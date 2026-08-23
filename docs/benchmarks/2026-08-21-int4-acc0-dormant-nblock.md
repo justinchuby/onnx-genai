@@ -14,14 +14,16 @@ kernel — see the [placement record](2026-08-21-decode-worker-cpu-placement.md)
 
 ## 1. The route, by counter
 
-The question was where the 1.84x acc0 gap sits. The first thing to establish is
-which kernel the production default even runs. Route counters instrumented from
+The question was where the acc0 gap sat, which at the time was measured at
+1.84x (**stale — see the note below**). The first thing to establish is which
+kernel the production default even runs. Route counters instrumented from
 operator entry through to the innermost arm, over a real decode step at
 `accuracy_level = 0`:
 
 > **Note (2026-08-23, revised):** the `1.84x` inherited here **no longer
-> holds** — re-measured on `e189244ba` the acc0 gap is **1.12x at t=1, 1.15x at
-> t=4, 1.12x at t=8**. Part of that closure is the work this very document
+> holds** — re-measured on `e189244ba` the acc0 gap is **1.12x at t=1 and
+> 1.12x at t=8**; the `t=4` cell reads ~1.15x but sits inside its own A/A null
+> (0.868-1.150) and does not resolve. Part of that closure is the work this very document
 > motivated: enabling the register-blocked kernel at `accuracy_level = 0`
 > (#1679) was one of three acc0 merges that landed after the 1.84x was taken.
 > The route findings below are categorical (which kernel runs) and stand

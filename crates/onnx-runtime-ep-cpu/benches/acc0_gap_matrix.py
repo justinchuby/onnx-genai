@@ -65,11 +65,36 @@ assumed rather than checked
   from the binary and a cell is refused unless it equals the request. Timings
   cannot detect this: a sweep that silently runs one width in every row looks
   perfectly stable, because it is -- it is the same configuration each time.
+
+Distribution, orientation and token budget
+------------------------------------------
+* `--launches N` repeats the whole matrix `N` times. Every arm is already a
+  fresh process, so this distributes over **process launches**, which is the
+  larger source of variance and the one `--reps` cannot see: reps live inside
+  one process and inherit whatever state it started in. The per-width summary
+  at the end medians the gap over *paired* cells -- native and ORT run seconds
+  apart inside one launch, so pairing cancels drift that a ratio of two
+  independently-medianed columns would keep -- and prints the cell count and
+  the full range beside it, because a median of two cells and a median of six
+  are not the same claim.
+* `--tokens` accepts either a single count or a per-width map,
+  `1:64,4:192,8:384`. A fixed count is not width-neutral: at `t=1` a token
+  costs ~16x what it costs at `t=16`, so a flat budget spends the most wall
+  time on the narrow widths and still gives them the fewest samples relative
+  to their variance.
+* Two ratio columns are printed, and this is deliberate. `ratio` is
+  **native/ORT** (below 1.0 means we are behind); `gap` is its reciprocal, the
+  "Nx behind ORT" figure the documents quote. Printing both means neither
+  orientation has to be inferred from which side of 1.0 a number happens to
+  sit -- which is exactly the kind of inference that produced a published
+  reciprocal once already.
 """
 import argparse
+import collections
 import json
 import os
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -298,8 +323,19 @@ def main():
     ap.add_argument("--sessions", default="1,2,4")
     ap.add_argument("--block", type=int, default=32)
     ap.add_argument("--acc", type=int, default=0)
-    ap.add_argument("--tokens", type=int, default=24)
+    ap.add_argument("--tokens", default="24",
+                    help="measured tokens per session. Either a single number, "
+                         "or a per-width map `1:64,4:192,8:384` -- a fixed token "
+                         "count makes a t=1 cell 16x longer in wall time than a "
+                         "t=16 cell, so the narrow widths get the fewest samples "
+                         "exactly where the variance is worst")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--launches", type=int, default=1,
+                    help="independent repetitions of the whole matrix. Every "
+                         "arm is a fresh process, so this distributes over "
+                         "process launches rather than over reps inside one "
+                         "process -- the launch-to-launch spread is the larger "
+                         "of the two and is invisible to --reps")
     ap.add_argument("--out", default="acc0_gap.json")
     ap.add_argument("--aa", action="store_true", help="per-cell interleaved A/A")
     ap.add_argument("--slack", type=int, default=4,
@@ -313,16 +349,28 @@ def main():
                          "or both so the asymmetry is quantified")
     args = ap.parse_args()
 
+    # `--tokens 192` or `--tokens 1:64,4:192,8:384`.
+    if ":" in args.tokens:
+        tokens_for = {}
+        for pair in args.tokens.split(","):
+            key, value = pair.split(":")
+            tokens_for[int(key)] = int(value)
+    else:
+        fixed = int(args.tokens)
+        tokens_for = collections.defaultdict(lambda: fixed)
+
     rows = []
-    hdr = (f"{'model':>6} {'t':>3} {'s':>2} {'nat_tps':>9} {'nat_sp%':>8} "
-           f"{'ort_tps':>9} {'ort_sp%':>8} {'ratio':>7} {'nat_GB/s':>9} "
+    hdr = (f"{'model':>6} {'L':>2} {'t':>3} {'s':>2} {'nat_tps':>9} {'nat_sp%':>8} "
+           f"{'ort_tps':>9} {'ort_sp%':>8} {'ratio':>7} {'gap':>7} {'nat_GB/s':>9} "
            f"{'ort_GB/s':>9} {'A/A':>6}")
     print(hdr)
     print("-" * len(hdr))
 
-    for model in args.models.split(","):
+    for launch in range(args.launches):
+      for model in args.models.split(","):
         wb = weight_bytes(model, args.block)
         for t in [int(x) for x in args.threads.split(",")]:
+            tokens = tokens_for[t]
             for s in [int(x) for x in args.sessions.split(",")]:
                 load, busy = wait_quiet()
                 if busy:
@@ -337,21 +385,21 @@ def main():
                 # there when `wait_quiet` returned.
                 with LoadWatch() as watch:
                     a1 = native(args.binary, model, args.block, args.acc, t, s,
-                                args.tokens, args.reps)
+                                tokens, args.reps)
                     o = None
                     o_wide = None
                     if args.ort_pin in ("matched", "both"):
-                        o = ort(model, args.block, args.acc, t, s, args.tokens,
+                        o = ort(model, args.block, args.acc, t, s, tokens,
                                 args.reps, pin=native_pin(t))
                     if args.ort_pin in ("wide", "both"):
                         o_wide = ort(model, args.block, args.acc, t, s,
-                                     args.tokens, args.reps, pin=PIN)
+                                     tokens, args.reps, pin=PIN)
                     if o is None:
                         o = o_wide
                     aa = ""
                     if args.aa:
                         a2 = native(args.binary, model, args.block, args.acc, t,
-                                    s, args.tokens, args.reps)
+                                    s, tokens, args.reps)
                         aa = f"{a2['tps'] / a1['tps']:.3f}"
                 if watch.peak > t + args.slack:
                     sys.stderr.write(
@@ -361,8 +409,14 @@ def main():
                     busy = busy or [("-", 0.0, f"peak runnable {watch.peak}")]
                 nat_bw = a1["tps"] * wb / 1e9
                 ort_bw = o["tps"] * wb / 1e9
-                row = {"model": model, "threads": t, "sessions": s,
+                row = {"model": model, "launch": launch, "threads": t,
+                       "sessions": s, "tokens": tokens,
                        "native": a1, "ort": o, "ratio": a1["tps"] / o["tps"],
+                       # `ratio` is native/ORT (below 1 means we are behind);
+                       # `gap` is its reciprocal, the "Nx behind ORT" the docs
+                       # quote. Both are printed so neither orientation has to
+                       # be inferred from which side of 1.0 a number sits.
+                       "gap": o["tps"] / a1["tps"],
                        "ort_wide": o_wide,
                        "ratio_wide": (a1["tps"] / o_wide["tps"]) if o_wide else None,
                        "native_gbs": nat_bw, "ort_gbs": ort_bw,
@@ -377,15 +431,43 @@ def main():
                 if o_wide is not None and row["ratio_wide"] is not None:
                     wide = (f"  wide_ort={o_wide['tps']:.1f} "
                             f"ratio_wide={row['ratio_wide']:.3f}")
-                print(f"{model:>6} {t:>3} {s:>2} {a1['tps']:>9.1f} "
+                print(f"{model:>6} {launch:>2} {t:>3} {s:>2} {a1['tps']:>9.1f} "
                       f"{a1['spread']:>8.1f} {o['tps']:>9.1f} {o['spread']:>8.1f} "
-                      f"{row['ratio']:>7.3f} {nat_bw:>9.1f} {ort_bw:>9.1f} {aa:>6}"
+                      f"{row['ratio']:>7.3f} {row['gap']:>7.3f} "
+                      f"{nat_bw:>9.1f} {ort_bw:>9.1f} {aa:>6}"
                       f"{wide}{flag}")
                 sys.stdout.flush()
                 with open(os.path.join(HERE, args.out), "w") as f:
                     json.dump(rows, f, indent=1)
 
     print()
+    # Per-width summary over launches. The gap is medianed over *paired* cells
+    # -- native and ORT run seconds apart inside one launch, so pairing cancels
+    # drift that a ratio of two independently-medianed columns would keep. The
+    # cell count and the full range are printed beside it because a median of
+    # two cells and a median of six are not the same claim, and a range that
+    # straddles the A/A null means the cell did not resolve the gap at all.
+    if args.launches > 1 or args.aa:
+        print(f"{'model':>6} {'t':>3} {'s':>2} {'gap_med':>8} {'gap_min':>8} "
+              f"{'gap_max':>8} {'cells':>6} {'aa_min':>7} {'aa_max':>7}")
+        for model in args.models.split(","):
+            for t in [int(x) for x in args.threads.split(",")]:
+                for s in [int(x) for x in args.sessions.split(",")]:
+                    kept = [r for r in rows
+                            if r["model"] == model and r["threads"] == t
+                            and r["sessions"] == s and r["trusted"]]
+                    if not kept:
+                        print(f"{model:>6} {t:>3} {s:>2} "
+                              f"{'no trusted cells':>40}")
+                        continue
+                    gaps = sorted(r["gap"] for r in kept)
+                    aas = sorted(r["aa"] for r in kept if r["aa"] is not None)
+                    print(f"{model:>6} {t:>3} {s:>2} "
+                          f"{statistics.median(gaps):>8.3f} {gaps[0]:>8.3f} "
+                          f"{gaps[-1]:>8.3f} {len(gaps):>6} "
+                          f"{(f'{aas[0]:.3f}' if aas else '-'):>7} "
+                          f"{(f'{aas[-1]:.3f}' if aas else '-'):>7}")
+        print()
     print("weight bytes per token per session:",
           {m: f"{weight_bytes(m, args.block) / 1e6:.1f} MB" for m in args.models.split(",")})
 

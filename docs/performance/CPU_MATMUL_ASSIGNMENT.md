@@ -1939,27 +1939,62 @@ an ORT number. Neither is resolvable by the measurement that produced it. The
 t=1 and t=4 rows have headroom and are unaffected; **t=8 is the widest row
 worth arguing from.**
 
-**The default path did not move and is now the bigger target.** This kernel is
-gated to `accuracy_level = 4`; production default is 0, where native was 56.307
-ms/token against ORT's 30.632 — **1.84x** at the time this was written.
+**The default path was the bigger target when this was written, and is not any
+more.** This kernel is gated to `accuracy_level = 4`; production default is 0,
+where native measured 56.307 ms/token against ORT's 30.632 — **1.84x** at the
+time. That figure is now stale; the re-measurement replaces it.
 
 > **Re-measured 2026-08-23: the acc0 gap is ~1.12x, and 1.84x is stale.** On
-> `e189244ba`, llama / block 32 / one session / matched core budget, three
-> independent launches per width: **t=1 1.120x** (native 35.36 ms, ORT 31.99,
-> 1.4% across launches), **t=4 1.148x** (17.1%, the weakest row), **t=8 1.120x**
-> (5.0%). The gap is flat across the measurable range, so
-> acc0 is neither a scaling problem nor the top target any more.
+> `e189244ba`, llama / block 32 / one session / matched core budget, arms
+> interleaved and the gap medianed over paired cells: **t=1 1.120x** (native
+> 27.9 tok/s, ORT 31.2; range 1.112–1.128 over 2 retained cells of 3),
+> **t=8 1.120x** (range 1.089–1.145, 3 cells), **t=4 ~1.15x but unresolved** —
+> its A/A null spans 0.868–1.150, so the gap sits inside its own noise floor at
+> that width. Flat across the measurable range, so acc0 is neither a scaling
+> problem nor the top target any more.
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
-> that no longer exists.** The control that establishes this is the ORT arm:
-> it reproduces to **+4.4%** (30.632 → 31.99 ms), same binary, same graph, same
-> host, same statistic, so the harness and the definition are comparable and
-> the entire movement is on our side. Native went 56.307 → 35.36 at t=1
-> (1.59x) and 14.091 → 4.57 at t=8 (3.08x). Six merges landed after
-> `e9754e7ef` published the number, three of them direct acc0 kernel work
-> (#1667 broke the serial f32 reduction chain, 5.75x t=1; #1679 enabled the
-> register-blocked kernel *at acc0*; #1783 folded the zero-point unpack) and
-> three of which change what a width means (#1728, #1794, #1746).
+> that no longer exists.** An earlier draft argued this from the ORT arm alone
+> (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not
+> sufficient**: it shows the *ORT* ruler did not move and says nothing about the
+> native ruler, which changed repeatedly over the same window. So the inference
+> was replaced with a direct A/B — `e9754e7ef`'s bench rebuilt and run beside
+> current main's, same host, same environment, `PROBE_REPS=1` on both, arms
+> interleaved:
+>
+> | width | kernel-only, measured | published pair implies | verdict |
+> |---:|---:|---:|---|
+> | 1 | **1.64x** [1.61–1.88], 12 paired cells | 1.59x | apparent movement **is** kernel |
+> | 8 | **1.82x** [1.78–1.89], 6 paired cells | 3.08x | **3.08x retracted** |
+>
+> **The `t=8` overclaim is worth knowing about.** Both old figures reproduce
+> today to within 0.4% — but only **unpinned**. The old bench never called
+> `EpFactory::initialize`, so it never ran `bound_process_to_decode_budget()`
+> and its process was never confined; that function, physical-core selection
+> included, **already existed at `e9754e7ef`**, and only the bench was missing
+> the call (added by #1766 `11cb8e5f3`). So the old `t=8` row measured eight
+> decode workers scattered over 32 logical CPUs onto SMT siblings — a topology
+> **no served session ever ran in**. Pinning the same old binary to eight
+> physical cores gives 8.430 ms against its unpinned 14.115, and forcing it onto
+> `0-7` gives 16.121: 1.67x of the claimed 3.08x was that, not kernel work.
+> Today's binary is pin-insensitive (4.619 unpinned vs 4.664 pinned) because it
+> confines itself.
+>
+> Two corrections that look right and are not, recorded so they are not
+> re-applied here: the ~11% warmup/spawn handicap of §27 is in
+> **`tokens_s_total`**, and both published figures are **`ms_token`** (the old
+> ORT harness's docstring names "the native harness's `steady` column-2 median"
+> as its comparand, and the reproductions land on it to 0.4%), so deducting 11%
+> yields a number neither tree produces. The asymmetry that *is* real —
+> old ORT took `min` over reps, old native was single-shot — biases in **ORT's**
+> favour, making the old gap look worse rather than better.
+>
+> Eight merges landed after `e9754e7ef` published the number: three direct acc0
+> kernel work (#1667 broke the serial f32 reduction chain, 5.75x t=1; #1679
+> enabled the register-blocked kernel *at acc0*; #1783 folded the zero-point
+> unpack), three changing what a width means (#1728, #1794, #1746), and two
+> changing the ruler (#1722 made the two arms measure one quantity; #1766 put
+> the benches in the production decode topology).
 >
 > The 2026-08-23 scope note this replaces said the figure was `t=1`-only and
 > that the production-width gap was unmeasured. Both were true; both missed
@@ -1972,12 +2007,13 @@ ms/token against ORT's 30.632 — **1.84x** at the time this was written.
 >
 > Still true and unchanged: at t=1 the native side runs `path=flat`, confined by
 > the decode budget to a single CPU with no pool built at all (§20), so that row
-> compares native-serial against ORT-single-thread. **t=16 remains unresolved**
-> — every cell at that width was taken against a sibling `cargo test` and
-> discarded; the contaminated cells hint at ~1.6x and native was in the slow
-> mode of its 514% bimodality for all of them, so it is a hypothesis, not a
-> result, and it is the cell closest to an unconfined production process.
-> Full record:
+> compares native-serial against ORT-single-thread and every scaling figure
+> quoted against it is "vs serial", not "vs a one-worker pool". **t=16 remains
+> unresolved** — every cell at that width was taken against a sibling
+> `cargo test` and discarded; the contaminated cells hint at ~1.6x and native
+> was in the slow mode of its 514% bimodality for all of them, so it is a
+> hypothesis, not a result, and it is the cell closest to an unconfined
+> production process. Full record:
 > [`docs/benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md`](../benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md).
 
 Full record for the acc4 table above:

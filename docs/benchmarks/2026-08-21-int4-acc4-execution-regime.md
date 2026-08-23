@@ -484,29 +484,47 @@ This kernel is gated to `accuracy_level = 4`. Production default is
 | 8 | — | 14.091 | — |
 
 > **Superseded 2026-08-23 — the table above is stale, not merely unlabelled.**
-> Re-measured on `e189244ba` with a matched core budget and three independent
-> launches per width, the acc0 gap is **1.120x at t=1** (native 35.36 ms, ORT
-> 31.99), **1.148x at t=4**, **1.120x at t=8**. The rows above were correct when
-> taken; they predate #1667 (broke the serial f32 reduction chain in the int4
-> decode GEMV, 5.75x t=1), #1679 (enabled the register-blocked kernel *at
+> Re-measured on `e189244ba` with a matched core budget, arms interleaved and
+> the gap medianed over paired cells, the acc0 gap is **1.120x at t=1**
+> (range 1.112–1.128) and **1.120x at t=8** (1.089–1.145). The `t=4` cell reads
+> ~1.15x but does **not** resolve: its A/A null spans 0.868–1.150, so the gap
+> is inside its own noise floor there. The rows above were correct when taken;
+> they predate #1667 (broke the serial f32 reduction chain in the int4 decode
+> GEMV, 5.75x t=1), #1679 (enabled the register-blocked kernel *at
 > `accuracy_level = 0`*) and #1783 (folded the zero-point unpack), plus three
-> merges that change what a width means (#1728, #1794, #1746).
+> merges that change what a width means (#1728, #1794, #1746) and two that
+> changed the ruler (#1722, #1766).
 >
-> The control is the ORT arm: it reproduces to **+4.4%** (30.632 → 31.99 ms) on
-> the same host and statistic, so the comparison is sound and the whole
-> movement is on our side — native went 56.307 → 35.36 at t=1 and 14.091 → 4.57
-> at t=8. An earlier note here said the figure was `t=1`-only and that the
-> production-width gap was unmeasured. Both were true and both missed that the
-> `t=1` number was three kernel merges out of date. Full record:
+> **The `t=1` and `t=8` rows are stale for different reasons, and only one of
+> them is the kernel.** An earlier version of this note argued from the ORT arm
+> reproducing (+4.4%, 30.632 → 31.99 ms) that "the whole movement is on our
+> side". That control is not sufficient — it shows the *ORT* ruler held still
+> and says nothing about the native one. Rebuilding `e9754e7ef`'s bench and
+> running it beside current main's, same host, `PROBE_REPS=1` on both, arms
+> interleaved: **t=1 is 1.64x kernel** [1.61–1.88, 12 paired cells], matching
+> the 1.59x the published pair implies. **t=8 is 1.82x kernel** [1.78–1.89,
+> 6 cells], *not* the 3.08x that pair implies.
+>
+> The missing 1.67x at t=8 is worker placement. `14.091` reproduces today to
+> 0.2% — but only **unpinned**. The old bench never called
+> `EpFactory::initialize`, so `bound_process_to_decode_budget()` never ran and
+> its eight workers scattered across 32 logical CPUs onto SMT siblings; that
+> function already existed at `e9754e7ef` and production always called it, so
+> the row measured a topology no served session used. #1766 added the call.
+> The same old binary pinned to eight physical cores gives 8.430 ms, and forced
+> onto `0-7` gives 16.121. This is the effect
+> [2026-08-21-decode-worker-cpu-placement.md](2026-08-21-decode-worker-cpu-placement.md)
+> already documented, landing on this table's own `t=8` row. Full record:
 > [2026-08-23-acc0-gap-vs-ort-by-width.md](2026-08-23-acc0-gap-vs-ort-by-width.md).
 
 So the honest summary *at the time of writing* was that we had moved the
 *opt-in* path from 3.01x to 1.79x and left the *default* path at 1.84x, where
 it was. Nothing in this document was progress on acc0, and that remains true of
-this document. What is no longer true is the conclusion drawn from it: acc0 was
-closed to ~1.12x by the three kernel merges listed in the note above, within
-two days of this being written, and the figure here outlived the tree it
-measured. **Do not rank work off this table.**
+this document. What is no longer true is the conclusion drawn from it: acc0 is
+~1.12x on current main, and the figure here outlived the tree it measured.
+Roughly 1.6-1.8x of that closure is the three kernel merges listed in the note
+above; at `t=8` the rest is the worker placement the old bench never applied.
+**Do not rank work off this table.**
 
 Two implementation details cost more than they saved and are recorded so they
 are not re-tried:
