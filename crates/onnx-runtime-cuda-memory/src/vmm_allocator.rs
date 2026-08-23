@@ -1228,6 +1228,15 @@ impl CudaVmmAllocator {
         (arena.spans.committed, arena.spans.capacity())
     }
 
+    /// The [`DeviceKey`] this allocator's arena is bound to. Used by callers
+    /// that hold several allocators keyed by an unrelated identifier (e.g.
+    /// `ValueId`) to verify they all belong to the same physical device
+    /// before performing any cross-allocator device-scoped operation, rather
+    /// than assuming it.
+    pub fn device_key(&self) -> DeviceKey {
+        self.device
+    }
+
     /// Execute a closure with exclusive access to the arena's reservation
     /// and this allocator's `CudaVirtualBacking`.
     ///

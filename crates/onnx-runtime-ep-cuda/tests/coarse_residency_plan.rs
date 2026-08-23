@@ -15,14 +15,14 @@
 use std::collections::HashMap;
 
 use onnx_runtime_ep_cuda::coarse_residency::{
-    BoundaryApplicationOutcome, COARSE_RESIDENCY_PROFILE_ENV, coarse_residency_profile_enabled,
+    BoundaryApplicationOutcome, COARSE_RESIDENCY_ENABLE_ENV, coarse_residency_profile_enabled,
 };
 
 #[test]
 fn env_var_name_is_the_documented_gate() {
     assert_eq!(
-        COARSE_RESIDENCY_PROFILE_ENV,
-        "ONNX_GENAI_WEIGHT_OFFLOAD_COARSE_RESIDENCY_PROFILE"
+        COARSE_RESIDENCY_ENABLE_ENV,
+        "ONNX_GENAI_WEIGHT_OFFLOAD_COARSE_RESIDENCY_ENABLE"
     );
 }
 
@@ -31,7 +31,7 @@ fn feature_gate_reflects_env_value_semantics() {
     // Read whatever the ambient env says. The point is that the gate reads
     // the specific env var above; we don't set it here (tests share a
     // process — mutating env is contagious).
-    let raw = std::env::var(COARSE_RESIDENCY_PROFILE_ENV).ok();
+    let raw = std::env::var(COARSE_RESIDENCY_ENABLE_ENV).ok();
     let expected = matches!(
         raw.as_deref()
             .map(str::trim)

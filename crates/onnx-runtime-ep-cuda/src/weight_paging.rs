@@ -3498,10 +3498,17 @@ impl CudaWeightResidency {
     ///
     /// This is a thin, byte-identical-when-disabled convenience wrapper: it
     /// is off by default (gated by
-    /// [`crate::coarse_residency::COARSE_RESIDENCY_PROFILE_ENV`]) and, when
+    /// [`crate::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV`]) and, when
     /// off, returns a no-op outcome without touching any allocator. When on,
     /// every mutation goes through the Slice-4 transition primitive with
     /// full safe-point / drain / rollback semantics.
+    ///
+    /// `expert_groups` should be
+    /// [`onnx_runtime_ep_api::expert_weight_groups`] derived from the same
+    /// graph these catalogs came from, so multi-tensor logical experts
+    /// (fc1/fc2/fc3/scales of one QMoE bank) are tiered atomically. Pass
+    /// `&[]` to validate every value independently (no cross-tensor
+    /// grouping).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_coarse_residency_plan(
         &self,
@@ -3518,6 +3525,7 @@ impl CudaWeightResidency {
         host_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
         device_count: usize,
         device_ordinal: i32,
+        expert_groups: &[onnx_runtime_ep_api::ExpertWeightGroup],
     ) -> crate::coarse_residency::BoundaryApplicationOutcome {
         crate::coarse_residency::apply_residency_plan_at_boundary(
             &self.runtime,
@@ -3529,6 +3537,7 @@ impl CudaWeightResidency {
             host_pool,
             device_count,
             device_ordinal,
+            expert_groups,
         )
     }
 
