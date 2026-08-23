@@ -448,6 +448,25 @@ pub(super) fn kernel_input_uses_physical_capacity(node: &Node, input_index: usiz
                 && node.outputs.len() == 3
                 && node.inputs.get(6).is_some_and(Option::is_some)
         )
+        || (
+            // `pkg.nxrt::KvCacheCapacityAppend` (the CUDA-only rewritten form of a
+            // decomposed-attention KV-cache growth `Concat`, see
+            // `is_kv_cache_growth_concat`) writes `current` into a fixed-capacity
+            // `past` in place at the offset(s) carried by its third operand
+            // (`position_ids`), rather than growing a logical concatenation. Its
+            // own kernel is therefore *designed* to receive `past` at physical
+            // capacity — exactly like GQA/Attention/IndexShare above — so binding
+            // it that way from the first (empty) step is what keeps whole-step
+            // CUDA-graph capture shape-static. Gated on the `position_ids` operand
+            // (input 2) actually being present: a malformed 2-input node with this
+            // op/domain (which the rewrite never produces, but nothing else
+            // enforces structurally) has no write-offset signal and must not be
+            // treated as capacity-safe.
+            node.domain == KV_CAPACITY_APPEND_DOMAIN
+                && node.op_type == KV_CAPACITY_APPEND_OP
+                && input_index == 0
+                && node.inputs.get(2).is_some_and(Option::is_some)
+        )
 }
 
 pub(super) fn kernel_input_uses_padded_capacity(node: &Node, input_index: usize) -> bool {
@@ -528,14 +547,36 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
         && kernel_input_uses_physical_capacity(node, 4)
 }
 
+/// Domain of the native-only S3 capacity-write append (see
+/// [`is_kv_cache_growth_concat`]'s second arm and
+/// `kv_capacity_write_eligible_concats`). A CUDA-only load-time rewrite
+/// replaces an eligible growth `Concat` with this op so the KV cache is
+/// updated as an in-place capacity write instead of a growing concatenation,
+/// which is what lets whole-step CUDA-graph capture stay shape-static across
+/// decode steps. Kept as a bare literal (matching how `pkg.nxrt::IndexShare`
+/// is already spelled independently in each crate that touches it) rather
+/// than a cross-crate constant, since the rewrite and the kernel that
+/// executes it live in different crates with no shared dependency edge.
+pub(super) const KV_CAPACITY_APPEND_DOMAIN: &str = "pkg.nxrt";
+/// Op type of the native-only S3 capacity-write append; see
+/// [`KV_CAPACITY_APPEND_DOMAIN`].
+pub(super) const KV_CAPACITY_APPEND_OP: &str = "KvCacheCapacityAppend";
+
 /// Structural signature of a *decomposed*-attention KV-cache append: a
 /// default-domain `Concat` whose growing operand is a graph **input** (the
 /// persisted past cache) and whose result is a graph **output** (the
-/// persisted present cache). This recognizes the append node by input/output
-/// *role* alone — not by name, axis, or tensor shape — so it matches any
-/// decomposed self-attention export that grows its cache with a plain
-/// `Concat` rather than an in-op cache (`Attention` / `GroupQueryAttention` /
-/// `pkg.nxrt::IndexShare`).
+/// persisted present cache) — **or** the rewritten
+/// [`KV_CAPACITY_APPEND_DOMAIN`]`::`[`KV_CAPACITY_APPEND_OP`] form of the same
+/// node (same input/output role, plus a third `position_ids` operand; see
+/// `kv_capacity_write_eligible_concats`). This recognizes the append node by
+/// input/output *role* alone — not by name, axis, or tensor shape — so it
+/// matches any decomposed self-attention export that grows its cache with a
+/// plain `Concat` rather than an in-op cache (`Attention` /
+/// `GroupQueryAttention` / `pkg.nxrt::IndexShare`), and continues to match
+/// after the CUDA-only rewrite swaps the node for its capacity-write form —
+/// otherwise the mask-cone walk's `Add`-rule provenance check
+/// ([`derives_from_kv_cache_growth`]) would stop recognizing its own
+/// rewritten output on the very graph the rewrite was proven safe for.
 ///
 /// The KV-cache manager binds *both* ends of this edge — the past input and
 /// the present output — at a fixed physical capacity regardless of node type
@@ -546,8 +587,8 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
 /// capacity-consistent as `present.*` itself, which is what lets a mask that
 /// combines with such a value stay sound once frozen to physical width.
 pub(super) fn is_kv_cache_growth_concat(graph: &Graph, node: &Node) -> bool {
-    node.is_default_domain()
-        && node.op_type == "Concat"
+    ((node.is_default_domain() && node.op_type == "Concat")
+        || (node.domain == KV_CAPACITY_APPEND_DOMAIN && node.op_type == KV_CAPACITY_APPEND_OP))
         && node
             .inputs
             .first()
@@ -560,12 +601,35 @@ pub(super) fn is_kv_cache_growth_concat(graph: &Graph, node: &Node) -> bool {
             .is_some_and(|output| graph.outputs.contains(output))
 }
 
+/// The shape-relabelling/scaling op set that carries an operand's length axis
+/// through unchanged, shared by both the backward provenance walk
+/// ([`kv_cache_growth_concat_source`]) and the forward value-role walk
+/// ([`forward_shape_preserving_matmul_consumers`]): `Transpose`, `Reshape`,
+/// `Unsqueeze`, `Squeeze`, `Cast`, `Mul`, `Div`, `Slice`, `Expand`. One list,
+/// walked in whichever direction the question needs, rather than a second
+/// allowlist that could drift from this one.
+fn is_shape_preserving_relabel_op(node: &Node) -> bool {
+    node.is_default_domain()
+        && matches!(
+            node.op_type.as_str(),
+            "Transpose"
+                | "Reshape"
+                | "Unsqueeze"
+                | "Squeeze"
+                | "Cast"
+                | "Mul"
+                | "Div"
+                | "Slice"
+                | "Expand"
+        )
+}
+
 /// Bounded backward walk: does `value`'s length axis structurally derive from
-/// an [`is_kv_cache_growth_concat`] node's output?
+/// an [`is_kv_cache_growth_concat`] node's output? Returns the source node so
+/// callers that need to name *which* append it came from (the S3
+/// capacity-write rewrite) do not have to re-walk to recover it.
 ///
-/// Descends through shape-relabelling/scaling ops that carry an operand's
-/// length axis through unchanged — `Transpose`, `Reshape`, `Unsqueeze`,
-/// `Squeeze`, `Cast`, `Mul`, `Div`, `Slice`, `Expand` — following *every*
+/// Descends through [`is_shape_preserving_relabel_op`], following *every*
 /// input, since for these ops no operand introduces a length axis foreign to
 /// the one already being traced: an auxiliary shape/axes/scalar operand is
 /// either a dead end or itself a legitimate `Shape(present.*)` read, which is
@@ -578,7 +642,7 @@ pub(super) fn is_kv_cache_growth_concat(graph: &Graph, node: &Node) -> bool {
 /// that actually determines the result's length axis — restricting to input 1
 /// is what keeps this a general structural fact about `MatMul`, not a
 /// `Q`/`K`-specific convention.
-pub(super) fn derives_from_kv_cache_growth(graph: &Graph, value: ValueId) -> bool {
+pub(super) fn kv_cache_growth_concat_source(graph: &Graph, value: ValueId) -> Option<NodeId> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     let mut producer: HashMap<ValueId, NodeId> = HashMap::new();
@@ -600,7 +664,7 @@ pub(super) fn derives_from_kv_cache_growth(graph: &Graph, value: ValueId) -> boo
         };
         let node = graph.node(node_id);
         if is_kv_cache_growth_concat(graph, node) {
-            return true;
+            return Some(node_id);
         }
         if node.is_default_domain() && node.op_type == "MatMul" {
             if let Some(Some(rhs)) = node.inputs.get(1) {
@@ -608,26 +672,71 @@ pub(super) fn derives_from_kv_cache_growth(graph: &Graph, value: ValueId) -> boo
             }
             continue;
         }
-        if node.is_default_domain()
-            && matches!(
-                node.op_type.as_str(),
-                "Transpose"
-                    | "Reshape"
-                    | "Unsqueeze"
-                    | "Squeeze"
-                    | "Cast"
-                    | "Mul"
-                    | "Div"
-                    | "Slice"
-                    | "Expand"
-            )
-        {
+        if is_shape_preserving_relabel_op(node) {
             for input in node.inputs.iter().flatten() {
                 frontier.push_back(*input);
             }
         }
     }
-    false
+    None
+}
+
+/// Whether `value`'s length axis structurally derives from an
+/// [`is_kv_cache_growth_concat`] node's output. See
+/// [`kv_cache_growth_concat_source`] for the walk and its rationale.
+pub(super) fn derives_from_kv_cache_growth(graph: &Graph, value: ValueId) -> bool {
+    kv_cache_growth_concat_source(graph, value).is_some()
+}
+
+/// Forward walk from a proven-safe `Softmax` sink's output, through
+/// [`is_shape_preserving_relabel_op`], collecting every `MatMul` node it
+/// reaches and which input slot the traced value occupies there.
+///
+/// This is the value-role counterpart of [`kv_cache_growth_concat_source`]'s
+/// backward walk: the same op set, walked forward from the softmax output
+/// instead of backward from a score operand, because a proven-safe softmax's
+/// exact-zero padded probabilities are what make the *other* `MatMul` operand
+/// (the "V" of `probs @ V`) safe regardless of its padded content — so the
+/// question here is "where does this probability value get multiplied",
+/// which is naturally asked forward. `MatMul` is a traversal terminus (not
+/// followed through) because the identity of "this is still the mask's
+/// length axis" ends at the matmul; the caller inspects the *other* operand.
+fn forward_shape_preserving_matmul_consumers(
+    graph: &Graph,
+    start: ValueId,
+) -> Vec<(NodeId, usize)> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut consumers: std::collections::HashMap<ValueId, Vec<(NodeId, usize)>> =
+        std::collections::HashMap::new();
+    for (node_id, node) in graph.nodes.iter() {
+        for (slot, value) in node.inputs.iter().enumerate() {
+            if let Some(vid) = value {
+                consumers.entry(*vid).or_default().push((node_id, slot));
+            }
+        }
+    }
+
+    let mut seen: HashSet<ValueId> = HashSet::new();
+    let mut frontier: VecDeque<ValueId> = VecDeque::new();
+    frontier.push_back(start);
+    let mut hits = Vec::new();
+    while let Some(value) = frontier.pop_front() {
+        if !seen.insert(value) {
+            continue;
+        }
+        for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
+            let node = graph.node(node_id);
+            if node.is_default_domain() && node.op_type == "MatMul" {
+                hits.push((node_id, slot));
+                continue;
+            }
+            if is_shape_preserving_relabel_op(node) {
+                frontier.extend(node.outputs.iter().copied());
+            }
+        }
+    }
+    hits
 }
 
 /// Structural pattern-match: is `mask` an attention-mask binding whose entire
@@ -694,6 +803,42 @@ pub(super) fn mask_cone_rejection(
 pub(super) fn mask_binding_feeds_additive_causal_builder(graph: &Graph, mask: ValueId) -> bool {
     mask_binding_feeds_capacity_form_attention_impl(graph, mask, ShapeConsumptionPolicy::Allow)
         .is_ok()
+}
+
+/// Every [`is_kv_cache_growth_concat`] node in `graph` structurally proven
+/// safe to rewrite from a growing concatenation into an in-place
+/// [`KV_CAPACITY_APPEND_OP`] capacity write.
+///
+/// Reuses the exact decode-freeze-safe proof
+/// [`mask_binding_feeds_additive_causal_builder`] already establishes (the
+/// `ShapeConsumptionPolicy::Allow` walk): the rewrite only ever fires for a
+/// single-token capture-eligible decode step, the same regime that proof is
+/// scoped to. Two roles fall out of that one proof (see
+/// `mask_binding_feeds_capacity_form_attention_impl`'s doc comment):
+///
+/// - **Score role**: the append feeds the non-mask operand of an `Add` the
+///   walk classified `Propagate`.
+/// - **Value role**: the append feeds one operand of a `MatMul` whose other
+///   operand forward-derives from a `Softmax` the walk classified `Sink` —
+///   safe because the sink's exact-zero padded probabilities already make
+///   the padded rows of that operand irrelevant regardless of content.
+///
+/// Iterates every graph input as a mask candidate rather than assuming a
+/// fixed binding-order convention (e.g. "bindings[0] is the mask"), and unions
+/// the results — cheap at load-time graph sizes, and keeps this analysis
+/// decoupled from how the engine layer happens to order its device bindings.
+pub(super) fn kv_capacity_write_eligible_concats(graph: &Graph) -> HashSet<NodeId> {
+    let mut eligible = HashSet::new();
+    for &input in &graph.inputs {
+        if let Ok(concats) = mask_binding_feeds_capacity_form_attention_impl(
+            graph,
+            input,
+            ShapeConsumptionPolicy::Allow,
+        ) {
+            eligible.extend(concats);
+        }
+    }
+    eligible
 }
 
 /// How the mask-cone walk treats a `Shape(mask)` consumer whose output is itself
@@ -923,11 +1068,18 @@ fn expand_target_is_mask_derived(graph: &Graph, expand: &Node, mask: ValueId) ->
     false
 }
 
+/// Walks the mask cone and, on success, also returns every
+/// [`is_kv_cache_growth_concat`] node the walk structurally proved safe to
+/// rewrite into an in-place capacity write (see
+/// [`kv_capacity_write_eligible_concats`]). Kept as one walk rather than a
+/// separate graph-wide scan: the K-role (score) and V-role (value) concats
+/// are byproducts of the *same* padding-neutralization proof this function
+/// already computes for the mask itself, not an independent question.
 fn mask_binding_feeds_capacity_form_attention_impl(
     graph: &Graph,
     mask: ValueId,
     shape_policy: ShapeConsumptionPolicy,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<HashSet<NodeId>, String> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // value → consumers as (node id, input slot).
@@ -945,6 +1097,13 @@ fn mask_binding_feeds_capacity_form_attention_impl(
     let mut frontier: VecDeque<ValueId> = VecDeque::new();
     frontier.push_back(mask);
     let mut reached_attention = false;
+    // Score-role (K): an `Add` classified `Propagate` proves its *other*
+    // operand safe by definition (see `classify_mask_consumer`'s `Add` rule) —
+    // recover which append that operand derives from, if any.
+    let mut score_role_concats: HashSet<NodeId> = HashSet::new();
+    // Outputs of every `Softmax` this walk classified `Sink`, for the value-role
+    // forward search below.
+    let mut sink_softmax_outputs: Vec<ValueId> = Vec::new();
     while let Some(value) = frontier.pop_front() {
         if !visited.insert(value) {
             continue;
@@ -965,20 +1124,49 @@ fn mask_binding_feeds_capacity_form_attention_impl(
         for &(node_id, slot) in consumers.get(&value).map_or(&[][..], Vec::as_slice) {
             let node = graph.node(node_id);
             match classify_mask_consumer(graph, node, slot, mask, &consumers, shape_policy) {
-                ConsumerRole::Sink => reached_attention = true,
+                ConsumerRole::Sink => {
+                    reached_attention = true;
+                    if node.is_default_domain() && node.op_type == "Softmax" {
+                        sink_softmax_outputs.extend(node.outputs.iter().copied());
+                    }
+                }
                 ConsumerRole::InvariantLeaf => {}
-                ConsumerRole::Propagate => frontier.extend(node.outputs.iter().copied()),
+                ConsumerRole::Propagate => {
+                    if node.is_default_domain() && node.op_type == "Add" && node.inputs.len() == 2 {
+                        let other = node.inputs[1 - slot];
+                        if let Some(concat_id) =
+                            other.and_then(|value| kv_cache_growth_concat_source(graph, value))
+                        {
+                            score_role_concats.insert(concat_id);
+                        }
+                    }
+                    frontier.extend(node.outputs.iter().copied());
+                }
                 ConsumerRole::Mixes(reason) => return Err(reason),
             }
         }
     }
-    if reached_attention {
-        Ok(())
-    } else {
-        Err(String::from(
+    if !reached_attention {
+        return Err(String::from(
             "the mask cone never reached a capacity-form Attention mask input",
-        ))
+        ));
     }
+    let mut eligible = score_role_concats;
+    for output in sink_softmax_outputs {
+        for (matmul_id, probs_slot) in forward_shape_preserving_matmul_consumers(graph, output) {
+            let matmul = graph.node(matmul_id);
+            if matmul.inputs.len() != 2 {
+                continue;
+            }
+            let Some(other) = matmul.inputs[1 - probs_slot] else {
+                continue;
+            };
+            if let Some(concat_id) = kv_cache_growth_concat_source(graph, other) {
+                eligible.insert(concat_id);
+            }
+        }
+    }
+    Ok(eligible)
 }
 
 /// `name(OpType)`, or `<unnamed>(OpType)` — the shared spelling for every node

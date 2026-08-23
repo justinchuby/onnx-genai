@@ -2268,6 +2268,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "KvCacheCapacityAppend"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::kv_cache_capacity_append::unsupported_reason(shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "IndexShare"
             && op.domain == "pkg.nxrt"
             && let Some(reason) =

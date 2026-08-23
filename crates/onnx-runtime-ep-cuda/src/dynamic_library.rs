@@ -158,20 +158,70 @@ fn wheel_library_directory(os: TargetOs) -> &'static str {
     }
 }
 
+/// Architecture sub-directory used by the consolidated wheel layout.
+///
+/// The per-component wheels put libraries directly in `bin`/`lib`; the
+/// consolidated ones add an architecture level below it, spelled differently
+/// for libraries (`x64`) and binaries (`x86_64`) on Windows.
+fn wheel_arch_directories(os: TargetOs) -> &'static [&'static str] {
+    match os {
+        TargetOs::Windows => &["x86_64", "x64"],
+        TargetOs::Linux => &["x86_64", "sbsa"],
+        TargetOs::Macos | TargetOs::Other => &[],
+    }
+}
+
+/// CUDA major versions the consolidated wheels are published under.
+///
+/// Ordered newest first so a machine carrying more than one prefers the newer,
+/// which is also the one a default build (`cuda-13000`) can actually use.
+const WHEEL_CUDA_MAJORS: &[&str] = &["cu13", "cu12"];
+
+/// Directories a wheel root may hold libraries in, newest layout first.
+///
+/// NVIDIA publishes these wheels under two layouts, and a machine can carry
+/// both because the package names differ:
+///
+/// * consolidated — `nvidia/cu13/{bin,lib}/<arch>/`, one wheel per CUDA line
+///   (`nvidia-cuda-nvrtc`, version-pinned to select the CUDA major);
+/// * per-component — `nvidia/<component>/{bin,lib}/`, the older
+///   `nvidia-*-cu12` spelling.
+///
+/// Searching only the older layout was a silent gap: the file is present and on
+/// the loader path, but never at the path we built, so discovery falls back to
+/// the system search order and reports "not found" on a machine that has it.
+fn wheel_library_directories(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<PathBuf> {
+    // The driver ships with the display driver and is never redistributed in a
+    // wheel, so it has no component and must not acquire candidates from either
+    // layout.
+    let Some(component) = nvidia_component(library) else {
+        return Vec::new();
+    };
+    let mut directories = Vec::new();
+    let nvidia = root.join("nvidia");
+    let library_directory = wheel_library_directory(os);
+
+    for major in WHEEL_CUDA_MAJORS {
+        let base = nvidia.join(major).join(library_directory);
+        for arch in wheel_arch_directories(os) {
+            directories.push(base.join(arch));
+        }
+        // Some consolidated wheels omit the architecture level entirely.
+        directories.push(base);
+    }
+
+    directories.push(nvidia.join(component).join(library_directory));
+    directories
+}
+
 fn wheel_candidates_for(root: &Path, os: TargetOs, library: CudaLibrary) -> Vec<PathBuf> {
     if !root.is_absolute() {
         return Vec::new();
     }
-    let Some(component) = nvidia_component(library) else {
-        return Vec::new();
-    };
-    let directory = root
-        .join("nvidia")
-        .join(component)
-        .join(wheel_library_directory(os));
-    candidates_for(os, library)
-        .iter()
-        .map(|name| directory.join(name))
+    let names = candidates_for(os, library);
+    wheel_library_directories(root, os, library)
+        .into_iter()
+        .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .collect()
 }
 
@@ -228,13 +278,42 @@ fn wheel_roots_from_environment() -> Vec<PathBuf> {
     unique
 }
 
-/// The root a `<root>/nvidia/<component>/{bin,lib}` entry belongs to.
+/// The wheel root a library directory belongs to.
+///
+/// Both published layouts share one shape:
+///
+/// ```text
+/// <root>/nvidia/<component-or-cuda-major>/<bin|lib>[/<arch>]
+/// ```
+///
+/// `nvidia/<component>/lib` for the older per-component wheels,
+/// `nvidia/cu13/bin/x86_64` for the consolidated ones. So rather than
+/// enumerating both, walk up: an optional architecture level, then the library
+/// directory, then the component level, then `nvidia`.
+///
+/// The component level is load-bearing, not decoration. Without it a plain
+/// system install like `/opt/nvidia/lib` would report `/opt` as a wheel root,
+/// and every later failure would name a path nothing was ever installed to.
 fn wheel_root_of(entry: &Path) -> Option<PathBuf> {
-    let library_directory = entry.file_name()?;
-    if library_directory != "bin" && library_directory != "lib" {
-        return None;
+    fn is_library_directory(path: &Path) -> bool {
+        matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("bin") | Some("lib")
+        )
     }
-    let component = entry.parent()?;
+
+    // Skip at most one architecture level, which only the consolidated layout has.
+    let library_directory = if is_library_directory(entry) {
+        entry
+    } else {
+        let parent = entry.parent()?;
+        if !is_library_directory(parent) {
+            return None;
+        }
+        parent
+    };
+
+    let component = library_directory.parent()?;
     let nvidia = component.parent()?;
     if nvidia.file_name()? != "nvidia" {
         return None;
@@ -317,9 +396,18 @@ pub(crate) fn wheel_cuda_include_paths() -> Vec<PathBuf> {
         .into_iter()
         .flat_map(|root| {
             let nvidia = root.join("nvidia");
-            ["cuda_runtime", "cuda_nvcc"]
+            // Consolidated layout keeps one `include` per CUDA line; the older
+            // per-component layout splits the headers NVRTC needs across the
+            // runtime and nvcc wheels.
+            let consolidated = WHEEL_CUDA_MAJORS
+                .iter()
+                .map(|major| nvidia.join(major).join("include"))
+                .collect::<Vec<_>>();
+            let per_component = ["cuda_runtime", "cuda_nvcc"]
                 .into_iter()
-                .map(move |component| nvidia.join(component).join("include"))
+                .map(|component| nvidia.join(component).join("include"))
+                .collect::<Vec<_>>();
+            consolidated.into_iter().chain(per_component)
         })
         .collect()
 }
@@ -504,24 +592,42 @@ mod tests {
         let root = std::env::current_dir()
             .expect("current directory should be available")
             .join("site-packages");
+        // Consolidated layout first (it is what current wheels publish), then
+        // the older per-component one, so a machine carrying both prefers the
+        // newer.
+        let linux = wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::CublasLt);
         assert_eq!(
-            wheel_candidates_for(&root, TargetOs::Linux, CudaLibrary::CublasLt),
-            vec![
-                root.join("nvidia/cublas/lib/libcublasLt.so.13"),
-                root.join("nvidia/cublas/lib/libcublasLt.so.12"),
-                root.join("nvidia/cublas/lib/libcublasLt.so"),
-            ]
+            linux.first(),
+            Some(&root.join("nvidia/cu13/lib/x86_64/libcublasLt.so.13"))
+        );
+        assert!(linux.contains(&root.join("nvidia/cublas/lib/libcublasLt.so.13")));
+        assert!(linux.contains(&root.join("nvidia/cublas/lib/libcublasLt.so")));
+
+        let windows = wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Nvrtc);
+        // The exact file the current `nvidia-cuda-nvrtc` wheel installs.
+        assert!(windows.contains(&root.join("nvidia/cu13/bin/x86_64/nvrtc64_130_0.dll")));
+        // ...and the older layout is still reachable.
+        assert!(windows.contains(&root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll")));
+    }
+
+    #[test]
+    fn a_consolidated_wheel_library_directory_identifies_its_root() {
+        // `nvidia/cu13/bin/x86_64` is three levels below `nvidia`, one deeper
+        // than the per-component layout. Recovering the root from it is what
+        // lets a loader-path entry imply the wheel root.
+        let root = std::env::current_dir()
+            .expect("current directory should be available")
+            .join("site-packages");
+        assert_eq!(
+            wheel_root_of(&root.join("nvidia/cu13/bin/x86_64")),
+            Some(root.clone())
         );
         assert_eq!(
-            wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Nvrtc),
-            vec![
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_130_0.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_13.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc64_12.dll"),
-                root.join("nvidia/cuda_nvrtc/bin/nvrtc.dll"),
-            ]
+            wheel_root_of(&root.join("nvidia/cu13/lib/x64")),
+            Some(root.clone())
         );
+        // The bare consolidated directory, without the architecture level.
+        assert_eq!(wheel_root_of(&root.join("nvidia/cu13/bin")), Some(root));
     }
 
     #[test]
@@ -603,6 +709,14 @@ mod tests {
             "/opt/site-packages/nvidia/cublas",
             "/opt/site-packages/nvidia/cublas/lib64",
             "/opt/notnvidia/cublas/lib",
+            // A library directory sitting directly under `nvidia`, with no
+            // component level. This is what a plain system install looks like,
+            // and claiming it would make `/opt` a search root that nothing was
+            // ever installed to.
+            "/opt/nvidia/bin",
+            // An architecture level is allowed, but only one, and only beneath
+            // a real library directory.
+            "/opt/site-packages/nvidia/cu13/bin/x86_64/extra",
         ] {
             assert_eq!(
                 wheel_root_of(Path::new(entry)),

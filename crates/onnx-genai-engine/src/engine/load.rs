@@ -17,28 +17,23 @@ impl Engine {
     /// for a declared decode step only when that step is the package's *whole*
     /// graph, because it loads one model directory and holds one session.
     ///
+    /// It does not re-derive that shape. `contracted_single_decoder` is layer 2
+    /// of the one classification in `onnx-genai-metadata`: layer 1 (this
+    /// workflow executes exactly one ONNX graph and that graph's declared roles
+    /// make it a decoder) *plus* the contract naming the step. Asking the same
+    /// helper the metadata, CLI and server layers ask is what makes "the loader
+    /// routed a package the metadata layer does not call a single decoder"
+    /// unrepresentable rather than merely unobserved.
+    ///
     /// A package it cannot cover loses nothing: the same interpreter executes
     /// the same declared workflow, invoking each component from the artifact
     /// the package names. There is no second generation path either way — only
     /// a faster executor for one declared step, when that step is one this
     /// runtime registered an executor for.
     fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
-        let graph_components = workflow
-            .components
-            .iter()
-            .filter(|(_, component)| {
-                !matches!(
-                    component.implementation,
-                    onnx_genai_metadata::ComponentImplementation::Binding
-                )
-            })
-            .collect::<Vec<_>>();
-        let [(_, only)] = graph_components.as_slice() else {
-            return false;
-        };
-        only.contract.as_ref().is_some_and(|contract| {
-            contract.id == onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT
-        })
+        onnx_genai_metadata::classify_workflow(workflow)
+            .contracted_single_decoder()
+            .is_some()
     }
 
     /// The workflow a package declares, read from the package.
@@ -2996,6 +2991,170 @@ mod mtp_seed_tests {
         let io = io_with_hidden_output(None);
 
         assert!(decoder_io_seeded_with(&io, "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod decode_core_coverage_tests {
+    use super::*;
+
+    /// Every workflow this repository maintains, read from disk.
+    ///
+    /// The same corpus `decoder_recognizer_agreement.rs` walks, including the
+    /// crate-local fixture directories, so the loader is checked against every
+    /// package the metadata layer classifies rather than a subset of them.
+    fn maintained_workflows() -> Vec<(String, onnx_genai_metadata::WorkflowSpec)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut workflows = Vec::new();
+        collect(&root, &root, &mut workflows);
+        assert!(
+            workflows.len() > 50,
+            "the corpus walk found only {} workflows, so it is not walking the fixtures",
+            workflows.len()
+        );
+        workflows
+    }
+
+    fn collect(
+        directory: &Path,
+        root: &Path,
+        out: &mut Vec<(String, onnx_genai_metadata::WorkflowSpec)>,
+    ) {
+        const SKIPPED: &[&str] = &["target", ".git", ".github", "node_modules", "wiki"];
+
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !SKIPPED.contains(&name.as_str()) {
+                    collect(&path, root, out);
+                }
+                continue;
+            }
+            let recognized_extension = path.extension().is_some_and(|extension| {
+                matches!(
+                    extension.to_string_lossy().as_ref(),
+                    "yaml" | "yml" | "json"
+                )
+            });
+            let location = path.to_string_lossy().replace('\\', "/");
+            let maintained_fixture = name.starts_with("inference_metadata")
+                || location.contains("/tests/fixtures/")
+                || location.contains("/examples/inference_metadata/");
+            if !recognized_extension || !maintained_fixture {
+                continue;
+            }
+            if let Some(pipeline) = onnx_genai_metadata::load_metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.pipeline)
+            {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                out.push((relative.display().to_string(), pipeline.workflow));
+            }
+        }
+    }
+
+    /// The smallest complete single decoder: one ONNX graph, one runtime policy.
+    fn single_decoder_workflow() -> onnx_genai_metadata::WorkflowSpec {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml");
+        onnx_genai_metadata::load_metadata(&path)
+            .expect("the tiny-llm fixture must load")
+            .pipeline
+            .expect("the tiny-llm fixture declares a workflow")
+            .workflow
+    }
+
+    /// The loader never routes a package the metadata layer calls composite.
+    ///
+    /// The corpus sweep is the regression net over real packages; the two
+    /// adversarial shapes beneath it are what make this test load-bearing,
+    /// because no fixture has either shape.
+    ///
+    /// * *a decode contract with no roles* is the shape on which the loader's
+    ///   own previous scan disagreed with the metadata layer, so restoring that
+    ///   scan fails this assertion — verified by doing exactly that.
+    /// * *a binding wearing the decoder's roles* is the shape on which
+    ///   `origin/main`'s **pair** disagreed: the contract-only cover check said
+    ///   "the decode core has this" while role recognition, which counted
+    ///   bindings as candidates, called the package composite. It is carried
+    ///   here so the loader is exercised on it too;
+    ///   `decoder_recognizer_agreement.rs` pins the recognition half.
+    #[test]
+    fn nothing_the_decode_core_covers_is_composite_elsewhere() {
+        let mut corpus = maintained_workflows();
+
+        // A `binding` wearing the decoder's roles. The old recognizer counted
+        // every component as a decoder candidate, so two candidates made
+        // `sole_decoder_component` yield `None` and `is_single_decoder_workflow`
+        // therefore say "not a single decoder" — not because the graph count
+        // rose, but because the decoder had become ambiguous. The contract-only
+        // cover check meanwhile still said "the decode core has this".
+        let mut binding_decoy = single_decoder_workflow();
+        let decoder_roles = binding_decoy.components["decoder"].ports.roles.clone();
+        binding_decoy
+            .components
+            .get_mut("token_policy")
+            .expect("the fixture declares a token policy")
+            .ports
+            .roles = decoder_roles;
+        corpus.push((
+            "a token policy wearing the decoder's roles".into(),
+            binding_decoy,
+        ));
+
+        // A decode contract with no roles to drive it. The old cover check read
+        // only the contract id, so it handed this to an executor that resolves
+        // its ABI from the roles and would have found none.
+        let mut contract_without_roles = single_decoder_workflow();
+        contract_without_roles
+            .components
+            .get_mut("decoder")
+            .expect("the fixture declares a decoder")
+            .ports
+            .roles = std::collections::BTreeMap::new();
+        corpus.push((
+            "a decoder declaring the contract but no roles".into(),
+            contract_without_roles,
+        ));
+
+        for (name, workflow) in corpus {
+            if Engine::decode_core_covers(&workflow) {
+                assert!(
+                    onnx_genai_metadata::is_single_decoder_workflow(&workflow),
+                    "{name}: the loader chose the fused executor for a package the metadata, CLI \
+                     and server layers do not call a single decoder",
+                );
+            }
+        }
+    }
+
+    /// The loader declines a decode contract that has no roles behind it.
+    ///
+    /// Stated separately from the containment above because it is the stronger
+    /// claim: not merely that the two layers agree, but that this shape is
+    /// refused rather than routed to an executor with no ABI to drive it.
+    #[test]
+    fn the_loader_declines_a_decode_contract_with_no_roles() {
+        let mut workflow = single_decoder_workflow();
+        assert!(
+            Engine::decode_core_covers(&workflow),
+            "the unmodified fixture is exactly what the decode core covers",
+        );
+        workflow
+            .components
+            .get_mut("decoder")
+            .expect("the fixture declares a decoder")
+            .ports
+            .roles = std::collections::BTreeMap::new();
+        assert!(
+            !Engine::decode_core_covers(&workflow),
+            "a component naming the decode step without the roles that resolve its ABI must not \
+             be handed to the fused executor",
+        );
     }
 }
 

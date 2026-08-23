@@ -667,11 +667,11 @@ pub(crate) fn build_handle_with_authorities(
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
     // Every package declares a workflow, including a single decoder — so
-    // "declares a workflow" no longer distinguishes a composed pipeline. The
-    // shared role-structural recognizer answers "does this package need
-    // multimodal input specs". The engine's executor choice asks a different
-    // question — whether the sole graph component declares the decode contract
-    // — so these are related but not the same predicate.
+    // "declares a workflow" no longer distinguishes a composed pipeline. Layer
+    // 1 of the shared classification answers "does this package need multimodal
+    // input specs". The engine's executor choice reads layer 2 of the *same*
+    // classification — layer 1 plus the decode contract — so it can never
+    // route a package this call classifies as composed.
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
         .filter(|directory| {

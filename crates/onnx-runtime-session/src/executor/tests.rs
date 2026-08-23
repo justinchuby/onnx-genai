@@ -2986,6 +2986,557 @@ fn decomposed_concat_with_independent_sink_bias_is_capacity_safe() {
     );
 }
 
+/// Builds `decomposed_kv_growth_score_graph`'s K-role cone (`Add(score,
+/// mask)` -> `Softmax`) and extends it with a V-role: `Softmax` output ->
+/// `MatMul(probs, present_value)`, where `present_value` is a *second*,
+/// independent KV-cache-growth `Concat` (a distinct `past_value`/
+/// `current_value` pair from the K-role's `past_key`/`current_key`). Returns
+/// the graph, the mask, the K-role concat's `NodeId`, and the V-role concat's
+/// `NodeId`, so tests can assert exactly which node identities the eligibility
+/// scan reports.
+fn decomposed_kv_growth_score_and_value_graph() -> (Graph, ValueId, NodeId, NodeId) {
+    let (mut graph, mask, score) = decomposed_kv_growth_score_graph();
+    let key_concat_id = NodeId(0);
+
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+
+    let past_value = graph.create_named_value("past_value", DataType::Float32, static_shape([1]));
+    graph.add_input(past_value);
+    let current_value =
+        graph.create_named_value("current_value", DataType::Float32, static_shape([1]));
+    let present_value =
+        graph.create_named_value("present_value", DataType::Float32, static_shape([1]));
+    let value_concat_id = NodeId(4);
+    graph.insert_node(Node::new(
+        value_concat_id,
+        "Concat",
+        vec![Some(past_value), Some(current_value)],
+        vec![present_value],
+    ));
+    graph.add_output(present_value);
+
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(5),
+        "MatMul",
+        vec![Some(softmax), Some(present_value)],
+        vec![out],
+    ));
+    graph.add_output(out);
+
+    (graph, mask, key_concat_id, value_concat_id)
+}
+
+/// The S3 capacity-emission entry point: [`kv_capacity_write_eligible_concats`]
+/// must report BOTH the K-role concat (reached via the `Add` "score-role" rule
+/// already proven by #1838's mask-cone walk) and the V-role concat (reached
+/// via the new forward `Softmax` -> `MatMul` walk) for the same decomposed
+/// attention cone, not just one or the other.
+#[test]
+fn kv_capacity_eligible_concats_includes_both_score_and_value_role() {
+    let (graph, _mask, key_concat_id, value_concat_id) =
+        decomposed_kv_growth_score_and_value_graph();
+    let eligible = kv_capacity_write_eligible_concats(&graph);
+    assert!(
+        eligible.contains(&key_concat_id),
+        "the K-role (score) KV-cache-growth Concat must be eligible: {eligible:?}"
+    );
+    assert!(
+        eligible.contains(&value_concat_id),
+        "the V-role (value) KV-cache-growth Concat must be eligible: {eligible:?}"
+    );
+    assert_eq!(
+        eligible.len(),
+        2,
+        "exactly the two KV-cache-growth Concats in this cone should be eligible, got {eligible:?}"
+    );
+}
+
+/// Counterexample: a `MatMul` reachable from a proven-safe `Softmax` sink, but
+/// whose *other* operand does NOT derive from any KV-cache-growth `Concat`
+/// (e.g. a static weight/value with no producer at all). The value-role rule
+/// must not spuriously invent eligibility here — the eligible set stays
+/// exactly the K-role concat.
+#[test]
+fn kv_capacity_eligible_concats_excludes_matmul_with_foreign_value_operand() {
+    let (mut graph, _mask, score) = decomposed_kv_growth_score_graph();
+    let mask = graph
+        .inputs
+        .first()
+        .copied()
+        .expect("mask is graph input 0");
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    // A "V" operand with no KV-cache-growth provenance at all.
+    let foreign_value =
+        graph.create_named_value("foreign_value", DataType::Float32, static_shape([1]));
+    let out = graph.create_named_value("out", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(4),
+        "MatMul",
+        vec![Some(softmax), Some(foreign_value)],
+        vec![out],
+    ));
+    graph.add_output(out);
+
+    let eligible = kv_capacity_write_eligible_concats(&graph);
+    assert_eq!(
+        eligible,
+        std::iter::once(NodeId(0)).collect(),
+        "only the K-role concat should be eligible when the MatMul's other operand \
+         has no KV-cache-growth provenance: {eligible:?}"
+    );
+}
+
+/// A mask cone that fails the underlying capacity-safety proof entirely (the
+/// "external width" counterexample) must report zero eligible concats, even
+/// though a KV-cache-growth `Concat` exists in the graph: eligibility must
+/// never be granted independent of the proof it is a byproduct of.
+#[test]
+fn kv_capacity_eligible_concats_is_empty_when_mask_cone_is_rejected() {
+    let (mut graph, mask, _kv_growth_score) = decomposed_kv_growth_score_graph();
+    let foreign_score =
+        graph.create_named_value("foreign_score", DataType::Float32, static_shape([1]));
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(foreign_score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+
+    let eligible = kv_capacity_write_eligible_concats(&graph);
+    assert!(
+        eligible.is_empty(),
+        "a rejected mask cone must contribute zero eligible concats: {eligible:?}"
+    );
+}
+
+/// A minimal test-double `ExecutionProvider` for exercising
+/// [`rewrite_kv_capacity_appends`] in isolation: it wraps a real
+/// `CpuExecutionProvider` for everything (so `supports_op` still gives
+/// truthful answers for ordinary ops, `Graph::validate()`-adjacent behavior
+/// stays realistic, etc.), and overrides only the one decision this pass
+/// actually asks of an EP — whether `pkg.nxrt::KvCacheCapacityAppend` is
+/// supported — via a constructor flag. This directly models the real
+/// contract: CPU (accept = false) leaves every candidate Concat untouched;
+/// CUDA (accept = true) is the only EP that has ever registered the kernel.
+struct KvCapacityAppendTestEp {
+    cpu: CpuExecutionProvider,
+    accept_capacity_append: bool,
+}
+
+impl KvCapacityAppendTestEp {
+    fn new(accept_capacity_append: bool) -> Self {
+        let mut cpu = CpuExecutionProvider::new();
+        cpu.initialize(&EpConfig::default()).unwrap();
+        Self {
+            cpu,
+            accept_capacity_append,
+        }
+    }
+}
+
+impl ExecutionProvider for KvCapacityAppendTestEp {
+    fn name(&self) -> &str {
+        "kv_capacity_append_test_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        DeviceType::Cpu
+    }
+
+    fn device_id(&self) -> onnx_runtime_ir::DeviceId {
+        onnx_runtime_ir::DeviceId::cpu()
+    }
+
+    fn initialize(&mut self, _config: &EpConfig) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        if op.domain == "pkg.nxrt" && op.op_type == "KvCacheCapacityAppend" {
+            return if self.accept_capacity_append {
+                KernelMatch::Supported {
+                    cost: Cost::ZERO,
+                    required_input_layouts: None,
+                    output_layouts: vec![TensorLayout::contiguous(); op.outputs.len()],
+                }
+            } else {
+                KernelMatch::unsupported(
+                    "test EP does not register pkg.nxrt::KvCacheCapacityAppend",
+                )
+            };
+        }
+        self.cpu
+            .supports_op(op, opset, shapes, input_dtypes, layouts)
+    }
+
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> onnx_runtime_ep_api::Result<Box<dyn Kernel>> {
+        self.cpu.get_kernel(op, shapes, opset)
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> onnx_runtime_ep_api::Result<DeviceBuffer> {
+        self.cpu.allocate(size, alignment)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.deallocate(buffer)
+    }
+
+    fn copy(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> onnx_runtime_ep_api::Result<Fence> {
+        self.cpu.copy_async(src, dst, size)
+    }
+
+    fn sync(&self) -> onnx_runtime_ep_api::Result<()> {
+        self.cpu.sync()
+    }
+}
+
+/// Rewrites a KV-cache-growth `Concat` node's `past`/`current`/`present`
+/// operand shapes to a realistic rank-4 `[batch, heads, capacity/1,
+/// head_dim]` physical layout and stamps its mandatory `axis` attribute to
+/// `2` (the sequence axis) — the shape/axis precondition
+/// [`rewrite_kv_capacity_appends`] now requires before it will rewrite a
+/// candidate `Concat` (see that function's axis-normalization comment). The
+/// rest of the cone (`mask`/`score`/`softmax`/etc.) is deliberately left at
+/// its placeholder rank-1 `[1]` shape: the classifier's proof and the pass's
+/// other preconditions are purely topological and never inspect those
+/// shapes, so only the two values this new gate actually reads need to carry
+/// realistic ranks.
+fn shape_kv_growth_concat_as_rank4_axis2(graph: &mut Graph, concat_id: NodeId) {
+    let node = graph.node(concat_id);
+    let axis = 2;
+    let past = node.inputs[0].expect("KV-growth Concat must have a past operand");
+    let current = node.inputs[1].expect("KV-growth Concat must have a current operand");
+    let present = node.outputs[0];
+    graph.value_mut(past).shape = static_shape([1, 2, 4, 8]);
+    graph.value_mut(current).shape = static_shape([1, 2, 1, 8]);
+    graph.value_mut(present).shape = static_shape([1, 2, 4, 8]);
+    graph
+        .node_mut(concat_id)
+        .attributes
+        .insert("axis".into(), Attribute::Int(axis));
+}
+
+/// Adds a `position_ids` graph input to
+/// [`decomposed_kv_growth_score_and_value_graph`]'s cone — the load-bearing
+/// signal [`rewrite_kv_capacity_appends`] requires before it will even run
+/// the classifier — and shapes both KV-growth `Concat`s (see
+/// [`shape_kv_growth_concat_as_rank4_axis2`]) to satisfy the rewrite's
+/// rank-4/axis-2 precondition. Returns the same tuple plus the new value id.
+fn decomposed_kv_growth_cone_with_position_ids() -> (Graph, NodeId, NodeId, ValueId) {
+    let (mut graph, _mask, key_concat_id, value_concat_id) =
+        decomposed_kv_growth_score_and_value_graph();
+    shape_kv_growth_concat_as_rank4_axis2(&mut graph, key_concat_id);
+    shape_kv_growth_concat_as_rank4_axis2(&mut graph, value_concat_id);
+    let position_ids =
+        graph.create_named_value("position_ids", DataType::Int64, static_shape([1, 1]));
+    graph.add_input(position_ids);
+    (graph, key_concat_id, value_concat_id, position_ids)
+}
+
+/// The core positive case: given a cone with both a K-role and a V-role
+/// KV-cache-growth `Concat` (both proven eligible by the classifier), a
+/// `position_ids` input, and an EP that accepts the new op, both Concats must
+/// be rewritten in place into `pkg.nxrt::KvCacheCapacityAppend` — same
+/// `NodeId`, inputs `[past, current, position_ids]`, output unchanged — and
+/// the `pkg.nxrt` opset-import must be recorded.
+#[test]
+fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_the_op() {
+    let (mut graph, key_concat_id, value_concat_id, position_ids) =
+        decomposed_kv_growth_cone_with_position_ids();
+    let ep = KvCapacityAppendTestEp::new(true);
+
+    let rewritten = rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert!(rewritten, "an eligible cone with a supporting EP must fire");
+    for (id, expected_past_name, expected_current_name) in [
+        (key_concat_id, "past_key", "current_key"),
+        (value_concat_id, "past_value", "current_value"),
+    ] {
+        let node = graph.node(id);
+        assert_eq!(node.domain, "pkg.nxrt", "node {id:?} must be re-domained");
+        assert_eq!(
+            node.op_type, "KvCacheCapacityAppend",
+            "node {id:?} must be re-typed"
+        );
+        assert_eq!(node.inputs.len(), 3, "node {id:?} must gain position_ids");
+        let past = node.inputs[0].expect("past operand must survive");
+        let current = node.inputs[1].expect("current operand must survive");
+        assert_eq!(
+            graph.value(past).name.as_deref(),
+            Some(expected_past_name),
+            "node {id:?}'s past operand must be preserved exactly"
+        );
+        assert_eq!(
+            graph.value(current).name.as_deref(),
+            Some(expected_current_name),
+            "node {id:?}'s current operand must be preserved exactly"
+        );
+        assert_eq!(
+            node.inputs[2],
+            Some(position_ids),
+            "node {id:?}'s third input must be the graph's position_ids value"
+        );
+        assert_eq!(node.outputs.len(), 1);
+    }
+    assert_eq!(
+        graph.opset_imports.get("pkg.nxrt"),
+        Some(&1),
+        "the pkg.nxrt opset-import must be recorded once a rewrite fires"
+    );
+    assert!(
+        graph.validate().is_ok(),
+        "the rewritten graph must remain structurally valid: {:?}",
+        graph.validate().err()
+    );
+}
+
+/// The eligibility classifier proves the KV-growth `Concat`'s output
+/// *provenance* is safe — it never inspects which axis the concatenation
+/// grows on. A `Concat` that structurally matched but grows on an axis other
+/// than 2 (of a rank-4 `[batch, heads, seq, head_dim]` layout) is not one
+/// `pkg.nxrt::KvCacheCapacityAppend`'s kernel understands (it hardcodes axis
+/// 2), so the rewrite must decline it and leave the original, axis-generic
+/// `Concat` completely untouched — never silently write into the wrong
+/// physical dimension. Covers both an explicit non-2 axis and a negative
+/// axis that normalizes away from 2.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_concat_axis_is_not_the_sequence_axis() {
+    for wrong_axis in [1_i64, -1_i64] {
+        let (mut graph, key_concat_id, value_concat_id, _position_ids) =
+            decomposed_kv_growth_cone_with_position_ids();
+        graph
+            .node_mut(key_concat_id)
+            .attributes
+            .insert("axis".into(), Attribute::Int(wrong_axis));
+        let ep = KvCapacityAppendTestEp::new(true);
+
+        // The pass legitimately still fires overall (the unrelated,
+        // correctly-shaped value-role Concat below is rewritten), so this
+        // test asserts on the per-node outcome, not the pass's aggregate
+        // "did anything change" return value.
+        rewrite_kv_capacity_appends(&mut graph, &ep);
+
+        assert_eq!(
+            graph.node(key_concat_id).op_type,
+            "Concat",
+            "the wrong-axis Concat must remain untouched for axis={wrong_axis}"
+        );
+        // The unrelated, correctly-axis-2 value-role Concat in the same graph
+        // is unaffected by the key-role node's axis being wrong — this is a
+        // per-node structural gate, not an all-or-nothing graph veto.
+        assert_eq!(
+            graph.node(value_concat_id).op_type,
+            "KvCacheCapacityAppend",
+            "an unrelated correctly-shaped Concat must still be rewritten for axis={wrong_axis}"
+        );
+    }
+}
+
+/// The same axis precondition also declines a `Concat` whose `past`/`present`
+/// operands are not rank 4 at all (e.g. a rank-3 layout with no separate
+/// heads axis) — there is no well-defined "axis 2 of a 4-D physical layout"
+/// to even ask about, so the rewrite must leave it as a plain `Concat`
+/// regardless of what its `axis` attribute says.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_past_is_not_rank4() {
+    let (mut graph, key_concat_id, value_concat_id, _position_ids) =
+        decomposed_kv_growth_cone_with_position_ids();
+    let past = graph.node(key_concat_id).inputs[0].unwrap();
+    let present = graph.node(key_concat_id).outputs[0];
+    graph.value_mut(past).shape = static_shape([2, 4, 8]);
+    graph.value_mut(present).shape = static_shape([2, 4, 8]);
+    let ep = KvCapacityAppendTestEp::new(true);
+
+    // As above: the sibling value-role Concat is still rank-4/axis-2 and is
+    // legitimately rewritten, so only the per-node outcome is asserted.
+    rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert_eq!(
+        graph.node(key_concat_id).op_type,
+        "Concat",
+        "a rank-3 past operand must never be rewritten regardless of its axis attribute"
+    );
+    assert_eq!(
+        graph.node(value_concat_id).op_type,
+        "KvCacheCapacityAppend",
+        "an unrelated correctly rank-4 value-role Concat must still be rewritten"
+    );
+}
+
+/// The capability gate: the exact same eligible cone, but the EP does not
+/// support the new op (modeling every EP except CUDA today, e.g. CPU). Every
+/// candidate Concat must be left completely untouched, and no `pkg.nxrt`
+/// opset-import may be introduced — this is what makes the pass a
+/// capability-gated rewrite instead of a model/op allowlist that assumes the
+/// kernel always exists.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_ep_does_not_support_the_op() {
+    let (mut graph, key_concat_id, value_concat_id, _position_ids) =
+        decomposed_kv_growth_cone_with_position_ids();
+    let ep = KvCapacityAppendTestEp::new(false);
+
+    let rewritten = rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert!(
+        !rewritten,
+        "a non-supporting EP must leave the pass a no-op"
+    );
+    for id in [key_concat_id, value_concat_id] {
+        let node = graph.node(id);
+        assert!(
+            node.is_default_domain(),
+            "node {id:?} must remain default-domain when the EP has no kernel"
+        );
+        assert_eq!(
+            node.op_type, "Concat",
+            "node {id:?} must remain a plain Concat when the EP has no kernel"
+        );
+    }
+    assert!(
+        !graph.opset_imports.contains_key("pkg.nxrt"),
+        "no pkg.nxrt opset-import may be introduced when nothing was rewritten"
+    );
+}
+
+/// A supporting EP does not matter if the graph has no `position_ids` input
+/// at all (e.g. an encoder-style export, or any graph that never threads
+/// position ids): the rewrite has nothing to bind its third operand to, so it
+/// must bail before even consulting the classifier, leaving every Concat
+/// untouched.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_without_a_position_ids_input() {
+    let (mut graph, _mask, key_concat_id, value_concat_id) =
+        decomposed_kv_growth_score_and_value_graph();
+    assert!(
+        graph
+            .inputs
+            .iter()
+            .all(|&v| graph.value(v).name.as_deref() != Some("position_ids")),
+        "precondition: this graph must have no position_ids input"
+    );
+    let ep = KvCapacityAppendTestEp::new(true);
+
+    let rewritten = rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert!(
+        !rewritten,
+        "a graph with no position_ids input must never be rewritten, \
+         regardless of EP support"
+    );
+    for id in [key_concat_id, value_concat_id] {
+        assert_eq!(graph.node(id).op_type, "Concat");
+    }
+}
+
+/// A supporting EP and a present `position_ids` input do not matter if the
+/// classifier itself rejects the cone (the "external width" counterexample):
+/// eligibility must always flow through the classifier's own proof, never be
+/// granted merely because a `Concat` and `position_ids` happen to coexist in
+/// the graph.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_classifier_rejects_the_cone() {
+    let (mut graph, mask, _kv_growth_score) = decomposed_kv_growth_score_graph();
+    let foreign_score =
+        graph.create_named_value("foreign_score", DataType::Float32, static_shape([1]));
+    let add = graph.create_named_value("add", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(2),
+        "Add",
+        vec![Some(foreign_score), Some(mask)],
+        vec![add],
+    ));
+    let softmax = graph.create_named_value("softmax", DataType::Float32, static_shape([1]));
+    graph.insert_node(Node::new(
+        NodeId(3),
+        "Softmax",
+        vec![Some(add)],
+        vec![softmax],
+    ));
+    graph.add_output(softmax);
+    let position_ids = graph.create_named_value("position_ids", DataType::Int64, static_shape([1]));
+    graph.add_input(position_ids);
+    assert!(
+        kv_capacity_write_eligible_concats(&graph).is_empty(),
+        "precondition: the classifier must reject this cone"
+    );
+    let ep = KvCapacityAppendTestEp::new(true);
+
+    let rewritten = rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert!(
+        !rewritten,
+        "a classifier-rejected cone must never be rewritten, even with a \
+         supporting EP and a position_ids input present"
+    );
+    assert_eq!(graph.node(NodeId(0)).op_type, "Concat");
+}
+
 #[test]
 fn mask_builder_without_capacity_attention_is_rejected() {
     use onnx_runtime_ir::static_shape;
