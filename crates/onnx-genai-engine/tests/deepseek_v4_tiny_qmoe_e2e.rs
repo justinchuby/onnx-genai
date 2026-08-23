@@ -264,35 +264,50 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
 /// this was strictly a native-CUDA-decode-engine gap, not a fixture, export,
 /// or numerics bug.
 ///
-/// **CUDA-graph capture stays declined for this fixture, correctly and by a
-/// separate mechanism than the crash above.** Whole-step capture requires the
-/// persistent `past_key_values.*` **input** bindings to be pinned at physical
-/// capacity from the very first (empty) prefill step
+/// **CUDA-graph capture now fires for this fixture (S3 capacity emission),
+/// closing the gap the paragraph above used to describe.** Whole-step capture
+/// requires the persistent `past_key_values.*` **input** bindings to be
+/// pinned at physical capacity from the very first (empty) prefill step
 /// (`GraphCaptureDecision`'s `persistent_inputs_have_fixed_logical_shapes`
 /// predicate, `native_decode/cuda.rs`); that in turn requires every *direct*
 /// consumer of that input to be capacity-aware
 /// (`build.rs::binding_consumers_use_physical_capacity`,
-/// `geometry.rs::kernel_input_uses_physical_capacity`), which today only
-/// recognizes `Attention`/`GroupQueryAttention`/`pkg.nxrt::IndexShare` --
-/// kernels deliberately designed with an auxiliary total-length signal so a
-/// physical/padded cache extent never corrupts their arithmetic. A plain
-/// `Concat` (this fixture's cache-growth op) has no such duality: its kernel
-/// computes `output.shape[axis] = past.shape[axis] + current.shape[axis]`
-/// literally, so feeding it a physical-capacity past shape would silently
-/// reproduce a variant of the original crash (an ever-growing, wrong output
-/// length) rather than becoming capture-safe. Reaching `captures>0` for a
-/// `Concat`-based cache append therefore needs a genuinely different decode-
-/// time write mechanism (e.g. a fixed-slot copy/scatter op in place of
-/// `Concat`) -- a substantial new capability, not a classifier generalization
-/// -- matching the same conclusion `glm_tiny_qmoe_native_cuda_e2e.rs`'s
-/// `..._declines_capture` test already documents for GLM-5.2's own
-/// concat/logical form ("must remain eager before S3 capacity emission").
-/// Building that write mechanism is out of scope here (explicit user
-/// direction: extend the existing classifier, do not modify the Mobius
-/// exporter or invent a DeepSeek-specific path) and is the concrete follow-up
-/// tracked for whole-step capture on this fixture. This test instead asserts
-/// what the fix actually delivers: correct, eager, non-fallback CUDA decode
-/// that is token-identical to CPU.
+/// `geometry.rs::kernel_input_uses_physical_capacity`). A plain `Concat` (this
+/// fixture's original cache-growth op) never qualified: its kernel computes
+/// `output.shape[axis] = past.shape[axis] + current.shape[axis]` literally,
+/// so feeding it a physical-capacity past shape would silently reproduce a
+/// variant of the original crash (an ever-growing, wrong output length)
+/// rather than becoming capture-safe.
+///
+/// The fix is `rewrite_kv_capacity_appends`
+/// (`onnx-runtime-session/src/executor/build.rs`), invoked from `place_graph`
+/// right after EP-scoped passes run. It structurally identifies every
+/// KV-cache-growth `Concat` the existing #1838 mask-cone classifier already
+/// proves capacity-safe (`geometry::kv_capacity_write_eligible_concats` --
+/// unchanged from #1838, generalized there to cover both the K-role
+/// `Add(score, mask)` chain and a new forward V-role `Softmax` -> `MatMul`
+/// walk) and, only when the active EP's `supports_op` actually accepts the
+/// new op (a per-candidate capability gate, not a model/op-name allowlist),
+/// replaces it in place with `pkg.nxrt::KvCacheCapacityAppend`. That op's CUDA
+/// kernel (`onnx-runtime-ep-cuda/src/kernels/kv_cache_capacity_append.rs`)
+/// resolves the one legitimately step-varying quantity -- the destination
+/// row -- from `position_ids`'s *device memory contents* at execute time,
+/// instead of baking it into host-side launch parameters the way `Concat`'s
+/// grid-size-from-logical-length launch does; every other launch parameter
+/// stays frozen across replays, which is what makes the captured graph
+/// replay-safe as the logical length grows. `geometry.rs::kernel_input_uses_
+/// physical_capacity` was extended with a matching arm so the capture-
+/// eligibility predicate itself recognizes the rewritten op the same way it
+/// already recognized `Attention`/`GroupQueryAttention`/`pkg.nxrt::IndexShare`.
+/// No DeepSeek-specific branch exists anywhere in this path: CPU (which has
+/// no such kernel) leaves the `Concat` untouched and remains exactly as
+/// eager as before.
+///
+/// GLM-5.2's own concat/logical decode form
+/// (`glm_tiny_qmoe_native_cuda_e2e.rs`'s `..._declines_capture` test)
+/// benefits from the same generalized mechanism whenever its own decomposed
+/// cone satisfies the classifier; that test's capture expectation is tracked
+/// and updated independently, not assumed here.
 #[test]
 fn deepseek_v4_tiny_native_cuda_matches_cpu() -> anyhow::Result<()> {
     let Some(dir) = fixture_dir() else {
@@ -335,27 +350,32 @@ fn deepseek_v4_tiny_native_cuda_matches_cpu() -> anyhow::Result<()> {
     );
     assert_eq!(
         stats.graph.fallbacks, 0,
-        "eager decode on a capacity-ineligible fixture must not additionally suffer runtime \
-         capture-attempt fallbacks"
+        "S3 capacity emission must make whole-step capture succeed outright -- any \
+         runtime capture-attempt fallback here is a regression, not an expected cost"
     );
-    // Whole-step capture is not expected here -- see the doc comment above --
-    // but the reason must be exactly the known, pre-existing structural one
-    // (a `past_key_values.*` input consumed by a plain `Concat`), not some new
-    // regression the classifier fix introduced.
-    assert_eq!(
-        stats.graph.captures, 0,
-        "unexpected CUDA graph capture for a Concat-cache-growth fixture -- \
-         if a capacity-write mechanism now makes this fixture capture-eligible, \
-         update this assertion and the doc comment above deliberately"
+    // S3 capacity emission (`rewrite_kv_capacity_appends`) makes this fixture's
+    // decomposed KV-cache growth capture-eligible: see the doc comment above.
+    // A regression back to `captures == 0` would mean either the rewrite no
+    // longer fires (e.g. the CUDA EP stopped advertising
+    // `pkg.nxrt::KvCacheCapacityAppend` support) or the capture-eligibility
+    // predicate stopped recognizing the rewritten op.
+    assert!(
+        stats.graph.captures > 0,
+        "expected whole-step CUDA graph capture to succeed for this fixture now that \
+         S3 capacity emission rewrites its KV-cache-growth Concat into \
+         pkg.nxrt::KvCacheCapacityAppend, got captures={} decline_reason={:?}",
+        stats.graph.captures,
+        stats.graph.decline_reason
     );
     assert!(
-        stats
-            .graph
-            .decline_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("persistent_inputs_have_fixed_logical_shapes")),
-        "expected capture to be declined specifically by the persistent-input capacity \
-         predicate, got: {:?}",
+        stats.graph.replays > 0,
+        "a successful capture with more than one decode step must also replay, got \
+         replays={}",
+        stats.graph.replays
+    );
+    assert_eq!(
+        stats.graph.decline_reason, None,
+        "a successful capture must carry no decline reason, got: {:?}",
         stats.graph.decline_reason
     );
     Ok(())

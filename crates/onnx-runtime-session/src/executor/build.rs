@@ -53,6 +53,127 @@ pub(super) fn run_ep_scoped_passes(
     Ok(())
 }
 
+/// The S3 capacity-emission gate: rewrite every KV-cache-growth `Concat` the
+/// mask-cone classifier proves safe
+/// ([`geometry::kv_capacity_write_eligible_concats`]) into the
+/// CUDA-graph-capture-safe `pkg.nxrt::KvCacheCapacityAppend` op, so a
+/// decomposed-attention decode step becomes capture/replay-eligible instead of
+/// being permanently pinned to `captures == 0` — see that function's doc
+/// comment, and [`geometry::KV_CAPACITY_APPEND_OP`], for the full derivation
+/// of why a plain `Concat`'s own launch geometry cannot survive a captured
+/// replay while this op's can (it reads its one legitimately varying quantity,
+/// the destination row, from `position_ids`'s *device memory contents* at
+/// execute time instead of baking it into host launch parameters).
+///
+/// This is a **capability-gated structural rewrite, not a model allowlist**:
+/// every candidate is re-checked against `ep.supports_op` individually before
+/// it fires, so an EP that has not registered the op (every EP but CUDA
+/// today — the CPU EP, or a future EP that never adds the kernel) leaves the
+/// original growing `Concat` completely untouched, exactly as correct as it
+/// was before this pass existed. Nothing here inspects a model name, op
+/// count, or shape beyond what the classifier itself already requires.
+///
+/// Returns whether any rewrite fired, purely for the caller's bookkeeping (no
+/// caller currently branches on it, but it keeps this pass's contract
+/// explicit and testable in isolation).
+pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionProvider) -> bool {
+    // `position_ids` is the load-bearing per-step signal the new op's kernel
+    // reads at execute time; a graph with no such input (e.g. an encoder, or
+    // any export that never threads position ids to begin with) has nothing
+    // for the rewrite to bind, so bail before even running the classifier.
+    let Some(position_ids) = graph
+        .inputs
+        .iter()
+        .copied()
+        .find(|&value| graph.value(value).name.as_deref() == Some("position_ids"))
+    else {
+        return false;
+    };
+
+    let mut eligible: Vec<NodeId> = kv_capacity_write_eligible_concats(graph)
+        .into_iter()
+        .collect();
+    if eligible.is_empty() {
+        return false;
+    }
+    // Deterministic order: `HashSet` iteration order is not stable, and this
+    // pass's effect (which nodes end up rewritten) must not depend on hash
+    // seed noise.
+    eligible.sort_by_key(|id| id.0);
+
+    // The op's registered version (see `onnx-runtime-shape-inference`'s
+    // `custom_ops::kv_cache_capacity_append` registration and the CUDA kernel
+    // factory's `OpKey`). Queried as a literal rather than via
+    // `effective_opset`, since `pkg.nxrt` may not yet be a graph opset-import
+    // for a decomposed-attention export that uses no other `pkg.nxrt` op —
+    // exactly the case this rewrite exists to upgrade.
+    const KV_CAPACITY_APPEND_OPSET: u64 = 1;
+
+    let mut rewritten = false;
+    for node_id in eligible {
+        let node = graph.node(node_id);
+        // The classifier's `is_kv_cache_growth_concat` also matches an
+        // *already*-rewritten node (so the mask-cone walk keeps recognizing
+        // its own output across re-placement); skip those here; there is
+        // nothing left for this pass to do to them.
+        if !(node.is_default_domain() && node.op_type == "Concat") {
+            continue;
+        }
+        // A KV-growth append is always binary: `Concat(past, current)`. A
+        // node that structurally matched but is not exactly this shape is not
+        // one this rewrite understands; leave it as an ordinary Concat.
+        if node.inputs.len() != 2 {
+            continue;
+        }
+        let (Some(past), Some(current)) = (node.inputs[0], node.inputs[1]) else {
+            continue;
+        };
+        let present = node.outputs[0];
+
+        let mut candidate = Node::new(
+            node_id,
+            KV_CAPACITY_APPEND_OP,
+            vec![Some(past), Some(current), Some(position_ids)],
+            vec![present],
+        );
+        candidate.domain = KV_CAPACITY_APPEND_DOMAIN.to_string();
+
+        let shapes = [past, current, position_ids].map(|value| graph.value(value).shape.clone());
+        let dtypes = [past, current, position_ids].map(|value| graph.value(value).dtype);
+        let layouts = vec![TensorLayout::contiguous(); shapes.len()];
+        if !ep
+            .supports_op(
+                &candidate,
+                KV_CAPACITY_APPEND_OPSET,
+                &shapes,
+                &dtypes,
+                &layouts,
+            )
+            .is_supported()
+        {
+            // No kernel for this op on the current EP (e.g. CPU): leave the
+            // original Concat exactly as it was.
+            continue;
+        }
+
+        graph.replace_node(node_id, candidate);
+        graph
+            .opset_imports
+            .entry(KV_CAPACITY_APPEND_DOMAIN.to_string())
+            .or_insert(KV_CAPACITY_APPEND_OPSET);
+        rewritten = true;
+    }
+
+    if rewritten {
+        debug_assert!(
+            graph.validate().is_ok(),
+            "rewrite_kv_capacity_appends produced an invalid graph: {:?}",
+            graph.validate().err()
+        );
+    }
+    rewritten
+}
+
 pub(super) fn validate_if_branch_outputs(graph: &Graph, node: &Node) -> Result<()> {
     let Some(then_branch) = graph.subgraphs.get(&(node.id, "then_branch".to_string())) else {
         return Ok(());
@@ -1013,6 +1134,13 @@ impl Executor {
     /// Reassigns `graph` and `ep` in place and returns the fallback report (if
     /// any) for the executor to retain. Preserves the `session.node_placement`
     /// tracing span and every span argument.
+    ///
+    /// Also runs [`rewrite_kv_capacity_appends`] (the S3 capacity-emission
+    /// gate) between the EP-scoped optimizer passes and the CUDA-coverage
+    /// fallback check: it must see the *stabilized* post-EP-pass graph (any
+    /// CUDA-only fusion that could otherwise touch a KV-growth `Concat` has
+    /// already run), and its own output must be accounted for by the coverage
+    /// check that follows.
     fn place_graph(
         graph: &mut Graph,
         weights: &Arc<WeightStore>,
@@ -1042,6 +1170,7 @@ impl Executor {
         let ep_pass_nodes_before = graph.num_nodes();
         run_ep_scoped_passes(graph, weights, ep.as_ref())?;
         let ep_pass_nodes_after = graph.num_nodes();
+        rewrite_kv_capacity_appends(graph, ep.as_ref());
         let mut execution_provider_fallback_report = cuda_fallback_report(graph, ep.as_ref());
         let fallback_declines = execution_provider_fallback_report
             .as_ref()
