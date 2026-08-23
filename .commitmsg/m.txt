@@ -1,48 +1,68 @@
-test(pipeline): measure which executor an authored body selects
+perf(speculative): narrow and score where the tensors already are
 
-The convergence's central claim is that a package's declared body — not Rust
-inspecting the package — decides which loop algorithm runs. That claim was true
-after the previous commit and entirely unmeasured: every existing test asserts
-that tokens came out, and tokens would keep coming out if a `match` on package
-shape quietly came back.
+A chained proposal's per-token work is supposed to stay on the device that
+produced it. Whether it does was, until now, unmeasurable from inside the
+process — a reintroduced copy shows up months later as "it got slower",
+attributed to anything but the line responsible.
 
-So the interpreter now counts, inside its own node dispatch, how many nodes it
-routed to a registered executor per contract id. Three packages declaring three
-different bodies are driven through **one** entry point and the counters differ:
+**The measurement first.** `WorkflowRuntime` counts every device→host
+materialization it performs. The count lives in
+`materialize_workflow_value_copy`, which is the one place such a copy can
+happen, so a future caller is counted without having to remember to count
+itself. `chained_speculative_proposal_parity_native_cuda` reads it across a
+propose/verify/reject/rollback decode on an H200.
 
-* `tiny-llm` names `autoregressive-decode` and `token-policy`, and shows exactly
-  five of each for five tokens — one declared node per step, and nothing else.
-* the `decoder` fixture authors its sampler and termination predicate as ONNX
-  components, and shows **zero** contract executions. That negative is the more
-  interesting half: a non-zero count there would mean the runtime had supplied a
-  step the package shipped a graph for, which is precisely how a declared
-  document becomes decorative.
-* the `speculative` fixture authors a proposer, a verifier and grammar adapters,
-  and runs those.
+That measurement is what makes the rest of this honest. The count today is
+**16** for `speculative_decode(8, 4)`, and the assertion is a ratchet at that
+number rather than a zero, because 16 is what the remaining work costs and
+claiming otherwise would be a lie the tokens would not catch: a chain that
+staged everything on the host produces byte-identical output.
 
-What varies across the three is the *request* — a prompt for a package that
-takes one, declared tensors for a package whose inputs are tensors — never the
-method. `generate_with_pipeline_request` resolves a prompt-only request to the
-session-aware path, so a caller with a plain prompt still gets scheduler
-admission, prefix reuse and the fused decode executor rather than quietly giving
-up all three by having chosen the "pipeline" call.
+The two remaining sites are named in the assertion. Both are the *folded carry*:
+its seed, once per proposal, and the carry itself, once per draft token. Both
+exist because the fused proposer input is assembled on the host —
+`concat(embed(token), carry)` — so the carry has to come down to be
+concatenated and the whole fused input goes back up. Removing them needs the
+fused input built in device memory, which is a device-side scatter this seam
+does not have; faking it with a staging copy would satisfy the counter and
+change nothing.
 
-**Composite HTTP sessions.** `/v1/sessions` used to reject a package the
-interpreter drives, on the grounds that it owns no decode-core KV sequence. That
-conflated two things: a session is the conversation a client is having, and
-where the runtime keeps it is not something a client can act on. A client that
-opened a session against one package and got a 400 against another would have to
-know which kind it was talking to — the caller-side split this work removes. The
-new server case opens and closes one against an interpreted package.
+**What did move.**
 
-**Docs.** `WORKFLOW_RUNTIME_UNIFICATION.md` described two executors picked by
-`WorkflowShape` and a `canonical_workflow` guard on every decode entry point.
-Neither exists. It now states what landed, including why the missing-workflow
-state is unrepresentable rather than guarded, and points at the counter test as
-the thing that measures the selection claim.
+*Narrowing happens where the value is.* A borrowed proposer binding used to be
+copied to the host in full and then narrowed to one position, discarding every
+byte of the copy on the next line. `ResidentTensorOps::last_along_axis` narrows
+in place: on a device value whose sequence axis is outermost this is a pointer
+view via the new `Value::alias_with_offset`, and on an inner axis it refuses
+rather than staging — a strided device copy belongs to the provider that owns
+the stream.
 
-Verified: engine and server suites; the new selection cases; the shape-dispatch
-gate at zero; fmt; clippy `-D warnings`.
+*Argmax reads four bytes, not a vocabulary.* The per-draft-token argmax copied
+a `[1, 1, vocab]` row down to find one token id — ≈300 KiB at vocab 151936 in
+f16, per token. `device_argmax_rows` runs the same kernel the decode fast path
+already uses, directly on the ORT device pointer, with the same lowest-index
+tie-break and NaN handling as `Value::argmax_last_row` so no token changes.
+
+*The embedding table is read once.* A `[vocab, hidden]` initializer was read off
+disk on every `propose_chained`. A loaded package's artifact cannot change under
+it, so it is now cached for the runtime's life.
+
+**Fail-closed.** `tensor_ops_for` returns host ops for a host value and CUDA ops
+for a device one; a device value in a build with no device implementation is an
+error naming both remedies — select the host backend, or build with `ort-cuda` —
+never a quiet copy.
+
+`Value::alias_with_offset` takes an *element* offset rather than a byte offset,
+because a byte offset invites exactly one mistake — forgetting the dtype width —
+that a device pointer will not diagnose until a kernel reads garbage.
+
+Verified on H200: all 12 `native_workflow_parity` cases including both chained
+parity gates; 9 `gemma4_chained_workflow` cases; the alias-offset cases; engine
+and ort suites; fmt; clippy `-D warnings`.
+
+Note: `onnx-genai-ort`'s `selected_non_dense_candidate_fails_explicitly` fails
+identically on `origin/main@cb81745b0`, checked in a clean worktree. It is not
+from this branch.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

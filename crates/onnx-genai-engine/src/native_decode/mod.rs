@@ -1366,7 +1366,7 @@ impl NativeDecodeSession {
     }
 
     /// Generate through the engine's shared token loop, not a backend-local loop.
-    pub fn generate(
+    pub(crate) fn generate(
         &mut self,
         prompt_tokens: &[TokenId],
         options: &GenerateOptions,

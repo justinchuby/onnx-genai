@@ -525,6 +525,11 @@ impl WorkflowRuntime {
         if value.is_host_resident()? {
             return clone_value(value);
         }
+        // Every device→host copy this runtime performs goes through here, which
+        // is why the count lives here and not at the call sites: a new caller
+        // is counted without having to remember to count itself.
+        self.host_staging_count
+            .set(self.host_staging_count.get().saturating_add(1));
         let device_id = value.device_id()?;
         if let Some(island) = self
             .execution_islands

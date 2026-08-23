@@ -825,6 +825,32 @@ impl CudaSampler {
     }
 }
 
+/// Argmax rows of a device-resident logits buffer, without staging them on the
+/// host.
+///
+/// A caller holding a device tensor and wanting only the winning token id per
+/// row is asking for four bytes back, not a vocabulary. Copying the buffer down
+/// to argmax it on the host is the single largest per-token transfer in a
+/// speculative proposal (≈300 KiB at vocab 151936 in f16), and it is entirely
+/// avoidable: the same kernel the decode fast path already uses reads an ORT
+/// device pointer directly.
+///
+/// `ptr_addr` must be a device pointer on `device` — [`Value::data_ptr_addr`]
+/// of a value whose [`Value::is_host_resident`] is false. Ties resolve to the
+/// lowest index and NaN is ignored, matching [`Value::argmax_last_row`], so a
+/// caller can substitute one for the other without changing which token comes
+/// out.
+#[cfg(feature = "cuda")]
+pub fn device_argmax_rows(
+    device: usize,
+    dtype: DataType,
+    ptr_addr: usize,
+    rows: usize,
+    vocab: usize,
+) -> Result<Vec<u32>> {
+    CudaSampler::new(device)?.argmax_rows(dtype, ptr_addr, rows, vocab)
+}
+
 impl CudaSampler {
     /// Argmax each of `rows` contiguous `vocab`-element rows in the device buffer
     /// at `ptr_addr` (a device pointer, e.g. from

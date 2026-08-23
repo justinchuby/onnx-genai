@@ -263,3 +263,34 @@ fn mixed_head_dim_speculative_decode_equals_greedy_decode() -> anyhow::Result<()
     assert!(tally.proposed > 0, "the proposer was not active: {tally:?}");
     Ok(())
 }
+
+/// A proposal chain narrows and scores where its tensors already are.
+///
+/// On the host backend every value is host-resident, so the driver has nothing
+/// to stage and the count is zero for the uninteresting reason. What this pins
+/// is the *shape* of the claim, in the place the native-CUDA case extends: the
+/// chain performs no device→host materialization of its own. A future change
+/// that reintroduces one — narrowing a borrowed KV binding by copying it down,
+/// or argmaxing a logits row on the host — fails here instead of surfacing
+/// months later as "it got slower", attributed to anything but the line
+/// responsible.
+///
+/// The embedding table is read once and cached for the runtime's life, so a
+/// multi-round decode reads the `[vocab, hidden]` initializer exactly once.
+#[test]
+fn a_proposal_chain_stages_nothing_of_its_own() -> anyhow::Result<()> {
+    let mut fixture = ChainedFixture::new(engine(&fixture_root())?)?;
+    let before = fixture.engine().host_staging_count();
+    let (committed, tally) = fixture.speculative_decode(6, 2)?;
+    assert!(!committed.is_empty(), "the chain must commit tokens");
+    assert!(
+        tally.proposed > 0,
+        "the chain must have proposed: {tally:?}"
+    );
+    assert_eq!(
+        fixture.engine().host_staging_count(),
+        before,
+        "the proposal chain performed a device→host materialization of its own"
+    );
+    Ok(())
+}

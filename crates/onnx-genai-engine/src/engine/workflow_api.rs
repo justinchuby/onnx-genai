@@ -23,6 +23,17 @@ use crate::pipeline::{
 };
 
 impl Engine {
+    /// How many device→host materializations this runtime has performed.
+    ///
+    /// A proposal chain's per-token work is supposed to stay on the device that
+    /// produced it. That is not something a throughput number diagnoses — a
+    /// reintroduced copy surfaces months later as "it got slower", attributed
+    /// to anything but the line responsible — so it is counted and a test holds
+    /// it to zero.
+    pub fn host_staging_count(&self) -> u64 {
+        self.workflow.host_staging_count()
+    }
+
     /// How many nodes this runtime executed through each declared contract.
     ///
     /// Which algorithmic executor ran is decided by the contract a component

@@ -1335,17 +1335,52 @@ impl Value {
     /// The returned OrtValue has its own shape but points at the same underlying
     /// tensor data as `owner`. `owner` is kept alive by the alias backing.
     pub fn alias_with_shape(owner: Arc<Value>, shape: &[i64]) -> Result<Self> {
+        Self::alias_with_offset(owner, 0, shape)
+    }
+
+    /// Create a no-copy tensor view starting `element_offset` elements into
+    /// `owner`.
+    ///
+    /// The offset is in *elements*, not bytes, so a caller cannot accidentally
+    /// produce a misaligned view by forgetting the dtype width — the one class
+    /// of mistake a byte offset invites and that a device pointer will not
+    /// diagnose until a kernel reads garbage.
+    ///
+    /// The view is backed by `TensorBacking::Alias(owner)`, so the owner — and
+    /// with it any device allocation or IO binding it holds — outlives every
+    /// value derived from it. That is the same guarantee an output binding's
+    /// alias relies on, and it is what makes a device-resident slice safe to
+    /// hold across a step without copying it anywhere.
+    ///
+    /// Residency is preserved: this never moves bytes and never consults the
+    /// host, so a view of a device tensor is a device tensor. What it cannot do
+    /// is express a *strided* window — a slice along an inner axis is not a
+    /// contiguous range, and asking for one here would silently return the
+    /// wrong elements. Callers that need one must copy on whatever owns the
+    /// buffer.
+    pub fn alias_with_offset(
+        owner: Arc<Value>,
+        element_offset: usize,
+        shape: &[i64],
+    ) -> Result<Self> {
         validate_shape(shape, None)?;
         let alias_numel = shape.iter().try_fold(1usize, |acc, &dim| {
             acc.checked_mul(dim as usize).ok_or_else(|| {
                 OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
             })
         })?;
-        if alias_numel > owner.numel() {
+        let window_end = element_offset.checked_add(alias_numel).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "alias offset {element_offset} plus {alias_numel} elements overflows"
+            ))
+        })?;
+        if window_end > owner.numel() {
             return Err(OrtError::InvalidArgument(format!(
-                "alias shape {:?} has {} elements, larger than owner shape {:?} with {} elements",
+                "alias shape {:?} at element offset {} needs {} elements, past the end of owner \
+                 shape {:?} with {} elements",
                 shape,
-                alias_numel,
+                element_offset,
+                window_end,
                 owner.shape(),
                 owner.numel()
             )));
@@ -1360,7 +1395,10 @@ impl Value {
         let data = if alias_numel == 0 {
             dangling_aligned(owner.dtype)
         } else {
-            tensor_data_ptr(owner.ptr.as_ptr())?
+            let base = tensor_data_ptr(owner.ptr.as_ptr())?;
+            // Pointer arithmetic only; the bytes are never read here, so this is
+            // valid for a device address the host cannot dereference.
+            unsafe { base.byte_add(element_offset * owner.dtype.size_of()) }
         };
         let ptr = create_tensor_with_data_at(
             memory_info,
@@ -2780,5 +2818,59 @@ mod element_alignment_tests {
             Value::from_raw_bytes(Vec::new(), &[0, 8], DataType::Float16).expect("empty fp16");
         assert!(value.as_raw_bytes().expect("borrowed bytes").is_empty());
         assert!(value.to_raw_bytes().expect("copied bytes").is_empty());
+    }
+}
+
+#[cfg(test)]
+// A `Value` is deliberately neither Send nor Sync: an OrtValue belongs to
+// the thread that created it. `Arc` is nonetheless what the alias backing
+// takes, so these cases build one exactly the way the production path does.
+#[allow(clippy::arc_with_non_send_sync)]
+mod alias_offset_tests {
+    use super::*;
+
+    /// An offset alias sees the window it named, and nothing before it.
+    #[test]
+    fn an_offset_alias_reads_from_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(Arc::clone(&owner), 2, &[3]).unwrap();
+        assert_eq!(view.shape(), &[3]);
+        assert_eq!(view.to_vec_i64().unwrap(), vec![12, 13, 14]);
+    }
+
+    /// A zero offset is the prefix alias, so one implementation serves both.
+    #[test]
+    fn a_zero_offset_alias_is_the_prefix() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let prefix = Value::alias_with_shape(Arc::clone(&owner), &[2]).unwrap();
+        let offset = Value::alias_with_offset(owner, 0, &[2]).unwrap();
+        assert_eq!(prefix.to_vec_i64().unwrap(), offset.to_vec_i64().unwrap());
+    }
+
+    /// A window running past the owner is refused, naming both extents.
+    ///
+    /// Silently clamping would hand a kernel a shorter tensor than its contract
+    /// declares; reading past the end would hand it another allocation's bytes.
+    #[test]
+    fn a_window_past_the_end_is_refused() {
+        let owner = Arc::new(Value::from_slice_i64(&[1, 2, 3, 4], &[4]).unwrap());
+        let Err(error) = Value::alias_with_offset(owner, 3, &[2]) else {
+            panic!("a window past the end of the owner must be refused");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("past the end"),
+            "the refusal must say the window leaves the allocation: {message}"
+        );
+    }
+
+    /// The owner outlives every view derived from it.
+    #[test]
+    fn a_view_keeps_its_owner_alive() {
+        let view = {
+            let owner = Arc::new(Value::from_slice_i64(&[7, 8, 9], &[3]).unwrap());
+            Value::alias_with_offset(owner, 1, &[2]).unwrap()
+        };
+        assert_eq!(view.to_vec_i64().unwrap(), vec![8, 9]);
     }
 }

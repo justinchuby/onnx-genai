@@ -25,6 +25,7 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod audio;
+mod device_ops;
 pub(crate) mod generation;
 mod islands;
 #[cfg(feature = "native-backend")]
@@ -172,6 +173,21 @@ pub(crate) struct WorkflowRuntime {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    /// Device→host materializations this runtime performed.
+    ///
+    /// A proposal chain's whole point is that its per-token work stays on the
+    /// device that produced it, and "stays on the device" is not something a
+    /// throughput number diagnoses: a reintroduced copy shows up as a slower
+    /// run months later, attributed to anything but the line that caused it.
+    /// Counting the transfers makes it a property a test can hold.
+    host_staging_count: std::cell::Cell<u64>,
+    /// Embedding tables read out of a component's artifact, cached for the
+    /// runtime's life.
+    ///
+    /// Re-reading a `[vocab, hidden]` initializer off disk once per proposal is
+    /// pure waste — the file cannot change under a loaded package — and at real
+    /// vocabularies it is the dominant cost of starting a proposal.
+    embedding_tables: RefCell<HashMap<(String, String), std::rc::Rc<speculative::EmbeddingTable>>>,
     /// Nodes this runtime executed through a declared contract, by contract id.
     ///
     /// Selection of an algorithmic executor is supposed to come from what the
@@ -377,6 +393,8 @@ impl WorkflowRuntime {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            host_staging_count: std::cell::Cell::new(0),
+            embedding_tables: RefCell::new(HashMap::new()),
             contract_executions: RefCell::new(std::collections::BTreeMap::new()),
             adapter_service: None,
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
@@ -725,6 +743,8 @@ impl WorkflowRuntime {
                 workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
+                host_staging_count: std::cell::Cell::new(0),
+                embedding_tables: RefCell::new(HashMap::new()),
                 contract_executions: RefCell::new(std::collections::BTreeMap::new()),
                 adapter_service: directory.adapters,
                 adapter_cache: RefCell::new(adapters::AdapterCache::default()),
@@ -769,6 +789,11 @@ impl WorkflowRuntime {
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
         &self.workflow
+    }
+
+    /// How many device→host materializations this runtime has performed.
+    pub fn host_staging_count(&self) -> u64 {
+        self.host_staging_count.get()
     }
 
     /// How many nodes this runtime executed per declared contract.

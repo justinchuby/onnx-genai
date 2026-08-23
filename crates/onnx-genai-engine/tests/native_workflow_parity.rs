@@ -832,8 +832,39 @@ fn assert_chained_parity(
     // A full propose/verify/accept/reject/rollback decode, which is where the
     // folded carry, the borrowed read-only shared KV, and the declared rollback
     // state all have to agree.
+    //
+    // The staging count is read across the decode because *where* the work
+    // happens is as much a contract as what comes out of it. On a device
+    // backend a chain that narrowed a borrowed KV binding by copying it down,
+    // or argmaxed a logits row on the host, would produce byte-identical tokens
+    // and be invisible to every assertion above — which is exactly why the
+    // per-token transfers were there to begin with.
+    let native_staging_before = native.engine().host_staging_count();
     let (ort_tokens, ort_tally) = ort.speculative_decode(8, 4)?;
     let (native_tokens, native_tally) = native.speculative_decode(8, 4)?;
+    // A ratchet, not a zero, and the difference is the honest part.
+    //
+    // Two sites still cross the bus per proposal: the folded carry seed
+    // (`folded_carry_seed`, once per proposal) and the folded carry itself
+    // (`folded_carry_output`, once per draft token). Both exist because the
+    // fused proposer input is assembled on the host — `concat(embed(token),
+    // carry)` — so the carry has to come down to be concatenated and the whole
+    // fused input goes back up. Removing them needs the fused input to be
+    // built in device memory, which is a device-side scatter this seam does not
+    // yet have and which would be wrong to fake with a staging copy.
+    //
+    // What this number does is stop the count *growing*. The two sites are
+    // named, so a third one is a failing assertion rather than a slow run
+    // nobody attributes; and when the fused input moves onto the device this
+    // becomes zero and the assertion says so.
+    const KNOWN_FOLDED_CARRY_STAGING: u64 = 16;
+    let staged = native.engine().host_staging_count() - native_staging_before;
+    assert!(
+        staged <= KNOWN_FOLDED_CARRY_STAGING,
+        "the proposal chain performed {staged} device→host materializations, above the \
+         {KNOWN_FOLDED_CARRY_STAGING} the host-assembled fused input still requires; a new one \
+         has been introduced"
+    );
     assert_eq!(
         ort_tokens, native_tokens,
         "speculative decoding diverged between ORT and native"

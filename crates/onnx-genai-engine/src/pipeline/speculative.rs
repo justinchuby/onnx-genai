@@ -172,18 +172,24 @@ impl WorkflowRuntime {
                     plan.proposer
                 )
             })?;
-            let value = self.host_copy_of(value)?;
+            // Narrow first, and where the value already is. Copying the wide
+            // tensor down to keep one position of it was the largest transfer
+            // in this loop, and every byte of it was discarded on the next
+            // line.
             let narrowed = match position_symbol
                 .as_deref()
                 .and_then(|symbol| symbol_axis(declaration, port, symbol))
             {
-                Some(axis) => last_position_along(&value, axis).with_context(|| {
-                    format!(
-                        "failed to narrow chained proposer '{}' input '{port}' to one position",
-                        plan.proposer
-                    )
-                })?,
-                None => value,
+                Some(axis) => super::device_ops::tensor_ops_for(value)?
+                    .last_along_axis(value, axis)
+                    .with_context(|| {
+                        format!(
+                            "failed to narrow chained proposer '{}' input '{port}' to one \
+                             position",
+                            plan.proposer
+                        )
+                    })?,
+                None => self.host_copy_of(value)?,
             };
             fixed.push((port.clone(), narrowed));
         }
@@ -223,7 +229,7 @@ impl WorkflowRuntime {
             };
 
         let embedding = match plan.token_embedding {
-            Some((component, table)) => Some(self.embedding_table(component, table)?),
+            Some((component, table)) => Some(self.embedding_table_cached(component, table)?),
             None => None,
         };
 
@@ -277,7 +283,7 @@ impl WorkflowRuntime {
                 &fused_shape,
                 fused_width,
                 batch_rows,
-                embedding.as_ref(),
+                embedding.as_deref(),
                 last_token,
                 carry.as_deref(),
             )
@@ -319,7 +325,14 @@ impl WorkflowRuntime {
                     plan.proposer, plan.logits_output
                 )
             })?;
-            let drafted = i64::from(self.host_copy_of(&logits)?.argmax_last_row()?);
+            // Four bytes back, not a vocabulary: the winning id is all this
+            // step needs, and a device that produced the row can find it.
+            let drafted = i64::from(
+                *super::device_ops::tensor_ops_for(&logits)?
+                    .argmax_rows(&logits, 1)?
+                    .first()
+                    .context("device argmax returned no row")?,
+            );
 
             if let Some(value) = next_carry {
                 carry = Some(
@@ -552,6 +565,27 @@ impl WorkflowRuntime {
     /// The contract names both the component and the initializer, so this never
     /// guesses which weight is the embedding: a missing or non-2D initializer is
     /// an error naming the contract field that pointed at it.
+    /// The declared embedding table, read once and cached.
+    ///
+    /// A loaded package's artifact cannot change under it, so re-reading the
+    /// initializer per proposal buys nothing and costs a full `[vocab, hidden]`
+    /// read every time a chain starts.
+    pub fn embedding_table_cached(
+        &self,
+        component: &str,
+        table: &str,
+    ) -> anyhow::Result<std::rc::Rc<EmbeddingTable>> {
+        let key = (component.to_string(), table.to_string());
+        if let Some(cached) = self.embedding_tables.borrow().get(&key) {
+            return Ok(std::rc::Rc::clone(cached));
+        }
+        let loaded = std::rc::Rc::new(self.embedding_table(component, table)?);
+        self.embedding_tables
+            .borrow_mut()
+            .insert(key, std::rc::Rc::clone(&loaded));
+        Ok(loaded)
+    }
+
     pub fn embedding_table(&self, component: &str, table: &str) -> anyhow::Result<EmbeddingTable> {
         let path = self
             .models
@@ -869,7 +903,7 @@ fn symbol_axis(
 }
 
 /// Keep only the final index of `axis`, preserving rank.
-fn last_position_along(value: &Value, axis: usize) -> anyhow::Result<Value> {
+pub(crate) fn last_position_along(value: &Value, axis: usize) -> anyhow::Result<Value> {
     let shape = value.shape().to_vec();
     anyhow::ensure!(
         axis < shape.len(),
