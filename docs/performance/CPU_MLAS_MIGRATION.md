@@ -439,6 +439,20 @@ at 32 threads, and its 21% spread is wider than its 12% win. **Under the rule
 above that is not a graduation.** It is the strongest candidate on the board and
 the right next thing to re-measure properly. Everything else stays `keep-mlas`.
 
+**Before re-measuring that row, read #1827.** The explanation given above for
+why it does not hold at 32 threads — "the two routes do not scale alike" — is
+true but may be materially under-specified for this particular row. `m == 1`
+takes `sgemm_simd_m1`, whose strip decomposition carries a `.max(8)` floor that
+appears to cap it at `ceil(n / 256)` tasks *independently of pool width*: at
+`n = 2048` that is 8 tasks at both 6 and 32 threads, which would mean the wide
+arm added twenty-four spinning workers and no parallelism. If that holds, the
+wide number is not "native scaled worse", it is "native was capped while the
+pool spun", and this row is **better** than the table credits it for. That is
+derived from source and **not yet measured** — #1827 states the falsifiable
+prediction (native wall time flat from 8 threads upward at `n = 2048`, with the
+knee moving to `ceil(n / 256)` at other shapes). Settle it before spending a
+graduation argument on this row in either direction.
+
 **Softmax moved, and the MLAS column tells you how much of it was ours.** An
 earlier revision of this table recorded softmax at 5.17 ns/element and a ratio
 near 0.10 — "~9–10× off, the widest measured gap" — because the native route was
