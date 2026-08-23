@@ -71,8 +71,8 @@ pub use weight::{
     ResidencyPolicyInput, ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest,
     ResidentWeight, ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
     RoutedResidencyCoverage, RoutedResidencyGuardHandle, RoutedResidencyProof,
-    RoutedResidencyRequirement, WeightHandle, WeightHandleError, WholeBankReason,
-    WholeBankResidentPolicy, lazy_weight_candidates, plan_residency, plan_resize,
+    RoutedResidencyRequirement, StaticProfileResidencyPolicy, WeightHandle, WeightHandleError,
+    WholeBankReason, WholeBankResidentPolicy, lazy_weight_candidates, plan_residency, plan_resize,
     prove_routed_residency,
 };
 

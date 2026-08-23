@@ -3492,6 +3492,46 @@ impl CudaWeightResidency {
         }
     }
 
+    /// #1810 Slice 5 — Apply a [`ResidencyPlan`] at the model-load coarse
+    /// boundary, delegating to
+    /// [`crate::coarse_residency::apply_residency_plan_at_boundary`].
+    ///
+    /// This is a thin, byte-identical-when-disabled convenience wrapper: it
+    /// is off by default (gated by
+    /// [`crate::coarse_residency::COARSE_RESIDENCY_PROFILE_ENV`]) and, when
+    /// off, returns a no-op outcome without touching any allocator. When on,
+    /// every mutation goes through the Slice-4 transition primitive with
+    /// full safe-point / drain / rollback semantics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_coarse_residency_plan(
+        &self,
+        plan: &onnx_runtime_ep_api::ResidencyPlan,
+        catalogs: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            onnx_runtime_loader::WeightRegionCatalog,
+        >,
+        allocators: &std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator>,
+        >,
+        device_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        host_pool: &Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+    ) -> crate::coarse_residency::BoundaryApplicationOutcome {
+        crate::coarse_residency::apply_residency_plan_at_boundary(
+            &self.runtime,
+            self,
+            plan,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+        )
+    }
+
     /// Prove residency for a QMoE-family dispatch and mint a guard that keeps
     /// this residency's resize seam closed until the guard is dropped.
     ///
@@ -7920,6 +7960,7 @@ mod tests {
         };
         let catalog = onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout);
         let input = onnx_runtime_ep_api::ResidencyPolicyInput {
+            value_id: onnx_runtime_ir::ValueId(0),
             boundary: LazyWeightBoundary::QMoe,
             catalog: &catalog,
             budget_bytes: None,

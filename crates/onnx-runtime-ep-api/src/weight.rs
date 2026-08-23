@@ -580,6 +580,11 @@ impl ResidencyPlan {
 /// [`onnx_runtime_loader::WeightRegionCatalog`] (byte layout/pageability), and
 /// the caller-supplied budget/capability context.
 pub struct ResidencyPolicyInput<'a> {
+    /// The [`ValueId`] of the weight initializer this decision covers. Used
+    /// by profile-based policies (e.g. [`StaticProfileResidencyPolicy`]) to
+    /// look up the per-value hot-expert set. Policies that don't need it
+    /// (like [`WholeBankResidentPolicy`]) simply ignore it.
+    pub value_id: ValueId,
     pub boundary: LazyWeightBoundary,
     pub catalog: &'a onnx_runtime_loader::WeightRegionCatalog,
     /// Advisory device byte budget available for expert-bank residency, if
@@ -675,6 +680,72 @@ impl ResidencyPolicy for WholeBankResidentPolicy {
             }
         };
         ResidencyDecision::WholeBankResident { reason }
+    }
+}
+
+/// A [`ResidencyPolicy`] that consults a static offline profile: a
+/// `HashMap<ValueId, Vec<usize>>` mapping each value to its "hot" expert
+/// indices (the set to keep Device-resident). Values absent from the profile
+/// fall back to [`WholeBankResidentPolicy`] behavior — byte-for-byte
+/// unchanged from today's default.
+///
+/// The profile is pure data: no model-name inspection, no env-var allowlist,
+/// no runtime trace. All entries are validated at `decide()` time by the
+/// existing `plan_residency` validation layer; out-of-range or duplicate
+/// indices degrade to `WholeBankResident` there, never here.
+///
+/// This is the sole new production policy in Slice 5 of #1810.
+#[derive(Clone, Debug, Default)]
+pub struct StaticProfileResidencyPolicy {
+    /// Hot expert indices per value. An entry with an empty `Vec` is
+    /// treated identically to a missing entry
+    /// (→ `WholeBankResident`).
+    profile: std::collections::HashMap<ValueId, Vec<usize>>,
+}
+
+impl StaticProfileResidencyPolicy {
+    /// Build from an explicit profile map. Entries with empty expert lists
+    /// are silently dropped (equivalent to a missing entry).
+    pub fn new(profile: std::collections::HashMap<ValueId, Vec<usize>>) -> Self {
+        let profile = profile
+            .into_iter()
+            .filter(|(_, experts)| !experts.is_empty())
+            .collect();
+        Self { profile }
+    }
+
+    /// Add or replace the hot-expert set for one value. An empty list
+    /// removes any existing entry.
+    pub fn with_entry(mut self, value: ValueId, experts: Vec<usize>) -> Self {
+        if experts.is_empty() {
+            self.profile.remove(&value);
+        } else {
+            self.profile.insert(value, experts);
+        }
+        self
+    }
+
+    /// How many values have an explicit hot-expert profile.
+    pub fn profile_len(&self) -> usize {
+        self.profile.len()
+    }
+}
+
+impl ResidencyPolicy for StaticProfileResidencyPolicy {
+    fn name(&self) -> &'static str {
+        "static_profile"
+    }
+
+    fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+        match self.profile.get(&input.value_id) {
+            Some(experts) if !experts.is_empty() => {
+                let mut sorted = experts.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                ResidencyDecision::PerExpertCandidate { experts: sorted }
+            }
+            _ => WholeBankResidentPolicy.decide(input),
+        }
     }
 }
 
@@ -1045,6 +1116,7 @@ pub fn plan_residency<'a>(
     let mut decisions = std::collections::HashMap::new();
     for (value, boundary, catalog) in candidates {
         let input = ResidencyPolicyInput {
+            value_id: value,
             boundary,
             catalog,
             budget_bytes,
@@ -1674,5 +1746,85 @@ mod tests {
             ..Default::default()
         };
         assert!(point.is_safe());
+    }
+
+    // -- StaticProfileResidencyPolicy tests -------------------------------
+
+    #[test]
+    fn static_profile_policy_emits_per_expert_candidate_for_profiled_value() {
+        let catalog = pageable_catalog();
+        let mut profile = std::collections::HashMap::new();
+        profile.insert(value(7), vec![2, 0]);
+        let policy = StaticProfileResidencyPolicy::new(profile);
+        assert_eq!(policy.profile_len(), 1);
+        let plan = plan_residency(
+            [(value(7), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert_eq!(plan.policy_name(), "static_profile");
+        assert_eq!(
+            plan.decision(value(7)),
+            Some(&ResidencyDecision::PerExpertCandidate {
+                experts: vec![0, 2]
+            })
+        );
+    }
+
+    #[test]
+    fn static_profile_policy_missing_value_falls_back_to_whole_bank() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::new(std::collections::HashMap::new());
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert_eq!(
+            plan.decision(value(1)),
+            Some(&ResidencyDecision::WholeBankResident { reason: None })
+        );
+    }
+
+    #[test]
+    fn static_profile_policy_empty_entry_is_treated_as_missing() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::default()
+            .with_entry(value(3), vec![])
+            .with_entry(value(4), vec![1]);
+        assert_eq!(policy.profile_len(), 1);
+        let plan = plan_residency(
+            [
+                (value(3), LazyWeightBoundary::QMoe, &catalog),
+                (value(4), LazyWeightBoundary::QMoe, &catalog),
+            ],
+            &policy,
+            None,
+        );
+        assert!(matches!(
+            plan.decision(value(3)),
+            Some(&ResidencyDecision::WholeBankResident { .. })
+        ));
+        assert!(matches!(
+            plan.decision(value(4)),
+            Some(&ResidencyDecision::PerExpertCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn static_profile_policy_out_of_range_expert_degrades_via_validation() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::default().with_entry(value(9), vec![9999]);
+        let plan = plan_residency(
+            [(value(9), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert!(matches!(
+            plan.decision(value(9)),
+            Some(&ResidencyDecision::WholeBankResident {
+                reason: Some(ResidencyDegradationReason::RejectedByValidation(_))
+            })
+        ));
     }
 }
