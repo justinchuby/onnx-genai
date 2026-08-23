@@ -63,8 +63,8 @@ use onnx_genai_metadata::WorkflowStep;
 
 use crate::config::{FinishReason, GenerateOptions, GenerateResult, GenerateTokenCallback};
 use crate::decode_loop::{
-    DecodeLoopBackend, DecodeLoopState, finish_result, forward_step, reached_context_limit,
-    select_and_commit_step,
+    DecodeLoopBackend, DecodeLoopState, ForwardOutcome, finish_result, forward_step,
+    reached_context_limit, select_and_commit_step,
 };
 use crate::logits::ProcessorChain;
 use crate::processors::ensure_constrained_finish;
@@ -213,6 +213,110 @@ impl CanonicalBody {
 /// stop belongs to the loop, not the body, so a caller that owns the iteration
 /// checks it before calling in — [`run_canonical_decode`] does, and so does the
 /// prioritized drive.
+/// The runtime's implementation of the contracts a decoder workflow declares.
+///
+/// This is the executor the interpreter drives. It advances exactly one node per
+/// call — a decoder forward pass, or the token policy — and holds nothing about
+/// the *loop*: iteration bounds, carries, stop predicates and emits belong to
+/// whoever walks the body. That split is what lets the fused decode session,
+/// with its paged KV and device fast paths, be a step inside a workflow rather
+/// than a second loop beside one.
+///
+/// The logits produced by the decode node are held until the policy node
+/// consumes them, which is the only state that spans nodes within an iteration.
+/// A workflow that applies its policy before any decode is an authoring error
+/// and says so.
+pub(crate) struct DecodeNodeHost<'a, 'c, B: DecodeLoopBackend + ?Sized> {
+    pub(crate) backend: &'a mut B,
+    pub(crate) state: &'a mut DecodeLoopState,
+    pub(crate) options: &'a GenerateOptions,
+    pub(crate) chain: &'a ProcessorChain,
+    pub(crate) tokenizer: &'a Tokenizer,
+    pub(crate) callback: Option<&'a mut GenerateTokenCallback<'c>>,
+    /// Logits from this iteration's decode node, awaiting its policy node.
+    pending_forward: Option<ForwardOutcome>,
+    /// The stop the policy node reached, if any.
+    finish: Option<FinishReason>,
+}
+
+impl<'a, 'c, B: DecodeLoopBackend + ?Sized> DecodeNodeHost<'a, 'c, B> {
+    pub(crate) fn new(
+        backend: &'a mut B,
+        state: &'a mut DecodeLoopState,
+        options: &'a GenerateOptions,
+        chain: &'a ProcessorChain,
+        tokenizer: &'a Tokenizer,
+        callback: Option<&'a mut GenerateTokenCallback<'c>>,
+    ) -> Self {
+        Self {
+            backend,
+            state,
+            options,
+            chain,
+            tokenizer,
+            callback,
+            pending_forward: None,
+            finish: None,
+        }
+    }
+
+    /// Run one node named by its declared contract.
+    ///
+    /// Shared by the interpreter's node dispatch and by the body walker below,
+    /// so a decoder step means the same thing however the body is driven.
+    pub(crate) fn run_contract(&mut self, contract: &str) -> anyhow::Result<bool> {
+        match contract {
+            onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT => {
+                self.pending_forward = Some(forward_step(
+                    self.backend,
+                    self.state,
+                    self.options,
+                    self.chain,
+                )?);
+                Ok(true)
+            }
+            onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT => {
+                let forward = self.pending_forward.take().context(
+                    "the generation loop applied its token policy before any decoder forward \
+                     pass produced logits",
+                )?;
+                let (_token, reason) = select_and_commit_step(
+                    self.backend,
+                    self.state,
+                    self.options,
+                    self.chain,
+                    self.tokenizer,
+                    forward,
+                    self.callback.as_deref_mut(),
+                )?;
+                self.finish = reason;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The stop this iteration reached, if the policy node reached one.
+    pub(crate) fn take_finish(&mut self) -> Option<FinishReason> {
+        self.finish.take()
+    }
+}
+
+impl<B: DecodeLoopBackend + ?Sized> crate::pipeline::workflow::WorkflowNodeHost
+    for DecodeNodeHost<'_, '_, B>
+{
+    fn execute_contract_node(
+        &mut self,
+        request: crate::pipeline::workflow::WorkflowNodeRequest<'_>,
+    ) -> anyhow::Result<bool> {
+        self.run_contract(request.contract)
+    }
+}
+
+/// Run one iteration of the declared loop body.
+///
+/// Walks the body the workflow declares and hands each node to the executor
+/// above, so the body determines what runs and in what order.
 pub(crate) fn step_canonical_body<B: DecodeLoopBackend + ?Sized>(
     backend: &mut B,
     state: &mut DecodeLoopState,
@@ -220,42 +324,28 @@ pub(crate) fn step_canonical_body<B: DecodeLoopBackend + ?Sized>(
     options: &GenerateOptions,
     chain: &ProcessorChain,
     tokenizer: &Tokenizer,
-    mut callback: Option<&mut GenerateTokenCallback<'_>>,
+    callback: Option<&mut GenerateTokenCallback<'_>>,
 ) -> anyhow::Result<Option<FinishReason>> {
-    let mut forward = None;
-    let mut finish = None;
+    let mut host = DecodeNodeHost::new(backend, state, options, chain, tokenizer, callback);
     for step in &body.steps {
         match step {
             BodyStep::Decode => {
-                forward = Some(forward_step(backend, state, options, chain)?);
+                host.run_contract(
+                    onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
+                )?;
             }
             BodyStep::TokenPolicy => {
-                let forward = forward.take().context(
-                    "the canonical loop applied its token policy before any decoder forward pass \
-                     produced logits",
-                )?;
-                let (_token, reason) = select_and_commit_step(
-                    backend,
-                    state,
-                    options,
-                    chain,
-                    tokenizer,
-                    forward,
-                    callback.as_deref_mut(),
-                )?;
-                finish = reason;
+                let handled = host
+                    .run_contract(onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT)?;
+                debug_assert!(handled);
             }
             // The committed token stream is published by `finish_result` from
-            // the policy's own state, so the emit step names where it lands
-            // rather than moving bytes here.
-            // The emitted token stream is the `Vec<u32>` this loop returns and
-            // the callback it already fired; `resolve_body` has checked the
-            // step names the declared tokens output, so there is nothing
-            // further to route here.
+            // the policy's own state, and `resolve_body` has checked the step
+            // names the declared tokens output, so there is nothing to route.
             BodyStep::Emit { .. } => {}
         }
     }
-    Ok(finish)
+    Ok(host.take_finish())
 }
 
 /// Drive the canonical `Loop { decode; token_policy; emit }` to completion.

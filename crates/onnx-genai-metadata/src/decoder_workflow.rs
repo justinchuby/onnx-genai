@@ -405,7 +405,13 @@ pub fn decoder_workflow(
             outputs: std::mem::take(&mut builder.ports_out),
             roles: std::mem::take(&mut builder.roles),
         },
-        contract: None,
+        contract: Some(crate::schema::ComponentContract {
+            id: AUTOREGRESSIVE_DECODE_CONTRACT.to_string(),
+            version: CONTRACT_VERSION.to_string(),
+            equivalence: crate::schema::EquivalenceClass::default(),
+            bindings: BTreeMap::new(),
+            parameters: BTreeMap::new(),
+        }),
         application_overridable: false,
         effects: Vec::new(),
         row_scope: None,
@@ -924,6 +930,17 @@ const CONTRACT_VERSION: &str = "1.0";
 pub const POLICY_COMPONENT: &str = "token_policy";
 /// Contract identifying the runtime-implemented token policy.
 pub const TOKEN_POLICY_CONTRACT: &str = "onnx-genai.token-policy";
+/// Contract identifying one autoregressive decoder forward pass.
+///
+/// Declared *alongside* the component's ONNX artifact rather than instead of
+/// it: the package still says which graph this step runs, and the contract says
+/// what the step *is*. A runtime that has a fused session for this contract —
+/// one owning paged KV on device, capturing a CUDA graph, reusing a decode
+/// workspace — supplies it as the executor; a runtime without one invokes the
+/// artifact generically. Both run the same declared step, which is what lets
+/// the optimized path be a node inside a workflow rather than a second loop
+/// beside one.
+pub const AUTOREGRESSIVE_DECODE_CONTRACT: &str = "onnx-genai.autoregressive-decode";
 /// Policy port consuming the decoder's scores.
 const POLICY_LOGITS_PORT: &str = "logits";
 /// Policy port producing the selected token.

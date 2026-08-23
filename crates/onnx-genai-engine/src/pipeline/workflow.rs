@@ -5216,7 +5216,7 @@ mod node_host_tests {
         assert!(handled);
         assert_eq!(host.seen, vec!["token_policy".to_string()]);
         assert!(
-            values.get("out").is_some(),
+            values.contains_key("out"),
             "the host must define every output the invocation declares"
         );
     }

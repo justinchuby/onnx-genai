@@ -1,44 +1,38 @@
-feat(pipeline): a generic node-executor seam in the interpreter
+feat(engine): the decode step becomes a node executor, not a loop
 
-B2 checkpoint 1 of the workflow-runtime unification: the interpreter gains a
-seam for steps the runtime implements, so a fused decode session can become a
-*node executor the interpreter drives* rather than a second loop beside it.
+B2 checkpoint 2: the runtime's decode and token-policy steps are now a
+`WorkflowNodeHost` implementation, so the fused decode session is something an
+interpreter *drives* rather than something that drives itself.
 
-A workflow declares what happens at each step. Most steps are ONNX graphs the
-package ships; some are steps the runtime implements — an autoregressive decoder
-driven by a session that owns paged KV on device, or the token policy that
-scores logits and decides when generation ends. A package states those as
-`implementation: binding` with a contract id. Until now the interpreter answered
-a binding by copying same-named ports, which is fine for a pass-through and
-useless for a step with an implementation.
+`DecodeNodeHost` advances exactly one node per call — a decoder forward pass
+(with its device greedy/sampling fast paths and paged KV), or the token policy
+(processor chain, sampler, logprobs, KV commit, stop detection). It holds
+nothing about the loop. The only state spanning nodes within an iteration is the
+logits the decode node produced and the policy node consumes, and a workflow
+applying its policy before any decode says so rather than silently scoring
+nothing.
 
-`WorkflowNodeHost::execute_contract_node` is that implementation point. The
-interpreter still owns everything that makes it a *workflow*: `continue_when`,
-`max_iterations`, `carried`, `termination`, the emits, and the SSA environment.
-The host advances exactly one node. A host that owned the loop would be the
-second runtime this work exists to remove.
+`step_canonical_body` no longer contains the step logic; it walks the declared
+body and calls the executor. So there is one implementation of "what a decoder
+step is", reached today by the body walker and — once `Engine::generate*` moves
+across — by the interpreter's own node dispatch, through the same
+`execute_contract_node` seam checkpoint 1 added.
 
-**Fail-closed.** A binding declaring a contract that no host implements is now an
-error. Previously it fell through to the port copy, which would define the
-outputs with the wrong tensors and let a declared step silently not happen —
-indistinguishable from success at the API. Bindings without a contract keep the
-pass-through, which is what the existing workflow fixtures use.
+**The decoder now declares a contract.** `onnx-genai.autoregressive-decode` sits
+*alongside* the component's ONNX artifact rather than instead of it: the package
+still says which graph the step runs, and the contract says what the step *is*.
+A runtime holding a fused session for that contract supplies it as the executor;
+a runtime without one invokes the artifact generically. That is what lets the
+optimized path be a node inside a workflow instead of a second loop beside one —
+without the package having to know which runtime will execute it.
 
-The host is threaded as `Option<&mut dyn WorkflowNodeHost>` through
-`run_workflow_node`'s five recursion sites and reaches the interpreter through
-`execute_retained_with_host`; `execute_retained` passes `None`, so every
-existing caller is unchanged.
+An earlier draft of the body walker re-borrowed the token callback per node with
+a `transmute`. That was a lifetime workaround standing in for a design problem,
+so the host carries two lifetimes instead — one for the borrows it holds, one
+for the callback's own — and the transmute is gone.
 
-Two unit tests pin the seam: a host declining a contract it does not implement
-(so the interpreter can report it rather than silently doing nothing), and a
-host defining the declared outputs (so "the executor ran" is distinguishable
-from "the interpreter fell through to a port copy").
-
-`WorkflowNodeRequest` carries a scoped `dead_code` allowance: this checkpoint
-defines the seam and its dispatch, and the first non-test implementor is the
-autoregressive-decode host in the next commit. The allowance is on the struct
-alone so it cannot hide anything else, and it goes away with that commit.
-
-Verified: 73/73 engine targets; fmt; no new warnings.
+Verified: 73/73 engine targets; **all five real foundry models byte-identical to
+the pre-change baseline**, which is what shows the executor split changed no
+token on any real decoder; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
