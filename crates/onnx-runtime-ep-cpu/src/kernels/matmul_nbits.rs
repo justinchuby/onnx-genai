@@ -19669,6 +19669,11 @@ mod tests {
     /// Set on the realized-width child; its value is the requested width.
     const SPMD_WIDTH_CHILD_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_CHILD";
 
+    /// Set on a realized-width child to make it misreport its own placement.
+    /// See [`placement_is_honest`] and
+    /// [`a_pool_that_misreports_its_placement_is_caught_end_to_end`].
+    const PLACEMENT_DISHONEST_ENV: &str = "ONNX_GENAI_TEST_PLACEMENT_DISHONEST";
+
     /// Attempts allowed for the realized-width child before a
     /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
     const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
@@ -19688,6 +19693,200 @@ mod tests {
         /// `None` when the pool is unpinned or the topology is unreadable, so
         /// there is no placement claim to check.
         distinct_cores: Option<bool>,
+        /// Whether the placement the pool *reports* is the placement the OS
+        /// actually enforced, cross-checked against `/proc`. `None` when the
+        /// question is unanswerable (not Linux, partially pinned pool,
+        /// unreadable `/proc`). See [`placement_is_honest`].
+        placement_honest: Option<bool>,
+        /// Whether every worker carries an applied pin. Distinct from
+        /// `distinct_cores`, which answers `Some(false)` for a partially pinned
+        /// pool and so cannot say whether the `/proc` cross-check is even
+        /// answerable.
+        fully_pinned: bool,
+        /// Whether the child could read the affinities actually in force.
+        proc_readable: bool,
+    }
+
+    /// The placement the OS actually enforced, read from `/proc`, as one CPU
+    /// list per SPMD worker thread.
+    ///
+    /// Threads are matched by name, which is why this returns a *multiset* and
+    /// never a per-worker mapping: `/proc/<pid>/task/*/comm` truncates at 15
+    /// bytes and `onnx-genai-spmd` is exactly 15, so every worker of every pool
+    /// in the process is indistinguishable by name. Multiset equality is
+    /// nevertheless the whole property worth asserting here -- "these N CPUs
+    /// are the ones actually in force" -- and it does not require identity.
+    ///
+    /// A thread that exits between `read_dir` and the reads is skipped rather
+    /// than treated as an error; the caller catches any resulting shortfall by
+    /// requiring the counts to match.
+    #[cfg(target_os = "linux")]
+    fn observed_worker_affinities() -> Option<Vec<Vec<usize>>> {
+        let mut observed = Vec::new();
+        for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+                continue;
+            };
+            if !comm.trim_end().starts_with("onnx-genai-spmd") {
+                continue;
+            }
+            let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let list = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+            observed.push(onnx_runtime_hostmon::parse_cpu_list(list)?);
+        }
+        (!observed.is_empty()).then_some(observed)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn observed_worker_affinities() -> Option<Vec<Vec<usize>>> {
+        None
+    }
+
+    /// Does the pool's reported placement match the placement in force?
+    ///
+    /// This is the **policy-neutral** half of the placement contract, and the
+    /// only half that stays true across a policy change. It asserts nothing
+    /// about *where* workers should run -- spread, compact, one per core, two
+    /// per core are all equally acceptable to it. It asserts only that
+    /// `worker_cpus()`, which is what a benchmark row's placement label is
+    /// derived from, is not a claim the process failed to carry out.
+    ///
+    /// That is the exact defect behind #1792: a runtime that reports
+    /// `realized=16 as_requested` and then runs on eight cores is not making a
+    /// trade-off, it is wrong -- and it is wrong regardless of which placement
+    /// policy is the right default.
+    ///
+    /// `None` when unanswerable: a partially pinned pool has no single
+    /// placement claim to check (a free worker is schedulable anywhere,
+    /// including onto a pinned worker's CPU), and a non-Linux or unreadable
+    /// `/proc` cannot answer at all.
+    fn placement_is_honest(pool: &crate::decode_spmd::SpmdDecodePools) -> Option<bool> {
+        let mut reported = pool.worker_cpus().to_vec();
+        // Fault injection, test-only by construction (this whole module is
+        // `cfg(test)`). Without it the end-to-end honesty assertion can only
+        // ever be observed passing: a real pool on a healthy host is honest,
+        // there is no way to ask it to lie, and an assertion never seen to fail
+        // is an assertion nobody has shown is connected to anything. This makes
+        // the child claim a CPU it is not on, which is exactly the #1792 shape.
+        if std::env::var_os(PLACEMENT_DISHONEST_ENV).is_some()
+            && let Some(slot) = reported.iter_mut().flatten().next()
+        {
+            *slot = slot.wrapping_add(1);
+        }
+        placement_verdict(&reported, observed_worker_affinities())
+    }
+
+    /// The policy-neutral half of the placement contract, as a helper so the
+    /// sweep and the falsification test exercise the *same* assertion rather
+    /// than two similar-looking ones. A check the negative test does not go
+    /// through is a check the negative test does not cover.
+    fn assert_placement_is_honest(report: &RealizedWidth) {
+        if let Some(honest) = report.placement_honest {
+            assert!(
+                honest,
+                "requested width {} built a pool whose reported worker CPUs are not the CPUs \
+                 the kernel actually enforced, so any placement label derived from \
+                 `worker_cpus()` is a claim the process did not carry out ({report:?})",
+                report.requested
+            );
+        }
+    }
+    ///
+    /// Split out from the `/proc` read so the decision itself is testable
+    /// against synthetic inputs. The interesting cases -- a pin the kernel did
+    /// not apply, a reported CPU that is not the one in force -- cannot be
+    /// produced on demand by building a real pool, so a predicate that could
+    /// only ever be exercised through one would be a predicate nothing proves
+    /// can return `false`.
+    ///
+    /// `reported` is `worker_cpus()`: one slot per worker, `None` if unpinned.
+    /// `observed` is one CPU list per worker thread, in arbitrary order.
+    fn placement_verdict(
+        reported: &[Option<usize>],
+        observed: Option<Vec<Vec<usize>>>,
+    ) -> Option<bool> {
+        let mut reported: Vec<usize> = {
+            let pinned: Vec<usize> = reported.iter().flatten().copied().collect();
+            if pinned.len() != reported.len() || pinned.is_empty() {
+                return None;
+            }
+            pinned
+        };
+        let observed = observed?;
+        if observed.len() != reported.len() {
+            return None;
+        }
+        // A pinned thread is confined to exactly one CPU. Anything wider is a
+        // pin the kernel did not apply, which is precisely the dishonesty this
+        // predicate exists to catch -- so it is `Some(false)`, not `None`.
+        let mut actual = Vec::with_capacity(observed.len());
+        for list in observed {
+            match list.as_slice() {
+                [cpu] => actual.push(*cpu),
+                _ => return Some(false),
+            }
+        }
+        actual.sort_unstable();
+        reported.sort_unstable();
+        Some(actual == reported)
+    }
+
+    #[test]
+    fn placement_verdict_accepts_only_the_placement_actually_in_force() {
+        let pinned = [Some(2), Some(3)];
+
+        // Agreement, including when `/proc` enumerates threads in another
+        // order -- there is no thread-to-worker identity to preserve, because
+        // `comm` truncation makes the workers indistinguishable by name.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![3]])),
+            Some(true)
+        );
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![3], vec![2]])),
+            Some(true)
+        );
+
+        // The #1792 shape: the pool reports CPUs it is not on.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![4]])),
+            Some(false)
+        );
+
+        // A pin that was reported but never applied: the thread is still free
+        // to run anywhere. `Some(false)`, not `None` -- the claim exists and is
+        // untrue.
+        assert_eq!(
+            placement_verdict(&pinned, Some(vec![vec![2], vec![0, 1, 2, 3]])),
+            Some(false)
+        );
+
+        // Unanswerable, and must not be scored: a partially pinned pool has no
+        // single claim (a free worker may sit on a pinned worker's CPU), a
+        // wholly unpinned pool makes no claim at all, and a thread count that
+        // does not line up means the read raced the pool.
+        assert_eq!(
+            placement_verdict(&[Some(2), None], Some(vec![vec![2], vec![3]])),
+            None
+        );
+        // The same case with the counts contrived to line up *after* the
+        // unpinned slot is dropped. Without this, discarding `None` slots and
+        // scoring the pinned subset is indistinguishable from rejecting the
+        // pool, because the length check masks it -- and the subset verdict is
+        // the dangerous one: it would let a pool with an entirely unplaced
+        // worker report an honest placement.
+        assert_eq!(
+            placement_verdict(&[Some(2), None], Some(vec![vec![2]])),
+            None
+        );
+        assert_eq!(placement_verdict(&[None, None], Some(vec![vec![2]])), None);
+        assert_eq!(placement_verdict(&[], Some(vec![])), None);
+        assert_eq!(placement_verdict(&pinned, Some(vec![vec![2]])), None);
+        assert_eq!(placement_verdict(&pinned, None), None);
     }
 
     /// Report the pool this process actually built. The width has to be
@@ -19708,29 +19907,55 @@ mod tests {
             crate::decode_affinity::allowed_cpus()
                 .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
         });
-        let (pool_built, workers, nodes, placement) = match crate::decode_spmd::pools() {
-            Some(pool) => (
-                true,
-                pool.total_workers(),
-                pool.node_count(),
-                pool.placement_is_one_worker_per_physical_core(),
-            ),
-            None => (false, 0, 0, None),
+        let (pool_built, workers, nodes, placement, honest, fully_pinned) =
+            match crate::decode_spmd::pools() {
+                Some(pool) => {
+                    // Reported separately from `placement`, because
+                    // `placement_is_one_worker_per_physical_core` answers
+                    // `Some(false)` for a *partially* pinned pool and so cannot
+                    // distinguish "every worker pinned, sharing cores" from
+                    // "some worker's pin failed". Only the latter makes the
+                    // `/proc` cross-check unanswerable, and the sweep's
+                    // anti-vacuity guard has to key off exactly that.
+                    let cpus = pool.worker_cpus();
+                    let fully_pinned = !cpus.is_empty() && cpus.iter().all(Option::is_some);
+                    (
+                        true,
+                        pool.total_workers(),
+                        pool.node_count(),
+                        pool.placement_is_one_worker_per_physical_core(),
+                        placement_is_honest(pool),
+                        fully_pinned,
+                    )
+                }
+                None => (false, 0, 0, None, None, false),
+            };
+        // Whether `/proc` answered at all, so that an unreadable `/proc` reads
+        // as "unanswerable" rather than as a pool that failed to pin.
+        let proc_ok = observed_worker_affinities().is_some();
+        let tri = |value: Option<bool>| match value {
+            Some(true) => "1",
+            Some(false) => "0",
+            None => "na",
         };
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
-             nodes={nodes} workers={workers} pool={} cores={cores} placement={}",
+             nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
+             pinned={} proc={}",
             available_parallelism(),
             u8::from(pool_built),
-            match placement {
-                Some(true) => "1",
-                Some(false) => "0",
-                None => "na",
-            }
+            tri(placement),
+            tri(honest),
+            u8::from(fully_pinned),
+            u8::from(proc_ok)
         );
     }
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
+        realized_width_report_with(requested, false)
+    }
+
+    fn realized_width_report_with(requested: usize, dishonest: bool) -> RealizedWidth {
         let width = requested.to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -19753,6 +19978,14 @@ mod tests {
             // same way this spawn refuses to inherit an affinity override.
             .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
             .env_remove(SPMD_PARITY_CHILD_ENV);
+        // Never inherited: the sweep's honesty assertion would be meaningless
+        // if an ambient value could switch the injection on, and unfalsifiable
+        // if one could switch it off.
+        if dishonest {
+            command.env(PLACEMENT_DISHONEST_ENV, "1");
+        } else {
+            command.env_remove(PLACEMENT_DISHONEST_ENV);
+        }
 
         // Bounded retry scoped to *exactly* the known environmental crash
         // signature, for the same reason `run_affinity_defer_child` carries one:
@@ -19815,6 +20048,14 @@ mod tests {
                 .parse()
                 .unwrap_or_else(|_| panic!("`{key}` is not a decimal count: {report}"))
         };
+        let tri = |key: &str| -> Option<bool> {
+            match text(key) {
+                "1" => Some(true),
+                "0" => Some(false),
+                "na" => None,
+                other => panic!("`{key}` is not 1/0/na: {other}"),
+            }
+        };
         RealizedWidth {
             requested: field("requested"),
             available: field("available"),
@@ -19823,12 +20064,10 @@ mod tests {
             workers: field("workers"),
             pool_built: field("pool") == 1,
             cores: field("cores"),
-            distinct_cores: match text("placement") {
-                "1" => Some(true),
-                "0" => Some(false),
-                "na" => None,
-                other => panic!("`placement` is not 1/0/na: {other}"),
-            },
+            distinct_cores: tri("placement"),
+            placement_honest: tri("honest"),
+            fully_pinned: field("pinned") == 1,
+            proc_readable: field("proc") == 1,
         }
     }
 
@@ -19857,6 +20096,78 @@ mod tests {
     /// case is the *common* one in production, because
     /// `bound_process_to_decode_budget` confines the process to exactly the
     /// budgeted CPUs at EP init.
+    /// A placement label the pool cannot back up must be *detected*, not just
+    /// computed.
+    ///
+    /// `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+    /// asserts `honest`, but on a healthy host every pool is honest, so that
+    /// assertion is only ever observed passing and nothing shows it is wired to
+    /// anything. This drives one child with the reported placement deliberately
+    /// perturbed by a single CPU -- the minimum possible lie, and exactly the
+    /// #1792 shape of "reports one placement, runs another" -- and requires the
+    /// verdict to come back false.
+    ///
+    /// Linux-only because the cross-check reads `/proc`; elsewhere the verdict
+    /// is `None` by design and there is nothing to falsify.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_pool_that_misreports_its_placement_is_caught_end_to_end() {
+        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        if allowed < 2 || crate::core_topology::host().is_none() {
+            return;
+        }
+        let honest = realized_width_report_with(2, false);
+        let lying = realized_width_report_with(2, true);
+
+        // A pool that did not fully pin cannot be cross-checked at all, so the
+        // experiment below has no signal to read either way. Skip on the *host
+        // fact* rather than on the verdict: keying this off
+        // `placement_honest.is_none()` would let any defect that suppresses
+        // verdicts silence this test instead of failing it, which is the exact
+        // vacuity the sweep's guard exists to prevent. `fully_pinned` is
+        // reported independently of the verdict, so a suppressed verdict here
+        // is still a failure.
+        assert!(
+            honest.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
+            "this process can read `/proc/self/task` but the control child could not, so \
+             the cross-check is not running at all ({honest:?})"
+        );
+        if !honest.fully_pinned {
+            return;
+        }
+
+        // The control: the same width, same host, same code path, injection
+        // off. If this is not `Some(true)` the comparison below proves nothing,
+        // because a verdict that is never true cannot show that a false one
+        // means anything.
+        assert_eq!(
+            honest.placement_honest,
+            Some(true),
+            "the un-injected control did not produce an honest verdict, so the injected \
+             arm below is not a comparison ({honest:?})"
+        );
+        assert_eq!(
+            lying.placement_honest,
+            Some(false),
+            "a pool reporting a CPU it is not pinned to was not detected, so the honesty \
+             cross-check cannot see the defect it exists for ({lying:?})"
+        );
+
+        // And the assertion the sweep actually runs must reject it. Going
+        // through the same helper is the point: verifying the verdict alone
+        // would leave the sweep's own guard untested, which is how a check ends
+        // up computing the right answer and then not acting on it.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let rejected = std::panic::catch_unwind(|| assert_placement_is_honest(&lying)).is_err();
+        std::panic::set_hook(previous);
+        assert!(
+            rejected,
+            "the sweep's placement-honesty assertion accepted a pool that misreports its \
+             own placement ({lying:?})"
+        );
+    }
+
     #[test]
     fn every_benchmarked_decode_width_realizes_the_worker_count_it_requests() {
         // The published widths alone leave the interesting hole unprobed: on a
@@ -19915,21 +20226,122 @@ mod tests {
 
             saw_full_subscription |= report.allowed >= 2 && effective >= report.allowed;
 
-            // The placement half of the same label. A `t=N` row claims N
-            // workers ran; it also implicitly claims they ran on N cores.
-            // #1729 is what the second half costs: the default pool put 16
-            // workers on 8 physical cores -- two per front end -- while
-            // reporting `realized=16 as_requested`, and the count was never the
-            // thing that was wrong. Only assert it where one-per-core is
-            // achievable: past the core budget the workers must double up, and
-            // demanding otherwise would fail the host, not the code.
+            // The placement half of the same label, in two parts that must not
+            // be confused with each other.
+            //
+            // (1) POLICY-NEUTRAL, always required: the placement the pool
+            // reports must be the placement actually in force. This is the
+            // #1792 defect -- the only user-facing placement control was inert,
+            // and a runtime that reports `realized=16 as_requested` while
+            // running somewhere else is wrong under *every* policy. Nothing
+            // here says where workers ought to run.
+            assert_placement_is_honest(&report);
+
+            // Anti-vacuity, per width rather than per sweep.
+            // `assert_placement_is_honest` is a no-op on `None`, so a verdict
+            // that stops being produced turns the check above into decoration
+            // that still passes.
+            //
+            // The condition is `fully_pinned && proc_readable`, reported by the
+            // child, and deliberately *not* `distinct_cores.is_some()`. An
+            // earlier version used the latter and was wrong:
+            // `placement_is_one_worker_per_physical_core` answers `Some(false)`
+            // for a partially pinned pool, while `placement_verdict` answers
+            // `None` for that same pool, so a single failed
+            // `sched_setaffinity` -- a CPU offlined or dropped from the cpuset
+            // between assignment and pin -- would have tripped this assertion
+            // on a legitimately configured host. A false failure here is worse
+            // than a missed detection, because the cheap way out of it is to
+            // weaken the guard back into decoration.
+            //
+            // `None` remains the correct answer for an unpinned or partially
+            // pinned pool, and demanding a verdict there would assert a pinning
+            // policy this half of the test is specifically not allowed to
+            // assert.
+            //
+            // An earlier version also accumulated `saw_honesty_check |= ...`
+            // across the sweep and asserted it once at the end. The mutation
+            // battery showed that guard was never load-bearing: its
+            // precondition was identical to the skip condition of
+            // `a_pool_that_misreports_its_placement_is_caught_end_to_end`,
+            // whose control arm already asserts `Some(true)` at width 2 -- a
+            // strictly stronger claim -- and one width contributing satisfied
+            // it for all five. The per-width form catches what neither did:
+            // verdicts disappearing for widths 4/8/16 while width 2 keeps
+            // working.
+            // Asserting `/proc` readability rather than skipping on it is what
+            // keeps "the cross-check was disabled outright" a failure instead
+            // of a silent skip -- an earlier version tolerated it and the
+            // mutation battery immediately showed P4 escaping through it.
+            //
+            // The escape hatch is the *parent's own* read, not a tolerated
+            // `false`: `hidepid` restricts other processes' entries and never
+            // your own, so the one host that legitimately cannot answer is one
+            // with no `/proc` mounted at all (minimal container, chroot,
+            // initramfs) -- and there this process cannot read it either.
+            // Checking it here rather than trusting the child's flag is the
+            // point: the parent's read is independent of whatever the child's
+            // cross-check does, so a broken cross-check on a normal host still
+            // fails.
+            #[cfg(target_os = "linux")]
+            assert!(
+                report.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
+                "width {requested}: this process can read `/proc/self/task` but the child \
+                 could not, so the failure is in the cross-check rather than the host -- \
+                 the placement cross-check is not running ({report:?})"
+            );
+
+            #[cfg(target_os = "linux")]
+            assert!(
+                !(report.fully_pinned && report.proc_readable) || report.placement_honest.is_some(),
+                "width {requested}: every worker is pinned and `/proc` is readable, so the \
+                 cross-check was answerable, yet no honesty verdict came back -- \
+                 `worker_cpus()` went unverified at this width and the #1792 class is \
+                 unguarded here ({report:?})"
+            );
+
+            // The other direction, so the guard above cannot be silenced by
+            // misreporting the host fact it keys off: a verdict is only
+            // producible from a fully pinned pool, so one that exists while
+            // `pinned=0` means the two disagree and one of them is lying.
+            assert!(
+                report.placement_honest.is_none() || (report.fully_pinned && report.proc_readable),
+                "width {requested}: a placement verdict was produced while the child \
+                 reports it could not have produced one (pinned={}, proc={}), so the \
+                 honesty check and the host facts its guard keys off disagree about the \
+                 same pool ({report:?})",
+                report.fully_pinned,
+                report.proc_readable
+            );
+
+            // (2) POLICY-DEPENDENT, and deliberately labelled as such: one
+            // worker per physical core is #1729's *spread* policy, not a law.
+            // It is measured better on a quiet host and measured ~26% worse
+            // with a single ~90% co-tenant, because a compact pool leaves half
+            // the box for the co-tenant to land on. The standing user direction
+            // (`.squad/decisions/inbox/copilot-cpu-shared-host-default-2026-08-23.md`,
+            // via #1729) is that a policy which wins only under exclusive
+            // quiet-host conditions is not a valid default, so this assertion
+            // may legitimately have to change.
+            //
+            // If it does, change it *deliberately* -- it is an assertion about
+            // the policy that is currently shipped, not about correctness. Do
+            // not "fix" it by loosening it to match whatever the pool did,
+            // which would delete the check; and do not read a failure here as a
+            // regression without first deciding which policy is intended. Part
+            // (1) above is the part that must survive that decision intact.
+            //
+            // Only assert where one-per-core is achievable: past the core
+            // budget the workers must double up, and demanding otherwise would
+            // fail the host, not the code.
             if report.workers <= report.cores && report.distinct_cores.is_some() {
                 assert_eq!(
                     report.distinct_cores,
                     Some(true),
                     "requested width {requested} realized {} workers that share physical \
                      cores on a host with {} cores available, so a decode row labelled \
-                     t={requested} ran on fewer front ends than its label implies ({report:?})",
+                     t={requested} ran on fewer front ends than its label implies. This is \
+                     an assertion about the currently shipped spread policy ({report:?})",
                     report.workers,
                     report.cores
                 );
