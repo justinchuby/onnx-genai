@@ -2196,6 +2196,14 @@ impl Drop for WorkerCompletion<'_> {
             .fetch_sub(1, Ordering::AcqRel)
             == 1
         {
+            // Counted on this path too, so `sum(last_arrivals) == dispatches *
+            // node_count` holds unconditionally rather than "except when a
+            // worker panicked". An identity with an exception is not an
+            // identity, and a harness that subtracts snapshots has no way to
+            // learn the exception applied.
+            if let Some(counters) = self.shared.worker_counters.get(self.global_index) {
+                counters.0.last_arrivals.fetch_add(1, Ordering::Relaxed);
+            }
             // A panicking worker still has to release a parked dispatcher, or
             // the poisoned pool would hang instead of reporting.
             self.shared.signal_completion();
@@ -4843,6 +4851,38 @@ mod tests {
         pool.shutdown();
     }
 
+    /// RAII scope for [`FORCE_WORKER_PROFILE`], restoring the previous value on
+    /// drop -- including on unwind.
+    ///
+    /// The plain set/build/reset sequence this replaces leaks the override into
+    /// every later test on the same thread if anything between the set and the
+    /// reset panics, which is precisely the defect `EnvVarGuard` exists to
+    /// eliminate for environment variables. The current body happens to reset
+    /// before its first assertion, so the leak is unreachable *today*; that is
+    /// an argument for making it structurally unreachable rather than for
+    /// leaving a future edit to remember.
+    struct ForcedWorkerProfile(Option<bool>);
+
+    impl ForcedWorkerProfile {
+        fn set(value: bool) -> Self {
+            let previous = FORCE_WORKER_PROFILE.with(|cell| cell.replace(Some(value)));
+            Self(previous)
+        }
+
+        /// Run `build` under the override and drop the guard immediately after.
+        /// The gate is read once, on this thread, while the pool is built, so
+        /// the override need not outlive the build.
+        fn build<T>(self, build: impl FnOnce() -> T) -> T {
+            build()
+        }
+    }
+
+    impl Drop for ForcedWorkerProfile {
+        fn drop(&mut self) {
+            FORCE_WORKER_PROFILE.with(|cell| cell.set(self.0));
+        }
+    }
+
     /// Profiling is a per-pool decision, not a per-process one.
     ///
     /// The gate is read at every build rather than latched into a `OnceLock`,
@@ -4855,11 +4895,8 @@ mod tests {
         let workers = 2usize;
         let ops = 8u64;
 
-        FORCE_WORKER_PROFILE.with(|cell| cell.set(Some(false)));
-        let off = single_group_pool(workers);
-        FORCE_WORKER_PROFILE.with(|cell| cell.set(Some(true)));
-        let on = single_group_pool(workers);
-        FORCE_WORKER_PROFILE.with(|cell| cell.set(None));
+        let off = ForcedWorkerProfile::set(false).build(|| single_group_pool(workers));
+        let on = ForcedWorkerProfile::set(true).build(|| single_group_pool(workers));
 
         for _ in 0..ops {
             off.dispatch_index_tasks(workers, &|_| {});
@@ -4934,9 +4971,19 @@ mod tests {
     /// worker happens to call in, fails this and passes
     /// `last_arrivals_sum_to_the_dispatch_count`.
     ///
-    /// The sleep is 2 ms against shards that do nothing, so the ordering is not
-    /// a close call on any host; the assertion is on *which* worker, never on
-    /// how long it took.
+    /// The sleep is 2 ms against shards that do nothing, and that margin is
+    /// fixed -- so this deliberately does **not** assert a clean sweep. Last
+    /// arrival is completion order, and an empty-shard worker preempted for
+    /// longer than the sleep between its wake and its acknowledgement
+    /// legitimately retires last. `cargo test` saturates every core with its
+    /// own parallel tests, so on a small runner that is a real scheduling
+    /// outcome rather than a defect, and demanding all 8 would fail a *correct*
+    /// implementation -- the one thing a test must never do.
+    ///
+    /// A supermajority plus "is the busiest" still kills every mutation this
+    /// test exists for: misattribution to a fixed index leaves the slow worker
+    /// at zero, and attributing to whoever acknowledges leaves it at its even
+    /// `1/w` share.
     #[test]
     fn the_slow_shard_is_attributed_to_the_worker_that_ran_it() {
         let workers = 4usize;
@@ -4952,11 +4999,20 @@ mod tests {
         }
 
         let profiles = pool.worker_profiles();
+        let counts: Vec<u64> = profiles.iter().map(|p| p.last_arrivals).collect();
+        let busiest = profiles
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, p)| p.last_arrivals)
+            .map_or(usize::MAX, |(index, _)| index);
         assert_eq!(
-            profiles[slow].last_arrivals,
-            ops,
-            "the deliberately slow worker must own every last arrival, got {:?}",
-            profiles.iter().map(|p| p.last_arrivals).collect::<Vec<_>>()
+            busiest, slow,
+            "the deliberately slow worker must own the most last arrivals, got {counts:?}"
+        );
+        assert!(
+            profiles[slow].last_arrivals * 4 >= ops * 3,
+            "the deliberately slow worker must own a supermajority of last \
+             arrivals, not merely the plurality, got {counts:?}"
         );
         pool.shutdown();
     }
@@ -5790,6 +5846,34 @@ mod tests {
             message.contains("persistent SPMD decode worker 2 panicked")
                 && message.contains("pool is poisoned"),
             "unexpected dispatcher diagnostic: {message}"
+        );
+    }
+
+    /// The last-arrival identity survives a worker panic.
+    ///
+    /// Every shard panics, so whichever worker retires last does so through
+    /// `WorkerCompletion::drop` rather than `complete`. If only the happy path
+    /// counted, the sum would be zero here and the documented identity would
+    /// hold "except when a worker panicked" -- an exception a harness
+    /// subtracting two snapshots has no way to learn about. Making every shard
+    /// panic is what removes the timing dependence: it does not matter which
+    /// worker is last, only that the last one took the unwind path.
+    #[test]
+    fn a_panicking_last_arriver_is_still_counted() {
+        let pool = single_group_pool(4);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pool.dispatch(&|worker| panic!("intentional SPMD worker panic on {worker}"));
+        }));
+        assert!(result.is_err(), "the dispatcher must report the poison");
+
+        let profiles = pool.worker_profiles();
+        let total: u64 = profiles.iter().map(|p| p.last_arrivals).sum();
+        assert_eq!(
+            total,
+            1,
+            "the one dispatch must have exactly one last arriver even though it \
+             unwound, got {:?}",
+            profiles.iter().map(|p| p.last_arrivals).collect::<Vec<_>>()
         );
     }
 
