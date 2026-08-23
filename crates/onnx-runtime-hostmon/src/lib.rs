@@ -147,6 +147,22 @@ pub fn online_cpus() -> Option<usize> {
     None
 }
 
+/// The largest CPU number [`parse_cpu_list`] will accept.
+///
+/// No CPU above the affinity mask's own width can ever be in an allowed set, so
+/// a larger number is malformed rather than merely unusual. The bound exists
+/// because `cpus.extend(lo..=hi)` allocates eagerly: a truncated or corrupt read
+/// of `0-18446744073709551614` would otherwise try to allocate exabytes and
+/// abort the benchmark. This crate's whole argument is that it does not rely on
+/// "the kernel would never emit that".
+///
+/// A plain constant rather than `8 * size_of::<libc::cpu_set_t>()`, because
+/// `cpu_set_t` is Linux-only and this parser is not -- deriving the cap from it
+/// broke the macOS and Windows builds. `glibc`'s `CPU_SETSIZE` is 1024 and the
+/// Linux-only test `the_cpu_list_cap_covers_the_real_affinity_mask` asserts the
+/// two cannot silently diverge.
+pub const MAX_CPU: usize = 1024;
+
 /// Parses a kernel CPU list such as `0-3,8,12-13` into individual CPU numbers.
 ///
 /// This is the format of `Cpus_allowed_list` in `/proc/<pid>/status`, which is
@@ -155,26 +171,19 @@ pub fn online_cpus() -> Option<usize> {
 /// silently truncated mask would read as "this thread is confined to fewer CPUs
 /// than it is", which is the direction that fabricates a passing check.
 pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
-    // No CPU above the affinity mask's own width can ever be in `allowed`, so a
-    // larger number is malformed rather than merely unusual. Bounded because
-    // `cpus.extend(lo..=hi)` allocates eagerly: a truncated or corrupt read of
-    // `0-18446744073709551614` would otherwise try to allocate exabytes and
-    // abort the benchmark. This module's whole argument is that it does not
-    // rely on "the kernel would never emit that".
-    let max_cpu = 8 * std::mem::size_of::<libc::cpu_set_t>();
     let mut cpus = Vec::new();
     for part in list.trim().split(',').filter(|p| !p.is_empty()) {
         match part.split_once('-') {
             Some((lo, hi)) => {
                 let (lo, hi) = (lo.trim().parse().ok()?, hi.trim().parse::<usize>().ok()?);
-                if hi < lo || hi >= max_cpu {
+                if hi < lo || hi >= MAX_CPU {
                     return None;
                 }
                 cpus.extend(lo..=hi);
             }
             None => {
                 let cpu = part.trim().parse().ok()?;
-                if cpu >= max_cpu {
+                if cpu >= MAX_CPU {
                     return None;
                 }
                 cpus.push(cpu);
