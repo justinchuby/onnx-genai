@@ -1151,27 +1151,70 @@ fn load_inference_metadata(model_directory: &ModelDirectory) -> anyhow::Result<I
 /// Admit metadata for the bare-decoder decode path.
 ///
 /// Structural defects mean the document does not describe a runnable model, so
-/// they stay fatal. Declared capabilities are a different question: the
-/// canonical package describes a *workflow*, and the capabilities it lists
-/// (`workflow_ssa`, `serving_service_contract`, `bounded_state_recurrence`, …)
-/// describe that workflow manifest — not extra computation this decode path
-/// must perform. The decode path derives the IO it needs from the graph and
-/// never interprets the manifest, so refusing to load over a capability the
-/// runtime has not implemented rejects packages that decode correctly.
-/// Measured: a package declaring all eight of those capabilities produces a
-/// coherent token stream whose first token matches the same model exported
-/// without a workflow manifest. So report them and continue.
+/// they stay fatal.
+///
+/// Declared capabilities split on one question: **does the capability describe
+/// the document, or does it prescribe computation this path must perform?**
+///
+/// *Descriptive* capabilities are derived from the workflow manifest —
+/// `workflow_ssa`, `serving_service_contract`, `bounded_state_recurrence`,
+/// `typed_emit`, `emit_valid_length`, `linear_effects`,
+/// `loop_induction_values`, `nested_control_flow`. The canonical package
+/// describes a workflow; this path derives its IO from the graph and never
+/// interprets that manifest, so refusing to load over one rejects packages that
+/// decode correctly. Measured: a package declaring all eight loads, decodes,
+/// and produces a coherent token stream whose first token matches the same
+/// model exported without a workflow manifest. Report and continue.
+///
+/// *Prescriptive* capabilities are derived from `metadata.adapters` — a
+/// concrete weight overlay, not a description. This path never reads
+/// `metadata.adapters`, so decoding anyway would silently emit **base-model
+/// output** rather than the adapted output the package asks for. That is wrong
+/// output, not degraded output, and the caller has no way to notice. These stay
+/// fatal.
 fn admit_inference_metadata(metadata: &InferenceMetadata) -> anyhow::Result<()> {
+    use onnx_genai_metadata::capabilities as capability;
+
     let runtime_caps = onnx_genai_metadata::RuntimeCapabilities::default();
     let report = onnx_genai_metadata::validate_structure_and_capabilities(metadata, &runtime_caps);
     if !report.structural.is_empty() {
         anyhow::bail!("Invalid inference metadata: {:?}", report.structural);
     }
-    if !report.unsupported_capabilities.is_empty() {
+
+    // Capabilities that prescribe computation this path cannot perform. Listed
+    // explicitly rather than inferred from `metadata.adapters` so that adding a
+    // future overlay-style capability is a deliberate edit here.
+    const PRESCRIPTIVE: &[&str] = &[
+        capability::PARAMETER_ADAPTERS,
+        capability::HETEROGENEOUS_ADAPTER_BATCHING,
+    ];
+
+    let (prescriptive, descriptive): (Vec<_>, Vec<_>) = report
+        .unsupported_capabilities
+        .iter()
+        .partition(|capability| PRESCRIPTIVE.contains(&capability.as_str()));
+
+    if !prescriptive.is_empty() {
+        anyhow::bail!(
+            "inference metadata requires capabilities this decode path cannot perform: {}; \
+             decoding anyway would silently emit base-model output instead of the output the \
+             package describes",
+            prescriptive
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !descriptive.is_empty() {
         tracing::warn!(
             "inference metadata declares capabilities this runtime does not implement: {}; \
              continuing because the decode path does not interpret the workflow manifest",
-            report.unsupported_capabilities.join(", ")
+            descriptive
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())
@@ -2680,6 +2723,77 @@ pipeline:
             .expect_err("a document that does not describe a runnable model must fail closed")
             .to_string();
         assert!(error.contains("Invalid inference metadata"), "{error}");
+        assert!(
+            error.contains("absent_component"),
+            "the specific unknown-component defect must be named: {error}"
+        );
+    }
+
+    #[test]
+    fn declared_adapters_fail_closed_because_this_path_cannot_apply_them() {
+        // An adapter overlay is prescriptive, not descriptive: this path never
+        // reads `metadata.adapters`, so loading anyway would silently emit
+        // base-model output instead of the adapted output the package asks for.
+        let metadata: InferenceMetadata = serde_yaml::from_str(
+            r#"
+schema_version: v1
+adapters:
+  target_manifest:
+    targets:
+      - id: projection
+        component: model
+        initializer: projection.weight
+        layer_index: 0
+        node_name: projection
+        output_name: projection.output
+        activation_dtype: float32
+        input_features: 2
+        output_features: 2
+        rank: 2
+        alpha: 4.0
+  discovery_fallback: tooling_only
+  selection:
+    segments: request.lora_segments
+    adapter_counts: request.lora_counts
+    scales: request.lora_scales
+    max_adapters: 2
+  application_capability: onnx-genai.adapters@1
+  artifacts:
+    demo:
+      index: 0
+      identity: demo.peft
+      version: "1"
+      rank: 2
+      alpha: 4.0
+      dtype: float32
+      weights:
+        - location: adapters/demo/adapter_model.safetensors
+          loader_capability: onnx-genai.adapters.hf-peft@1
+          config_location: adapters/demo/adapter_config.json
+          scale_encoding: alpha_over_rank
+          format: hf_peft
+      bindings: [{ target: projection, weight_key: projection }]
+"#,
+        )
+        .expect("metadata parses");
+
+        assert!(
+            metadata.adapters.is_some(),
+            "fixture must actually declare an adapter service"
+        );
+
+        let error = admit_inference_metadata(&metadata)
+            .expect_err("an adapter package must not silently decode as the base model")
+            .to_string();
+        assert!(
+            !error.contains("Invalid inference metadata"),
+            "the fixture must be structurally valid so the adapter guard is what rejects it: \
+             {error}"
+        );
+        assert!(
+            error.contains("cannot perform") && error.contains("base-model output"),
+            "{error}"
+        );
     }
 }
 
