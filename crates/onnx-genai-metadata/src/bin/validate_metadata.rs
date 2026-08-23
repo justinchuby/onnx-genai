@@ -72,8 +72,9 @@ validate_metadata — check inference metadata
         without its weights -- for example before uploading to a model hub.
 
     validate_metadata --shape [...]
-        Also report whether each package is a single decoder or a composite
-        pipeline, which is the triage question when migrating a fleet.
+        Also report how each package classifies: a single decoder (with or
+        without the decode contract), or a composite pipeline and how many ONNX
+        components it names. This is the triage question when migrating a fleet.
 ";
 
 /// Load and validate the document, without requiring the artifacts beside it.
@@ -94,15 +95,34 @@ fn document_of(input: &Path) -> Result<onnx_genai_metadata::InferenceMetadata, S
 }
 
 /// How this package will be executed, which is the migration triage question.
-fn shape_of(metadata: &onnx_genai_metadata::InferenceMetadata) -> &'static str {
-    match metadata.pipeline.as_ref() {
-        Some(pipeline) => {
-            if onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow) {
-                "single-decoder workflow"
-            } else {
-                "composite workflow"
-            }
+///
+/// Both layers of the shared classification are reported, because they answer
+/// different halves of "will this load and how". A package can be a
+/// structurally recognizable single decoder and still not name the decode step,
+/// which is what a fleet migration needs to see rather than have folded into a
+/// yes/no.
+fn shape_of(metadata: &onnx_genai_metadata::InferenceMetadata) -> String {
+    use onnx_genai_metadata::GraphCardinality::{Composite, NoGraph, SingleGraph};
+
+    let Some(pipeline) = metadata.pipeline.as_ref() else {
+        return "no workflow".to_string();
+    };
+    let classification = onnx_genai_metadata::classify_workflow(&pipeline.workflow);
+    match classification.cardinality() {
+        NoGraph => "workflow with no ONNX component".to_string(),
+        SingleGraph if classification.contracted_single_decoder().is_some() => {
+            "single-decoder workflow".to_string()
         }
-        None => "no workflow",
+        SingleGraph if classification.is_single_decoder() => {
+            "single-decoder workflow, no decode contract".to_string()
+        }
+        SingleGraph if classification.decoder_evidence().contradictory() => {
+            "one ONNX component declaring the decode contract but no port roles".to_string()
+        }
+        SingleGraph => "one ONNX component, not a decoder".to_string(),
+        Composite => format!(
+            "composite workflow ({} ONNX components)",
+            classification.graph_component_count()
+        ),
     }
 }

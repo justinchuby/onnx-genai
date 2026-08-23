@@ -17,28 +17,23 @@ impl Engine {
     /// for a declared decode step only when that step is the package's *whole*
     /// graph, because it loads one model directory and holds one session.
     ///
+    /// It does not re-derive that shape. `contracted_single_decoder` is layer 2
+    /// of the one classification in `onnx-genai-metadata`: layer 1 (this
+    /// workflow executes exactly one ONNX graph and that graph's declared roles
+    /// make it a decoder) *plus* the contract naming the step. Asking the same
+    /// helper the metadata, CLI and server layers ask is what makes "the loader
+    /// routed a package the metadata layer does not call a single decoder"
+    /// unrepresentable rather than merely unobserved.
+    ///
     /// A package it cannot cover loses nothing: the same interpreter executes
     /// the same declared workflow, invoking each component from the artifact
     /// the package names. There is no second generation path either way — only
     /// a faster executor for one declared step, when that step is one this
     /// runtime registered an executor for.
     fn decode_core_covers(workflow: &onnx_genai_metadata::WorkflowSpec) -> bool {
-        let graph_components = workflow
-            .components
-            .iter()
-            .filter(|(_, component)| {
-                !matches!(
-                    component.implementation,
-                    onnx_genai_metadata::ComponentImplementation::Binding
-                )
-            })
-            .collect::<Vec<_>>();
-        let [(_, only)] = graph_components.as_slice() else {
-            return false;
-        };
-        only.contract.as_ref().is_some_and(|contract| {
-            contract.id == onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT
-        })
+        onnx_genai_metadata::classify_workflow(workflow)
+            .contracted_single_decoder()
+            .is_some()
     }
 
     /// The workflow a package declares, read from the package.
@@ -2996,6 +2991,94 @@ mod mtp_seed_tests {
         let io = io_with_hidden_output(None);
 
         assert!(decoder_io_seeded_with(&io, "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod decode_core_coverage_tests {
+    use super::*;
+
+    /// Every workflow this repository maintains, read from disk.
+    fn maintained_workflows() -> Vec<(String, onnx_genai_metadata::WorkflowSpec)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut workflows = Vec::new();
+        for directory in ["tests/fixtures", "examples/inference_metadata/catalogue"] {
+            collect(&root.join(directory), &root, &mut workflows);
+        }
+        assert!(
+            workflows.len() > 40,
+            "the corpus walk found only {} workflows, so it is not walking the fixtures",
+            workflows.len()
+        );
+        workflows
+    }
+
+    fn collect(
+        directory: &Path,
+        root: &Path,
+        out: &mut Vec<(String, onnx_genai_metadata::WorkflowSpec)>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, root, out);
+                continue;
+            }
+            let named_metadata = path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("inference_metadata"));
+            if path.extension().is_none_or(|extension| extension != "yaml")
+                || !(named_metadata || directory.ends_with("catalogue"))
+            {
+                continue;
+            }
+            if let Some(pipeline) = onnx_genai_metadata::load_metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.pipeline)
+            {
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                out.push((relative.display().to_string(), pipeline.workflow));
+            }
+        }
+    }
+
+    /// The loader routes on the shared classification and nothing else.
+    ///
+    /// `decode_core_covers` used to scan the components itself. Asserting the
+    /// identity here is what stops it drifting back into a second scan that
+    /// happens to agree on today's fixtures.
+    #[test]
+    fn the_loader_routes_on_the_shared_classification() {
+        for (name, workflow) in maintained_workflows() {
+            assert_eq!(
+                Engine::decode_core_covers(&workflow),
+                onnx_genai_metadata::classify_workflow(&workflow)
+                    .contracted_single_decoder()
+                    .is_some(),
+                "{name}: the loader disagreed with the shared classification",
+            );
+        }
+    }
+
+    /// The loader never routes a package the metadata layer calls composite.
+    ///
+    /// This is the containment the two hand-rolled recognizers could only be
+    /// observed to have: whatever the decode core covers, every other caller
+    /// already calls a single decoder.
+    #[test]
+    fn nothing_the_decode_core_covers_is_composite_elsewhere() {
+        for (name, workflow) in maintained_workflows() {
+            if Engine::decode_core_covers(&workflow) {
+                assert!(
+                    onnx_genai_metadata::is_single_decoder_workflow(&workflow),
+                    "{name}: the loader chose the fused executor for a package the metadata, CLI \
+                     and server layers do not call a single decoder",
+                );
+            }
+        }
     }
 }
 

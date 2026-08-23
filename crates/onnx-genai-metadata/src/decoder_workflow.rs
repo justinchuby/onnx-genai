@@ -1153,7 +1153,7 @@ mod tests {
     fn roundtrips(abi: &DecoderAbi) -> DecoderAbi {
         let workflow = decoder_workflow(abi, "model.onnx", &DecoderFacts::default())
             .expect("a complete decoder ABI must be expressible as a workflow");
-        let component = crate::decoder_abi::sole_decoder_component(&workflow)
+        let component = crate::graph_cardinality::sole_decoder_component(&workflow)
             .expect("the converted workflow must present exactly one decoder");
         assert_eq!(component, DECODER_COMPONENT);
         crate::decoder_abi::decoder_abi(&workflow, component)
@@ -1385,7 +1385,8 @@ mod roundtrip_coverage {
     fn read_back(abi: &DecoderAbi) -> DecoderAbi {
         let workflow = decoder_workflow(abi, "model.onnx", &DecoderFacts::default())
             .expect("a complete decoder ABI must be expressible as a workflow");
-        let component = crate::decoder_abi::sole_decoder_component(&workflow).expect("one decoder");
+        let component =
+            crate::graph_cardinality::sole_decoder_component(&workflow).expect("one decoder");
         crate::decoder_abi::decoder_abi(&workflow, component).expect("readable")
     }
 

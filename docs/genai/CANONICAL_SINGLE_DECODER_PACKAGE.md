@@ -170,7 +170,7 @@ decode cannot disagree about whether a model has finished.
 A package is a single decoder when its workflow has **exactly one ONNX
 component** (components the runtime implements — `binding` — do not count) and
 that component is structurally recognizable as a decoder: it consumes the
-autoregressive sequence and produces logits.
+autoregressive sequence and either produces logits or owns attention state.
 
 This is narrower than "has a decoder". A vision-language package has a
 recognizable decoder among its encoder, projector and decoder components, and
@@ -179,9 +179,30 @@ interpreter. Both execute a declared `pipeline.workflow`; what differs is which
 executor implements the decode step, which is a backend choice beneath one
 representation.
 
-The single predicate is `onnx_genai_metadata::is_single_decoder_workflow`.
-Every caller asks it — engine loader, server, CLI — so no two of them can
-classify the same package differently.
+### One classification, two layers
+
+`onnx_genai_metadata::classify_workflow` is the only place that question is
+answered, for every caller. It reads the workflow once and reports two nested
+layers:
+
+| Layer | Accessor | Question | Evidence | Asked by |
+|---|---|---|---|---|
+| 1 | `is_single_decoder()` | does this workflow execute exactly one ONNX graph, and is that graph a decoder? | declared port `roles` | metadata `--shape`, server, CLI |
+| 2 | `contracted_single_decoder()` | …*and* does that graph name the step this runtime registered an executor for? | layer 1 **plus** `onnx-genai.autoregressive-decode` | the engine loader |
+
+Layer 2 is *defined* as layer 1 plus the contract, so "the loader chose the
+fused decode core for a package the metadata layer calls composite" is not a
+state the code can reach. Requiring layer 1 is not an extra safety gate: the
+fused executor is driven by the resolved `DecoderAbi`, which is derived from
+the declared roles and from nothing else, so a component naming the decode step
+without them has no ABI to drive it.
+
+`is_single_decoder_workflow` and `sole_decoder_component` remain as named views
+onto the same classification. `decoder_recognizer_agreement.rs` pins all of it:
+an exhaustive matrix over every fixture and catalogue example, a coverage guard
+so a new fixture cannot skip the matrix, and the adversarial shapes no fixture
+has — extra policy bindings, two decoders, a contract with no roles, a
+composite whose text head is decoder-shaped, and a 187-component package.
 
 ## Converting a package
 
@@ -219,8 +240,10 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- \
 
 `--metadata-only` is what a publisher needs: a hub package can be hundreds of
 gigabytes, and requiring its weights before its metadata could be checked would
-mean nobody checks metadata before uploading it. `--shape` reports
-`single-decoder workflow` / `composite workflow` / `no workflow`, which is the
+mean nobody checks metadata before uploading it. `--shape` reports both layers
+of the shared classification — `single-decoder workflow`,
+`single-decoder workflow, no decode contract`,
+`composite workflow (N ONNX components)`, or `no workflow` — which is the
 triage question when migrating a fleet.
 
 ## Republishing a hub package
@@ -229,8 +252,8 @@ triage question when migrating a fleet.
    `inference_metadata.yaml`. It answers three of the four questions at once:
    does it still parse, does it still validate, and what shape is it.
    - `no workflow` or a `model.io` rejection → needs conversion.
-   - `single-decoder workflow` / `composite workflow` → already canonical;
-     confirm the shape is the one you expect.
+   - `single-decoder workflow` / `composite workflow (N ONNX components)` →
+     already canonical; confirm the shape is the one you expect.
 2. If it needs conversion, run `migrate_model_io` against a local checkout of
    the package. The tool needs the ONNX artifact present to read port contracts,
    but not the weights of every variant — a single decoder's graph is enough.
@@ -291,7 +314,11 @@ a 186-graph package to the fused single-graph executor, which cannot run the
 other 185. Every vision-language package classified the same way.
 
 The predicate now asks the question the phrase actually means: does this
-workflow execute **one** ONNX graph? `is_single_decoder_workflow` is fixed and
-pinned by `decoder_workflow_roundtrip::a_multi_component_package_is_not_a_single_decoder`.
-A published package is the only place this would have shown up — no in-repo
-fixture has that shape.
+workflow execute **one** ONNX graph? That reading lives in
+`classify_workflow`, which every caller — metadata validation, the CLI, the
+server and the engine loader — reads instead of scanning the components itself.
+It is pinned by `decoder_workflow_roundtrip::a_multi_component_package_is_not_a_single_decoder`
+and, exhaustively, by `decoder_recognizer_agreement.rs`, whose
+`a_187_component_package_with_one_text_head_is_composite` reconstructs this
+package's shape so the defect is covered in-repo. A published package was the
+only place it would otherwise have shown up — no in-repo fixture has that shape.

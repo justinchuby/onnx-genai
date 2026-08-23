@@ -101,6 +101,7 @@ pub mod capabilities {
 pub mod cache;
 mod decoder_abi;
 pub mod decoder_workflow;
+mod graph_cardinality;
 pub mod identity;
 mod lowering;
 pub mod parser;
@@ -108,7 +109,11 @@ pub mod schema;
 pub mod validation;
 
 pub use cache::{CacheDependencies, cache_dependencies};
-pub use decoder_abi::{decoder_abi, is_single_decoder_workflow, sole_decoder_component};
+pub use decoder_abi::decoder_abi;
+pub use graph_cardinality::{
+    DecoderEvidence, GraphCardinality, WorkflowClassification, classify_workflow,
+    is_single_decoder_workflow, sole_decoder_component,
+};
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{

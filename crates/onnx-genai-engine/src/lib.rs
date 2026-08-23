@@ -75,8 +75,9 @@ pub use onnx_genai_kv::{
     LocalTieredConfig,
 };
 pub use onnx_genai_metadata::GenerationDefaults;
-/// Re-exported so every caller asks one recognizer whether a package is a
-/// composed pipeline or a single decoder.
+/// Re-exported so every caller reads one classification. This is layer 1 —
+/// "this workflow executes one ONNX graph and that graph is a decoder" — and
+/// the loader's executor choice is layer 2 of the same classification.
 pub use onnx_genai_metadata::is_single_decoder_workflow;
 pub use onnx_genai_scheduler::{
     FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,

@@ -73,17 +73,8 @@ impl Engine {
 
     /// How many of those components name an ONNX graph.
     pub fn workflow_graph_component_count(&self) -> usize {
-        self.workflow
-            .workflow_spec()
-            .components
-            .values()
-            .filter(|component| {
-                !matches!(
-                    component.implementation,
-                    onnx_genai_metadata::ComponentImplementation::Binding
-                )
-            })
-            .count()
+        onnx_genai_metadata::classify_workflow(self.workflow.workflow_spec())
+            .graph_component_count()
     }
 
     /// Whether the declared workflow contains a generation loop.
