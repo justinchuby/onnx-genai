@@ -1,38 +1,39 @@
-feat(engine): the decode step becomes a node executor, not a loop
+feat(engine): the declared loop semantics become load-bearing, fail-closed
 
-B2 checkpoint 2: the runtime's decode and token-policy steps are now a
-`WorkflowNodeHost` implementation, so the fused decode session is something an
-interpreter *drives* rather than something that drives itself.
+B2 checkpoint 3, and the review's "no ignored declared semantics" item.
 
-`DecodeNodeHost` advances exactly one node per call — a decoder forward pass
-(with its device greedy/sampling fast paths and paged KV), or the token policy
-(processor chain, sampler, logprobs, KV commit, stop detection). It holds
-nothing about the loop. The only state spanning nodes within an iteration is the
-logits the decode node produced and the policy node consumes, and a workflow
-applying its policy before any decode says so rather than silently scoring
-nothing.
+The interpreter's `Loop` node already honours everything a workflow declares —
+`continue_when`, `max_iterations`, `termination`, `carried`, `iteration`, and
+`service_group` cells whose buffers the runtime owns. The decode executor did
+not: it read the body's *steps* and supplied the loop itself, taking the
+iteration bound from the request's `max_new_tokens` and the stop from the
+runtime's token policy.
 
-`step_canonical_body` no longer contains the step logic; it walks the declared
-body and calls the executor. So there is one implementation of "what a decoder
-step is", reached today by the body walker and — once `Engine::generate*` moves
-across — by the interpreter's own node dispatch, through the same
-`execute_contract_node` seam checkpoint 1 added.
+That is faithful only if the workflow declared those same things. A package
+saying `max_iterations: package.some_literal`, or `termination: predicate`, or a
+`continue_when` naming a cell the token policy never writes, describes a loop
+this executor would silently override — the tokens still come out, and they are
+the wrong tokens for the workflow as written. A reader of the YAML could not
+detect that, and neither could a test that only checked token counts.
 
-**The decoder now declares a contract.** `onnx-genai.autoregressive-decode` sits
-*alongside* the component's ONNX artifact rather than instead of it: the package
-still says which graph the step runs, and the contract says what the step *is*.
-A runtime holding a fused session for that contract supplies it as the executor;
-a runtime without one invokes the artifact generically. That is what lets the
-optimized path be a node inside a workflow instead of a second loop beside one —
-without the package having to know which runtime will execute it.
+`validate_loop_semantics` now checks each declared field against what the
+executor actually does and refuses a mismatch, naming the field:
 
-An earlier draft of the body walker re-borrowed the token callback per node with
-a `transmute`. That was a lifetime workaround standing in for a design problem,
-so the host carries two lifetimes instead — one for the borrows it holds, one
-for the callback's own — and the transmute is gone.
+* `termination` must be `generation_eos`. A predicate-terminated loop states its
+  stop condition in the graph, which is a different kind of workflow and belongs
+  to the generic interpreter.
+* `max_iterations` must name a declared input carrying a `max_iterations` /
+  `max_output_tokens` role, because the executor bounds generation by the
+  request — a bound it cannot see is a bound it would ignore.
+* `continue_when` must be the serving contract's `active` cell, because that is
+  the cell the token policy writes; any other predicate would never be updated
+  and the loop would never stop.
+* every carried cell must be declared state.
 
-Verified: 73/73 engine targets; **all five real foundry models byte-identical to
-the pre-change baseline**, which is what shows the executor split changed no
-token on any real decoder; fmt; clippy `-D warnings`.
+Five tests, one per field, each mutating the real lowering into a workflow that
+still parses and validates but describes something this executor does not
+implement.
+
+Verified: 73/73 engine targets; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

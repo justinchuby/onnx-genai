@@ -1584,3 +1584,14 @@ pipeline:
         }
     }
 }
+
+/// Constructors for schema values a test needs to build but the runtime never
+/// constructs, kept beside the module that owns the type rather than duplicated
+/// per test.
+#[cfg(test)]
+pub(crate) mod workflow_test_support {
+    /// A loop that states its own stop condition in the graph.
+    pub(crate) fn predicate_termination() -> onnx_genai_metadata::WorkflowLoopTermination {
+        onnx_genai_metadata::WorkflowLoopTermination::Predicate
+    }
+}

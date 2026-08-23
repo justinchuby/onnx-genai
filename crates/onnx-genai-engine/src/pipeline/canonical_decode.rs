@@ -106,6 +106,75 @@ enum BodyStep {
 /// that *runs* rather than a load-time attestation: declare a component whose
 /// contract this runtime does not implement, or a body that never applies a
 /// policy, and execution fails here instead of quietly doing something else.
+/// Refuse a loop whose declared semantics this executor does not honour.
+///
+/// The executor drives the *body* and supplies the loop itself: the iteration
+/// bound comes from the request's `max_new_tokens`, the stop from the runtime's
+/// token policy. That is only faithful if the workflow declared those same
+/// things. A package that says `max_iterations: package.some_literal` or
+/// `termination: predicate` is describing a loop this executor would silently
+/// override — the tokens would come out, and they would be the wrong tokens for
+/// the workflow as written.
+///
+/// So each declared field is checked against what the executor actually does,
+/// and a mismatch is an error naming the field. Nothing declared is ignored.
+fn validate_loop_semantics(
+    workflow: &onnx_genai_metadata::WorkflowSpec,
+    continue_when: &str,
+    max_iterations: &str,
+    termination: &onnx_genai_metadata::WorkflowLoopTermination,
+    carried: &[onnx_genai_metadata::WorkflowCarry],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        *termination == onnx_genai_metadata::WorkflowLoopTermination::GenerationEos,
+        "this workflow's loop declares termination '{termination:?}', but the runtime's token \
+         policy ends generation; a predicate-terminated loop states its own stop condition in \
+         the graph and must be executed by the generic interpreter"
+    );
+
+    // The bound must be the request's, because the executor uses the request's.
+    let bound = workflow.inputs.get(max_iterations).with_context(|| {
+        format!(
+            "this workflow's loop is bounded by '{max_iterations}', which it does not declare as \
+             an input; the runtime bounds generation by the request's max_new_tokens and cannot \
+             honour a bound it cannot see"
+        )
+    })?;
+    anyhow::ensure!(
+        matches!(
+            &bound.role,
+            onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                if *role == onnx_genai_metadata::RuntimeInputRole::MaxIterations
+                    || *role == onnx_genai_metadata::RuntimeInputRole::MaxOutputTokens
+        ),
+        "this workflow's loop is bounded by '{max_iterations}', which declares no \
+         max_iterations role; the runtime would bound it by the request instead, silently \
+         ignoring the package's own bound"
+    );
+
+    // The liveness predicate must be the cell the token policy writes.
+    let serving = workflow.serving.as_ref().context(
+        "this workflow declares a generation loop but no serving contract, so nothing names the \
+         cell its liveness predicate reads",
+    )?;
+    anyhow::ensure!(
+        continue_when == serving.active,
+        "this workflow's loop continues while '{continue_when}', but its serving contract names \
+         '{}' as the active cell; the runtime's token policy writes the serving cell, so a \
+         different predicate would never be updated",
+        serving.active
+    );
+
+    for carry in carried {
+        anyhow::ensure!(
+            workflow.state.contains_key(&carry.cell),
+            "this workflow's loop carries '{}', which it does not declare as state",
+            carry.cell
+        );
+    }
+    Ok(())
+}
+
 fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<Vec<BodyStep>> {
     // The decoder is recognized structurally — the sole component consuming the
     // autoregressive sequence and producing logits — so no component name, model
@@ -115,17 +184,31 @@ fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<
         "this workflow presents no single decoder component, so it is not a single-row \
          autoregressive package and must be executed by the generic interpreter",
     )?;
-    let loop_body = workflow
+    let (loop_body, continue_when, max_iterations, termination, carried) = workflow
         .steps
         .iter()
         .find_map(|step| match step {
-            WorkflowStep::Loop { steps, .. } => Some(steps),
+            WorkflowStep::Loop {
+                steps,
+                continue_when,
+                max_iterations,
+                termination,
+                carried,
+                ..
+            } => Some((steps, continue_when, max_iterations, termination, carried)),
             _ => None,
         })
         .context(
             "the workflow declares no loop; an autoregressive decoder's token stream \
              is a loop by construction",
         )?;
+    validate_loop_semantics(
+        workflow,
+        continue_when,
+        max_iterations,
+        termination,
+        carried,
+    )?;
     let mut body = Vec::with_capacity(loop_body.len());
     for step in loop_body {
         match step {
@@ -587,6 +670,90 @@ mod tests {
                 }
             },
             "which this runtime does not implement",
+        );
+    }
+
+    /// Each declared loop field is load-bearing, not decoration.
+    ///
+    /// The executor supplies the loop — the request's bound, the runtime's stop
+    /// — so a package declaring different ones describes a loop this executor
+    /// would silently override. The tokens would come out, and they would be
+    /// the wrong tokens for the workflow as written, which is the failure a
+    /// reader of the YAML could never detect.
+    #[test]
+    fn a_loop_bound_the_runtime_cannot_honour_is_refused() {
+        refuses(
+            |workflow| {
+                for step in &mut workflow.steps {
+                    if let WorkflowStep::Loop { max_iterations, .. } = step {
+                        *max_iterations = "package.state_seed".to_string();
+                    }
+                }
+            },
+            "declares no max_iterations role",
+        );
+    }
+
+    #[test]
+    fn a_bound_naming_no_declared_input_is_refused() {
+        refuses(
+            |workflow| {
+                for step in &mut workflow.steps {
+                    if let WorkflowStep::Loop { max_iterations, .. } = step {
+                        *max_iterations = "nothing.declares.this".to_string();
+                    }
+                }
+            },
+            "does not declare as an input",
+        );
+    }
+
+    /// A predicate-terminated loop states its own stop in the graph, so it is a
+    /// different kind of workflow and belongs to the generic interpreter.
+    #[test]
+    fn a_predicate_terminated_loop_is_refused() {
+        refuses(
+            |workflow| {
+                for step in &mut workflow.steps {
+                    if let WorkflowStep::Loop { termination, .. } = step {
+                        *termination =
+                            crate::pipeline::workflow_test_support::predicate_termination();
+                    }
+                }
+            },
+            "predicate-terminated loop",
+        );
+    }
+
+    /// The liveness predicate must be the cell the token policy writes; any
+    /// other cell would never be updated and the loop would never stop.
+    #[test]
+    fn a_liveness_predicate_the_policy_never_writes_is_refused() {
+        refuses(
+            |workflow| {
+                for step in &mut workflow.steps {
+                    if let WorkflowStep::Loop { continue_when, .. } = step {
+                        *continue_when = "done".to_string();
+                    }
+                }
+            },
+            "as the active cell",
+        );
+    }
+
+    #[test]
+    fn a_carry_of_undeclared_state_is_refused() {
+        refuses(
+            |workflow| {
+                for step in &mut workflow.steps {
+                    if let WorkflowStep::Loop { carried, .. } = step
+                        && let Some(carry) = carried.first_mut()
+                    {
+                        carry.cell = "not_a_declared_cell".to_string();
+                    }
+                }
+            },
+            "does not declare as state",
         );
     }
 
