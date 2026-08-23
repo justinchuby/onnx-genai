@@ -106,10 +106,17 @@ fn nvrtc_include_paths() -> Vec<String> {
 
     if let Some(paths) = std::env::var_os("LD_LIBRARY_PATH") {
         for path in std::env::split_paths(&paths) {
-            if path.ends_with(Path::new("nvidia/cuda_nvrtc/lib"))
-                && let Some(nvidia) = path.parent().and_then(Path::parent)
-            {
-                candidates.push(nvidia.join("cuda_runtime/include"));
+            // Recover the wheel root through the shared helper rather than
+            // matching one layout's spelling: this previously only recognised
+            // `nvidia/cuda_nvrtc/lib`, so a consolidated wheel's loader path
+            // never yielded its sibling headers.
+            if let Some(root) = onnx_genai_cuda_version_guard::wheel_root_of(&path) {
+                candidates.extend(
+                    onnx_genai_cuda_version_guard::WHEEL_CUDA_MAJORS
+                        .iter()
+                        .map(|major| root.join("nvidia").join(major).join("include")),
+                );
+                candidates.push(root.join("nvidia/cuda_runtime/include"));
             }
         }
     }
