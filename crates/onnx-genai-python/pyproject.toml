@@ -37,7 +37,7 @@ classifiers = [
 # execution-provider plugin so Apple Silicon is fast out of the box. Install the
 # `cuda` extra (Windows/Linux) to swap in the GPU ONNX Runtime + CUDA runtime.
 dependencies = [
-    "onnxruntime>=1.28,<2",
+    "onnxruntime>=1.29,<2",
     "onnxruntime-ep-mlx>=0.27 ; platform_system == 'Darwin'",
 ]
 dynamic = ["version"]
@@ -47,7 +47,7 @@ dynamic = ["version"]
 # the wheel — this pulls the GPU ONNX Runtime plus its CUDA 13 / cuDNN 9 pip
 # runtime. onnxruntime-gpu installs the same `onnxruntime` import package as the
 # CPU wheel, so it effectively replaces the default CPU runtime.
-cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.28,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
+cuda = ["onnxruntime-gpu[cuda,cudnn]>=1.29,<2 ; platform_system == 'Windows' or platform_system == 'Linux'"]
 
 [project.urls]
 repository = "https://github.com/justinchuby/onnx-genai"

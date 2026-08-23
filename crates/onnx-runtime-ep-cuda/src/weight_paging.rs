@@ -2648,6 +2648,51 @@ pub struct CudaWeightResidency {
     /// fence-safety argument.
     staging_pool: Arc<PinnedStagingPool>,
     inner: Mutex<ResidencyInner>,
+    /// Count of live [`onnx_runtime_ep_api::RoutedResidencyProof`] guards
+    /// acquired via [`CudaWeightResidency::acquire_routed_residency`]. Only
+    /// this residency owner increments/decrements it (on acquire / on the
+    /// returned guard's `Drop`), so it cannot be forged or bypassed from
+    /// outside this module. `resize_safe_point` folds it into
+    /// `routed_guards_active` so a resize fails closed while any dispatch
+    /// still holds a proof that a region set stays resident.
+    routed_guards_active: AtomicU64,
+}
+
+/// RAII handle for a live [`onnx_runtime_ep_api::RoutedResidencyProof`],
+/// minted only by [`CudaWeightResidency::acquire_routed_residency`].
+///
+/// Holds an `Arc` back to the residency that issued it so `Drop` can
+/// decrement `routed_guards_active` even if the guard outlives the call
+/// site that acquired it (e.g. passed into an async completion callback).
+/// This is deliberately the *only* way to obtain or release a slot in that
+/// counter: there is no public constructor and no public field, so a policy
+/// or kernel cannot fabricate a proof or forget to release one short of
+/// leaking the guard itself (which fails closed — a leaked guard keeps
+/// blocking resize, never silently allows an unsafe one).
+pub struct RoutedResidencyGuard {
+    proof: onnx_runtime_ep_api::RoutedResidencyProof,
+    residency: Arc<CudaWeightResidency>,
+}
+
+impl RoutedResidencyGuard {
+    /// The typed proof this guard keeps alive.
+    pub fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
+        &self.proof
+    }
+}
+
+impl onnx_runtime_ep_api::RoutedResidencyGuardHandle for RoutedResidencyGuard {
+    fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
+        &self.proof
+    }
+}
+
+impl Drop for RoutedResidencyGuard {
+    fn drop(&mut self) {
+        self.residency
+            .routed_guards_active
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct PhysicalAdmission {
@@ -3070,6 +3115,7 @@ impl CudaWeightResidency {
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
             }),
+            routed_guards_active: AtomicU64::new(0),
         }
     }
 
@@ -3132,6 +3178,7 @@ impl CudaWeightResidency {
                 pin_hit_step: HashMap::new(),
                 pin_granule_hashes: HashMap::new(),
             }),
+            routed_guards_active: AtomicU64::new(0),
         })
     }
 
@@ -3257,6 +3304,34 @@ impl CudaWeightResidency {
             pending_deferred_releases,
             admission_in_flight,
             multi_device: device_count > 1,
+            routed_guards_active: self.routed_guards_active.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Prove residency for a QMoE-family dispatch and mint a guard that keeps
+    /// this residency's resize seam closed until the guard is dropped.
+    ///
+    /// This wraps [`onnx_runtime_ep_api::prove_routed_residency`] (pure
+    /// validation over `catalog`) with the one piece only this residency
+    /// owner can add: an unforgeable, counted lifetime. The bytes themselves
+    /// are already resident by the time this is called — every input this
+    /// method's caller (`execute_kernel`) is proving over has already been
+    /// paged in via the existing `resident_mapped` call on the same
+    /// dispatch — so this mints the typed attestation of *which* coverage
+    /// claim (whole-bank, today always) the caller may rely on, and blocks
+    /// `resize_safe_point` from reporting a safe point for as long as any
+    /// guard remains alive, so a concurrent resize cannot relocate or unmap
+    /// what this dispatch was just promised is resident.
+    pub fn acquire_routed_residency(
+        self: &Arc<Self>,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> RoutedResidencyGuard {
+        let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
+        self.routed_guards_active.fetch_add(1, Ordering::SeqCst);
+        RoutedResidencyGuard {
+            proof,
+            residency: Arc::clone(self),
         }
     }
 
@@ -7592,5 +7667,139 @@ mod tests {
             "5 grows of 100 with nothing evictable to shrink net +500 over the 400 byte start"
         );
         assert_eq!(governor.available(Tier::Device), 100);
+    }
+
+    // -- RoutedResidencyGuard / acquire_routed_residency --
+
+    fn expert_catalog(pageable: bool) -> onnx_runtime_loader::WeightRegionCatalog {
+        let mut layout = onnx_runtime_loader::ExpertTensorLayout {
+            version: 1,
+            experts: 3,
+            rows_per_expert: 2,
+            storage_elements_per_row: 4,
+            order: onnx_runtime_loader::ExpertStorageOrder::ExpertMajor,
+            quantization: Some(onnx_runtime_loader::ExpertQuantization {
+                bits: 4,
+                block_size: 16,
+                blocks_per_row: 1,
+            }),
+        };
+        if !pageable {
+            layout.order = onnx_runtime_loader::ExpertStorageOrder::Interleaved;
+        }
+        let weight = onnx_runtime_ir::WeightRef::External {
+            path: std::path::PathBuf::from("/nonexistent/weights.bin"),
+            offset: 16,
+            length: layout.experts * layout.rows_per_expert * layout.storage_elements_per_row,
+            dtype: DataType::Uint8,
+            dims: vec![
+                layout.experts,
+                layout.rows_per_expert,
+                layout.storage_elements_per_row,
+            ],
+        };
+        onnx_runtime_loader::WeightRegionCatalog::classify(&weight, layout)
+    }
+
+    /// A held guard always proves whole-bank today (no kernel surfaces
+    /// routed ids host-side) and increments the live-guard counter that
+    /// `resize_safe_point` folds into `routed_guards_active`; dropping it
+    /// releases the count.
+    #[test]
+    fn acquired_guard_reports_whole_bank_and_blocks_resize_until_dropped() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the routed-guard lifecycle check did NOT run.");
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(true);
+
+        assert!(residency.resize_safe_point(1).is_safe());
+
+        let guard = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        assert_eq!(
+            guard.proof().coverage(),
+            &onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
+                reason: onnx_runtime_ep_api::WholeBankReason::FusedRoutingHasNoHostVisibility
+            }
+        );
+
+        let point = residency.resize_safe_point(1);
+        assert_eq!(point.routed_guards_active, 1);
+        assert!(!point.is_safe());
+        let plan =
+            onnx_runtime_ep_api::plan_resize(grow_request(1), residency.resize_safe_point(1));
+        assert!(matches!(
+            plan,
+            onnx_runtime_ep_api::ResidencyResizePlan::Rejected {
+                reason: onnx_runtime_ep_api::ResizeRejection::NotSafePoint(_),
+                ..
+            }
+        ));
+
+        drop(guard);
+        assert!(residency.resize_safe_point(1).is_safe());
+    }
+
+    /// Two concurrently-held guards each count independently; a resize
+    /// stays blocked until *both* are dropped, and the counter is exact
+    /// (never negative, never double-released) across overlapping lifetimes.
+    #[test]
+    fn concurrent_guards_are_counted_independently_and_released_in_either_order() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!("SKIPPED (no CUDA runtime): the concurrent-guard count check did NOT run.");
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(true);
+
+        let guard_a = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        let guard_b = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::FusedRoutingUnknown,
+            &catalog,
+        );
+        assert_eq!(residency.resize_safe_point(1).routed_guards_active, 2);
+
+        drop(guard_a);
+        let mid_point = residency.resize_safe_point(1);
+        assert_eq!(mid_point.routed_guards_active, 1);
+        assert!(!mid_point.is_safe());
+
+        drop(guard_b);
+        assert!(residency.resize_safe_point(1).is_safe());
+    }
+
+    /// A `HostKnownExperts` requirement over a non-pageable catalog still
+    /// mints a guard (never fails/panics): it degrades to whole-bank with an
+    /// explicit reason, exactly as the pure `prove_routed_residency` function
+    /// does, and still counts toward `routed_guards_active`.
+    #[test]
+    fn guard_over_non_pageable_catalog_degrades_to_whole_bank_and_still_blocks_resize() {
+        let Ok(runtime) = crate::runtime::CudaRuntime::new(0).map(std::sync::Arc::new) else {
+            eprintln!(
+                "SKIPPED (no CUDA runtime): the non-pageable guard degradation check did NOT run."
+            );
+            return;
+        };
+        let residency = std::sync::Arc::new(CudaWeightResidency::new(runtime, 400));
+        let catalog = expert_catalog(false);
+
+        let guard = residency.acquire_routed_residency(
+            onnx_runtime_ep_api::RoutedResidencyRequirement::HostKnownExperts { experts: vec![0] },
+            &catalog,
+        );
+        assert!(matches!(
+            guard.proof().coverage(),
+            onnx_runtime_ep_api::RoutedResidencyCoverage::WholeBank {
+                reason: onnx_runtime_ep_api::WholeBankReason::InvalidExactSet(_)
+            }
+        ));
+        assert_eq!(residency.resize_safe_point(1).routed_guards_active, 1);
     }
 }

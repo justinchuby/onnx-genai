@@ -1320,6 +1320,40 @@ impl NBitsLayout {
     }
 }
 
+/// Decode one **int4** zero point without the generic layout's integer divisions.
+///
+/// [`NBitsLayout::zero_point`] is generic over `bits`, so it reaches
+/// `unpack`, which computes `8 / bits`, `index / values_per_byte` and
+/// `index % values_per_byte` from a runtime field. Every int4 decode kernel
+/// carries `#[target_feature(enable = "avx2,fma")]`, which stops it being
+/// inlined into its un-annotated caller, so `bits` stays opaque across that
+/// boundary and LLVM cannot fold those into shifts. The result is real integer
+/// division in an epilogue that runs once per `(block, column)` -- for a
+/// 4096-deep row at `block_size = 32` that is 128 blocks x 4 columns of
+/// division per output group, and `div` is both long-latency and poorly
+/// pipelined.
+///
+/// With `bits == 4` the whole computation is a shift and a mask. This is
+/// **bit-identical** to `layout.zero_point(points, block)` for `bits == 4`, not
+/// an approximation: `values_per_byte` is `8 / 4 == 2`, so `index / 2` is
+/// `index >> 1` and `index % 2` is `index & 1`; the shift amount
+/// `(index % 2) * bits` is `(block & 1) << 2`; `mask()` is `0x0f`; and the
+/// absent-zero-point default `1 << (bits - 1)` is `8`. Indexing is the same
+/// element, so out-of-range blocks still panic identically.
+///
+/// `int4_zero_point_matches_the_generic_layout` pins the equivalence over every
+/// block index and both zero-point states, so a future change to either
+/// definition cannot silently diverge. Exactness matters here beyond tidiness:
+/// this feeds the acc0 route, whose contract is exact agreement with the scalar
+/// reference (#1676).
+#[inline(always)]
+fn int4_zero_point(zero_points: Option<&[u8]>, block: usize) -> u8 {
+    match zero_points {
+        Some(points) => (points[block >> 1] >> ((block & 1) << 2)) & 0x0f,
+        None => 8,
+    }
+}
+
 struct PackedNBitsRow<'a> {
     values: &'a [u8],
     scales: &'a [f32],
@@ -3706,8 +3740,8 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] (about half the logical CPUs) instead of
-/// the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
+/// pool: [`default_persistent_threads`] (one worker per allowed physical core)
+/// instead of the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
 /// because its per-op fork/join regresses beyond that; the persistent pool
 /// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
 /// with cores until it hits the memory-bandwidth knee (measured plateau ~half
@@ -3721,6 +3755,7 @@ pub fn configured_persistent_decode_threads() -> Option<usize> {
         decode_threads_override(),
         value.as_deref(),
         available,
+        crate::core_topology::allowed_physical_cores(),
     );
     // Snapdragon/X Elite style ARM64 hosts have measured their decode roofline
     // at 6--8 workers, and the KAI-style packed SDOT path still scales from the
@@ -4399,10 +4434,54 @@ fn prefill_worker_name(index: usize) -> String {
 /// *spin* before parking, a fully-subscribed pool starves the dispatcher and
 /// collapses throughput (measured 1.4 tok/s at 96 workers vs 28.7 at 48 on a
 /// 96-logical-CPU host); half sits at the measured plateau while avoiding that
-/// cliff, and on SMT hosts it maps to roughly the physical-core count.
-fn default_persistent_threads(available: usize) -> Option<usize> {
+/// cliff.
+///
+/// # Why `available / 2` is only a proxy
+///
+/// The rule the measurements actually support is *one worker per physical
+/// core*. Halving the CPU count is a stand-in that agrees with it only when the
+/// process can see every logical CPU on an SMT host. It disagrees badly the
+/// moment the allowed set is already one CPU per core: `taskset -c 0,2,...,30`
+/// on a 16-core/32-thread host leaves `available == 16`, all of them distinct
+/// cores, and halving builds an **8**-worker pool on 16 reserved cores. The
+/// operator asked for the machine and got half of it, silently, because the
+/// proxy cannot tell a 16-CPU SMT-free set from half of a 32-CPU SMT set.
+///
+/// So take the real answer when the topology is discoverable and the allowed
+/// set is known ([`crate::core_topology::allowed_physical_cores`]), and fall
+/// back to the halving proxy only when it is not. `None` from the topology
+/// means "unknown", never "one" — capping on a guess is how a 32-thread host
+/// silently becomes a 1-thread host.
+///
+/// # What this is *not* evidenced by
+///
+/// Both measurements behind the old rule — the plateau at "~half the logical
+/// CPUs" on a 2-socket Xeon 8480C, and the 1.4 tok/s at 96 workers against 28.7
+/// at 48 on a 96-logical-CPU host — were taken on SMT hosts, where half the
+/// logical CPUs *is* the physical-core count. Neither one distinguishes the two
+/// rules, so neither one supports this change on a **non-SMT** host, where
+/// `cores == available` and the default moves from half the machine to all of
+/// it. That case is an inference, not a measurement, and no non-SMT host was
+/// available to check it.
+///
+/// What makes the inference safe rather than merely plausible is that the
+/// consuming path reserves dispatcher headroom:
+/// `decode_spmd`'s `reserve_single_group_headroom` turns a request for `n`
+/// on `n` cores into `n - 1` spawned workers plus the inline dispatcher's own
+/// shard, so the fully-subscribed spinning layout that produced the 1.4 tok/s
+/// cliff is not reachable through this default. Verified on a 16-core host
+/// pinned to one CPU per core: 15 threads named `onnx-genai-spmd` on 15 leader
+/// CPUs, with the sixteenth core left free for the dispatcher.
+fn default_persistent_threads(
+    available: usize,
+    allowed_physical_cores: Option<usize>,
+) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    Some((available / 2).max(1))
+    let default = match allowed_physical_cores {
+        Some(cores) if cores > 0 => cores,
+        _ => available / 2,
+    };
+    Some(default.clamp(1, available))
 }
 
 /// Query the performance-core count on Apple Silicon via sysctl.
@@ -4436,16 +4515,17 @@ fn performance_core_count() -> Option<usize> {
 /// unparseable value falls back to [`default_persistent_threads`].
 #[cfg(test)]
 fn resolve_persistent_decode_threads(raw: Option<&str>, available: usize) -> Option<usize> {
-    resolve_persistent_decode_threads_with_override(None, raw, available)
+    resolve_persistent_decode_threads_with_override(None, raw, available, None)
 }
 
 fn resolve_persistent_decode_threads_with_override(
     override_threads: Option<usize>,
     raw: Option<&str>,
     available: usize,
+    allowed_physical_cores: Option<usize>,
 ) -> Option<usize> {
     let available = std::num::NonZeroUsize::new(available)?.get();
-    let default = default_persistent_threads(available)?;
+    let default = default_persistent_threads(available, allowed_physical_cores)?;
     let threads = match override_threads {
         Some(threads) => threads,
         None => match raw {
@@ -4782,18 +4862,22 @@ thread_local! {
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
 /// requested or the host cannot be split (fallback, logged once).
 ///
-/// It is sized from [`configured_persistent_decode_threads`] (about half the
-/// logical CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is
+/// It is sized from [`configured_persistent_decode_threads`] (one worker per
+/// allowed physical core), *not* the flat pool's eight-worker ceiling. `numa-split` is
 /// the two-level, node-pinned mirror of the persistent SPMD pool (see
 /// [`crate::decode_spmd`]) and its whole purpose is to reach *both* sockets'
 /// memory bandwidth; the eight-worker flat ceiling would leave only ~four
 /// row-sharded workers per node, far too few to saturate either memory
 /// controller, so it could never realize the bandwidth win the layout exists
-/// for. Half the logical CPUs, split across the nodes, lands each per-node
-/// sub-pool at the measured bandwidth knee while leaving cores for the
-/// dispatcher and co-tenants (a *fully*-subscribed split oversubscribes the
-/// cores and collapses throughput). `ONNX_GENAI_CPU_DECODE_THREADS` still
-/// overrides the count (and `0` opts out).
+/// for. One worker per physical core, split across the nodes, lands each
+/// per-node sub-pool at the measured bandwidth knee; [`reserve_split_headroom`]
+/// is what then leaves room for the dispatcher, since a *fully*-subscribed split
+/// oversubscribes the cores and collapses throughput.
+/// `ONNX_GENAI_CPU_DECODE_THREADS` still overrides the count (and `0` opts out).
+///
+/// Note the per-node reserve frees one *logical* CPU rather than a physical
+/// core, so on an SMT host the on-node dispatcher gets a sibling rather than a
+/// free core; tracked separately as issue 1791.
 fn numa_pools() -> Option<&'static crate::decode_numa::NumaDecodePools> {
     static NUMA_POOLS: OnceLock<Option<crate::decode_numa::NumaDecodePools>> = OnceLock::new();
     NUMA_POOLS
@@ -7396,6 +7480,12 @@ unsafe fn borrowed_int4_nblock4_avx2(
     k: usize,
     out: &mut [f32],
 ) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
     use std::arch::x86_64::*;
 
     let group = packed_rows.len();
@@ -7414,7 +7504,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
                 let block_values =
                     &packed_rows[c][block * packed_block_size..(block + 1) * packed_block_size];
                 let scale = scales.get(scale_bases[c] + block);
-                let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+                let zero_point = int4_zero_point(zp_rows[c], block) as f32;
                 let mut dot = 0.0f32;
                 for (byte_index, &byte) in block_values.iter().enumerate() {
                     let within = byte_index * 2;
@@ -7467,7 +7557,7 @@ unsafe fn borrowed_int4_nblock4_avx2(
         }
         for c in 0..group {
             let scale = scales.get(scale_bases[c] + block);
-            let zero_point = layout.zero_point(zp_rows[c], block) as f32;
+            let zero_point = int4_zero_point(zp_rows[c], block) as f32;
             acc[c] = _mm256_fmadd_ps(blk[c], _mm256_set1_ps(scale), acc[c]);
             correction[c] += scale * zero_point * activation_sums[block];
         }
@@ -7510,6 +7600,11 @@ fn borrowed_int4_output_element(
     k: usize,
     dot_kernel: DotKernel,
 ) -> f32 {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
     // On non-x86 targets `dot_kernel` drives no fast path; discard it to keep
     // `-D warnings` happy, mirroring `borrowed_affine_int4_matmul`.
     #[cfg(not(target_arch = "x86_64"))]
@@ -7521,7 +7616,7 @@ fn borrowed_int4_output_element(
         let block_values = &packed_row
             [block * layout.packed_block_size()..(block + 1) * layout.packed_block_size()];
         let scale = scales.get(scale_base + block);
-        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let zero_point = int4_zero_point(zp_row, block) as f32;
         let mut dot;
         #[cfg(target_arch = "aarch64")]
         if valid == 32 && block_size == 32 {
@@ -7898,6 +7993,12 @@ unsafe fn borrowed_int4_rowblock_avx2(
     k: usize,
     out: &mut [f32],
 ) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
     use std::arch::x86_64::*;
 
     let mask = _mm_set1_epi8(0x0f);
@@ -7910,7 +8011,7 @@ unsafe fn borrowed_int4_rowblock_avx2(
         let depth_start = block * block_size;
         let valid = k.saturating_sub(depth_start).min(block_size);
         let scale = scales.get(scale_base + block);
-        let zero_point = layout.zero_point(zp_row, block) as f32;
+        let zero_point = int4_zero_point(zp_row, block) as f32;
         let block_values = &packed_row[block * packed_block_size..(block + 1) * packed_block_size];
 
         if valid != block_size || !block_size.is_multiple_of(32) {
@@ -10399,6 +10500,50 @@ mod tests {
     ///
     /// The shapes here are the ones where this bites: long `k`, same-sign
     /// terms, so cancellation cannot mask the drift.
+    /// Pins `int4_zero_point` bit-identical to the generic
+    /// `NBitsLayout::zero_point` it specialises.
+    ///
+    /// The specialisation exists to delete two runtime integer divisions from
+    /// an epilogue that runs once per `(block, column)`; the divisions come
+    /// from `bits` being opaque across the kernels' `#[target_feature]`
+    /// boundary. That is a pure code-generation change and must not move a
+    /// single result bit, because it feeds the exact-accuracy acc0 route
+    /// (#1676), whose whole contract is agreeing with the scalar reference
+    /// exactly. A one-nibble divergence here would be an accuracy regression
+    /// disguised as an optimisation.
+    ///
+    /// Both zero-point states and every nibble position are covered: the packed
+    /// byte holds two blocks, so an off-by-one in the shift or the index swaps
+    /// even and odd blocks -- which a run of equal zero points would hide, hence
+    /// the distinct per-nibble values.
+    #[test]
+    fn int4_zero_point_matches_the_generic_layout() {
+        let layout = NBitsLayout {
+            bits: 4,
+            block_size: 32,
+        };
+        // Distinct low/high nibbles per byte, so even and odd blocks can never
+        // be confused for one another.
+        let packed: Vec<u8> = (0u8..64)
+            .map(|i| (i.wrapping_mul(7) & 0x0f) | ((i.wrapping_mul(11) & 0x0f) << 4))
+            .collect();
+
+        for block in 0..packed.len() * 2 {
+            assert_eq!(
+                int4_zero_point(Some(&packed), block),
+                layout.zero_point(Some(&packed), block),
+                "block {block}: specialised int4 decode diverged from the generic layout"
+            );
+        }
+
+        // The absent-zero-point default must also match, at every block, and be
+        // the int4 midpoint rather than whatever the last `Some` returned.
+        for block in 0..8 {
+            assert_eq!(int4_zero_point(None, block), layout.zero_point(None, block));
+            assert_eq!(int4_zero_point(None, block), 8);
+        }
+    }
+
     #[test]
     fn reassociated_dot_is_at_least_as_accurate_as_the_serial_chain() {
         fn serial(a: &[f32], b: &[f32]) -> f32 {
@@ -16917,18 +17062,44 @@ mod tests {
     }
 
     #[test]
-    fn persistent_decode_thread_default_is_half_the_logical_cpus() {
+    fn persistent_decode_thread_default_is_half_the_logical_cpus_when_topology_is_unknown() {
         // The persistent pool scales past the flat pool's 8-worker ceiling: unset
         // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
-        assert_eq!(default_persistent_threads(96), Some(48));
-        assert_eq!(default_persistent_threads(8), Some(4));
-        assert_eq!(default_persistent_threads(4), Some(2));
-        assert_eq!(default_persistent_threads(2), Some(1));
-        assert_eq!(default_persistent_threads(1), Some(1));
-        assert_eq!(default_persistent_threads(0), None);
+        // With no discoverable core count the halving proxy still applies.
+        assert_eq!(default_persistent_threads(96, None), Some(48));
+        assert_eq!(default_persistent_threads(8, None), Some(4));
+        assert_eq!(default_persistent_threads(4, None), Some(2));
+        assert_eq!(default_persistent_threads(2, None), Some(1));
+        assert_eq!(default_persistent_threads(1, None), Some(1));
+        assert_eq!(default_persistent_threads(0, None), None);
         // Distinct from the flat default on a big host (48 vs 8) -- proving the
         // persistent path does not inherit the fork/join-bound cap.
-        assert_ne!(default_persistent_threads(96), default_decode_threads(96));
+        assert_ne!(
+            default_persistent_threads(96, None),
+            default_decode_threads(96)
+        );
+    }
+
+    /// The halving proxy is wrong whenever the allowed set is *already* one CPU
+    /// per physical core, which is what `taskset -c 0,2,...` produces on an SMT
+    /// host and what every careful benchmark on such a host uses.
+    #[test]
+    fn persistent_decode_default_uses_physical_cores_not_half_the_cpuset() {
+        // 16 CPUs that are 16 distinct cores: the whole point of the pin is to
+        // get 16 workers. Halving would build 8 and report nothing.
+        assert_eq!(default_persistent_threads(16, Some(16)), Some(16));
+        // The unpinned SMT case must be unchanged: 32 CPUs, 16 cores -> 16,
+        // which is exactly what the halving proxy used to produce.
+        assert_eq!(default_persistent_threads(32, Some(16)), Some(16));
+        assert_eq!(default_persistent_threads(96, Some(48)), Some(48));
+        // A core count can never exceed the CPUs actually available, and can
+        // never round down to zero.
+        assert_eq!(default_persistent_threads(4, Some(9)), Some(4));
+        // `Some(0)` is nonsense from the topology layer; treat it as unknown
+        // rather than building a zero-worker pool.
+        assert_eq!(default_persistent_threads(8, Some(0)), Some(4));
+        // Unknown topology keeps the historical behaviour exactly.
+        assert_eq!(default_persistent_threads(16, None), Some(8));
     }
 
     #[test]
@@ -17012,7 +17183,7 @@ mod tests {
             Some(6)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96),
+            resolve_persistent_decode_threads_with_override(Some(8), Some("32"), 96, None),
             Some(8)
         );
         assert_eq!(
@@ -17020,7 +17191,7 @@ mod tests {
             Some(12)
         );
         assert_eq!(
-            resolve_persistent_decode_threads_with_override(None, None, 96),
+            resolve_persistent_decode_threads_with_override(None, None, 96, None),
             Some(48),
             "the uncapped automatic default must remain unchanged"
         );
@@ -17045,7 +17216,7 @@ mod tests {
         assert_ne!(default_dense_decode_threads(96), default_decode_threads(96));
         assert_ne!(
             default_dense_decode_threads(96),
-            default_persistent_threads(96)
+            default_persistent_threads(96, None)
         );
     }
 

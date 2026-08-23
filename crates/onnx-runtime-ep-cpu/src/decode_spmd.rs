@@ -68,8 +68,10 @@
 //! under greedy decode.
 //!
 //! The worker count is
-//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (about
-//! half the logical CPUs); a `THREADS=0` opt-out leaves the decode path unchanged.
+//! [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`] (one
+//! worker per *allowed physical core*, falling back to half the logical CPUs
+//! only when the core topology is undiscoverable); a `THREADS=0` opt-out leaves
+//! the decode path unchanged.
 //!
 //! # Precedence when on (default or `=1`) vs the affinity control
 //!
@@ -1726,8 +1728,9 @@ pub fn shutdown_pools() {
 
 /// Resolve the persistent pool's worker count. Honors `ONNX_GENAI_CPU_DECODE_THREADS`
 /// when set (`0` opts out); when unset it uses the persistent-specific default
-/// (about half the logical CPUs), *not* the flat pool's eight-worker ceiling --
-/// see [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
+/// (one worker per allowed physical core), *not* the flat pool's eight-worker
+/// ceiling -- see
+/// [`crate::kernels::matmul_nbits::configured_persistent_decode_threads`].
 fn default_threads() -> Option<usize> {
     crate::kernels::matmul_nbits::configured_persistent_decode_threads()
 }
@@ -2165,10 +2168,16 @@ fn node_shards_with(
 /// run; reserving *per node* (see [`reserve_split_headroom`]) rather than once
 /// globally guarantees the spare core lands on whichever socket the scheduler
 /// places the dispatcher on, and keeps every node's completion-counter reads
-/// unblocked on a NUMA-split layout. One is enough because the workers already
-/// plateau around half the logical CPUs (memory-bandwidth bound), so giving up
-/// the single highest-index core costs nothing measurable while removing the
+/// unblocked on a NUMA-split layout. One is enough because there is exactly one
+/// inline dispatcher thread to house, so giving up the single highest-index core
+/// costs one worker's share of a bandwidth-bound loop while removing the
 /// starvation cliff.
+///
+/// This used to be justified by the workers plateauing "around half the logical
+/// CPUs", which stopped being the sizing rule when the default became one worker
+/// per allowed physical core: on a non-SMT host the pool is now deliberately
+/// wide enough that this reserve is what keeps it from being *fully*
+/// subscribed.
 const DISPATCHER_RESERVED_CPUS: usize = 1;
 
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]

@@ -730,6 +730,12 @@ pub struct ResizeSafePoint {
     /// devices, so a resize under TP must fail closed rather than invent
     /// distributed synchronization.
     pub multi_device: bool,
+    /// Count of live [`RoutedResidencyProof`] guards. Any live guard —
+    /// whole-bank or exact-set — promised its holder that the covered region
+    /// set stays resident and unrelocated for the guard's lifetime; a resize
+    /// that committed while one is alive could break that promise, so a
+    /// nonzero count fails the safe-point check closed.
+    pub routed_guards_active: u64,
 }
 
 impl ResizeSafePoint {
@@ -739,6 +745,7 @@ impl ResizeSafePoint {
             && self.pending_deferred_releases == 0
             && !self.admission_in_flight
             && !self.multi_device
+            && self.routed_guards_active == 0
     }
 
     /// Human-readable reason the current snapshot is not a safe point, or
@@ -759,6 +766,12 @@ impl ResizeSafePoint {
             return Some(
                 "no existing barrier/authority coordinates a resize across devices/TP; \
                  failing closed rather than inventing distributed synchronization",
+            );
+        }
+        if self.routed_guards_active > 0 {
+            return Some(
+                "a RoutedResidencyProof guard is alive and promised its covered region \
+                 set stays resident and unrelocated for its lifetime",
             );
         }
         None
@@ -854,6 +867,157 @@ pub fn plan_resize(
         };
     }
     ResidencyResizePlan::Accepted(request)
+}
+
+/// What a dispatch is asking to be proven resident before it launches.
+///
+/// Fused-routing kernels (today, every shipped `QMoE`/`BlockQuantizedMoE`
+/// CUDA kernel) select experts entirely on-device inside the same launch that
+/// consumes their weights — the host never sees `selected_experts` before or
+/// during dispatch. [`RoutedResidencyRequirement::FusedRoutingUnknown`] names
+/// that honestly. [`RoutedResidencyRequirement::HostKnownExperts`] exists for
+/// a future (or non-fused) kernel that computes routing host-side, or on a
+/// separate pre-pass, before the weight-touching sub-kernels launch; no
+/// kernel in this codebase constructs it today.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutedResidencyRequirement {
+    /// The caller cannot name the routed set before launch. The only lawful
+    /// proof for this requirement is [`RoutedResidencyCoverage::WholeBank`].
+    FusedRoutingUnknown,
+    /// The caller already knows exactly which experts this dispatch will
+    /// touch (e.g. a host-side or pre-pass routing step ran first).
+    /// `experts` need not be sorted or deduplicated; [`prove_routed_residency`]
+    /// normalizes and validates it.
+    HostKnownExperts { experts: Vec<usize> },
+}
+
+/// Why a [`RoutedResidencyProof`] covers the whole bank instead of an exact
+/// expert set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WholeBankReason {
+    /// The requirement was [`RoutedResidencyRequirement::FusedRoutingUnknown`]
+    /// — routing is fused into the kernel and no host pre-launch visibility
+    /// exists. This is the only reachable reason for QMoE/BlockQuantizedMoE
+    /// as shipped today.
+    FusedRoutingHasNoHostVisibility,
+    /// Host-known expert IDs were supplied but failed validation (an
+    /// out-of-range index, or the catalog itself is non-pageable), so the
+    /// proof safely degrades to whole-bank rather than risk exposing a cold
+    /// expert.
+    InvalidExactSet(String),
+}
+
+/// What a [`RoutedResidencyProof`] actually covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoutedResidencyCoverage {
+    /// Every expert region in the bank is proven resident for the guard's
+    /// lifetime. `reason` records why an exact set was not used.
+    WholeBank { reason: WholeBankReason },
+    /// Exactly these experts (sorted ascending, deduplicated) are proven
+    /// resident; no other expert region is guaranteed resident by this proof.
+    ExactExperts { experts: Vec<usize> },
+}
+
+/// An unforgeable, RAII-shaped proof that a QMoE/BlockQuantizedMoE dispatch's
+/// expert-bank residency requirement has been satisfied for the lifetime of
+/// this value.
+///
+/// Only [`prove_routed_residency`] can construct one (the private `_sealed`
+/// field has no public constructor and no field a caller outside this module
+/// can set), so a kernel or policy cannot fabricate a proof to bypass the
+/// residency owner. While a guard is alive, [`RoutedResidencyProof::blocks_resize`]
+/// tells the resize seam (`plan_resize`/`ResizeSafePoint`) to fail closed
+/// rather than relocate or unmap a region this proof promised was resident —
+/// dropping the guard (stream completion / deferred release settled) is what
+/// releases that constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoutedResidencyProof {
+    coverage: RoutedResidencyCoverage,
+    _sealed: (),
+}
+
+impl RoutedResidencyProof {
+    pub fn coverage(&self) -> &RoutedResidencyCoverage {
+        &self.coverage
+    }
+
+    /// `true` for every proof: a live guard of any coverage (whole-bank or
+    /// exact-set) blocks a concurrent resize, because a resize that succeeded
+    /// mid-dispatch could relocate or unmap a region this proof promised was
+    /// resident for the launch's lifetime.
+    pub fn blocks_resize(&self) -> bool {
+        true
+    }
+}
+
+/// Object-safe handle for a live per-EP routed-residency guard (e.g.
+/// `onnx-runtime-ep-cuda::weight_paging::RoutedResidencyGuard`), so
+/// [`crate::provider::ExecutionProvider::acquire_routed_residency`] can
+/// return one without this crate depending on any specific EP backend.
+/// Dropping the box is what releases the guard; `proof` exposes the typed
+/// attestation it holds.
+pub trait RoutedResidencyGuardHandle: Send + Sync {
+    fn proof(&self) -> &RoutedResidencyProof;
+}
+
+/// The one function that turns a [`RoutedResidencyRequirement`] into a
+/// [`RoutedResidencyProof`].
+///
+/// This is pure validation over `catalog`; it never allocates, copies, pages,
+/// or synchronizes. The residency owner (`CudaWeightResidency`) is what
+/// already guarantees every expert's bytes are resident before this is
+/// called (today: whole-initializer paging, so any coverage this returns is
+/// already true by construction); this function's job is only to produce the
+/// typed, unforgeable attestation of *which* coverage claim dispatch may rely
+/// on, and to refuse (degrading to whole-bank) rather than certify an
+/// exact-set claim that fails validation.
+///
+/// * [`RoutedResidencyRequirement::FusedRoutingUnknown`] always yields
+///   [`RoutedResidencyCoverage::WholeBank`] with
+///   [`WholeBankReason::FusedRoutingHasNoHostVisibility`] — the only lawful
+///   proof when the host has no pre-launch visibility into the routed set.
+/// * [`RoutedResidencyRequirement::HostKnownExperts`] yields
+///   [`RoutedResidencyCoverage::ExactExperts`] (sorted, deduplicated) only
+///   when the catalog is pageable and every index is in range; otherwise it
+///   degrades to [`RoutedResidencyCoverage::WholeBank`] with
+///   [`WholeBankReason::InvalidExactSet`].
+pub fn prove_routed_residency(
+    requirement: RoutedResidencyRequirement,
+    catalog: &onnx_runtime_loader::WeightRegionCatalog,
+) -> RoutedResidencyProof {
+    let coverage = match requirement {
+        RoutedResidencyRequirement::FusedRoutingUnknown => RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::FusedRoutingHasNoHostVisibility,
+        },
+        RoutedResidencyRequirement::HostKnownExperts { experts } => {
+            if !catalog.is_pageable() {
+                RoutedResidencyCoverage::WholeBank {
+                    reason: WholeBankReason::InvalidExactSet(
+                        "catalog is not pageable; cannot certify an exact expert set".into(),
+                    ),
+                }
+            } else {
+                let mut sorted = experts;
+                sorted.sort_unstable();
+                sorted.dedup();
+                match sorted
+                    .iter()
+                    .find(|&&expert| catalog.region(expert).is_none())
+                {
+                    Some(&bad) => RoutedResidencyCoverage::WholeBank {
+                        reason: WholeBankReason::InvalidExactSet(format!(
+                            "expert index {bad} is out of range for this catalog"
+                        )),
+                    },
+                    None => RoutedResidencyCoverage::ExactExperts { experts: sorted },
+                }
+            }
+        }
+    };
+    RoutedResidencyProof {
+        coverage,
+        _sealed: (),
+    }
 }
 
 /// Build a validated [`ResidencyPlan`] from the per-expert region candidates
@@ -1391,6 +1555,7 @@ mod tests {
             pending_deferred_releases: 5,
             admission_in_flight: true,
             multi_device: true,
+            routed_guards_active: 1,
         };
         assert!(!point.is_safe());
         assert_eq!(
@@ -1418,5 +1583,96 @@ mod tests {
             ..success
         };
         assert!(!failure.is_success());
+    }
+
+    #[test]
+    fn fused_routing_unknown_always_yields_whole_bank() {
+        let catalog = pageable_catalog();
+        let proof =
+            prove_routed_residency(RoutedResidencyRequirement::FusedRoutingUnknown, &catalog);
+        assert_eq!(
+            proof.coverage(),
+            &RoutedResidencyCoverage::WholeBank {
+                reason: WholeBankReason::FusedRoutingHasNoHostVisibility
+            }
+        );
+        assert!(proof.blocks_resize());
+    }
+
+    #[test]
+    fn host_known_experts_over_a_pageable_catalog_yields_exact_sorted_deduped_set() {
+        let catalog = pageable_catalog();
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts {
+                experts: vec![2, 0, 0, 1],
+            },
+            &catalog,
+        );
+        assert_eq!(
+            proof.coverage(),
+            &RoutedResidencyCoverage::ExactExperts {
+                experts: vec![0, 1, 2]
+            }
+        );
+    }
+
+    #[test]
+    fn host_known_experts_over_a_non_pageable_catalog_degrades_to_whole_bank_with_reason() {
+        let catalog = non_pageable_catalog();
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts { experts: vec![0] },
+            &catalog,
+        );
+        let RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::InvalidExactSet(reason),
+        } = proof.coverage()
+        else {
+            panic!("a non-pageable catalog must never certify an exact expert set");
+        };
+        assert!(reason.contains("not pageable"));
+    }
+
+    #[test]
+    fn host_known_experts_with_an_out_of_range_index_degrades_to_whole_bank_with_reason() {
+        let catalog = pageable_catalog();
+        // `expert_layout()` has 3 experts (indices 0..=2); 99 is out of range.
+        let proof = prove_routed_residency(
+            RoutedResidencyRequirement::HostKnownExperts {
+                experts: vec![0, 99],
+            },
+            &catalog,
+        );
+        let RoutedResidencyCoverage::WholeBank {
+            reason: WholeBankReason::InvalidExactSet(reason),
+        } = proof.coverage()
+        else {
+            panic!("an out-of-range expert index must never be certified");
+        };
+        assert!(reason.contains("99"));
+    }
+
+    #[test]
+    fn resize_safe_point_fails_closed_while_a_routed_guard_is_active() {
+        let point = ResizeSafePoint {
+            routed_guards_active: 1,
+            ..Default::default()
+        };
+        assert!(!point.is_safe());
+        assert_eq!(
+            point.blocking_reason(),
+            Some(
+                "a RoutedResidencyProof guard is alive and promised its covered region \
+                 set stays resident and unrelocated for its lifetime"
+            )
+        );
+    }
+
+    #[test]
+    fn resize_safe_point_is_safe_with_no_routed_guards() {
+        let point = ResizeSafePoint {
+            routed_guards_active: 0,
+            ..Default::default()
+        };
+        assert!(point.is_safe());
     }
 }

@@ -70,8 +70,10 @@ pub use weight::{
     ResidencyDecision, ResidencyDegradationReason, ResidencyPlan, ResidencyPolicy,
     ResidencyPolicyInput, ResidencyResizeOutcome, ResidencyResizePlan, ResidencyResizeRequest,
     ResidentWeight, ResidentWeightMaterializer, ResizeDirection, ResizeRejection, ResizeSafePoint,
-    WeightHandle, WeightHandleError, WholeBankResidentPolicy, lazy_weight_candidates,
-    plan_residency, plan_resize,
+    RoutedResidencyCoverage, RoutedResidencyGuardHandle, RoutedResidencyProof,
+    RoutedResidencyRequirement, WeightHandle, WeightHandleError, WholeBankReason,
+    WholeBankResidentPolicy, lazy_weight_candidates, plan_residency, plan_resize,
+    prove_routed_residency,
 };
 
 // Re-export the device vocabulary from the IR so EP authors have one import.

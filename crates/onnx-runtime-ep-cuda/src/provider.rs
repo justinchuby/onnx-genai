@@ -2109,6 +2109,31 @@ impl ExecutionProvider for CudaExecutionProvider {
         )))
     }
 
+    /// Mint a routed-residency guard for a QMoE-family dispatch. Returns
+    /// `Ok(None)` when offload is disabled (nothing pages lazily, so nothing
+    /// needs a guard against a resize the executor's default path never
+    /// initiates); when offload is enabled this always proves whole-bank
+    /// today, because no QMoE or BlockQuantizedMoE kernel in this codebase
+    /// surfaces `selected_experts` to the host before or during dispatch —
+    /// see [`onnx_runtime_ep_api::prove_routed_residency`] for why that makes
+    /// [`onnx_runtime_ep_api::RoutedResidencyRequirement::HostKnownExperts`]
+    /// structurally unreachable from here as shipped.
+    fn acquire_routed_residency(
+        &self,
+        _key: u64,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> Result<Option<Box<dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle>>> {
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(None);
+        };
+        let guard = residency.acquire_routed_residency(requirement, catalog);
+        Ok(Some(Box::new(guard)
+            as Box<
+                dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle,
+            >))
+    }
+
     fn prefetch_lazy_weight(
         &self,
         key: u64,
