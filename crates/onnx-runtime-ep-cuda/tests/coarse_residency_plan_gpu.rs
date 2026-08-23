@@ -41,6 +41,37 @@
 //!    that lacks host-NUMA support.  The path is exercised implicitly: if the
 //!    GPU under test lacks host-NUMA support, every GPU test in this file
 //!    auto-skips via `host_numa_capability`'s `Unsupported` branch.
+//!
+//! ## Cycle-19 fix: cross-tensor expert-group hot-set agreement (tests 9-13)
+//!
+//! Item 7 from Cycle 17 was only half-fixed as of the prior revision
+//! (`0215e6663`): `expert_group_member_failure_forces_whole_group_fallback`
+//! (test 8, above) only exercised a **capability** mismatch between group
+//! members, never a case where two members individually pass every check but
+//! propose *different* hot-expert partitions for the same logical expert
+//! bank. Tests 9-13 close that gap:
+//!
+//! 9. `expert_group_equal_hot_sets_normalize_and_transition_together` — two
+//!    members whose *raw* profile lists differ in order and carry duplicates
+//!    but normalize to the identical hot-expert set: the group proceeds
+//!    all-or-none and both members transition.
+//! 10. `expert_group_disagreeing_hot_sets_rejects_whole_group_with_zero_side_effects`
+//!     — two individually-valid, individually-aligned members with genuinely
+//!     different hot sets over the *same* expert-count domain: the whole
+//!     group is rejected before any mutation.
+//! 11. `expert_group_expert_count_domain_mismatch_rejects_whole_group_with_zero_side_effects`
+//!     — two members whose raw hot-expert indices are numerically identical
+//!     but drawn from different expert-count domains (4 vs 8): rejected as a
+//!     domain mismatch, distinct from a hot-set mismatch.
+//! 12. `expert_group_unsupported_member_metadata_rejects_whole_group_before_mutation`
+//!     — one member's catalog is non-pageable at application time (distinct
+//!     from test 8's sub-granule-alignment failure): the whole group is
+//!     rejected before any mutation.
+//! 13. `expert_group_successful_transition_then_later_member_fault_causes_full_group_rollback`
+//!     — both members agree and pass; the group proceeds; a fault forced on
+//!     the *later*-ordered member's first driver call proves the *earlier*
+//!     member's already-committed ranges are still fully and cleanly rolled
+//!     back, using the existing (item 1) range-level rollback machinery.
 
 #![cfg(feature = "gpu-tests")]
 #![allow(
@@ -68,7 +99,7 @@ use onnx_runtime_ep_cuda::coarse_residency::{
     apply_residency_plan_at_boundary_with_phase8_faults,
 };
 use onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency;
-use onnx_runtime_ir::{DataType, WeightRef};
+use onnx_runtime_ir::{DataType, TensorData, WeightRef};
 use onnx_runtime_ir::{NodeId, ValueId};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
@@ -1398,5 +1429,889 @@ fn expert_group_member_failure_forces_whole_group_fallback() {
 
     println!(
         "test8 PASSED: one misaligned expert-group member blocks the WHOLE group, no partial tiering ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: equal hot sets (different raw order + duplicates) normalize and
+// the group proceeds all-or-none.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_equal_hot_sets_normalize_and_transition_together() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== test9: expert_group_equal_hot_sets_normalize_and_transition_together ===");
+
+    let provider = match provider_or_skip("test9") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test9: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    let n_experts = 4_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(90),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(91),
+    );
+    let pattern_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 3) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc2, base_fc2).expect("htod fc2");
+    }
+
+    let value_fc1 = ValueId(900);
+    let catalog_fc1 = make_aligned_catalog(n_experts, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(901);
+    let catalog_fc2 = make_aligned_catalog(n_experts, gran, total_bytes);
+    assert!(catalog_fc2.is_pageable());
+
+    // fc1's raw profile is reordered and carries a duplicate; fc2's is given
+    // plainly. Both normalize to the SAME logical hot set {0, 2}.
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![2, 0, 2, 0]);
+    profile.insert(value_fc2, vec![0, 2]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(value_fc2, Arc::clone(&allocator_fc2));
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert!(
+        outcome.fallback_reason.is_none(),
+        "no structural fallback expected, got: {:?}",
+        outcome.fallback_reason
+    );
+    assert_eq!(
+        outcome.values_touched, 2,
+        "both agreeing group members must transition, got values_touched={}",
+        outcome.values_touched
+    );
+    assert_eq!(
+        outcome.committed_values.len(),
+        2,
+        "both members must appear in committed_values, got: {:?}",
+        outcome.committed_values
+    );
+    assert!(
+        outcome.committed_values.contains(&value_fc1)
+            && outcome.committed_values.contains(&value_fc2),
+        "expected both fc1 and fc2 in committed_values, got: {:?}",
+        outcome.committed_values
+    );
+    assert!(
+        outcome.per_value_fallbacks.is_empty(),
+        "no fallback expected for either member, got: {:?}",
+        outcome.per_value_fallbacks
+    );
+    let expected_host_bytes = (2 * (2 * gran)) as u64; // 2 cold experts * gran, * 2 members
+    assert_eq!(
+        outcome.host_bytes_committed, expected_host_bytes,
+        "expected host_bytes_committed={expected_host_bytes}, got {}",
+        outcome.host_bytes_committed
+    );
+
+    for (base, pattern, label) in [
+        (base_fc1, &pattern_fc1, "fc1"),
+        (base_fc2, &pattern_fc2, "fc2"),
+    ] {
+        let mut readback = vec![0u8; total_bytes];
+        unsafe {
+            runtime.dtoh(&mut readback, base).expect("dtoh readback");
+        }
+        assert_eq!(*pattern, readback, "{label} content corrupted after plan");
+    }
+
+    println!(
+        "test9 PASSED: reordered/duplicated-but-equal hot sets normalize; group transitions together ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: two individually-valid members with genuinely DIFFERENT hot sets
+// over the same expert-count domain reject the whole group, zero side effects.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_disagreeing_hot_sets_rejects_whole_group_with_zero_side_effects() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\n=== test10: expert_group_disagreeing_hot_sets_rejects_whole_group_with_zero_side_effects ==="
+    );
+
+    let provider = match provider_or_skip("test10") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test10: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    let n_experts = 4_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(100),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+    let (fc1_committed_before, _) = allocator_fc1.committed_and_reserved();
+
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(101),
+    );
+    let pattern_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 3) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc2, base_fc2).expect("htod fc2");
+    }
+    let (fc2_committed_before, _) = allocator_fc2.committed_and_reserved();
+
+    let value_fc1 = ValueId(1000);
+    let catalog_fc1 = make_aligned_catalog(n_experts, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(1001);
+    let catalog_fc2 = make_aligned_catalog(n_experts, gran, total_bytes);
+    assert!(catalog_fc2.is_pageable());
+
+    // fc1 hot={0,2}; fc2 hot={1,3} -- both individually valid and aligned,
+    // but they disagree on which experts of the SAME logical bank are hot.
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![0, 2]);
+    profile.insert(value_fc2, vec![1, 3]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(value_fc2, Arc::clone(&allocator_fc2));
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert_eq!(
+        outcome.values_touched, 0,
+        "neither member may transition when the group disagrees on the hot-expert \
+         partition, got values_touched={}",
+        outcome.values_touched
+    );
+    assert!(
+        outcome.committed_values.is_empty(),
+        "no member may commit, got: {:?}",
+        outcome.committed_values
+    );
+    for (value, label) in [(value_fc1, "fc1"), (value_fc2, "fc2")] {
+        let fallback = outcome
+            .per_value_fallbacks
+            .iter()
+            .find(|(v, _)| *v == value);
+        assert!(
+            fallback.is_some(),
+            "{label} must appear in per_value_fallbacks, got: {:?}",
+            outcome.per_value_fallbacks
+        );
+        let (_, reason) = fallback.unwrap();
+        let reason_lower = reason.to_ascii_lowercase();
+        assert!(
+            reason_lower.contains("group") && reason_lower.contains("hot-expert partition"),
+            "{label}'s fallback reason should name the hot-set disagreement, got: {reason}"
+        );
+    }
+
+    let (fc1_committed_after, _) = allocator_fc1.committed_and_reserved();
+    let (fc2_committed_after, _) = allocator_fc2.committed_and_reserved();
+    assert_eq!(
+        fc1_committed_before, fc1_committed_after,
+        "fc1 committed bytes must be unchanged"
+    );
+    assert_eq!(
+        fc2_committed_before, fc2_committed_after,
+        "fc2 committed bytes must be unchanged"
+    );
+
+    let mut readback_fc1 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc1, base_fc1).expect("dtoh fc1");
+    }
+    assert_eq!(pattern_fc1, readback_fc1, "fc1 bytes must be untouched");
+    let mut readback_fc2 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc2, base_fc2).expect("dtoh fc2");
+    }
+    assert_eq!(pattern_fc2, readback_fc2, "fc2 bytes must be untouched");
+
+    println!(
+        "test10 PASSED: disagreeing hot-expert sets block the WHOLE group, zero side effects ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: same raw hot indices but a different expert-count DOMAIN rejects
+// the whole group -- distinct from a hot-set mismatch.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_expert_count_domain_mismatch_rejects_whole_group_with_zero_side_effects() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\n=== test11: expert_group_expert_count_domain_mismatch_rejects_whole_group_with_zero_side_effects ==="
+    );
+
+    let provider = match provider_or_skip("test11") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test11: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    // fc1: 4-expert domain. fc2: 8-expert domain. Both propose the SAME raw
+    // hot indices {0, 2} -- but that means very different logical partitions
+    // (fc1 cold={1,3} out of 4; fc2 cold={1,3,4,5,6,7} out of 8).
+    let n_experts_fc1 = 4_usize;
+    let n_experts_fc2 = 8_usize;
+    let total_fc1 = n_experts_fc1 * gran;
+    let total_fc2 = n_experts_fc2 * gran;
+    let pool_bytes = (total_fc1 + total_fc2) * 4;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts_fc1,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(110),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_fc1).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+    let (fc1_committed_before, _) = allocator_fc1.committed_and_reserved();
+
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        &provider,
+        n_experts_fc2,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(111),
+    );
+    let pattern_fc2: Vec<u8> = (0..total_fc2).map(|j| ((j + 3) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc2, base_fc2).expect("htod fc2");
+    }
+    let (fc2_committed_before, _) = allocator_fc2.committed_and_reserved();
+
+    let value_fc1 = ValueId(1100);
+    let catalog_fc1 = make_aligned_catalog(n_experts_fc1, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(1101);
+    let catalog_fc2 = make_aligned_catalog(n_experts_fc2, gran, total_fc1);
+    assert!(catalog_fc2.is_pageable());
+
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![0, 2]);
+    profile.insert(value_fc2, vec![0, 2]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(value_fc2, Arc::clone(&allocator_fc2));
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert_eq!(
+        outcome.values_touched, 0,
+        "neither member may transition when the group disagrees on the expert-count \
+         domain, got values_touched={}",
+        outcome.values_touched
+    );
+    assert!(
+        outcome.committed_values.is_empty(),
+        "no member may commit, got: {:?}",
+        outcome.committed_values
+    );
+    for (value, label) in [(value_fc1, "fc1"), (value_fc2, "fc2")] {
+        let fallback = outcome
+            .per_value_fallbacks
+            .iter()
+            .find(|(v, _)| *v == value);
+        assert!(
+            fallback.is_some(),
+            "{label} must appear in per_value_fallbacks, got: {:?}",
+            outcome.per_value_fallbacks
+        );
+        let (_, reason) = fallback.unwrap();
+        let reason_lower = reason.to_ascii_lowercase();
+        assert!(
+            reason_lower.contains("group") && reason_lower.contains("expert_count"),
+            "{label}'s fallback reason should name the expert_count domain mismatch, got: {reason}"
+        );
+    }
+
+    let (fc1_committed_after, _) = allocator_fc1.committed_and_reserved();
+    let (fc2_committed_after, _) = allocator_fc2.committed_and_reserved();
+    assert_eq!(
+        fc1_committed_before, fc1_committed_after,
+        "fc1 committed bytes must be unchanged"
+    );
+    assert_eq!(
+        fc2_committed_before, fc2_committed_after,
+        "fc2 committed bytes must be unchanged"
+    );
+
+    let mut readback_fc1 = vec![0u8; total_fc1];
+    unsafe {
+        runtime.dtoh(&mut readback_fc1, base_fc1).expect("dtoh fc1");
+    }
+    assert_eq!(pattern_fc1, readback_fc1, "fc1 bytes must be untouched");
+    let mut readback_fc2 = vec![0u8; total_fc2];
+    unsafe {
+        runtime.dtoh(&mut readback_fc2, base_fc2).expect("dtoh fc2");
+    }
+    assert_eq!(pattern_fc2, readback_fc2, "fc2 bytes must be untouched");
+
+    println!(
+        "test11 PASSED: expert_count domain mismatch blocks the WHOLE group, zero side effects ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: one member's catalog is unsupported/non-pageable at application
+// time -- distinct from test 8's sub-granule-alignment failure -- and blocks
+// the whole group before any mutation.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_unsupported_member_metadata_rejects_whole_group_before_mutation() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\n=== test12: expert_group_unsupported_member_metadata_rejects_whole_group_before_mutation ==="
+    );
+
+    let provider = match provider_or_skip("test12") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test12: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    let n_experts = 4_usize;
+    let total_fc1 = n_experts * gran;
+    let pool_bytes = total_fc1 * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(120),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_fc1).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+    let (fc1_committed_before, _) = allocator_fc1.committed_and_reserved();
+
+    let value_fc1 = ValueId(1200);
+    let catalog_fc1 = make_aligned_catalog(n_experts, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(1201);
+    // A pageable catalog is used ONLY to build the plan (so fc2 gets a real
+    // PerExpertCandidate decision instead of being degraded at plan-build
+    // time by `validate_decision`'s own pageability check).
+    let catalog_fc2_for_plan = make_aligned_catalog(n_experts, gran, total_fc1);
+    assert!(catalog_fc2_for_plan.is_pageable());
+
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![0, 2]);
+    profile.insert(value_fc2, vec![0, 2]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2_for_plan),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+
+    // At APPLICATION time, fc2's catalog is swapped for an inline (i.e.
+    // non-external, non-pageable) one -- modeling metadata this applier
+    // cannot express/support, discovered fresh at the boundary rather than
+    // at plan-build time. No allocator is wired for fc2 either, modeling
+    // "missing required metadata" for this member.
+    let catalog_fc2_for_apply = WeightRegionCatalog::classify(
+        &WeightRef::Inline(TensorData::from_raw(
+            DataType::Uint8,
+            vec![n_experts, 512, gran / 512],
+            vec![0u8; n_experts * gran],
+        )),
+        catalog_fc2_for_plan.layout().clone(),
+    );
+    assert!(!catalog_fc2_for_apply.is_pageable());
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2_for_apply);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    // Deliberately no allocator for value_fc2.
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert_eq!(
+        outcome.values_touched, 0,
+        "fc1 (individually valid) must not be touched because its group-mate's \
+         metadata is unsupported, got values_touched={}",
+        outcome.values_touched
+    );
+    assert!(
+        outcome.committed_values.is_empty(),
+        "no member may commit, got: {:?}",
+        outcome.committed_values
+    );
+    let fc1_fallback = outcome
+        .per_value_fallbacks
+        .iter()
+        .find(|(v, _)| *v == value_fc1);
+    assert!(
+        fc1_fallback.is_some(),
+        "fc1 must appear in per_value_fallbacks due to its group-mate's failure, got: {:?}",
+        outcome.per_value_fallbacks
+    );
+    let (_, fc1_reason) = fc1_fallback.unwrap();
+    assert!(
+        fc1_reason.to_ascii_lowercase().contains("group"),
+        "fc1's fallback reason should mention the expert-group cause, got: {fc1_reason}"
+    );
+
+    let (fc1_committed_after, _) = allocator_fc1.committed_and_reserved();
+    assert_eq!(
+        fc1_committed_before, fc1_committed_after,
+        "fc1 (individually valid) must be UNTOUCHED because its group-mate's metadata \
+         is unsupported"
+    );
+
+    let mut readback_fc1 = vec![0u8; total_fc1];
+    unsafe {
+        runtime.dtoh(&mut readback_fc1, base_fc1).expect("dtoh fc1");
+    }
+    assert_eq!(
+        pattern_fc1, readback_fc1,
+        "fc1 bytes must be completely untouched by the group fallback"
+    );
+
+    println!(
+        "test12 PASSED: unsupported/missing group-member metadata blocks the WHOLE group before mutation ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: the group agrees and fc1 (earlier ValueId) fully commits; fc2
+// (later ValueId, its group-mate) then hits a genuine `Fatal` — a partial
+// commit *within its own single merged range* (granule 0 of a 2-granule
+// range switches, granule 1's Unmap is then forced to fail) — which is the
+// only way `transition_granule_range` reports `Fatal` rather than a clean
+// `RolledBack` (see its module doc: a partial commit is always `Fatal`,
+// never `RolledBack`). This proves the EARLIER member's already-committed
+// range is still fully and cleanly rolled back once the Fatal propagates
+// (existing item-1 machinery, now proven for a group-tagged pair rather than
+// ungrouped values).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_successful_transition_then_later_member_fault_causes_full_group_rollback() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\n=== test13: expert_group_successful_transition_then_later_member_fault_causes_full_group_rollback ==="
+    );
+
+    let provider = match provider_or_skip("test13") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test13: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    let n_experts = 4_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    // fc1 (lower ValueId, processed FIRST): no fault, its single cold range
+    // ([1,2], adjacent since experts 0 and 3 are hot -> merges into ONE
+    // 2-granule `transition_granule_range` call) fully commits.
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(130),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+
+    // fc2 (higher ValueId, processed LATER): same 2-granule merged cold
+    // range as fc1. Fail the 2nd Unmap call within fc2's own transition:
+    // granule 0 (expert 1) already switches to the new backing before
+    // granule 1 (expert 2)'s Unmap is forced to fail, so this is a genuine
+    // partial commit -> Fatal with committed_count == 1 (never a clean
+    // RolledBack, per `transition_granule_range`'s own contract).
+    let faults_fc2 = Arc::new(DriverFaultPlan::new().fail_nth(DriverOperation::Unmap, 2));
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(131),
+    );
+    let pattern_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 3) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc2, base_fc2).expect("htod fc2");
+    }
+
+    let value_fc1 = ValueId(1300);
+    let catalog_fc1 = make_aligned_catalog(n_experts, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(1301);
+    let catalog_fc2 = make_aligned_catalog(n_experts, gran, total_bytes);
+    assert!(catalog_fc2.is_pageable());
+
+    // Both members propose the SAME hot set {0, 3}: the group agrees and
+    // proceeds; this test is about rollback, not the agreement check itself
+    // (already covered by tests 9-11).
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![0, 3]);
+    profile.insert(value_fc2, vec![0, 3]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(value_fc2, Arc::clone(&allocator_fc2));
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let mut phase8_faults: HashMap<ValueId, Arc<DriverFaultPlan>> = HashMap::new();
+    phase8_faults.insert(value_fc2, faults_fc2);
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary_with_phase8_faults(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+        phase8_faults,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert!(
+        !outcome.fatal_progress.is_empty(),
+        "expected fc2 to hit a Fatal, got: {:?}",
+        outcome.fatal_progress
+    );
+    assert!(
+        outcome
+            .fatal_progress
+            .iter()
+            .any(|(v, _, _)| *v == value_fc2),
+        "the Fatal must be attributed to fc2, got: {:?}",
+        outcome.fatal_progress
+    );
+    assert_eq!(
+        outcome.values_touched, 0,
+        "no member may end up touched: fc1's already-committed ranges must be \
+         reverted once fc2 (its group-mate) hits Fatal, got values_touched={}",
+        outcome.values_touched
+    );
+    assert!(
+        outcome.committed_values.is_empty(),
+        "committed_values must be empty after full rollback, got: {:?}",
+        outcome.committed_values
+    );
+    assert_eq!(
+        outcome.rollback_count, 1,
+        "exactly fc1 must have been rolled back (fc2 never committed anything to \
+         revert), got rollback_count={}",
+        outcome.rollback_count
+    );
+    assert!(
+        outcome.rollback_failures.is_empty(),
+        "fc1's rollback is expected to succeed cleanly, got: {:?}",
+        outcome.rollback_failures
+    );
+
+    // fc1's bytes must be back to their original pattern (committed, then
+    // reverted). fc2's bytes must still read back bit-identical: granule 0 of
+    // its cold range physically relocated to the new backing before granule
+    // 1's Unmap was forced to fail, but the granule-transition contract
+    // copies content before ever switching the stable VA, so the bytes stay
+    // correct regardless of which physical backing currently holds them.
+    let mut readback_fc1 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc1, base_fc1).expect("dtoh fc1");
+    }
+    assert_eq!(
+        pattern_fc1, readback_fc1,
+        "fc1 content must be restored after rollback"
+    );
+    let mut readback_fc2 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc2, base_fc2).expect("dtoh fc2");
+    }
+    assert_eq!(
+        pattern_fc2, readback_fc2,
+        "fc2 content must remain bit-identical: the content-preserving \
+         transition copies bytes before switching, so a mid-flight Fatal \
+         cannot corrupt them"
+    );
+
+    println!(
+        "test13 PASSED: successful group transition, then a later member's fault, causes a \
+         full and clean group rollback ✓"
     );
 }

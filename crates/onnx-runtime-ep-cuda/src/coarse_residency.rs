@@ -43,10 +43,18 @@
 //! expert's compute. This function is given the graph-derived
 //! [`onnx_runtime_ep_api::ExpertWeightGroup`] list (purely structural — no
 //! tensor-name heuristics) alongside the plan, and for every group whose
-//! member `ValueId`s are present in `catalogs`, it requires *every* member to
-//! independently pass the granule-alignment check before *any* of them may be
-//! transitioned. If one member is misaligned/non-pageable/missing, the whole
-//! group falls back to `WholeBankResident` for this call (recorded once per
+//! member `ValueId`s are present in `catalogs`, it requires *every* member
+//! to (a) independently pass the capability/granule-alignment check, AND
+//! (b) propose the exact same logical hot-expert set (order/duplicate
+//! differences in the source list are immaterial; the sets are compared
+//! after normalization) over the same expert-count domain, before *any* of
+//! them may be transitioned. A single authoritative hot set is derived once
+//! per group and reused for every member's byte-range computation — never
+//! re-derived per member — so the actual bytes transitioned cannot diverge
+//! from the agreement that was checked. If one member is
+//! misaligned/non-pageable/missing, or any two members disagree on which
+//! experts are hot or on the expert-count domain itself, the whole group
+//! falls back to `WholeBankResident` for this call (recorded once per
 //! member in `per_value_fallbacks`) — never a partial tiering.
 //!
 //! # Honest scope note (QMoE int4 fixtures)
@@ -317,11 +325,15 @@ fn cold_ranges_for(
 /// groups (see [`onnx_runtime_ep_api::expert_weight_groups`]). Any group with
 /// two or more members present in `catalogs` is treated atomically: every
 /// member must independently validate (pageable, allocator present,
-/// same-device, granule-aligned) before *any* member of that group is
-/// transitioned. Values with no matching group behave exactly as before
-/// (validated independently). Pass `&[]` to opt out of grouping entirely
-/// (every value validated independently, matching pre-Slice5-revision
-/// behavior).
+/// same-device, granule-aligned) *and* every validating member's normalized
+/// hot-expert set and expert-count domain must agree exactly with every
+/// other validating member's, before *any* member of that group is
+/// transitioned. A member disagreeing with its group-mates on the
+/// hot-expert partition is treated exactly like a capability failure: the
+/// whole group falls back, none of it mutates. Values with no matching group
+/// behave exactly as before (validated independently). Pass `&[]` to opt out
+/// of grouping entirely (every value validated independently, matching
+/// pre-Slice5-revision behavior).
 ///
 /// Returns a [`BoundaryApplicationOutcome`] describing what happened. Never
 /// panics; every safety failure degrades to a structural no-op with an
@@ -341,8 +353,12 @@ fn cold_ranges_for(
 ///   * Checks every "cold" expert's byte range is granule-aligned (else
 ///     per-value fallback for this value only).
 ///   * If the value belongs to a multi-member `ExpertWeightGroup`, requires
-///     every member present in `catalogs` to pass the same checks before any
-///     member transitions; one failing member falls the whole group back.
+///     every member present in `catalogs` to pass the same checks AND to
+///     propose the exact same normalized hot-expert set over the same
+///     expert-count domain, before any member transitions; one failing or
+///     disagreeing member falls the whole group back, and every member that
+///     does transition uses one authoritative, group-derived hot set (never
+///     its own independently re-derived one) for its byte-range computation.
 ///   * For each cold-expert granule range, calls
 ///     [`transition_granule_range`] with `new_location = HostNuma`.
 ///   * On any `Fatal`, stops iterating and enters the rollback loop:
@@ -490,6 +506,17 @@ fn apply_residency_plan_at_boundary_inner(
     // group's transitions before any of them touch the driver.
     struct Eligible {
         value: ValueId,
+        /// This member's own normalized (order/duplicate-independent)
+        /// hot-expert set, kept only so the group-agreement pass below can
+        /// compare it against sibling members'. The actual byte ranges
+        /// transitioned for a multi-member group are always re-derived from
+        /// the group's single authoritative hot set (see `group_hot`
+        /// below), never from this per-member copy.
+        hot: std::collections::HashSet<usize>,
+        /// This member's own expert-count domain (`catalog.layout().experts`),
+        /// compared across group members so a domain mismatch (not just a
+        /// hot-set mismatch) is caught before any mutation.
+        total_experts: usize,
         hot_count: usize,
         cold_count: usize,
         merged_ranges: Vec<(usize, usize)>,
@@ -530,6 +557,8 @@ fn apply_residency_plan_at_boundary_inner(
             let cold_count = total_experts.saturating_sub(hot_count);
             Ok(Eligible {
                 value,
+                hot,
+                total_experts,
                 hot_count,
                 cold_count,
                 merged_ranges: merged,
@@ -545,6 +574,56 @@ fn apply_residency_plan_at_boundary_inner(
                 .or_insert_with(|| format!("group member {value:?} failed: {reason}"));
         }
         per_value_precheck.push((value, precheck));
+    }
+
+    // 4a. Group-level hot-expert agreement (Cycle-19 fix): a multi-member
+    // `ExpertWeightGroup` names one *logical* expert bank split across
+    // several `ValueId`s (fc1/fc2/fc3 weights, scales, ...). Each member can
+    // independently clear the capability/alignment precheck above yet still
+    // be told to keep a *different* set of experts hot — that would tier
+    // one logical expert across Device/Host, exactly the split this type
+    // exists to prevent. This pass derives a single authoritative hot set
+    // per group, once, from the first member (in deterministic plan order)
+    // that clears its own precheck, and requires every other clearing
+    // member's own (also normalized-to-a-`HashSet`, so order/duplicates in
+    // the source `Vec<usize>` are already immaterial) hot set and
+    // expert-count domain to match it exactly. This is the one mechanism
+    // that decides "does the group agree on its partition" — it does not
+    // duplicate or race the capability check above; a capability failure
+    // already short-circuits via `group_failed` before this pass runs for
+    // that member.
+    let mut group_hot: HashMap<usize, (std::collections::HashSet<usize>, usize)> = HashMap::new();
+    for (value, precheck) in &per_value_precheck {
+        let Some(&group_idx) = value_to_group.get(value) else {
+            continue;
+        };
+        if group_failed.contains(&group_idx) {
+            continue;
+        }
+        let Ok(candidate) = precheck else { continue };
+        match group_hot.get(&group_idx) {
+            None => {
+                group_hot.insert(group_idx, (candidate.hot.clone(), candidate.total_experts));
+            }
+            Some((canonical_hot, canonical_total_experts)) => {
+                if candidate.total_experts != *canonical_total_experts {
+                    group_failed.insert(group_idx);
+                    group_fail_reason.entry(group_idx).or_insert_with(|| {
+                        format!(
+                            "expert-group members disagree on expert_count domain ({canonical_total_experts} vs {}, value {value:?})",
+                            candidate.total_experts
+                        )
+                    });
+                } else if candidate.hot != *canonical_hot {
+                    group_failed.insert(group_idx);
+                    group_fail_reason.entry(group_idx).or_insert_with(|| {
+                        format!(
+                            "expert-group members disagree on hot-expert partition (value {value:?})"
+                        )
+                    });
+                }
+            }
+        }
     }
 
     for (value, precheck) in per_value_precheck {
@@ -563,7 +642,29 @@ fn apply_residency_plan_at_boundary_inner(
             continue;
         }
         match precheck {
-            Ok(e) => eligible.push(e),
+            Ok(mut e) => {
+                // The group agreed (or this value isn't grouped). For a
+                // validated multi-member group, re-derive this member's
+                // byte ranges from the group's single authoritative hot set
+                // — never from this member's own independently-computed
+                // (though already-verified-equal) one — so no future change
+                // to either code path can let two members' cold ranges
+                // disagree even if the equality check above were ever
+                // weakened.
+                if let Some(&group_idx) = value_to_group.get(&value)
+                    && let Some((canonical_hot, _)) = group_hot.get(&group_idx)
+                {
+                    let catalog = catalogs.get(&value).expect("validated present above");
+                    match cold_ranges_for(catalog, canonical_hot, granularity) {
+                        Ok(merged) => e.merged_ranges = merged,
+                        Err(reason) => {
+                            outcome.per_value_fallbacks.push((value, reason));
+                            continue;
+                        }
+                    }
+                }
+                eligible.push(e);
+            }
             Err(reason) => outcome.per_value_fallbacks.push((value, reason)),
         }
     }
