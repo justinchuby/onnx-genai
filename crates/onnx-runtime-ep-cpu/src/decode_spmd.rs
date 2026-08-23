@@ -2444,6 +2444,26 @@ mod tests {
     /// host without SMT (there every CPU is its own leader).
     #[test]
     fn shard_cpus_prefer_distinct_physical_cores() {
+        // Host-independent half. The loop below can only run where `/sys`
+        // exposes a sibling map, which a minimal container does not, so on its
+        // own this test passes vacuously exactly where it would be most useful.
+        // Assert the ordering contract the shard builder relies on against a
+        // synthetic SMT host first, so the property is covered everywhere.
+        let synthetic = crate::core_topology::CoreTopology::from_sibling_groups(
+            (0..8).map(|c| vec![c * 2, c * 2 + 1]),
+        );
+        let all: Vec<usize> = (0..16).collect();
+        let ordered = crate::decode_affinity::order_pin_targets(&all, Some(&synthetic));
+        let mut leaders = synthetic.leaders_within(&all);
+        leaders.sort_unstable();
+        let mut first_eight: Vec<usize> = ordered.iter().take(8).copied().collect();
+        first_eight.sort_unstable();
+        assert_eq!(
+            first_eight, leaders,
+            "the first workers must take one CPU per physical core before any \
+             worker doubles up on an SMT sibling: {ordered:?}"
+        );
+
         let Some(cores) = crate::core_topology::host() else {
             return;
         };
