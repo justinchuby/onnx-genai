@@ -52,10 +52,12 @@
 #                     the lock and exit 5, because a gate that warns and
 #                     proceeds labels contaminated rows as gated. `proceed`
 #                     measures anyway and records `gate=timed_out_proceeded`.
-#   --strict-reap     exit 4 rather than silently taking over a stale or
-#                     TTL-expired lock. Reclaiming a lock does not stop the
-#                     dead holder's benchmark, so for an unattended harness
-#                     "somebody died holding this" is a reason to stop.
+#   --strict-reap     refuse (exit 4, releasing) an acquire that had to reap a
+#                     stale or TTL-expired lock, instead of taking it over.
+#                     Reclaiming a lock does not stop the dead holder's
+#                     benchmark, so for an unattended harness "somebody died
+#                     holding this" is a reason to stop. Decided before the
+#                     gate, so it never sits on a lock it is about to refuse.
 #   --ttl S           hard expiry: a lock older than this is reapable by the
 #                     next acquirer, which prints a loud warning naming you.
 #                     Default 3600 for `acquire`, 0 (never) for `run`.
@@ -67,21 +69,38 @@
 #                         guessed threshold
 #   --oneline             one space-separated line, to append to a result row
 #
-# Exit codes:
+# Exit codes (acquire/release/wait):
 #   0 ok            1 usage/error       2 busy (acquire without --wait)
 #   3 timed out     4 reap refused      5 gate not satisfied
+#
+# `run` does NOT use this table: it returns the wrapped command's own status,
+# so a command exiting 5 is indistinguishable from a gate failure. When you
+# need to tell hostlock's failures apart from the command's, use `acquire` and
+# `release` around the command rather than `run`. Interrupted `run` returns
+# 128+signal (130 SIGINT, 143 SIGTERM) like any shell.
 #
 # Recording provenance. Emitting the lock state to a terminal helps whoever is
 # watching; embedding it in the rows is what helps six weeks later. Every
 # contaminated run on this host was caught, when it was caught, by somebody
 # having an A/A null arm -- which is luck, not method. So:
 #
-#   eval "$(scripts/hostlock.sh provenance --expect-runnable 2 --oneline \
-#           | tr ' ' '\n' | sed 's/^/HL_/')"   # or just append the line
+#   printf '%s\t%s\n' "$ms" "$(scripts/hostlock.sh provenance --oneline \
+#                                --expect-runnable 2)" >> results.tsv
 #
-# and write `held_by`, `runnable` and `contended` into the same row as the
-# milliseconds. A row that cannot say what the host was doing is not a
-# measurement, it is an anecdote with a number in it.
+# Append the line to the row; do not `eval` it. The fields are `key=value` and
+# every value in the one-line form is a bounded token, but `reason` is free
+# text written by whichever peer holds this shared, fixed-path lock, so it is
+# omitted from `--oneline` entirely and only appears in the multi-line form,
+# where the newline delimits it. Parse with awk/split on `=`, never with the
+# shell.
+#
+# Record `hostlock_state` and `takeover` alongside `held_by` -- `held_by` names
+# the holder of a STALE lock just as readily as a live one, so on its own it
+# can attribute a row to somebody who was already dead. A row that cannot say
+# what the host was doing is not a measurement, it is an anecdote with a number
+# in it.
+#
+# (end of usage summary)
 #
 # The `run` form is the one to prefer: it releases on success, on failure and
 # on Ctrl-C, and it stops the wrapped command when interrupted. Signals it
@@ -154,8 +173,15 @@ num_or() {
     esac
 }
 
+# Returns 1 when the key is ABSENT, not just when the file is. The two are
+# different facts and collapsing them is how a lock written by an older
+# version of this script reports `takeover=none gate=none` -- an assertion --
+# for a takeover and a gate it never recorded. Absent must surface as
+# `unknown`, for the same reason `contended` is `unknown` without an
+# expectation.
 meta_get() {
     [ -f "$META" ] || return 1
+    grep -q "^$1=" "$META" 2>/dev/null || return 1
     sed -n "s/^$1=//p" "$META" | head -1
 }
 
@@ -166,6 +192,14 @@ meta_get() {
 # reason publish_lock stages and renames. Refuses to touch a lock whose
 # anchor is not ours, so a takeover race cannot have the loser rewriting the
 # winner's metadata.
+#
+# `tmp` MUST stay INSIDE $LOCK_DIR. That is what actually makes this safe
+# against a concurrent reap, not the anchor check: remove_lock renames the
+# whole directory away, so a staged file inside it goes with the corpse and
+# the final mv fails harmlessly. Moved to a sibling path (as every other temp
+# path in this file is) it would survive the reap and land on the SUCCESSOR's
+# meta -- writing our metadata over their live lock, which is theft plus a
+# leak, since their remove_lock_if_mine would then refuse to release.
 meta_set() {
     local key=$1 value=$2 tmp cur
     [ -f "$META" ] || return 1
@@ -294,7 +328,7 @@ publish_lock() {
         echo "ttl=${TTL}"
         echo "runnable_at_acquire=$(runnable_now)"
         echo "takeover=none"
-        echo "gate=${GATE:-none}"
+        echo "gate=${GATE:+requested:${GATE}}"
     } >"${stage}/meta"
     if mv -T "$stage" "$LOCK_DIR" 2>/dev/null; then
         return 0
@@ -371,38 +405,60 @@ cmd_provenance() {
     local state owner pid age reason takeover gate r contended
     state=$(lock_state)
     r=$(runnable_now)
-    owner='' ; pid='' ; age='' ; reason='' ; takeover='' ; gate=''
+    owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
     if [ -d "$LOCK_DIR" ]; then
-        owner=$(meta_get owner 2>/dev/null || echo '')
-        pid=$(meta_get anchor_pid 2>/dev/null || echo '')
-        reason=$(meta_get reason 2>/dev/null || echo '')
-        takeover=$(meta_get takeover 2>/dev/null || echo '')
-        gate=$(meta_get gate 2>/dev/null || echo '')
-        age=$(lock_age)
+        owner=$(meta_get owner) || owner=unknown
+        pid=$(meta_get anchor_pid) || pid=unknown
+        reason=$(meta_get reason) || reason=''
+        # An absent key stays `unknown`. A lock published by an older
+        # version of this script has neither of these, and answering `none`
+        # for it asserts "no takeover, no gate" about a run that may have
+        # reaped a corpse and abandoned its gate -- moving the very
+        # mislabelling this subcommand exists to prevent out of the console
+        # and into the data, where it outlives the person who could correct it.
+        takeover=$(meta_get takeover) || takeover=unknown
+        gate=$(meta_get gate) || gate=unknown
+        # `acquired_epoch` absent makes lock_age default it to 0, i.e. the
+        # current epoch -- a 56-year age that looks like a datum if anyone
+        # aggregates the column.
+        if meta_get acquired_epoch >/dev/null; then age=$(lock_age); fi
     fi
     contended=unknown
     if [ -n "$EXPECT_RUNNABLE" ]; then
         if [ "$r" -le "$EXPECT_RUNNABLE" ]; then contended=no; else contended=yes; fi
     fi
+    # EXPIRED means the TTL lapsed, NOT that the box is unclaimed: the holder
+    # can be alive and mid-benchmark. With a 3600s default TTL and an anchor
+    # that is an agent session alive for days, a live holder past its TTL is
+    # this design's steady state, not an edge case. `declared` is the one
+    # boolean a reader will filter on, so answering `no` for a claimed, busy
+    # box is the reassuring direction and the wrong one. The lapse is not
+    # hidden -- it is in hostlock_state.
     local declared=no
-    [ "$state" = HELD ] && declared=yes
+    case "$state" in HELD | EXPIRED) declared=yes ;; esac
     local fields=(
         "hostlock_state=${state}"
         "declared=${declared}"
         "held_by=${owner:-none}"
         "held_pid=${pid:-none}"
-        "held_secs=${age:-0}"
+        "held_secs=${age}"
         "takeover=${takeover:-none}"
         "gate=${gate:-none}"
         "runnable=${r}"
         "contended=${contended}"
         "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        "reason=${reason:-}"
     )
     if [ "$ONELINE" = 1 ]; then
+        # `reason` is deliberately NOT in the one-line form. It is free text
+        # written by whoever held the lock, it is unquoted and unterminated
+        # among space-separated fields, and the shared fixed path means the
+        # text comes from a peer. A two-word reason silently truncates the
+        # field; anything shell-active is worse. Multi-line output carries it
+        # on its own line, where a newline is the delimiter.
         echo "${fields[*]}"
     else
         printf '%s\n' "${fields[@]}"
+        printf 'reason=%s\n' "${reason:-}"
     fi
 }
 
@@ -444,15 +500,42 @@ cmd_status() {
     return 0
 }
 
+# Give back a lock we took but are not going to use.
+#
+# `remove_lock_if_mine`, never `remove_lock`: by the time an acquire decides to
+# abandon, our own TTL may have lapsed and a successor may legitimately hold
+# the lock -- which is not hypothetical, it is what happens whenever --ttl is
+# shorter than --gate-timeout. Unconditional removal would delete a live
+# holder's lock while their benchmark runs, and it satisfies every "the lock
+# is FREE afterwards" assertion identically, so the guard has to be here and
+# tested here rather than duplicated at each call site.
+abandon_lock() {
+    remove_lock_if_mine
+}
+
 cmd_acquire() {
     local deadline=$((SECONDS + TIMEOUT)) rc
     while :; do
         if publish_lock; then
             meta_set takeover "$TAKEOVER"
+            # Refuse BEFORE gating. The other order holds the reaped lock --
+            # the one we were told to refuse -- for the whole --gate-timeout
+            # (default 900s), blocks every other acquirer for that long, and
+            # then reports the gate failure instead. The two are causally
+            # linked: the dead holder's orphaned benchmark is the likeliest
+            # reason the gate cannot be met, so the case where --strict-reap
+            # has something to say is exactly the case that suppressed it.
+            if [ "$TAKEOVER" != none ] && [ "$STRICT_REAP" = 1 ]; then
+                echo "hostlock: outcome=reap_refused (${TAKEOVER}) by ${OWNER}"
+                echo "hostlock: --strict-reap given: refusing an acquire that required reaping a ${TAKEOVER} lock." >&2
+                echo "hostlock: the previous holder's load may still be running; check the host before retrying." >&2
+                abandon_lock
+                return 4
+            fi
             gate_on_runnable
             rc=$?
             if [ "$rc" -ne 0 ]; then
-                remove_lock_if_mine
+                abandon_lock
                 return "$rc"
             fi
             # An acquire that had to reap is NOT the same event as one that
@@ -462,12 +545,6 @@ cmd_acquire() {
             # can decide, rather than folding it into a silent success.
             if [ "$TAKEOVER" != none ]; then
                 echo "hostlock: outcome=acquired_after_reap (${TAKEOVER}) by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
-                if [ "$STRICT_REAP" = 1 ]; then
-                    echo "hostlock: --strict-reap given: refusing an acquire that required reaping a ${TAKEOVER} lock." >&2
-                    echo "hostlock: the previous holder's load may still be running; check the host before retrying." >&2
-                    remove_lock_if_mine
-                    return 4
-                fi
             else
                 echo "hostlock: outcome=acquired by ${OWNER} (anchor pid ${ANCHOR_PID})${REASON:+ — ${REASON}}"
             fi
@@ -477,9 +554,18 @@ cmd_acquire() {
         # then retry immediately. Testing `! holder_alive` here instead of
         # `reapable` silently disabled TTL expiry altogether -- status would
         # report EXPIRED and the next acquirer would still be told BUSY.
+        # TAKEOVER has to survive from the iteration that reaps to the one
+        # that publishes, so it cannot be reset at the top of the loop. It
+        # must still be dropped the moment it stops describing us: if a peer
+        # won the publish race after our reap and now holds the lock legitimately,
+        # our eventual acquire is a CLEAN one. Carrying the stale value would
+        # label it acquired_after_reap and, under --strict-reap, abort an
+        # unattended harness over a takeover that did not happen.
         if reapable; then
             if holder_alive; then TAKEOVER=ttl_expired; else TAKEOVER=stale_pid; fi
             if reap_if_dead; then continue; fi
+            TAKEOVER=none
+        else
             TAKEOVER=none
         fi
         if [ "$DO_WAIT" != 1 ]; then
@@ -634,13 +720,37 @@ EXPECT_RUNNABLE=""
 ONELINE=0
 
 [ "$#" -ge 1 ] || {
-    sed -n '3,50p' "$0" >&2
+    awk '/^# \(end of usage summary\)/ { exit } NR >= 3' "$0" >&2
     exit 1
 }
 SUB=$1
 shift
 
+# Every flag that takes a value must be given one, and numeric flags must be
+# numeric.
+#
+# `--gate` with a missing value is not a typo that costs a warning: `${2:-}`
+# supplies a default, so validation passes, and then `shift 2` with one
+# argument left FAILS SILENTLY (there is no `set -e`). `$#` never decreases
+# and this loop spins with no syscall in it -- a core pinned at 100% forever,
+# on the one box whose contention this script exists to control.
+#
+# `--gate abc` used to cost a warning and proceed. Now that the gate fails
+# closed it holds the lock for the full --gate-timeout and exits 5, and
+# `--gate-timeout abc` evaluates to 0 inside $((SECONDS + GATE_TIMEOUT)),
+# quietly turning the gate into "give up immediately".
+require_uint() {
+    case "$2" in
+        '' | *[!0-9]*) die "$1 takes a non-negative integer, got: '$2'" ;;
+    esac
+}
+
 while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --reason | --owner | --timeout | --gate | --gate-timeout | --ttl | --pid | --on-gate-timeout | --expect-runnable)
+            [ "$#" -ge 2 ] || die "$1 requires a value"
+            ;;
+    esac
     case "$1" in
         --reason)
             REASON=${2:-}
@@ -655,23 +765,28 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --timeout)
-            TIMEOUT=${2:-3600}
+            TIMEOUT=$2
+            require_uint "$1" "$TIMEOUT"
             shift 2
             ;;
         --gate)
-            GATE=${2:-}
+            GATE=$2
+            require_uint "$1" "$GATE"
             shift 2
             ;;
         --gate-timeout)
-            GATE_TIMEOUT=${2:-900}
+            GATE_TIMEOUT=$2
+            require_uint "$1" "$GATE_TIMEOUT"
             shift 2
             ;;
         --ttl)
-            TTL=${2:-0}
+            TTL=$2
+            require_uint "$1" "$TTL"
             shift 2
             ;;
         --pid)
-            ANCHOR_PID=${2:-}
+            ANCHOR_PID=$2
+            require_uint "$1" "$ANCHOR_PID"
             shift 2
             ;;
         --porcelain)
@@ -679,7 +794,7 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --on-gate-timeout)
-            ON_GATE_TIMEOUT=${2:-fail}
+            ON_GATE_TIMEOUT=$2
             case "$ON_GATE_TIMEOUT" in
                 fail | proceed) ;;
                 *) die "--on-gate-timeout takes 'fail' or 'proceed', got: ${ON_GATE_TIMEOUT}" ;;
@@ -691,10 +806,8 @@ while [ "$#" -gt 0 ]; do
             shift
             ;;
         --expect-runnable)
-            EXPECT_RUNNABLE=${2:-}
-            case "$EXPECT_RUNNABLE" in
-                '' | *[!0-9]*) die "--expect-runnable takes a non-negative integer, got: ${EXPECT_RUNNABLE}" ;;
-            esac
+            EXPECT_RUNNABLE=$2
+            require_uint "$1" "$EXPECT_RUNNABLE"
             shift 2
             ;;
         --oneline)
