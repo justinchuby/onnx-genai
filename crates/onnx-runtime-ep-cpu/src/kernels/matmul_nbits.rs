@@ -19661,6 +19661,12 @@ mod tests {
         nodes: usize,
         workers: usize,
         pool_built: bool,
+        /// Physical cores covered by the child's allowed cpuset.
+        cores: usize,
+        /// Whether the pinned workers landed on distinct physical cores.
+        /// `None` when the pool is unpinned or the topology is unreadable, so
+        /// there is no placement claim to check.
+        distinct_cores: Option<bool>,
     }
 
     /// Report the pool this process actually built. The width has to be
@@ -19677,15 +19683,29 @@ mod tests {
             .parse()
             .expect("the parent passes a decimal width");
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
-        let (pool_built, workers, nodes) = match crate::decode_spmd::pools() {
-            Some(pool) => (true, pool.total_workers(), pool.node_count()),
-            None => (false, 0, 0),
+        let cores = crate::core_topology::host().map_or(allowed, |topology| {
+            crate::decode_affinity::allowed_cpus()
+                .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
+        });
+        let (pool_built, workers, nodes, placement) = match crate::decode_spmd::pools() {
+            Some(pool) => (
+                true,
+                pool.total_workers(),
+                pool.node_count(),
+                pool.placement_is_one_worker_per_physical_core(),
+            ),
+            None => (false, 0, 0, None),
         };
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
-             nodes={nodes} workers={workers} pool={}",
+             nodes={nodes} workers={workers} pool={} cores={cores} placement={}",
             available_parallelism(),
-            u8::from(pool_built)
+            u8::from(pool_built),
+            match placement {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "na",
+            }
         );
     }
 
@@ -19762,12 +19782,15 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!("the child emitted no width report for requested={requested}:\n{stdout}")
             });
-        let field = |key: &str| -> usize {
+        let text = |key: &str| -> &str {
             let needle = format!("{key}=");
             report
                 .split_whitespace()
                 .find_map(|pair| pair.strip_prefix(&needle))
                 .unwrap_or_else(|| panic!("the width report is missing `{key}`: {report}"))
+        };
+        let field = |key: &str| -> usize {
+            text(key)
                 .parse()
                 .unwrap_or_else(|_| panic!("`{key}` is not a decimal count: {report}"))
         };
@@ -19778,6 +19801,13 @@ mod tests {
             nodes: field("nodes"),
             workers: field("workers"),
             pool_built: field("pool") == 1,
+            cores: field("cores"),
+            distinct_cores: match text("placement") {
+                "1" => Some(true),
+                "0" => Some(false),
+                "na" => None,
+                other => panic!("`placement` is not 1/0/na: {other}"),
+            },
         }
     }
 
@@ -19823,6 +19853,7 @@ mod tests {
         }
 
         let mut saw_full_subscription = false;
+        let mut saw_placement_check = false;
         for requested in widths {
             let report = realized_width_report(requested);
             assert_eq!(
@@ -19863,6 +19894,28 @@ mod tests {
 
             saw_full_subscription |= report.allowed >= 2 && effective >= report.allowed;
 
+            // The placement half of the same label. A `t=N` row claims N
+            // workers ran; it also implicitly claims they ran on N cores.
+            // #1729 is what the second half costs: the default pool put 16
+            // workers on 8 physical cores -- two per front end -- while
+            // reporting `realized=16 as_requested`, and the count was never the
+            // thing that was wrong. Only assert it where one-per-core is
+            // achievable: past the core budget the workers must double up, and
+            // demanding otherwise would fail the host, not the code.
+            if report.workers <= report.cores && report.distinct_cores.is_some() {
+                assert_eq!(
+                    report.distinct_cores,
+                    Some(true),
+                    "requested width {requested} realized {} workers that share physical \
+                     cores on a host with {} cores available, so a decode row labelled \
+                     t={requested} ran on fewer front ends than its label implies ({report:?})",
+                    report.workers,
+                    report.cores
+                );
+            }
+            saw_placement_check |=
+                report.workers <= report.cores && report.distinct_cores.is_some();
+
             assert_eq!(
                 report.workers, effective,
                 "requested width {requested} realized {} compute lanes, not the {effective} \
@@ -19884,6 +19937,20 @@ mod tests {
                 "no swept width reached full subscription on a {allowed_now}-CPU cpuset, so \
                  the reservation path went untested and only the no-op half of the contract \
                  was checked -- the full-subscription probe is not doing its job"
+            );
+        }
+
+        // Same reasoning for the placement half: if no swept width was pinned
+        // and inside the core budget, every placement assertion above was
+        // skipped and this test verified width only -- exactly the blind spot
+        // it was extended to close. An unpinned host is a legitimate reason,
+        // but it has to be stated rather than silently passed.
+        if allowed_now >= 2 && crate::core_topology::host().is_some() {
+            assert!(
+                saw_placement_check,
+                "no swept width produced a checkable placement on a {allowed_now}-CPU cpuset, \
+                 so the pool's core layout went unasserted and only the worker count was \
+                 verified"
             );
         }
     }
