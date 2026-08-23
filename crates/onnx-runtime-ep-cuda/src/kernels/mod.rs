@@ -95,6 +95,7 @@ pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
 pub mod structural;
+pub mod tensor_scatter;
 pub mod topk;
 pub mod trilu;
 pub mod unary_predicate;
@@ -309,6 +310,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Pad",
     "Range",
     "ScatterND",
+    "TensorScatter",
     "HannWindow",
     "HammingWindow",
     "BlackmanWindow",
@@ -513,6 +515,9 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         | ("GatherND", _)
         | ("ScatterElements", _)
         | ("ScatterND", _)
+        // `TensorScatter` moves bytes into a fixed-capacity cache, so the
+        // kernel is dtype-agnostic like the other byte movers.
+        | ("TensorScatter", _)
         | ("Shape", _)
         | ("Size", _)
         | ("Pad", _)
@@ -667,6 +672,13 @@ pub fn build_cuda_registry_with_metrics(
             }),
         );
     }
+    // TensorScatter (opset 24) standardizes the KV-cache update.
+    reg.register(
+        OpKey::new("TensorScatter", "", 24),
+        Box::new(tensor_scatter::TensorScatterFactory {
+            runtime: runtime.clone(),
+        }),
+    );
     reg.register(
         OpKey::new("CumSum", "", 11),
         Box::new(cumsum::CumSumFactory {
