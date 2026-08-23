@@ -108,7 +108,7 @@ use std::time::Instant;
 use common::Tensor;
 use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
 use onnx_runtime_ep_api::Kernel;
-use onnx_runtime_ep_cpu::with_decode_pool_scope;
+use onnx_runtime_ep_cpu::{decode_spmd, with_decode_pool_scope};
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -118,6 +118,78 @@ fn median(mut samples: Vec<f64>) -> f64 {
 /// Set by every session; read once after the measured phases. See the checksum
 /// comment in the session loop.
 static CHECKSUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One repetition of one phase.
+struct Rep {
+    ms: f64,
+    p90: f64,
+    tps: f64,
+    wall: f64,
+    cpu: Option<common::CpuTime>,
+    workers: Vec<WorkerDelta>,
+}
+
+/// Per-worker counters over exactly the measured window.
+///
+/// Aggregate CPU seconds say *how much* of the pool was occupied; they cannot
+/// say why the rest was not. These can, because the three ways a worker spends
+/// the window are separately attributed:
+///
+/// * `work_ns`  -- in its shard, computing.
+/// * `wake_ns`  -- publish-to-observe, i.e. the dispatcher has already released
+///   this op and the worker has not yet noticed. This is wake/dispatch latency.
+/// * the residual, `wall - (wake + work)`, during which the op the worker is
+///   waiting for has **not been published yet**. That is dispatcher-serial time
+///   or end-of-barrier straggler time, and it is invisible to both counters
+///   above -- which is exactly why the residual is reported rather than assumed
+///   to be zero.
+///
+/// Load imbalance and wake latency both show up as idle in the aggregate and
+/// are opposite problems: imbalance concentrates `last_arrivals` on a few
+/// workers and skews `work_ns`, while wake latency is spread evenly and lands
+/// in `wake_ns`. `last_arrivals` summed over a node equals that node's dispatch
+/// count, so with `w` workers chance alone gives each `1/w`.
+///
+/// Only populated when `ONNX_GENAI_CPU_DECODE_WORKER_PROFILE` was set before
+/// the pool was built; `wake_ns`/`work_ns` cost two clock reads per worker per
+/// op (~4% at width 12), so a profiled run is a **diagnostic**, not a
+/// throughput measurement, and its `tps` must not be compared against an
+/// unprofiled arm.
+struct WorkerDelta {
+    worker: usize,
+    cpu: Option<usize>,
+    wake_ns: u64,
+    work_ns: u64,
+    timed_ops: u64,
+    last_arrivals: u64,
+    parks: u64,
+    spin_hits: u64,
+}
+
+/// Per-worker deltas between two `worker_profiles()` snapshots, matched on
+/// worker index. A worker present in only one snapshot is dropped rather than
+/// treated as having started at zero.
+fn worker_deltas(
+    before: &[decode_spmd::SpmdWorkerProfile],
+    after: &[decode_spmd::SpmdWorkerProfile],
+) -> Vec<WorkerDelta> {
+    after
+        .iter()
+        .filter_map(|b| {
+            let a = before.iter().find(|a| a.worker == b.worker)?;
+            Some(WorkerDelta {
+                worker: b.worker,
+                cpu: b.cpu,
+                wake_ns: b.wake_ns.saturating_sub(a.wake_ns),
+                work_ns: b.work_ns.saturating_sub(a.work_ns),
+                timed_ops: b.timed_ops.saturating_sub(a.timed_ops),
+                last_arrivals: b.last_arrivals.saturating_sub(a.last_arrivals),
+                parks: b.parks.saturating_sub(a.parks),
+                spin_hits: b.spin_hits.saturating_sub(a.spin_hits),
+            })
+        })
+        .collect()
+}
 
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
@@ -265,10 +337,10 @@ fn main() {
         samples
     };
 
-    // One repetition of one phase. Returns `(median_ms_token, p90, tokens_s_total)`.
-    let measure = |warm: bool| -> (f64, f64, f64) {
+    // One repetition of one phase.
+    let measure = |warm: bool| -> Rep {
         let barrier = std::sync::Barrier::new(sessions + 1);
-        let (per_session, wall) = std::thread::scope(|scope| {
+        let (per_session, wall, cpu, workers) = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..sessions)
                 .map(|_| {
                     let barrier = &barrier;
@@ -278,9 +350,21 @@ fn main() {
             // Releases every session at once, then starts the clock. All
             // warmup and allocation is already behind us at this point.
             barrier.wait();
+            // Bracketed by exactly the same two points as `wall`, so
+            // `cpu / (wall * width)` is a busy fraction over the measured
+            // window and nothing else. Read after the barrier so pool
+            // construction and the three warmup steps are outside it.
+            let cpu0 = common::process_cpu_time();
+            let wp0 = decode_spmd::worker_profiles().unwrap_or_default();
             let start = Instant::now();
             let out: Vec<Vec<f64>> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            (out, start.elapsed().as_secs_f64())
+            let elapsed = start.elapsed().as_secs_f64();
+            let wp1 = decode_spmd::worker_profiles().unwrap_or_default();
+            let cpu = match (cpu0, common::process_cpu_time()) {
+                (Some(a), Some(b)) => Some(b.since(a)),
+                _ => None,
+            };
+            (out, elapsed, cpu, worker_deltas(&wp0, &wp1))
         });
 
         let mut all: Vec<f64> = per_session.into_iter().flatten().collect();
@@ -290,24 +374,31 @@ fn main() {
         // Aggregate throughput is the number the pool question is really about:
         // a wider fork can cut one session's latency and still lose once
         // sessions have to share the machine.
-        (ms, p90, (sessions * tokens) as f64 / wall)
+        Rep {
+            ms,
+            p90,
+            tps: (sessions * tokens) as f64 / wall,
+            wall,
+            cpu,
+            workers,
+        }
     };
 
     for (phase, warm) in [("cold", false), ("steady", true)] {
         // `cold` is inherently single-shot: repeating it would measure a warm
         // run. Only `steady` is repeated.
         let n = if warm { reps } else { 1 };
-        let mut rows: Vec<(f64, f64, f64)> = Vec::with_capacity(n);
+        let mut rows: Vec<Rep> = Vec::with_capacity(n);
         for _ in 0..n {
             rows.push(measure(warm));
         }
-        let ms = median(rows.iter().map(|r| r.0).collect());
-        let p90 = median(rows.iter().map(|r| r.1).collect());
+        let ms = median(rows.iter().map(|r| r.ms).collect());
+        let p90 = median(rows.iter().map(|r| r.p90).collect());
         // MEDIAN over repetitions, deliberately not min/max. Reporting the
         // best repetition makes every arm look like its luckiest run and makes
         // the spread invisible, which is how a 2x measurement artifact can
         // survive review (see the ratio-definition note in the module docs).
-        let mut tps: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let mut tps: Vec<f64> = rows.iter().map(|r| r.tps).collect();
         let total = median(tps.clone());
         tps.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let spread = if total > 0.0 {
@@ -316,6 +407,73 @@ fn main() {
             0.0
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
+
+        // A separate line, and deliberately not prefixed with the phase name:
+        // the existing matrix scripts key the throughput row on a leading
+        // `steady`, and a second line starting the same way would be parsed as
+        // one and fail on the first field.
+        //
+        // Every field comes from ONE repetition -- the one whose throughput is
+        // the median, which is exactly the repetition the `tps` column above
+        // reports, since `median` here returns `sorted[len / 2]` rather than
+        // interpolating. Taking an independent median per quantity looks
+        // equivalent and is not: `tps = tokens / wall`, so sorting by `tps`
+        // ascending and sorting by `wall` ascending are *reversed* orders, and
+        // at an even repetition count the two medians land on different
+        // repetitions. The resulting row describes no run that ever happened,
+        // and `cpu / (wall * width)` inherits the full rep-to-rep spread as
+        // bias -- measured at 4.4% to 29.7% against an identity that is 0.00%
+        // when the row is self-consistent.
+        //
+        // `user` and `sys` are reported separately rather than summed because
+        // they distinguish work from waiting: `sched_yield` is charged to `sys`.
+        // The single repetition whose throughput is the median. Everything
+        // below is read from THIS repetition, never mixed across repetitions --
+        // see the long note in the `cpu` block for why that distinction is
+        // load-bearing rather than cosmetic.
+        let mut by_tps: Vec<usize> = (0..rows.len()).collect();
+        by_tps.sort_by(|&a, &b| rows[a].tps.partial_cmp(&rows[b].tps).unwrap());
+        let rep = &rows[by_tps[by_tps.len() / 2]];
+
+        if rows.iter().all(|r| r.cpu.is_some()) {
+            let cpu = rep.cpu.unwrap();
+            let counted = (sessions * tokens) as f64;
+            let cpu_s = cpu.total_s();
+            println!(
+                "cpu phase={phase} user_s={:.4} sys_s={:.4} cpu_s={cpu_s:.4} \
+                 wall_s={:.4} tokens={counted:.0} tps_rep={:.4} \
+                 cpu_s_per_token={:.6} sys_frac={:.4}",
+                cpu.user_s,
+                cpu.sys_s,
+                rep.wall,
+                rep.tps,
+                cpu_s / counted,
+                if cpu_s > 0.0 { cpu.sys_s / cpu_s } else { 0.0 },
+            );
+        } else {
+            println!("cpu phase={phase} unavailable");
+        }
+
+        // Emitted from the same repetition as the `cpu` row, so `wall_s` is
+        // shared and the residual `wall - (wake + work)` is computable per
+        // worker without joining two rows that may describe different runs.
+        // Absent entirely unless the pool was built with the profile env set;
+        // silence here means "not measured", never "measured as zero".
+        for w in &rep.workers {
+            println!(
+                "worker phase={phase} idx={} cpu={} timed_ops={} wake_ns={} \
+                 work_ns={} last_arrivals={} parks={} spin_hits={} wall_s={:.4}",
+                w.worker,
+                w.cpu.map_or(-1, |c| c as i64),
+                w.timed_ops,
+                w.wake_ns,
+                w.work_ns,
+                w.last_arrivals,
+                w.parks,
+                w.spin_hits,
+                rep.wall,
+            );
+        }
     }
 
     println!(

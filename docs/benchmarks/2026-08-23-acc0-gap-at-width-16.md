@@ -216,9 +216,15 @@ completed cells.
   the width closest to an unconfined production process.
 - **The scaling wall is localised to us and not to the host.** Native converts
   the `t=8 → t=16` doubling into 1.32x where ORT gets 1.76x, in 10 of 10 paired
-  launches. The next step is to localise it further — pool dispatch versus
-  kernel — with per-op timing (`ONNX_GENAI_PROFILE_OPS=1`) and the per-worker
-  straggler attribution added in #1859, which exists for exactly this question.
+  launches. **This has since been split into its two causes** —
+  [2026-08-23-acc0-width-16-cpu-attribution.md](2026-08-23-acc0-width-16-cpu-attribution.md)
+  adds CPU-seconds attribution to both arms and finds ~30% more CPU burned per
+  token at `t=16` *and* ~40% of the sixteen cores idle (`busy` 0.938 → 0.595),
+  against ORT's `busy = 0.999`. It also found that the decode pool's 500 us
+  spin/yield wait makes `busy` read 0.966 instead of 0.595 at the same
+  throughput, so **occupancy readings taken at the default blocktime cannot be
+  used to argue the pool is fed.** The remaining step is narrower than stated
+  here: localise the *idle* half with #1859's per-worker straggler attribution.
 - **The width-16 A/A null is itself a defect.** ±35% on two identical arms is
   not a property any other width in this matrix has (`t=8` is ±2.8%), and until
   it is understood every width-16 number costs 16 launches to state as a range.
