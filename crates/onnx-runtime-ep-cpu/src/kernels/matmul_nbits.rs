@@ -11741,6 +11741,16 @@ mod tests {
             (1, 1024, 5, 128, 256.0, true),
             (1, 512, 4, 32, 1024.0, true),
             (2, 256, 9, 32, 1.0, false),
+            // Shapes that reach the kernel's scalar fallback: `k` not a
+            // multiple of `block_size` gives a ragged tail block, and
+            // `block_size = 16` (the one legal size that is not a multiple of
+            // 32) sends every block down it. The fallback accumulates into the
+            // same `extra`/`correction` pair as the vector path, so its
+            // cancellation behaviour belongs under this contract too -- every
+            // case above divides evenly and left it unmeasured.
+            (1, 1000, 7, 32, 1.0, true),
+            (1, 1024, 6, 16, 1.0, true),
+            (1, 1000, 5, 128, 256.0, true),
         ];
         for &(m, k, n, block_size, gain, hostile) in cases {
             for &asymmetric in &[false, true] {
