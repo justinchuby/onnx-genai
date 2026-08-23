@@ -170,7 +170,7 @@ decode cannot disagree about whether a model has finished.
 A package is a single decoder when its workflow has **exactly one ONNX
 component** (components the runtime implements — `binding` — do not count) and
 that component is structurally recognizable as a decoder: it consumes the
-autoregressive sequence and produces logits.
+autoregressive sequence and either produces logits or owns attention state.
 
 This is narrower than "has a decoder". A vision-language package has a
 recognizable decoder among its encoder, projector and decoder components, and
@@ -179,9 +179,34 @@ interpreter. Both execute a declared `pipeline.workflow`; what differs is which
 executor implements the decode step, which is a backend choice beneath one
 representation.
 
-The single predicate is `onnx_genai_metadata::is_single_decoder_workflow`.
-Every caller asks it — engine loader, server, CLI — so no two of them can
-classify the same package differently.
+### One classification, two layers
+
+`onnx_genai_metadata::classify_workflow` is the only place that question is
+answered, for every caller. It reads the workflow once and reports two nested
+layers:
+
+| Layer | Accessor | Question | Evidence | Asked by |
+|---|---|---|---|---|
+| 1 | `is_single_decoder()` | does this workflow execute exactly one ONNX graph, and is that graph a decoder? | declared port `roles` | metadata `--shape`, server, CLI |
+| 2 | `contracted_single_decoder()` | …*and* does that graph name the step this runtime registered an executor for? | layer 1 **plus** `onnx-genai.autoregressive-decode` | the engine loader |
+
+Layer 2 is *defined* as layer 1 plus the contract, so "the loader chose the
+fused decode core for a package the metadata layer calls composite" is not a
+state the code can reach. Requiring layer 1 is not an extra safety gate: the
+fused executor is driven by the resolved `DecoderAbi`, which is derived from
+the declared roles and from nothing else, so a component naming the decode step
+without them has no ABI to drive it.
+
+`is_single_decoder_workflow` and `sole_decoder_component` remain as named views
+onto the same classification. `decoder_recognizer_agreement.rs` pins all of it:
+an exhaustive matrix over every workflow-declaring document in the repository —
+top-level fixtures, catalogue examples and crate-local fixtures alike — a
+coverage guard that walks the tree so a new fixture cannot skip the matrix, and
+the adversarial shapes no fixture has: extra policy bindings, two decoders, a
+contract with no roles, a binding wearing the decoder's roles, a composite whose
+text head is decoder-shaped, and a 187-component package. `engine/load.rs`
+asserts the same from the loader side, on the shapes where the loader's previous
+scan disagreed with the metadata layer.
 
 ## Converting a package
 
@@ -219,21 +244,33 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- \
 
 `--metadata-only` is what a publisher needs: a hub package can be hundreds of
 gigabytes, and requiring its weights before its metadata could be checked would
-mean nobody checks metadata before uploading it. `--shape` reports
-`single-decoder workflow` / `composite workflow` / `no workflow`, which is the
-triage question when migrating a fleet.
+mean nobody checks metadata before uploading it.
+
+`--shape` reports both layers of the shared classification. It has seven
+possible answers, and the triage verdict for each. A *graph component* is one
+the package ships an artifact for — an `onnx` component or an `adapter`; a
+`binding` is a step the runtime implements and is not counted.
+
+| Reported shape | What it means | Action |
+|---|---|---|
+| `single-decoder workflow` | one graph, recognized as a decoder by its roles, naming the decode contract | already canonical; the fused decode core covers it |
+| `single-decoder workflow, no decode contract` | one graph, recognized as a decoder by its roles, but no component names `onnx-genai.autoregressive-decode` | already canonical, and it generates: the interpreter runs the declared loop as-is. Adding the contract only opts the package into the fused decode core |
+| `composite workflow (N graph components)` | several graphs, executed by the interpreter | already canonical; confirm `N` is the number you expect |
+| `one graph component, not a decoder` | one graph that decodes nothing: it consumes no autoregressive sequence, or it consumes one but produces no logits and owns no attention state — an encoder, a CTC head, a rollout step | already canonical for what it is; it is not a generation package and no decode step applies |
+| `one graph component declaring the decode contract but no port roles` | contradictory: the step is named, but nothing says how to drive it | a producer error; declare the port roles |
+| `workflow with no graph component` | a workflow whose every component is a `binding` | there is no artifact to execute; check this is really the package you meant to publish |
+| `no workflow` | the document declares no `pipeline.workflow` | needs conversion |
 
 ## Republishing a hub package
 
 1. `validate_metadata --metadata-only --shape` the *current* published
    `inference_metadata.yaml`. It answers three of the four questions at once:
-   does it still parse, does it still validate, and what shape is it.
-   - `no workflow` or a `model.io` rejection → needs conversion.
-   - `single-decoder workflow` / `composite workflow` → already canonical;
-     confirm the shape is the one you expect.
-2. If it needs conversion, run `migrate_model_io` against a local checkout of
-   the package. The tool needs the ONNX artifact present to read port contracts,
-   but not the weights of every variant — a single decoder's graph is enough.
+   does it still parse, does it still validate, and what shape is it. Look the
+   reported shape up in the table above.
+2. If it needs conversion (`no workflow`, or a `model.io` rejection), run
+   `migrate_model_io` against a local checkout of the package. The tool needs
+   the ONNX artifact present to read port contracts, but not the weights of
+   every variant — a single decoder's graph is enough.
 3. Re-run `validate_metadata --metadata-only` on the result, then upload the
    metadata file as a new revision. Nothing else in the package changes:
    conversion rewrites how the graph ABI is *stated*, not the graph.
@@ -269,7 +306,7 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- --metadata-only --sh
 
 | Repo | Revision audited | Metadata | Status |
 |---|---|---|---|
-| `justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` | `541afaea12e85222766b694cccc30153ea6dd3c1` | `inference_metadata.yaml` | **Already canonical.** Declares `pipeline.workflow`, no `model.io`. Validates against this branch. Classified `composite workflow` (186 ONNX components). **No action.** |
+| `justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` | `541afaea12e85222766b694cccc30153ea6dd3c1` | `inference_metadata.yaml` | **Already canonical.** Declares `pipeline.workflow`, no `model.io`. Validates against this branch. Classified `composite workflow (186 graph components)`. **No action.** |
 | `justinchuby/gemma-4-e2b-it-onnx` | `9bcf2cb1c2878b1c68a5f94db037272dfb278384` | 13 × `genai_config.json` (NF4, Q4_K_M, bf16, f16, openvino × cpu/cuda/webgpu) | **No action.** `genai_config.json` is a *foreign* producer's format, not `model.io`. The importer converts it in memory to a canonical workflow, so these load unchanged. |
 
 **No published package requires metadata replacement.** The retired `model.io`
@@ -291,7 +328,11 @@ a 186-graph package to the fused single-graph executor, which cannot run the
 other 185. Every vision-language package classified the same way.
 
 The predicate now asks the question the phrase actually means: does this
-workflow execute **one** ONNX graph? `is_single_decoder_workflow` is fixed and
-pinned by `decoder_workflow_roundtrip::a_multi_component_package_is_not_a_single_decoder`.
-A published package is the only place this would have shown up — no in-repo
-fixture has that shape.
+workflow execute **one** ONNX graph? That reading lives in
+`classify_workflow`, which every caller — metadata validation, the CLI, the
+server and the engine loader — reads instead of scanning the components itself.
+It is pinned by `decoder_workflow_roundtrip::a_multi_component_package_is_not_a_single_decoder`
+and, exhaustively, by `decoder_recognizer_agreement.rs`, whose
+`a_187_component_package_with_one_text_head_is_composite` reconstructs this
+package's shape so the defect is covered in-repo. A published package was the
+only place it would otherwise have shown up — no in-repo fixture has that shape.

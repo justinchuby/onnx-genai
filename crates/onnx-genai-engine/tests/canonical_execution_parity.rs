@@ -214,16 +214,7 @@ fn a_composite_workflow_is_executed_by_the_interpreter() -> anyhow::Result<()> {
     let workflow = engine
         .package_workflow()
         .expect("a loaded package always declares a workflow");
-    let graph_components = workflow
-        .components
-        .values()
-        .filter(|component| {
-            !matches!(
-                component.implementation,
-                onnx_genai_metadata::ComponentImplementation::Binding
-            )
-        })
-        .count();
+    let graph_components = onnx_genai_metadata::classify_workflow(workflow).graph_component_count();
     assert!(
         graph_components > 1,
         "the composite fixture declares several graph components"

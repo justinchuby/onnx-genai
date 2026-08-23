@@ -19678,6 +19678,154 @@ mod tests {
     /// `STATUS_ACCESS_VIOLATION` is treated as a real failure.
     const SPMD_WIDTH_CHILD_MAX_ATTEMPTS: u32 = 3;
 
+    /// Grep anchor for a consumed environmental retry (#1745).
+    const ENVIRONMENTAL_RETRY_MARKER: &str = "NXRT_ENV_RETRY:";
+
+    /// Record that a bounded retry was consumed, in a way that survives a
+    /// *passing* test.
+    ///
+    /// The obvious `eprintln!` does not. libtest captures the `print!`/
+    /// `eprintln!` family per test thread and replays it only when the test
+    /// *fails*, so a retry followed by a green run destroys its own evidence —
+    /// and that is exactly the case needed to estimate the environmental crash
+    /// rate. Measured, plain `cargo test`, two passing tests: an `eprintln!`
+    /// marker never appears while a direct `io::stderr()` marker does.
+    ///
+    /// This matters more than it looks. With `max` attempts and a per-attempt
+    /// crash probability `p`, a lane only goes red when every attempt faults,
+    /// so the observed failure rate is `p^max` and the true rate is its
+    /// `max`th root — an observed 1-in-200 flake implies a per-attempt rate
+    /// near 17%. Retries do not merely hide the rate, they cube it, so the
+    /// number has to be recoverable from *green* runs or it is not recoverable
+    /// at all.
+    ///
+    /// Best-effort by construction: a diagnostic must never fail a test, so
+    /// both the write and the flush discard their errors.
+    ///
+    /// See [`a_consumed_retry_is_recorded_where_a_green_run_can_be_mined`].
+    fn record_environmental_retry(site: &str, detail: &str, attempt: u32, max: u32) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = writeln!(
+            err,
+            "{ENVIRONMENTAL_RETRY_MARKER} site={site} {detail} attempt={attempt} max={max}"
+        );
+        let _ = err.flush();
+    }
+
+    /// The claim the Linux invariant in [`realized_width_report_with`] rests
+    /// on: no Linux exit status can be mistaken for the environmental crash.
+    ///
+    /// That assertion is a tripwire for a condition that cannot occur here, so
+    /// it can never fire on this host and no mutation of it is catchable. What
+    /// *is* catchable is the premise — a Linux child exits with `0..=255`, or
+    /// reports no code at all when signalled, and `STATUS_ACCESS_VIOLATION` is
+    /// none of those. Proving the premise is what makes the tripwire more than
+    /// an assertion nobody has tested.
+    #[test]
+    fn the_environmental_retry_cannot_trigger_on_a_linux_exit_status() {
+        for code in 0..=255i32 {
+            assert!(
+                !is_environmental_access_violation_crash(
+                    false,
+                    Some(code),
+                    "",
+                    "",
+                    SPMD_WIDTH_MARKER
+                ),
+                "exit code {code} was classified as the environmental crash, so the retry \
+                 is reachable on Linux and every `attempts == 1` invariant is unsound"
+            );
+        }
+        // A signalled child (SIGSEGV, SIGKILL, the OOM killer) reports no code.
+        assert!(
+            !is_environmental_access_violation_crash(false, None, "", "", SPMD_WIDTH_MARKER),
+            "a signalled child was classified as the environmental crash, which would retry \
+             away a real segfault or an OOM kill"
+        );
+    }
+
+    /// Set on the child half of
+    /// [`a_consumed_retry_is_recorded_where_a_green_run_can_be_mined`].
+    const RETRY_RECORD_CHILD_ENV: &str = "ONNX_GENAI_TEST_RETRY_RECORD_CHILD";
+
+    /// Emitted by that child through `eprintln!` as the control arm.
+    const RETRY_RECORD_CAPTURED_CONTROL: &str = "NXRT_ENV_RETRY_CAPTURED_CONTROL:";
+
+    /// Child half: emits both forms and then *passes*.
+    #[test]
+    fn retry_record_child() {
+        if std::env::var_os(RETRY_RECORD_CHILD_ENV).is_none() {
+            return;
+        }
+        // Control arm: the macro form the retry sites used to use.
+        eprintln!("{RETRY_RECORD_CAPTURED_CONTROL} control");
+        record_environmental_retry("selftest", "case=probe", 1, 3);
+    }
+
+    /// A retry that is followed by a green run must still leave a trace.
+    ///
+    /// This is the whole point of [`record_environmental_retry`]: the rate we
+    /// need for #1745 lives in runs that *passed* after retrying, so a record
+    /// that only survives failure records nothing we can use.
+    ///
+    /// The child is deliberately spawned **without** `--nocapture`, because
+    /// capture is the thing under test, and it is asserted to have passed,
+    /// because libtest replays captured output for a *failing* test and would
+    /// otherwise hand us a false positive.
+    ///
+    /// The control arm is what keeps this honest. If libtest ever stopped
+    /// capturing — or the child were spawned with `--nocapture` by mistake —
+    /// both markers would survive, the interesting assertion would hold for a
+    /// reason that has nothing to do with the fix, and the test would be
+    /// decorative. Asserting the `eprintln!` marker is *absent* means the test
+    /// fails rather than silently stops proving anything.
+    #[test]
+    fn a_consumed_retry_is_recorded_where_a_green_run_can_be_mined() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::retry_record_child")
+            .arg("--test-threads=1")
+            // libtest honours `RUST_TEST_NOCAPTURE` as well as `--nocapture`,
+            // and `Command` inherits the parent environment. Without this a
+            // developer running the suite with `RUST_TEST_NOCAPTURE=1` — a
+            // legitimate way to watch test output — would disable capture in
+            // the child, let the control marker through, and fail this test for
+            // a reason unrelated to the fix. The premise has to be established
+            // here rather than inherited.
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .env(RETRY_RECORD_CHILD_ENV, "1")
+            .output()
+            .expect("run the retry-record child process");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        assert!(
+            output.status.success(),
+            "the retry-record child failed (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            child_status_detail(&output.status)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child must have PASSED for this to say anything about a green run; \
+             libtest replays captured output on failure:\nstdout:\n{stdout}"
+        );
+        assert!(
+            stderr.contains(ENVIRONMENTAL_RETRY_MARKER),
+            "a consumed retry left no trace in a passing child, so the crash rate \
+             behind {SPMD_WIDTH_CHILD_MAX_ATTEMPTS} attempts stays unmeasurable \
+             (#1745):\nstderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains(RETRY_RECORD_CAPTURED_CONTROL)
+                && !stdout.contains(RETRY_RECORD_CAPTURED_CONTROL),
+            "the `eprintln!` control survived, so libtest is not capturing here and \
+             this test proves nothing about surviving capture:\nstdout:\n{stdout}\n\
+             stderr:\n{stderr}"
+        );
+    }
+
     /// What a realized-width child observed about the pool it built.
     #[derive(Debug)]
     struct RealizedWidth {
@@ -19705,6 +19853,19 @@ mod tests {
         fully_pinned: bool,
         /// Whether the child could read the affinities actually in force.
         proc_readable: bool,
+        /// Attempts the parent consumed to obtain this report. `1` on a clean
+        /// run; more means environmental crashes were retried away and this
+        /// number is the only in-band trace of them (#1745).
+        ///
+        /// On non-Linux targets the only *field access* is the Linux invariant
+        /// below, which `cfg` strips — and rustc's dead-code analysis
+        /// deliberately ignores the derived `Debug` that carries this into every
+        /// `{report:?}` assertion message. Without the `allow` the lanes that
+        /// actually see this crash (Windows ARM64, Windows x86_64, macOS arm64,
+        /// all built with `-D warnings`) fail to compile on a field that exists
+        /// to diagnose them.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+        attempts: u32,
     }
 
     /// The placement the OS actually enforced, read from `/proc`, as one CPU
@@ -19995,7 +20156,9 @@ mod tests {
         // (see #1745). A real assertion failure prints a Rust panic and so still
         // fails fast on the first attempt; on Linux this signature never occurs.
         let mut stdout = String::new();
+        let mut attempts_used = 1;
         for attempt in 1..=SPMD_WIDTH_CHILD_MAX_ATTEMPTS {
+            attempts_used = attempt;
             let output = command
                 .output()
                 .expect("run the realized-width child process");
@@ -20010,9 +20173,11 @@ mod tests {
                 SPMD_WIDTH_MARKER,
             ) && attempt < SPMD_WIDTH_CHILD_MAX_ATTEMPTS
             {
-                eprintln!(
-                    "note: retrying realized-width child (requested={requested}) after \
-                     environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                record_environmental_retry(
+                    "spmd_realized_width",
+                    &format!("requested={requested}"),
+                    attempt,
+                    SPMD_WIDTH_CHILD_MAX_ATTEMPTS,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;
@@ -20056,7 +20221,7 @@ mod tests {
                 other => panic!("`{key}` is not 1/0/na: {other}"),
             }
         };
-        RealizedWidth {
+        let report = RealizedWidth {
             requested: field("requested"),
             available: field("available"),
             allowed: field("allowed"),
@@ -20068,7 +20233,25 @@ mod tests {
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             proc_readable: field("proc") == 1,
-        }
+            attempts: attempts_used,
+        };
+
+        // A retry is only ever consumed for an exit code of exactly
+        // `STATUS_ACCESS_VIOLATION` (`0xC0000005`). A Linux exit status is
+        // `0..=255`, or absent when the child was signalled, so it cannot equal
+        // that NTSTATUS and the retry is structurally unreachable here. If this
+        // fires, either the signature widened or something genuinely new is
+        // crashing the child — both worth a red test rather than a silent
+        // retry, which is the failure mode #1745 is made of.
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            report.attempts, 1,
+            "a realized-width child consumed {} attempts on Linux, where the environmental \
+             STATUS_ACCESS_VIOLATION signature cannot occur ({report:?})",
+            report.attempts
+        );
+
+        report
     }
 
     /// A `t=N` label must mean N workers actually ran.
@@ -21069,9 +21252,11 @@ mod tests {
                 &format!("{AFFINITY_DEFER_MARKER}ok"),
             ) && attempt < AFFINITY_DEFER_CHILD_MAX_ATTEMPTS
             {
-                eprintln!(
-                    "note: retrying affinity-defer child (scenario={scenario}) after \
-                     environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                record_environmental_retry(
+                    "affinity_defer",
+                    &format!("scenario={scenario}"),
+                    attempt,
+                    AFFINITY_DEFER_CHILD_MAX_ATTEMPTS,
                 );
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 continue;

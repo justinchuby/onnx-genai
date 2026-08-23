@@ -989,6 +989,174 @@ impl Value {
         Ok(host)
     }
 
+    /// Allocate an uninitialized tensor in CUDA device memory on `device_id`.
+    ///
+    /// The returned value *owns* its allocation: the backing
+    /// [`crate::cuda_rt::CudaAllocation`] travels with the value and frees the
+    /// device memory only when the value — and every
+    /// [`alias_with_offset`](Self::alias_with_offset) view derived from it —
+    /// has dropped.
+    ///
+    /// This exists so an interpreter construct can build a tensor *where its
+    /// operands already are*. A destination that has to be allocated on the
+    /// host and uploaded is a host round trip by another name, and the fused
+    /// input of a speculative proposal step is exactly that destination.
+    ///
+    /// The contents are whatever the device last left there; every caller here
+    /// overwrites the whole buffer, and [`fill_zero_device`](Self::fill_zero_device)
+    /// is available for one that cannot.
+    #[cfg(feature = "cuda")]
+    pub fn empty_cuda(shape: &[i64], dtype: DataType, device_id: i32) -> Result<Self> {
+        validate_shape(shape, None)?;
+        let numel = shape.iter().try_fold(1usize, |acc, &dim| {
+            acc.checked_mul(dim as usize).ok_or_else(|| {
+                OrtError::InvalidArgument(format!("tensor shape too large: {shape:?}"))
+            })
+        })?;
+        let bytes = numel.checked_mul(dtype.size_of()).ok_or_else(|| {
+            OrtError::InvalidArgument(format!("tensor {shape:?} byte size overflows usize"))
+        })?;
+        if bytes == 0 {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot allocate a device tensor with no elements (shape {shape:?}); an empty \
+                 tensor has no device address to publish, so build it on the host instead"
+            )));
+        }
+        let allocation = crate::cuda_rt::CudaAllocation::new(device_id, bytes)?;
+        let device_ptr = allocation.device_ptr() as *mut std::ffi::c_void;
+        let memory_info = MemoryInfo::cuda(device_id)?;
+        // SAFETY: `device_ptr` is this process's own `cudaMalloc` allocation on
+        // `device_id`, valid for exactly `bytes`, and the returned value takes
+        // ownership of the guard that frees it — so the allocation outlives the
+        // value and every ORT use of it.
+        unsafe {
+            Self::from_external_memory_with_owner(
+                device_ptr,
+                bytes,
+                shape,
+                dtype,
+                &memory_info,
+                Box::new(allocation),
+            )
+        }
+    }
+
+    /// Zero every byte of a device-resident tensor.
+    ///
+    /// The companion to [`empty_cuda`](Self::empty_cuda): a buffer a caller
+    /// cannot prove it fully overwrites is zeroed rather than left holding
+    /// whatever the device last wrote there.
+    #[cfg(feature = "cuda")]
+    pub fn fill_zero_device(&self, device_id: i32) -> Result<()> {
+        if self.is_host_resident()? {
+            return Err(OrtError::InvalidArgument(
+                "fill_zero_device requires a device-resident tensor; this one is on the host"
+                    .into(),
+            ));
+        }
+        let bytes = self
+            .numel()
+            .checked_mul(self.dtype.size_of())
+            .ok_or_else(|| {
+                OrtError::InvalidArgument("device zero-fill byte size overflows usize".into())
+            })?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _guard = crate::cuda_rt::DeviceGuard::set(device_id)?;
+        crate::cuda_rt::memset_zero(self.data_ptr_addr()?, bytes)
+    }
+
+    /// Borrow this tensor's elements as `f32`.
+    ///
+    /// The borrowing counterpart of [`to_vec_f32`](Self::to_vec_f32), for a
+    /// reader that scans a large table (an embedding matrix, above all) and
+    /// would otherwise pay a full copy of it to read one row.
+    ///
+    /// Errors for a non-`Float32` or device-resident tensor rather than
+    /// reinterpreting bytes the caller did not ask for.
+    pub fn as_slice_f32(&self) -> Result<&[f32]> {
+        if self.dtype != DataType::Float32 {
+            return Err(OrtError::InvalidArgument(format!(
+                "as_slice_f32 requires a Float32 tensor, got {:?}",
+                self.dtype
+            )));
+        }
+        let bytes = self.as_raw_bytes()?;
+        if bytes.is_empty() {
+            return Ok(&[]);
+        }
+        // SAFETY-adjacent: `align_to` is safe, and the prefix/suffix check below
+        // turns a hypothetically misaligned ORT allocation into an error rather
+        // than undefined behaviour. ORT allocates tensors at least element
+        // aligned, so the prefix is empty in practice.
+        let (prefix, elements, suffix) = unsafe { bytes.align_to::<f32>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
+            return Err(OrtError::InvalidArgument(
+                "this tensor's buffer is not f32-aligned, so its elements cannot be borrowed; \
+                 copy it with to_vec_f32 instead"
+                    .into(),
+            ));
+        }
+        Ok(elements)
+    }
+
+    /// Overwrite `bytes.len()` bytes starting `element_offset` elements into
+    /// this host-resident tensor, leaving its OrtValue and buffer address
+    /// unchanged.
+    ///
+    /// The dtype-agnostic scatter primitive: an interpreter construct
+    /// assembling a tensor out of segments (the `concat(embed(token), carry)`
+    /// fused input of a speculative proposal step) writes each segment into
+    /// place rather than allocating a fresh buffer per step. The offset is in
+    /// elements so a caller cannot produce a misaligned write by forgetting the
+    /// dtype width.
+    ///
+    /// `bytes` must be a whole number of elements and must land entirely inside
+    /// the tensor; both are errors rather than a truncated or wrapping write.
+    pub fn write_raw_bytes_at(&self, element_offset: usize, bytes: &[u8]) -> Result<()> {
+        self.ensure_host_accessible("write_raw_bytes_at")?;
+        let element = self.dtype.size_of();
+        if !bytes.len().is_multiple_of(element) {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_raw_bytes_at got {} bytes, which is not a whole number of {:?} elements \
+                 ({element} bytes each)",
+                bytes.len(),
+                self.dtype
+            )));
+        }
+        let count = bytes.len() / element;
+        let end = element_offset.checked_add(count).ok_or_else(|| {
+            OrtError::InvalidArgument("write_raw_bytes_at range overflows usize".into())
+        })?;
+        if end > self.numel() {
+            return Err(OrtError::InvalidArgument(format!(
+                "write_raw_bytes_at would write elements {element_offset}..{end} of a tensor with \
+                 {} elements (shape {:?})",
+                self.numel(),
+                self.shape
+            )));
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let base = tensor_data_ptr(self.ptr.as_ptr())?;
+        // SAFETY: `base` points at this host-resident tensor's row-major
+        // allocation of `numel() * element` bytes, and the destination window
+        // was bounds-checked above; `u8` has alignment 1, so any non-null
+        // `base` is suitably aligned. `copy` rather than `copy_nonoverlapping`
+        // because nothing in the signature stops `bytes` from borrowing a
+        // tensor that aliases this one -- an `alias_with_offset` view of the
+        // same allocation is an ordinary `Value` -- and an overlapping
+        // `copy_nonoverlapping` would be undefined behaviour rather than a
+        // wrong answer.
+        unsafe {
+            let destination = base.cast::<u8>().add(element_offset * element);
+            std::ptr::copy(bytes.as_ptr(), destination, bytes.len());
+        }
+        Ok(())
+    }
+
     /// Overwrite the leading `data.len()` Int64 elements of this tensor in
     /// place, leaving the tensor's OrtValue (and its buffer address) unchanged.
     ///
