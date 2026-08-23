@@ -34,6 +34,18 @@ impl Engine {
         self.workflow.host_staging_count()
     }
 
+    /// How many bytes this runtime has deliberately read back off a device.
+    ///
+    /// The companion to [`Engine::host_staging_count`]: that counts whole
+    /// tensors brought down, this counts the bytes of the one path that is
+    /// allowed to bring anything down — the token id a device argmax produces.
+    /// Together they account for every device→host byte the interpreter can
+    /// produce, so a test asserting "only token ids came back" can say so as a
+    /// number rather than as a hope.
+    pub fn device_readback_bytes(&self) -> u64 {
+        self.workflow.device_readback_bytes()
+    }
+
     /// How many nodes this runtime executed through each declared contract.
     ///
     /// Which algorithmic executor ran is decided by the contract a component
@@ -328,6 +340,17 @@ impl Engine {
         table: &str,
     ) -> anyhow::Result<crate::pipeline::speculative::EmbeddingTable> {
         self.workflow_runtime().embedding_table(component, table)
+    }
+
+    /// How many times this runtime read an embedding table out of an artifact.
+    ///
+    /// A declared `[vocab, hidden]` table is loaded — and, on a device,
+    /// uploaded — once for the runtime's life. Re-reading it per proposal is
+    /// correct and, at a real vocabulary, costs more than the proposal it
+    /// feeds, so the cache is a contract rather than an optimization and this
+    /// is what holds it.
+    pub fn embedding_table_loads(&self) -> u64 {
+        self.workflow.embedding_table_loads()
     }
 
     /// Native component invocations performed by this package's workflow, or

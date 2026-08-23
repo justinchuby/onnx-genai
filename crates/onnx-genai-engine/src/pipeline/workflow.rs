@@ -1938,11 +1938,28 @@ impl WorkflowRuntime {
     /// seam is what makes those constructs backend-neutral: ORT and native both
     /// run through the identical path, with no second "invoke a component"
     /// implementation to keep in sync.
+    ///
+    /// `symbol_hints` binds shape symbols the caller has already proven for
+    /// this component but that none of the inputs it is binding carry — a
+    /// vocabulary an output declares and no input mentions, above all. Without
+    /// them such an output has no resolvable shape, so no device buffer can be
+    /// sized for it and the run has to hand it back through host memory: a
+    /// per-invocation download of the very tensor the caller then wants scored
+    /// on the device.
+    ///
+    /// A hint only ever *adds* resolution; it cannot change a shape the inputs
+    /// already determine, because a symbol an input carries is re-bound from
+    /// that input's actual extent and a disagreement is a validation error.
+    /// And a hint that is simply wrong fails closed rather than corrupting
+    /// data: an output binding is sized from the resolved shape and the session
+    /// requires it to equal the kernel's own output shape exactly, so a
+    /// mis-sized buffer is a run error naming both shapes, never a short read.
     pub(crate) fn invoke_component_values(
         &self,
         component: &str,
         inputs: &[(&str, &Value)],
         outputs: &std::collections::BTreeMap<String, String>,
+        symbol_hints: &HashMap<String, i64>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let workflow = &self.workflow;
         let declaration = workflow
@@ -1956,7 +1973,7 @@ impl WorkflowRuntime {
             ),
             "workflow component '{component}' is not an ONNX component"
         );
-        let mut component_symbols = HashMap::new();
+        let mut component_symbols = symbol_hints.clone();
         let component_dynamic_symbols = std::collections::HashSet::new();
         for (port, value) in inputs {
             if let Some(contract) = declaration.ports.inputs.get(*port) {
@@ -1997,16 +2014,6 @@ impl WorkflowRuntime {
             }
         }
         Ok(produced)
-    }
-
-    /// Copy a possibly device-resident value into host memory.
-    ///
-    /// Interpreter constructs that must read tensor bytes (a proposal loop's
-    /// argmax, a folded carry it re-packs into the next fused input) go through
-    /// here so a native-CUDA run stays correct without the caller knowing where
-    /// the value lives.
-    pub(crate) fn host_copy_of(&self, value: &Value) -> anyhow::Result<Value> {
-        self.materialize_workflow_value_copy(value)
     }
 
     /// Backend-neutral execution seam for a declared ONNX component.

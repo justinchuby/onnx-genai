@@ -261,6 +261,16 @@ impl NativeComponentSet {
         &self.device_label
     }
 
+    /// CUDA device ordinal these sessions run on, or `None` on CPU.
+    ///
+    /// Where a component *will* execute is configured, not discovered, so an
+    /// interpreter construct that has to build a tensor for it can build that
+    /// tensor in the right memory the first time instead of assembling it on
+    /// the host and letting the binding upload it.
+    pub(crate) fn cuda_ordinal(&self) -> Option<u32> {
+        self.cuda_ordinal
+    }
+
     /// Number of native component invocations performed so far.
     ///
     /// Tests assert this is non-zero after a native run (proving the native

@@ -44,6 +44,12 @@ required-features = ["native-backend"]
 name = "native_workflow_parity"
 required-features = ["native-backend"]
 
+# Asserts a process-global CUDA live-allocation count, so it needs a process
+# with no sibling test building or dropping CUDA engines underneath it.
+[[test]]
+name = "chained_proposal_device_memory"
+required-features = ["native-cuda"]
+
 [[test]]
 name = "native_cuda_captured_step_inputs_parity"
 required-features = ["native-cuda"]
