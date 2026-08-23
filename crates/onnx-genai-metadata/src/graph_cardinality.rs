@@ -27,8 +27,9 @@
 //! package the metadata layer does not call a single decoder" is not a state
 //! this code can reach — it is not a property two independent scans happen to
 //! share, it is how the second layer is built.
-//! `decoder_recognizer_agreement.rs` pins that over every maintained fixture,
-//! every catalogue example and the adversarial shapes none of them cover.
+//! `decoder_recognizer_agreement.rs` pins that over every workflow-declaring
+//! document in the repository and the adversarial shapes none of them cover,
+//! and `engine/load.rs` asserts it again from the loader's own predicate.
 //!
 //! Nothing here reads a component name, a model name or an architecture
 //! string. A package may name its components whatever it likes.
@@ -189,8 +190,17 @@ impl<'a> WorkflowClassification<'a> {
 
 /// The components that name something to execute, in the workflow's own order.
 ///
-/// The one place the "graph component" question is answered. A `binding` is a
-/// step the runtime implements and has no artifact; everything else does.
+/// The one place a *cardinality* question about graph components is answered:
+/// a `binding` is a step the runtime implements and has no artifact, so it does
+/// not count; everything else does, including an `adapter`.
+///
+/// This is not the only filter over `implementation` in the crate, and
+/// deliberately so. `validation.rs` counts `Onnx`-only components when deciding
+/// whether a single graph must declare a sequence role, because that check is
+/// about which components a decode ABI could be resolved *from* — an adapter is
+/// something to execute but never a decoder. Two questions, two filters; what
+/// this module owns is "how many graphs, and is the lone one a decoder".
+///
 /// Callers outside this crate read the resolved [`WorkflowClassification`]
 /// rather than re-scanning, which is the duplication this module removes.
 pub(crate) fn graph_components(

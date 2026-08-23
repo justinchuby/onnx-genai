@@ -199,10 +199,14 @@ without them has no ABI to drive it.
 
 `is_single_decoder_workflow` and `sole_decoder_component` remain as named views
 onto the same classification. `decoder_recognizer_agreement.rs` pins all of it:
-an exhaustive matrix over every fixture and catalogue example, a coverage guard
-so a new fixture cannot skip the matrix, and the adversarial shapes no fixture
-has — extra policy bindings, two decoders, a contract with no roles, a
-composite whose text head is decoder-shaped, and a 187-component package.
+an exhaustive matrix over every workflow-declaring document in the repository —
+top-level fixtures, catalogue examples and crate-local fixtures alike — a
+coverage guard that walks the tree so a new fixture cannot skip the matrix, and
+the adversarial shapes no fixture has: extra policy bindings, two decoders, a
+contract with no roles, a binding wearing the decoder's roles, a composite whose
+text head is decoder-shaped, and a 187-component package. `engine/load.rs`
+asserts the same from the loader side, on the shapes where the loader's previous
+scan disagreed with the metadata layer.
 
 ## Converting a package
 
@@ -240,23 +244,30 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- \
 
 `--metadata-only` is what a publisher needs: a hub package can be hundreds of
 gigabytes, and requiring its weights before its metadata could be checked would
-mean nobody checks metadata before uploading it. `--shape` reports both layers
-of the shared classification — `single-decoder workflow`,
-`single-decoder workflow, no decode contract`,
-`composite workflow (N ONNX components)`, or `no workflow` — which is the
-triage question when migrating a fleet.
+mean nobody checks metadata before uploading it.
+
+`--shape` reports both layers of the shared classification. It has six possible
+answers, and the triage verdict for each:
+
+| Reported shape | What it means | Action |
+|---|---|---|
+| `single-decoder workflow` | one ONNX graph, recognized by its roles, naming the decode contract | already canonical; the decode core covers it |
+| `single-decoder workflow, no decode contract` | one ONNX graph, recognized by its roles, but no component names `onnx-genai.autoregressive-decode` | the document is valid; add the contract before a runtime will drive its generation loop |
+| `composite workflow (N ONNX components)` | several graphs, executed by the interpreter | already canonical; confirm `N` is the number you expect |
+| `one ONNX component, not a decoder` | one graph that consumes no autoregressive sequence — an encoder, a CTC head, a rollout step | already canonical for what it is; it is not a generation package and no decode step applies |
+| `one ONNX component declaring the decode contract but no port roles` | contradictory: the step is named, but nothing says how to drive it | a producer error; declare the port roles |
+| `no workflow` | the document declares no `pipeline.workflow` | needs conversion |
 
 ## Republishing a hub package
 
 1. `validate_metadata --metadata-only --shape` the *current* published
    `inference_metadata.yaml`. It answers three of the four questions at once:
-   does it still parse, does it still validate, and what shape is it.
-   - `no workflow` or a `model.io` rejection → needs conversion.
-   - `single-decoder workflow` / `composite workflow (N ONNX components)` →
-     already canonical; confirm the shape is the one you expect.
-2. If it needs conversion, run `migrate_model_io` against a local checkout of
-   the package. The tool needs the ONNX artifact present to read port contracts,
-   but not the weights of every variant — a single decoder's graph is enough.
+   does it still parse, does it still validate, and what shape is it. Look the
+   reported shape up in the table above.
+2. If it needs conversion (`no workflow`, or a `model.io` rejection), run
+   `migrate_model_io` against a local checkout of the package. The tool needs
+   the ONNX artifact present to read port contracts, but not the weights of
+   every variant — a single decoder's graph is enough.
 3. Re-run `validate_metadata --metadata-only` on the result, then upload the
    metadata file as a new revision. Nothing else in the package changes:
    conversion rewrites how the graph ABI is *stated*, not the graph.

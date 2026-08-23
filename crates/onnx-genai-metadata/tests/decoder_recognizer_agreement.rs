@@ -10,12 +10,14 @@
 //!
 //! [`classify_workflow`] is now the only place either question is answered, and
 //! the contract layer is *defined* as the role layer plus the contract. This
-//! file is the evidence: an exhaustive matrix over every maintained fixture and
-//! every catalogue example, a coverage guard so a new fixture cannot skip the
-//! matrix, and the adversarial shapes no fixture has — extra policy bindings,
-//! two decoders, a decoder missing the roles that drive it, a composite whose
-//! text head is decoder-shaped, and the 187-component published package that
-//! caught the original defect.
+//! file is the evidence: an exhaustive matrix over every workflow-declaring
+//! document in the repository — top-level fixtures, catalogue examples and
+//! crate-local fixtures alike — a coverage guard that walks the tree so a new
+//! fixture cannot skip the matrix, and the adversarial shapes no fixture has:
+//! extra policy bindings, two decoders, a decoder missing the roles that drive
+//! it, a binding wearing the decoder's roles, a composite whose text head is
+//! decoder-shaped, and the 187-component published package that caught the
+//! original defect.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -59,7 +61,7 @@ const fn row(
     }
 }
 
-use GraphCardinality::{Composite, SingleGraph};
+use GraphCardinality::{Composite, NoGraph, SingleGraph};
 
 /// Every workflow this repository maintains, and how it classifies.
 const MATRIX: &[Row] = &[
@@ -546,6 +548,42 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // ── crate-local fixtures ─────────────────────────────────────────────────
+    // A package fixture the engine's model-package tests load.
+    row(
+        "crates/onnx-genai-engine/tests/fixtures/model-package-cpu/cpu/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
+    ),
+    // The smallest document that declares a workflow at all: its one component
+    // is a `binding`, so the workflow names no graph.
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/north_star_minimal.yaml",
+        0,
+        NoGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/validator_missing_artifact/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
+    row(
+        "crates/onnx-genai-metadata/tests/fixtures/validator_package/inference_metadata.yaml",
+        1,
+        SingleGraph,
+        None,
+        false,
+        None,
+    ),
 ];
 
 fn repository_root() -> PathBuf {
@@ -627,9 +665,7 @@ fn the_free_functions_are_the_classification() {
 fn the_matrix_covers_every_maintained_workflow() {
     let root = repository_root();
     let mut found = BTreeSet::new();
-    for directory in ["tests/fixtures", "examples/inference_metadata/catalogue"] {
-        collect_workflows(&root.join(directory), &root, &mut found);
-    }
+    collect_workflows(&root, &root, &mut found);
     let recorded = MATRIX
         .iter()
         .map(|row| row.relative.to_string())
@@ -648,23 +684,29 @@ fn the_matrix_covers_every_maintained_workflow() {
     );
 }
 
+/// Walk the whole repository for documents that declare a workflow.
+///
+/// Deliberately not two hard-coded directories: crate-local fixtures under
+/// `crates/*/tests/fixtures` declare workflows too, and a guard that only
+/// watched the top-level ones would let a new fixture skip the matrix from
+/// four directories away. Build output and VCS metadata are skipped because
+/// they are not maintained fixtures.
 fn collect_workflows(directory: &Path, root: &Path, found: &mut BTreeSet<String>) {
+    const SKIPPED: &[&str] = &["target", ".git", ".github", "node_modules", "wiki"];
+
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            collect_workflows(&path, root, found);
+            if !SKIPPED.contains(&name.as_str()) {
+                collect_workflows(&path, root, found);
+            }
             continue;
         }
-        let is_catalogue_example = directory.ends_with("catalogue");
-        let is_package_metadata = path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with("inference_metadata"));
-        if path.extension().is_none_or(|extension| extension != "yaml")
-            || !(is_catalogue_example || is_package_metadata)
-        {
+        if !is_candidate_document(&path, &name) {
             continue;
         }
         let declares_workflow = load_metadata(&path)
@@ -675,6 +717,29 @@ fn collect_workflows(directory: &Path, root: &Path, found: &mut BTreeSet<String>
             found.insert(relative.to_string_lossy().replace('\\', "/"));
         }
     }
+}
+
+/// Whether a file is somewhere a maintained metadata document lives.
+///
+/// The extensions are the ones `parser::METADATA_FILE_NAMES` recognizes, so a
+/// fixture written as `.yml` or `.json` cannot slip past the guard. The
+/// location test keeps the walk from trying to parse every YAML in the tree as
+/// a package: a fixture is either named like package metadata, or it sits in a
+/// fixture or example directory.
+fn is_candidate_document(path: &Path, name: &str) -> bool {
+    let recognized_extension = path.extension().is_some_and(|extension| {
+        matches!(
+            extension.to_string_lossy().as_ref(),
+            "yaml" | "yml" | "json"
+        )
+    });
+    if !recognized_extension {
+        return false;
+    }
+    let location = path.to_string_lossy().replace('\\', "/");
+    name.starts_with("inference_metadata")
+        || location.contains("/tests/fixtures/")
+        || location.contains("/examples/inference_metadata/")
 }
 
 // ── the layering invariant ───────────────────────────────────────────────────

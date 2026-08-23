@@ -459,7 +459,10 @@ multimodal and CLI inspection read layer 1 through the named views
 *defined* as layer 1 plus the contract, the loader cannot route a package the
 other callers classify differently — the containment holds by construction, not
 by two scans happening to agree. `decoder_recognizer_agreement.rs` pins the
-whole matrix, including the adversarial shapes no fixture has.
+whole matrix — every workflow-declaring document in the repository, with a
+coverage guard that walks the tree — plus the adversarial shapes no fixture has,
+and `engine/load.rs` asserts the containment again from the loader's own
+predicate.
 
 **KV stays with its executor.** State cells owned by a group are
 `management: runtime` with a `release_boundary`, which is the schema's existing
