@@ -1670,29 +1670,39 @@ Two cheaper hypotheses were tested and **both are closed negative**:
     open question, not an explanation"; the honest disposition is that it is
     **false**. On a re-measurement with one process per cell, `t=2` is
     **1.96x** faster than `t=1` (7.278 vs 14.300 ms/token) against a **0.00%
-    A/A null** over five reps per arm. This independently reproduces, on a
-    different shape and accuracy level, the 1.96x that §27 records for acc0 —
-    two unrelated configurations agreeing on the same factor. The cause is
-    harness-side and mechanical (#1771), not a property of the pool.
-  - **`t=1` is a different code path, so every ratio against it is "vs
-    serial".** The bench reports `path=flat` at width 1 and `path=spmd-pool`
-    from width 2 up: at `total_workers <= 1` `dispatch_output_rows` takes a
-    serial short-circuit and runs on the *dispatcher*, while the spawned worker
-    receives no dispatch at all. "1.96x over `t=1`" therefore means "over the
-    serial dispatcher", not "over a one-worker pool".
-  - **The `8→16 = 1.77x ±0.7%` error bar is withdrawn as unsupportable on a
-    shared host.** Over six independent launches `w=16` spans **1.476–9.064
-    ms/token (514%)** while `w=8` spans 3.195–3.509 (9.8%), and the slow `w=16`
-    launches track SMT-sibling occupancy on the unpinned CPUs. At `w=16` the
-    run holds all 16 physical cores and has no headroom, so a co-tenant on the
-    hardware siblings degrades it non-linearly; at `w=8` there is slack and the
-    number is robust. The original `±0.7%` was three repetitions that happened
-    to land in one mode. **`w=16` is not measurable on this host while it is
-    shared**, and `8→16` is left unquoted rather than given a false interval.
+    A/A null** over five reps per arm. The 1.96x is not itself a surprise —
+    the budget confines the process to `w` CPUs, so `t=2` has twice the
+    hardware of `t=1` and ~2x is the *expected* result. That is the point: the
+    recorded curve reported no speedup where the ordinary one was, and the
+    cause is harness-side and mechanical (#1771), not a property of the pool.
+  - **`t=1` does not build a pool at all, so ratios against it are "vs
+    serial".** At width 1 the decode budget confines the process to a single
+    CPU, and `build_from_env` then *declines* to construct the SPMD pool —
+    with one CPU there is no core to run the inline dispatcher alongside a
+    spinning worker, so it would starve itself (`decode_spmd.rs`, the
+    `allowed.len() == 1` fallback; the crate's own test notes "the smallest
+    budget that builds a pool is 2"). Decode runs on the flat path and the
+    bench reports `path=flat`. Note this is a *different* mechanism from the
+    `total_workers <= 1` serial short-circuit in `dispatch_output_rows`, which
+    is not what fires here: at width 1 there is no pool and no worker to
+    short-circuit. Either way `t=1` is a different code path from every other
+    column, so "1.96x over `t=1`" means "over the serial flat path".
+  - **The `8→16 = 1.77x ±0.7%` error bar is withdrawn as unverifiable.** Over
+    six independent launches `w=16` spans **1.476–9.064 ms/token (514%)**
+    while `w=8` spans 3.195–3.509 (9.8%). At `w=16` the run holds all 16
+    physical cores and has no headroom, so any co-tenant takes throughput
+    straight out of the measurement; at `w=8` there is slack. Note the
+    absolute level also moved between builds — the 2026-08-21 `t=8` of 5.87
+    against today's 3.31 — so this is **not** a claim that those three
+    repetitions were secretly bimodal; it is that a ±0.7% interval on `w=16`
+    is not something this host can support, and the original cannot now be
+    re-checked because the build has moved. **`8→16` is left unquoted** rather
+    than given an interval the measurement cannot carry.
   - Trustworthy cells, five reps each, `realized=`/`as_requested` verified per
     cell: **14.300 / 7.278 / 3.784 ms/token at t=1/2/4** — 1.00x / 1.96x /
-    3.78x, spreads 2.25% / 1.73% / 2.60%. `w=8` is stable at ~3.3 ms but is
-    already near the plateau. Full record:
+    3.78x, spreads 2.25% / 1.73% / 2.60%. **`w=8` is the widest measurable
+    cell on a shared host** (9.8% over six launches); `w=16` is not. Full
+    record:
     [`docs/benchmarks/2026-08-23-acc4-decode-width-remeasurement.md`](../benchmarks/2026-08-23-acc4-decode-width-remeasurement.md).
 - *"Production is stuck on the narrow flat pool, so 1.77x is free."* False.
   `default_persistent_threads(32)` is 16 and `PERSISTENT_POOL_DEFAULT` is
@@ -1702,6 +1712,9 @@ Two cheaper hypotheses were tested and **both are closed negative**:
   *not* a persistent-vs-flat A/B: `PROBE_SPMD` does not move the pool under the
   default policy, an earlier draft wrongly labelled an arm "flat", and
   adversarial review caught it — a 6-wide pool cannot produce a 16-wide time.
+  (The `1.77x` in the hypothesis is the figure withdrawn above; the refutation
+  does not depend on it, since it rests on which pool width is reachable at
+  all, not on the ratio between two widths.)
 
 **Shipped:** `PROBE_ACCURACY` in `int4_decode_loop_ab`. The bench hard-coded
 `accuracy_level = 0`, and 4 is the only value reaching the packed-nibble route,

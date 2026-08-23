@@ -1,4 +1,4 @@
-# acc4 int4 decode — width curve re-measured, and why `w=16` is not measurable here
+# acc4 int4 decode — width curve re-measured, and why `w=16` resists measurement here
 
 **Date:** 2026-08-23 · **Owner:** Roy (CPU MatMul) · **Host:** AMD EPYC 9V74,
 16 physical / 32 logical, single NUMA node, AVX2+FMA+F16C, shared.
@@ -7,13 +7,21 @@ Re-measurement of the decode width curve recorded in
 [`CPU_MATMUL_ASSIGNMENT.md` §20](../performance/CPU_MATMUL_ASSIGNMENT.md), which
 gave `22.949/22.893/11.584/5.866/3.302 ms/token at 1/2/4/8/16 threads`, an
 `8→16` ratio of `1.77x ±0.7%`, and recorded `t=1 ≡ t=2` as "unexplained ... an
-open question". Two of those three are wrong. This document replaces them.
+open question".
+
+Dispositions: the `t=1 ≡ t=2` cell is **wrong**; the `±0.7%` interval is
+**unverifiable on this host** and withdrawn without being disproven; the
+description of what width 1 actually runs was **wrong in the source material
+and in my own earlier accounts of it**, and is corrected here.
 
 The trigger was #1740, which retracted the same `t=1 ≡ t=2` signature in three
 other locations after a controlled re-measurement showed `=2` is 1.96x `=1` on
 acc0. That correction missed §20, and §20 is the one place the claim was framed
 as an open research question rather than an observation — the framing most
-likely to stop the next person from measuring it.
+likely to stop the next person from measuring it. In the same spirit, this
+change also corrects two sites that *this* document's first draft missed: the
+bench header in `int4_decode_loop_ab.rs` and §4 of the ntile record, both of
+which still asserted the withdrawn `±0.7%`.
 
 ## Method
 
@@ -64,26 +72,46 @@ pin would silently be 8 cores and every number below would be wrong.
 **A/A null: 0.00%.** The two width-2 arms returned the same median to four
 significant figures, so the 1.96x is not close to the noise floor.
 
-This reproduces §27's acc0 figure of 1.96x on a *different* configuration
-(acc4 rather than acc0, llama rather than qwen). Two unrelated shapes landing
-on the same factor is much stronger evidence than either alone.
+**The 1.96x is not itself remarkable, and should not be sold as if it were.**
+The decode budget confines the process to `w` CPUs (the run banner says so:
+`CPU decode budget 2 confined the process to 2 CPUs [0, 2]`), so `t=2` has
+twice the hardware of `t=1` and roughly 2x is the *expected* outcome. §27
+records 1.96x for acc0/qwen and this is acc4/llama, which is worth noting, but
+both are a doubling of lanes measured against the same serial baseline through
+the same harness — they are corroborating, not independent. The finding here is
+**negative**: the previously recorded curve reported *no* speedup where the
+ordinary one was.
 
 Note the irony worth recording: four-significant-figure agreement is what
 originally exposed the bug — `23.529` vs `23.527` between two configurations
 that should have differed. Here the same agreement appears between two arms
 that *should* be identical, which is what it is supposed to mean.
 
-## Result 2 — `t=1` is not "the pool with one worker"
+## Result 2 — `t=1` does not build a pool at all
 
-The bench reports `path=flat` at width 1 and `path=spmd-pool` from width 2 up.
-At `total_workers <= 1`, `dispatch_output_rows` takes a serial short-circuit and
-runs every op on the **dispatcher**; the spawned worker receives no dispatch.
+At width 1 the decode budget confines the process to a **single CPU**, and
+`build_from_env` then declines to construct the SPMD pool: with one CPU there
+is no core to run the inline dispatcher alongside a spinning worker, so the
+pool would starve itself. The fallback is explicit in `decode_spmd.rs` (the
+`allowed.len() == 1` branch, which calls `report_spmd_fallback` and returns
+`None`), and the crate's own test records the consequence — *"the smallest
+budget that builds a pool is 2"*. Decode runs on the flat path, and the bench
+reports `path=flat` at width 1 and `path=spmd-pool` from width 2 up.
 
-So any speedup quoted against `t=1` is **"vs the serial dispatcher"**, not "vs a
-one-worker pool". This is a footnote every thread-scaling table on this codebase
-needs, including the ones in §20 and §27.
+Two corrections to how this has been described previously, including by me:
 
-## Result 3 — `w=16` is not measurable on this host while it is shared
+* It is **not** the `total_workers <= 1` serial short-circuit in
+  `dispatch_output_rows` that fires here. That short-circuit is real, but at
+  width 1 there is no pool and no worker for it to act on.
+* There is therefore **no "spawned worker sitting at 0% busy"** under this
+  harness — nothing is spawned. Any account of width 1 that describes an idle
+  pinned worker does not apply to a budget-confined run.
+
+The conclusion is unchanged and is the part that matters: **`t=1` is a
+different code path from every other column**, so a speedup quoted against it
+means "vs the serial flat path", not "vs a one-worker pool".
+
+## Result 3 — `w=16` is bimodal here, and no narrow interval on it is supportable
 
 The original `8→16 = 1.77x ±0.7% over three interleaved repetitions` is
 withdrawn. Six independent launches, alternating widths, sampling per-CPU busy
@@ -109,42 +137,87 @@ time from `/proc/stat` across each run:
 | 8 | 6 | 3.195 | 3.307 | 3.509 | **9.8%** |
 | 16 | 6 | 1.476 | 3.210 | 9.064 | **514%** |
 
-`w=8` is stable. `w=16` spans a factor of six, and the slow launches are the
-ones with the busiest SMT siblings. The mechanism is headroom: at `w=16` the
-run holds all 16 physical cores, so a co-tenant scheduled on the hardware
-siblings takes throughput directly out of the measurement; at `w=8` half the
-cores are free to absorb it.
+**What is established:** `w=8` is stable to 9.8% across independent launches
+and `w=16` is not, spanning a factor of six. That alone retires the `±0.7%`.
 
-Three things this rules out, each checked rather than argued:
+**What is *not* established: the cause.** The obvious reading is SMT
+contention — `w=16` holds all 16 physical cores, so a co-tenant lands on a
+hardware sibling — and the correlation looks strong at Pearson **r = 0.91**.
+That figure should not be trusted: it rests entirely on two leverage points
+(the ~9 ms launches), and the rank correlation, which does not, is Spearman
+**0.54** on n = 6 — nowhere near significant.
+
+The data contains a direct counterexample. Launch 8 is **slow (4.820 ms) at
+15.7%** sibling occupancy while launch 2 is the **fastest of all (1.476 ms) at
+16.1%** — slightly *more* sibling load, 3.3x faster. The two modes' sibling
+ranges overlap (fast {10.6, 12.1, 16.1}, slow {15.7, 21.3, 22.1}), so no
+threshold on sibling occupancy separates them.
+
+And odd-CPU occupancy is a proxy for **whole-socket load**, not specifically
+for SMT. On a single-NUMA 16-core socket a co-tenant contends for shared L3 and
+memory bandwidth wherever it is scheduled. This measurement cannot separate
+"sibling steals issue slots" from "neighbour steals bandwidth", because it only
+has an aggregate odd-CPU number. Distinguishing them needs per-core-pair
+attribution, which is not done here.
+
+So: bimodality **confirmed**, external-load involvement **likely**, SMT as the
+specific mechanism **unproven**.
+
+**On the withdrawn interval specifically.** The 2026-08-21 `t=16` reps
+(3.297 / 3.328 / 3.344) are not directly comparable to today's: the absolute
+level moved between builds, with `t=8` going from 5.87 to 3.31 over the same
+period. So this is *not* a claim that those three repetitions were secretly
+bimodal and got lucky — that cannot be determined now, and the arithmetic does
+not support it either, since the old `t=16` sits near today's `w=8`. The claim
+is narrower and sufficient: **a ±0.7% interval on `w=16` is not something this
+host can support**, so the figure should not stand.
+
+### Three things ruled out, each checked rather than argued
 
 1. **Not a configuration failure.** Every one of these launches reported
    `realized=16 path=spmd-pool as_requested`. The slow runs are genuinely
    16-wide.
-2. **Not the efficiency guard failing to fire.** In the slow mode rusage
-   efficiency is ~13-14 CPU-s/wall-s — the threads *are* runnable and running.
-   SMT contention is invisible to a CPU-time guard by construction, because the
-   victim thread is never descheduled; it just retires fewer instructions per
-   cycle. This is a real limitation of the guard and worth knowing.
-3. **Not a bandwidth knee.** A plateau is monotone and reproducible. This is
-   bimodal, and it correlates with an external variable.
+2. **Not the efficiency guard failing to fire — the guard cannot see this.**
+   Rusage efficiency `(utime+stime)/wall` across ten `w=16` launches, split by
+   mode:
 
-The `±0.7%` was three repetitions that happened to land in one mode. That is
-precisely the "do not quote the flattering statistic" failure the acc4 protocol
-warns about, applied to my own number, and the correct response is to leave
-`8→16` unquoted rather than to publish a narrower interval than the host can
-support.
+   | mode | ms/token | CPU-s per wall-s |
+   |---|---:|---:|
+   | fast | 1.884, 1.888, 1.901, 1.897, 1.897, 1.893 | 13.21–14.74 (mean 14.4) |
+   | slow | 3.392, 3.374, 3.408, 3.375 | 13.82–14.45 (mean 14.1) |
+
+   The slow mode bills **the same CPU-seconds** as the fast one while taking
+   1.8x the wall time. That is the signature of reduced instructions-per-cycle,
+   not of missing or parked workers: the affected thread is never descheduled,
+   so it stays runnable and burns its full CPU-second. A CPU-time guard is
+   therefore blind to this class of interference **by construction**, as are
+   voluntary-context-switch counts. `/usr/bin/time`'s `Percent of CPU` is blind
+   twice over, being wall-derived as well.
+3. **Not a bad pin.** `thread_siblings_list` reads `0-1`, `2-3`, … on this box,
+   so the even-CPU pin really is 16 distinct physical cores. Verified rather
+   than assumed: on a host where siblings are `(0,16),(1,17),…` the identical
+   pin would silently be 8 cores and every number here would be wrong.
+
+**Not ruled out:** which specific external resource is contended. See above.
 
 ## Practice this changes
 
-* **A CPU-efficiency guard does not detect SMT contention.** It catches missing
-  workers and descheduled threads; it cannot catch a co-tenant halving your IPC.
-  For any run that occupies all physical cores, sample sibling occupancy from
-  `/proc/stat` and report it alongside the timing, or measure at half width
-  where there is headroom.
+* **A CPU-efficiency guard does not detect throughput interference.** It catches
+  missing workers and descheduled threads; it cannot catch a co-tenant halving
+  your IPC, because the victim still bills full CPU-time. Measured directly
+  above: identical CPU-seconds across a 1.8x wall-time gap.
 * **Prefer `w=8` for A/B work on this host.** It is 9.8% stable against `w=16`'s
   514%, and an A/B that cannot distinguish its arms from the host is not an A/B.
+  The relevant boundary is **physical cores, not vCPUs** — an earlier record
+  drew it at "all-vCPU" (t=32) and so treated t=16 as safe, which it is not.
 * **Report distributions over independent launches, not repetitions within one.**
-  The bimodality here is invisible within a single launch: reps 1-4 of one
-  process agree closely and are jointly wrong.
+  The bimodality here is invisible within a single launch: reps *inside* one
+  process agree closely and are jointly wrong, because the mode is fixed for
+  that launch's lifetime. This is the case that shows why the practice matters.
 * **Read `realized=`/`path=` from the binary.** It is the only non-vacuity check
-  in this codebase that is not harness-dependent.
+  in this codebase that is not harness-dependent — and note it would *not* have
+  caught the problem in Result 3, which is why it is necessary and not
+  sufficient.
+* **When an interval is withdrawn, say whether it was wrong or merely
+  unverifiable.** These are different claims and only the weaker one is
+  supported here.
