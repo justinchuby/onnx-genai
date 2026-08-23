@@ -45,7 +45,16 @@
 #   --timeout S       give up after S seconds (default 3600 with --wait)
 #   --gate N          after taking the lock, also wait until the instantaneous
 #                     runnable count is <= N, so non-participating load (other
-#                     agents' builds, a stray editor) is drained too
+#                     agents' builds, a stray editor) is drained too.
+#                     N=0 is unsatisfiable by construction: field 4 of
+#                     /proc/loadavg counts the process doing the reading, so
+#                     the floor is 1 even on a perfectly idle box.
+#                     The gate is a SECONDARY signal. The lock -- declared
+#                     intent -- is the primary one. A bounded good citizen
+#                     using 4 of 32 cpus reads runnable 4-5 and trips
+#                     `--gate 3`, while a single-threaded 100% hog reads ~1
+#                     and sails through. Do not gate tightly and call it
+#                     admission control.
 #   --gate-timeout S  give up gating after S seconds (default 900)
 #   --on-gate-timeout fail|proceed
 #                     what to do when the gate expires. Default `fail`: release
@@ -152,11 +161,26 @@ die() {
 # Start time (field 22) of a pid, robust to a comm containing spaces or
 # parentheses: everything up to and including the last ')' is dropped, which
 # removes fields 1 and 2, so field 22 becomes field 20 of the remainder.
+# NOTE the 2>/dev/null precedes the input redirection. Bash performs
+# redirections left to right, so with the usual `<file 2>/dev/null` ordering
+# the "No such file or directory" for a departed pid is emitted BEFORE stderr
+# is silenced -- which put two lines of shell noise in front of every `status`
+# on a stale lock, and in front of anything parsing it.
 proc_start_time() {
     local pid=$1 rest
-    rest=$(tr -d '\0' <"/proc/${pid}/stat" 2>/dev/null | sed 's/.*) //') || return 1
+    rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
     [ -n "$rest" ] || return 1
     awk '{print $20}' <<<"$rest"
+}
+
+# Process state (field 3) and start time (field 22) in one read. Both come
+# from the same remainder after the comm field is dropped, so they cost one
+# open between them and cannot disagree about which process they describe.
+proc_state_and_start() {
+    local pid=$1 rest
+    rest=$(tr -d '\0' 2>/dev/null <"/proc/${pid}/stat" | sed 's/.*) //') || return 1
+    [ -n "$rest" ] || return 1
+    awk '{print $1, $20}' <<<"$rest"
 }
 
 runnable_now() {
@@ -211,12 +235,58 @@ meta_set() {
 }
 
 # 0 if the recorded anchor process is still running, 1 otherwise.
+# True when a pid names a process that is genuinely still running.
+#
+# A SIGKILLed process whose parent has not wait()ed for it is a ZOMBIE:
+# /proc/<pid> still exists and its start time still matches, so a liveness
+# check built from those two facts alone reports HELD on a corpse forever.
+# That is worst on the `run` path, which sets ttl=0 on the reasoning that its
+# own pid is exact -- exact, and still resolving, to a dead process. Every
+# agent harness here launches long commands without an immediate wait(), so
+# this is the common shape, not the exotic one.
+#
+# But state Z is NOT proof of death. When a thread-group leader exits via
+# pthread_exit() while other threads keep running, /proc/<tgid>/stat reports Z
+# for a fully live process (`ps` shows `Zl ... <defunct>`). Treating that as
+# dead reaps a LIVE holder mid-benchmark, which is the worse of the two errors
+# by a wide margin. Threads: is signal->nr_threads -- non-reaped tasks in the
+# group -- so a true zombie reads 1 and a live leader reads more. If status
+# cannot be read, or reads as something that is not a number, we have no
+# evidence of death and the process is treated as alive: there is deliberately
+# no numeric default here, because a default is a constant nothing tests.
+pid_is_live() {
+    local pid=$1 info state threads
+    [ -n "$pid" ] || return 1
+    info=$(proc_state_and_start "$pid") || return 1
+    state=${info%% *}
+    [ "$state" = Z ] || return 0
+    threads=$(awk '/^Threads:/ { print $2; exit }' "/proc/${pid}/status" 2>/dev/null)
+    case "$threads" in
+        '' | *[!0-9]*) return 0 ;;
+        *) [ "$threads" -gt 1 ] ;;
+    esac
+}
+
+# True when the lock's anchor is running but the lock cannot be VERIFIED,
+# because it carries no start_time. Kept separate from holder_alive: for a
+# lock that does have a start_time, a live pid with the wrong one is a
+# recycled pid and must NOT count as alive.
+unverifiable_live_anchor() {
+    local a s
+    a=$(meta_get anchor_pid) || return 1
+    s=$(meta_get start_time) || s=""
+    [ -n "$a" ] && [ -z "$s" ] || return 1
+    pid_is_live "$a"
+}
+
 holder_alive() {
-    local pid start now
+    local pid start info now
     pid=$(meta_get anchor_pid) || return 1
     start=$(meta_get start_time) || return 1
-    [ -n "$pid" ] && [ -d "/proc/${pid}" ] || return 1
-    now=$(proc_start_time "$pid") || return 1
+    [ -n "$pid" ] && [ -n "$start" ] || return 1
+    pid_is_live "$pid" || return 1
+    info=$(proc_state_and_start "$pid") || return 1
+    now=${info##* }
     # A recycled pid has a different start time, so this is not just "does
     # some process with this number exist".
     [ "$now" = "$start" ]
@@ -240,12 +310,45 @@ holder_expired() {
 
 # 0 if the lock is reapable: its anchor died, or it outlived its TTL.
 #
-# A lock with no readable metadata is NOT evidence of a dead holder -- it is
-# most likely a lock from an older or newer version of this script, or one
-# being written by a peer. Refuse to reap it until it is clearly abandoned,
-# so that an unparseable lock degrades to "busy" rather than "free".
+# A lock with no readable metadata is NOT evidence of a dead holder. The
+# reachable cause is a lock caught MID-WRITE by a peer, or one damaged on
+# disk; a future version that stops writing a field would be another. It is
+# not a past version: start_time has been written by every revision since
+# this script landed, so no release has ever produced an anchor without one.
+# Refuse to reap such a lock until it is clearly abandoned, so that an
+# unparseable lock degrades to "busy" rather than "free".
 reapable() {
-    if [ ! -s "$META" ]; then
+    # "Cannot verify liveness" must not be treated as "the holder is dead".
+    # The grace below used to apply only to a ZERO-BYTE meta, so a lock with
+    # content but no readable anchor_pid/start_time -- a lock caught mid-write
+    # being the reachable way to get one -- skipped it, fell through to
+    # `! holder_alive`, and had a LIVE holder's box stolen out from under it.
+    # The protection did not cover its own rationale.
+    local a s
+    a=$(meta_get anchor_pid) || a=""
+    s=$(meta_get start_time) || s=""
+    # Use the evidence we actually have before falling back to a clock. If
+    # the anchor pid is readable and that pid is running, the holder is not
+    # demonstrably dead -- unverifiable, but not dead -- and the age grace
+    # must not apply. The grace is 300s and the runs it protects are 40
+    # minutes, so routing a live-but-unverifiable holder through it does not
+    # prevent the theft, it schedules it.
+    # Note the predicate is unverifiable_live_anchor and not `[ -d /proc/$a ]`:
+    # a ZOMBIE anchor passes the directory test, and with ttl=0 -- the `run`
+    # path's default -- holder_expired is never true, so a corpse would hold
+    # the box forever with the bounding grace disabled on its behalf. A dead
+    # anchor therefore falls through to the clock, which is what bounds it.
+    if unverifiable_live_anchor; then
+        # ...but do not void the holder's OWN declared expiry while doing it.
+        # Returning unconditionally here replaced a bounded wedge with an
+        # unbounded one: a lock with a live anchor and no readable start_time
+        # would outlive any ttl forever and `wait` would block on a lock
+        # everyone agrees has expired. The anti-theft property only needs the
+        # CLOCK-BASED grace disabled, not the expiry the holder asked for.
+        holder_expired
+        return $?
+    fi
+    if [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]; then
         local mtime now
         mtime=$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
         now=$(date +%s)
@@ -254,6 +357,16 @@ reapable() {
     fi
     ! holder_alive && return 0
     holder_expired
+}
+
+# True when a lock is reapable only because it aged out of the grace, i.e.
+# the script never established that the holder was dead. `stale_pid` is a
+# positive claim and must not be made on this evidence.
+reap_was_unverifiable() {
+    local a s
+    a=$(meta_get anchor_pid) || a=""
+    s=$(meta_get start_time) || s=""
+    [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]
 }
 
 # Remove a reapable lock. Guarded so that two acquirers racing on the same
@@ -277,7 +390,7 @@ reap_if_dead() {
         local pid owner
         pid=$(meta_get anchor_pid 2>/dev/null || echo '?')
         owner=$(meta_get owner 2>/dev/null || echo '?')
-        if holder_alive; then
+        if holder_alive || unverifiable_live_anchor; then
             echo "hostlock: WARNING taking over a lock held by ${owner} (pid ${pid}, still alive) after its $(meta_get ttl)s TTL expired" >&2
             echo "hostlock: WARNING if ${owner} is still benchmarking, both sets of numbers are now suspect" >&2
         else
@@ -312,14 +425,20 @@ reap_if_dead() {
 # creates $LOCK_DIR directly, with a bare mkdir anywhere, breaks that
 # invariant and reintroduces the three-winner bug.
 publish_lock() {
-    local start stage
+    local start stage uid
     start=$(proc_start_time "$ANCHOR_PID") || die "cannot read start time of anchor pid ${ANCHOR_PID}"
+    # `owner` is self-declared free text and corroborates nothing -- anyone can
+    # pass --owner roy. `anchor_uid` is read from the kernel, so a row can at
+    # least say which account really holds the box. This is an ADVISORY lock;
+    # the identity is for attribution in a published row, not enforcement.
+    uid=$(awk '/^Uid:/ { print $2; exit }' "/proc/${ANCHOR_PID}/status" 2>/dev/null || echo "")
     stage="${LOCK_DIR}.stage.$$"
     rm -rf "$stage"
     mkdir -p "$stage" || die "cannot create staging dir ${stage}"
     {
         echo "anchor_pid=${ANCHOR_PID}"
         echo "start_time=${start}"
+        echo "anchor_uid=${uid}"
         echo "script_pid=$$"
         echo "owner=${OWNER}"
         echo "reason=${REASON}"
@@ -338,12 +457,26 @@ publish_lock() {
 }
 
 # One state word, for scripts: FREE, HELD, EXPIRED or STALE.
+# The four states, and nothing else -- FREE, HELD, STALE, EXPIRED.
+#
+# STALE is a claim about the world ("the holder is dead, the next acquire
+# will reap it"), so it must not be reported for a lock this script is
+# actually refusing to reap. An unverifiable lock inside its grace window
+# reads STALE by the liveness test and BUSY by `acquire`, and of those two
+# the reassuring one is STALE: it tells a human the box is abandoned, and
+# they take it. Report what the tool will actually do.
 lock_state() {
     [ -d "$LOCK_DIR" ] || { echo FREE; return 0; }
-    if holder_alive; then
+    # unverifiable_live_anchor is the class this tool cannot verify but can
+    # SEE running. Routing it through the STALE arm made `status` say "is
+    # gone" about a pid the reaper had just confirmed present -- the same
+    # false-abandonment message the HELD and EXPIRED arms were fixed for.
+    if holder_alive || unverifiable_live_anchor; then
         if holder_expired; then echo EXPIRED; else echo HELD; fi
-    else
+    elif reapable; then
         echo STALE
+    else
+        echo HELD
     fi
 }
 
@@ -402,13 +535,18 @@ remove_lock_if_mine() {
 # are both "runnable > 1" and only one of them ruins a measurement. With no
 # expectation the field is `unknown`, which is a fact, unlike a guess.
 cmd_provenance() {
-    local state owner pid age reason takeover gate r contended
+    local state owner pid age reason takeover gate r r_acq contended uid
     state=$(lock_state)
     r=$(runnable_now)
     owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
+    r_acq=unknown ; uid=unknown
     if [ -d "$LOCK_DIR" ]; then
         owner=$(meta_get owner) || owner=unknown
         pid=$(meta_get anchor_pid) || pid=unknown
+        # `held_by` is whatever the holder typed. `held_uid` came from the
+        # kernel. When a published row has to be trusted months later, they
+        # are not the same kind of fact and should not look like it.
+        uid=$(meta_get anchor_uid) || uid=unknown
         reason=$(meta_get reason) || reason=''
         # An absent key stays `unknown`. A lock published by an older
         # version of this script has neither of these, and answering `none`
@@ -422,6 +560,12 @@ cmd_provenance() {
         # current epoch -- a 56-year age that looks like a datum if anyone
         # aggregates the column.
         if meta_get acquired_epoch >/dev/null; then age=$(lock_age); fi
+        # publish_lock already sampled occupancy when the window OPENED, and
+        # dropping it left the row with a single sample taken after the window
+        # CLOSED -- the moment the row was written, not the interval it
+        # describes. Emitting both lets a reader bracket the measurement for
+        # the cost of one line.
+        r_acq=$(meta_get runnable_at_acquire) || r_acq=unknown
     fi
     contended=unknown
     if [ -n "$EXPECT_RUNNABLE" ]; then
@@ -440,10 +584,12 @@ cmd_provenance() {
         "hostlock_state=${state}"
         "declared=${declared}"
         "held_by=${owner:-none}"
+        "held_uid=${uid:-unknown}"
         "held_pid=${pid:-none}"
         "held_secs=${age}"
         "takeover=${takeover:-none}"
         "gate=${gate:-none}"
+        "runnable_at_acquire=${r_acq:-unknown}"
         "runnable=${r}"
         "contended=${contended}"
         "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -486,17 +632,34 @@ cmd_status() {
     pid=$(meta_get anchor_pid || echo '?')
     ttl=$(meta_get ttl || echo 0)
     age=$(lock_age)
-    if holder_alive; then
-        local state="HELD"
-        if holder_expired; then
-            state="EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over)"
-        fi
-        echo "${state} by ${owner} pid=${pid} for ${age}s since ${at}"
-        echo "  reason: ${reason}"
-        echo "  runnable=$(runnable_now)"
-        return 0
-    fi
-    echo "STALE  holder ${owner} pid=${pid} is gone; next acquire will reap it"
+    # Drive the human branch from lock_state, not from holder_alive directly.
+    # Keying off holder_alive made this print "STALE ... is gone; next acquire
+    # will reap it" for a lock that lock_state calls HELD and that acquire
+    # refuses to take -- and cmd_acquire dumps this text on the BUSY path, so
+    # the contradiction is exactly what a blocked agent reads. Telling a human
+    # the box is abandoned is how the box gets taken.
+    case "$(lock_state)" in
+        HELD)
+            echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        EXPIRED)
+            echo "EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over) by ${owner} pid=${pid} for ${age}s since ${at}"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        STALE)
+            echo "STALE  holder ${owner} pid=${pid} is gone; next acquire will reap it"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        *)
+            # lock_state saw no lock dir; it was released under us since the
+            # test above. Report what is true now rather than a stale label.
+            echo "FREE  (runnable=$(runnable_now))"
+            ;;
+    esac
     return 0
 }
 
@@ -562,7 +725,18 @@ cmd_acquire() {
         # label it acquired_after_reap and, under --strict-reap, abort an
         # unattended harness over a takeover that did not happen.
         if reapable; then
-            if holder_alive; then TAKEOVER=ttl_expired; else TAKEOVER=stale_pid; fi
+            if holder_alive; then
+                TAKEOVER=ttl_expired
+            elif reap_was_unverifiable; then
+                # The lock aged out of the grace with unreadable metadata. We
+                # never established the holder was dead, so `stale_pid` would
+                # be a claim the script has no evidence for -- the same
+                # mislabelling `takeover=unknown` exists to prevent, one level
+                # down.
+                TAKEOVER=unverifiable
+            else
+                TAKEOVER=stale_pid
+            fi
             if reap_if_dead; then continue; fi
             TAKEOVER=none
         else
@@ -666,9 +840,18 @@ cmd_wait() {
 # Kill the wrapped command, release, and exit with the conventional code.
 run_teardown() {
     local child=$1 name=$2 code=$3
-    if [ -n "$child" ] && [ -e "/proc/${child}" ]; then
-        kill -TERM "$child" 2>/dev/null
-        wait "$child" 2>/dev/null
+    # Verify the start time before signalling. The window between the child
+    # exiting and this trap firing is small, but pids on this box are cycling
+    # at ~1.5M in four days, so "small" is not "empty" -- and this is the one
+    # place the script signals anything at all. If the pid has been recycled,
+    # leave it alone and just release the lock.
+    if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then
+        local now
+        now=$(proc_start_time "$child" 2>/dev/null || echo "")
+        if [ "$now" = "$RUN_CHILD_START" ]; then
+            kill -TERM "$child" 2>/dev/null
+            wait "$child" 2>/dev/null
+        fi
     fi
     remove_lock_if_mine
     echo "hostlock: released (${name})" >&2
@@ -692,9 +875,15 @@ cmd_run() {
     "$@" &
     child=$!
 
+    # Traps first. Reading the child's start time forks, and a signal arriving
+    # in that window would take the script's default action -- leaking the
+    # lock and orphaning the benchmark, the two failures this block exists to
+    # prevent. run_teardown tolerates an empty RUN_CHILD_START by declining to
+    # signal, which is the safe direction for a window this narrow.
     trap 'run_teardown "$child" SIGINT 130' INT
     trap 'run_teardown "$child" SIGTERM 143' TERM
     trap 'run_teardown "$child" SIGHUP 129' HUP
+    RUN_CHILD_START=$(proc_start_time "$child" 2>/dev/null || echo "")
 
     wait "$child"
     rc=$?
@@ -718,6 +907,7 @@ STRICT_REAP=0
 TAKEOVER=none
 EXPECT_RUNNABLE=""
 ONELINE=0
+RUN_CHILD_START=""
 
 [ "$#" -ge 1 ] || {
     awk '/^# \(end of usage summary\)/ { exit } NR >= 3' "$0" >&2

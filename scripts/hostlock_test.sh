@@ -3,9 +3,13 @@
 #
 # Run: scripts/hostlock_test.sh
 #
-# Costs no measurable CPU (it is mkdir/rename traffic and short sleeps), so it
-# is safe to run on a busy host -- which matters, because the whole point of
-# the thing under test is that the host is busy.
+# Almost free: it is mkdir/rename traffic and short sleeps. The ONE exception
+# is the R2 occupancy assertion, which deliberately spins 6 of 32 logical cpus
+# for ~5s to prove the reported runnable count moves with real load -- without
+# it, `runnable_now() { echo 1; }` passes and silently disables every --gate.
+# So the suite is safe next to somebody's benchmark in every respect except
+# that one burst. Do not run it during a run you intend to publish; take the
+# real lock first, exactly as this tool asks everyone else to.
 #
 # The test that earned its place is the atomicity watcher. An earlier
 # implementation acquired with `mkdir` and then wrote its metadata as a
@@ -32,7 +36,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".dead.* "$LOCK".gate 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -45,6 +49,42 @@ chk() {
         echo "          want: $3"
         fail=$((fail + 1))
     fi
+}
+
+# Spawn a REAL zombie and echo "<zombie_pid> <keeper_pid>".
+#
+# A pid that is present-and-dead cannot be produced by killing a child of this
+# shell: bash reaps it, /proc/<pid> disappears, and what is left is an ABSENT
+# pid, which exercises a different branch. The only way to hold a corpse
+# visible in /proc is a parent that deliberately never wait()s -- which is
+# also exactly how every agent harness here launches work (Popen, no wait).
+# The caller must kill the keeper when finished.
+spawn_zombie() {
+    local f="$LOCK.zombie.$$" z="" par
+    rm -f "$f"
+    # >/dev/null is load-bearing, not tidiness: this runs inside $(...), and a
+    # background child that inherits the substitution's stdout keeps the pipe
+    # open, so the caller blocks until the keeper exits -- by which time init
+    # has reaped the corpse and the fixture is an ABSENT pid, silently testing
+    # the other branch.
+    python3 -c '
+import subprocess, sys, time
+c = subprocess.Popen(["sleep", "300"])
+open(sys.argv[1], "w").write(str(c.pid))
+c.kill()          # SIGKILL, and deliberately no wait(): the child stays a zombie
+time.sleep(120)
+' "$f" >/dev/null 2>&1 &
+    par=$!
+    for _ in $(seq 1 20); do
+        [ -s "$f" ] && { z=$(cat "$f"); break; }
+        sleep 0.5
+    done
+    for _ in $(seq 1 20); do
+        [ "$(sed 's/.*) //' "/proc/${z}/stat" 2>/dev/null | awk '{print $1}')" = Z ] && break
+        sleep 0.5
+    done
+    rm -f "$f"
+    echo "$z $par"
 }
 
 # Deliver a signal to a pid we spawned ourselves.
@@ -275,10 +315,27 @@ $HL run --owner leon --reason "long bench" -- sleep 60 >/dev/null 2>&1 &
 runner=$!
 sleep 2
 chk "held while the command runs" "$(st state)" "HELD"
+kids_before=$(pgrep -P "$runner" 2>/dev/null | wc -l)
+chk "the wrapped command is a child of the runner" \
+    "$([ "${kids_before:-0}" -ge 1 ] && echo yes || echo no)" "yes"
+# Capture the wrapped pid BEFORE signalling. Asking `pgrep -P "$runner"` after
+# the runner has exited and been reaped answers 0 whether or not the child was
+# terminated, because an orphan is reparented to pid 1 -- the assertion would
+# be inert, passing with the teardown kill removed entirely.
+wrapped_kid=$(pgrep -P "$runner" 2>/dev/null | head -1)
+chk "and the test actually found it" \
+    "$([ -n "$wrapped_kid" ] && echo found || echo missing)" "found"
 sig "$runner" 15
 chk "runner terminates on SIGTERM" "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
 sleep 1
 chk "released after SIGTERM" "$(st state)" "FREE"
+# run_teardown verifies the child's START TIME before signalling, because a
+# recycled pid would otherwise be signalled by a process that never started
+# it. The verification must not be so strict that it stops terminating the
+# real child -- a `sleep 60` still running here means the teardown refused a
+# legitimate kill and the wrapped benchmark is now an orphan on the cores.
+chk "the wrapped command is really stopped, not left orphaned" \
+    "$(alive "$wrapped_kid" && echo orphaned || echo stopped)" "stopped"
 
 # SIGKILL cannot be trapped, so the lock survives; the anchor is the runner's
 # own pid, so the next acquirer must reap it. This is the case the pid anchor
@@ -615,6 +672,15 @@ sleep 2
 chk "an expired-but-live lock is still EXPIRED" "$(st state)" "EXPIRED"
 chk "and is still declared -- the box IS claimed" \
     "$($HL provenance | sed -n 's/^declared=//p')" "yes"
+# The human branch has to say so too, and this is the arm that gets it wrong:
+# an EXPIRED holder is by definition ALIVE, so "is gone; next acquire will
+# reap it" is the same false-abandonment message one arm over. Read through
+# `status` rather than `acquire`, because an expired lock is reapable and
+# acquire would simply take it.
+exp_text=$($HL status 2>&1 | tr '\n' ' ')
+chk "the EXPIRED message does not say the holder is gone" \
+    "$(echo "$exp_text" | grep -c 'is gone')" "0"
+chk "and it says EXPIRED" "$(echo "$exp_text" | grep -c 'EXPIRED')" "1"
 sig "$holder" 9
 wait "$holder" 2>/dev/null
 cleanup
@@ -652,6 +718,610 @@ help=$($HL 2>&1)
 for flag in --strict-reap --on-gate-timeout --expect-runnable --oneline --ttl --pid; do
     chk "help mentions $flag" "$(echo "$help" | grep -c -- "$flag" | head -1 | awk '{print ($1>0)?1:0}')" "1"
 done
+
+echo
+echo "== REQUIREMENTS CONFORMANCE =="
+# The seven properties this lock exists to guarantee, each asserted directly
+# and named after the requirement rather than after the implementation. Three
+# of them (R1, R6, R7) had no test at all before this block: they were
+# properties of the design that nothing would have noticed the loss of.
+
+echo "-- R1: the holder is the outer harness, spanning every arm --"
+# The collision this encodes: an observer ran `ps`, saw the benchmark gone,
+# concluded the host was clear, and started work -- but that process had
+# exited only because the harness had advanced from one arm of an interleaved
+# A/B to the next.
+#
+# So the test has to be two harnesses that differ in EXACTLY one thing -- which
+# pid the lock is anchored to -- whose arms exit NORMALLY, sampled in the gap
+# between arms. An earlier version of this block passed `--pid` explicitly and
+# asserted only that the lock stayed HELD; it was inert (it passed unchanged
+# with the arms deleted entirely) because it tested `--pid` rather than
+# anchoring, and no edit to the script could have failed it.
+cleanup
+rm -f "$LOCK.gap"
+
+# (a) The REJECTED design: anchored to the arm. Arm 1 ends by itself.
+bash -c 'sleep 3' &
+arm=$!
+$HL acquire --owner per-arm --pid "$arm" --ttl 600 >/dev/null 2>&1
+gap_child_during=$(st state)
+wait "$arm" 2>/dev/null
+gap_child=$(st state)
+cleanup
+
+# (b) The SHIPPED design: anchored to the harness that spans both arms.
+(
+    $HL acquire --owner harness --pid "$BASHPID" --ttl 600 >/dev/null 2>&1
+    bash -c 'sleep 1' &
+    a=$!
+    wait "$a"
+    $HL status --porcelain | sed -n 's/^state=//p' >"$LOCK.gap"
+    $HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_by=//p' >>"$LOCK.gap"
+    bash -c 'sleep 1' &
+    a=$!
+    wait "$a"
+    $HL release >/dev/null 2>&1
+)
+gap_harness=$(sed -n 1p "$LOCK.gap")
+owner_harness=$(sed -n 2p "$LOCK.gap")
+rm -f "$LOCK.gap"
+
+chk "a per-arm anchor holds the box while its arm runs" "$gap_child_during" "HELD"
+chk "and LOSES it the moment that arm ends normally -- the hole" "$gap_child" "STALE"
+chk "a harness anchor still holds it in the same gap" "$gap_harness" "HELD"
+chk "and the row emitted in the gap names the harness" "$owner_harness" "harness"
+# Without this the two halves could agree and the block would assert nothing.
+chk "the two anchorings genuinely disagree" \
+    "$([ "$gap_child" != "$gap_harness" ] && echo differ || echo same)" "differ"
+cleanup
+
+echo "-- R2: emitted rows carry identity, state and occupancy --"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
+for field in hostlock_state declared held_by held_uid held_pid held_secs takeover gate runnable_at_acquire runnable contended sampled_at; do
+    chk "the row carries $field" \
+        "$(echo "$row" | tr ' ' '\n' | grep -c "^${field}=")" "1"
+done
+chk "the row's state is the real state" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^hostlock_state=//p')" "HELD"
+chk "the row's owner is the real owner" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "leon"
+# `held_by` is self-declared free text: `--owner roy` from my shell produces a
+# row that says roy. The only identity the kernel vouches for is the anchor's
+# uid, so a published row must carry that too, and it must be the REAL uid --
+# not an echo of the declared string.
+#
+# Compared against the ANCHOR's uid read independently, not against the
+# reader's own `id -u`. Those are the same number when the test acquires as
+# itself, so `uid=$(id -u)` in the writer -- reporting whoever READ the lock
+# rather than whoever HOLDS it -- passed the earlier form of this check while
+# destroying the entire point of the field, which is attribution when you are
+# looking at somebody else's lock.
+anchor_of_row=$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_pid=//p')
+chk "identity is corroborated against the kernel, not just declared" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_uid=//p')" \
+    "$(awk '/^Uid:/ { print $2; exit }' "/proc/${anchor_of_row}/status" 2>/dev/null)"
+# Everything on this box runs as one user, so the check above cannot tell
+# "the holder's uid" from "the reader's uid" -- and `uid=$(id -u)` in the
+# writer, which reports whoever READ the lock, passes it while destroying the
+# only thing the field is for: attribution when you are looking at somebody
+# else's lock. Anchor to pid 1 instead, whose uid is derived here rather than
+# assumed: hardcoding 0 fails as root (the default in most CI containers) and
+# under a rootless or user-namespaced pid 1, for reasons that have nothing to
+# do with hostlock. Skipped entirely when pid 1 is unreadable (hidepid=) or is
+# us, because then it discriminates nothing.
+pid1_uid=$(awk '/^Uid:/ { print $2; exit }' /proc/1/status 2>/dev/null)
+if [ -n "$pid1_uid" ] && [ "$pid1_uid" != "$(id -u)" ]; then
+    cleanup
+    $HL acquire --owner leon --pid 1 --ttl 600 --reason "foreign anchor" >/dev/null 2>&1
+    chk "held_uid is the HOLDER's uid, not the reader's" \
+        "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_uid=//p')" "$pid1_uid"
+else
+    echo "  SKIP  held_uid vs a foreign anchor (pid 1 uid unreadable or same as ours)"
+    # A SKIP must not silently reduce the assertion count: in a root container
+    # this branch is taken, and with nothing here the only check that pins
+    # held_uid to the kernel disappears with no total to notice it. Assert the
+    # weaker thing that is still true, so the count stays invariant and the
+    # pinned total at the end of this file keeps its power.
+    chk "held_uid is at least present and numeric when the foreign anchor is unavailable" \
+        "$($HL provenance --oneline | tr ' ' '\n' | grep -c '^held_uid=[0-9]')" "1"
+fi
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
+chk "occupancy is a number, not a label" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^runnable=//p' | grep -c '^[0-9][0-9]*$')" "1"
+# The row must be able to bracket the measured window, not just report the
+# instant it was written -- provenance runs AFTER the measurement, so a single
+# sample describes a moment when the window has already closed.
+chk "the row brackets the window with occupancy at acquire" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^runnable_at_acquire=//p' | grep -c '^[0-9][0-9]*$')" "1"
+
+# The assertion with actual power. "Is a number" is satisfied by a hardcoded
+# constant -- and a constant would not merely corrupt this column, it would
+# silently satisfy every `--gate N` for N>=1 on a saturated box, disabling the
+# ONLY mechanism that sees load from agents who never took the lock. That is
+# the 8.6x corruption this tool exists to prevent, wearing a green stamp.
+#
+# Bounded deliberately: 6 of 32 logical CPUs for ~3s. This is the ONE part of
+# the suite that is not free (see the header note).
+spin() {
+    local end=$((SECONDS + 5))
+    while [ "$SECONDS" -lt "$end" ]; do :; done
+}
+spinners=""
+for _ in 1 2 3 4 5 6; do
+    spin &
+    spinners="$spinners $!"
+done
+sleep 1
+busy=$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^runnable=//p')
+# Acquire a SECOND lock while the load is still up, so runnable_at_acquire is
+# sampled under known load and read back after it has gone. That is the
+# bracketing property the field claims, and it is the only assertion here that
+# a hardcoded `runnable_at_acquire=1` cannot satisfy.
+cleanup
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+for sp in $spinners; do sig "$sp" 9; done
+wait 2>/dev/null
+sleep 1
+row_after=$($HL provenance --oneline)
+acq_busy=$(echo "$row_after" | tr ' ' '\n' | sed -n 's/^runnable_at_acquire=//p')
+chk "occupancy tracks load the test itself created" \
+    "$([ "${busy:-0}" -ge 6 ] && echo tracks || echo "constant:${busy}")" "tracks"
+chk "runnable_at_acquire is sampled while the window is open" \
+    "$([ "${acq_busy:-0}" -ge 6 ] && echo bracketed || echo "constant:${acq_busy}")" "bracketed"
+# The load-based assertion above cannot distinguish "stored at acquire" from
+# "re-read at print time" on a host that is busy for other reasons, and this
+# host is. Forge the stored value instead: a reader that re-samples prints the
+# real count, a reader that reports what the holder recorded prints 4242.
+# Deterministic, and independent of what anyone else is running.
+sed -i 's/^runnable_at_acquire=.*/runnable_at_acquire=4242/' "$LOCK/meta"
+chk "and it is the holder's stored sample, not a reading taken now" \
+    "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^runnable_at_acquire=//p')" "4242"
+chk "while the live occupancy column is still a live reading" \
+    "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^runnable=//p' | grep -c '^4242$')" "0"
+cleanup
+
+echo "-- R3: FREE, HELD, STALE and EXPIRED are four distinct states --"
+# STALE (holder dead) and EXPIRED (holder alive, TTL lapsed) are the pair that
+# must not collapse: one means the box may still be loaded by an orphan, the
+# other means somebody is actively using it and has overrun.
+cleanup
+s_free=$(st state)
+sleep 30 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 600 >/dev/null 2>&1
+s_held=$(st state)
+sig "$h" 9
+wait "$h" 2>/dev/null
+s_stale=$(st state)
+cleanup
+sleep 30 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 1 >/dev/null 2>&1
+sleep 2
+s_expired=$(st state)
+sig "$h" 9
+wait "$h" 2>/dev/null
+cleanup
+chk "the four states are FREE/HELD/STALE/EXPIRED" \
+    "${s_free}/${s_held}/${s_stale}/${s_expired}" "FREE/HELD/STALE/EXPIRED"
+chk "and all four are distinct" \
+    "$(printf '%s\n' "$s_free" "$s_held" "$s_stale" "$s_expired" | sort -u | wc -l)" "4"
+
+echo "-- R4: both expiries fail closed --"
+cleanup
+# Admission expiry (the gate).
+chk "admission expiry fails closed (5)" \
+    "$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 >/dev/null 2>&1; echo $?)" "5"
+chk "and holds nothing afterwards" "$(st state)" "FREE"
+cleanup
+# Wait expiry, on the acquire path a harness actually uses -- `wait` alone was
+# covered, `acquire --wait` was not, and `run` goes through the latter.
+# `--timeout 6` costs ~10s, not 6: the deadline is checked at the top of each
+# iteration and then `sleep 5`, so it rounds up. Two of those is 20s, and a
+# 30s incumbent would leave 10s of margin -- if it expired first the waiter
+# would REAP and succeed, flipping both assertions on a loaded box. A suite
+# that certifies measurements taken under load must not itself flake under it.
+sleep 300 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 600 >/dev/null 2>&1
+chk "wait expiry on acquire fails closed (3)" \
+    "$($HL acquire --owner leon --wait --timeout 6 --ttl 600 >/dev/null 2>&1; echo $?)" "3"
+# `st owner` reads the meta and answers identically for HELD and STALE, so on
+# its own this passes even if the incumbent died.
+chk "and the incumbent still holds it" "$(st owner)" "alice"
+chk "and is genuinely still alive, not merely named" "$(st state)" "HELD"
+chk "run inherits the same failure, it does not run the command" \
+    "$($HL run --owner leon --timeout 6 -- bash -c 'echo RAN' 2>/dev/null | grep -c RAN)" "0"
+sig "$h" 9
+wait "$h" 2>/dev/null
+cleanup
+
+echo "-- R5: reaping compares start time, not just the pid --"
+# A recycled pid must not be able to masquerade as a live holder. Forge a lock
+# whose anchor pid is THIS script -- alive -- but whose recorded start time is
+# wrong, which is exactly what pid reuse looks like.
+cleanup
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nstart_time=1\nacquired_epoch=%s\nttl=600\nreason=recycled\ntakeover=none\n' \
+    "$$" "$(date +%s)" >"$LOCK/meta"
+chk "a live pid with the wrong start time is STALE, not HELD" "$(st state)" "STALE"
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "and is reaped as a stale pid" "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+# The converse: the same pid with the RIGHT start time is a live holder and
+# must never be reaped.
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=600\nreason=live\ntakeover=none\n' \
+    "$$" "$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')" "$(date +%s)" >"$LOCK/meta"
+chk "the same pid with the right start time is HELD" "$(st state)" "HELD"
+chk "and is not reapable" "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+cleanup
+# "Cannot verify liveness" must not be read as "the holder is dead". A meta
+# with content but no start_time is exactly the older-or-newer-version case
+# the grace window exists for, and the grace used to apply only to a ZERO-BYTE
+# meta -- so this fell through to `! holder_alive` and a LIVE holder's box was
+# taken. Agents on this host run different revisions of this script side by
+# side, so it is a live risk rather than a hypothetical.
+sleep 300 &
+h=$!
+mkdir -p "$LOCK"
+printf 'owner=alice\nanchor_pid=%s\nacquired_epoch=%s\nttl=3600\nreason=live run\n' \
+    "$h" "$(date +%s)" >"$LOCK/meta"
+chk "a live holder with no start_time keeps its box" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+chk "and is still the owner afterwards" "$(st owner)" "alice"
+# The label has to agree with the behaviour: reporting STALE for a lock the
+# tool refuses to reap tells a human the box is abandoned, and they take it.
+chk "and is not labelled STALE while being treated as busy" "$(st state)" "HELD"
+# The human-readable branch has to agree too, and it is the one that matters
+# here: cmd_acquire dumps it on the BUSY path, so this text is what a blocked
+# agent actually reads. Telling them "is gone; next acquire will reap it"
+# about a box the tool refuses to reap is how the box gets taken by hand.
+busy_text=$($HL acquire --owner leon --ttl 600 2>&1 >/dev/null | tr '\n' ' ')
+chk "the BUSY message does not tell a human the box is abandoned" \
+    "$(echo "$busy_text" | grep -c 'is gone')" "0"
+chk "and it names the real holder" \
+    "$(echo "$busy_text" | grep -c 'HELD by alice')" "1"
+# ...and it must STAY its box. The grace is 300s; the runs it protects are 40
+# minutes. Routing a live-but-unverifiable holder through an age window does
+# not prevent the theft, it schedules it. Backdate the lock well past the
+# grace: the anchor pid is readable and running, which is evidence the clock
+# cannot override.
+touch -d "@$(( $(date +%s) - 4000 ))" "$LOCK"
+chk "a live holder with no start_time keeps its box past the grace too" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+chk "and is still the owner after the grace lapses" "$(st owner)" "alice"
+# ...but the anti-theft guard must disable the CLOCK-BASED grace only, not the
+# expiry the holder itself declared. Returning "not reapable" unconditionally
+# here replaced a bounded wedge with an unbounded one: the lock would outlive
+# any ttl forever, and `wait` would block on a lock everyone agrees has
+# expired. Guard against a vacuous pass first: if any assertion above has
+# already let the lock be reaped, the acquire below succeeds for the wrong
+# reason and this -- the primary assertion for the primary fix -- passes
+# without exercising anything.
+chk "the ttl fixture starts from a lock that is still alice's" "$(st owner)" "alice"
+printf 'owner=alice\nanchor_pid=%s\nacquired_epoch=%s\nttl=1\nreason=live but overrun\n' \
+    "$h" "$(( $(date +%s) - 4000 ))" >"$LOCK/meta"
+# The LABEL for that class has to be right too, and this is the third arm of
+# the same defect: HELD said "is gone" (fixed), EXPIRED said "is gone"
+# (fixed), and then the reaper announced "reaping stale lock from dead pid N"
+# about a pid the guard immediately above had just verified was RUNNING --
+# suppressing the "still alive ... both sets of numbers are now suspect"
+# warning in exactly the case it applies to. A takeover from a live holder is
+# the one event in this tool that can corrupt somebody's benchmark, so it is
+# the one message that must never be downgraded to routine housekeeping.
+chk "an overrun live holder with no start_time is EXPIRED, not STALE" "$(st state)" "EXPIRED"
+exp_text=$($HL status 2>&1 | tr '\n' ' ')
+chk "and the human text does not call that live pid gone" \
+    "$(echo "$exp_text" | grep -c 'is gone')" "0"
+chk "and it says the ttl ran out" \
+    "$(echo "$exp_text" | grep -c '^EXPIRED')" "1"
+rm -f "$LOCK.warn"
+$HL acquire --owner leon --ttl 600 >/dev/null 2>"$LOCK.warn"
+chk "a live holder with no start_time still honours its own ttl" "$?" "0"
+chk "and the takeover warns the holder is STILL ALIVE" \
+    "$(grep -c 'still alive' "$LOCK.warn")" "1"
+chk "and warns that both sets of numbers are suspect" \
+    "$(grep -c 'both sets of numbers' "$LOCK.warn")" "1"
+chk "and never claims it reaped a dead pid" \
+    "$(grep -c 'dead pid' "$LOCK.warn")" "0"
+rm -f "$LOCK.warn"
+sig "$h" 9
+wait "$h" 2>/dev/null
+cleanup
+# The converse of the guard above: an anchor pid that is DEAD, with no
+# start_time. Nothing else in this file has that shape -- every other fixture
+# either carries a start_time or has no anchor_pid at all -- so deleting the
+# liveness test from that guard made every unparseable lock permanently
+# unreapable, which is the exact wedge this commit exists to avoid, and left
+# the suite green.
+#
+# dead_pid() is fully reaped, so /proc/<pid> does NOT exist: this is the
+# ABSENT-and-dead shape. The present-and-dead shape is a zombie and is tested
+# immediately below; both must reach the clock, by different routes.
+dead=$(dead_pid)
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nacquired_epoch=%s\nttl=3600\nreason=dead anchor, old script\n' \
+    "$dead" "$(date +%s)" >"$LOCK/meta"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
+chk "a dead anchor with no start_time is still protected inside the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
+chk "a dead anchor with no start_time is reapable past the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+chk "and that takeover is labelled unverifiable too" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "unverifiable"
+cleanup
+# The present-and-dead shape, which is the one that actually wedges the box.
+# A ZOMBIE anchor passes `[ -d /proc/$pid ]`, so writing the anti-theft guard
+# in terms of the directory rather than in terms of real liveness hands a
+# corpse the same protection a live holder gets -- and on the `run` path,
+# where ttl=0, holder_expired is never true, so nothing bounds it: the grace
+# that would have released the box is disabled on behalf of a dead process,
+# forever. That is a strictly worse wedge than the one the guard replaced.
+zline=$(spawn_zombie); zapid=${zline%% *}; zakeeper=${zline##* }
+chk "the fixture anchor really is a zombie" \
+    "$(sed 's/.*) //' "/proc/${zapid}/stat" 2>/dev/null | awk '{print $1}')" "Z"
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nacquired_epoch=%s\nttl=0\nreason=zombie anchor, meta caught mid-write\n' \
+    "$zapid" "$(date +%s)" >"$LOCK/meta"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
+chk "a zombie anchor with no start_time is protected inside the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
+chk "a zombie anchor with no start_time is reapable past the grace, ttl=0 and all" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+sig "$zakeeper" 9
+wait "$zakeeper" 2>/dev/null
+cleanup
+# The grace itself must be pinned. Every assertion above creates its lock
+# immediately before checking, so now-mtime is 0 and ANY grace >= 1 passes --
+# UNPARSEABLE_GRACE could be cut from 300 to 2 with the suite still green.
+# Bracketed at 200s and 400s, so the constant is pinned to within a factor of
+# two rather than the two orders of magnitude a 30s/4000s pair allows.
+mkdir -p "$LOCK"
+printf 'owner=ghost\nacquired_epoch=%s\nttl=3600\nreason=unreadable\n' "$(date +%s)" >"$LOCK/meta"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
+chk "an unreadable lock inside the grace is held" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
+chk "an unreadable lock past the grace is reapable" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+# ...but the takeover must not CLAIM the holder was dead. The script never
+# established that; `stale_pid` is a positive claim on evidence it does not
+# have, and it is the reassuring direction.
+chk "and the takeover is labelled unverifiable, not stale_pid" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "unverifiable"
+cleanup
+
+echo "-- R6: a SIGKILLed holder is recoverable --"
+# Not a forged lock: a real holder, really SIGKILLed, which is the failure the
+# design promises to survive because it is the one signal it cannot trap.
+cleanup
+sleep 300 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 600 --reason "killed mid-run" >/dev/null 2>&1
+chk "held while the anchor lives" "$(st state)" "HELD"
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+chk "SIGKILL leaves the lock behind, reported STALE" "$(st state)" "STALE"
+# The STALE arm of the human branch had no assertion at all: replacing its
+# whole body with `echo "FREE (nobody is here)"` left the suite green, because
+# every STALE check in this file went through porcelain. That is the one arm
+# where saying FREE is actively dangerous -- a stale lock still covers a host
+# that may be loaded, and "next acquire will reap it" is the sentence that
+# tells a human to go through the tool instead of round it.
+stale_text=$($HL status 2>&1 | tr '\n' ' ')
+# 2>&1 deliberately: this assertion is anchored, so anything the script leaks
+# on stderr breaks it. That is how the departed-pid redirection noise was
+# found -- `<"/proc/$pid/stat" 2>/dev/null` silences tr but not bash's own
+# "No such file or directory", because redirections apply left to right, so
+# every status on a stale lock printed two lines of shell error first.
+chk "the STALE human text says STALE, with nothing leaked in front of it" \
+    "$(echo "$stale_text" | grep -c '^STALE')" "1"
+chk "and status writes nothing at all on stderr for a departed pid" \
+    "$($HL status 2>&1 >/dev/null | wc -c)" "0"
+chk "and names the owner it is about to reap" \
+    "$(echo "$stale_text" | grep -c 'holder alice')" "1"
+chk "and says a reap is what happens next" \
+    "$(echo "$stale_text" | grep -c 'is gone')" "1"
+chk "and still reports occupancy, because a stale lock does not stop the load" \
+    "$(echo "$stale_text" | tr ' ' '\n' | grep -c '^runnable=[0-9]')" "1"
+chk "the next acquirer recovers the box" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+chk "and is told it was a takeover, not a free box" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+
+# The case that actually wedges the box, and the reason the block above is not
+# sufficient on its own: `wait` there reaps the zombie, and only THEN does
+# /proc/<pid> disappear -- so it measures bash's reaping, not the lock's
+# recovery. A SIGKILLed process whose parent has not wait()ed is a ZOMBIE:
+# /proc/<pid> still exists and its start time still matches, so a liveness
+# check built from those two facts alone reports HELD on a corpse, forever.
+# Every agent harness here launches long commands via Popen without an
+# immediate wait(), and `run` sets ttl=0, so there is no expiry escape hatch.
+# This test file's own alive() helper has excluded state Z since it was
+# written; the implementation had not.
+rm -f "$LOCK.zpid"
+python3 -c '
+import os, subprocess, time, sys
+c = subprocess.Popen(["sleep", "300"])
+open(sys.argv[1], "w").write(str(c.pid))
+time.sleep(6)
+c.kill()          # SIGKILL, and deliberately no wait(): the child stays a zombie
+time.sleep(90)
+' "$LOCK.zpid" &
+zparent=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [ -s "$LOCK.zpid" ] && break
+    sleep 0.5
+done
+zchild=$(cat "$LOCK.zpid" 2>/dev/null)
+$HL acquire --owner alice --pid "$zchild" --ttl 0 --reason "run form, no expiry" >/dev/null 2>&1
+chk "held while the run-form anchor lives" "$(st state)" "HELD"
+wait_bounded_z=0
+for _ in $(seq 1 20); do
+    [ "$(sed 's/.*) //' "/proc/${zchild}/stat" 2>/dev/null | awk '{print $1}')" = Z ] && { wait_bounded_z=1; break; }
+    sleep 1
+done
+chk "the anchor really did become a zombie" "$wait_bounded_z" "1"
+chk "a zombie anchor is STALE, not HELD" "$(st state)" "STALE"
+chk "and the box is recoverable despite ttl=0" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+sig "$zparent" 9
+wait "$zparent" 2>/dev/null
+rm -f "$LOCK.zpid"
+cleanup
+
+# The converse, and the more dangerous error of the two. State Z is NOT proof
+# of death: when a thread-group leader exits via pthread_exit() while other
+# threads keep running, /proc/<tgid>/stat reports Z for a fully LIVE process
+# (`ps` shows `Zl ... <defunct>`). Reading that as dead reaps a live holder
+# mid-benchmark -- one agent stealing another's box, which is the outcome this
+# whole tool exists to prevent, whereas the zombie bug above only wedged it.
+# Reachable via `acquire --pid <harness>`, which is the flag R1 requires.
+rm -f "$LOCK.zlpid"
+python3 -c '
+import ctypes, os, sys, threading, time
+open(sys.argv[1], "w").write(str(os.getpid()))
+def worker():
+    time.sleep(120)
+t = threading.Thread(target=worker, daemon=False)
+t.start()
+time.sleep(2)
+# Exit the thread-group LEADER only. The process stays alive via the worker.
+ctypes.CDLL(None).pthread_exit(None)
+' "$LOCK.zlpid" &
+zlparent=$!
+for _ in $(seq 1 20); do
+    [ -s "$LOCK.zlpid" ] && break
+    sleep 0.5
+done
+zlpid=$(cat "$LOCK.zlpid" 2>/dev/null)
+$HL acquire --owner alice --pid "$zlpid" --ttl 600 --reason "threaded harness" >/dev/null 2>&1
+zl_is_z=0
+for _ in $(seq 1 20); do
+    [ "$(sed 's/.*) //' "/proc/${zlpid}/stat" 2>/dev/null | awk '{print $1}')" = Z ] && { zl_is_z=1; break; }
+    sleep 1
+done
+chk "a live threaded harness can report state Z" "$zl_is_z" "1"
+chk "and it still has more than one thread" \
+    "$([ "$(awk '/^Threads:/ { print $2; exit }' "/proc/${zlpid}/status" 2>/dev/null || echo 0)" -gt 1 ] \
+        && echo threaded || echo single)" "threaded"
+chk "a Z leader with live threads keeps its box" "$(st state)" "HELD"
+chk "and is not reaped out from under the run" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+chk "and the owner is unchanged" "$(st owner)" "alice"
+# KNOWN GAP, recorded rather than hidden: the "unreadable status means no
+# evidence of death, so the lock stands" direction is NOT pinned. Producing a
+# process that is Z with a readable /proc/<pid>/stat and an unreadable
+# /proc/<pid>/status needs hidepid= or a pid namespace, or losing a
+# microsecond race between the two reads; the alternative is a HOSTLOCK_PROC
+# test hook in production, which would also be a way to spoof liveness and
+# steal a lock. Mutation `[ "${threads:-1}" -le 1 ]` leaves this suite green.
+# What makes that acceptable: every ACCIDENTAL form of the regression is safe
+# by construction. Dropping the `-n` guard gives `[ "" -le 1 ]`, which exits 2
+# ("integer expression expected"), so the `if` is false and the holder is
+# still treated as alive. Only writing an explicit numeric default flips the
+# direction, and that is a deliberate rewrite rather than a drift.
+sig "$zlparent" 9
+wait "$zlparent" 2>/dev/null
+rm -f "$LOCK.zlpid"
+cleanup
+
+echo "-- R7: the lock never kills anything it did not start --"
+# Reclaiming a lock does not stop the load: the dead holder's benchmark is
+# still on the cores. The tempting "fix" is for the reaper to kill it, which
+# would make this tool capable of destroying a colleague's forty-minute run on
+# the strength of a misparsed pid. It must never do that -- it warns instead.
+cleanup
+# Named to look like a benchmark, so a reaper that "helpfully" pattern-kills
+# the dead holder's load (pkill -f) is caught behaviourally too, not only by
+# the structural assertion below.
+bash -c 'exec -a onnx-genai-bench-orphan sleep 300' &
+orphan=$!
+sleep 300 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 600 >/dev/null 2>&1
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "reaping leaves the dead holder's orphaned load running" \
+    "$(alive "$orphan" && echo alive || echo killed)" "alive"
+sig "$orphan" 9
+wait "$orphan" 2>/dev/null
+cleanup
+# Structural, because the behavioural test above can only cover the reap path.
+# `grep -c '^[^#]*\bkill\b'` had three independent holes, each verified to
+# leave the suite green: \b does not match pkill/killall/killpg (no word
+# boundary between p and k); -c counts LINES, so a second kill appended to the
+# sanctioned line was invisible; and ^[^#]* cannot cross a `#`, so a kill
+# after any `#` on a line -- including one inside a string -- was hidden.
+#
+# The obvious repair, stripping at any `#` that begins a word, has the SAME
+# false-PASS hole: `echo "reaping # " ; kill -9 "$p"` is one shell command and
+# no comment at all, but the sed truncates it. So strip only lines that are
+# ENTIRELY comments. A kill mentioned in a trailing comment then counts, which
+# is a false FAIL -- noisy, and the safe direction.
+#
+# This is a net for concrete spellings, not a proof: `K=kil; "${K}l" -9 $p`
+# evades any grep by construction. That is exactly why the count is EXACT
+# rather than a threshold, and why the behavioural test above exists.
+# `timeout -s`/`timeout -k` send signals and are matched; bare `timeout` is
+# not, because --timeout/GATE_TIMEOUT would swamp it.
+kills=$(sed -E '/^[[:space:]]*#/d' "$HL" \
+    | grep -oEi '(p?kill(all)?|killpg|pthread_kill|fuser)|timeout[[:space:]]+(-[sk]|--signal|--kill-after)|\bxargs\b' | wc -l)
+chk "exactly one call in the kill family anywhere in the script" "$kills" "1"
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "and it targets the command the script itself started" \
+    "$(grep -c 'kill -TERM "\$child"' "$HL")" "1"
+# ...and it verifies that pid before signalling. Pids on this box cycle at
+# ~1.5M in four days, so signalling on "the pid still exists" would let the
+# one place this script signals anything hit a process it never started.
+#
+# Asserted as a whole canonicalised function body, not as a grep for the
+# comparison. `grep -c` counts LINES, so appending `|| [ -d "/proc/$child" ]`
+# to the guard leaves the literal intact and the count at 1 -- restoring
+# exactly the "pid still exists" behaviour while the suite stays green. The
+# recycled-pid window is microseconds wide and cannot be produced on demand,
+# so a behavioural test would need a test-only hook in production; a golden
+# body is the cheaper honest option. It is brittle to legitimate refactoring,
+# which is a false FAIL and the safe direction.
+teardown_body=$(awk '/^run_teardown\(\) \{/,/^\}/' "$HL" \
+    | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | tr '\n' '|')
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "and the teardown guard is exactly a start-time comparison" "$teardown_body" \
+'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|kill -TERM "$child" 2>/dev/null|wait "$child" 2>/dev/null|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
+
+# ...and the ORDER of that teardown's inputs is load-bearing, which the golden
+# body above cannot see: it is a body, not a position. Moving
+# `RUN_CHILD_START=$(...)` back above the three traps leaves that golden text
+# byte-identical while reopening the window it was written to close -- a
+# signal arriving during the fork that reads the start time would take bash's
+# default action, leaking the lock and orphaning a forty-minute benchmark.
+run_body=$(awk '/^cmd_run\(\) \{/,/^\}/' "$HL" | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; /^$/d')
+# Match the INSTALLING traps only: `trap - INT TERM HUP` on the way out is
+# also a trap line and is legitimately last, so a bare '^trap ' compares the
+# wrong one and reports "no" for correct code.
+trap_last=$(echo "$run_body" | grep -n '^trap .*run_teardown' | tail -1 | cut -d: -f1)
+start_at=$(echo "$run_body" | grep -n '^RUN_CHILD_START=' | head -1 | cut -d: -f1)
+chk "cmd_run installs all three traps before it reads the child's start time" \
+    "$([ -n "$trap_last" ] && [ -n "$start_at" ] && [ "$trap_last" -lt "$start_at" ] && echo yes || echo no)" "yes"
+chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_teardown')" "3"
+
+# Finally, pin the assertion count itself. Two of the checks in this file sit
+# behind environment probes, and an assertion that quietly stops running is
+# indistinguishable from one that passes -- which is the same failure mode as
+# the inert R1 block and the vacuous STALE arm that this PR exists to fix.
+# Both probe branches now assert something, so the total is invariant across
+# environments; if a refactor drops a check, this fails and says so.
+chk "every assertion in this file ran" "$((pass + fail + 1))" "208"
 
 echo
 echo "passed=${pass} failed=${fail}"
