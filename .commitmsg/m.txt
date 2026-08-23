@@ -1,18 +1,29 @@
-Merge remote-tracking branch 'origin/main' into feat/native-workflow-backend
+test(corpus): a machine with no corpus is not a corpus that covered nothing
 
-Taken to pick up `b9217fafc`, which gates the Linux-only import in
-`onnx-runtime-hostmon`'s contention test. That crate landed on `main` after the
-previous merge here and broke the macOS coverage job on this PR — a failure in a
-crate this branch does not touch, fixed upstream rather than worked around.
+`real_model_workflow_corpus` failed on CI, and correctly so by its own rule: it
+demanded either a covered package or `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1`, and a CI
+runner has neither. A gate that cannot pass on the project's own CI is not a
+gate; it is a red mark everyone learns to ignore.
 
-Clean merge, no conflicts.
+The rule was right about the thing it was protecting. Two situations look
+identical from inside the loop and are not the same:
 
-Note: `onnx-runtime-ep-cuda`'s `content_preserving_transition_gpu` test does not
-compile against `origin/main` either (`transition_granule_range_with_phase8_faults`
-is configured out of the non-GPU build), verified in a clean worktree at the same
-commit. Not from this branch.
+* **Packages are installed and none was covered.** Every one failed to load or
+  was skipped. Returning `Ok` there reports success without checking anything —
+  the silent pass this suite exists to prevent.
+* **This machine has no corpus.** A CI runner has no multi-gigabyte model
+  directories and never will. There is nothing to check and nothing wrong.
 
-Verified: engine and server suites; workspace check.
+They are now distinguished by asking whether any candidate directory exists,
+which is a fact about the machine rather than a variable a run can set to
+silence a real failure — the failure mode the escape hatch had. The weightless
+case prints what it did not cover, so a green run stays legible.
+
+The strict half is now stricter than it was: with packages installed, covering
+none fails and names them, where before setting one variable made that pass too.
+
+Verified: all 5 corpus cases green on a machine holding 6 corpus packages
+(314 s, so it is genuinely loading them); fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
