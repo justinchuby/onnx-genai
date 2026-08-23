@@ -23,9 +23,10 @@ operator entry through to the innermost arm, over a real decode step at
 > **Note (2026-08-23, revised):** the `1.84x` inherited here **no longer
 > holds** — re-measured on `e189244ba` the acc0 gap is **1.12x at t=1 and
 > 1.12x at t=8**; the `t=4` cell reads ~1.15x but sits inside its own A/A null
-> (0.868-1.150) and does not resolve, and **`t=16` reads ~1.64x on two
-> guard-passing cells against a 0.969-1.295 null, so it does not resolve
-> either** and remains the open row. Part of that closure is the work this very document
+> (0.868-1.150) and does not resolve, and **`t=16` measures ~1.78x** over a
+> dedicated 30-launch study, which is where the remaining acc0 work now is
+> ([2026-08-23-acc0-gap-at-width-16.md](2026-08-23-acc0-gap-at-width-16.md)).
+> Part of that closure is the work this very document
 > motivated: enabling the register-blocked kernel at `accuracy_level = 0`
 > (#1679) was one of three acc0 merges that landed after the 1.84x was taken.
 > The route findings below are categorical (which kernel runs) and stand

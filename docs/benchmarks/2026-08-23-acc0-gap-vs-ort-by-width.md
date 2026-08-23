@@ -21,7 +21,18 @@ two independently-medianed columns would keep.
 | 1 | 27.9 | 31.2 | **1.120x** | 1.112–1.128 | 3/3, **2 retained** | 1.025–1.036 |
 | 4 | 107.2 | 122.3 | ~1.15x | 1.087–1.284 | 4/6 | **0.868–1.150** |
 | 8 | 211.0 | 238.0 | **1.120x** | 1.089–1.145 | 3/3 | 0.997–1.028 |
-| 16 | — | — | ~1.64x, **does not resolve** | 1.456–1.831 | 2/3 | **0.969–1.295** |
+| 16 | ~244 | ~414 | **~1.78x** | 1.279–2.176 | 17/30 | **0.653–1.377** |
+
+> **The `t=16` row was resolved on 2026-08-23 and it overturns the re-ranking
+> below.** 30 further launches across two runs on `0f84888b8` put the gap at
+> **~1.78x** — paired medians 1.782 and 1.773 in the two runs, 1.770x best-launch
+> vs best-launch, and 1.650x even in the half of cells where native ran fastest.
+> A separate same-session scaling run reproduces it at 1.793x and shows why:
+> **native converts the t=8 -> t=16 doubling into 1.319x where ORT gets 1.762x,
+> in 10 of 10 paired launches.** **acc0 goes back to the top of the CPU
+> MatMulNBits work list.** The row above is that study's figure, not this
+> matrix's three cells. Full record:
+> [2026-08-23-acc0-gap-at-width-16.md](2026-08-23-acc0-gap-at-width-16.md).
 
 Two columns of that table are doing different jobs and must not be read the same
 way. *Trusted/taken* is the harness's own verdict — it refuses a cell whose peak
@@ -36,11 +47,10 @@ effect has to clear:
 - **`t=4`** reads ~1.15x against an A/A of 0.868–1.150. The gap is inside its own
   noise floor. Read it as "about the same as its neighbours", not as a distinct
   1.15x; an earlier draft of this document quoted `1.148x` to four digits.
-- **`t=16`** reads 1.64x against an A/A of 0.969–1.295 — ±30%, an order of
-  magnitude worse than at `t=8`. **This is the row that matters most and it is
-  the row we cannot measure**, because `t=16` is the closest cell to an
-  unconfined production process. See [below](#what-is-still-unresolved); an
-  earlier draft of this document wrongly wrote it off as contaminated.
+- **`t=16`** did not resolve *in this matrix* — three cells, A/A 0.969–1.295.
+  It has since been measured properly at **~1.78x** over 30 launches; see the
+  note under the table. Nothing below this line reflects that result, because it
+  post-dates the analysis; read the linked study for the width-16 conclusion.
 
 `t=1` and `t=8` clear their nulls by 3.6% and 2.8% respectively.
 
@@ -277,13 +287,15 @@ widths acc0 is **not** a scaling problem. The remaining ~11–12% is a kernel
 efficiency difference small enough to sit below several other open items rather
 than above them.
 
-**That re-ranking is conditional on `t=16`, and `t=16` is not in the table
-above.** Its two guard-passing cells read ~1.64x — the width closest to an
-unconfined production process is also the only one pointing at a large gap, and
-its A/A null is too wide to call it either way. If a quiet-host study confirms
-1.64x there, acc0 goes back to the top of the list. "acc0 is no longer the top
-target" is therefore a claim about `t=1` and `t=8`, held provisionally, with the
-`t=16` study as the thing that settles it.
+**That re-ranking was conditional on `t=16`, and the condition failed.** The
+dedicated study this section called for was run the same day and measured
+**~1.78x** at that width over 30 launches. So "acc0 is no longer the top target"
+is true of `t=1` and `t=8` and **false of the width closest to an unconfined
+production process**. acc0 is back at the top of the list. The reasoning below
+is left as written — it was the correct call *on the evidence available here*,
+and the condition it named is exactly what settled it — but the conclusion it
+guards is superseded by
+[2026-08-23-acc0-gap-at-width-16.md](2026-08-23-acc0-gap-at-width-16.md).
 
 ### The `t=1` discard is post-hoc, and here is what it costs
 
@@ -443,6 +455,16 @@ longer the top CPU MatMulNBits target — rests on the two widths that resolve, 
 **a confirmed 1.64x at `t=16` would overturn it.** That makes a dedicated
 quiet-host study of `t=16`, with launch distributions and a pre-registered A/A
 acceptance threshold, the first thing to do next rather than a footnote.
+
+> **Done, and it overturned it.** 30 launches on `0f84888b8` with the acceptance
+> rule written before the first run: the gap at `t=16` is **~1.78x**, agreeing to
+> 0.5% across two runs with different token budgets and corroborated by a
+> best-vs-best statistic at 1.770x. The scaling factor `t=8 → t=16` is ~1.16x for
+> native against ~1.76x for ORT — measured same-session, 10 of 10 paired
+> launches — so the width-16 gap is the `t=8` gap plus a scaling wall that is
+> ours alone, and *not* the host bandwidth knee, which would have flattened ORT
+> too.
+> [2026-08-23-acc0-gap-at-width-16.md](2026-08-23-acc0-gap-at-width-16.md)
 
 ## Reproduce
 

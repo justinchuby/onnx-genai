@@ -517,11 +517,13 @@ This kernel is gated to `accuracy_level = 4`. Production default is
 > already documented, landing on this table's own `t=8` row. Full record:
 > [2026-08-23-acc0-gap-vs-ort-by-width.md](2026-08-23-acc0-gap-vs-ort-by-width.md).
 >
-> **`t=16` is the open row.** Two guard-passing cells there read 1.831 and 1.456
-> (median **1.643x**), but that width's A/A null spans 0.969–1.295 and both arms
-> show 20–55% intra-run spread, so it does not resolve. It is the width closest
-> to an unconfined production process, and a confirmed ~1.64x there would
-> reverse the re-ranking below.
+> **`t=16` was the open row; it has since been measured at ~1.78x, and it does
+> reverse the re-ranking below.** 30 launches on `0f84888b8` with the acceptance
+> rule pre-registered: paired medians 1.782 and 1.773 across two runs, 1.770x
+> best-launch vs best-launch, 1.650x even where native ran fastest. So acc0 is
+> ~1.12x at t=1/t=8 and **~1.78x at the width closest to an unconfined
+> production process**, and it returns to the top of the CPU MatMulNBits list.
+> [2026-08-23-acc0-gap-at-width-16.md](2026-08-23-acc0-gap-at-width-16.md).
 
 So the honest summary *at the time of writing* was that we had moved the
 *opt-in* path from 3.01x to 1.79x and left the *default* path at 1.84x, where

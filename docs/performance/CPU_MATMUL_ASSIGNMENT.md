@@ -1951,8 +1951,26 @@ time. That figure is now stale; the re-measurement replaces it.
 > **t=8 1.120x** (range 1.089–1.145, 3 cells), **t=4 ~1.15x but unresolved** —
 > its A/A null spans 0.868–1.150, so the gap sits inside its own noise floor at
 > that width. Flat across the measurable range, so acc0 is neither a scaling
-> problem nor the top target any more — **conditional on t=16**, which does not
-> resolve and points at ~1.6x (see below).
+> problem nor the top target any more — **conditional on t=16**, which did not
+> resolve here and pointed at ~1.6x.
+>
+> **The condition failed. acc0 is back at the top.** A dedicated study the same
+> day (`0f84888b8`, 30 launches, acceptance rule pre-registered) measured
+> **~1.78x at t=16** — paired medians 1.782 and 1.773 across two runs with
+> different token budgets, 1.770x best-launch-vs-best-launch, and 1.650x even in
+> the half of cells where native ran fastest. **acc0 is ~1.12x at t=1 and t=8
+> and ~1.78x at the width closest to an unconfined production process.** The
+> scaling wall was then measured directly, both widths inside the same launch
+> with the width order rotated: **native converts the t=8 -> t=16 doubling into
+> 1.319x where ORT gets 1.762x, in 10 of 10 paired launches** (pre-registered
+> sign test, threshold 80%). So this is not a new kernel deficiency at that
+> width — it is the t=8 gap plus a scaling failure that is ours alone. It is
+> **not** the host bandwidth knee (`2026-08-22-decode-width-scaling.md`): a DRAM
+> ceiling is a property of the host and would have flattened both arms, and ORT
+> scales 1.76x across the same doubling on the same host in the same launch.
+> Next step is to localise the wall to pool dispatch versus kernel, for which
+> #1859's per-worker straggler attribution exists. Full record:
+> [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
