@@ -283,8 +283,18 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 220);
-    assert_eq!(registry.entry_count(), 265);
+    assert_eq!(
+        registry.operator_count(),
+        221,
+        "registry operator count moved; if you added or removed a handler, say so by \
+         updating this pin in the same commit -- an unbumped pin reds every lane in the repo"
+    );
+    assert_eq!(
+        registry.entry_count(),
+        266,
+        "registry entry count moved; one operator can carry several opset entries, so this \
+         number does not always move in step with the operator count"
+    );
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
