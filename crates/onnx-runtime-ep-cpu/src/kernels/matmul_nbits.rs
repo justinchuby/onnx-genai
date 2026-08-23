@@ -7430,6 +7430,12 @@ unsafe fn borrowed_int4_nblock4_avx2(
     k: usize,
     out: &mut [f32],
 ) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
     use std::arch::x86_64::*;
 
     let group = packed_rows.len();
@@ -7544,6 +7550,11 @@ fn borrowed_int4_output_element(
     k: usize,
     dot_kernel: DotKernel,
 ) -> f32 {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
     // On non-x86 targets `dot_kernel` drives no fast path; discard it to keep
     // `-D warnings` happy, mirroring `borrowed_affine_int4_matmul`.
     #[cfg(not(target_arch = "x86_64"))]
@@ -7932,6 +7943,12 @@ unsafe fn borrowed_int4_rowblock_avx2(
     k: usize,
     out: &mut [f32],
 ) {
+    debug_assert_eq!(
+        layout.bits, 4,
+        "int4_zero_point() below hard-codes the 4-bit pack; a wider layout \
+         would need the generic NBitsLayout::zero_point"
+    );
+
     use std::arch::x86_64::*;
 
     let mask = _mm_set1_epi8(0x0f);

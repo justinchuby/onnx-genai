@@ -30,6 +30,12 @@
 //! - `PROBE_SESSIONS` -- concurrent decode loops (default 1).
 //! - `PROBE_TOKENS` -- measured tokens per session (default 64).
 //! - `PROBE_LAYERS` -- projection chains per token (default 1).
+//! - `PROBE_ZERO_POINTS` -- `1` supplies a fourth (asymmetric) zero-points
+//!   input; the default `0` leaves it absent, which is the **symmetric**
+//!   route. This axis matters more than it looks: symmetric int4 takes the
+//!   implicit midpoint 8 and never touches a zero-points byte, so any
+//!   measurement of zero-point unpacking taken with the default is measuring
+//!   a branch that is never entered.
 //!
 //! To vary the decode pool width, set **`ONNX_GENAI_CPU_DECODE_THREADS`**.
 //! `RAYON_NUM_THREADS` does *not* size this pool -- `configured_decode_threads`
@@ -148,10 +154,19 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples[samples.len() / 2]
 }
 
-fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box<dyn Kernel> {
+fn build_kernel(
+    k: usize,
+    n: usize,
+    block_size: usize,
+    accuracy: i64,
+    zero_points: bool,
+) -> Box<dyn Kernel> {
     let blocks = k.div_ceil(block_size);
     let blob = block_size / 2;
-    let shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
+    let mut shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
+    if zero_points {
+        shapes.push(vec![n, blocks.div_ceil(2)]);
+    }
     let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
     node.domain = "com.microsoft".into();
     for (name, value) in [
@@ -166,17 +181,44 @@ fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box<dyn
     let mut kernel = CpuExecutionProvider::new()
         .get_kernel(&node, &shapes, 1)
         .expect("CPU EP must register MatMulNBits");
-    kernel.set_constant_inputs(&[false, true, true]);
+    if zero_points {
+        kernel.set_constant_inputs(&[false, true, true, true]);
+    } else {
+        kernel.set_constant_inputs(&[false, true, true]);
+    }
     kernel
+}
+
+/// Packed asymmetric zero points, two int4 nibbles per byte, one per block.
+///
+/// Values sit near the symmetric midpoint 8 the way a real round-to-nearest
+/// quantizer's do; the exact values do not change the instruction count, only
+/// the arithmetic they feed.
+fn packed_zero_points(blocks: usize, n: usize) -> Vec<u8> {
+    let per_row = blocks.div_ceil(2);
+    let mut bytes = vec![0u8; n * per_row];
+    for row in 0..n {
+        for block in 0..blocks {
+            let value = 7u8 + ((row + block) % 3) as u8;
+            let byte = &mut bytes[row * per_row + block / 2];
+            *byte |= value << ((block % 2) * 4);
+        }
+    }
+    bytes
 }
 
 /// A weight, shared across sessions the way a served model's weights are.
 struct Weight {
     b: Tensor,
     scales: Tensor,
+    zero_points: Option<Tensor>,
     k: usize,
     n: usize,
 }
+
+/// Set by every session; read once after the measured phase. See the checksum
+/// comment in `run_session`.
+static CHECKSUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
@@ -198,6 +240,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
+    let asymmetric: bool = std::env::var("PROBE_ZERO_POINTS")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let layers: usize = std::env::var("PROBE_LAYERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -227,6 +273,8 @@ fn main() {
             Weight {
                 b: Tensor::u8(&[n, blocks, blob], &packed),
                 scales: Tensor::floats(common::FloatDType::F32, &[n, blocks], &scales),
+                zero_points: asymmetric
+                    .then(|| Tensor::u8(&[n, blocks.div_ceil(2)], &packed_zero_points(blocks, n))),
                 k,
                 n,
             }
@@ -234,8 +282,13 @@ fn main() {
         .collect();
 
     println!(
-        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}",
-        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into())
+        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd} zero_points={}",
+        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into()),
+        if asymmetric {
+            "asymmetric"
+        } else {
+            "symmetric"
+        }
     );
     println!(
         "{:>10} {:>12} {:>12} {:>14} {:>9}",
@@ -250,7 +303,9 @@ fn main() {
         let mut outputs: Vec<Tensor> = Vec::new();
         for _ in 0..layers {
             for weight in &weights {
-                kernels.push(build_kernel(weight.k, weight.n, block_size, accuracy));
+                kernels.push(build_kernel(
+                    weight.k, weight.n, block_size, accuracy, asymmetric,
+                ));
                 activations.push(Tensor::floats(
                     common::FloatDType::F32,
                     &[1, weight.k],
@@ -270,11 +325,14 @@ fn main() {
          -> (Vec<Box<dyn Kernel>>, Vec<Tensor>) {
             for (index, kernel) in kernels.iter().enumerate() {
                 let weight = &weights[index % weights.len()];
-                let ins = vec![
+                let mut ins = vec![
                     activations[index].view(),
                     weight.b.view(),
                     weight.scales.view(),
                 ];
+                if let Some(zero_points) = weight.zero_points.as_ref() {
+                    ins.push(zero_points.view());
+                }
                 kernel
                     .execute(&ins, &mut [outputs[index].view_mut()])
                     .expect("execute");
@@ -311,6 +369,24 @@ fn main() {
             state = returned;
             samples.push(elapsed);
         }
+        // Route proof, not decoration. A benchmark arm that supplies a fourth
+        // input the kernel silently ignores would time the *symmetric* route
+        // while claiming to time the asymmetric one, and every number taken
+        // from it would be attributed to a branch never entered. The checksum
+        // is the cheapest evidence the zero points were consumed: symmetric
+        // uses the implicit midpoint 8, asymmetric uses 7/8/9, so the two
+        // arms cannot agree unless the input was dropped.
+        let checksum: f64 = state
+            .1
+            .iter()
+            .map(|out| {
+                let view = out.view();
+                let len: usize = view.shape.iter().product();
+                let values = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
+                values.iter().map(|v| *v as f64).sum::<f64>()
+            })
+            .sum();
+        CHECKSUM.store(checksum.to_bits(), std::sync::atomic::Ordering::Relaxed);
         samples
     };
 
@@ -366,6 +442,11 @@ fn main() {
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
     }
+
+    println!(
+        "checksum={:.6}",
+        f64::from_bits(CHECKSUM.load(std::sync::atomic::Ordering::Relaxed))
+    );
 
     // After the phases, never before: the pool is built at first decode, so this
     // is the earliest point the realized width exists to be read.
