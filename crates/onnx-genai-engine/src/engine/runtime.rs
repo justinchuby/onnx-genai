@@ -711,6 +711,29 @@ impl Engine {
         self.native_session.as_mut()
     }
 
+    /// Teacher-forced native generation over an exact token prefix.
+    ///
+    /// Divergence and decode-lock audits feed a fixed prefix and read the top
+    /// log-probabilities of the single next token, which the ordinary text
+    /// entry points cannot express: they tokenize a prompt, and the whole point
+    /// is to pin the *exact* ids an oracle agreed on. Exposed here rather than
+    /// on the native session so a caller never needs the interpreter type.
+    #[cfg(feature = "native-backend")]
+    pub fn generate_native_from_token_ids(
+        &mut self,
+        prompt_tokens: &[TokenId],
+        options: &GenerateOptions,
+        chain: &crate::logits::ProcessorChain,
+        tokenizer: &Tokenizer,
+    ) -> anyhow::Result<GenerateResult> {
+        let runtime = &*self.workflow;
+        let session = self
+            .native_session
+            .as_mut()
+            .context("native decoder session is unavailable")?;
+        session.generate(prompt_tokens, options, chain, tokenizer, runtime)
+    }
+
     /// Whether this runtime holds the fused decode session that implements the
     /// declared `onnx-genai.autoregressive-decode` step.
     ///

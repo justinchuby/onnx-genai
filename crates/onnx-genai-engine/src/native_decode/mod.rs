@@ -1479,6 +1479,7 @@ impl NativeDecodeSession {
     ///
     /// If `resume_from > current_len`, behaves like full generation from 0.
     /// If `resume_from < current_len`, rewinds the KV cache to `resume_from`.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_incremental_with_callback(
         &mut self,
         prompt_tokens: &[TokenId],

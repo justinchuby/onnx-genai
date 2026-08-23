@@ -1,68 +1,31 @@
-fix(engine): address the independent review's blockers
+fix(engine): the CUDA-feature build compiled nothing this branch changed
 
-An adversarial review of the branch found two correctness bugs, a latent one in
-unsafe code, and three places where the prose claimed more than the code does.
+CI's "CUDA compile (Linux x86_64)" caught what a default-feature build could
+not: the `ort-cuda`-gated test module in `pipeline/mod.rs` still destructured
+`WorkflowRuntime` construction as one value and read a `resource_governor` field
+that moved to `Engine`, and two divergence audits called a native-session method
+whose signature now takes the interpreter.
 
-**A session id was silently dropped for any request carrying tensors.**
-`run_generation` bound multimodal input into a fresh `PipelineGenerateRequest`,
-which starts with `session_id: None`, and then matched `(Some(bound), _)` —
-discarding the header. This branch is what made it reachable: removing the
-"sessions are not supported by pipeline models" refusals means a VLM package with
-`scope: session` state now *does* get sessions, and it would have run with none
-of them keyed, succeeded, and reported a permanently stale token count. Bound
-requests now carry the session.
+The divergence audits are the interesting part. They opened `model.onnx`
+directly with `NativeDecodeSession::load` and drove a teacher-forced step against
+the raw graph. That was always measuring a decode no request can reach, and it
+is now impossible to express, because a decode runs the loop the *package*
+declares. They load through `Engine::from_dir` with the native backend and use a
+new `Engine::generate_native_from_token_ids`, which exists for exactly this
+purpose: feeding an oracle-agreed token prefix and reading the top
+log-probabilities of the single next token, which the text entry points cannot
+express because they tokenize a prompt.
 
-**An offset alias re-aliased to the wrong bytes.** `alias_with_offset` recorded
-its window in the pointer only, so `try_alias_clone` — which every carried value
-in the interpreter passes through — rebuilt the alias from shape alone and
-rebased it to the owner's *prefix*. Same shape, same dtype, another tensor's
-data, no error anywhere. `TensorBacking::Alias` now carries the element offset
-and re-aliasing reproduces the window; two cases cover the round trip and offset
-composition. Not yet reachable on this branch (narrowed values stay local to the
-proposal loop), which is exactly why it needed finding now.
+That also keeps `WorkflowRuntime` crate-private. Exposing it to let a test call
+the native session would have widened the public surface to work around a test.
 
-**`loop_ended_by_predicate` was a run-wide latch.** Any loop whose predicate went
-false set it, and `run_declared_generation` read it as `EosToken`. A workflow may
-declare several loops — the `video` and `tts` fixtures each declare two — so a
-denoise loop ending normally would make a generation that exhausted its budget
-report EOS. That is the same inversion the composite finish-reason work fixed,
-in the other direction. It is now recorded only for the loop that emits the
-package's `role: tokens` output.
+Also two `--features native-cuda` clippy findings: the `Arc<Value>` in
+`device_ops` needs the same non-Send/Sync allowance the production alias path
+uses, and the `cfg`-selected return in `tensor_ops_for` does not need a block.
 
-**The consumer analyses missed nested steps.** `runtime_managed_seeds` and
-`host_supplied_inputs` walked one level of `Loop` and never entered `Branch`
-cases. `runtime_managed_seeds` runs for *every* package, and a seed it wrongly
-classifies as unconsumed is skipped at binding — so a branch-heavy composite
-package with a runtime-managed cell seeded from inside a case would have failed
-mid-run with "references unavailable value". Both now walk every declared step.
-
-**Three overclaims corrected.**
-
-`WORKFLOW_RUNTIME_UNIFICATION.md` said, as landed, that *every* generated token
-comes from the interpreter. It does not: `speculative/mod.rs`,
-`native_speculative.rs` and `batched.rs` still own their iteration, and the
-continuous-batch driver is the server's default whenever more than one request is
-in flight. The status now says single-row generation is unified and names the two
-loops that are not, with what moving them requires. Its Phase 2 section still
-described the in-memory `model.io` lowering — the thing the invariant forbids —
-as current design, citing `canonical.rs` and `install_canonical_workflow`, neither
-of which exists; deleted. Phase 4 justified the pre-admission ordering property by
-citing a guard that was removed, so a reader could not verify it; it now states
-where the property actually comes from, which is that nothing downstream can fail.
-
-`decoder_abi.rs` claimed `is_single_decoder_workflow` was "the one place this
-question is answered … the engine choosing an executor asks here". The engine
-asks a different question — whether the sole graph component declares the decode
-contract — and the two predicates differ on packages the emitter does not
-produce. Both comments now say what each actually decides.
-
-The negative halves of `authored_body_selects_executor` asserted only an empty
-contract count, which a second generation drive would also satisfy. They now pair
-that with the interpreter's own component-invocation record, which a second drive
-would not produce.
-
-Verified: engine, server, ort and metadata suites; all 12 `native_workflow_parity`
-cases on an H200; fmt; clippy `-D warnings`.
+Verified: `cargo check`/`clippy -D warnings` under `--features native-cuda
+--all-targets`; 12 `native_workflow_parity` and 9 `gemma4_chained_workflow` cases
+on an H200; engine, server and ort suites on the default features; fmt.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

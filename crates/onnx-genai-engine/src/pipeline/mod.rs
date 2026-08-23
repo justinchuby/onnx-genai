@@ -1334,14 +1334,12 @@ pipeline:
 
         fn wait_for_allocator_idle(
             engine: &WorkflowRuntime,
+            governor: &crate::engine::EngineResourceGovernor,
             expected_live_allocations: usize,
         ) -> anyhow::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let snapshot = engine
-                    .resource_governor
-                    .process_memory_manager()
-                    .snapshot()?;
+                let snapshot = governor.process_memory_manager().snapshot()?;
                 let stats = engine
                     .models
                     .environment()?
@@ -1375,7 +1373,7 @@ pipeline:
             let provider = Arc::new(FixedAuthorityProvider::new(0));
             let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
-            let mut engine =
+            let (mut engine, engine_governor) =
                 WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
@@ -1422,8 +1420,8 @@ pipeline:
             );
             wait_for_allocator_idle(
                 &engine,
-                engine
-                    .resource_governor
+                &engine_governor,
+                engine_governor
                     .process_memory_manager()
                     .snapshot()
                     .expect("baseline snapshot")
@@ -1432,8 +1430,7 @@ pipeline:
             )
             .expect("idle after run");
 
-            let baseline_live_allocations = engine
-                .resource_governor
+            let baseline_live_allocations = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("baseline snapshot")
@@ -1459,8 +1456,7 @@ pipeline:
                 .expect("CUDA island allocator");
             let island_value = Value::empty_in(&[BATCH as i64], DataType::Int64, &island_allocator)
                 .expect("island-managed device allocation");
-            let live_snapshot = engine
-                .resource_governor
+            let live_snapshot = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("live snapshot");
@@ -1473,7 +1469,7 @@ pipeline:
 
             drop(component_value);
             drop(island_value);
-            wait_for_allocator_idle(&engine, baseline_live_allocations)
+            wait_for_allocator_idle(&engine, &engine_governor, baseline_live_allocations)
                 .expect("component and island frees must settle");
         }
 
@@ -1491,7 +1487,7 @@ pipeline:
             let mut options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
             options.graph_capture = true;
-            let mut engine =
+            let (mut engine, _engine_governor) =
                 WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
@@ -1545,7 +1541,7 @@ pipeline:
             let options = SessionOptions::with_execution_provider(ep_selection("cuda"))
                 .with_intra_op_threads(1);
             let calibration_provider = Arc::new(FixedAuthorityProvider::new(0));
-            let calibration =
+            let (calibration, calibration_governor) =
                 WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root,
                     EngineConfig::default(),
@@ -1553,8 +1549,7 @@ pipeline:
                     calibration_provider,
                 )
                 .expect("calibration pipeline engine");
-            let calibration_snapshot = calibration
-                .resource_governor
+            let calibration_snapshot = calibration_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("calibration PMM snapshot");
@@ -1580,13 +1575,12 @@ pipeline:
             let provider = Arc::new(FixedAuthorityProvider::with_capacity(0, limit));
             let mut config = EngineConfig::default();
             config.limits.vram_limit = ResourceLimit::Bytes(limit);
-            let engine =
+            let (_engine, engine_governor) =
                 WorkflowRuntime::from_dir_with_session_options_and_memory_authority_provider(
                     &root, config, options, provider,
                 )
                 .expect("a model that fits once must not fail from a duplicate fixed reservation");
-            let snapshot = engine
-                .resource_governor
+            let snapshot = engine_governor
                 .process_memory_manager()
                 .snapshot()
                 .expect("near-budget PMM snapshot");
@@ -1595,8 +1589,7 @@ pipeline:
                 "managed initializer charges exceeded the shared authority limit: {snapshot:?}"
             );
             assert!(
-                engine
-                    .resource_governor
+                engine_governor
                     .plan()
                     .breakdown()
                     .iter()
@@ -1605,7 +1598,7 @@ pipeline:
             );
             assert_eq!(
                 snapshot.authority_snapshots[0].used[0],
-                engine.resource_snapshot().vram.used,
+                engine_governor.snapshot().vram.used,
                 "PMM and engine snapshots must report the same canonical device charge"
             );
         }

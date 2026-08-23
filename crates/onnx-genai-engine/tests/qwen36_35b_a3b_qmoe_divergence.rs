@@ -185,7 +185,7 @@ fn engine(
         native_device: Some(device),
         ..EngineConfig::default()
     };
-    Engine::from_dir_with_config(dir, config)
+    Engine::from_dir(dir, config)
 }
 
 /// Autoregressive greedy stream (temperature 0) of `max_new_tokens` tokens.

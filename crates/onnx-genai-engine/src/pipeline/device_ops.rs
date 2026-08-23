@@ -137,6 +137,10 @@ impl ResidentTensorOps for CudaTensorOps {
             .context("negative tensor extent")?;
         let mut narrowed = shape.clone();
         narrowed[axis] = 1;
+        // `Value` is deliberately neither Send nor Sync — an OrtValue belongs
+        // to the thread that made it — and `Arc` is what the alias backing
+        // takes, so this is the shape the production path already uses.
+        #[allow(clippy::arc_with_non_send_sync)]
         let owner = Arc::new(value.try_alias_clone().transpose()?.context(
             "a device-resident value must be aliasable to be narrowed without a copy; \
                      this one owns its buffer directly",
@@ -182,9 +186,7 @@ pub(crate) fn tensor_ops_for(value: &Value) -> anyhow::Result<Box<dyn ResidentTe
     }
     let device = value.device_id()?;
     #[cfg(feature = "ort-cuda")]
-    {
-        return Ok(Box::new(CudaTensorOps::new(device)));
-    }
+    return Ok(Box::new(CudaTensorOps::new(device)));
     #[cfg(not(feature = "ort-cuda"))]
     anyhow::bail!(
         "this value is resident on CUDA device {device}, and this build has no device tensor \
