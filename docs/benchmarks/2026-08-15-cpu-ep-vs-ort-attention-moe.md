@@ -4854,12 +4854,48 @@ default 16-wide pool pins its workers to cpus 0-15, which on this host is 8
 physical cores with two workers per core, and one of the two L3 domains. cpu0
 additionally carries a permanent external competitor -- a pinned scalar probe
 gets 0.503 of the throughput there that it gets on any other CPU. ORT's pool is
-not pinned and roams all 32 logical CPUs. Whether this reached the
-single-node MHA graphs measured here is **not yet verified** -- it needs a
-`/proc` read against a live bench process, which is queued behind the current
-host owner -- but `ONNX_GENAI_CPU_DECODE_THREADS` is the knob `bench_generic`
-sets for the native arm and it is the same knob that governs the pool
-`decode_affinity` places, so it cannot be assumed away.
+not pinned and roams all 32 logical CPUs.
+
+**Resolved, and narrower than stated: this leg does not apply to these rows.**
+It was left as "not yet verified", pending a `/proc` read against a live bench
+process. It did not need one -- it is answerable from the routing code, with no
+timing at all, and the answer is no:
+
+* The production SDPA route forks on `decode_pool_active()` (`sdpa.rs:1287`).
+  Only the true arm reaches `decode_parallel_output_row_blocks`, i.e. the SPMD
+  pool that `decode_affinity` places. The false arm goes to
+  `task_runtime::chunk_runs_mut`.
+* `decode_pool_active()` is `spmd_decode_active() || numa_decode_active()`
+  (`matmul_nbits.rs:4918`). Both halves are gated on a **thread-local**:
+  `IN_SPMD_SCOPE` (`:4901`) and `IN_NUMA_SCOPE` (`:4891`), each set only inside
+  `with_decode_pool_scope`. Neither is a process-global, so no other thread's
+  decode loop can turn this on for the benchmark's engine thread.
+* The only production caller of that scope is the generation loop in
+  `onnx-genai-engine/src/native_decode/cpu.rs`. `bench_generic` never mentions
+  `native_decode`; it drives graphs through `onnx-runtime-session`.
+
+So on a single-node SDPA/MHA graph the flag is false, the SPMD pool is never
+entered, and the cpus 0-15 mask never governed these measurements. The width
+knob still bites -- `task_runtime::resolve_width` honours
+`ONNX_GENAI_CPU_DECODE_THREADS` deliberately, so `--native-threads T` does size
+the fan-out -- but that pool is **capped to physical cores and never pinned**
+(`cap_spinning_workers`), which is the opposite of the compact mask. The
+inference in the previous paragraph -- "same knob, so it cannot be assumed
+away" -- was sound as caution and wrong as fact: the knob sizes two different
+pools, and only one of them is placed.
+
+**Consequence for the re-measurement queue.** Decode rows taken before
+`6e8c31ebd` were on 8 physical cores and do need re-taking. The single-node
+SDPA/MHA rows in 45.7-45.9 are **not** in that set and should not be re-taken on
+placement grounds. They still need re-taking for reason 1 above, which is
+sufficient on its own and unaffected by any of this.
+
+**Rule.** A confound is a claim like any other and needs the same standard of
+proof in both directions. "It shares a knob with something that was broken" is a
+reason to check, not a finding; leaving it recorded as an open confound when it
+was decidable from three lines of routing code let it sit as though it were
+evidence, and would have sent somebody re-measuring rows that were never
+affected.
 
 **What still stands.** The finding of 45.8 -- the shipped SDPA route claims no
 parallelism -- is a statement about code: `sdpa_f32_simd` is a plain
