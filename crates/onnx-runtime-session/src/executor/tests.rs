@@ -3153,6 +3153,10 @@ struct WeightDeliveryEp {
     support_index_share_workspace: bool,
     fail_next_allocation: Arc<AtomicBool>,
     fail_allocation_size: Arc<AtomicUsize>,
+    /// Count of `acquire_routed_residency` calls, for the dispatch-site
+    /// integration tests below (issue #82 slice 5): proves the executor
+    /// gates guard acquisition on QMoE-family boundary nodes only.
+    routed_residency_calls: Arc<AtomicUsize>,
 }
 
 impl WeightDeliveryEp {
@@ -3203,6 +3207,7 @@ impl WeightDeliveryEp {
             support_index_share_workspace: false,
             fail_next_allocation: Arc::new(AtomicBool::new(false)),
             fail_allocation_size: Arc::new(AtomicUsize::new(0)),
+            routed_residency_calls: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -3427,6 +3432,24 @@ impl ExecutionProvider for WeightDeliveryEp {
     ) -> onnx_runtime_ep_api::Result<bool> {
         self.deliveries.lock().unwrap().push("prefetch");
         Ok(true)
+    }
+
+    fn acquire_routed_residency(
+        &self,
+        _key: u64,
+        requirement: onnx_runtime_ep_api::RoutedResidencyRequirement,
+        catalog: &onnx_runtime_loader::WeightRegionCatalog,
+    ) -> onnx_runtime_ep_api::Result<Option<Box<dyn onnx_runtime_ep_api::RoutedResidencyGuardHandle>>>
+    {
+        self.routed_residency_calls.fetch_add(1, Ordering::Relaxed);
+        let proof = onnx_runtime_ep_api::prove_routed_residency(requirement, catalog);
+        struct TestGuardHandle(onnx_runtime_ep_api::RoutedResidencyProof);
+        impl onnx_runtime_ep_api::RoutedResidencyGuardHandle for TestGuardHandle {
+            fn proof(&self) -> &onnx_runtime_ep_api::RoutedResidencyProof {
+                &self.0
+            }
+        }
+        Ok(Some(Box::new(TestGuardHandle(proof))))
     }
 
     fn reserve_workspace(
@@ -4042,6 +4065,62 @@ fn qmoe_expert_region_candidates_record_reason_for_non_rank3_layout() {
     // handle per initializer, proving the invalid layout does not change
     // existing binder/allocation behavior.
     assert_eq!(executor.weight_handles.len(), 2);
+}
+
+/// Dispatch-time integration proof for issue #82 slice 5: `execute_kernel`
+/// acquires exactly one routed-residency guard per QMoE dispatch (never zero,
+/// never more than once per node — `find_map` short-circuits on the first
+/// matching catalog), and never for a non-QMoE-family node.
+#[test]
+fn qmoe_dispatch_acquires_exactly_one_routed_residency_guard_per_node() {
+    let (graph, weights, _path) = qmoe_expert_region_fixture();
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let calls = Arc::clone(&ep.routed_residency_calls);
+    let mut executor = Executor::build(graph, weights, Arc::new(ep)).unwrap();
+
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+    let input = Tensor::from_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let _ = executor.run(&[("activation", &input)]).unwrap();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        1,
+        "one QMoE dispatch must acquire exactly one routed-residency guard"
+    );
+
+    // A second dispatch of the same (only) node acquires exactly one more,
+    // proving the guard is re-acquired per dispatch rather than leaked or
+    // acquired once and reused stale.
+    let _ = executor.run(&[("activation", &input)]).unwrap();
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+/// A non-QMoE-family node (plain `Identity`) must never trigger routed-
+/// residency guard acquisition, proving the dispatch-site gate is scoped to
+/// `LazyWeightBoundary::{QMoe, BlockQuantizedMoe}` and not every node.
+#[test]
+fn non_qmoe_dispatch_never_acquires_a_routed_residency_guard() {
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 18);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([1, 4]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([1, 4]));
+    let node = Node::new(NodeId(0), "Identity", vec![Some(input)], vec![output]);
+    graph.insert_node(node);
+    graph.add_output(output);
+
+    let deliveries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ep = WeightDeliveryEp::new(true, deliveries);
+    let calls = Arc::clone(&ep.routed_residency_calls);
+    let mut executor = Executor::build(graph, Arc::new(WeightStore::new()), Arc::new(ep)).unwrap();
+
+    let values = Tensor::from_f32(&[1, 4], &[1.0, 2.0, 3.0, 4.0]).unwrap();
+    let _ = executor.run(&[("input", &values)]).unwrap();
+    assert_eq!(
+        calls.load(Ordering::Relaxed),
+        0,
+        "a non-QMoE-family node must never acquire a routed-residency guard"
+    );
 }
 
 #[test]
