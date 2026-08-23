@@ -496,9 +496,7 @@ fn run_remap_benchmark(
     // host_pool_stats used for future per-location accounting; warm/cold detected via device pool.
     let _ = host_pool.stats();
 
-    for step in 0..n_steps {
-        let routed_experts = &trace[step];
-
+    for (step, routed_experts) in trace.iter().enumerate().take(n_steps) {
         // Pick k_remap_per_step experts to promote (host→device) this step.
         // Among the routed experts, promote those still on host; if fewer
         // than k_remap_per_step routed experts need promotion, pick
@@ -944,7 +942,7 @@ fn run_accounting_oscillation(
         };
         to_backing
             .commit_at_location(&mut reservation, 0, to_location, to_pool)
-            .expect(&format!("oscillation commit failed at step {step}"));
+            .unwrap_or_else(|error| panic!("oscillation commit failed at step {step}: {error}"));
         accounting.note_commit(to_pool_location, granularity);
 
         let to_stats_after = to_pool_stats.snapshot();
