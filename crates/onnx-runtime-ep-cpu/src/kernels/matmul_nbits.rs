@@ -19786,6 +19786,14 @@ mod tests {
             .arg("--exact")
             .arg("kernels::matmul_nbits::tests::retry_record_child")
             .arg("--test-threads=1")
+            // libtest honours `RUST_TEST_NOCAPTURE` as well as `--nocapture`,
+            // and `Command` inherits the parent environment. Without this a
+            // developer running the suite with `RUST_TEST_NOCAPTURE=1` — a
+            // legitimate way to watch test output — would disable capture in
+            // the child, let the control marker through, and fail this test for
+            // a reason unrelated to the fix. The premise has to be established
+            // here rather than inherited.
+            .env_remove("RUST_TEST_NOCAPTURE")
             .env(RETRY_RECORD_CHILD_ENV, "1")
             .output()
             .expect("run the retry-record child process");
@@ -19848,6 +19856,15 @@ mod tests {
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
         /// number is the only in-band trace of them (#1745).
+        ///
+        /// On non-Linux targets the only *field access* is the Linux invariant
+        /// below, which `cfg` strips — and rustc's dead-code analysis
+        /// deliberately ignores the derived `Debug` that carries this into every
+        /// `{report:?}` assertion message. Without the `allow` the lanes that
+        /// actually see this crash (Windows ARM64, Windows x86_64, macOS arm64,
+        /// all built with `-D warnings`) fail to compile on a field that exists
+        /// to diagnose them.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         attempts: u32,
     }
 
