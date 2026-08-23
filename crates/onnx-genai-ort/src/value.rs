@@ -111,7 +111,17 @@ enum TensorBacking {
     /// the backend-neutral component-session seam, which carries host tensors as
     /// opaque bytes).
     Bytes(ElementBytes),
-    Alias(Arc<Value>),
+    /// A no-copy view over `element_offset..element_offset + numel` of an owner.
+    ///
+    /// The offset is carried rather than folded into the pointer alone, because
+    /// re-aliasing has to reproduce the *same window*. An alias that recorded
+    /// only its shape would re-alias to the owner's prefix — same shape, same
+    /// dtype, different bytes, no error — and every carried value in the
+    /// interpreter passes through `try_alias_clone`.
+    Alias {
+        owner: Arc<Value>,
+        element_offset: usize,
+    },
     /// Memory this `Value` does not own.
     ///
     /// Used when a caller hands ORT a buffer it allocated itself — typically
@@ -1213,7 +1223,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot zero row for non-owned or non-KV tensor".into(),
                 ));
@@ -1311,7 +1321,7 @@ impl Value {
                     )));
                 }
             },
-            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias(_) => {
+            TensorBacking::I64(_) | TensorBacking::Bytes(_) | TensorBacking::Alias { .. } => {
                 return Err(OrtError::InvalidArgument(
                     "cannot pack rows for non-owned or non-KV tensor".into(),
                 ));
@@ -1411,7 +1421,10 @@ impl Value {
             ptr,
             shape: shape.to_vec(),
             dtype: owner.dtype,
-            backing: TensorBacking::Alias(owner),
+            backing: TensorBacking::Alias {
+                owner,
+                element_offset,
+            },
         })
     }
 
@@ -1435,9 +1448,17 @@ impl Value {
     /// reallocating or memcpy-ing the underlying buffer.
     pub fn try_alias_clone(&self) -> Option<Result<Value>> {
         match &self.backing {
-            TensorBacking::Alias(owner) => {
-                Some(Value::alias_with_shape(Arc::clone(owner), &self.shape))
-            }
+            // Re-aliasing reproduces the *same window*, offset included: an
+            // alias that carried only its shape would silently rebase to the
+            // owner's prefix.
+            TensorBacking::Alias {
+                owner,
+                element_offset,
+            } => Some(Value::alias_with_offset(
+                Arc::clone(owner),
+                *element_offset,
+                &self.shape,
+            )),
             // An external allocation this value *owns* (e.g. a native `Tensor`'s
             // device memory) can be aliased in O(1): re-wrap the same allocation
             // as another external value sharing the owner `Arc`, so both keep it
@@ -1506,7 +1527,7 @@ impl Drop for Value {
             TensorBacking::F16(data) => data.len(),
             TensorBacking::I64(data) => data.len(),
             TensorBacking::Bytes(data) => data.len(),
-            TensorBacking::Alias(owner) => owner.numel(),
+            TensorBacking::Alias { owner, .. } => owner.numel(),
             // Borrowed memory. Any `_owner` here is a struct field, so drop glue
             // frees it *after* this body releases the `OrtValue` below — ORT is
             // always done with the allocation before the owner frees it.
@@ -2862,6 +2883,34 @@ mod alias_offset_tests {
             message.contains("past the end"),
             "the refusal must say the window leaves the allocation: {message}"
         );
+    }
+
+    /// Re-aliasing an offset view reproduces the same window.
+    ///
+    /// Every carried value in the interpreter passes through
+    /// `try_alias_clone`. An alias that recorded only its shape would re-alias
+    /// to the owner's *prefix* — same shape, same dtype, another tensor's
+    /// bytes, and no error anywhere to notice it.
+    #[test]
+    fn re_aliasing_an_offset_view_keeps_the_offset() {
+        let owner = Arc::new(Value::from_slice_i64(&[10, 11, 12, 13, 14, 15], &[6]).unwrap());
+        let view = Value::alias_with_offset(owner, 2, &[3]).unwrap();
+        let cloned = view
+            .try_alias_clone()
+            .expect("an alias is alias-cloneable")
+            .unwrap();
+        assert_eq!(cloned.to_vec_i64().unwrap(), vec![12, 13, 14]);
+        assert_eq!(cloned.to_vec_i64().unwrap(), view.to_vec_i64().unwrap());
+    }
+
+    /// Offsets compose, so narrowing twice narrows twice.
+    #[test]
+    fn offsets_compose_through_a_re_alias() {
+        let owner = Arc::new(Value::from_slice_i64(&[0, 1, 2, 3, 4, 5, 6, 7], &[8]).unwrap());
+        let first = Value::alias_with_offset(owner, 2, &[4]).unwrap();
+        let re_aliased = Arc::new(first.try_alias_clone().expect("aliasable").unwrap());
+        let second = Value::alias_with_offset(re_aliased, 1, &[2]).unwrap();
+        assert_eq!(second.to_vec_i64().unwrap(), vec![3, 4]);
     }
 
     /// The owner outlives every view derived from it.

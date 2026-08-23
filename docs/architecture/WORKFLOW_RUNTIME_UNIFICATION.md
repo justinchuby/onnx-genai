@@ -1,12 +1,29 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **landed.** There is one runtime type, one interpreter, and one drive.
-Every package — a bare decoder, a composite pipeline, a speculative block —
-serializes `pipeline.workflow`, and every generated token comes out of
-`pipeline::workflow::run_workflow_node` walking that document: the iteration
-bound, the liveness predicate, the carried state, the emit that publishes the
-token stream, and the stop are read from the package, not supplied by a Rust
-loop written beside it.
+Status: **single-row generation is unified; two algorithms are not yet.**
+
+There is one runtime type, one interpreter and one drive. Every package
+serializes `pipeline.workflow`, and every **single-row** generated token comes
+out of `pipeline::workflow::run_workflow_node` walking that document: the
+iteration bound, the liveness predicate, the carried state, the emit that
+publishes the token stream and the stop are read from the package, not supplied
+by a Rust loop written beside it. That covers a bare decoder, a composite
+pipeline whose sampler is a graph, and the scheduler's per-token drive.
+
+**Two loops still own their own iteration and do not reach the interpreter**, and
+this document says so rather than rounding up:
+
+* `speculative/mod.rs::generate_speculative_loop` and
+  `native_speculative.rs::NativeSpeculativeDriver` — reached whenever a request
+  names `speculative_mode` / `num_speculative_tokens`, or an MTP head is loaded.
+* `batched.rs::generate_batched_static` and `ContinuousBatchManager` — reached by
+  the server's continuous-batch driver, which is the default whenever the decode
+  path reports it can batch and more than one request is in flight.
+
+Both take their bound and their stop from Rust, not from the workflow. §"The
+three loop algorithms" below describes what expressing them as declared steps
+requires. Until that lands, "every generated token comes from the interpreter" is
+true of the single-row path and false of these two.
 
 **What varies between packages is which executor implements a declared node,
 and that is answered by the contract the node names.** A component declaring
@@ -48,17 +65,29 @@ empty but for the gate itself, and it may only shrink.
 
 ## The three loop algorithms
 
-They remain three algorithms, because they *are* three algorithms — a token, a
-row-major step, a proposed block. What they no longer are is three runtimes:
+They are three algorithms, because they *are* three — a token, a row-major step,
+a proposed block. Only the first is currently driven by the interpreter.
 
-1. **single-token** — a body naming `autoregressive-decode` + `token-policy`.
-   The interpreter drives the loop; the decode core executes the two nodes.
-2. **continuous-row batch** — the same body with the decode step advancing N
-   rows. The interpreter's `Loop` already resolves per-row liveness through
-   `continue_when`, so the row vector is the predicate.
-3. **speculative block** — a body authoring proposer and verifier components,
-   with the acceptance step declared as `onnx-genai.speculative-verifier`. The
-   interpreter invokes what the body names.
+1. **single-token — landed.** A body naming `autoregressive-decode` +
+   `token-policy`. The interpreter drives the loop; the decode core executes the
+   two nodes. `authored_body_selects_executor.rs` measures the selection.
+2. **continuous-row batch — not yet.** `batched.rs` owns its iteration. The
+   interpreter's `Loop` already resolves per-row liveness through
+   `continue_when`, so the row vector *can* be the predicate; what is missing is
+   a decode executor that advances N rows behind a declared contract, and a
+   package that authors one.
+3. **speculative block — partly.** A composite package that authors its
+   proposer, verifier and acceptance components is driven by the interpreter
+   today (the `speculative` fixture, and the chained driver on `gemma4_chained`).
+   The ORT draft-model loop in `speculative/mod.rs` and the native driver in
+   `native_speculative.rs` are **not**: they are selected by a *request option*
+   (`speculative_mode`, `num_speculative_tokens`) and own their own iteration.
+
+For 2 and 3 the remaining work is the same shape: express the step as a declared
+contract, register an executor for it, and let the interpreter's `Loop` own the
+iteration — exactly what the single-token case now does. Neither is a second
+*runtime*; both are second *loops*, and the difference matters because a second
+loop can be moved without changing what a package declares.
 
 ## The scheduler's per-token drive runs the same loop
 
@@ -161,7 +190,7 @@ records what replaced them.
 
 ```
                          ┌───────────────────────────────────────────┐
-   from_pretrained  ───► │  canonical single-decoder WorkflowSpec      │  synthesized (Phase 2)
+   from_pretrained  ───► │  the package's declared WorkflowSpec        │  read, never synthesized
    (plain decoder)       │  (Loop{ decode }, state cells, emit tokens) │
                          └───────────────────┬─────────────────────────┘
    from_dir ─────────────────────────────►│  (authored workflow package)
@@ -271,14 +300,13 @@ that constructs and runs a canonical workflow.
   stays the single implementation. Backend executors stay `DecodeLoopBackend`
   (ORT) / native. §7 records the landed shape.
 
-- **Phase 2 — a single decoder *is* a workflow — LANDED (superseding option A).**
-  Option A compiled `model.io` into a `WorkflowSpec` in memory at load. That was
-  ratified and shipped, then superseded: keeping a second serialized way to
-  state a graph ABI meant keeping a compiler, a fallback and a provenance
-  distinction for it. `model.io` is now **deleted from the schema**, every
-  package declares `pipeline.workflow`, and one carrying the retired block is
-  refused at load with an error naming the offline `migrate_model_io`
-  conversion. §7 records the landed shape.
+- **Phase 2 — a single decoder *is* a workflow — LANDED.** An earlier plan
+  compiled `model.io` into a `WorkflowSpec` in memory at load. It was superseded:
+  keeping a second serialized way to state a graph ABI meant keeping a compiler,
+  a fallback and a provenance distinction for it. `model.io` is **deleted from
+  the schema**, every package declares `pipeline.workflow`, and one carrying the
+  retired block is refused at load with an error naming the offline
+  `migrate_model_io` conversion. No lowering runs at load.
 
 - **Phase 3 — migrate callers to the sole runtime — LANDED.** Point server, CLI, bench,
   C ABI (`onnx-genai-capi`), and Python (`onnx-genai-python`) at the workflow
@@ -339,21 +367,6 @@ touched, so a reviewer can check the claim rather than take it.
   `finish_reason_after_token`, `commit_selected_token` — the one sampling /
   stopping / commit policy, unchanged and still the only one.
 
-**Phase 2 — canonical lowering (option A: in memory, never serialized).**
-- New: `crates/onnx-genai-metadata/src/canonical.rs` — lowers
-  `decode/metadata.rs::ModelIoSpec` / `engine/metadata.rs` introspection into a
-  canonical `WorkflowSpec`. It emits canonical YAML and re-parses it through
-  the *unrelaxed* schema, so a lowering that the schema would reject fails at
-  load rather than producing a second, weaker answer.
-- `crates/onnx-genai-engine/src/engine/load.rs`: `install_canonical_workflow`
-  runs at load for every decoder package and asserts the lowered spec declares
-  the contracts this runtime implements.
-- The capability gap that made a *serialized* synthesis unworkable — no
-  workflow representation for paged KV, the batch scheduler, sessions, FIM,
-  connector KV, or the rich Rust sampler — is what option A avoids: the
-  canonical spec names the decode and policy contracts, and the Rust
-  implementations behind those contracts keep every capability.
-
 **Phase 3 — migrate callers.**
 - One public runtime type. `PipelineEngine` is deleted; the workflow interpreter
   is `pub(crate) pipeline::WorkflowRuntime`, held by `Engine`.
@@ -373,25 +386,27 @@ touched, so a reviewer can check the claim rather than take it.
 - Pinned by `crates/onnx-genai-engine/tests/one_runtime_e2e.rs` (5 cases).
 
 **Phase 4 — delete the superseded orchestration.**
-- `crates/onnx-genai-engine/src/engine/runtime.rs`: every decode entry point —
-  `generate_with_callbacks`, `generate_in_session_with_priority_and_callback`,
-  `prepare_active_generate` / `step_active_generate` (the scheduler's
-  prioritized drive), and both native paths — resolves the canonical workflow
-  through the shared `canonical_workflow` accessor before it can decode, and
-  then runs the canonical body. There is no declaration switch left to choose a
-  legacy path with; `canonical_execution_parity.rs` pins the refusal.
-- `crates/onnx-genai-engine/src/session.rs`: `ActiveGenerate` carries the
-  resolved `CanonicalBody`, so the prioritized drive is the same body as the
-  run-to-completion loop rather than a parallel implementation of it.
+- `crates/onnx-genai-engine/src/engine/runtime.rs`: the runtime guard every
+  decode entry point used to call is **gone**, because the state it checked for
+  is no longer representable. `Engine` holds one non-optional interpreter, and
+  `Engine::declared_workflow` refuses a package declaring no workflow before an
+  engine exists — so there is nothing downstream to check.
+- `crates/onnx-genai-engine/src/session.rs`: `ActiveGenerate` carries a
+  `WorkflowGenerationCursor`, so the prioritized drive advances the *same*
+  declared loop the run-to-completion path drives, one iteration per call.
 
-**Every token-producing entry point is held to the canonical precondition.**
-Not just the single-row ones. `batched.rs::generate_batched_static` and
-`continuous_batch_manager` (the single admission point for both continuous-batch
-entry points) resolve `canonical_workflow(..)` before they can decode, as do the
-two native paths — and all four native/batched guards run *before* scheduler
-admission, so a refusal never consumes a slot or disturbs session state.
-`canonical_execution_parity` pins the refusal for the four single-row entry
-points and for batched generation.
+**The pre-admission ordering property is preserved by construction.** A refusal
+must never consume a scheduler slot or mutate session state. That used to be a
+property of where the workflow guard was placed; it is now a property of what
+can fail at all. In `generate_in_session_with_priority_and_callback` the
+executor question, option validation, EOS defaults, prompt tokenization, session
+existence and the processor chain all resolve before
+`admit_generate_request_with_scheduler`; in `prepare_active_generate` the
+cursor — which binds the request and runs the loop's setup, and is where an
+unexecutable package fails — is built before both `sessions.remove` and
+`enqueue_generate_request`. The batched routes keep an explicit precondition at
+their single admission point, because "this package's declared loop is not a
+row-major batch" is a real refusal rather than an unreachable one.
 
 **Two loops remain, and they are not duplicates.**
 `batched.rs` (N rows advancing together) and the speculative

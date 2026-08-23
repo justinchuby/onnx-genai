@@ -267,8 +267,8 @@ pub(crate) struct WorkflowRunTelemetry {
     emit_timestamps_ns: Vec<u128>,
     max_iterations_only: bool,
     loop_iterations: u64,
-    /// Whether the outermost generation loop ended because its liveness
-    /// predicate went false, rather than because it exhausted its bound.
+    /// Whether the loop that produces the package's token stream ended because
+    /// its liveness predicate went false, rather than exhausting its bound.
     ///
     /// This is *why generation stopped*, and it is only knowable here: the loop
     /// is the thing that decided. Without it a caller has to guess, and the
@@ -5343,6 +5343,21 @@ pub(crate) struct WorkflowLoopPlan<'n> {
     pub(crate) carried: &'n [onnx_genai_metadata::WorkflowLoopCarry],
 }
 
+/// Whether this loop body publishes the package's token stream.
+///
+/// The question is answered from the workflow: a loop is the generation loop
+/// when it emits into an output the package declares with `role: tokens`. A
+/// package with several loops has exactly one such loop, and a package with
+/// none — an image pipeline — has no generation stop to report.
+fn loop_emits_generation_tokens(body: &WorkflowNode, workflow: &WorkflowSpec) -> bool {
+    workflow_emitted_outputs(body).iter().any(|output| {
+        workflow
+            .outputs
+            .get(output)
+            .is_some_and(|declared| declared.role == WorkflowOutputRole::Tokens)
+    })
+}
+
 /// Release the loop's induction value once no iteration can read it.
 pub(crate) fn end_workflow_loop(plan: &WorkflowLoopPlan<'_>, values: &mut PipelineTensors) {
     if let Some(iteration) = plan.iteration {
@@ -5462,6 +5477,7 @@ impl WorkflowRuntime {
             ..
         } = plan;
         let carried = *carried;
+        let emits_generation_tokens = loop_emits_generation_tokens(body, workflow);
         // Skipping the liveness read is an optimization for a predicate the
         // caller said it does not care about: with `stop_on_eos` off, an
         // in-graph EOS predicate cannot end the loop, so reading it every step
@@ -5482,10 +5498,18 @@ impl WorkflowRuntime {
             workflow_bool_rows(values, continue_when)?
         };
         if !active_rows.iter().any(|active| *active) {
-            // The loop stopped because the model said it was done,
-            // not because it ran out of budget. Recording which is
-            // the only way a caller can report the real reason.
-            telemetry.loop_ended_by_predicate = true;
+            // The loop stopped because the model said it was done, not because
+            // it ran out of budget. Recording which is the only way a caller
+            // can report the real reason.
+            //
+            // Recorded only for the loop that emits the token stream. A
+            // workflow may declare several — a denoise loop beside a generation
+            // loop, or an inner loop within one — and any of them ending by its
+            // own predicate would otherwise latch this and make a generation
+            // that exhausted its budget report EOS.
+            if emits_generation_tokens {
+                telemetry.loop_ended_by_predicate = true;
+            }
             return Ok(false);
         }
         telemetry.loop_iterations += 1;

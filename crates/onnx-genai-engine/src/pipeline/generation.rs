@@ -282,7 +282,7 @@ fn validate_runtime_managed_values(
 pub(crate) fn host_supplied_inputs(workflow: &WorkflowSpec, hosted: &[&str]) -> HashSet<String> {
     let mut consumers: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut visit = |steps: &[WorkflowStep]| {
-        for step in steps {
+        for step in walk_steps(steps) {
             if let WorkflowStep::Invoke {
                 component, inputs, ..
             } = step
@@ -304,12 +304,6 @@ pub(crate) fn host_supplied_inputs(workflow: &WorkflowSpec, hosted: &[&str]) -> 
         }
     };
     visit(&workflow.steps);
-    for step in &workflow.steps {
-        if let WorkflowStep::Loop { setup, steps, .. } = step {
-            visit(setup);
-            visit(steps);
-        }
-    }
     consumers
         .into_iter()
         .filter(|(_, (total, hosted))| *total > 0 && total == hosted)
@@ -739,18 +733,9 @@ fn assert_streams_agree(
 /// buffer, exactly as the package says it does.
 pub(crate) fn runtime_managed_seeds(workflow: &WorkflowSpec) -> HashSet<String> {
     let mut consumed = HashSet::new();
-    let mut visit = |steps: &[WorkflowStep]| {
-        for step in steps {
-            if let WorkflowStep::Invoke { inputs, .. } = step {
-                consumed.extend(inputs.values().cloned());
-            }
-        }
-    };
-    visit(&workflow.steps);
-    for step in &workflow.steps {
-        if let WorkflowStep::Loop { setup, steps, .. } = step {
-            visit(setup);
-            visit(steps);
+    for step in walk_steps(&workflow.steps) {
+        if let WorkflowStep::Invoke { inputs, .. } = step {
+            consumed.extend(inputs.values().cloned());
         }
     }
     let mut seeds: HashSet<String> = HashSet::new();
@@ -823,4 +808,37 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
         ),
         None,
     )
+}
+
+/// Every declared step, including the ones nested inside control flow.
+///
+/// A one-level walk misses `Branch` cases and loops within loops. For the
+/// consumer analyses above that is not cosmetic: an input a nested step reads
+/// would be classified as unconsumed, and an unconsumed runtime-managed seed is
+/// skipped at binding — so the pass fails mid-run with "references unavailable
+/// value" for a package that is perfectly well formed.
+fn walk_steps(steps: &[WorkflowStep]) -> Vec<&WorkflowStep> {
+    fn collect<'s>(steps: &'s [WorkflowStep], into: &mut Vec<&'s WorkflowStep>) {
+        for step in steps {
+            into.push(step);
+            match step {
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    collect(setup, into);
+                    collect(steps, into);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for case in cases.values() {
+                        collect(std::slice::from_ref(case), into);
+                    }
+                    if let Some(default) = default {
+                        collect(std::slice::from_ref(default.as_ref()), into);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut collected = Vec::new();
+    collect(steps, &mut collected);
+    collected
 }

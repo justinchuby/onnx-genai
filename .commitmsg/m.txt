@@ -1,69 +1,68 @@
-evidence(goldens): run the pinned packages against a clean main baseline
+fix(engine): address the independent review's blockers
 
-The previous `REAL_MODEL_EVIDENCE.md` was captured at `5a58eafa`, described a
-lowering step that no longer exists, and compared nothing to `main`. It has been
-replaced with a matrix produced by running one probe against two builds — a
-clean `origin/main@cb81745b0` worktree and this branch — on the same machine
-against the same bytes.
+An adversarial review of the branch found two correctness bugs, a latent one in
+unsafe code, and three places where the prose claimed more than the code does.
 
-**The load-bearing result.** `justinchuby/qwen3-0.6b-onnx-genai@a89c02d3` decodes
-16 greedy tokens byte-identically on both:
+**A session id was silently dropped for any request carrying tensors.**
+`run_generation` bound multimodal input into a fresh `PipelineGenerateRequest`,
+which starts with `session_id: None`, and then matched `(Some(bound), _)` —
+discarding the header. This branch is what made it reachable: removing the
+"sessions are not supported by pipeline models" refusals means a VLM package with
+`scope: session` state now *does* get sessions, and it would have run with none
+of them keyed, succeeded, and reported a permanently stale token count. Bound
+requests now carry the session.
 
-    3988,0,358,2776,773,12035,311,387,1588,0,358,2776,773,12035,311,387
+**An offset alias re-aliased to the wrong bytes.** `alias_with_offset` recorded
+its window in the pointer only, so `try_alias_clone` — which every carried value
+in the interpreter passes through — rebuilt the alias from shape alone and
+rebased it to the owner's *prefix*. Same shape, same dtype, another tensor's
+data, no error anywhere. `TensorBacking::Alias` now carries the element offset
+and re-aliasing reproduces the window; two cases cover the round trip and offset
+composition. Not yet reachable on this branch (narrowed values stay local to the
+proposal loop), which is exactly why it needed finding now.
 
-Those are not the same code path. `main` loaded this package from its
-`genai_config.json` and ran it on the fused decode core, *ignoring the
-`pipeline.workflow` it ships*; head reads the declared workflow — eleven ONNX
-components, an in-graph sampler, an in-graph termination predicate — and runs it
-through the interpreter. Same weights, different execution, same tokens.
+**`loop_ended_by_predicate` was a run-wide latch.** Any loop whose predicate went
+false set it, and `run_declared_generation` read it as `EosToken`. A workflow may
+declare several loops — the `video` and `tts` fixtures each declare two — so a
+denoise loop ending normally would make a generation that exhausted its budget
+report EOS. That is the same inversion the composite finish-reason work fixed,
+in the other direction. It is now recorded only for the loop that emits the
+package's `role: tokens` output.
 
-**Two packages `main` cannot run at all.**
-`onnx-genai-example-gemma4-e2b@b1189a9b` fails before generating
-(`cannot resolve decoder state from tensor shapes`) and
-`onnx-genai-example-gemma4-e2b-speculative@3e5d3b6a` fails to *load*
-(`declared kv_outputs port 'present.4.key' is not exposed by the graph`). Both
-load on head and open sessions. That is also why the composite paths have no
-baseline comparison: there is nothing on `main` that runs them.
+**The consumer analyses missed nested steps.** `runtime_managed_seeds` and
+`host_supplied_inputs` walked one level of `Loop` and never entered `Branch`
+cases. `runtime_managed_seeds` runs for *every* package, and a seed it wrongly
+classifies as unconsumed is skipped at binding — so a branch-heavy composite
+package with a runtime-managed cell seeded from inside a case would have failed
+mid-run with "references unavailable value". Both now walk every declared step.
 
-**Two behaviour changes, reported rather than summarised away.** Seeded sampling
-differs, because head uses the sampler the package declares instead of
-substituting the runtime's. And multi-turn continuation is *lost* for
-`qwen3_0_6b`: `main` carried KV across turns through the decode core, head
-executes the package as declared and its workflow declares no `scope: session`
-state, so each turn is independent and `prefix_cache_hit_len` is honestly `0`.
-That is a real regression for this package, called out as one, with both possible
-fixes named and neither taken here.
+**Three overclaims corrected.**
 
-**Two defects the pinned packages found, fixed here.** `generate_in_session` on a
-package with no decode core reached `require_tokenizer()` and failed, because
-only the `_with_callbacks` wrapper had been routed to the interpreted session
-path — every variant now routes through the same place. And a text prompt against
-a package declaring a `prompt_tokens` input was refused with "use a tokenizer
-adapter for text" *even when the package shipped `tokenizer.json`*; the runtime
-now encodes with the package's own tokenizer. Without that second fix, result one
-above could not have been measured at all.
+`WORKFLOW_RUNTIME_UNIFICATION.md` said, as landed, that *every* generated token
+comes from the interpreter. It does not: `speculative/mod.rs`,
+`native_speculative.rs` and `batched.rs` still own their iteration, and the
+continuous-batch driver is the server's default whenever more than one request is
+in flight. The status now says single-row generation is unified and names the two
+loops that are not, with what moving them requires. Its Phase 2 section still
+described the in-memory `model.io` lowering — the thing the invariant forbids —
+as current design, citing `canonical.rs` and `install_canonical_workflow`, neither
+of which exists; deleted. Phase 4 justified the pre-admission ordering property by
+citing a guard that was removed, so a reader could not verify it; it now states
+where the property actually comes from, which is that nothing downstream can fail.
 
-**A gap, stated.** Both Gemma4 packages declare `request.active`/`done`/
-`accepted_len` as required application inputs with no default, so
-`Engine::generate` with a bare prompt cannot seed them. Composite speculative
-generation at widths 1/2/4 against *those two packages* therefore has no
-measurement here, and the hermetic `gemma4_chained` fixture is not substituted
-for it — that fixture is covered separately, including the CUDA
-propose/verify/reject/rollback gate, and conflating the two would be the kind of
-evidence that reads as coverage without being it.
+`decoder_abi.rs` claimed `is_single_decoder_workflow` was "the one place this
+question is answered … the engine choosing an executor asks here". The engine
+asks a different question — whether the sole graph component declares the decode
+contract — and the two predicates differ on packages the emitter does not
+produce. Both comments now say what each actually decides.
 
-`capture_pinned.sh` prints `COVERED=`, writes `MISSING_DIR` for an absent package
-and the probe's error for a failing one, and has no allow-empty escape hatch: a
-corpus that quietly emptied would diff clean.
+The negative halves of `authored_body_selects_executor` asserted only an empty
+contract count, which a second generation drive would also satisfy. They now pair
+that with the interpreter's own component-invocation record, which a second drive
+would not produce.
 
-Also: the FIM streaming case asserted its headers arrived within 100 ms. That
-budget measures the machine, not the ordering property — it fails on a saturated
-box under `--test-threads=$(nproc)` while the request itself takes milliseconds.
-Measured end-to-end (load plus six 64-token generations) head is 115 ms against
-the baseline's 109 ms, so the budget is now two seconds, which still separates
-"after admission" from "after generation" by orders of magnitude.
-
-Verified: 241 server tests, engine suites, fmt, clippy `-D warnings`.
+Verified: engine, server, ort and metadata suites; all 12 `native_workflow_parity`
+cases on an H200; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>

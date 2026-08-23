@@ -136,10 +136,16 @@ pub fn sole_decoder_component(workflow: &WorkflowSpec) -> Option<&str> {
 
 /// Whether a workflow is a single-decoder package.
 ///
-/// The one place this question is answered. Every caller that needs to know
-/// whether a package is "just a decoder" — the engine choosing an executor, the
-/// CLI and server deciding whether to build multimodal input specs — asks here,
-/// so no two of them can reach different conclusions about the same package.
+/// Answers "does this workflow execute exactly one ONNX graph, and is that
+/// graph a decoder" from the component's declared *port roles*.
+///
+/// The CLI and server ask this when deciding whether to build multimodal input
+/// specs. The engine deliberately asks a different question — whether the sole
+/// graph component declares the `onnx-genai.autoregressive-decode` contract —
+/// because it is choosing an *executor* for a declared step, and a contract is
+/// what names a step. The two agree on every package the emitter produces,
+/// since it emits the roles and the contract together, but they are not the
+/// same predicate and nothing here pretends otherwise.
 ///
 /// # This is not the same question as [`sole_decoder_component`]
 ///

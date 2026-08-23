@@ -1583,8 +1583,16 @@ fn run_generation(
             }
         };
         match (bound, session_id) {
-            (Some(bound), _) => engine.generate_with_pipeline_callbacks(
-                bound,
+            // A request carrying tensors is still a request in a conversation.
+            // Dropping the session here would lose every `scope: session` cell
+            // the package declares — silently, since the generation still
+            // succeeds — which is exactly the multimodal multi-turn case
+            // sessions were opened up for.
+            (Some(bound), session) => engine.generate_with_pipeline_callbacks(
+                match session {
+                    Some(session) => bound.with_session_id(session.to_string()),
+                    None => bound,
+                },
                 Some(&mut admitted),
                 Some(&mut callback),
             ),

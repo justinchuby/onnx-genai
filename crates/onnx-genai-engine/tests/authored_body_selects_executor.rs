@@ -124,6 +124,11 @@ fn an_in_graph_body_selects_no_runtime_executor() -> anyhow::Result<()> {
          {:?}",
         engine.contract_executions()
     );
+    // An empty contract count on its own is satisfied by a *second* drive that
+    // counts nothing, so it is not evidence by itself. The component
+    // invocations are: they are recorded by the interpreter's own `Invoke`
+    // dispatch, so a non-empty set proves this package's tokens came out of
+    // `run_workflow_node` and not from somewhere else.
     // The decoder graph is invoked as a declared component; the sampler and
     // termination predicate this package also declares are fused into an
     // execution island, so they are reported there rather than individually.
@@ -166,6 +171,9 @@ fn a_speculative_body_selects_its_declared_components() -> anyhow::Result<()> {
         "this body names no runtime contract, so nothing may have been supplied: {:?}",
         engine.contract_executions()
     );
+    // As above: the positive half is what rules out a second drive. An empty
+    // contract count would also be produced by a loop that never reached the
+    // interpreter at all.
     // The proposer and verifier graphs are fused into an execution island, so
     // their work is reported there rather than as individual component stages;
     // the grammar adapters this package also declares are not fusible and show
@@ -240,8 +248,17 @@ fn three_bodies_select_three_executor_sets_through_one_entry_point() -> anyhow::
          invoked its graph as an ordinary component too: {:?}",
         single.2
     );
-    assert!(in_graph.1.is_empty() && !in_graph.2.is_empty());
-    assert!(chained.1.is_empty() && !chained.2.is_empty());
+    // Each negative case pairs its empty contract set with a *non-empty* set of
+    // interpreter-recorded component invocations. That pairing is what makes it
+    // evidence: a second generation drive would leave both empty.
+    assert!(
+        in_graph.1.is_empty() && !in_graph.2.is_empty(),
+        "the in-graph body ran no runtime contract and did run its own components: {in_graph:?}"
+    );
+    assert!(
+        chained.1.is_empty() && !chained.2.is_empty(),
+        "the speculative body ran no runtime contract and did run its own components: {chained:?}"
+    );
     assert_ne!(
         in_graph.2, chained.2,
         "two authored bodies naming different components must run different components"
