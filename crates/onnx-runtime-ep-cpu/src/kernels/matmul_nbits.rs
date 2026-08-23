@@ -19497,6 +19497,103 @@ mod tests {
         })
     }
 
+    /// Prefix of the stage breadcrumb a pool-building child leaves behind.
+    ///
+    /// A #1745 report says the child faulted and nothing else. The child's
+    /// stdout carries a result marker, so the log distinguishes "finished" from
+    /// "did not finish" -- but between process start and that one line the
+    /// child builds a pool, runs a kernel, encodes bytes and then tears the
+    /// pool down, and a fault anywhere in that span produces the same report.
+    /// "Crashed doing the work" and "crashed at exit after the work" are
+    /// different bugs with different fixes, and today's output cannot separate
+    /// them.
+    ///
+    /// It is worth being explicit that the missing detail was never *printed
+    /// and lost*, because that is the natural suspicion when a child dies on a
+    /// pipe. It is not what happens: Rust's stdout is a `LineWriter` on every
+    /// platform, so a newline-terminated `println!` has already reached the
+    /// pipe before the fault. Checked rather than assumed -- a child that
+    /// writes one newline-terminated line, one unterminated `print!` and one
+    /// flushed stderr line and then `abort()`s under `Command::output()`
+    /// delivers the first and the third and loses only the unterminated
+    /// fragment. So the gap is that nothing is emitted between "started" and
+    /// "produced the result", which is what these breadcrumbs fill.
+    ///
+    /// They go to **stderr**, and that is deliberate rather than stylistic.
+    /// Both readers of these children key on stdout *by content*:
+    /// [`is_environmental_access_violation_crash`] treats the result marker's
+    /// presence as "the child produced its result", and
+    /// [`parity_child_output_mode`] scans stdout lines for the parity payload.
+    /// Extra stdout lines are therefore a change to two lanes' red/green
+    /// semantics; extra stderr lines are not, provided they never contain
+    /// `panicked at` or `assertion`, which are the only two strings that
+    /// classifier reads out of stderr. That constraint is asserted in
+    /// [`a_stage_breadcrumb_is_invisible_to_the_crash_classifier`].
+    const CHILD_STAGE_MARKER: &str = "NXRT_CHILD_STAGE:";
+
+    /// Record how far a pool-building child got, so the next fault says where.
+    ///
+    /// Best-effort by construction, like [`record_environmental_retry`]: a
+    /// diagnostic must never be the thing that fails a test, so the write and
+    /// the flush both discard their errors.
+    fn record_child_stage(site: &str, stage: &str) {
+        use std::io::Write;
+        let mut err = std::io::stderr();
+        let _ = writeln!(err, "{}", child_stage_line(site, stage));
+        let _ = err.flush();
+    }
+
+    /// The exact text [`record_child_stage`] writes.
+    ///
+    /// Split out so the wording can be asserted against the crash classifier
+    /// without spawning anything: what matters about a breadcrumb is not only
+    /// that it is emitted but that emitting it does not reclassify the fault it
+    /// is describing.
+    fn child_stage_line(site: &str, stage: &str) -> String {
+        format!("{CHILD_STAGE_MARKER} site={site} stage={stage}")
+    }
+
+    /// Stop and join the process-wide decode pool before a child process exits.
+    ///
+    /// The pool lives in a module-level `static`, which Rust never `Drop`s, so
+    /// without this the child's workers are still spinning or parked on
+    /// `Arc<SharedState>` while the process tears itself down. On Windows that
+    /// is a genuine hazard rather than a tidiness point: `ExitProcess`
+    /// terminates every other thread at an arbitrary instruction, including one
+    /// holding a CRT or heap lock that exit-time cleanup then takes.
+    ///
+    /// This is not a new theory. [`affinity_defer_routing_child`] already ends
+    /// this way and its comment names the same `STATUS_ACCESS_VIOLATION` on
+    /// native Windows ARM64 as the reason. The two other children that build
+    /// the same pool -- the parity child and the realized-width child -- never
+    /// got the same treatment, and #1745 is reported against exactly those.
+    /// Applying the existing remedy to them is the cheapest way to find out
+    /// whether it is the same bug.
+    ///
+    /// A no-op for a child that built no pool, so the `off` parity arm pays
+    /// nothing.
+    ///
+    /// **Where to call it.** In the two children that never had a teardown it
+    /// goes *after* the result marker, so that a crash inside our own teardown
+    /// is reported rather than retried away -- a bug in this code is not a
+    /// flaky runner. That ordering is only load-bearing for the realized-width
+    /// child, whose parent runs
+    /// [`is_environmental_access_violation_crash`] and retries: with the marker
+    /// already on stdout the crash reads as non-environmental and spends no
+    /// retries. [`parity_child_output_mode`] has no retry at all -- it asserts
+    /// `status.success()` directly -- so its teardown crashes were always going
+    /// to be reported; the same ordering is used there for consistency rather
+    /// than because it changes the verdict.
+    /// [`affinity_defer_routing_child`] keeps its existing marker-last order:
+    /// flipping it would change the red/green semantics of a lane that is
+    /// currently green, on a platform this workspace cannot execute, to test a
+    /// hypothesis that is not yet confirmed. Its `pools-stopped` breadcrumb
+    /// answers the same question without touching the verdict.
+    fn quiesce_pools_for_child_exit(site: &str) {
+        crate::decode_spmd::shutdown_pools();
+        record_child_stage(site, "pools-stopped");
+    }
+
     /// Which persistence policy the SPMD parity child runs under.
     #[derive(Clone, Copy)]
     enum SpmdParityMode {
@@ -19577,6 +19674,79 @@ mod tests {
             .collect()
     }
 
+    /// Breadcrumbs must not change how a fault is classified.
+    ///
+    /// [`is_environmental_access_violation_crash`] reads exactly two strings
+    /// out of stderr -- `panicked at` and `assertion` -- and treats either as
+    /// "this was a real test failure, do not retry". A stage breadcrumb is
+    /// written to stderr by three children covered by that classifier, so
+    /// wording that happened to contain either token would silently convert an
+    /// environmental crash into a hard failure and spend the retry budget on
+    /// the wrong verdict. The property is about the text, so it is asserted on
+    /// the text.
+    #[test]
+    fn a_stage_breadcrumb_is_invisible_to_the_crash_classifier() {
+        let line = child_stage_line("spmd_parity", "pools-stopped");
+        assert!(
+            line.starts_with(CHILD_STAGE_MARKER),
+            "a breadcrumb has to be greppable in a CI log: {line}"
+        );
+        assert!(
+            !line.contains("panicked at") && !line.contains("assertion"),
+            "this breadcrumb reads as a panic to the crash classifier: {line}"
+        );
+        // The real check: the classifier's verdict on a crash whose stderr is
+        // nothing but breadcrumbs must equal its verdict on an empty stderr.
+        const MARKER: &str = "NXRT_TEST_RESULT";
+        const ACCESS_VIOLATION: i32 = -1_073_741_819;
+        let breadcrumbs = format!(
+            "{}\n{}\n",
+            child_stage_line("spmd_parity", "body-complete"),
+            child_stage_line("spmd_parity", "pools-stopped")
+        );
+        let verdict = |stderr: &str, stdout: &str| {
+            crate::test_support::is_environmental_access_violation_crash(
+                false,
+                Some(ACCESS_VIOLATION),
+                stdout,
+                stderr,
+                MARKER,
+            )
+        };
+        for (stdout, expected) in [("", true), (MARKER, false)] {
+            assert_eq!(
+                verdict(&breadcrumbs, stdout),
+                verdict("", stdout),
+                "breadcrumbs changed the verdict for stdout {stdout:?}"
+            );
+            assert_eq!(verdict(&breadcrumbs, stdout), expected);
+        }
+    }
+
+    /// Each site/stage pair has to be distinguishable in a log.
+    ///
+    /// The whole value of a breadcrumb is answering "which child, and how far
+    /// did it get" from a CI log carrying all three children's stderr
+    /// interleaved. A formatter that dropped either field would still be
+    /// greppable and would still pass the classifier test above while
+    /// answering neither question.
+    #[test]
+    fn a_stage_breadcrumb_names_both_the_site_and_the_stage() {
+        let line = child_stage_line("spmd_realized_width", "pools-stopped");
+        assert!(line.contains("site=spmd_realized_width"), "{line}");
+        assert!(line.contains("stage=pools-stopped"), "{line}");
+        assert_ne!(
+            child_stage_line("spmd_parity", "pools-stopped"),
+            child_stage_line("affinity_defer", "pools-stopped"),
+            "two different children produce the same breadcrumb"
+        );
+        assert_ne!(
+            child_stage_line("spmd_parity", "body-complete"),
+            child_stage_line("spmd_parity", "pools-stopped"),
+            "two different stages of one child produce the same breadcrumb"
+        );
+    }
+
     #[test]
     fn spmd_real_int4_parity_subprocess() {
         let _probe = lock_dispatch_probe();
@@ -19627,8 +19797,10 @@ mod tests {
                 }
             }
         }
+        record_child_stage("spmd_parity", "body-complete");
         let encoded: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         println!("{SPMD_PARITY_MARKER}{encoded}");
+        quiesce_pools_for_child_exit("spmd_parity");
     }
 
     #[test]
@@ -20110,6 +20282,7 @@ mod tests {
             u8::from(fully_pinned),
             u8::from(proc_ok)
         );
+        quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
@@ -21182,15 +21355,13 @@ mod tests {
             }
             other => panic!("unknown affinity-defer scenario `{other}`"),
         }
-        // Deterministically stop and join the persistent pool's workers before
-        // this child process exits. The pool lives in a module-level `static`,
-        // which Rust never `Drop`s at exit, so without this join the forced
-        // scenario's hot worker threads would still be spinning/parked on
-        // `Arc<SharedState>` while the process tears down its runtime -- the
-        // race that intermittently faulted this child with an empty-stderr
-        // `STATUS_ACCESS_VIOLATION` (0xC0000005) on native Windows ARM64. It is a
-        // no-op for the auto scenarios (they build no pool).
-        crate::decode_spmd::shutdown_pools();
+        record_child_stage("affinity_defer", "body-complete");
+        // Through the shared helper so all three pool-building children have one
+        // teardown path rather than one that was fixed and two that were not --
+        // which is how #1745 came to be reported against the other two. The
+        // order here (teardown, then marker) is this child's existing one and is
+        // deliberately left alone; see `quiesce_pools_for_child_exit`.
+        quiesce_pools_for_child_exit("affinity_defer");
         println!("{AFFINITY_DEFER_MARKER}ok");
     }
 
