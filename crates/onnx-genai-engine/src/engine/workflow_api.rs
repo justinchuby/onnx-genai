@@ -23,6 +23,35 @@ use crate::pipeline::{
 };
 
 impl Engine {
+    /// How many nodes this runtime executed through each declared contract.
+    ///
+    /// Which algorithmic executor ran is decided by the contract a component
+    /// declares, and this is the count that proves it: a package whose loop
+    /// body names the autoregressive-decode step routes its nodes there, and a
+    /// package whose body names none routes nothing there and runs its
+    /// components from their own artifacts instead.
+    pub fn contract_executions(&self) -> std::collections::BTreeMap<String, u64> {
+        self.workflow.contract_executions()
+    }
+
+    /// How many times each declared component was invoked.
+    ///
+    /// The other half of the same question: a body that authors its sampler as
+    /// an ONNX component shows that component's invocations here and no
+    /// contract executions at all.
+    pub fn component_invocations(&self) -> std::collections::BTreeMap<String, u64> {
+        self.workflow
+            .workflow_performance_diagnostic()
+            .last_stage_runs
+            .into_iter()
+            .filter_map(|(stage, runs)| {
+                stage
+                    .strip_prefix("component:")
+                    .map(|component| (component.to_string(), runs))
+            })
+            .collect()
+    }
+
     /// How many components the package's declared workflow names.
     ///
     /// A fact about the serialized document, for diagnostics. Nothing branches

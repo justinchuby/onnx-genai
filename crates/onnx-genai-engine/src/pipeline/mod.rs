@@ -172,6 +172,15 @@ pub(crate) struct WorkflowRuntime {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    /// Nodes this runtime executed through a declared contract, by contract id.
+    ///
+    /// Selection of an algorithmic executor is supposed to come from what the
+    /// workflow *authors*, and a claim like that is worth nothing unless
+    /// something counts it. A test can assert that a package whose body names
+    /// one contract routed its nodes there and nowhere else, which is a
+    /// statement about the interpreter's dispatch rather than about which
+    /// function a caller happened to call.
+    contract_executions: RefCell<std::collections::BTreeMap<String, u64>>,
     adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
     adapter_cache: RefCell<adapters::AdapterCache>,
     active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
@@ -368,6 +377,7 @@ impl WorkflowRuntime {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            contract_executions: RefCell::new(std::collections::BTreeMap::new()),
             adapter_service: None,
             adapter_cache: RefCell::new(adapters::AdapterCache::default()),
             active_adapter_context: RefCell::new(None),
@@ -715,6 +725,7 @@ impl WorkflowRuntime {
                 workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
+                contract_executions: RefCell::new(std::collections::BTreeMap::new()),
                 adapter_service: directory.adapters,
                 adapter_cache: RefCell::new(adapters::AdapterCache::default()),
                 active_adapter_context: RefCell::new(None),
@@ -758,6 +769,20 @@ impl WorkflowRuntime {
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
         &self.workflow
+    }
+
+    /// How many nodes this runtime executed per declared contract.
+    pub fn contract_executions(&self) -> std::collections::BTreeMap<String, u64> {
+        self.contract_executions.borrow().clone()
+    }
+
+    /// Record one node executed through a declared contract.
+    pub(crate) fn record_contract_execution(&self, contract: &str) {
+        *self
+            .contract_executions
+            .borrow_mut()
+            .entry(contract.to_string())
+            .or_default() += 1;
     }
 
     /// Drop every session-scoped cell a conversation accumulated.

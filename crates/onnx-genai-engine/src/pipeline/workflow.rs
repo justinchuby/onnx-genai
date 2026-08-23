@@ -1249,6 +1249,7 @@ impl WorkflowRuntime {
                                  '{contract}', which the running host lists as implemented but \
                                  then declined to execute"
                             );
+                            self.record_contract_execution(contract);
                             telemetry.record_stage(
                                 component.clone(),
                                 stage_started.elapsed().as_nanos(),
@@ -1356,13 +1357,17 @@ impl WorkflowRuntime {
                         let contract = declaration.contract.as_ref().map(|c| c.id.as_str());
                         let handled = match (contract, host.as_deref_mut()) {
                             (Some(contract), Some(host)) => {
-                                host.execute_contract_node(WorkflowNodeRequest {
+                                let handled = host.execute_contract_node(WorkflowNodeRequest {
                                     contract,
                                     component,
                                     inputs,
                                     outputs,
                                     values,
-                                })?
+                                })?;
+                                if handled {
+                                    self.record_contract_execution(contract);
+                                }
+                                handled
                             }
                             _ => false,
                         };

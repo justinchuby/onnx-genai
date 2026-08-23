@@ -3814,3 +3814,50 @@ async fn mutating_commands_are_still_deferred() {
         "a command requiring &mut Engine must stay deferred"
     );
 }
+
+/// Sessions work for a package whose components the interpreter invokes.
+///
+/// `/v1/sessions` used to reject these outright, on the grounds that they own
+/// no decode-core KV sequence. That conflated two different things: a session
+/// is the conversation a client is having, and where the runtime keeps it —
+/// a paged KV sequence, or the `scope: session` cells the workflow declares —
+/// is not something a client can act on. A client that opened a session against
+/// one package and got a 400 against another would have to know which kind it
+/// was talking to, which is exactly the caller-side split this removes.
+#[tokio::test]
+async fn sessions_open_and_close_for_an_interpreted_package() {
+    let state = speech_state_from("speech_wav", "workflow-sessions");
+    let router = app(state);
+
+    let created = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        created.status(),
+        StatusCode::OK,
+        "a package the interpreter drives still has conversations"
+    );
+    let created: Value =
+        serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let id = created["id"].as_str().expect("session id").to_string();
+
+    let deleted = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+}

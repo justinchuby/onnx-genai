@@ -45,7 +45,7 @@ did not share an implementation:
    One token loop plus the `DecodeLoopBackend` trait own single-row decode, and
    both `SessionDecodeLoopBackend` (ORT) and `NativeLoopAdapter` (native)
    implement it. (That loop was `decode_loop.rs::run_decode_loop` when this was
-   written; it is now `pipeline::canonical_decode`, which reads its body from
+   written; it is now the interpreter's `Loop` node, which reads its body from
    the canonical workflow — see
    [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md).) Sampling, stopping, constraint
    application and KV commit have one authoritative home
@@ -228,7 +228,7 @@ invariants are observable through a per-backend run counter.
   per step is a perf follow-up, not a correctness gap.
 * **Follow-up boundary B — specialized AR executor. DONE**, in the form
   described by [`WORKFLOW_RUNTIME_UNIFICATION.md`](WORKFLOW_RUNTIME_UNIFICATION.md):
-  the canonical single-decoder `Loop` is read by `pipeline::canonical_decode`,
+  the single-decoder `Loop` is walked by `pipeline::workflow::run_workflow_node`,
   which dispatches by contract id to `NativeDecodeSession` / the ORT backend as
   specialized component executors (device sampling fast paths, in-place KV)
   instead of re-entering the generic interpreter per token. Correctness was

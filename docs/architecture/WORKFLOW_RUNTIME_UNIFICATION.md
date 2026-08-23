@@ -1,25 +1,83 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **Option A is implemented.** One public runtime type; no caller
-dispatches on package shape; a single decoder *declares* a canonical
-`WorkflowSpec` like every other package and **every
-single-row autoregressive request executes that workflow** through
-`pipeline::canonical_decode::run_canonical_decode`, which reads its loop body
-from the spec and dispatches by contract id. The second token loop
-(`run_decode_loop`) and its per-step twin (`step_decode_loop`) are deleted. §6
-and §7 record what landed, and the two loops that remain because they are
-different algorithms rather than duplicates. The parent ratified REPLACE + DELETE (no
-compatibility facade, no permanent delegator) and assigned this consolidation to
-the owner of PR #1723. Its two gate conditions are both satisfied: `#1716` is on
-`main` (`7b79b3f5`), merged here (never rebased), and the hermetic executable
-chained fixture is committed. This document is the authoritative plan for
-collapsing the two execution engines (`Engine` text-generation and
-`PipelineEngine` workflow) into **one** canonical `pipeline.workflow` runtime
-with a single state/session model, a single sampling/stopping/decode policy, and
-ORT/native backend executors beneath it. It supersedes the "staged follow-up
-boundaries" framing in
-[`NATIVE_WORKFLOW_BACKEND.md`](NATIVE_WORKFLOW_BACKEND.md), which introduced the
-backend-neutral component seam this plan builds on.
+Status: **landed.** There is one runtime type, one interpreter, and one drive.
+Every package — a bare decoder, a composite pipeline, a speculative block —
+serializes `pipeline.workflow`, and every generated token comes out of
+`pipeline::workflow::run_workflow_node` walking that document: the iteration
+bound, the liveness predicate, the carried state, the emit that publishes the
+token stream, and the stop are read from the package, not supplied by a Rust
+loop written beside it.
+
+**What varies between packages is which executor implements a declared node,
+and that is answered by the contract the node names.** A component declaring
+`onnx-genai.autoregressive-decode` is run by the fused decode session — paged
+KV, the device sampling fast paths, the captured CUDA graph — when this runtime
+holds one, and invoked from its own ONNX artifact when it does not. A component
+declaring `onnx-genai.token-policy` is run by the single sampling/stopping
+implementation. A component declaring neither is invoked generically. No code
+asks what *kind* of package it holds; `Engine::holds_decode_core()` asks only
+whether this process has the fused session, which is a question about a
+resource.
+
+`crates/onnx-genai-engine/tests/authored_body_selects_executor.rs` measures
+this rather than asserting it: three packages declaring three different loop
+bodies are driven through one entry point, and the per-contract execution
+counter recorded inside the interpreter's node dispatch shows each one selecting
+a different executor set. A package whose sampler and termination predicate are
+ONNX components shows **zero** contract executions — if that ever became
+non-zero, the runtime would be supplying a step the package declared a graph
+for.
+
+`crates/onnx-genai-engine/tests/shape_dispatch_gate.rs` keeps the removed
+vocabulary out. `lowered_workflow`, `canonical_decode`, `WorkflowShape` and
+`is_workflow` no longer exist anywhere in the tree; the gate's allowance is
+empty but for the gate itself, and it may only shrink.
+
+## What is gone
+
+| removed | why |
+|---|---|
+| `pipeline/canonical_decode.rs` | the loop it owned is the interpreter's `Loop` node |
+| `Engine::lowered_workflow` | one non-optional `WorkflowRuntime`, so there is no second field a workflow could be in |
+| `canonical_workflow()` and its nine guard call sites | the state they guarded against is unrepresentable |
+| `WorkflowShape` / `declared_workflow_shape` | the loader asks which executor covers the declared decode step, not what shape the package is |
+| `is_workflow()`, `workflow_shape()`, `WorkflowShapeReport` | a caller has nothing to do differently, so a question whose answer distinguished packages existed only to be branched on |
+| `from_pipeline_dir*`, `generate_pipeline_with_callback(s)`, `workflow_generate` | one constructor family, one generate |
+| server `start_pipeline` / `run_pipeline_driver` / `GeneratePipeline` | one driver, one generation command carrying an optional session and optional bound tensors |
+| CLI `Backend::{Text,Pipeline}` | one backend holding the contracts a package declares |
+
+## The three loop algorithms
+
+They remain three algorithms, because they *are* three algorithms — a token, a
+row-major step, a proposed block. What they no longer are is three runtimes:
+
+1. **single-token** — a body naming `autoregressive-decode` + `token-policy`.
+   The interpreter drives the loop; the decode core executes the two nodes.
+2. **continuous-row batch** — the same body with the decode step advancing N
+   rows. The interpreter's `Loop` already resolves per-row liveness through
+   `continue_when`, so the row vector is the predicate.
+3. **speculative block** — a body authoring proposer and verifier components,
+   with the acceptance step declared as `onnx-genai.speculative-verifier`. The
+   interpreter invokes what the body names.
+
+## The scheduler's per-token drive runs the same loop
+
+A prioritized request is advanced one token at a time, so it cannot call a
+function that loops to completion. The loop's phases are therefore
+`begin_workflow_loop` / `advance_workflow_loop` / `end_workflow_loop`, driven in
+a `for` by `run_workflow_node` and one iteration per call by
+`WorkflowGenerationCursor`. One statement of the semantics, two ways to drive
+it — a second walker is exactly what could disagree.
+
+## Sessions
+
+A session is the conversation a client is having. Where the runtime keeps it — a
+paged KV sequence, or the `scope: session` cells a workflow declares — is not
+something a client can act on, so `create_session` / `session_token_count` /
+`close_session` and the HTTP `X-Session-Id` header mean the same thing for every
+package.
+
+---
 
 **The chained-proposer contract, as executed.** The Phase-1 driver reads every
 field it needs from `speculative.proposal_execution` and never infers by
@@ -106,7 +164,7 @@ records what replaced them.
    from_pretrained  ───► │  canonical single-decoder WorkflowSpec      │  synthesized (Phase 2)
    (plain decoder)       │  (Loop{ decode }, state cells, emit tokens) │
                          └───────────────────┬─────────────────────────┘
-   from_pipeline_dir ───────────────────────►│  (authored workflow package)
+   from_dir ─────────────────────────────►│  (authored workflow package)
                                              ▼
                     ┌────────────────────────────────────────────────┐
                     │  ONE workflow compiler + interpreter            │  pipeline/workflow.rs
@@ -117,7 +175,7 @@ records what replaced them.
                     (single pass,    │               │node (Phase 1)
                      diffusion, VLM) │               ▼
                                      │   ┌───────────────────────────────┐
-                                     │   │ ONE decode policy              │  canonical_decode.rs + decode_loop.rs
+                                     │   │ ONE decode policy              │  generation.rs + decode_loop.rs
                                      │   │ canonical body / sampling /    │  + processors.rs
                                      │   │ stopping / KV commit           │
                                      │   └───────────┬─────────────────────┘
@@ -205,7 +263,7 @@ that constructs and runs a canonical workflow.
   tokens on ORT, native-CPU, and device-resident native-CUDA (H200).
 
 - **Phase 1b — autoregressive decode beneath the interpreter — LANDED.**
-  The decode loop no longer hard-codes its own iteration: `canonical_decode.rs`
+  The decode loop no longer hard-codes its own iteration: `pipeline/generation.rs`
   reads the loop body out of the `WorkflowSpec` and dispatches each step by
   contract id (`onnx-genai.autoregressive-decode`,
   `onnx-genai.token-policy`), so the *spec* decides what runs and in what order,
@@ -263,13 +321,13 @@ and each carry their proof.
 Phases 1b-4 were code, not a plan. This is the surface each one actually
 touched, so a reviewer can check the claim rather than take it.
 
-**Phase 1b — canonical decode body.**
-- `crates/onnx-genai-engine/src/pipeline/canonical_decode.rs`: `resolve_body`
-  reads the loop body out of the `WorkflowSpec`; `BodyStep` is the resolved
-  form; `CanonicalBody::resolve` binds it once per request;
-  `step_canonical_body` runs one iteration; `run_canonical_decode` runs to
-  completion. Both drives call the same body, so there is no "run" versus
-  "step" policy.
+**Phase 1b — the declared loop, executed.**
+- `crates/onnx-genai-engine/src/pipeline/generation.rs`:
+  `validate_generation_workflow` refuses at load a loop this runtime would
+  silently override, naming the field; `GenerationNodeHost` is the decode
+  core as *node executors*, advancing exactly one declared node per call;
+  `run_declared_generation` is the one drive, with or without a core.
+  `pipeline/canonical_decode.rs` — which owned a loop of its own — is deleted.
 - `crates/onnx-genai-engine/src/decode_loop.rs`: `run_decode_loop` and
   `step_decode_loop` are **deleted**. What is left is the per-step split the
   canonical body is built from — `forward_step` (one forward pass, including
@@ -301,9 +359,10 @@ touched, so a reviewer can check the claim rather than take it.
   is `pub(crate) pipeline::WorkflowRuntime`, held by `Engine`.
 - `Engine::from_dir` resolves the package shape itself, so no caller runs
   `PipelineModelDirectory::load_if_declared` and picks a constructor.
-- `crates/onnx-genai-server/src/driver.rs`: `EngineBackend::{Single,Pipeline}` is
-  one owned runtime; `run_engine_driver` asks `engine.is_workflow()`.
-  `EngineDriver::warmup` no longer takes a caller-supplied `pipeline: bool`.
+- `crates/onnx-genai-server/src/driver.rs`: one `DriverCommand::Generate`
+  carrying an optional session and optional bound tensors, one
+  `run_generation`, and one `run_engine_driver` whose only question is whether
+  the decode path reports it can batch — a capability, not a package kind.
 - `crates/onnx-genai-server/src/routes/completions.rs`: the four
   `if handle.pipeline` branches are one `submit_generation` call. `sessions.rs`
   and `admin.rs` ask the runtime. `ModelHandle::pipeline` is deleted.
@@ -381,23 +440,31 @@ differently.
 word for buffers the runtime owns. Paged, shared-buffer and CUDA-graph KV stay
 device-resident; nothing round-trips through the interpreter as an SSA value.
 
-**Two executors, one representation.** `WorkflowShape` picks the fused decode
-session for a single decoder and the generic interpreter for a composite
-package. That is a backend choice *beneath* the declared workflow — the same
-kind of choice as ORT versus native — not a second runtime beside it, and not a
-mode a caller can select.
+**One representation, executors chosen by contract.** A component declaring
+`onnx-genai.autoregressive-decode` is run by the fused decode session when this
+runtime holds one and invoked from its own artifact when it does not. That is a
+backend choice *beneath* the declared workflow — the same kind of choice as ORT
+versus native — not a second runtime beside it, and not a mode a caller can
+select. `Engine::holds_decode_core()` asks whether the session exists, never
+what kind of package was loaded.
 
-**Fail-closed, not mode-switched.** Every decode entry point resolves the
-package's workflow through the shared `canonical_workflow` accessor before it
-can decode, and all four native/batched guards run before scheduler admission so
-a refusal never consumes a slot. There is no declaration switch left to choose a
-legacy path with.
+**Fail-closed by construction, not by guard.** `Engine` holds one non-optional
+interpreter and the loader refuses a package that declares no workflow, so the
+state the old `canonical_workflow` guards checked for is unrepresentable. The
+batched routes keep an explicit precondition at their single admission point,
+before a scheduler slot is taken, because "this package's declared loop is not a
+row-major batch" is a real refusal rather than an unreachable one.
 
 **Conversion is offline.** `migrate_model_io <package-dir>` rewrites a retired
 `model.io` block as the canonical workflow, reading the ONNX graph for real port
 contracts rather than guessing a state tensor's rank. It is deliberately not a
 load-time step: a runtime that repaired packages in memory would mean the
 package on disk said one thing and the runtime executed another.
+`migrate_model_io --reemit` rebuilds an already-converted package's workflow
+from the ABI its own workflow resolves — the direction
+`decoder_workflow_roundtrip` pins as exact — which is how the fourteen converted
+fixtures were brought forward when the emitter gained the decode contract and
+corrected the `sequence` cell's recurrence.
 
 ### Evidence
 
