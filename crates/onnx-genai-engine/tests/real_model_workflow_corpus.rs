@@ -71,25 +71,38 @@ fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/root"))
 }
 
-/// Fail a corpus case that covered nothing, unless the machine declares it has
-/// no corpus.
+/// Fail a corpus case that covered nothing while a corpus was present.
 ///
-/// A case that iterates an empty corpus and returns `Ok` reports success without
-/// checking anything — exactly the silent pass this suite's doc claims not to
-/// allow. A weightless machine must therefore opt out explicitly with
-/// `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1`, which turns a green run into a legible
-/// "covered nothing" rather than an indistinguishable pass.
+/// Two situations look identical from inside the loop and are not the same
+/// thing:
+///
+/// * **Packages are installed and none was covered.** Every one of them failed
+///   to load, or the case skipped them all. Returning `Ok` there reports success
+///   without checking anything — the silent pass this suite exists to prevent.
+/// * **This machine has no corpus.** A CI runner has no multi-gigabyte model
+///   directories and never will. There is nothing to check and nothing wrong.
+///
+/// They are distinguished by asking whether any candidate directory exists,
+/// which is a fact about the machine rather than an environment variable a run
+/// can set to silence a real failure. The weightless case prints what it did
+/// not cover, so a green run stays legible instead of merely quiet.
 fn require_corpus_coverage(case: &str, covered: usize) {
     if covered > 0 {
         return;
     }
+    let present = corpus()
+        .into_iter()
+        .filter(|(_, dir)| dir.is_dir())
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>();
     assert!(
-        std::env::var_os("ONNX_GENAI_ALLOW_EMPTY_CORPUS").is_some(),
-        "{case} covered no real packages. Install at least one corpus package (see \
-         corpus_inventory for the list this machine is missing), or set \
-         ONNX_GENAI_ALLOW_EMPTY_CORPUS=1 to acknowledge a weightless run."
+        present.is_empty(),
+        "{case} covered none of the {} corpus package(s) installed on this machine ({present:?}). \
+         Every one of them failed to load or was skipped, which is a failure rather than an \
+         absence.",
+        present.len()
     );
-    eprintln!("CANONICAL_CORPUS {case}: covered nothing (ONNX_GENAI_ALLOW_EMPTY_CORPUS set)");
+    eprintln!("CANONICAL_CORPUS {case}: this machine has no corpus package installed");
 }
 
 fn open(dir: &Path) -> Option<Engine> {
