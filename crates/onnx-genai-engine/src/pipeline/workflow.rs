@@ -1113,6 +1113,8 @@ pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<
             std::collections::HashSet::from([
                 onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
                 onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT,
+                onnx_genai_metadata::decoder_workflow::CONTINUOUS_BATCH_CONTRACT,
+                onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT,
             ])
         });
     &REGISTRY
@@ -5778,6 +5780,45 @@ impl WorkflowGenerationCursor {
             return Ok(Vec::new());
         };
         value.to_vec_i64().map_err(Into::into)
+    }
+
+    /// Tokens the loop emitted, per request-aligned row.
+    ///
+    /// A row-major body's emit writes one accumulator per row and no aggregate,
+    /// so reading the aggregate — or falling back to row 0 — would report one
+    /// row's stream as the whole batch's. This says what each row published, so
+    /// a caller can hold the declared emit against what its executor committed
+    /// *per row*, which is the only comparison that catches a row whose tokens
+    /// stopped reaching the stream.
+    pub(crate) fn emitted_token_rows(
+        &self,
+        runtime: &WorkflowRuntime,
+    ) -> anyhow::Result<Vec<Vec<i64>>> {
+        let Some(output) = runtime
+            .workflow
+            .outputs
+            .iter()
+            .find(|(_, output)| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens)
+            .map(|(name, _)| name.clone())
+        else {
+            return Ok(Vec::new());
+        };
+        let values = clone_pipeline_tensors(&self.values)?;
+        let outputs = runtime.package_outputs(values, self.telemetry.row_outputs.clone())?;
+        let rows = outputs.rows(&output);
+        if rows.is_empty() {
+            return Ok(outputs
+                .aggregate(&output)
+                .map(|value| value.to_vec_i64())
+                .transpose()?
+                .into_iter()
+                .collect());
+        }
+        let mut emitted = vec![Vec::new(); rows.iter().map(|(row, _)| row + 1).max().unwrap_or(0)];
+        for (row, value) in rows {
+            emitted[row] = value.to_vec_i64()?;
+        }
+        Ok(emitted)
     }
 }
 

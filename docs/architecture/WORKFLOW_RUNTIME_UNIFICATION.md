@@ -1,49 +1,135 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
-Status: **single-row generation is unified; two algorithms are not yet.**
+Status: **all three loop algorithms are interpreter-driven.**
 
 There is one runtime type, one interpreter and one drive. Every package
-serializes `pipeline.workflow`, and every **single-row** generated token comes
-out of `pipeline::workflow::run_workflow_node` walking that document: the
-iteration bound, the liveness predicate, the carried state, the emit that
-publishes the token stream and the stop are read from the package, not supplied
-by a Rust loop written beside it. That covers a bare decoder, a composite
-pipeline whose sampler is a graph, and the scheduler's per-token drive.
-
-**Two loops still own their own iteration and do not reach the interpreter**, and
-this document says so rather than rounding up:
-
-* `speculative/mod.rs::generate_speculative_loop` and
-  `native_speculative.rs::NativeSpeculativeDriver` — reached whenever a request
-  names `speculative_mode` / `num_speculative_tokens`, or an MTP head is loaded.
-* `batched.rs::generate_batched_static` and `ContinuousBatchManager` — reached by
-  the server's continuous-batch driver, which is the default whenever the decode
-  path reports it can batch and more than one request is in flight.
-
-Both take their bound and their stop from Rust, not from the workflow. §"The
-three loop algorithms" below describes what expressing them as declared steps
-requires. Until that lands, "every generated token comes from the interpreter" is
-true of the single-row path and false of these two.
+serializes `pipeline.workflow`, and every generated token comes out of
+`pipeline::workflow::run_workflow_node` walking that document: the iteration
+bound, the liveness predicate, the carried state, the emit that publishes the
+token stream and the stop are read from the package, not supplied by a Rust loop
+written beside it. That covers a bare decoder, a composite pipeline whose
+sampler is a graph, the scheduler's per-token drive, a continuous batch, and a
+speculative block.
 
 **What varies between packages is which executor implements a declared node,
 and that is answered by the contract the node names.** A component declaring
 `onnx-genai.autoregressive-decode` is run by the fused decode session — paged
-KV, the device sampling fast paths, the captured CUDA graph — when this runtime
-holds one, and invoked from its own ONNX artifact when it does not. A component
-declaring `onnx-genai.token-policy` is run by the single sampling/stopping
-implementation. A component declaring neither is invoked generically. No code
-asks what *kind* of package it holds; `Engine::holds_decode_core()` asks only
-whether this process has the fused session, which is a question about a
-resource.
+KV, the device sampling fast paths, the captured CUDA graph — when that
+component is the package's whole graph *and* this runtime holds such a session,
+and invoked from its own ONNX artifact when it is not (see §"Recognition is
+structural, and there is one of it" for the classification that answers the
+first half). A component declaring `onnx-genai.token-policy` is run by the
+single sampling/stopping implementation. A component declaring
+`onnx-genai.continuous-batch` is run by the row-major batch executor; one
+declaring `onnx-genai.speculative-block` by the propose-verify-accept executor.
+A component declaring none is invoked generically. No code asks what *kind* of
+package it holds; `Engine::holds_decode_core()` asks only whether this process
+has the fused session, which is a question about a resource, and
+`classify_workflow` answers the structural half from the workflow's declared
+port roles.
 
-`crates/onnx-genai-engine/tests/authored_body_selects_executor.rs` measures
-this rather than asserting it: three packages declaring three different loop
-bodies are driven through one entry point, and the per-contract execution
-counter recorded inside the interpreter's node dispatch shows each one selecting
-a different executor set. A package whose sampler and termination predicate are
-ONNX components shows **zero** contract executions — if that ever became
-non-zero, the runtime would be supplying a step the package declared a graph
-for.
+## The three loop algorithms, and how one is chosen
+
+They are three algorithms, because they *are* three — a token, a row-major step,
+a proposed block. All three are declared, and all three are driven by the
+interpreter's `Loop`.
+
+| authored body | contract the body's node names | executor |
+|---|---|---|
+| single token | `onnx-genai.autoregressive-decode` + `onnx-genai.token-policy` | the fused decode session and the token policy (`pipeline/generation.rs`) |
+| row-major batch | `onnx-genai.continuous-batch` | `ContinuousBatchManager` (`batched.rs`) |
+| proposal block | `onnx-genai.speculative-block` | `Engine::advance_speculative_block` (`speculative/mod.rs`) and `NativeSpeculativeDriver::advance_block` (`native_speculative.rs`) |
+
+The bodies are **authored**, not inferred.
+`onnx_genai_metadata::decoder_workflow::iteration_variant` re-authors a
+package's own declared generation loop into the body that names a given
+`IterationPolicy`: the bound, the liveness predicate, the carried cells, the
+termination and the emits stay byte-identical, and only the body's node changes.
+It lives in the same module that authors the single-token body, so the three
+cannot drift into three different statements of the same loop.
+
+A package that **authors its own** proposer, verifier and acceptance components
+— the `speculative` fixture, `gemma4_chained`, and the device-resident chained
+driver in `pipeline/speculative.rs` — is a fourth case only in the sense that it
+needs no re-authoring: its loop body already names the components it wants, so
+the interpreter invokes them directly and no runtime contract is involved.
+`onnx-genai.speculative-block` exists for the *other* case, where the package
+declares a plain decoder and the caller asks for speculation the runtime
+implements. The two never contend, and each half is pinned by the test that
+actually runs it: the `speculative` fixture shows zero contract executions in
+`authored_body_selects_executor.rs`, and the chained driver is exercised by
+`native_workflow_parity::chained_speculative_proposal_parity` and
+`gemma4_chained_workflow.rs`.
+
+`WorkflowRuntime::iteration_runtime(policy)` is the **single** place an
+iteration algorithm is selected, and it selects by naming a policy — never by
+inspecting a package's decode path, its file layout or its model identity. A
+variant interpreter is built on first use and cached; its body invokes binding
+components only, so it holds no models, no allocators and no governor, and
+building one costs a workflow compile rather than a load.
+
+What still varies by *deployment* is which decode **session** a batch runs on
+(ORT static-cache, ORT shared-buffer, the native CUDA persistent batch). That is
+a question about a resource this process holds, in the same family as
+`holds_decode_core()`, and it does not choose an algorithm: all three sessions
+implement `BatchedDecodeSession` and are driven by the one authored body.
+
+### Why the emit carries a length now
+
+A single-token iteration emits one token per row, so its emit needs no length.
+A batch row may sit out a step and a verified block may contribute several
+tokens, so a re-authored body emits a *prefix* whose per-row length is the
+step's declared `accepted_len`. That also makes the token output row-wise, which
+is what gives each row its own accumulated stream — and each row's stream is
+held against what the executor committed for that row when the pass ends
+(`ContinuousBatchManager::drain`, `generation::verify_emitted_tokens`), so the
+declared emit is load-bearing rather than decorative.
+
+### Why a batch publishes the batch's liveness, not each row's
+
+The interpreter reads a loop's predicate *before* the body runs and preserves an
+inactive row's carried state afterwards (`merge_inactive_rows`). A slot that
+published `false` therefore cannot come back within the pass — and a continuous
+batch **recycles slots**, so a per-slot bit would permanently retire a slot the
+scheduler is about to backfill, drop the backfilled request's tokens out of the
+declared stream, and end the pass while that request was still running. The
+batch publishes one liveness answer for every slot: *will this batch decode
+again?* The per-row question the emit needs — *did this slot contribute a token
+this iteration?* — is answered by `accepted_len`, which is zero for a slot that
+sat the step out.
+
+### Measured, not asserted
+
+`crates/onnx-genai-engine/tests/authored_body_selects_executor.rs` measures the
+original property: three packages declaring three different loop bodies are
+driven through one entry point, and the per-contract execution counter recorded
+inside the interpreter's node dispatch shows each one selecting a different
+executor set. A package whose sampler and termination predicate are ONNX
+components shows **zero** contract executions — if that ever became non-zero,
+the runtime would be supplying a step the package declared a graph for.
+
+`crates/onnx-genai-engine/tests/authored_iteration_executors.rs` measures the
+comparative half for the three *iteration algorithms*: the same runtime, driven
+as a single-token generation, a continuous batch and a speculative request,
+produces three **disjoint** contract sets. A batched generation that produced
+the right tokens would keep passing if Rust went back to picking the row-major
+loop from `ModelDecodePath::StaticCache`; a count against
+`onnx-genai.continuous-batch` cannot be produced by a shape `match`.
+
+`crates/onnx-genai-engine/tests/authored_iteration_e2e.rs` measures that the
+executors still do the job: a batched row stops on a declared end token that is
+**not** the first one listed, rows with different budgets finish independently,
+and a wider declared draft width proposes more candidates per block while the
+rejected suffix is rolled back rather than emitted — with the emitted stream
+byte-identical to plain greedy decoding.
+
+`batched.rs`'s scripted-decode unit tests run on the authored row-major body, so
+multi-EOS stops, per-row device/host sampling parity, priority admission and
+occupancy are exercised through the declared document.
+`a_slot_freed_into_an_empty_queue_is_reused_by_a_later_submission` pins the
+liveness rule above: with a per-slot bit it fails on the row-wise emit
+cross-check, which is the only place the failure is visible — the caller's event
+stream comes from the executor, not from the emit.
 
 `crates/onnx-genai-engine/tests/shape_dispatch_gate.rs` keeps the removed
 vocabulary out. `lowered_workflow`, `canonical_decode`, `WorkflowShape` and
@@ -62,32 +148,10 @@ empty but for the gate itself, and it may only shrink.
 | `from_pipeline_dir*`, `generate_pipeline_with_callback(s)`, `workflow_generate` | one constructor family, one generate |
 | server `start_pipeline` / `run_pipeline_driver` / `GeneratePipeline` | one driver, one generation command carrying an optional session and optional bound tensors |
 | CLI `Backend::{Text,Pipeline}` | one backend holding the contracts a package declares |
-
-## The three loop algorithms
-
-They are three algorithms, because they *are* three — a token, a row-major step,
-a proposed block. Only the first is currently driven by the interpreter.
-
-1. **single-token — landed.** A body naming `autoregressive-decode` +
-   `token-policy`. The interpreter drives the loop; the decode core executes the
-   two nodes. `authored_body_selects_executor.rs` measures the selection.
-2. **continuous-row batch — not yet.** `batched.rs` owns its iteration. The
-   interpreter's `Loop` already resolves per-row liveness through
-   `continue_when`, so the row vector *can* be the predicate; what is missing is
-   a decode executor that advances N rows behind a declared contract, and a
-   package that authors one.
-3. **speculative block — partly.** A composite package that authors its
-   proposer, verifier and acceptance components is driven by the interpreter
-   today (the `speculative` fixture, and the chained driver on `gemma4_chained`).
-   The ORT draft-model loop in `speculative/mod.rs` and the native driver in
-   `native_speculative.rs` are **not**: they are selected by a *request option*
-   (`speculative_mode`, `num_speculative_tokens`) and own their own iteration.
-
-For 2 and 3 the remaining work is the same shape: express the step as a declared
-contract, register an executor for it, and let the interpreter's `Loop` own the
-iteration — exactly what the single-token case now does. Neither is a second
-*runtime*; both are second *loops*, and the difference matters because a second
-loop can be moved without changing what a package declares.
+| `generate_batched_static`'s own row loop and token policy | a fixed batch is the continuous-batch algorithm with all-at-once admission, so it runs the same authored body |
+| `ContinuousBatchManager::step`'s hand-rolled iteration | one iteration of the authored loop, driven by `WorkflowGenerationCursor` |
+| `generate_speculative_loop`'s `loop { .. }` | `advance_speculative_block`, one declared node per call |
+| `NativeSpeculativeDriver::generate`'s `loop { .. }` | `advance_block`, reached through the same contract seam as the ORT block |
 
 ## The scheduler's per-token drive runs the same loop
 
@@ -448,18 +512,24 @@ unexecutable package fails — is built before both `sessions.remove` and
 their single admission point, because "this package's declared loop is not a
 row-major batch" is a real refusal rather than an unreachable one.
 
-**Two loops remain, and they are not duplicates.**
+**Two other algorithms remain, and they are declared steps, not loops.**
 `batched.rs` (N rows advancing together) and the speculative
 propose/verify/rollback block are *different algorithms*, not second copies of
-the single-row loop. Both call the same policy primitives
-(`select_next_token_with_rng`, `logprob_for_token`, `commit_selected_token`),
-so there is still exactly one sampling/stopping/commit implementation; what
-differs is the shape of the iteration, which is the thing that genuinely
-differs. `native_speculative.rs::NativeSpeculativeDriver` and the
-`SpeculativeProposer` implementations (`MtpProposer`, `Eagle3Proposer`,
-`DraftModelProposer`, `NgramProposer`) are proposal sources beneath that block;
-`Chained` is already interpreter-driven and is the template if the others are
-moved behind contracts later.
+the single-row loop — and each is now a node the interpreter dispatches by the
+contract its authored body names. Each advances exactly one iteration per call
+and holds nothing about the loop; the bound, the liveness predicate, the carried
+cells and the emits are the workflow's. All three call the same policy
+primitives (`select_next_token_with_rng`, `logprob_for_token`,
+`commit_selected_token`), so there is exactly one sampling/stopping/commit
+implementation; what differs is the shape of the iteration, which is the thing
+that genuinely differs.
+
+`native_speculative.rs::NativeSpeculativeDriver` and the `SpeculativeProposer`
+implementations (`MtpProposer`, `Eagle3Proposer`, `DraftModelProposer`,
+`NgramProposer`) are proposal sources beneath that block. The native driver
+implements the *same* `onnx-genai.speculative-block` contract as the ORT one, so
+the two are alternative implementations of one declared step rather than two
+loops; `Chained` remains interpreter-driven from its own authored components.
 
 Shared infrastructure both engines already used — `engine/load.rs`,
 `governor.rs`, `memory_strategy.rs`, `memory_plan.rs`, `metadata.rs`,

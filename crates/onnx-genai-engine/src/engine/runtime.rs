@@ -460,7 +460,17 @@ impl Engine {
             .as_ref()
             .context("this package declares no tokenizer, so it cannot decode text")?;
         let runtime = &*self.workflow;
+        // The authored block body this request iterates, read from the
+        // package's own declared loop. Resolved before the mutable native
+        // session borrow below, which the driver holds for the whole drive.
+        let block_runtime = match speculation_plan.as_ref() {
+            Some(_) => Some(self.workflow.iteration_runtime(
+                onnx_genai_metadata::decoder_workflow::IterationPolicy::SpeculativeBlock,
+            )?),
+            None => None,
+        };
         let result = if let Some(plan) = speculation_plan {
+            let block_runtime = block_runtime.expect("a speculation plan resolves a block body");
             let mut stats = SpeculativeStats::default();
             let result = (|| {
                 let native_session = self
@@ -518,6 +528,7 @@ impl Engine {
                     &options,
                     &chain,
                     tokenizer,
+                    &block_runtime,
                     &mut stats,
                     callback,
                 )

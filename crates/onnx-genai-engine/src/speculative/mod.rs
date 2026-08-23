@@ -30,6 +30,7 @@ use crate::{
 };
 use anyhow::Context;
 use onnx_genai_kv::KvCacheOps;
+use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_ort::{
     Eagle3DecodeOptions, Eagle3DecodeSession, MtpDecodeOptions, MtpDecodeSession, Session,
 };
@@ -1423,6 +1424,122 @@ pub(crate) struct SpeculativeLoopState<'state, 'callback> {
     pub(crate) callback: Option<&'state mut GenerateTokenCallback<'callback>>,
 }
 
+/// Everything one proposal block needs, carried between iterations.
+///
+/// The interpreter owns the loop; this owns the state a block advances. Split
+/// that way so the executor can be handed exactly one node at a time, which is
+/// what makes the speculative algorithm a *step inside* a declared workflow
+/// rather than a second loop beside one.
+pub(crate) struct SpeculativeBlock<'state, 'callback> {
+    session_id: SessionId,
+    state: &'state mut EngineSession,
+    options: &'state GenerateOptions,
+    chain: &'state ProcessorChain,
+    max_context: Option<usize>,
+    prefix_cache_hit_len: usize,
+    generated_tokens: &'state mut Vec<TokenId>,
+    generated_text: &'state mut String,
+    generated_logprobs: &'state mut Option<Vec<crate::config::TokenLogprob>>,
+    rng: &'state mut SamplingRng,
+    callback: Option<&'state mut GenerateTokenCallback<'callback>>,
+    speculative_mode: SpeculativeMode,
+    draft_width: usize,
+    mtp_proposer: Option<MtpProposer<'static, MtpEmbedder, MtpLmHead>>,
+    step: usize,
+}
+
+/// The propose-verify-accept executor, as the interpreter reaches it.
+struct SpeculativeBlockHost<'engine, 'state, 'callback> {
+    engine: &'engine mut Engine,
+    block: SpeculativeBlock<'state, 'callback>,
+    /// The stop this executor reached, if a block reached one.
+    finished: Option<GenerateResult>,
+}
+
+impl crate::pipeline::WorkflowNodeHost for SpeculativeBlockHost<'_, '_, '_> {
+    fn hosted_contracts(&self) -> &'static [&'static str] {
+        crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS
+    }
+
+    fn execute_contract_node(
+        &mut self,
+        mut request: crate::pipeline::WorkflowNodeRequest<'_>,
+    ) -> anyhow::Result<bool> {
+        if request.contract != onnx_genai_metadata::decoder_workflow::SPECULATIVE_BLOCK_CONTRACT {
+            return Ok(false);
+        }
+        // Defensive, not load-bearing: the loop reads its predicate before the
+        // body and writes the carry after it, and the liveness read is never
+        // skipped while a host implements a node in this body, so a stopped
+        // block is not re-entered. Republishing the stop rather than decoding
+        // past it keeps that a local property instead of a claim about the
+        // interpreter.
+        if self.finished.is_some() {
+            self.publish_block_outputs(&mut request, &[])?;
+            return Ok(true);
+        }
+        let before = self.block.generated_tokens.len();
+        let finished = self.engine.advance_speculative_block(&mut self.block)?;
+        let committed = self.block.generated_tokens[before..].to_vec();
+        self.finished = finished;
+        self.publish_block_outputs(&mut request, &committed)?;
+        Ok(true)
+    }
+}
+
+impl SpeculativeBlockHost<'_, '_, '_> {
+    /// Define the SSA values the block node declares.
+    ///
+    /// `token` carries the whole accepted block and `accepted_len` says how much
+    /// of it is real, which is what lets one iteration publish a variable number
+    /// of tokens through the same emit a single-token body uses. A rejected
+    /// suffix never appears here: it was rolled back before the commit that
+    /// produced these tokens.
+    fn publish_block_outputs(
+        &self,
+        request: &mut crate::pipeline::WorkflowNodeRequest<'_>,
+        committed: &[TokenId],
+    ) -> anyhow::Result<()> {
+        let width = committed.len().max(1) as i64;
+        for (port, value) in request.outputs.iter() {
+            let tensor = match port.as_str() {
+                "token" => {
+                    let mut tokens = committed
+                        .iter()
+                        .map(|id| i64::from(*id))
+                        .collect::<Vec<_>>();
+                    tokens.resize(width as usize, 0);
+                    onnx_genai_ort::Value::from_slice_i64(&tokens, &[1, width])?
+                }
+                "active" => block_flag(self.finished.is_none())?,
+                "done" => block_flag(self.finished.is_some())?,
+                "accepted_len" => {
+                    onnx_genai_ort::Value::from_slice_i64(&[committed.len() as i64], &[1])?
+                }
+                "cache_lengths" | "lengths" => onnx_genai_ort::Value::from_slice_i64(
+                    &[i64::try_from(self.block.state.tokens.len())
+                        .context("cache length exceeds int64")?],
+                    &[1],
+                )?,
+                // State ports the block also declares are the decode session's
+                // buffers, exactly as they are for the single-row decode core.
+                _ => continue,
+            };
+            request.values.insert(value.clone(), tensor);
+        }
+        Ok(())
+    }
+}
+
+fn block_flag(value: bool) -> anyhow::Result<onnx_genai_ort::Value> {
+    onnx_genai_ort::Value::from_raw_bytes(
+        vec![u8::from(value)],
+        &[1],
+        onnx_genai_ort::DataType::Bool,
+    )
+    .map_err(Into::into)
+}
+
 /// Target-model forward result for one speculative step: the base next-token
 /// logits, any hidden state(s) the active proposer consumes, and the target's
 /// unprocessed greedy next token (used by hidden-state proposers).
@@ -1513,6 +1630,20 @@ impl Engine {
             && self.kv_model.is_some()
     }
 
+    /// Generate through the package's loop re-authored as a proposal block.
+    ///
+    /// The iteration is the workflow's: the interpreter reads the bound, the
+    /// liveness predicate, the carried cells and the emit that publishes the
+    /// token stream from the authored document, and the body's single node
+    /// declares `onnx-genai.speculative-block`. This runtime registered an
+    /// executor for that contract, so the propose-verify-accept-rollback step
+    /// below is reached the same way the single-token decode core is — by the
+    /// contract a declared node names, not by a request option branching into a
+    /// second loop.
+    ///
+    /// What the request option still decides is *whether* to ask for the block
+    /// body at all, which is a caller's choice about equivalence class, not the
+    /// runtime inspecting the package.
     pub(crate) fn generate_speculative_loop(
         &mut self,
         loop_state: SpeculativeLoopState<'_, '_>,
@@ -1528,11 +1659,11 @@ impl Engine {
             generated_text,
             generated_logprobs,
             rng,
-            mut callback,
+            callback,
         } = loop_state;
         let speculative_mode = self.speculative_mode(options);
         let draft_width = self.resolve_draft_width(options, &speculative_mode)?;
-        let mut mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
+        let mtp_proposer = if matches!(&speculative_mode, SpeculativeMode::Mtp(_)) {
             let mtp = self
                 .mtp
                 .as_ref()
@@ -1555,156 +1686,260 @@ impl Engine {
         } else {
             None
         };
-        let mut step = 0;
-
-        loop {
-            if let Some(result) = self.check_speculative_termination(
+        let runtime = self
+            .workflow
+            .iteration_runtime(IterationPolicy::SpeculativeBlock)?;
+        // The loop's declared bound counts *blocks*, and every block that
+        // continues commits at least one token, so the request's token budget
+        // bounds them too. The per-token stop stays the executor's, exactly as
+        // it is for a single-token body.
+        let request = crate::pipeline::PipelineGenerateRequest::new(crate::GenerateRequest {
+            prompt: crate::GeneratePrompt::TokenIds(vec![0]),
+            options: options.clone(),
+        });
+        let mut host = SpeculativeBlockHost {
+            engine: self,
+            block: SpeculativeBlock {
+                session_id,
+                state,
+                options,
+                chain,
+                max_context,
+                prefix_cache_hit_len,
                 generated_tokens,
                 generated_text,
                 generated_logprobs,
-                state.tokens.len(),
-                options,
-                max_context,
-                prefix_cache_hit_len,
-            )? {
-                return Ok(result);
-            }
-
-            let remaining_tokens = options.max_new_tokens - generated_tokens.len();
-            let remaining_context = max_context
-                .map(|limit| limit.saturating_sub(state.tokens.len()))
-                .unwrap_or(remaining_tokens);
-            let width = draft_width
-                .min(remaining_tokens)
-                .min(remaining_context)
-                .max(1);
-
-            let base_len = state.tokens.len();
-            let base_generated_len = generated_tokens.len();
-
-            let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
-
-            let draft_tokens = self.propose_candidates(
-                &speculative_mode,
-                state,
-                &mut mtp_proposer,
                 rng,
-                CandidateProposalInputs {
-                    width,
-                    step,
-                    base_len,
-                    prediction: &prediction,
-                    generated_tokens,
-                    generated_text,
-                    options,
-                    chain,
-                },
-            )?;
-
-            // Snapshot the pre-draft recurrent/conv state of a hybrid native
-            // target BEFORE the verify window destructively advances it, so the
-            // accept path can commit it to exactly the accepted prefix. Inert for
-            // every non-native / pure-dense target (returns `None`).
-            #[cfg(feature = "native-backend")]
-            let recurrent_snapshot = match state.decode_state.native_recurrent_runner_mut() {
-                Some(native) => Some(native.snapshot_recurrent_state()?),
-                None => None,
-            };
-
-            let verified_logits =
-                self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
-
-            let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
-            target_logits.push(prediction.base_logits);
-            target_logits.extend(verified_logits);
-
-            let accepted_prefix = self.choose_accepted_prefix(
-                &mut target_logits,
-                &draft_tokens,
-                base_len,
-                state,
-                generated_tokens,
-                options,
-                chain,
-                rng,
-                step,
-            )?;
-            let accepted = accepted_prefix.accepted;
-
-            // Commit the hybrid native target's recurrent/conv state to the
-            // accepted prefix. Attention KV keeps the ordinary prefix-slice rewind
-            // in `assemble_commit_tokens`; this only rebuilds the destructive
-            // rolling caches (snapshot + accepted-token re-advance), then squares
-            // the paged length bookkeeping so that rewind becomes a no-op.
-            #[cfg(feature = "native-backend")]
-            if let Some(snapshot) = recurrent_snapshot.as_ref() {
-                self.commit_native_recurrent_target(
-                    session_id,
-                    state,
-                    base_len,
-                    &draft_tokens[..accepted],
-                    snapshot,
-                )?;
-            }
-
-            // Rewind the target KV to the accepted prefix and pick any correction
-            // or bonus token. The rewind happens inside assemble_commit_tokens
-            // BEFORE the token push in commit_speculative_tokens, so the commit
-            // starts from exactly the accepted boundary (base_len + accepted).
-            let (commit_tokens, commit_logprobs) = self.assemble_commit_tokens(
-                &accepted_prefix,
-                &draft_tokens,
-                base_len,
-                state,
-                &mut target_logits,
-                generated_tokens,
-                options,
-                chain,
-                rng,
-                step,
-                max_context,
-                session_id,
-            )?;
-
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
-            } else if let Some(proposer) = mtp_proposer.as_mut() {
-                proposer.accept(&SpeculativeAcceptContext {
-                    accepted_prefix_len: accepted,
-                    committed_tokens: &commit_tokens,
-                    target_tokens: &state.tokens,
-                })?;
-            }
-
-            if let Some(result) = self.commit_speculative_tokens(
-                session_id,
-                state,
-                generated_tokens,
-                generated_text,
-                generated_logprobs,
-                commit_tokens,
-                commit_logprobs,
-                accepted,
-                base_len,
-                prefix_cache_hit_len,
-                options,
-                chain,
-                &speculative_mode,
-                &mut step,
-                &mut callback,
-                max_context,
-            )? {
-                return Ok(result);
-            }
-
-            if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
-                self.sync_draft_to_target(state)?;
-            }
-
-            if generated_tokens.len() == base_generated_len {
-                anyhow::bail!("speculative decoding made no progress");
+                callback,
+                speculative_mode,
+                draft_width,
+                mtp_proposer,
+                step: 0,
+            },
+            finished: None,
+        };
+        let mut cursor = {
+            let mut node: Option<&mut dyn crate::pipeline::WorkflowNodeHost> = Some(&mut host);
+            crate::pipeline::WorkflowGenerationCursor::start(
+                &runtime,
+                request,
+                crate::pipeline::generation::SPECULATIVE_BLOCK_CONTRACTS,
+                &mut node,
+            )?
+        };
+        while {
+            let mut node: Option<&mut dyn crate::pipeline::WorkflowNodeHost> = Some(&mut host);
+            cursor.advance(&runtime, &mut node)?
+        } {}
+        let finished = host.finished.take();
+        let committed = host.block.generated_tokens.clone();
+        let logprobs = host.block.generated_logprobs.clone();
+        let unfinished_text = host.block.generated_text.clone();
+        drop(host);
+        // The declared emit and the block executor describe the same
+        // generation. Checking them against each other is what keeps the emit
+        // load-bearing rather than decorative: a block that published fewer
+        // tokens than it accepted, or republished a rolled-back suffix, would
+        // otherwise be invisible.
+        crate::pipeline::generation::verify_emitted_tokens(&runtime, &cursor, &committed)?;
+        match finished {
+            Some(result) => Ok(result),
+            None => {
+                // The bound ran out rather than the policy stopping. Report it
+                // the way every other exhausted budget is reported.
+                ensure_constrained_finish(options, &unfinished_text, FinishReason::MaxTokens)?;
+                self.finish_result(
+                    &committed,
+                    FinishReason::MaxTokens,
+                    prefix_cache_hit_len,
+                    logprobs.as_deref(),
+                )
             }
         }
+    }
+
+    /// Run one proposal block: propose, verify, accept the agreeing prefix and
+    /// roll the rejected suffix back out of every cell that advanced.
+    ///
+    /// Exactly one iteration, and nothing about the loop around it. `Ok(None)`
+    /// means the block committed and generation may continue; `Ok(Some(result))`
+    /// means this block reached a stop.
+    fn advance_speculative_block(
+        &mut self,
+        block: &mut SpeculativeBlock<'_, '_>,
+    ) -> anyhow::Result<Option<GenerateResult>> {
+        let SpeculativeBlock {
+            session_id,
+            state,
+            options,
+            chain,
+            max_context,
+            prefix_cache_hit_len,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            rng,
+            callback,
+            speculative_mode,
+            draft_width,
+            mtp_proposer,
+            step,
+        } = block;
+        let session_id = *session_id;
+        let options = *options;
+        let chain = *chain;
+        let max_context = *max_context;
+        let prefix_cache_hit_len = *prefix_cache_hit_len;
+        let draft_width = *draft_width;
+        let speculative_mode = speculative_mode.clone();
+
+        if let Some(result) = self.check_speculative_termination(
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            state.tokens.len(),
+            options,
+            max_context,
+            prefix_cache_hit_len,
+        )? {
+            return Ok(Some(result));
+        }
+
+        let remaining_tokens = options.max_new_tokens - generated_tokens.len();
+        let remaining_context = max_context
+            .map(|limit| limit.saturating_sub(state.tokens.len()))
+            .unwrap_or(remaining_tokens);
+        let width = draft_width
+            .min(remaining_tokens)
+            .min(remaining_context)
+            .max(1);
+
+        let base_len = state.tokens.len();
+        let base_generated_len = generated_tokens.len();
+
+        let prediction = self.load_target_prediction(session_id, state, &speculative_mode)?;
+
+        let draft_tokens = self.propose_candidates(
+            &speculative_mode,
+            state,
+            mtp_proposer,
+            rng,
+            CandidateProposalInputs {
+                width,
+                step: *step,
+                base_len,
+                prediction: &prediction,
+                generated_tokens,
+                generated_text,
+                options,
+                chain,
+            },
+        )?;
+
+        // Snapshot the pre-draft recurrent/conv state of a hybrid native
+        // target BEFORE the verify window destructively advances it, so the
+        // accept path can commit it to exactly the accepted prefix. Inert for
+        // every non-native / pure-dense target (returns `None`).
+        #[cfg(feature = "native-backend")]
+        let recurrent_snapshot = match state.decode_state.native_recurrent_runner_mut() {
+            Some(native) => Some(native.snapshot_recurrent_state()?),
+            None => None,
+        };
+
+        let verified_logits =
+            self.run_target_verification(session_id, state, &draft_tokens, base_len)?;
+
+        let mut target_logits = Vec::with_capacity(draft_tokens.len() + 1);
+        target_logits.push(prediction.base_logits);
+        target_logits.extend(verified_logits);
+
+        let accepted_prefix = self.choose_accepted_prefix(
+            &mut target_logits,
+            &draft_tokens,
+            base_len,
+            state,
+            generated_tokens,
+            options,
+            chain,
+            rng,
+            *step,
+        )?;
+        let accepted = accepted_prefix.accepted;
+
+        // Commit the hybrid native target's recurrent/conv state to the
+        // accepted prefix. Attention KV keeps the ordinary prefix-slice rewind
+        // in `assemble_commit_tokens`; this only rebuilds the destructive
+        // rolling caches (snapshot + accepted-token re-advance), then squares
+        // the paged length bookkeeping so that rewind becomes a no-op.
+        #[cfg(feature = "native-backend")]
+        if let Some(snapshot) = recurrent_snapshot.as_ref() {
+            self.commit_native_recurrent_target(
+                session_id,
+                state,
+                base_len,
+                &draft_tokens[..accepted],
+                snapshot,
+            )?;
+        }
+
+        // Rewind the target KV to the accepted prefix and pick any correction
+        // or bonus token. The rewind happens inside assemble_commit_tokens
+        // BEFORE the token push in commit_speculative_tokens, so the commit
+        // starts from exactly the accepted boundary (base_len + accepted).
+        let (commit_tokens, commit_logprobs) = self.assemble_commit_tokens(
+            &accepted_prefix,
+            &draft_tokens,
+            base_len,
+            state,
+            &mut target_logits,
+            generated_tokens,
+            options,
+            chain,
+            rng,
+            *step,
+            max_context,
+            session_id,
+        )?;
+
+        if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+            self.notify_draft_acceptance(state, accepted, &commit_tokens)?;
+        } else if let Some(proposer) = mtp_proposer.as_mut() {
+            proposer.accept(&SpeculativeAcceptContext {
+                accepted_prefix_len: accepted,
+                committed_tokens: &commit_tokens,
+                target_tokens: &state.tokens,
+            })?;
+        }
+
+        if let Some(result) = self.commit_speculative_tokens(
+            session_id,
+            state,
+            generated_tokens,
+            generated_text,
+            generated_logprobs,
+            commit_tokens,
+            commit_logprobs,
+            accepted,
+            base_len,
+            prefix_cache_hit_len,
+            options,
+            chain,
+            &speculative_mode,
+            step,
+            callback,
+            max_context,
+        )? {
+            return Ok(Some(result));
+        }
+
+        if matches!(&speculative_mode, SpeculativeMode::DraftModel) {
+            self.sync_draft_to_target(state)?;
+        }
+
+        if generated_tokens.len() == base_generated_len {
+            anyhow::bail!("speculative decoding made no progress");
+        }
+        Ok(None)
     }
 
     /// Resolve the configured maximum draft width for the active speculative
