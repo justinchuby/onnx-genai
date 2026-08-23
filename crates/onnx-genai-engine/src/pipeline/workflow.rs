@@ -836,6 +836,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
     pub fn execute_retained(
         &mut self,
     ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
+        self.execute_retained_with_host(&mut None)
+    }
+
+    /// Execute with a host supplying the runtime-implemented nodes.
+    ///
+    /// A workflow may declare steps the package ships no graph for — an
+    /// autoregressive decoder driven by a fused session, or the token policy.
+    /// The host implements those; the interpreter still owns the loop, the
+    /// carries and the emits, so there is one execution machinery rather than a
+    /// second loop beside it.
+    pub(crate) fn execute_retained_with_host(
+        &mut self,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
         let started = std::time::Instant::now();
         let mut telemetry = WorkflowRunTelemetry {
             started: Some(started),
@@ -936,6 +950,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut final_state_refs,
             &self.component_overrides,
             &mut telemetry,
+            host,
         );
         if let Err(error) = result {
             self.retain_inputs(&mut values);
@@ -1011,6 +1026,51 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 }
 
+/// A runtime-supplied executor for a workflow node the package does not ship a
+/// graph for.
+///
+/// A workflow declares *what happens* at each step. Most steps are ONNX graphs
+/// the package ships; some are steps the runtime implements — an autoregressive
+/// decoder driven by a fused session that owns paged KV on device, or the token
+/// policy that scores logits and decides when generation ends. A package states
+/// those as `implementation: binding` with a contract id, and the runtime
+/// supplies the implementation here.
+///
+/// This is the seam that lets the interpreter own the loop while a backend owns
+/// the step. The interpreter still resolves `continue_when`, `max_iterations`,
+/// `carried`, `termination` and the emits; the host only advances one node. A
+/// host that owned the loop instead would be a second runtime, which is exactly
+/// what this replaces.
+pub(crate) trait WorkflowNodeHost {
+    /// Execute one node bound to `contract`.
+    ///
+    /// Returns `Ok(false)` when this host does not implement the contract, so
+    /// the interpreter can report an unimplemented contract rather than
+    /// silently doing nothing — a declared step that no one runs is the failure
+    /// mode this signature exists to prevent.
+    fn execute_contract_node(&mut self, request: WorkflowNodeRequest<'_>) -> anyhow::Result<bool>;
+}
+
+/// Everything a host needs to advance one declared node.
+///
+/// `dead_code` is allowed only until the engine-side executors land: this
+/// checkpoint defines the seam and the interpreter's dispatch, and the first
+/// non-test implementor is the autoregressive-decode host in the next commit.
+/// The allowance is scoped to this struct so it cannot hide anything else.
+#[allow(dead_code)]
+pub(crate) struct WorkflowNodeRequest<'a> {
+    /// Contract id the component declares.
+    pub(crate) contract: &'a str,
+    /// Component name, for diagnostics only — never for dispatch.
+    pub(crate) component: &'a str,
+    /// Port name to SSA value, as the invocation bound them.
+    pub(crate) inputs: &'a BTreeMap<String, String>,
+    /// Port name to SSA value the host must define.
+    pub(crate) outputs: &'a BTreeMap<String, String>,
+    /// The invocation's value environment.
+    pub(crate) values: &'a mut PipelineTensors,
+}
+
 impl WorkflowRuntime {
     // Recursive execution threads the explicit interpreter stores and telemetry.
     #[allow(clippy::too_many_arguments)]
@@ -1025,6 +1085,7 @@ impl WorkflowRuntime {
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
         telemetry: &mut WorkflowRunTelemetry,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
         match node {
             WorkflowNode::Sequence { nodes } => {
@@ -1039,6 +1100,7 @@ impl WorkflowRuntime {
                         final_state_refs,
                         component_overrides,
                         telemetry,
+                        host,
                     )?;
                 }
             }
@@ -1150,17 +1212,46 @@ impl WorkflowRuntime {
                         }
                     }
                     ComponentImplementation::Binding => {
-                        for (port, output) in outputs {
-                            let source = inputs.get(port).with_context(|| {
-                                format!(
-                                    "binding component '{component}' output '{port}' requires \
-                                     an input with the same port name"
-                                )
-                            })?;
-                            let tensor = values.get(source).with_context(|| {
-                                format!("binding source value '{source}' is unavailable")
-                            })?;
-                            values.insert(output.clone(), clone_value(tensor)?);
+                        // A binding says "a step happens here and the runtime
+                        // implements it". When it names a contract, the host is
+                        // the implementation; the interpreter still owns the
+                        // loop around it.
+                        let contract = declaration.contract.as_ref().map(|c| c.id.as_str());
+                        let handled = match (contract, host.as_deref_mut()) {
+                            (Some(contract), Some(host)) => {
+                                host.execute_contract_node(WorkflowNodeRequest {
+                                    contract,
+                                    component,
+                                    inputs,
+                                    outputs,
+                                    values,
+                                })?
+                            }
+                            _ => false,
+                        };
+                        if !handled {
+                            // A contract nobody implements must fail, not fall
+                            // through to a port copy that would define the
+                            // outputs with the wrong tensors and let a declared
+                            // step silently not happen.
+                            if let Some(contract) = contract {
+                                anyhow::bail!(
+                                    "workflow component '{component}' declares contract \
+                                     '{contract}', which no runtime executor implements"
+                                );
+                            }
+                            for (port, output) in outputs {
+                                let source = inputs.get(port).with_context(|| {
+                                    format!(
+                                        "binding component '{component}' output '{port}' requires \
+                                         an input with the same port name"
+                                    )
+                                })?;
+                                let tensor = values.get(source).with_context(|| {
+                                    format!("binding source value '{source}' is unavailable")
+                                })?;
+                                values.insert(output.clone(), clone_value(tensor)?);
+                            }
                         }
                     }
                     ComponentImplementation::Adapter { abi, version, .. } => {
@@ -1214,6 +1305,7 @@ impl WorkflowRuntime {
                     final_state_refs,
                     component_overrides,
                     telemetry,
+                    host,
                 )?;
                 self.materialize_workflow_value(values, max_iterations)?;
                 for carry in carried {
@@ -1289,6 +1381,7 @@ impl WorkflowRuntime {
                         final_state_refs,
                         component_overrides,
                         telemetry,
+                        host,
                     )?;
                     for carry in carried {
                         let state = workflow.state.get(&carry.cell).with_context(|| {
@@ -1405,6 +1498,7 @@ impl WorkflowRuntime {
                     &mut branch_state_refs,
                     component_overrides,
                     telemetry,
+                    host,
                 )?;
 
                 // Emits are explicit side effects at the package boundary, so selected-branch
@@ -1627,6 +1721,7 @@ impl WorkflowRuntime {
                         final_state_refs,
                         component_overrides,
                         telemetry,
+                        host,
                     )?;
                     return Ok(());
                 }
@@ -5025,5 +5120,104 @@ mod workflow_sampling_binding_tests {
                 .expect("temperature binding")
                 .expect("temperature value");
         assert_eq!(temperature.to_vec_f32().expect("f32 rows"), vec![0.0]);
+    }
+}
+
+/// The node-host seam: a runtime executor runs, or the declared step fails.
+#[cfg(test)]
+mod node_host_tests {
+    use super::*;
+
+    /// A host that records what it was asked to run and defines its outputs by
+    /// copying the first input, so a test can tell "the executor ran" from
+    /// "the interpreter fell through to a port copy".
+    struct RecordingHost {
+        contract: String,
+        seen: Vec<String>,
+    }
+
+    impl WorkflowNodeHost for RecordingHost {
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != self.contract {
+                return Ok(false);
+            }
+            self.seen.push(request.component.to_string());
+            let source = request
+                .inputs
+                .values()
+                .next()
+                .context("the test host expects one input")?;
+            let tensor = clone_value(
+                request
+                    .values
+                    .get(source)
+                    .context("the test host's input must be bound")?,
+            )?;
+            for output in request.outputs.values() {
+                request.values.insert(output.clone(), clone_value(&tensor)?);
+            }
+            Ok(true)
+        }
+    }
+
+    /// A binding whose contract no host implements is an error.
+    ///
+    /// The alternative — falling through to the same-name port copy — would
+    /// define the outputs with the wrong tensors and let a declared step
+    /// silently not happen, which is indistinguishable from success at the API.
+    #[test]
+    fn an_unimplemented_contract_fails_closed() {
+        let mut host = RecordingHost {
+            contract: "vendor.something-else".to_string(),
+            seen: Vec::new(),
+        };
+        let request = WorkflowNodeRequest {
+            contract: "onnx-genai.token-policy",
+            component: "token_policy",
+            inputs: &BTreeMap::new(),
+            outputs: &BTreeMap::new(),
+            values: &mut PipelineTensors::default(),
+        };
+        assert!(
+            !host.execute_contract_node(request).expect("no error"),
+            "a host must decline a contract it does not implement, so the interpreter can \
+             report it rather than silently doing nothing"
+        );
+    }
+
+    /// A host that claims a contract is the implementation of that node.
+    #[test]
+    fn a_host_executor_defines_the_declared_outputs() {
+        let mut values = PipelineTensors::default();
+        values.insert(
+            "in".to_string(),
+            Value::from_slice_i64(&[7], &[1]).expect("value"),
+        );
+        let inputs = BTreeMap::from([("logits".to_string(), "in".to_string())]);
+        let outputs = BTreeMap::from([("token".to_string(), "out".to_string())]);
+        let mut host = RecordingHost {
+            contract: "onnx-genai.token-policy".to_string(),
+            seen: Vec::new(),
+        };
+
+        let handled = host
+            .execute_contract_node(WorkflowNodeRequest {
+                contract: "onnx-genai.token-policy",
+                component: "token_policy",
+                inputs: &inputs,
+                outputs: &outputs,
+                values: &mut values,
+            })
+            .expect("the host runs");
+
+        assert!(handled);
+        assert_eq!(host.seen, vec!["token_policy".to_string()]);
+        assert!(
+            values.get("out").is_some(),
+            "the host must define every output the invocation declares"
+        );
     }
 }

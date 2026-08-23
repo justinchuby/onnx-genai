@@ -1,68 +1,44 @@
-fix(engine): multi-EOS on the batched routes; seal the test seam; drop the PR-local fixture guard
+feat(pipeline): a generic node-executor seam in the interpreter
 
-Addresses review B1 and the contained N-items. B2 (making the interpreter own
-the AR loop) and B3 (baseline-from-main evidence) are **not** in this commit;
-see the PR discussion for the blocker.
+B2 checkpoint 1 of the workflow-runtime unification: the interpreter gains a
+seam for steps the runtime implements, so a fused decode session can become a
+*node executor the interpreter drives* rather than a second loop beside it.
 
-**B1 — batched routes resolved their own EOS.** `ContinuousBatchManager::submit`
-and `generate_batched_static` each set `eos_token_id` from the tokenizer's
-*first* id and never saw the package's declaration. That is the server's default
-route for a fixed-capacity package, so a multi-EOS model stopped correctly in
-single-row generation and ran past its end under serving — invisible from the
-API. Both now resolve the full set from the same source the single-row path
-uses, through one shared `apply_eos_policy`; the manager carries the resolved
-set because it holds a tokenizer, not the engine, and cannot reach the workflow
-once it holds a mutable session borrow.
+A workflow declares what happens at each step. Most steps are ONNX graphs the
+package ships; some are steps the runtime implements — an autoregressive decoder
+driven by a session that owns paged KV on device, or the token policy that
+scores logits and decides when generation ends. A package states those as
+`implementation: binding` with a contract id. Until now the interpreter answered
+a binding by copying same-named ports, which is fine for a pass-through and
+useless for a step with an implementation.
 
-`generate_batched_static` also checked "is this a static-cache model" *before*
-the canonical guard, so an unloadable package was reported as a batching
-capability problem. The invariant is now the prior question.
+`WorkflowNodeHost::execute_contract_node` is that implementation point. The
+interpreter still owns everything that makes it a *workflow*: `continue_when`,
+`max_iterations`, `carried`, `termination`, the emits, and the SSA environment.
+The host advances exactly one node. A host that owned the loop would be the
+second runtime this work exists to remove.
 
-**The batched test is deliberately in-crate.** No CPU fixture in this repository
-can batch — a shared KV buffer needs an EP reporting fixed-capacity present
-binding, and `batching_capability` asserts exactly that absence. An end-to-end
-batched case would therefore *skip*, and a skipped test reporting success is
-worse than no test. `batched::tests::
-a_continuous_row_stops_on_a_non_first_declared_end_token` drives a real
-`ContinuousBatchManager` row loop over a scripted decode and requires the row to
-end at a **non-first** declared id; with the old code the row runs to the
-budget. The `multi_eos` module header records why the end-to-end case is absent
-rather than pretending it ran.
+**Fail-closed.** A binding declaring a contract that no host implements is now an
+error. Previously it fell through to the port copy, which would define the
+outputs with the wrong tensors and let a declared step silently not happen —
+indistinguishable from success at the API. Bindings without a contract keep the
+pass-through, which is what the existing workflow fixtures use.
 
-Investigating this surfaced that `Engine::generate` on a fixed-capacity package
-has never worked end-to-end: `tiny-llm-scatter-workflow` fails on a contract/graph
-mismatch (`key_cache.0` axis 2 declares 4, the graph exposes 16). Pre-existing
-and pre-dating this branch — the static-cache fixtures are only ever driven
-through `StaticCacheDecodeSession` directly. Recorded, not silently worked
-around.
+The host is threaded as `Option<&mut dyn WorkflowNodeHost>` through
+`run_workflow_node`'s five recursion sites and reaches the interpreter through
+`execute_retained_with_host`; `execute_retained` passes `None`, so every
+existing caller is unchanged.
 
-**Malformed EOS declarations now error.** `literal_token_ids` used `filter_map`,
-so a package declaring `[2, -1]` silently kept one id — the package says "these
-tokens end me" and the runtime quietly keeps a subset. It returns `Result`, and
-`apply_eos_defaults`/`fim_options` propagate it.
+Two unit tests pin the seam: a host declining a contract it does not implement
+(so the interpreter can report it rather than silently doing nothing), and a
+host defining the declared outputs (so "the executor ran" is distinguishable
+from "the interpreter fell through to a port copy").
 
-**`forget_canonical_workflow_for_test` is `#[cfg(test)] pub(crate)`.** It
-produces a state no public API can reach, which is the whole point of the
-refusal it supports; exposing it made that state reachable. The refusal tests
-move in-crate to `canonical_refusal_tests` and gain a fifth entry point
-(`generate_batched_static`).
+`WorkflowNodeRequest` carries a scoped `dead_code` allowance: this checkpoint
+defines the seam and its dispatch, and the first non-test implementor is the
+autoregressive-decode host in the next commit. The allowance is on the struct
+alone so it cannot hide anything else, and it goes away with that commit.
 
-**The PR-local fixture guard is deleted.** Main's repository-wide, zero-allowlist
-`onnx-std/tests/fixture_ir_opset_guard.rs` supersedes it, and my own guard's doc
-said to replace it when that landed. It passes on this branch's fixtures.
-
-I tried extending that guard to inline model literals in `.rs` sources and
-reverted it: raising `opset_import` from 13 to 24 without porting the ops
-produces *invalid* models (`ReduceMax` moved `axes` from attribute to input in
-opset 18, and the bumped fixture was rejected by ORT). Many inline literals are
-also deliberate legacy-IR *parser* inputs — a loader must still parse IR 8 to be
-tested for it. Committed fixture files have generators and are the right scope;
-inline literals are not fixtures. This branch's own inline models are at the
-floor.
-
-Verified: 73/73 engine targets; downstream metadata, scheduler, CLI, C API,
-onnx-std green — the one server failure is the known
-`fim_stream_returns_headers_before_generation_finishes` load-flake, 3/3 in
-isolation; fmt; clippy `-D warnings`.
+Verified: 73/73 engine targets; fmt; no new warnings.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
