@@ -28,6 +28,12 @@ FIXTURES_DIR = os.path.dirname(os.path.abspath(__file__))
 
 MS = "com.microsoft"
 
+# Maintained fixtures target ONNX IR version 11 and default ONNX opset 24.
+# Custom-domain imports (com.microsoft) keep their own version. Enforced by the
+# fixture IR/opset guard test in onnx-std (crates/onnx-std/tests/fixture_ir_opset_guard.rs).
+IR_VERSION = 11
+DEFAULT_OPSET = 24
+
 
 def save(model, name, check=True):
     path = os.path.join(FIXTURES_DIR, name, "model.onnx.textproto")
@@ -43,13 +49,13 @@ def vi(name, dims, elem=TensorProto.FLOAT):
     return helper.make_tensor_value_info(name, elem, dims)
 
 
-def finish(nodes, name, inputs, outputs, opset=17, ms=False, inits=None):
+def finish(nodes, name, inputs, outputs, opset=DEFAULT_OPSET, ms=False, inits=None):
     graph = helper.make_graph(nodes, name, inputs, outputs, initializer=inits or [])
     imports = [helper.make_opsetid("", opset)]
     if ms:
         imports.append(helper.make_opsetid(MS, 1))
     model = helper.make_model(graph, opset_imports=imports)
-    model.ir_version = 10
+    model.ir_version = IR_VERSION
     return model
 
 
@@ -61,7 +67,7 @@ def gen_softmax_assignment_f32():
     X = vi("X", [1, 32, 1, 1024])
     Z = vi("Z", [1, 32, 1, 1024])
     node = helper.make_node("Softmax", ["X"], ["Z"], axis=-1)
-    save(finish([node], "softmax_assignment_f32", [X], [Z], opset=13),
+    save(finish([node], "softmax_assignment_f32", [X], [Z]),
          "softmax_assignment_f32")
 
 
@@ -72,7 +78,7 @@ def gen_transpose_assignment_f32():
     X = vi("X", [1, 128, 32, 128])
     Z = vi("Z", [1, 32, 128, 128])
     node = helper.make_node("Transpose", ["X"], ["Z"], perm=[0, 2, 1, 3])
-    save(finish([node], "transpose_assignment_f32", [X], [Z], opset=13),
+    save(finish([node], "transpose_assignment_f32", [X], [Z]),
          "transpose_assignment_f32")
 
 
@@ -84,7 +90,7 @@ def gen_kv_concat_assignment_f32():
     cur = vi("cur", [1, 8, 1, 128])
     out = vi("present", [1, 8, 1024, 128])
     node = helper.make_node("Concat", ["past", "cur"], ["present"], axis=2)
-    save(finish([node], "kv_concat_assignment_f32", [past, cur], [out], opset=13),
+    save(finish([node], "kv_concat_assignment_f32", [past, cur], [out]),
          "kv_concat_assignment_f32")
 
 
@@ -98,8 +104,7 @@ def gen_kv_scatternd_assignment_f32():
     updates = vi("updates", [1, 128])
     out = vi("updated", [1, 8, 1024, 128])
     node = helper.make_node("ScatterND", ["cache", "indices", "updates"], ["updated"])
-    save(finish([node], "kv_scatternd_assignment_f32", [data, indices, updates], [out],
-                opset=16),
+    save(finish([node], "kv_scatternd_assignment_f32", [data, indices, updates], [out]),
          "kv_scatternd_assignment_f32")
 
 

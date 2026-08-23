@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node: [
     { input: ["X", "B"] output: ["Z"] op_type: "BiasGelu" domain: "com.microsoft" }
@@ -37,6 +37,6 @@ graph {
   ]
 }
 opset_import: [
-  { version: 22 },
+  { version: 24 },
   { domain: "com.microsoft" version: 1 }
 ]

@@ -17,6 +17,12 @@ import numpy as np
 
 FIXTURES_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Maintained fixtures target ONNX IR version 11 and default ONNX opset 24.
+# Custom-domain imports (com.microsoft) keep their own version. Enforced by the
+# fixture IR/opset guard test in onnx-std (crates/onnx-std/tests/fixture_ir_opset_guard.rs).
+IR_VERSION = 11
+DEFAULT_OPSET = 24
+
 
 def save(model, name, check=True):
     # Fixtures are committed as git-friendly ONNX protobuf TextFormat
@@ -46,8 +52,8 @@ def gen_add_broadcast():
     Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, [2, 3])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_broadcast", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_broadcast")
 
 
@@ -71,8 +77,8 @@ def gen_chain_add_mul():
         [A, B, C, D],
         [T],
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "chain_add_mul")
 
 
@@ -88,8 +94,8 @@ def gen_matmul_2d():
     C = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 2])
     node = helper.make_node("MatMul", inputs=["A", "B"], outputs=["C"])
     graph = helper.make_graph([node], "matmul_2d", [A, B], [C])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "matmul_2d")
 
 
@@ -107,8 +113,8 @@ def gen_matmul_batched_nd():
     C = helper.make_tensor_value_info("C", TensorProto.FLOAT, [2, 3, 2])
     node = helper.make_node("MatMul", inputs=["A", "B"], outputs=["C"])
     graph = helper.make_graph([node], "matmul_batched_nd", [A, B], [C])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "matmul_batched_nd")
 
 
@@ -127,8 +133,8 @@ def gen_mixed_partition():
     add_node = helper.make_node("Add", inputs=["X", "Y"], outputs=["SUM"])
     nz_node = helper.make_node("NonZero", inputs=["SUM"], outputs=["Z"])
     graph = helper.make_graph([add_node, nz_node], "mixed_partition", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "mixed_partition")
 
 
@@ -141,8 +147,8 @@ def gen_add_int32():
     Z = helper.make_tensor_value_info("Z", TensorProto.INT32, [1, 4])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_int32", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_int32")
 
 
@@ -156,8 +162,8 @@ def gen_add_dynamic_dim():
     Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, ["batch", 4])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_dynamic_dim", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_dynamic_dim")
 
 
@@ -170,8 +176,8 @@ def gen_add_1x4():
     Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1, 4])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_1x4", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_1x4")
 
 
@@ -184,8 +190,8 @@ def gen_add_float16():
     Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT16, [1, 4])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_float16", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_float16")
 
 
@@ -198,8 +204,8 @@ def gen_add_bfloat16():
     Z = helper.make_tensor_value_info("Z", TensorProto.BFLOAT16, [1, 4])
     node = helper.make_node("Add", inputs=["X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "add_bfloat16", [X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "add_bfloat16")
 
 
@@ -211,8 +217,8 @@ def gen_nonzero_1x4():
     Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [2, None])
     node = helper.make_node("NonZero", inputs=["X"], outputs=["Y"])
     graph = helper.make_graph([node], "nonzero_1x4", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "nonzero_1x4")
 
 
@@ -227,8 +233,8 @@ def gen_cast_f32_to_i64():
     Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [2, 3])
     node = helper.make_node("Cast", inputs=["X"], outputs=["Y"], to=TensorProto.INT64)
     graph = helper.make_graph([node], "cast_f32_to_i64", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "cast_f32_to_i64")
 
 
@@ -247,8 +253,8 @@ def gen_where_bool_f32():
     Z = helper.make_tensor_value_info("Z", TensorProto.FLOAT, [2, 2])
     node = helper.make_node("Where", inputs=["C", "X", "Y"], outputs=["Z"])
     graph = helper.make_graph([node], "where_bool_f32", [C, X, Y], [Z])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "where_bool_f32")
 
 
@@ -260,8 +266,8 @@ def gen_shape_f32():
     Y = helper.make_tensor_value_info("Y", TensorProto.INT64, [3])
     node = helper.make_node("Shape", inputs=["X"], outputs=["Y"])
     graph = helper.make_graph([node], "shape_f32", [X], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "shape_f32")
 
 
@@ -283,8 +289,8 @@ def gen_layer_norm_f32():
     graph = helper.make_graph(
         [node], "layer_norm_f32", [X, scale], [Y, Mean, InvStdDev]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "layer_norm_f32")
 
 
@@ -311,8 +317,8 @@ def gen_layer_norm_neg_axis_f32():
     graph = helper.make_graph(
         [node], "layer_norm_neg_axis_f32", [X, scale], [Y, Mean, InvStdDev]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "layer_norm_neg_axis_f32")
 
 
@@ -336,8 +342,8 @@ def gen_simplified_layer_norm_f32():
     graph = helper.make_graph(
         [node], "simplified_layer_norm_f32", [X, scale], [Y]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 23)])
-    model.ir_version = 10
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "simplified_layer_norm_f32")
 
 
@@ -359,10 +365,10 @@ def gen_skip_layer_norm_f16_absent_output():
     )
     graph = helper.make_graph([node], "skip_ln_f16_absent", [X, skip, gamma], [output, sum_out])
     model = helper.make_model(graph, opset_imports=[
-        helper.make_opsetid("", 17),
+        helper.make_opsetid("", DEFAULT_OPSET),
         helper.make_opsetid("com.microsoft", 1),
     ])
-    model.ir_version = 8
+    model.ir_version = IR_VERSION
     save(model, "skip_layer_norm_f16_absent_output")
 
 
@@ -383,10 +389,10 @@ def gen_skip_layer_norm_bf16_absent_output():
     )
     graph = helper.make_graph([node], "skip_ln_bf16_absent", [X, skip, gamma], [output, sum_out])
     model = helper.make_model(graph, opset_imports=[
-        helper.make_opsetid("", 17),
+        helper.make_opsetid("", DEFAULT_OPSET),
         helper.make_opsetid("com.microsoft", 1),
     ])
-    model.ir_version = 8
+    model.ir_version = IR_VERSION
     save(model, "skip_layer_norm_bf16_absent_output")
 
 
@@ -404,8 +410,8 @@ def gen_layer_norm_f16_absent_output():
         axis=-1,
     )
     graph = helper.make_graph([node], "layer_norm_f16_absent", [X, scale], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "layer_norm_f16_absent_output")
 
 
@@ -422,8 +428,8 @@ def gen_layer_norm_bf16_absent_output():
         axis=-1,
     )
     graph = helper.make_graph([node], "layer_norm_bf16_absent", [X, scale], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "layer_norm_bf16_absent_output")
 
 
@@ -453,10 +459,10 @@ def gen_add_skip_layer_norm_mul():
         [result],
     )
     model = helper.make_model(graph, opset_imports=[
-        helper.make_opsetid("", 17),
+        helper.make_opsetid("", DEFAULT_OPSET),
         helper.make_opsetid("com.microsoft", 1),
     ])
-    model.ir_version = 8
+    model.ir_version = IR_VERSION
     save(model, "add_skip_layer_norm_mul")
 
 
@@ -482,8 +488,8 @@ def gen_layer_norm_dynamic_axis():
     graph = helper.make_graph(
         [node], "layer_norm_dynamic_axis", [X, scale], [Y, Mean, InvStdDev]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "layer_norm_dynamic_axis")
 
 
@@ -508,10 +514,10 @@ def gen_skip_layer_norm_output_sum():
         [node], "skip_ln_sum", [X, skip, gamma], [output, sum_out]
     )
     model = helper.make_model(graph, opset_imports=[
-        helper.make_opsetid("", 17),
+        helper.make_opsetid("", DEFAULT_OPSET),
         helper.make_opsetid("com.microsoft", 1),
     ])
-    model.ir_version = 8
+    model.ir_version = IR_VERSION
     save(model, "skip_layer_norm_output_sum")
 
 
@@ -544,8 +550,8 @@ def gen_simplified_layer_norm_two_outputs():
     graph = helper.make_graph(
         [node], "sln_two_out", [X, scale], [output, inv_std]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 21)])
-    model.ir_version = 10
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     # SimplifiedLayerNormalization at domain "" is a non-standard op that the
     # onnx checker's schema registry does not know about; skip the check so the
     # fixture (which mirrors a real model the CPU EP must handle) can be written.
@@ -572,10 +578,10 @@ def gen_skip_layer_norm_no_beta_bias():
         [node], "skip_ln_no_beta", [X, skip, gamma], [output]
     )
     model = helper.make_model(graph, opset_imports=[
-        helper.make_opsetid("", 17),
+        helper.make_opsetid("", DEFAULT_OPSET),
         helper.make_opsetid("com.microsoft", 1),
     ])
-    model.ir_version = 8
+    model.ir_version = IR_VERSION
     save(model, "skip_layer_norm_no_beta_bias")
 
 
@@ -588,8 +594,8 @@ def gen_clip_no_min():
     Y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 4])
     node = helper.make_node("Clip", inputs=["X", "", "max_val"], outputs=["Y"])
     graph = helper.make_graph([node], "clip_no_min", [X, max_val], [Y])
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 8
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "clip_no_min")
 
 
@@ -613,8 +619,8 @@ def gen_matmul_initializer_weights():
     graph = helper.make_graph(
         [node], "matmul_initializer", [X], [Y], initializer=[W]
     )
-    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
-    model.ir_version = 10
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", DEFAULT_OPSET)])
+    model.ir_version = IR_VERSION
     save(model, "matmul_initializer_weights")
 
 

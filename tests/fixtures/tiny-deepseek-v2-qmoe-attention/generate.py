@@ -199,7 +199,7 @@ def build(output: Path) -> None:
         opset_imports=[helper.make_operatorsetid("", 24), helper.make_operatorsetid("com.microsoft", 1)],
         producer_name="onnx-genai tiny DeepSeek-V2 QMoE fixture",
     )
-    model.ir_version = 10
+    model.ir_version = 11
 
     output.mkdir(parents=True, exist_ok=True)
     for name in ["model.onnx", "model.onnx.textproto", "inference_metadata.yaml", "tokenizer.json", "manifest.json"]:

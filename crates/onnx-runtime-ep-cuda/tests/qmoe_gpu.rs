@@ -1353,6 +1353,66 @@ fn qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs() {
     assert_conforms(&replay, &expected, case, DataType::Float16);
 }
 
+/// Shared body for the grouped (M>1) capture+replay correctness checks at
+/// M=2 and M=4 below, isolating `rows` as the only variable against the
+/// existing M=8 sibling
+/// (`qmoe_64experts_top6_capture_replay_reresolves_changed_router_probs`
+/// above): same 64-expert/top-6 shape, same `router_with_top_experts`
+/// capture/replay pattern. Cycle-6 requirement: prove grouped CUDA-graph
+/// capture at every one of M={2,4,8}, not just one grouped data point.
+fn grouped_capture_replay_reresolves_changed_router_probs(rows: usize) {
+    let ep = require_cuda();
+    let case = qmoe_64expert_case(rows);
+    let mut capture_inputs = case_inputs(case, DataType::Float16);
+    capture_inputs[1] = Some(router_with_top_experts(case, 0));
+    let replay_router = router_with_top_experts(case, 32);
+
+    let replay = run_gpu_impl(
+        &ep,
+        case,
+        &capture_inputs,
+        DataType::Float16,
+        None,
+        Some(&replay_router),
+        true,
+    )
+    .unwrap();
+    let mut eager_inputs = capture_inputs;
+    eager_inputs[1] = Some(replay_router);
+    let eager = run_gpu_impl(
+        &ep,
+        case,
+        &eager_inputs,
+        DataType::Float16,
+        None,
+        None,
+        false,
+    )
+    .unwrap();
+    let expected = run_cpu(case, &rounded_cpu_inputs(&eager_inputs, DataType::Float16));
+
+    assert_conforms(&replay, &eager, case, DataType::Float16);
+    assert_conforms(&replay, &expected, case, DataType::Float16);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_64experts_top6_m2_capture_replay_reresolves_changed_router_probs() {
+    grouped_capture_replay_reresolves_changed_router_probs(2);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_64experts_top6_m4_capture_replay_reresolves_changed_router_probs() {
+    grouped_capture_replay_reresolves_changed_router_probs(4);
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -1988,6 +2048,21 @@ impl GemvBenchSetup {
         ep.deallocate(self.output_buffer)?;
         Ok(bytes)
     }
+
+    /// Frees every buffer through the provider's deferred-release queue
+    /// WITHOUT first reading the output back or forcing a `synchronize()` --
+    /// unlike `teardown`, which blocks on a synchronize first. Mirrors
+    /// `PendingExecution::free_without_readback` (same file, same reason):
+    /// this is the only way to free a setup whose last launch (e.g. a
+    /// captured graph *replay*) may still be in flight without a hidden sync
+    /// masking exactly the drop/teardown path a test wants to exercise.
+    fn free_without_readback(self, ep: &CudaExecutionProvider) -> onnx_runtime_ep_api::Result<()> {
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(())
+    }
 }
 
 fn decode_output_bytes(bytes: &[u8], dtype: DataType) -> Vec<f32> {
@@ -2389,6 +2464,337 @@ fn qmoe_expert_gemv_bandwidth_probe() {
     );
 }
 
+/// Times `batch` back-to-back [`CudaRuntime::replay_graph`] calls, `reps`
+/// times. Identical event/drain discipline to `median_us` above, with
+/// `replay_graph()` in place of `setup.execute_once()` -- this is the only
+/// way to isolate the launch-dispatch saving a graph replay buys over
+/// `median_us`'s per-node `execute()` path from any change in the kernel's
+/// own device-side cost (there is none: it is the same launches, replayed
+/// instead of re-recorded). Returns `(median_gpu_us_per_replay,
+/// median_host_us_per_replay, sorted_gpu_samples_us)`.
+fn median_replay_us(runtime: &CudaRuntime, reps: usize, batch: usize) -> (f64, f64, Vec<f64>) {
+    use cudarc::driver::result::event;
+    use cudarc::driver::sys::CUevent_flags;
+
+    let mut host = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let enqueue_begin = std::time::Instant::now();
+        for _ in 0..batch {
+            runtime.replay_graph().unwrap();
+        }
+        host.push(enqueue_begin.elapsed().as_secs_f64() * 1e6 / batch as f64);
+        runtime.drain_for_unmap().unwrap();
+    }
+    host.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let host_us = host[host.len() / 2];
+
+    let mut gpu = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let start = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+        let end = event::create(CUevent_flags::CU_EVENT_DEFAULT).unwrap();
+        // SAFETY: both events belong to this context and bracket `batch`
+        // back-to-back `replay_graph()` calls on the runtime's own stream.
+        unsafe {
+            event::record(start, runtime.stream_ptr()).unwrap();
+            for _ in 0..batch {
+                runtime.replay_graph().unwrap();
+            }
+            event::record(end, runtime.stream_ptr()).unwrap();
+            event::synchronize(end).unwrap();
+            gpu.push(event::elapsed(start, end).unwrap() as f64 / batch as f64 * 1000.0);
+            event::destroy(start).ok();
+            event::destroy(end).ok();
+        }
+    }
+    gpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = gpu[gpu.len() / 2];
+    (median, host_us, gpu)
+}
+
+/// One-time host cost of `begin_graph_capture` + one captured
+/// `execute_once()` + `end_graph_capture`, sampled `reps` times. Each sample
+/// tears the previous graph down first (`replay_graph` once so the just-
+/// captured graph is not discarded unused, then `drain_for_unmap` +
+/// `reset_graph`) so every sample records a genuinely fresh capture, not a
+/// no-op re-capture over an already-installed executable. Deliberately NOT
+/// divided by any batch count: capture is a one-time setup cost paid once per
+/// distinct captured shape, not a steady-state per-token cost, so reporting
+/// its own per-call median is the honest number (`median_replay_us` above is
+/// the steady-state number this cost is amortized against).
+fn median_capture_us(setup: &GemvBenchSetup, runtime: &CudaRuntime, reps: usize) -> Vec<f64> {
+    let mut samples = Vec::with_capacity(reps);
+    for sample in 0..reps {
+        let begin = std::time::Instant::now();
+        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        setup.execute_once().unwrap_or_else(|error| {
+            panic!("sample {sample}: capture-time execute failed: {error}")
+        });
+        guard.end().unwrap();
+        samples.push(begin.elapsed().as_secs_f64() * 1e6);
+        runtime.replay_graph().unwrap();
+        runtime.drain_for_unmap().unwrap();
+        runtime.reset_graph().unwrap();
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_capture_replay_bandwidth_probe() {
+    // Capture/replay extension of `qmoe_expert_gemv_bandwidth_probe` above,
+    // scoped to the grouped (M>=2) path this cycle's capability-invariant
+    // work concerns -- M=1 decode's `fused_decode` dispatch is already
+    // covered eager-only by the probe above and is a different launch
+    // sequence. Same shapes (`DEEPSEEK_V2_LITE_MOE`, `GLM_5_2_MOE`), same
+    // `reps`/`batch` methodology and env overrides, same
+    // `A100_SXM4_80GB_PEAK_GBPS` datasheet peak, same fast-filled weights for
+    // the bandwidth run and a reduced-expert-count `correctness_proxy_case`
+    // through the real `quantize()` + CPU-oracle path for correctness (see
+    // `qmoe_expert_gemv_bandwidth_probe`'s doc comments for why each of these
+    // choices is made -- unchanged here).
+    let ep = require_cuda();
+    let runtime = ep.runtime().clone();
+    let dtype = DataType::Float16;
+    let reps = env_usize("QMOE_GEMV_PROBE_REPS", 25).max(5);
+    let batch = env_usize("QMOE_GEMV_PROBE_BATCH", 16).max(1);
+    let capture_reps = env_usize("QMOE_CAPTURE_PROBE_REPS", 25).max(5);
+
+    // Clock ramp (cuda-perf-measurement Trap 5), identical in spirit to the
+    // eager probe's: run the heaviest grouped configuration (GLM-5.2, M=8)
+    // through the SAME replay-based measurement this test reports on, until
+    // it stops improving and at least 8s have elapsed.
+    let ramp_case = moe_bench_case(GLM_5_2_MOE, 8);
+    let ramp_inputs = fast_case_inputs(ramp_case, dtype);
+    let ramp_setup = setup_gemv_bench(&ep, ramp_case, dtype, &ramp_inputs).unwrap();
+    assert!(
+        ramp_setup.kernel.capture_support().is_supported(),
+        "ramp configuration must itself be capture-eligible once warmed, or the whole \
+         capture/replay probe below is measuring a fallback path"
+    );
+    let guard = CaptureGuard::begin(&runtime, &[ramp_setup.kernel.as_ref()]).unwrap();
+    ramp_setup.execute_once().unwrap();
+    guard.end().unwrap();
+    let ramp_start = std::time::Instant::now();
+    let ramp_deadline = ramp_start + std::time::Duration::from_secs(30);
+    let mut previous = f64::INFINITY;
+    let mut ramp_trace = Vec::new();
+    loop {
+        let (now, _, _) = median_replay_us(&runtime, 5, batch);
+        ramp_trace.push(now);
+        let settled = now > previous * 0.985;
+        previous = now;
+        if settled && ramp_start.elapsed() >= std::time::Duration::from_secs(8) {
+            break;
+        }
+        if std::time::Instant::now() >= ramp_deadline {
+            eprintln!(
+                "WARNING: clock had not settled after 30s of ramping; absolute numbers \
+                 below are not comparable across runs"
+            );
+            break;
+        }
+    }
+    println!(
+        "clock ramp (replay) on glm-5.2 M=8: {:.0} -> {:.0} us over {} readings in {:.1}s",
+        ramp_trace[0],
+        ramp_trace[ramp_trace.len() - 1],
+        ramp_trace.len(),
+        ramp_start.elapsed().as_secs_f64(),
+    );
+    runtime.reset_graph().unwrap();
+    ramp_setup.teardown(&ep).unwrap();
+
+    println!(
+        "{:<16} {:>2} {:>11} {:>11} {:>11} {:>11} {:>9} {:>10}",
+        "shape", "M", "capture_us", "replay_us", "eager_us", "gap_cut_%", "GB/s", "%peak(dedup)"
+    );
+
+    for shape in [DEEPSEEK_V2_LITE_MOE, GLM_5_2_MOE] {
+        for &rows in &[2usize, 4, 8] {
+            // --- Correctness gate: capture+replay must match BOTH the real
+            // CPU oracle and this same kernel's own eager output, at a
+            // reduced expert count (see `correctness_proxy_case`) so a fast
+            // WRONG kernel (or a graph that silently replays stale inputs)
+            // cannot pass. ---
+            let proxy_case = correctness_proxy_case(shape, rows);
+            let proxy_inputs = case_inputs(proxy_case, dtype);
+            let proxy_cpu_inputs = rounded_cpu_inputs(&proxy_inputs, dtype);
+            let expected = run_cpu(proxy_case, &proxy_cpu_inputs);
+            let proxy_setup = setup_gemv_bench(&ep, proxy_case, dtype, &proxy_inputs).unwrap();
+            assert!(
+                proxy_setup.kernel.capture_support().is_supported(),
+                "{} M={rows}: expected grouped capture to be supported once warmed, got a \
+                 decline instead -- the fast path under measurement did not fire",
+                shape.name,
+            );
+            let eager_bytes = {
+                proxy_setup.execute_once().unwrap();
+                runtime.synchronize().unwrap();
+                let mut bytes = vec![0u8; proxy_setup.output_bytes];
+                // SAFETY: `output_buffer` was sized `output_bytes`.
+                unsafe {
+                    runtime
+                        .dtoh(&mut bytes, cuptr(proxy_setup.output_buffer.as_ptr()))
+                        .unwrap()
+                };
+                bytes
+            };
+            let eager_actual = decode_output_bytes(&eager_bytes, dtype);
+            assert_conforms(&eager_actual, &expected, proxy_case, dtype);
+
+            let guard = CaptureGuard::begin(&runtime, &[proxy_setup.kernel.as_ref()]).unwrap();
+            proxy_setup.execute_once().unwrap();
+            guard.end().unwrap();
+            runtime.replay_graph().unwrap();
+            let replay_bytes = {
+                runtime.synchronize().unwrap();
+                let mut bytes = vec![0u8; proxy_setup.output_bytes];
+                // SAFETY: `output_buffer` was sized `output_bytes`.
+                unsafe {
+                    runtime
+                        .dtoh(&mut bytes, cuptr(proxy_setup.output_buffer.as_ptr()))
+                        .unwrap()
+                };
+                bytes
+            };
+            let replay_actual = decode_output_bytes(&replay_bytes, dtype);
+            assert_conforms(&replay_actual, &expected, proxy_case, dtype);
+            assert_eq!(
+                replay_bytes, eager_bytes,
+                "{} M={rows}: captured-replay output is not byte-identical to this same \
+                 kernel's eager output on the identical input",
+                shape.name,
+            );
+            runtime.reset_graph().unwrap();
+            proxy_setup.teardown(&ep).unwrap();
+
+            // --- Bandwidth + launch-gap measurement, at the real model
+            // expert count, with fast-filled weights (see
+            // `qmoe_expert_gemv_bandwidth_probe`'s doc comment for why). One
+            // `GemvBenchSetup` (one set of buffers) is reused for the eager,
+            // capture-cost, and replay measurements below so all three time
+            // the identical launches on the identical buffers. ---
+            let case = moe_bench_case(shape, rows);
+            let inputs = fast_case_inputs(case, dtype);
+            let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+            assert!(setup.kernel.capture_support().is_supported());
+
+            let router = host_f32(inputs[1].as_ref().unwrap());
+            let distinct = top_k_distinct_experts(case, &router);
+            let total_routes = case.rows * case.top_k;
+            let per_expert_bytes = expert_bytes(case) as f64;
+            let dedup_bytes = per_expert_bytes * distinct.len() as f64;
+            let no_dedup_bytes = per_expert_bytes * total_routes as f64;
+
+            // 1) Eager baseline through this exact setup (uncaptured).
+            let (eager_gpu_us, eager_host_us, _) = median_us(&setup, &runtime, reps, batch);
+
+            // 2) One-time capture cost, sampled independently `capture_reps`
+            // times (each sample re-captures from scratch).
+            let capture_samples = median_capture_us(&setup, &runtime, capture_reps);
+            let capture_median_us = capture_samples[capture_samples.len() / 2];
+            let capture_range_us = (
+                capture_samples
+                    .first()
+                    .copied()
+                    .unwrap_or(capture_median_us),
+                capture_samples.last().copied().unwrap_or(capture_median_us),
+            );
+
+            // 3) Steady-state replay cost: install one graph, then replay it
+            // `reps * batch` times under the same event/drain discipline as
+            // the eager measurement.
+            let guard = CaptureGuard::begin(&runtime, &[setup.kernel.as_ref()]).unwrap();
+            setup.execute_once().unwrap();
+            guard.end().unwrap();
+            let (replay_gpu_us, replay_host_us, replay_samples) =
+                median_replay_us(&runtime, reps, batch);
+            runtime.reset_graph().unwrap();
+
+            let gbps_dedup = dedup_bytes / (replay_gpu_us * 1e-6) / 1e9;
+            let gbps_no_dedup = no_dedup_bytes / (replay_gpu_us * 1e-6) / 1e9;
+            let pct_dedup = 100.0 * gbps_dedup / A100_SXM4_80GB_PEAK_GBPS;
+            let pct_no_dedup = 100.0 * gbps_no_dedup / A100_SXM4_80GB_PEAK_GBPS;
+            let host_gap_cut_pct = 100.0 * (eager_host_us - replay_host_us) / eager_host_us;
+            let range_us = (
+                replay_samples.first().copied().unwrap_or(replay_gpu_us),
+                replay_samples.last().copied().unwrap_or(replay_gpu_us),
+            );
+
+            println!(
+                "{:<16} {:>2} {:>11.2} {:>11.2} {:>11.2} {:>10.1}% {:>9.0} {:>11.1}%",
+                shape.name,
+                rows,
+                capture_median_us,
+                replay_gpu_us,
+                eager_gpu_us,
+                host_gap_cut_pct,
+                gbps_dedup,
+                pct_dedup,
+            );
+            // Stable machine-readable line (issue #82 baseline, capture
+            // extension): separates the one-time `capture_us` cost from the
+            // steady-state `replay_us` cost, and reports host enqueue time
+            // for both replay and eager dispatch so the launch-gap saving
+            // (`host_gap_cut_pct`) is itself a reported, falsifiable number
+            // rather than an assumed benefit. `captures=1` / `replays=` /
+            // `fallbacks=0` reflect this probe's own capture/replay call
+            // counts (it drives capture directly, not through the session
+            // executor's automatic segmentation already covered by
+            // `qmoe_grouped_capture_support_denied_before_warmup_with_reason`
+            // and friends) -- a nonzero `fallbacks` here would mean
+            // `capture_support()` declined on an already-warmed kernel and
+            // is asserted against above before any timing is trusted.
+            println!(
+                "QMOE_CAPTURE_BW model_shape={} M={} capture_reps={} capture_median_us={:.3} \
+                 capture_range_us=[{:.3},{:.3}] iterations={} replay_median_us={:.3} \
+                 replay_host_us={:.3} range_us=[{:.3},{:.3}] eager_median_us={:.3} \
+                 eager_host_us={:.3} host_gap_cut_pct={:.2} achieved_GBps_dedup={:.1} \
+                 pct_of_theoretical_memory_bw_dedup={:.2} achieved_GBps_no_dedup={:.1} \
+                 pct_of_theoretical_memory_bw_no_dedup={:.2} distinct_experts={} \
+                 total_routes={} captures=1 replays={} fallbacks=0 capture_supported=true \
+                 correctness=pass",
+                shape.name,
+                rows,
+                capture_reps,
+                capture_median_us,
+                capture_range_us.0,
+                capture_range_us.1,
+                reps * batch,
+                replay_gpu_us,
+                replay_host_us,
+                range_us.0,
+                range_us.1,
+                eager_gpu_us,
+                eager_host_us,
+                host_gap_cut_pct,
+                gbps_dedup,
+                pct_dedup,
+                gbps_no_dedup,
+                pct_no_dedup,
+                distinct.len(),
+                total_routes,
+                reps * batch,
+            );
+            if pct_dedup > 100.0 {
+                eprintln!(
+                    "WARNING: {} M={} replay achieved {:.1}% of peak under the dedup byte \
+                     hypothesis; see the identical warning in \
+                     `qmoe_expert_gemv_bandwidth_probe` for why this falsifies the dedup byte \
+                     count, not the hardware limit",
+                    shape.name, rows, pct_dedup
+                );
+            }
+
+            setup.teardown(&ep).unwrap();
+        }
+    }
+}
+
 #[cfg_attr(
     not(feature = "gpu-tests"),
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
@@ -2772,6 +3178,508 @@ fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
     // correctly (proves the stream itself is still healthy, not just plain
     // htod/dtoh).
     let case = qmoe_64expert_case(8);
+    let inputs = case_inputs(case, dtype);
+    let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+    let actual = run_gpu(&ep, case, &inputs, dtype).unwrap();
+    assert_conforms(&actual, &expected, case, dtype);
+}
+
+// ---------------------------------------------------------------------------
+// Grouped (M>=2) QMoE CUDA-graph capture-eligibility property (issue #82
+// follow-up to #1777/#1788).
+//
+// `QMoEKernel::capture_support()` returns `Supported` purely from a
+// row-count-agnostic `warmed` flag set by any prior non-capturing `execute()`
+// call. This is safe for the grouped/gather-scatter path (M>1) specifically
+// because:
+//   1. Every grouped-path launch grid (`launch_grouping`/`launch_gather`/
+//      `launch_grouped_linear`/`launch_linear`) is sized from HOST-KNOWN
+//      static shape values (`routes`, `experts`, `tasks = experts *
+//      out_features`), never from a device-computed per-expert count read
+//      back to the host -- the actual sparse/empty-expert distribution is
+//      handled by in-kernel bounds checks, not a smaller/dynamic launch grid.
+//      No launch-shape instability, no host dependency on device state.
+//   2. `ScratchPool::ensure(.., capturing)` rejects (loud `Err`, not a silent
+//      grow) any capacity increase while `capturing == true` (see `qmoe.rs`);
+//      the framework's own per-shape `KernelKey` cache (`kernel_cache.rs`,
+//      "Chew's guarantee") additionally never reuses a kernel instance for a
+//      DIFFERENT shape than it was compiled/warmed for in production, so this
+//      reject path is a defense-in-depth backstop, not the primary safety
+//      argument -- both are exercised directly below.
+//   3. The only host readback in `execute()` (`dump_route_selection`) is
+//      gated `if !capturing`, and the trailing `synchronize()` is gated the
+//      same way -- no hidden sync/drain in the captured region.
+//   4. No new global/second synchronization or allocation authority is used
+//      -- capture-time growth rejection and the post-call `synchronize()`
+//      gate are the SAME mechanisms already used on the eager path.
+//
+// The tests below exercise every taxonomy category from the capture
+// rejection enumeration this cycle derived: dynamic allocation/growth
+// (`..rejects_shape_growth..`), hidden sync/drain
+// (`..never_syncs_even_with_deferral_disabled`), missing runtime hook /
+// warm-up precondition (`..capture_support_denied_before_warmup..`),
+// consecutive graphs + repeated replay + allocator/accounting stability
+// (`..repeated_replays_and_consecutive_capture_cycles..`), eager-after-
+// capture (`..eager_execute_after_capture_replay..`), and drop/teardown
+// (`..drop_kernel_after_capture_replay..`). No M/model allowlist appears
+// anywhere below or in `qmoe.rs`: every check is driven by the kernel's own
+// `capture_support()`/`ScratchPool` state, independent of which `Case` shape
+// is in play.
+// ---------------------------------------------------------------------------
+
+/// RAII guard around a `begin_graph_capture`/`end_graph_capture` window: if
+/// dropped while still armed (i.e. before `.end()`/`.abort()` is explicitly
+/// called), it calls `abort_graph_capture()` itself. Several tests below
+/// deliberately assert on a capture-time call that is EXPECTED to fail (or
+/// panic if a real safety regression makes it unexpectedly succeed) --
+/// without this guard, that panic would unwind past a bare
+/// `runtime.end_graph_capture()`/`abort_graph_capture()` call and leave the
+/// stream stuck mid-capture (and any buffers allocated for the attempt
+/// unfreed) for the rest of that test's unwind, right at the moment the
+/// safety property under test has actually broken and clean diagnostics
+/// matter most.
+struct CaptureGuard<'a> {
+    runtime: &'a CudaRuntime,
+    armed: bool,
+}
+
+impl<'a> CaptureGuard<'a> {
+    fn begin(
+        runtime: &'a CudaRuntime,
+        kernels: &[&dyn onnx_runtime_ep_api::Kernel],
+    ) -> onnx_runtime_ep_api::Result<Self> {
+        runtime.begin_graph_capture(kernels)?;
+        Ok(Self {
+            runtime,
+            armed: true,
+        })
+    }
+
+    /// Successfully install the captured graph. Disarms the guard so `Drop`
+    /// does not also try to abort an already-ended capture.
+    fn end(mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.armed = false;
+        self.runtime.end_graph_capture()
+    }
+
+    /// Explicitly abort (the expected outcome for the rejection tests
+    /// below). Disarms the guard so `Drop` does not double-abort.
+    fn abort(mut self) -> onnx_runtime_ep_api::Result<()> {
+        self.armed = false;
+        self.runtime.abort_graph_capture()
+    }
+}
+
+impl Drop for CaptureGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.runtime.abort_graph_capture();
+        }
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_capture_support_denied_before_warmup_with_reason() {
+    // A freshly built kernel (never `execute()`d) must not claim capture
+    // support, and the SAME reason must independently block the runtime-level
+    // `begin_graph_capture` audit -- proving the rejection is enforced
+    // structurally (via `capture.rs::require_subgraph_graph_capturable`), not
+    // just advisory at the kernel level. This is the "missing runtime hook"
+    // rejection reason in this cycle's taxonomy: nothing about M or grouping
+    // decides it, only whether an eager pass has sized scratch and compiled
+    // every routed expert kernel.
+    let ep = require_cuda();
+    let template = qmoe_64expert_case(4);
+    let kernel = build_qmoe_kernel(&ep, template, DataType::Float16);
+
+    let support = kernel.capture_support();
+    assert!(!support.is_supported());
+    let reason = support.reason().expect("unsupported must carry a reason");
+    assert!(
+        reason.contains("warmed"),
+        "unexpected capture_support reason before warmup: {reason}"
+    );
+
+    let runtime = ep.runtime();
+    let error = runtime
+        .begin_graph_capture(&[kernel.as_ref()])
+        .expect_err("capture must be rejected before any warm-up pass");
+    assert!(
+        error.to_string().contains("warmed"),
+        "unexpected begin_graph_capture rejection: {error}"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_capture_rejects_shape_growth_without_corrupting_kernel() {
+    // Production never hands one kernel instance two different shapes mid-
+    // capture (the executor's per-shape `KernelKey` cache guarantees a
+    // captured instance only ever sees the exact shape it was warmed at --
+    // see `kernel_cache.rs`), but `ScratchPool::ensure`'s reject-on-grow-
+    // during-capture path is the load-bearing defense if that invariant were
+    // ever violated, so it must be exercised directly rather than only
+    // trusted from the framework side. Warm one instance at a SMALL grouped
+    // shape, begin capture, then request a LARGER shape on the very same
+    // instance: `execute()` must return `Err` (never silently reallocate
+    // mid-capture, which would misalign the replayed graph's baked-in
+    // pointers), and the kernel must remain fully usable afterward.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let template = qmoe_64expert_case(2);
+    let kernel = build_qmoe_kernel(&ep, template, dtype);
+
+    let warm_inputs = case_inputs(template, dtype);
+    let warm_expected = run_cpu(template, &rounded_cpu_inputs(&warm_inputs, dtype));
+    let warm_actual =
+        enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &warm_inputs, dtype)
+            .unwrap()
+            .read_back_and_free(&ep)
+            .unwrap();
+    assert_conforms(&warm_actual, &warm_expected, template, dtype);
+    assert!(
+        kernel.capture_support().is_supported(),
+        "kernel must claim capture support once warmed"
+    );
+
+    let runtime = ep.runtime();
+
+    // Prepare the LARGER shape's device buffers and upload them BEFORE
+    // touching capture at all: `ep.allocate`/`htod` are not capture-safe
+    // operations (real device allocation, and a host<->device transfer) and
+    // must never run inside a begin/end capture window -- only
+    // `kernel.execute()` itself runs inside capture below, matching every
+    // other capture test in this file (`run_gpu_impl`'s `capture` branch and
+    // `GemvBenchSetup`/`setup_gemv_bench`, which allocate once, outside any
+    // timed/captured region, precisely so the capture window only ever
+    // contains the kernel launch itself).
+    let mut larger = template;
+    larger.rows = 8;
+    let larger_inputs = case_inputs(larger, dtype);
+    let mut larger_buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in &larger_inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256).unwrap();
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr())).unwrap() };
+            larger_buffers.push(Some(buffer));
+        } else {
+            larger_buffers.push(None);
+        }
+    }
+    let larger_strides: Vec<_> = larger_inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let larger_views: Vec<_> = larger_inputs
+        .iter()
+        .zip(&larger_buffers)
+        .zip(&larger_strides)
+        .enumerate()
+        .map(
+            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
+                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    ep.device_id(),
+                ),
+                _ => TensorView::absent(absent_dtype(index, dtype)),
+            },
+        )
+        .collect();
+    let larger_output_shape = [larger.rows, larger.hidden];
+    let larger_output_bytes = larger.rows * larger.hidden * dtype.byte_size();
+    let mut larger_output_buffer = ep.allocate(larger_output_bytes, 256).unwrap();
+    let larger_output_strides = compute_contiguous_strides(&larger_output_shape);
+
+    let guard = CaptureGuard::begin(runtime, &[kernel.as_ref()]).unwrap();
+    let error = match kernel.execute(
+        &larger_views,
+        &mut [TensorMut::new(
+            DevicePtrMut(larger_output_buffer.as_mut_ptr()),
+            dtype,
+            &larger_output_shape,
+            &larger_output_strides,
+            ep.device_id(),
+        )],
+    ) {
+        Ok(()) => panic!(
+            "growing scratch capacity mid-capture must be rejected, not silently reallocated"
+        ),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("warmed capacity"),
+        "unexpected rejection message: {error}"
+    );
+    guard
+        .abort()
+        .expect("abort must succeed after a rejected in-capture growth attempt");
+
+    drop(larger_views);
+    for buffer in larger_buffers.into_iter().flatten() {
+        ep.deallocate(buffer).unwrap();
+    }
+    ep.deallocate(larger_output_buffer).unwrap();
+
+    // The kernel must still be correct afterward, at the ORIGINAL warmed
+    // shape, proving the rejected growth attempt left no partial state.
+    let post_inputs = case_inputs(template, dtype);
+    let post_expected = run_cpu(template, &rounded_cpu_inputs(&post_inputs, dtype));
+    let post = enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &post_inputs, dtype)
+        .unwrap()
+        .read_back_and_free(&ep)
+        .unwrap();
+    assert_conforms(&post, &post_expected, template, dtype);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_capture_never_syncs_even_with_deferral_disabled() {
+    // Regression test for the "no host sync/drain in captured region"
+    // taxonomy category: `execute()`'s trailing `synchronize()` call is
+    // gated `if !capturing` (`src/kernels/qmoe.rs`), but under the DEFAULT
+    // `ONNX_GENAI_DEFER_EAGER_SYNC=1` config, `CudaRuntime::synchronize` is
+    // ALSO already a no-op regardless of `capturing` (#1383) -- so exercising
+    // capture only under the default config could never distinguish "the
+    // capturing gate works" from "synchronize() never blocks anyway". Force
+    // `defer_eager_sync` off (a REAL, blocking synchronize on any call) and
+    // confirm grouped-shape capture still records and replays cleanly: a
+    // real device sync issued while stream capture is active is illegal and
+    // CUDA itself would fail `end_graph_capture`/corrupt the recording, so
+    // success here is direct proof the `if !capturing` gate is doing its job,
+    // not an artifact of the deferred-sync default.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let runtime = ep.runtime();
+    let case = qmoe_64expert_case(4);
+    let inputs = case_inputs(case, dtype);
+    // `setup_gemv_bench` allocates every buffer and does its warm-up
+    // `execute()` call ONCE, up front -- so the only thing that runs between
+    // `begin_graph_capture`/`end_graph_capture` below is `execute_once()`
+    // itself (a bare `kernel.execute()` against already-resident buffers),
+    // never a device allocation or host->device copy, matching the
+    // capture-safety contract every other capture path in this crate relies
+    // on.
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+    assert!(setup.kernel.capture_support().is_supported());
+
+    runtime.set_defer_eager_sync(false);
+    let outcome = (|| -> onnx_runtime_ep_api::Result<()> {
+        runtime.begin_graph_capture(&[setup.kernel.as_ref()])?;
+        if let Err(error) = setup.execute_once() {
+            let _ = runtime.abort_graph_capture();
+            return Err(error);
+        }
+        runtime.end_graph_capture()?;
+        runtime.replay_graph()
+    })();
+    runtime.set_defer_eager_sync(true);
+    outcome.expect(
+        "grouped-shape capture+replay must succeed with real (non-deferred) synchronize \
+         semantics; a failure here means execute() issued a blocking device sync mid-capture",
+    );
+
+    let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+    runtime.reset_graph().unwrap();
+    let bytes = setup.teardown(&ep).unwrap();
+    let actual = decode_output_bytes(&bytes, dtype);
+    assert_conforms(&actual, &expected, case, dtype);
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_capture_repeated_replays_and_consecutive_capture_cycles_stay_correct() {
+    // Covers: repeated replay stability, consecutive graphs (capture ->
+    // replay -> reset -> capture again, 3x), and a basic device-memory
+    // accounting check (no growth across cycles once warmed). Buffers are
+    // allocated exactly once by `setup_gemv_bench`, before the first
+    // capture, and reused unchanged for every cycle/replay below -- only
+    // `execute_once()`/`replay_graph()` run inside a capture window.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let runtime = ep.runtime();
+    let case = qmoe_64expert_case(8);
+    let inputs = case_inputs(case, dtype);
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+    assert!(setup.kernel.capture_support().is_supported());
+    let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+
+    let (free_before, _) = cudarc::driver::result::mem_get_info().unwrap();
+
+    for cycle in 0..3 {
+        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        setup
+            .execute_once()
+            .unwrap_or_else(|error| panic!("cycle {cycle}: capture-time execute failed: {error}"));
+        guard.end().unwrap();
+
+        let mut previous: Option<Vec<f32>> = None;
+        for replay in 0..5 {
+            runtime.replay_graph().unwrap();
+            let mut bytes = vec![0u8; setup.output_bytes];
+            // SAFETY: `setup.output_buffer` is sized `setup.output_bytes` for
+            // this fixed `[rows, hidden]` shape throughout the test.
+            unsafe {
+                runtime
+                    .dtoh(&mut bytes, cuptr(setup.output_buffer.as_ptr()))
+                    .unwrap();
+            }
+            let actual = decode_output_bytes(&bytes, dtype);
+            assert_conforms(&actual, &expected, case, dtype);
+            if let Some(previous) = &previous {
+                assert_eq!(
+                    &actual, previous,
+                    "cycle {cycle} replay {replay}: repeated replay output drifted"
+                );
+            }
+            previous = Some(actual);
+        }
+
+        runtime.reset_graph().unwrap();
+    }
+
+    let (free_after, _) = cudarc::driver::result::mem_get_info().unwrap();
+    let shrink = free_before.saturating_sub(free_after);
+    assert!(
+        shrink < 64 * 1024 * 1024,
+        "device free memory shrank by {shrink} bytes across 3 capture/replay cycles on an \
+         already-warmed kernel; possible per-cycle leak (free_before={free_before}, \
+         free_after={free_after})"
+    );
+
+    setup.teardown(&ep).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_eager_execute_after_capture_replay_still_correct() {
+    // After a capture/replay lifecycle completes and the graph is reset, the
+    // SAME kernel instance must still work correctly when invoked eagerly
+    // (not through `replay_graph`) with freshly-routed input -- proving the
+    // graph lifecycle leaves no residual state (a stuck `warmed` flag pointed
+    // at stale scratch, a poisoned capture-error latch, etc.) that corrupts
+    // subsequent ordinary calls.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let runtime = ep.runtime();
+    let case = qmoe_64expert_case(4);
+    let inputs = case_inputs(case, dtype);
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+
+    let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+    setup.execute_once().unwrap();
+    guard.end().unwrap();
+    runtime.replay_graph().unwrap();
+    runtime.reset_graph().unwrap();
+    {
+        // Prove the just-replayed output is correct before moving on to the
+        // eager call below, rather than silently assuming the replay fired.
+        let mut bytes = vec![0u8; setup.output_bytes];
+        // SAFETY: `setup.output_buffer` is sized `setup.output_bytes`.
+        unsafe {
+            runtime
+                .dtoh(&mut bytes, cuptr(setup.output_buffer.as_ptr()))
+                .unwrap();
+        }
+        let actual = decode_output_bytes(&bytes, dtype);
+        let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+        assert_conforms(&actual, &expected, case, dtype);
+    }
+
+    let mut eager_inputs = case_inputs(case, dtype);
+    eager_inputs[1] = Some(router_with_top_experts(case, 16));
+    let expected = run_cpu(case, &rounded_cpu_inputs(&eager_inputs, dtype));
+    let actual =
+        enqueue_with_existing_kernel(&ep, setup.kernel.as_ref(), case, &eager_inputs, dtype)
+            .unwrap()
+            .read_back_and_free(&ep)
+            .unwrap();
+    assert_conforms(&actual, &expected, case, dtype);
+
+    assert!(
+        setup.kernel.capture_support().is_supported(),
+        "capture_support() must still honestly report Supported after an eager call following \
+         a capture/replay lifecycle"
+    );
+
+    setup.teardown(&ep).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_grouped_drop_kernel_after_capture_replay_leaves_runtime_usable() {
+    // Drop a captured-and-replayed QMoE kernel WITHOUT reading its last
+    // replay back first, then prove the runtime/stream is still healthy for
+    // a completely independent follow-up kernel + graph lifecycle. `Drop for
+    // QMoEKernel`'s best-effort drain (from the prior #1777/#1788 cycles)
+    // must still retire this kernel's scratch correctly even though its last
+    // launches were REPLAYED (not directly executed) launches.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let case = qmoe_64expert_case(4);
+    {
+        let runtime = ep.runtime();
+        let inputs = case_inputs(case, dtype);
+        let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+
+        let guard = CaptureGuard::begin(runtime, &[setup.kernel.as_ref()]).unwrap();
+        setup.execute_once().unwrap();
+        guard.end().unwrap();
+        runtime.replay_graph().unwrap();
+        // Deliberately do not read back before dropping: exercises the same
+        // still-possibly-in-flight-launch drop path as
+        // `qmoe_drop_after_inflight_launch_leaves_runtime_usable` above, but
+        // for a REPLAYED (not directly executed) launch. `free_without_readback`
+        // frees `setup`'s buffers through the provider's deferred-release
+        // queue (mirroring `PendingExecution::free_without_readback`) without
+        // forcing a synchronize first, so this still exercises
+        // `QMoEKernel::drop`'s best-effort drain on a possibly-still-in-flight
+        // replay -- the thing actually under test -- without leaking the
+        // buffers for the rest of this process.
+        runtime.reset_graph().unwrap();
+        setup.free_without_readback(&ep).unwrap();
+    }
+
+    let runtime = ep.runtime();
+    let probe_bytes: Vec<u8> = (0u8..=255).collect();
+    let buffer = ep.allocate(probe_bytes.len(), 256).unwrap();
+    // SAFETY: allocation size equals `probe_bytes.len()`.
+    unsafe { runtime.htod(&probe_bytes, cuptr(buffer.as_ptr())).unwrap() };
+    let mut readback = vec![0u8; probe_bytes.len()];
+    // SAFETY: `buffer` was sized `probe_bytes.len()`.
+    unsafe { runtime.dtoh(&mut readback, cuptr(buffer.as_ptr())).unwrap() };
+    assert_eq!(
+        readback, probe_bytes,
+        "runtime state corrupted after captured-kernel drop"
+    );
+    ep.deallocate(buffer).unwrap();
+
     let inputs = case_inputs(case, dtype);
     let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
     let actual = run_gpu(&ep, case, &inputs, dtype).unwrap();

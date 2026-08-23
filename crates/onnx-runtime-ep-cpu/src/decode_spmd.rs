@@ -637,6 +637,15 @@ pub struct SpmdDecodePools {
     dispatcher_shard: Option<usize>,
     total_workers: usize,
     schedule: DecodeSchedule,
+    /// The CPU each spawned worker was pinned to, global-worker-index order, or
+    /// `None` for an unpinned worker.
+    ///
+    /// Retained purely so the realized *placement* can be asserted. The pool
+    /// already reports its realized *width* (`decode_width`, `as_requested`),
+    /// and #1792 was the case where that report was honest while the placement
+    /// underneath it was not -- the count was never the thing that was wrong.
+    /// A label nothing can check is a label that drifts.
+    worker_cpus: Vec<Option<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -728,6 +737,12 @@ impl SpmdDecodePools {
                 node_worker_counts: node_thread_counts.clone(),
                 node_thread_counts,
                 dispatcher_shard: None,
+                // The work-stealing pool spawns and places its own threads; we
+                // assign no pin target, so there is no placement of ours to
+                // report. Empty (rather than a vec of `None`) says "no claim"
+                // instead of "claimed nothing", and `worker_cpus()` documents
+                // the distinction.
+                worker_cpus: Vec::new(),
                 total_workers: total_threads,
                 schedule,
             };
@@ -751,14 +766,26 @@ impl SpmdDecodePools {
         });
 
         let mut handles = Vec::with_capacity(total_threads);
+        let mut worker_cpus: Vec<Option<usize>> = assignment.iter().map(|&(_, cpu)| cpu).collect();
+        // A pin target is a request, and this whole change exists because a
+        // request nobody verified is how #1729 and #1792 stayed invisible. So
+        // let each worker retract its own target if the pin actually failed,
+        // and report what the pool *realized* rather than what it intended.
+        // Read-back needs no further synchronization: a worker records this
+        // before incrementing `ready`, and the builder below waits on `ready`
+        // with `Acquire`.
+        let pin_failed: Arc<Vec<AtomicBool>> =
+            Arc::new((0..total_threads).map(|_| AtomicBool::new(false)).collect());
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
+            let pin_failed = Arc::clone(&pin_failed);
             let handle = thread::Builder::new()
                 .name(format!("onnx-genai-spmd-n{node_position}-{global_index}"))
                 .spawn(move || {
                     if let Some(cpu) = cpu
                         && let Err(message) = crate::decode_affinity::pin_current_thread_to_cpu(cpu)
                     {
+                        pin_failed[global_index].store(true, Ordering::Relaxed);
                         report_spmd_fallback(&format!(
                             "worker {global_index} could not pin to cpu {cpu}: {message}"
                         ));
@@ -778,6 +805,15 @@ impl SpmdDecodePools {
             std::hint::spin_loop();
         }
 
+        // Every worker has now recorded its pin outcome (it does so before
+        // incrementing `ready`, which the `Acquire` load above synchronizes
+        // with), so retract the targets that were not achieved.
+        for (slot, failed) in worker_cpus.iter_mut().zip(pin_failed.iter()) {
+            if failed.load(Ordering::Relaxed) {
+                *slot = None;
+            }
+        }
+
         // Snapshot the worker `Thread`s for teardown join only; the hot dispatch
         // path wakes workers via the per-node futex, not per-thread `unpark`.
         Self {
@@ -790,12 +826,74 @@ impl SpmdDecodePools {
             dispatcher_shard,
             total_workers,
             schedule,
+            worker_cpus,
         }
     }
 
     /// Total decode workers across all node groups.
     pub fn total_workers(&self) -> usize {
         self.total_workers
+    }
+
+    /// The CPU each spawned worker is *actually* pinned to, in global worker
+    /// index order.
+    ///
+    /// `None` in a slot means that worker is unpinned -- either it was never
+    /// assigned a target, or it was assigned one and the pin call failed, in
+    /// which case the target is retracted here rather than reported as
+    /// placement. That distinction is the point: reporting an intended pin as a
+    /// realized one would reproduce, inside the very mechanism built to catch
+    /// it, the unverified-label defect of #1729 and #1792.
+    ///
+    /// An **empty** slice means the pool makes no placement claim at all (the
+    /// `mlas` work-stealing pool places its own threads); an **all-`None`**
+    /// slice means this pool spawned workers and deliberately left them free
+    /// (`ONNX_GENAI_CPU_DECODE_AFFINITY=off`, or a host without pinning).
+    ///
+    /// See [`Self::placement_is_one_worker_per_physical_core`].
+    pub fn worker_cpus(&self) -> &[Option<usize>] {
+        &self.worker_cpus
+    }
+
+    /// Whether the pinned workers occupy distinct physical cores.
+    ///
+    /// `None` only when the question is unanswerable: an unpinned pool (no
+    /// placement claim to check) or an undiscoverable core topology.
+    /// `Some(false)` states literally that at least two pinned workers share a
+    /// core's front end. It is deliberately not qualified by whether that was
+    /// avoidable -- a pool asked for more workers than the host has cores must
+    /// still admit that it doubled up. The caller knows the budget; this does
+    /// not, and inferring it from the pinned set alone is circular, because a
+    /// collapsed placement covers exactly as few cores as it landed on.
+    ///
+    /// This is the placement counterpart to `decode_width().is_as_requested()`.
+    /// Width was always reported and asserted; placement was neither, and #1792
+    /// is what that costs -- a pool can report `realized=16 as_requested` while
+    /// running on half the cores it claims.
+    pub fn placement_is_one_worker_per_physical_core(&self) -> Option<bool> {
+        let cores = crate::core_topology::host()?;
+        let pinned: Vec<usize> = self.worker_cpus.iter().flatten().copied().collect();
+        if pinned.is_empty() {
+            return None;
+        }
+        // A pool that pinned only *some* of its workers has not established the
+        // property, and must not be scored on its pinned subset alone: a free
+        // worker is schedulable onto any core, including one a pinned worker
+        // already owns. Judging the subset would let a pool with an entirely
+        // unplaced node report `Some(true)` -- count honest, placement
+        // unexamined, the same half-answer this predicate exists to end.
+        // All-unpinned is a different case and returned `None` above: no claim,
+        // rather than a broken one.
+        if pinned.len() < self.worker_cpus.len() {
+            return Some(false);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        Some(pinned.iter().all(|&cpu| {
+            let core: Vec<usize> = cores
+                .siblings_of(cpu)
+                .map_or_else(|| vec![cpu], <[usize]>::to_vec);
+            seen.insert(core)
+        }))
     }
 
     /// Number of node groups in the layout.
@@ -1947,6 +2045,161 @@ fn explicit_decode_affinity_set() -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// What an explicit [`DECODE_AFFINITY_ENV`] request means for the persistent
+/// pool's CPU set.
+///
+/// Kept pure and separate from topology so the precedence is unit-tested
+/// without env races or a particular host, in the same style as
+/// [`persistence_mode_from_raw`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExplicitAffinity {
+    /// Unset, empty, or `numa-split`: the existing default placement already
+    /// implements it, so nothing is overridden.
+    DeferToDefault,
+    /// `off`: the user asked for unpinned workers, so the pool must not pin.
+    Unpinned,
+    /// `compact` / `node:<index>`: the CPU set comes from the shared planner,
+    /// which owns topology detection and the allowed-set intersection.
+    FromPlan,
+    /// A value that is not a selector at all. Placement defers exactly as for
+    /// `DeferToDefault`, but the caller reports it: a typo is precisely the
+    /// case a user needs told about, and silence here is how this knob went
+    /// unnoticed for so long.
+    Malformed,
+}
+
+/// Map a raw [`DECODE_AFFINITY_ENV`] value to its meaning for this path.
+///
+/// `numa-split` defers because [`node_shards`]'s multi-node branch *is* the
+/// numa-split layout; deferring keeps one implementation rather than two that
+/// can drift.
+///
+/// An unparseable value defers too, rather than being rejected: turning a bad
+/// env var into "decode silently unpinned" would be worse than ignoring it.
+/// It is reported as [`ExplicitAffinity::Malformed`] rather than folded into
+/// `DeferToDefault` so the caller can still say so out loud.
+fn explicit_affinity_request(raw: Option<&str>) -> ExplicitAffinity {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return ExplicitAffinity::DeferToDefault;
+    };
+    match crate::decode_affinity::DecodeAffinity::parse(Some(raw)) {
+        Ok(crate::decode_affinity::DecodeAffinity::Off) => ExplicitAffinity::Unpinned,
+        Ok(crate::decode_affinity::DecodeAffinity::Compact)
+        | Ok(crate::decode_affinity::DecodeAffinity::Node(_)) => ExplicitAffinity::FromPlan,
+        Ok(crate::decode_affinity::DecodeAffinity::NumaSplit) => ExplicitAffinity::DeferToDefault,
+        Err(_) => ExplicitAffinity::Malformed,
+    }
+}
+
+/// Resolve the shards an explicit affinity request asks for, or `None` to leave
+/// the default placement in charge.
+///
+/// This is the fix for the case where `ONNX_GENAI_CPU_DECODE_AFFINITY` was
+/// parsed for nothing on the default pool: the worker CPUs came straight from
+/// `sched_getaffinity`, so `off`, `compact` and `node:<index>` all produced
+/// byte-identical placement. Only the *CPU set* is decided here -- how workers
+/// are then laid out across it stays with the placement policy, so the two
+/// concerns do not have to know about each other.
+fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
+    let raw = std::env::var(crate::decode_affinity::DECODE_AFFINITY_ENV).ok();
+    let request = explicit_affinity_request(raw.as_deref());
+    if request == ExplicitAffinity::Malformed {
+        // Re-parse purely for the message, so the accepted-modes menu stays
+        // owned by `decode_affinity` rather than restated here.
+        if let Err(message) =
+            crate::decode_affinity::DecodeAffinity::parse(raw.as_deref().map(str::trim))
+        {
+            crate::kernels::matmul_nbits::report_decode_affinity_policy(&format!(
+                "{message}; the persistent decode pool is using default placement instead"
+            ));
+        }
+    }
+    explicit_affinity_shards_for(
+        request,
+        total,
+        || match crate::decode_affinity::plan_decode_affinity(total) {
+            Ok(plan) => {
+                if let Some(message) = plan.log {
+                    crate::kernels::matmul_nbits::report_decode_affinity_policy(&message);
+                }
+                plan.cpus
+            }
+            // The flat path propagates this as a hard error. Here the request is
+            // still reported -- deferring silently is how this knob went inert
+            // in the first place -- but the pool falls back to default placement
+            // rather than refusing to start decode over a placement preference.
+            Err(message) => {
+                crate::kernels::matmul_nbits::report_decode_affinity_policy(&format!(
+                    "{message}; the persistent decode pool is using default placement instead"
+                ));
+                None
+            }
+        },
+        crate::decode_affinity::allowed_cpus,
+    )
+}
+
+/// The shard decision itself, with topology supplied by the caller.
+///
+/// Split from [`explicit_affinity_shards`] for the reason given on
+/// [`parse_decode_blocktime`]: the env read is the only impure part, so keeping
+/// it out means the precedence can be tested exhaustively without `set_var` and
+/// without depending on the test host's NUMA layout.
+fn explicit_affinity_shards_for(
+    request: ExplicitAffinity,
+    total: usize,
+    planned_cpus: impl FnOnce() -> Option<Vec<usize>>,
+    allowed_cpus: impl FnOnce() -> Option<Vec<usize>>,
+) -> Option<Vec<NodeShard>> {
+    match request {
+        ExplicitAffinity::DeferToDefault | ExplicitAffinity::Malformed => None,
+        // An empty CPU list is how `SpmdDecodePools::build_with_schedule` reads
+        // "do not pin": it resolves `cpus.get(worker % len.max(1))` to `None`
+        // and skips the pin, keeping every worker.
+        //
+        // The worker *count* is still reserved against the allowed set, because
+        // `off` means "do not pin", not "also run wider". Dropping the
+        // reservation here would add an oversubscription mode that does not
+        // exist today: under an external `taskset` of K CPUs with a requested
+        // width of K, the pool would run K spinning workers plus the inline
+        // dispatcher on K CPUs, and the dispatcher's preemption makes it the
+        // straggler the whole barrier waits on. Reserving costs nothing on an
+        // unconfined host, where an explicit request already stands the
+        // process self-confinement down (`bound_process_to_decode_budget`) and
+        // the allowed set is the whole machine.
+        ExplicitAffinity::Unpinned => {
+            let allowed = allowed_cpus().unwrap_or_default();
+            let core_count = crate::core_topology::host()
+                .map_or(0, |cores| cores.leaders_within(&allowed).len());
+            let workers = reserve_single_group_headroom(total, allowed.len(), core_count);
+            Some(vec![NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers,
+            }])
+        }
+        ExplicitAffinity::FromPlan => {
+            let cpus = planned_cpus()?;
+            if cpus.is_empty() {
+                return None;
+            }
+            // Order through the same spread the default path uses. An explicit
+            // request selects *which* CPUs, never how workers are laid out
+            // across them; without this, `compact` would pin two workers per
+            // physical core and quietly reintroduce the defect #1729 fixed.
+            let cores = crate::core_topology::host();
+            let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
+            let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
+            let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
+            Some(vec![NodeShard {
+                index: 0,
+                cpus,
+                workers,
+            }])
+        }
+    }
+}
+
 /// Resolve the node shards for `total` workers: the multi-node split when the
 /// (cpuset-restricted) topology exposes >=2 nodes, otherwise a single group.
 ///
@@ -1956,7 +2209,29 @@ fn explicit_decode_affinity_set() -> bool {
 /// that reservation a fully-subscribed cpuset (workers == allowed CPUs) pins a
 /// spinning worker on every core, starving the dispatcher and collapsing
 /// throughput.
+///
+/// An explicit affinity request is resolved first (see
+/// [`explicit_affinity_shards`]); it selects the CPU *set*, and the worker
+/// count is still capped by the same reservation.
 fn node_shards(total: usize) -> Vec<NodeShard> {
+    node_shards_with(total, explicit_affinity_shards)
+}
+
+/// [`node_shards`] with the explicit-request lookup injected.
+///
+/// The seam exists so a test can prove the request is *consulted at all*. That
+/// is the whole defect in #1792: the helpers below can each be correct while
+/// `node_shards` never calls them, and every unit test of the helpers still
+/// passes. Deleting the early return has to fail something.
+fn node_shards_with(
+    total: usize,
+    explicit: impl FnOnce(usize) -> Option<Vec<NodeShard>>,
+) -> Vec<NodeShard> {
+    // An explicit request wins over the default placement. Without this the
+    // persistent pool reads the env var for exactly nothing.
+    if let Some(shards) = explicit(total) {
+        return shards;
+    }
     let allowed = crate::decode_affinity::allowed_cpus();
     let cores = crate::core_topology::host();
     if let Some(topology) = NumaTopology::detect() {
@@ -2691,6 +2966,530 @@ mod tests {
         assert_eq!(reserve_single_group_headroom(16, 8, 4), 7);
         // Single-core cpuset still yields a worker rather than zero.
         assert_eq!(reserve_single_group_headroom(2, 2, 1), 1);
+    }
+
+    // --- #1792: the persistent pool must honor an explicit affinity request ---
+
+    /// Every accepted `ONNX_GENAI_CPU_DECODE_AFFINITY` value maps to the meaning
+    /// the module docs promise. `off` in particular must not be read as "no
+    /// request": the defect this fixes is that the pool pinned workers to
+    /// `sched_getaffinity` regardless, so `off` and an explicit node produced
+    /// byte-identical placement.
+    #[test]
+    fn every_accepted_affinity_value_reaches_the_persistent_pool() {
+        assert_eq!(
+            explicit_affinity_request(Some("off")),
+            ExplicitAffinity::Unpinned
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("compact")),
+            ExplicitAffinity::FromPlan
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("node:0")),
+            ExplicitAffinity::FromPlan
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("node:3")),
+            ExplicitAffinity::FromPlan
+        );
+        // `numa-split` defers because the multi-node branch of `node_shards`
+        // already *is* that layout -- deferring keeps one implementation.
+        assert_eq!(
+            explicit_affinity_request(Some("numa-split")),
+            ExplicitAffinity::DeferToDefault
+        );
+        // Surrounding whitespace is the same request, matching `DecodeAffinity`.
+        assert_eq!(
+            explicit_affinity_request(Some("  off  ")),
+            ExplicitAffinity::Unpinned
+        );
+    }
+
+    /// Unset, empty and unparseable all leave the default placement alone.
+    ///
+    /// The unparseable case is deliberate rather than incidental: rejecting it
+    /// here would turn a typo into silently-unpinned decode, whereas deferring
+    /// leaves the flat path free to report it with the full accepted menu.
+    #[test]
+    fn only_a_real_affinity_request_overrides_default_placement() {
+        assert_eq!(
+            explicit_affinity_request(None),
+            ExplicitAffinity::DeferToDefault
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("")),
+            ExplicitAffinity::DeferToDefault
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("   ")),
+            ExplicitAffinity::DeferToDefault
+        );
+        // A typo defers like the rest, but is distinguishable so the caller can
+        // report it instead of leaving the user with a silently ignored knob.
+        assert_eq!(
+            explicit_affinity_request(Some("node:notanumber")),
+            ExplicitAffinity::Malformed
+        );
+        assert_eq!(
+            explicit_affinity_request(Some("sideways")),
+            ExplicitAffinity::Malformed
+        );
+        assert!(
+            explicit_affinity_shards_for(
+                ExplicitAffinity::Malformed,
+                4,
+                || panic!("a malformed value must not consult topology"),
+                || panic!("a malformed value must not consult topology"),
+            )
+            .is_none(),
+            "a malformed value must leave default placement in charge"
+        );
+    }
+
+    /// `off` yields a shard with no CPUs, which is what
+    /// `SpmdDecodePools::build_with_schedule` reads as "do not pin", and keeps
+    /// every worker: unpinned workers cannot pin the dispatcher out of a core,
+    /// so there is nothing for the headroom reservation to protect.
+    #[test]
+    fn affinity_off_leaves_the_pool_unpinned_without_widening_it() {
+        // Plenty of headroom: 4 workers over 16 allowed CPUs.
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || Some((0..16).collect()),
+        )
+        .expect("`off` is an explicit request");
+        assert_eq!(shards.len(), 1);
+        assert!(
+            shards[0].cpus.is_empty(),
+            "`off` must produce no CPUs to pin to, got {:?}",
+            shards[0].cpus
+        );
+        assert_eq!(
+            shards[0].workers, 4,
+            "`off` must not narrow a pool with headroom"
+        );
+
+        // `off` means "do not pin", not "also run wider": a fully subscribed
+        // allowed set still reserves a slot for the inline dispatcher, because
+        // an unpinned spinning worker preempts it just as a pinned one does.
+        let saturated = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || Some(vec![0, 1, 2, 3]),
+        )
+        .expect("`off` is an explicit request");
+        assert!(saturated[0].cpus.is_empty());
+        assert!(
+            saturated[0].workers < 4,
+            "a saturated `off` pool must still leave the dispatcher somewhere to run, got {}",
+            saturated[0].workers
+        );
+
+        // No knowable allowed set (pinning unsupported): nothing to reserve
+        // against, so the requested width stands -- same as the default path.
+        let unknown = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || None,
+        )
+        .expect("`off` is an explicit request");
+        assert_eq!(unknown[0].workers, 4);
+    }
+
+    /// A `compact` / `node:<index>` request takes its CPU set from the shared
+    /// planner -- the one that owns topology detection and the allowed-set
+    /// intersection -- and is then laid out by the *same* spread the default
+    /// path uses, so an explicit request cannot pin two workers onto one
+    /// physical core (the defect #1729 fixed).
+    #[test]
+    fn a_planned_affinity_request_pins_to_the_planned_cpus() {
+        let planned = vec![8, 9, 10, 11];
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            4,
+            || Some(planned.clone()),
+            || panic!("a planned request must not consult the allowed set"),
+        )
+        .expect("a planned request is honored");
+        assert_eq!(shards.len(), 1);
+
+        // The request decides *which* CPUs: exactly the planned set, nothing
+        // invented and nothing dropped.
+        let mut got = shards[0].cpus.clone();
+        got.sort_unstable();
+        assert_eq!(got, planned, "the planned CPU set must be honored exactly");
+
+        // ...and the placement policy decides the order. Asserted as the
+        // property rather than by comparing against `order_pin_targets`, which
+        // would just be restating the implementation: the leading pin targets
+        // must land on *distinct physical cores*, so the first workers never
+        // share a front end. Dropping the spread from this arm fails here on
+        // any host with core topology.
+        if let Some(cores) = crate::core_topology::host() {
+            let core_count = cores.leaders_within(&planned).len();
+            let mut seen_cores = std::collections::BTreeSet::new();
+            for &cpu in &shards[0].cpus[..core_count] {
+                // Identify the core by its sibling group, not by
+                // `leaders_within(&[cpu])` -- that answers "the leader among
+                // *these* CPUs" and so returns `cpu` itself for a one-element
+                // slice, which would make this check vacuously pass.
+                let core: Vec<usize> = cores
+                    .siblings_of(cpu)
+                    .map_or_else(|| vec![cpu], <[usize]>::to_vec);
+                assert!(
+                    seen_cores.insert(core),
+                    "cpu {cpu} shares a physical core with an earlier pin target in {:?}",
+                    shards[0].cpus
+                );
+            }
+        }
+
+        // Fully subscribed (4 workers, 4 CPUs), so the inline dispatcher still
+        // gets headroom on the explicit path exactly as on the default one.
+        // Every topology branch of `reserve_single_group_headroom` agrees on 3
+        // here, whether the four CPUs are two SMT pairs, four cores, or a host
+        // with no discoverable core topology at all.
+        assert_eq!(
+            shards[0].workers, 3,
+            "an explicit request must not starve the dispatcher"
+        );
+
+        // With genuine headroom the requested count is untouched.
+        let roomy = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            2,
+            || Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            || panic!("a planned request must not consult the allowed set"),
+        )
+        .expect("a planned request is honored");
+        assert_eq!(roomy[0].workers, 2);
+    }
+
+    /// If the planner cannot produce a CPU set -- no topology, an empty
+    /// intersection, a platform without pinning -- the default placement stays
+    /// in charge rather than the pool silently running unpinned.
+    #[test]
+    fn an_unresolvable_plan_falls_back_to_default_placement() {
+        let no_allowed = || panic!("the allowed set is only for `off`");
+        assert!(
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || None, no_allowed)
+                .is_none()
+        );
+        assert!(
+            explicit_affinity_shards_for(
+                ExplicitAffinity::FromPlan,
+                4,
+                || Some(Vec::new()),
+                no_allowed
+            )
+            .is_none()
+        );
+        assert!(
+            explicit_affinity_shards_for(
+                ExplicitAffinity::DeferToDefault,
+                4,
+                || panic!("deferring must not consult the plan"),
+                || panic!("deferring must not consult the allowed set"),
+            )
+            .is_none(),
+            "deferring must consult nothing at all"
+        );
+    }
+
+    /// The regression this fixes, stated as the property that failed: two
+    /// different explicit requests must not produce identical placement.
+    ///
+    /// Before the fix both went through `sched_getaffinity` and were
+    /// byte-identical, which is why the knob could be inert without any test
+    /// noticing. Reverting `node_shards` to ignore the request makes this fail.
+    #[test]
+    fn different_affinity_requests_do_not_collapse_to_the_same_placement() {
+        let planned = || Some(vec![16, 17, 18, 19]);
+        let off =
+            explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, planned, || Some(vec![16]))
+                .expect("`off` is honored");
+        let node =
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, planned, || Some(vec![16]))
+                .expect("`node:<index>` is honored");
+        assert_ne!(
+            off[0].cpus, node[0].cpus,
+            "`off` and `node:<index>` must not resolve to the same CPU set"
+        );
+        assert!(off[0].cpus.is_empty());
+        let mut node_cpus = node[0].cpus.clone();
+        node_cpus.sort_unstable();
+        assert_eq!(node_cpus, vec![16, 17, 18, 19]);
+    }
+
+    /// Whether this environment can pin a thread to every one of `cpus`.
+    ///
+    /// Probes the pinning primitive *directly* rather than through the pool, so
+    /// it stays independent of the bookkeeping under test: a defect that made
+    /// `worker_cpus` report nothing must not also switch these tests off.
+    ///
+    /// It probes the exact CPUs the caller will use, not a representative one.
+    /// Under Miri the affinity shim accepts cpu 0 and rejects the rest, so a
+    /// single-CPU probe reports "pinning works" and the test then fails on the
+    /// sandbox's virtual topology instead of on the pool.
+    fn environment_can_pin(cpus: &[usize]) -> bool {
+        !cpus.is_empty()
+            && cpus.iter().all(|&cpu| {
+                std::thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
+                })
+                .join()
+                .unwrap_or(false)
+            })
+    }
+
+    /// A pool that reports its width honestly must also *place* honestly.
+    ///
+    /// #1792's lesson: `decode_width()` said `realized=16 as_requested` while
+    /// the workers sat on 8 physical cores, and nothing checked. The width was
+    /// never the thing that was wrong. This asserts the half that was missing.
+    #[test]
+    fn a_pinned_pool_places_one_worker_per_physical_core() {
+        let cpus: Vec<usize> = match crate::core_topology::host() {
+            // Two full physical cores' worth of CPUs, spread the way the
+            // placement policy spreads them.
+            Some(cores) if cores.core_count() >= 2 => crate::decode_affinity::order_pin_targets(
+                &(0..cores.logical_count()).collect::<Vec<_>>(),
+                Some(cores),
+            ),
+            _ => return,
+        };
+        let cores = crate::core_topology::host().expect("checked above");
+        let workers = cores.core_count().min(4);
+        if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
+            return;
+        }
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus,
+                workers,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        let pinned: Vec<usize> = pools.worker_cpus().iter().flatten().copied().collect();
+        assert_eq!(
+            pinned.len(),
+            workers,
+            "every worker of a pinned pool must have a pin target"
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            Some(true),
+            "pinned workers landed on {pinned:?}, which shares a physical core"
+        );
+        pools.shutdown();
+    }
+
+    /// The same predicate must be able to say *no*, or it is decoration.
+    #[test]
+    fn placement_reports_a_shared_core_as_a_defect() {
+        let Some(cores) = crate::core_topology::host() else {
+            return;
+        };
+        // Find one physical core with at least two siblings, and pin two
+        // workers onto it -- exactly the layout #1729 removed.
+        let Some(pair) = cores.cores().iter().find(|group| group.len() >= 2) else {
+            return; // non-SMT host: the bad layout is unrepresentable
+        };
+        if !environment_can_pin(&pair[..2]) {
+            return;
+        }
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![pair[0], pair[1]],
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            Some(false),
+            "two workers on cpus {:?} share a core and must be reported as such",
+            &pair[..2]
+        );
+        pools.shutdown();
+    }
+
+    /// A pool that pinned only half its workers has not placed one worker per
+    /// core, and must not be scored on the half it did pin.
+    ///
+    /// This is the `.flatten()` trap: dropping the `None` slots and judging the
+    /// remainder lets a pool with an entirely unplaced node report healthy --
+    /// count honest, placement unexamined, the exact shape of #1729.
+    #[test]
+    fn a_partially_pinned_pool_is_not_scored_on_its_pinned_half() {
+        let Some(cores) = crate::core_topology::host() else {
+            return;
+        };
+        if cores.core_count() < 2 {
+            return;
+        }
+        let spread = crate::decode_affinity::order_pin_targets(
+            &(0..cores.logical_count()).collect::<Vec<_>>(),
+            Some(cores),
+        );
+        if !environment_can_pin(&spread[..2]) {
+            return;
+        }
+        // One shard pinned to distinct cores, one shard deliberately free.
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[
+                NodeShard {
+                    index: 0,
+                    cpus: spread[..2].to_vec(),
+                    workers: 2,
+                },
+                NodeShard {
+                    index: 1,
+                    cpus: Vec::new(),
+                    workers: 1,
+                },
+            ],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        // The property under test needs a *mixed* pool. Assert that premise
+        // rather than an exact pinned count: how many pins the kernel grants is
+        // an environment fact, and encoding it here would make the test report
+        // on the sandbox instead of on the predicate.
+        let placed = pools
+            .worker_cpus()
+            .iter()
+            .filter(|cpu| cpu.is_some())
+            .count();
+        assert!(
+            placed > 0 && placed < pools.worker_cpus().len(),
+            "this test needs a partially pinned pool, but got {:?}",
+            pools.worker_cpus()
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            Some(false),
+            "a pool with an unplaced worker must not report one-per-core on the \
+             strength of the workers it did place"
+        );
+        pools.shutdown();
+    }
+
+    /// A pin target the kernel refuses must be retracted, not reported.
+    ///
+    /// Otherwise `worker_cpus()` reports intent as achievement -- a pool that
+    /// failed to place a single worker would still present a tidy one-per-core
+    /// layout. That is the unverified-label defect this mechanism exists to
+    /// detect, reproduced inside the detector.
+    #[test]
+    fn a_pin_that_fails_is_retracted_rather_than_reported() {
+        // A CPU id far past any plausible host: the pin call rejects it, so the
+        // worker spawns and runs unpinned.
+        let unpinnable = 1 << 20;
+        if crate::decode_affinity::allowed_cpus().is_some_and(|cpus| cpus.contains(&unpinnable)) {
+            return;
+        }
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: vec![unpinnable],
+                workers: 1,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert_eq!(
+            pools.worker_cpus(),
+            &[None],
+            "a worker whose pin was rejected must report no placement, not the \
+             cpu it failed to reach"
+        );
+        assert_eq!(
+            pools.placement_is_one_worker_per_physical_core(),
+            None,
+            "a pool that placed nothing makes no placement claim"
+        );
+        pools.shutdown();
+    }
+
+    /// An unpinned pool has no placement claim to check, and must not be
+    /// reported as a defect.
+    #[test]
+    fn an_unpinned_pool_makes_no_placement_claim() {
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert!(
+            pools.worker_cpus().iter().all(Option::is_none),
+            "an empty CPU set must leave every worker unpinned"
+        );
+        assert_eq!(pools.placement_is_one_worker_per_physical_core(), None);
+        pools.shutdown();
+    }
+
+    /// `node_shards` must *consult* the explicit request, not merely have a
+    /// correct helper sitting next to it.
+    ///
+    /// This is the anti-vacuity guard for #1792. Every other test here also
+    /// passes against the unfixed code, because the bug was never in the
+    /// helpers -- it was that the builder never called them. Deleting the early
+    /// return in `node_shards_with` fails this and only this.
+    #[test]
+    fn node_shards_consults_the_explicit_request_before_default_placement() {
+        let sentinel = NodeShard {
+            index: 7,
+            cpus: vec![100, 101],
+            workers: 2,
+        };
+        let shards = node_shards_with(16, |total| {
+            assert_eq!(total, 16, "the worker count must reach the request");
+            Some(vec![sentinel.clone()])
+        });
+        assert_eq!(
+            shards.len(),
+            1,
+            "an honored request must replace default placement outright"
+        );
+        assert_eq!(shards[0].cpus, sentinel.cpus);
+        assert_eq!(shards[0].index, 7);
+        assert_eq!(shards[0].workers, 2);
+    }
+
+    /// ...and with no request, placement is what it was before this change.
+    /// That is the regression that would matter most: routing everything
+    /// through the parser would silently unpin the default pool, because
+    /// `DecodeAffinity::parse(None)` is `Off`.
+    #[test]
+    fn no_explicit_request_leaves_default_placement_intact() {
+        let defaulted = node_shards_with(16, |_| None);
+        // Whatever this host's topology, the default path never returns an
+        // empty schedule or a pool with no workers.
+        assert!(!defaulted.is_empty());
+        assert!(defaulted.iter().map(|s| s.workers).sum::<usize>() > 0);
+        // Deferring must reach the real placement policy, not the unpinned
+        // single shard `off` produces: on any host with a known allowed set the
+        // default path pins.
+        if crate::decode_affinity::allowed_cpus().is_some_and(|cpus| !cpus.is_empty()) {
+            assert!(
+                defaulted.iter().any(|shard| !shard.cpus.is_empty()),
+                "default placement pins when the allowed set is known"
+            );
+        }
     }
 
     #[test]

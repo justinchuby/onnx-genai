@@ -1,16 +1,12 @@
-ir_version: 8
+ir_version: 11
 producer_name: "onnx-genai WP4 fixture"
 graph {
   node {
     input: "position_ids"
+    input: "reduce_axes_0"
     output: "position_sum_i64"
     name: "node_ReduceSum_0"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -30,15 +26,10 @@ graph {
   }
   node {
     input: "state_a.in"
+    input: "reduce_axes_01"
     output: "state_a_sum"
     name: "node_ReduceSum_2"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      ints: 1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -47,16 +38,10 @@ graph {
   }
   node {
     input: "state_b.in"
+    input: "reduce_axes_012"
     output: "state_b_sum"
     name: "node_ReduceSum_3"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      ints: 1
-      ints: 2
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -79,16 +64,10 @@ graph {
   }
   node {
     input: "routed_sequence"
+    input: "reduce_axes_012"
     output: "routed_sum"
     name: "node_ReduceSum_6"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      ints: 1
-      ints: 2
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -122,15 +101,10 @@ graph {
   }
   node {
     input: "attention_mask"
+    input: "reduce_axes_01"
     output: "mask_sum_i64"
     name: "node_ReduceSum_10"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      ints: 1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -216,15 +190,10 @@ graph {
   }
   node {
     input: "token_float"
+    input: "unsqueeze_axes_13"
     output: "current_kv"
     name: "node_Unsqueeze_20"
     op_type: "Unsqueeze"
-    attribute {
-      name: "axes"
-      ints: 1
-      ints: 3
-      type: INTS
-    }
   }
   node {
     input: "current_kv"
@@ -314,6 +283,30 @@ graph {
     data_type: 1
     name: "state_b_increment"
     raw_data: "\000\000\000@"
+  }
+  initializer {
+    dims: 1
+    data_type: 7
+    name: "reduce_axes_0"
+    raw_data: "\000\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "reduce_axes_01"
+    raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 3
+    data_type: 7
+    name: "reduce_axes_012"
+    raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000\002\000\000\000\000\000\000\000"
+  }
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "unsqueeze_axes_13"
+    raw_data: "\001\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
   }
   initializer {
     data_type: 1
@@ -663,5 +656,5 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 12
+  version: 24
 }
