@@ -1,43 +1,38 @@
-fix(pipeline): a composite workflow reports why it actually stopped
+perf(speculative): a rejected proposal no longer copies the whole KV cache
 
-B2 checkpoint C, first half: the real `finish_reason` the convergence report
-flagged as fabricated.
+First residency fix from the CUDA plan, taking its ordering: rollback before
+`propose_chained`, because it is both the largest transfer and the smallest
+change.
 
-`WorkflowRuntime::generate_with_callbacks` returned `FinishReason::MaxTokens`
-unconditionally — a constant, not an observation. Every composite workflow
-generation claimed it had run out of budget, including runs the workflow ended
-itself. That is the single distinction a finish reason exists to make: a client
-deciding whether to continue a truncated response would have continued one the
-model considered complete, and nothing in the result would have told it
-otherwise.
+Rolling back a rejected proposal called `host_copy_of` on every
+`rollback_state` cell — the entire KV cache, device to host, to drop a few
+positions — then uploaded it again on the next bind. Per rejection. The report
+identifies it as the single worst copy in the workflow, and it is: the other
+sites move a logits row or a carry, this one moves the cache.
 
-The reason is only knowable inside the loop, because the loop is what decided.
-`WorkflowRunTelemetry::loop_ended_by_predicate` records whether the outermost
-generation loop stopped because its liveness predicate went false — the model's
-own stop — or because it exhausted its bound. The counters carry it out, and
-`generate_with_callbacks` reports it, for the streamed per-token reason as well
-as the final result.
+`truncate_state_cell` avoids it where the shape allows. A rollback keeps a
+*prefix* along the sequence axis; when every axis before that one has extent 1 —
+a batch-1 seq-major cache, which is what the native backend declares — the kept
+elements are already a contiguous prefix of the same buffer. The truncation is
+then a smaller view of it: `alias_with_shape`, no copy, and a device tensor
+stays on the device.
 
-**Also fixed: a committed fixture that could not execute.**
-`tiny-llm-scatter-workflow` declared its cache ports as
-`[batch, cache_capacity, 4]` while its ONNX graph exposes `[batch, 16, 16]`, so
-loading it for generation failed on the contract mismatch. The workflow now
-states the graph's real extent. Its existing suite
-(`workflow_derived_static_cache`, 4 cases) still passes, and the fixture gets
-further along than before — it now reaches a *second* pre-existing drift
-(`next_accepted_len` declared as an output the graph does not expose) that I
-have deliberately not chased here.
+It returns `None` rather than guessing when the kept elements are strided. A
+head-major `[batch, heads, sequence, head_dim]` cache interleaves its sequence
+across heads, so a prefix of the axis is not a prefix of the buffer; returning a
+view there would hand back the wrong elements, which is worse than the copy it
+would have avoided. Those cells fall back to the host path, and the fallback now
+says at its call site that this is where the large transfer happens rather than
+leaving it implicit inside `host_copy_of`. A strided device truncate needs an
+execution-provider copy and is the remaining work.
 
-**What the new test asserts, and what it does not.** The bound case is asserted
-end-to-end. The predicate case is not, because no committed composite fixture
-both executes through `generate` and stops on its own liveness predicate: the
-authored `decoder` fixture always runs to its bound, `gemma4_chained` is driven
-through the proposal API, and `tiny-llm-scatter-workflow` has the drift above.
-Asserting it against a fixture that cannot reach the state would be a test
-passing for the wrong reason, so the gap is written into the test rather than
-papered over, and the mechanism is covered at unit level.
+Five tests, including the one that makes the fast path safe at all: the view and
+the host truncation must agree element for element across every length. Two
+implementations of one operation are only trustworthy as a pair.
 
-Verified: 74/74 engine targets; **five real foundry models byte-identical to the
-pre-change baseline**; fmt; clippy `-D warnings`.
+Verified: engine speculative suites (gemma4_chained_workflow, chained_proposer_real,
+native_workflow_parity, tree_speculative, speculative_speedup) green on CPU;
+**H200 CUDA — gemma4_chained_workflow 8, native_workflow_parity 12 including the
+device-resident multicomponent case**; fmt; clippy `-D warnings`.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

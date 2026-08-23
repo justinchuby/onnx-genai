@@ -482,9 +482,21 @@ impl WorkflowRuntime {
             let value = state
                 .get(cell)
                 .with_context(|| format!("rollback_state cell '{cell}' has no value to undo"))?;
-            let host = self.host_copy_of(value)?;
-            let truncated = truncate_along_axis(&host, axis, length)
+            let truncated = truncate_state_cell(value, axis, length)
                 .with_context(|| format!("failed to roll back state cell '{cell}'"))?;
+            let truncated = match truncated {
+                Some(truncated) => truncated,
+                // Strided truncation still needs a host round trip. Copying the
+                // whole cache down and back is the single largest transfer in
+                // the workflow, so it is worth naming where it happens rather
+                // than leaving it implicit in a `host_copy_of` call.
+                None => {
+                    let host = self.host_copy_of(value)?;
+                    truncate_along_axis(&host, axis, length).with_context(|| {
+                        format!("failed to roll back state cell '{cell}' on the host")
+                    })?
+                }
+            };
             state.insert(cell.clone(), truncated);
         }
         Ok(())
@@ -1000,6 +1012,53 @@ fn build_fused_input(
 }
 
 /// Copy a value's leading `length` positions along `axis`.
+/// Truncate a state cell without moving it, when the shape allows.
+///
+/// A rollback keeps a *prefix* along the sequence axis. When every axis before
+/// that one has extent 1 — a batch-1 seq-major cache, which is what the native
+/// backend declares — the kept elements are already a contiguous prefix of the
+/// same buffer, so the truncation is a smaller view of it: no copy, and a device
+/// tensor stays on the device.
+///
+/// That matters because the alternative is the largest transfer in the
+/// workflow. Rolling back a rejected proposal copied the entire KV cache to the
+/// host to drop a few positions, then uploaded it again on the next bind — per
+/// rejection.
+///
+/// Returns `None` when the kept elements are strided rather than contiguous, so
+/// the caller can fall back rather than this silently producing a tensor whose
+/// contents are wrong. A strided device truncate needs an execution-provider
+/// copy and is the remaining work here.
+fn truncate_state_cell(value: &Value, axis: usize, length: usize) -> anyhow::Result<Option<Value>> {
+    let shape = value.shape().to_vec();
+    anyhow::ensure!(
+        axis < shape.len(),
+        "sequence axis {axis} is out of range for a rank-{} tensor",
+        shape.len()
+    );
+    let current = shape[axis] as usize;
+    if length > current {
+        return Ok(None);
+    }
+    // Elements before the truncated axis; the prefix is contiguous only when
+    // there is exactly one of them.
+    let leading: i64 = shape[..axis].iter().product();
+    if leading != 1 {
+        return Ok(None);
+    }
+    if length == current {
+        // Nothing to drop: alias rather than copy, so an unchanged cell also
+        // stays where it is.
+        return Ok(Some(clone_value(value)?));
+    }
+    let mut truncated = shape.clone();
+    truncated[axis] = length as i64;
+    let owner = std::sync::Arc::new(clone_value(value)?);
+    Value::alias_with_shape(owner, &truncated)
+        .map(Some)
+        .map_err(Into::into)
+}
+
 fn truncate_along_axis(value: &Value, axis: usize, length: usize) -> anyhow::Result<Value> {
     let shape = value.shape().to_vec();
     anyhow::ensure!(
@@ -1210,5 +1269,92 @@ steps:
         let error = ChainedPlan::resolve(&empty, &workflow())
             .expect_err("a chain with nothing to thread must not resolve");
         assert!(format!("{error:#}").contains("recurrent"), "{error:#}");
+    }
+}
+
+#[cfg(test)]
+mod rollback_residency_tests {
+    use super::*;
+
+    /// A batch-1 seq-major cache truncates as a view, not a copy.
+    ///
+    /// This is the shape the native backend declares, and it is the case that
+    /// used to copy the whole KV cache to the host and back on every rejection.
+    #[test]
+    fn a_contiguous_prefix_truncates_without_moving() {
+        // [batch=1, sequence=4, hidden=2]
+        let value = Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], &[1, 4, 2])
+            .expect("value");
+        let truncated = truncate_state_cell(&value, 1, 2)
+            .expect("truncation succeeds")
+            .expect("a contiguous prefix must not fall back to the host");
+        assert_eq!(truncated.shape(), &[1, 2, 2]);
+        assert_eq!(
+            truncated.to_vec_f32().expect("host read"),
+            vec![0.0, 1.0, 2.0, 3.0],
+            "the view must be the kept prefix, in order"
+        );
+    }
+
+    /// A strided truncation declines rather than producing wrong bytes.
+    ///
+    /// `[batch, heads, sequence, head_dim]` keeps a prefix of axis 2, which is
+    /// interleaved across heads — not a prefix of the buffer. Returning a view
+    /// here would silently hand back the wrong elements, which is worse than
+    /// the copy it would have avoided.
+    #[test]
+    fn a_strided_truncation_declines() {
+        // [batch=1, heads=2, sequence=2, head_dim=1]
+        let value = Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0], &[1, 2, 2, 1]).expect("value");
+        assert!(
+            truncate_state_cell(&value, 2, 1)
+                .expect("no error")
+                .is_none(),
+            "a head-major cache is strided along its sequence axis and must fall back"
+        );
+    }
+
+    /// An unchanged length is still a view, so a no-op rollback does not move a
+    /// device tensor to the host.
+    #[test]
+    fn an_unchanged_length_is_not_a_copy() {
+        let value = Value::from_slice_f32(&[0.0, 1.0], &[1, 2]).expect("value");
+        let kept = truncate_state_cell(&value, 1, 2)
+            .expect("no error")
+            .expect("an unchanged length must not fall back");
+        assert_eq!(kept.shape(), &[1, 2]);
+    }
+
+    /// A length beyond the cell declines rather than aliasing past the buffer.
+    #[test]
+    fn a_length_beyond_the_cell_declines() {
+        let value = Value::from_slice_f32(&[0.0, 1.0], &[1, 2]).expect("value");
+        assert!(
+            truncate_state_cell(&value, 1, 5)
+                .expect("no error")
+                .is_none()
+        );
+    }
+
+    /// The host fallback and the view agree, element for element.
+    ///
+    /// They are two implementations of one operation, so the only thing that
+    /// makes the fast path safe is that it produces what the slow path would.
+    #[test]
+    fn the_view_matches_the_host_truncation() {
+        let value =
+            Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 3, 2]).expect("value");
+        for length in 0..=3 {
+            let view = truncate_state_cell(&value, 1, length)
+                .expect("no error")
+                .expect("contiguous")
+                .to_vec_f32()
+                .expect("host read");
+            let host = truncate_along_axis(&value, 1, length)
+                .expect("host truncation")
+                .to_vec_f32()
+                .expect("host read");
+            assert_eq!(view, host, "length {length}");
+        }
     }
 }
