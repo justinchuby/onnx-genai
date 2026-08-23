@@ -482,13 +482,27 @@ what lets a single decoder keep the rich Rust sampler, paged KV, sessions and
 speculative decode, none of which has an in-graph representation, without
 needing a second package shape to hold them.
 
-**Recognition is structural.** `sole_decoder_component` finds the one component
-that consumes the autoregressive sequence and produces logits. No component
-name, model name, or architecture string decides anything — a package may name
-its component whatever it likes. `is_single_decoder_workflow` is the single
-recognizer every caller asks (engine loader, server state, server/CLI
-multimodal, CLI inspection), so no two of them can classify the same package
-differently.
+**Recognition is structural, and there is one of it.**
+`onnx_genai_metadata::classify_workflow` reads a workflow once and reports two
+nested layers: layer 1 (`is_single_decoder`) asks whether the workflow executes
+exactly one ONNX graph whose declared port `roles` make it a decoder — it
+consumes the autoregressive sequence and either produces logits or owns
+attention state — and layer 2 (`contracted_single_decoder`) asks layer 1 *plus*
+whether that graph declares `onnx-genai.autoregressive-decode`. No component
+name, model name, or architecture string decides anything; a package may name
+its components whatever it likes.
+
+Every caller reads that classification rather than scanning the components
+itself: the engine loader routes on layer 2, and server state, server/CLI
+multimodal and CLI inspection read layer 1 through the named views
+`is_single_decoder_workflow` and `sole_decoder_component`. Because layer 2 is
+*defined* as layer 1 plus the contract, the loader cannot route a package the
+other callers classify differently — the containment holds by construction, not
+by two scans happening to agree. `decoder_recognizer_agreement.rs` pins the
+whole matrix — every workflow-declaring document in the repository, with a
+coverage guard that walks the tree — plus the adversarial shapes no fixture has,
+and `engine/load.rs` asserts the containment again from the loader's own
+predicate.
 
 **KV stays with its executor.** State cells owned by a group are
 `management: runtime` with a `release_boundary`, which is the schema's existing
@@ -496,12 +510,13 @@ word for buffers the runtime owns. Paged, shared-buffer and CUDA-graph KV stay
 device-resident; nothing round-trips through the interpreter as an SSA value.
 
 **One representation, executors chosen by contract.** A component declaring
-`onnx-genai.autoregressive-decode` is run by the fused decode session when this
-runtime holds one and invoked from its own artifact when it does not. That is a
-backend choice *beneath* the declared workflow — the same kind of choice as ORT
-versus native — not a second runtime beside it, and not a mode a caller can
-select. `Engine::holds_decode_core()` asks whether the session exists, never
-what kind of package was loaded.
+`onnx-genai.autoregressive-decode` is run by the fused decode session when that
+component is the package's whole graph and this runtime holds one, and invoked
+from its own artifact when it is not. That is a backend choice *beneath* the
+declared workflow — the same kind of choice as ORT versus native — not a second
+runtime beside it, and not a mode a caller can select.
+`Engine::holds_decode_core()` asks whether the session exists, never what kind
+of package was loaded.
 
 **Fail-closed by construction, not by guard.** `Engine` holds one non-optional
 interpreter and the loader refuses a package that declares no workflow, so the
