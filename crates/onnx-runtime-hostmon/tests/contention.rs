@@ -13,7 +13,9 @@
 //! working around it, which is why the include is gone.
 
 use onnx_runtime_hostmon as host_contention;
-use onnx_runtime_hostmon::{parse_cpu_list, threads_off_mask};
+use onnx_runtime_hostmon::{
+    ThreadStatus, off_mask_from_statuses, parse_cpu_list, threads_off_mask,
+};
 
 #[cfg(target_os = "linux")]
 use host_contention::{AllowedCpus, snapshot};
@@ -65,6 +67,11 @@ fn foreign_cpu_is_total_busy_on_the_set_minus_our_own() {
         c.total_pct
     );
     assert!(c.is_contended());
+    assert!(
+        c.own_time_complete,
+        "snapshots built from `from_parts` are the complete case, and this test's \
+         arithmetic is only valid there"
+    );
 }
 
 /// A window we had entirely to ourselves must not be flagged, or the column
@@ -425,16 +432,126 @@ fn a_bounded_cell_is_printed_as_a_bound() {
         own_time_complete: complete,
     };
     assert_eq!(foreign_column(&[mk(3.0, true); 3]), "3.0");
-    assert_eq!(foreign_column(&[mk(3.0, false); 3]), ">3.0");
+    assert_eq!(foreign_column(&[mk(3.0, false); 3]), "3.0!");
     // Both qualifiers can apply at once and neither may swallow the other.
     assert_eq!(
         foreign_column(&[Contention::default(), mk(3.0, false), mk(9.0, false)]),
-        ">9.0*"
+        "9.0*!"
     );
     // One bounded rep among complete ones still bounds the cell: the median may
     // be the bounded sample, and which sample it is is not stable across runs.
     assert_eq!(
         foreign_column(&[mk(3.0, true), mk(3.0, true), mk(3.0, false)]),
-        ">3.0"
+        "3.0!"
+    );
+}
+
+/// The marker must never lead the cell.
+///
+/// This column is a field in a table that gets parsed, and the natural spelling
+/// of a lower bound -- a leading `>` -- makes `awk '$NF + 0'` evaluate `>9.0` as
+/// `0.0`. That silently converts the most contended row in a matrix into the
+/// cleanest-looking one, which is this module's own failure mode reappearing one
+/// hop downstream. A trailing marker degrades safely instead: awk recovers
+/// `9.0` and loses only the qualifier, and `float()` raises rather than guesses.
+#[test]
+fn a_qualifier_never_leads_the_cell_where_a_parser_would_read_it_as_zero() {
+    let mk = |pct: f64, complete: bool| Contention {
+        foreign_pct: pct,
+        total_pct: pct,
+        measured: true,
+        own_time_complete: complete,
+    };
+    for cell in [
+        foreign_column(&[mk(9.0, false); 3]),
+        foreign_column(&[Contention::default(), mk(9.0, false), mk(9.0, false)]),
+        foreign_column(&[mk(9.0, true); 3]),
+    ] {
+        let first = cell.chars().next().expect("a cell is never empty");
+        assert!(
+            first.is_ascii_digit(),
+            "a leading qualifier makes `awk '$NF + 0'` read this as 0.0: {cell}"
+        );
+        // The prefix up to the first non-numeric character must be the value
+        // itself, which is what any tolerant numeric parser will take.
+        let numeric: String = cell
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        assert_eq!(
+            numeric.parse::<f64>().expect("the leading run parses"),
+            9.0,
+            "the number a parser recovers must be the measured one: {cell}"
+        );
+    }
+}
+
+/// A malformed range must not be able to allocate its way to an abort. The cap
+/// is the affinity mask's own width, above which no CPU can be in `allowed`
+/// anyway.
+#[test]
+fn an_absurd_cpu_range_is_rejected_rather_than_allocated() {
+    assert_eq!(parse_cpu_list("0-18446744073709551614"), None);
+    assert_eq!(parse_cpu_list("0-1073741824"), None);
+    assert_eq!(parse_cpu_list("1073741824"), None);
+    // The cap must not reject a mask a real machine could have.
+    assert_eq!(parse_cpu_list("0-255").map(|c| c.len()), Some(256));
+}
+
+/// Only a thread that *vanished* may be skipped.
+///
+/// A thread that exited between the directory listing and the read is not
+/// evidence of anything. A thread whose status file could not be read, or whose
+/// mask could not be parsed, is a live thread of unknown affinity -- and letting
+/// its neighbours certify the subtraction as complete over it would publish a
+/// clean reading over unknown state, which is the failure the check exists to
+/// remove. These cases cannot be produced against a real `/proc`, which is why
+/// the decision is separated from the walk.
+#[test]
+fn only_a_vanished_thread_may_be_skipped() {
+    let confined = "Name:\tworker\nCpus_allowed_list:\t0-1\n";
+    let wide = "Name:\tworker\nCpus_allowed_list:\t0-31\n";
+    let allowed = [0, 1];
+
+    assert_eq!(
+        off_mask_from_statuses(&[ThreadStatus::Read(confined); 3], &allowed),
+        Some(0)
+    );
+    assert_eq!(
+        off_mask_from_statuses(
+            &[ThreadStatus::Read(confined), ThreadStatus::Read(wide)],
+            &allowed
+        ),
+        Some(1)
+    );
+
+    // A vanished thread is skipped, and the rest still answer.
+    assert_eq!(
+        off_mask_from_statuses(
+            &[ThreadStatus::Read(confined), ThreadStatus::Vanished],
+            &allowed
+        ),
+        Some(0)
+    );
+
+    // Every other failure poisons the whole answer rather than being skipped.
+    for bad in [
+        ThreadStatus::Unreadable,
+        ThreadStatus::Read("Name:\tworker\n"),
+        ThreadStatus::Read("Cpus_allowed_list:\tnonsense\n"),
+    ] {
+        assert_eq!(
+            off_mask_from_statuses(&[ThreadStatus::Read(confined), bad], &allowed),
+            None,
+            "a live thread of unknown affinity must not be certified by its \
+             neighbours: {bad:?}"
+        );
+    }
+
+    // Nothing observed at all is unknown, not zero.
+    assert_eq!(off_mask_from_statuses(&[], &allowed), None);
+    assert_eq!(
+        off_mask_from_statuses(&[ThreadStatus::Vanished; 2], &allowed),
+        None
     );
 }
