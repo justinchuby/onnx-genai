@@ -854,9 +854,9 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
     Ok(DecodePlan { cpus, log })
 }
 
-/// Order the *flat* decode pool's CPU list so that worker `i` lands on a
-/// distinct physical core for as long as cores last, and only then starts
-/// doubling up on SMT siblings.
+/// Order a decode pool's CPU list so that worker `i` lands on a distinct
+/// physical core for as long as cores last, and only then starts doubling up on
+/// SMT siblings.
 ///
 /// [`crate::kernels::matmul_nbits`]'s `build_decode_pool` pins worker `i` to
 /// `cpus[i % cpus.len()]`, so the *order* of this list — not just its contents —
@@ -864,14 +864,30 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
 /// or 4. Same set, same cpuset guarantees; only the ranking changes. With no
 /// discoverable SMT map this is the identity.
 ///
-/// Deliberately **not** applied to the persistent SPMD pool
-/// ([`crate::decode_spmd`]) or the `numa-split` sub-pools
-/// ([`crate::decode_numa`]): those build their pin lists from `NodeShard::cpus`
-/// and their workers *spin*. Spreading spinning workers one per core is the
-/// experiment recorded in [`crate::core_topology`]'s module docs, where it
-/// measured worse (0.133 ms vs 0.079 ms) than leaving them compact. This
-/// function is for the fork-join pool, where a worker that is handed a share of
-/// the arithmetic genuinely wants its own core's front end.
+/// # Who uses it, and a reversal
+///
+/// Applied by the fork-join pool, where a worker handed a share of the
+/// arithmetic wants its own core's front end, **and now also by the persistent
+/// SPMD pool** ([`crate::decode_spmd`]'s shard builder).
+///
+/// The SPMD half is a reversal. This doc previously said the spinning pool was
+/// deliberately left compact, on the strength of the 0.133 ms vs 0.079 ms
+/// experiment recorded in [`crate::core_topology`]'s module docs. What that
+/// experiment did not separate is the *dispatcher*: the inline dispatcher
+/// spin-waits on the completion counters, and with every physical core taken by
+/// a worker it has nowhere to run but some worker's SMT sibling, making that
+/// worker the straggler the whole barrier waits for on every op. Pinning only
+/// the dispatcher and changing nothing else measured 2.1x (19.58 ms/token on a
+/// CPU inside the worker set against 8.77 ms on a free core), with 600
+/// involuntary context switches per token in the contended case. So the
+/// spinning pool is spread *and* [`crate::decode_spmd`] reserves a core for the
+/// dispatcher; see [`crate::core_topology`]'s module docs for what survives of
+/// the compact-mask result and what does not.
+///
+/// Still **not** applied to the `numa-split` sub-pools
+/// ([`crate::decode_numa`]), whose per-node reserve frees a logical CPU rather
+/// than a core and so does not yet give an on-node dispatcher a free core to
+/// land on.
 pub(crate) fn order_pin_targets(
     cpus: &[usize],
     cores: Option<&crate::core_topology::CoreTopology>,
