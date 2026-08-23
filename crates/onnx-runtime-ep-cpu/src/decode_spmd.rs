@@ -1183,10 +1183,21 @@ impl SpmdDecodePools {
                     // it here would reintroduce exactly the unbounded wait this
                     // backstop exists to remove. Woken threads exit on their
                     // own; the panic does not wait for them.
+                    //
+                    // Deliberately *not* `begin_shutdown`: that first waits out
+                    // `SHUTDOWN_DISPATCH_QUIESCE` for an in-flight dispatch to
+                    // drain. No dispatch can be in flight here -- this pool has
+                    // never been returned to a caller and no job has ever been
+                    // published -- so there is nothing to quiesce, and waiting
+                    // would put a fresh timed wait on the failure path whose
+                    // entire purpose is to stop waiting.
                     shared.shutdown.store(true, Ordering::SeqCst);
                     for sense in &shared.node_sense {
-                        sense.0.fetch_add(1, Ordering::Release);
-                        atomic_wait::wake_all(&sense.0);
+                        // Only the wake word, matching `shutdown()`: leaving
+                        // `ops` untouched is what lets a woken worker tell this
+                        // from a published op.
+                        sense.0.wake.fetch_add(1, Ordering::Release);
+                        atomic_wait::wake_all(&sense.0.wake);
                     }
                     panic!(
                         "persistent SPMD decode pool never became ready: {ready} of \
