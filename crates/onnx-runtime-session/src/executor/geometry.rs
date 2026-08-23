@@ -481,12 +481,19 @@ pub(super) fn describe_non_padded_consumer(node: &Node, input_index: usize) -> O
 /// by width) and padded columns `[L, max_len)` are forced to `-inf` by the
 /// padding branch's `And`/`Where`, which dominates the CumSum suffix.
 ///
-/// Broadcasting combiners that mix the mask *elementwise* with a logical-width
-/// score — e.g. GLM-5.2's indexer `Add` — are deliberately **absent** from this
-/// set, so a mask feeding such a consumer never classifies as padded-safe and
-/// keeps exposing its logical valid length (freezing must never leak `max_len`
-/// into a logical-width computation). Only ops actually observed in the standard
-/// builder cone are listed; anything else disqualifies the binding conservatively.
+/// Broadcasting combiners that mix the mask *elementwise* with a score — `Add`,
+/// and `Concat` appending a fixed-size extra column — are deliberately
+/// **absent** from this unconditional set: whether they are safe depends on
+/// where their *other* operand's length axis comes from, which
+/// [`classify_mask_consumer`] decides case-by-case via
+/// [`derives_from_kv_cache_growth`] rather than blessing every `Add`/`Concat`
+/// here. GLM-5.2's indexer `Add` mixes the mask with a logical-width score
+/// sourced from neither the mask nor a KV-cache append, so it is still
+/// disqualified by that per-case check (freezing must never leak `max_len`
+/// into a logical-width computation). Only ops that are *always* safe
+/// regardless of their other operand's provenance are listed here; anything
+/// else disqualifies the binding conservatively unless a narrower rule in
+/// [`classify_mask_consumer`] applies.
 pub(super) fn is_additive_mask_builder_op(node: &Node) -> bool {
     node.is_default_domain()
         && matches!(
@@ -519,6 +526,108 @@ pub(super) fn is_capacity_form_attention_mask_input(node: &Node, input_index: us
         && node.inputs.get(4).is_some_and(Option::is_some)
         && node.inputs.get(5).is_some_and(Option::is_some)
         && kernel_input_uses_physical_capacity(node, 4)
+}
+
+/// Structural signature of a *decomposed*-attention KV-cache append: a
+/// default-domain `Concat` whose growing operand is a graph **input** (the
+/// persisted past cache) and whose result is a graph **output** (the
+/// persisted present cache). This recognizes the append node by input/output
+/// *role* alone — not by name, axis, or tensor shape — so it matches any
+/// decomposed self-attention export that grows its cache with a plain
+/// `Concat` rather than an in-op cache (`Attention` / `GroupQueryAttention` /
+/// `pkg.nxrt::IndexShare`).
+///
+/// The KV-cache manager binds *both* ends of this edge — the past input and
+/// the present output — at a fixed physical capacity regardless of node type
+/// (see `dispatch.rs`'s "Fixed-capacity KV widening", which recognizes this
+/// same predicate to keep the tracked present shape consistent with that
+/// binding). A value whose length axis structurally derives from this node's
+/// output (see [`derives_from_kv_cache_growth`]) is therefore exactly as
+/// capacity-consistent as `present.*` itself, which is what lets a mask that
+/// combines with such a value stay sound once frozen to physical width.
+pub(super) fn is_kv_cache_growth_concat(graph: &Graph, node: &Node) -> bool {
+    node.is_default_domain()
+        && node.op_type == "Concat"
+        && node
+            .inputs
+            .first()
+            .copied()
+            .flatten()
+            .is_some_and(|input| graph.inputs.contains(&input))
+        && node
+            .outputs
+            .first()
+            .is_some_and(|output| graph.outputs.contains(output))
+}
+
+/// Bounded backward walk: does `value`'s length axis structurally derive from
+/// an [`is_kv_cache_growth_concat`] node's output?
+///
+/// Descends through shape-relabelling/scaling ops that carry an operand's
+/// length axis through unchanged — `Transpose`, `Reshape`, `Unsqueeze`,
+/// `Squeeze`, `Cast`, `Mul`, `Div`, `Slice`, `Expand` — following *every*
+/// input, since for these ops no operand introduces a length axis foreign to
+/// the one already being traced: an auxiliary shape/axes/scalar operand is
+/// either a dead end or itself a legitimate `Shape(present.*)` read, which is
+/// the same signal reached from the other side.
+///
+/// `MatMul` gets a narrower, semantics-derived rule: only input 1 is
+/// followed, because ONNX defines a `MatMul` output's trailing axis as input
+/// 1's trailing axis. Following input 0 as well (e.g. the query projection in
+/// `Q @ Kᵀ`) would let an unrelated operand's provenance stand in for the one
+/// that actually determines the result's length axis — restricting to input 1
+/// is what keeps this a general structural fact about `MatMul`, not a
+/// `Q`/`K`-specific convention.
+pub(super) fn derives_from_kv_cache_growth(graph: &Graph, value: ValueId) -> bool {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    let mut producer: HashMap<ValueId, NodeId> = HashMap::new();
+    for (node_id, node) in graph.nodes.iter() {
+        for out in &node.outputs {
+            producer.insert(*out, node_id);
+        }
+    }
+
+    let mut seen: HashSet<ValueId> = HashSet::new();
+    let mut frontier: VecDeque<ValueId> = VecDeque::new();
+    frontier.push_back(value);
+    while let Some(current) = frontier.pop_front() {
+        if !seen.insert(current) {
+            continue;
+        }
+        let Some(&node_id) = producer.get(&current) else {
+            continue;
+        };
+        let node = graph.node(node_id);
+        if is_kv_cache_growth_concat(graph, node) {
+            return true;
+        }
+        if node.is_default_domain() && node.op_type == "MatMul" {
+            if let Some(Some(rhs)) = node.inputs.get(1) {
+                frontier.push_back(*rhs);
+            }
+            continue;
+        }
+        if node.is_default_domain()
+            && matches!(
+                node.op_type.as_str(),
+                "Transpose"
+                    | "Reshape"
+                    | "Unsqueeze"
+                    | "Squeeze"
+                    | "Cast"
+                    | "Mul"
+                    | "Div"
+                    | "Slice"
+                    | "Expand"
+            )
+        {
+            for input in node.inputs.iter().flatten() {
+                frontier.push_back(*input);
+            }
+        }
+    }
+    false
 }
 
 /// Structural pattern-match: is `mask` an attention-mask binding whose entire
@@ -616,7 +725,11 @@ pub(super) enum ShapeConsumptionPolicy {
 /// check are all the *same* question asked about different operands.
 enum ConsumerRole {
     /// A padding-aware sink: capacity-form `Attention` neutralises the padded
-    /// keys itself, so the substitution terminates safely here.
+    /// keys itself, so the substitution terminates safely here. A default-domain
+    /// `Softmax` over the mask's own (last) axis is the decomposed-attention
+    /// analogue: `-inf` mask lanes become exact-zero probability, which is the
+    /// same padding-neutralization `Attention` performs internally, just spelled
+    /// out as an explicit node instead of happening inside a fused kernel.
     Sink,
     /// Padding-invariant read that does not propagate: zero padding contributes
     /// nothing (`ReduceSum`), or the physical extent is read and discarded
@@ -681,8 +794,90 @@ fn classify_mask_consumer(
     if is_additive_mask_builder_op(node) {
         return ConsumerRole::Propagate;
     }
-    // Everything else — GLM-5.2's indexer `Add` is the motivating case — combines
-    // the mask elementwise with a value whose extent came from elsewhere.
+    // A decomposed attention score combines the additive mask with the raw
+    // `Q @ Kᵀ` score via `Add` rather than an in-op `Attention`/`GroupQuery
+    // Attention` cache. The substitution stays uniform through this `Add`
+    // exactly when the *other* operand's length axis is itself capacity-
+    // consistent — i.e. it structurally derives from the same KV-cache append
+    // that the present-KV widening in `dispatch.rs` already treats as physical
+    // capacity (see [`derives_from_kv_cache_growth`]). GLM-5.2's indexer `Add`
+    // combines the mask with a logical-width score sourced from neither the
+    // mask nor a KV-cache append, so it still falls to the `Mixes` branch below.
+    if node.is_default_domain() && node.op_type == "Add" && node.inputs.len() == 2 {
+        let other = node.inputs[1 - slot];
+        return if other.is_some_and(|value| derives_from_kv_cache_growth(graph, value)) {
+            ConsumerRole::Propagate
+        } else {
+            ConsumerRole::Mixes(format!(
+                "{}[input {slot}] adds the mask to an operand that does not itself derive \
+                 from a KV-cache append, so freezing would compare max_len against a value \
+                 still at its logical length",
+                describe_node(node)
+            ))
+        };
+    }
+    // A decomposed attention score may append a fixed-size extra column (e.g. a
+    // per-head learned "attention sink" bias) onto the masked score *before* the
+    // softmax that neutralises padding, via `Concat`. `Concat` only appends —
+    // it never reorders or truncates the mask-derived operand — so the
+    // substitution stays uniform as long as every *other* operand is
+    // structurally independent of it: neither derived from the mask cone itself
+    // nor from a KV-cache append (the two things whose size actually changes
+    // under the substitution). A `Concat` operand that fails that independence
+    // check would silently change size between the logical and frozen forms,
+    // so it disqualifies the binding instead.
+    if node.is_default_domain() && node.op_type == "Concat" {
+        let independent = node.inputs.iter().enumerate().all(|(i, input)| {
+            i == slot || input.is_none_or(|value| !derives_from_kv_cache_growth(graph, value))
+        });
+        return if independent {
+            ConsumerRole::Propagate
+        } else {
+            ConsumerRole::Mixes(format!(
+                "{}[input {slot}] concatenates the mask-derived value with an operand that \
+                 also derives from a KV-cache append, so the two would not stay the same \
+                 size once the mask is frozen",
+                describe_node(node)
+            ))
+        };
+    }
+    // A default-domain `Softmax` that normalises over the mask's own (last)
+    // axis is the decomposed-attention neutralisation point: `-inf` mask lanes
+    // become exact-zero probability there, so nothing needs to be tracked past
+    // it (mirrors capacity-form `Attention`'s internal padding treatment). A
+    // `Softmax` over any other axis would not neutralise the length axis at
+    // all, so it is deliberately excluded and falls to the catch-all below.
+    //
+    // The *default* when `axis` is absent is opset-dependent, not just a
+    // spelling convenience: opset >= 13 defaults to `-1` with plain per-axis
+    // normalization (identical to an explicit `-1`), but opset <= 12 defaults
+    // to `1` with "coerce to 2D" semantics that merge every dim from `axis`
+    // onward into one normalization group — for a rank > 2 tensor that mixes
+    // in axes *other than* the length axis, so it would not purely neutralise
+    // it. Since this call site has no tensor rank to confirm axis == rank - 1
+    // in that case, an absent attribute is only ever treated as safe under
+    // opset >= 13, where the default is unambiguously the last axis alone.
+    if node.is_default_domain() && node.op_type == "Softmax" {
+        let axis = node.attr("axis").and_then(Attribute::as_int);
+        let normalizes_length_axis = match axis {
+            Some(-1) => true,
+            Some(_) => false,
+            None => effective_opset(graph, node) >= 13,
+        };
+        return if normalizes_length_axis {
+            ConsumerRole::Sink
+        } else {
+            ConsumerRole::Mixes(format!(
+                "{} normalizes over an axis other than the last (or defaults to opset <= 12's \
+                 axis=1 coerce-to-2D semantics, which is not confirmed to be the last axis \
+                 alone), so it would not neutralise the mask's padded lanes before a \
+                 non-padding-aware consumer",
+                describe_node(node)
+            ))
+        };
+    }
+    // Everything else combines the mask with a value whose extent came from
+    // elsewhere, or consumes it in a shape not recognised above.
     ConsumerRole::Mixes(format!(
         "{}[input {slot}] is outside the additive causal-mask builder set, so it \
          sources the mask length axis from another value",
