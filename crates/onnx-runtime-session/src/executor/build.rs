@@ -1326,8 +1326,18 @@ impl Executor {
                 .collect();
             let output_dtypes: Vec<DataType> = outputs.iter().map(|v| value_dtypes[v]).collect();
             let mut lazy_weight_inputs = Vec::new();
+            // Dense (`MatMul`/`MatMulNBits`) and `BlockQuantizedMoE` weights may
+            // all be look-ahead prefetched: each boundary's EP-side
+            // `prefetch_lazy_weight` decides independently whether it can act on
+            // a given weight, so listing a boundary here only makes it eligible
+            // to be *offered* early, never that it will be. `QMoE`'s routed
+            // residency is intentionally excluded — it is a per-dispatch
+            // whole-bank guard (`RoutedResidencyProof`/`acquire_routed_residency`,
+            // #1797), not a look-ahead page-in, and mixing the two seams would
+            // require a second residency authority for the same weight.
             if LazyWeightBoundary::MatMul.matches(&node.domain, &node.op_type)
                 || LazyWeightBoundary::MatMulNBits.matches(&node.domain, &node.op_type)
+                || LazyWeightBoundary::BlockQuantizedMoe.matches(&node.domain, &node.op_type)
             {
                 for vid in inputs.iter().flatten() {
                     if weight_handles

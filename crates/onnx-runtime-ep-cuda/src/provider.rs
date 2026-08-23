@@ -2134,14 +2134,25 @@ impl ExecutionProvider for CudaExecutionProvider {
             >))
     }
 
+    /// Start an ahead-of-need transfer for a lazy weight the executor's
+    /// look-ahead has named (issue #82 cycle 7). `Ok(true)` only when a
+    /// `BlockQuantizedMoE` transfer was genuinely started asynchronously and
+    /// still needs a later [`Self::page_lazy_weight`] call for the same `key`
+    /// to promote it; every other boundary (dense `MatMul`/`MatMulNBits`,
+    /// `QMoE`) and every case this increment cannot prove safe returns
+    /// `Ok(false)` unchanged, identical to this method not existing.
     fn prefetch_lazy_weight(
         &self,
         key: u64,
         weight: &LazyWeight,
         source: &dyn onnx_runtime_ep_api::MmapRegionSource,
     ) -> Result<bool> {
-        let _ = (self, key, weight, source);
-        Ok(false)
+        let Some(residency) = self.residency.as_ref() else {
+            return Ok(false);
+        };
+        residency
+            .prefetch_block_quantized_moe(key, weight, source)
+            .map_err(|error| EpError::KernelFailed(format!("weight prefetch: {error}")))
     }
 
     fn initialize(&mut self, _config: &EpConfig) -> Result<()> {
