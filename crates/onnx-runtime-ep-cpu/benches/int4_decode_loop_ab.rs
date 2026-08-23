@@ -16,14 +16,29 @@
 //! | `m = 1` through the fused GEBP | default env, built with the row gates forced to 1 |
 //! | today's decode routes | `ONNX_GENAI_CPU_MM_INT4_GEBP=0` |
 //!
-//! Both arms come from one binary. The second reproduces today's behaviour
-//! exactly, because today no int4 prefill route is gated below `m = 2`.
+//! Both arms come from one binary.
+//!
+//! **Stale claim, corrected 2026-08-23 (#1783).** This used to say the second
+//! arm "reproduces today's behaviour exactly, because today no int4 prefill
+//! route is gated below `m = 2`". That is no longer true:
+//! `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` is **1**, so for any block size that
+//! is not a multiple of 32 the GEBP gate `m >= 1` admits a *decode* row. At
+//! those block sizes the default arm is GEBP and the two arms differ.
 //!
 //! Env:
-//! - `PROBE_BLOCK` -- quantization block size (default 32). 16 routes below the
-//!   gate to `borrowed_affine_int4_matmul`; 32/64/128 route to
-//!   `borrowed_affine_int4_matmul_nblock`, a different and much stronger
-//!   competitor.
+//! - `PROBE_BLOCK` -- quantization block size (default 32). 32/64/128 route to
+//!   `borrowed_affine_int4_matmul_nblock`, the N-blocked decode kernel.
+//!
+//!   **`16` does not measure a decode kernel at all, and this line used to say
+//!   it routed to `borrowed_affine_int4_matmul`.** It does not.
+//!   `int4_prefill_gebp_min_rows` returns
+//!   `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED == 1` for any block size that is
+//!   not a multiple of 32, so at `m = 1` the GEBP gate is already satisfied
+//!   and block 16 runs the *fused prefill* kernel `quant_prefill_gebp`.
+//!   Falsifier: `ONNX_GENAI_CPU_MM_INT4_GEBP=0` changes the block-16 checksum
+//!   (844.702358 -> 844.714874) and its time, and leaves block 32 untouched
+//!   (979.199155 either way). Any block-16 row taken here is a GEBP row.
+//!   Set `ONNX_GENAI_CPU_MM_INT4_GEBP=0` to reach the decode kernel at 16.
 //! - `PROBE_ACCURACY` -- `accuracy_level` (default 0). **4 is the only value
 //!   that reaches the packed-nibble kernel**, so without this axis that route
 //!   had no decode-loop row at all and only ever appeared in single-op benches.
@@ -213,6 +228,12 @@ fn main() {
             state = returned;
             samples.push(elapsed);
         }
+        // Written by every session, last writer wins. That is well defined
+        // rather than racy in substance: the sessions share one deterministic
+        // weight set and one deterministic activation, so every session
+        // computes the same sum and any of them is the right answer. It is an
+        // atomic store read after the scope joins, so there is no UB either.
+        //
         // Route proof, not decoration. An arm that supplies a fourth input the
         // kernel silently ignored would time the *symmetric* route while
         // claiming the asymmetric one, and every number taken from it would be
