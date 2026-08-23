@@ -3256,14 +3256,45 @@ impl ExecutionProvider for KvCapacityAppendTestEp {
     }
 }
 
+/// Rewrites a KV-cache-growth `Concat` node's `past`/`current`/`present`
+/// operand shapes to a realistic rank-4 `[batch, heads, capacity/1,
+/// head_dim]` physical layout and stamps its mandatory `axis` attribute to
+/// `2` (the sequence axis) — the shape/axis precondition
+/// [`rewrite_kv_capacity_appends`] now requires before it will rewrite a
+/// candidate `Concat` (see that function's axis-normalization comment). The
+/// rest of the cone (`mask`/`score`/`softmax`/etc.) is deliberately left at
+/// its placeholder rank-1 `[1]` shape: the classifier's proof and the pass's
+/// other preconditions are purely topological and never inspect those
+/// shapes, so only the two values this new gate actually reads need to carry
+/// realistic ranks.
+fn shape_kv_growth_concat_as_rank4_axis2(graph: &mut Graph, concat_id: NodeId) {
+    let node = graph.node(concat_id);
+    let axis = 2;
+    let past = node.inputs[0].expect("KV-growth Concat must have a past operand");
+    let current = node.inputs[1].expect("KV-growth Concat must have a current operand");
+    let present = node.outputs[0];
+    graph.value_mut(past).shape = static_shape([1, 2, 4, 8]);
+    graph.value_mut(current).shape = static_shape([1, 2, 1, 8]);
+    graph.value_mut(present).shape = static_shape([1, 2, 4, 8]);
+    graph
+        .node_mut(concat_id)
+        .attributes
+        .insert("axis".into(), Attribute::Int(axis));
+}
+
 /// Adds a `position_ids` graph input to
 /// [`decomposed_kv_growth_score_and_value_graph`]'s cone — the load-bearing
 /// signal [`rewrite_kv_capacity_appends`] requires before it will even run
-/// the classifier. Returns the same tuple plus the new value id.
+/// the classifier — and shapes both KV-growth `Concat`s (see
+/// [`shape_kv_growth_concat_as_rank4_axis2`]) to satisfy the rewrite's
+/// rank-4/axis-2 precondition. Returns the same tuple plus the new value id.
 fn decomposed_kv_growth_cone_with_position_ids() -> (Graph, NodeId, NodeId, ValueId) {
     let (mut graph, _mask, key_concat_id, value_concat_id) =
         decomposed_kv_growth_score_and_value_graph();
-    let position_ids = graph.create_named_value("position_ids", DataType::Int64, static_shape([1]));
+    shape_kv_growth_concat_as_rank4_axis2(&mut graph, key_concat_id);
+    shape_kv_growth_concat_as_rank4_axis2(&mut graph, value_concat_id);
+    let position_ids =
+        graph.create_named_value("position_ids", DataType::Int64, static_shape([1, 1]));
     graph.add_input(position_ids);
     (graph, key_concat_id, value_concat_id, position_ids)
 }
@@ -3322,6 +3353,79 @@ fn rewrite_kv_capacity_appends_rewrites_every_eligible_concat_when_ep_supports_t
         graph.validate().is_ok(),
         "the rewritten graph must remain structurally valid: {:?}",
         graph.validate().err()
+    );
+}
+
+/// The eligibility classifier proves the KV-growth `Concat`'s output
+/// *provenance* is safe — it never inspects which axis the concatenation
+/// grows on. A `Concat` that structurally matched but grows on an axis other
+/// than 2 (of a rank-4 `[batch, heads, seq, head_dim]` layout) is not one
+/// `pkg.nxrt::KvCacheCapacityAppend`'s kernel understands (it hardcodes axis
+/// 2), so the rewrite must decline it and leave the original, axis-generic
+/// `Concat` completely untouched — never silently write into the wrong
+/// physical dimension. Covers both an explicit non-2 axis and a negative
+/// axis that normalizes away from 2.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_concat_axis_is_not_the_sequence_axis() {
+    for wrong_axis in [1_i64, -1_i64] {
+        let (mut graph, key_concat_id, value_concat_id, _position_ids) =
+            decomposed_kv_growth_cone_with_position_ids();
+        graph
+            .node_mut(key_concat_id)
+            .attributes
+            .insert("axis".into(), Attribute::Int(wrong_axis));
+        let ep = KvCapacityAppendTestEp::new(true);
+
+        // The pass legitimately still fires overall (the unrelated,
+        // correctly-shaped value-role Concat below is rewritten), so this
+        // test asserts on the per-node outcome, not the pass's aggregate
+        // "did anything change" return value.
+        rewrite_kv_capacity_appends(&mut graph, &ep);
+
+        assert_eq!(
+            graph.node(key_concat_id).op_type,
+            "Concat",
+            "the wrong-axis Concat must remain untouched for axis={wrong_axis}"
+        );
+        // The unrelated, correctly-axis-2 value-role Concat in the same graph
+        // is unaffected by the key-role node's axis being wrong — this is a
+        // per-node structural gate, not an all-or-nothing graph veto.
+        assert_eq!(
+            graph.node(value_concat_id).op_type,
+            "KvCacheCapacityAppend",
+            "an unrelated correctly-shaped Concat must still be rewritten for axis={wrong_axis}"
+        );
+    }
+}
+
+/// The same axis precondition also declines a `Concat` whose `past`/`present`
+/// operands are not rank 4 at all (e.g. a rank-3 layout with no separate
+/// heads axis) — there is no well-defined "axis 2 of a 4-D physical layout"
+/// to even ask about, so the rewrite must leave it as a plain `Concat`
+/// regardless of what its `axis` attribute says.
+#[test]
+fn rewrite_kv_capacity_appends_is_a_no_op_when_past_is_not_rank4() {
+    let (mut graph, key_concat_id, value_concat_id, _position_ids) =
+        decomposed_kv_growth_cone_with_position_ids();
+    let past = graph.node(key_concat_id).inputs[0].unwrap();
+    let present = graph.node(key_concat_id).outputs[0];
+    graph.value_mut(past).shape = static_shape([2, 4, 8]);
+    graph.value_mut(present).shape = static_shape([2, 4, 8]);
+    let ep = KvCapacityAppendTestEp::new(true);
+
+    // As above: the sibling value-role Concat is still rank-4/axis-2 and is
+    // legitimately rewritten, so only the per-node outcome is asserted.
+    rewrite_kv_capacity_appends(&mut graph, &ep);
+
+    assert_eq!(
+        graph.node(key_concat_id).op_type,
+        "Concat",
+        "a rank-3 past operand must never be rewritten regardless of its axis attribute"
+    );
+    assert_eq!(
+        graph.node(value_concat_id).op_type,
+        "KvCacheCapacityAppend",
+        "an unrelated correctly rank-4 value-role Concat must still be rewritten"
     );
 }
 

@@ -130,6 +130,38 @@ pub(super) fn rewrite_kv_capacity_appends(graph: &mut Graph, ep: &dyn ExecutionP
         };
         let present = node.outputs[0];
 
+        // The eligibility classifier proves the *value provenance* of this
+        // `Concat`'s output is safe (it structurally reaches a proven-safe
+        // sink) -- it says nothing about which axis the concatenation grows
+        // on. The new op's kernel and `unsupported_reason` both hardcode that
+        // the growth axis is index 2 of a `[batch, heads, seq, head_dim]`
+        // physical layout; a `Concat` that structurally matched but grows on
+        // a different axis is not something this rewrite understands, and
+        // rewriting it anyway would silently write into the wrong physical
+        // dimension rather than fail loudly (the batch/heads/head_dim
+        // cross-shape checks in `unsupported_reason` only catch this
+        // incidentally, and only when every other axis happens to be
+        // statically known and distinct). Read the source `Concat`'s
+        // mandatory `axis` attribute, normalize a negative index against
+        // `past`'s rank, and decline unless it resolves to exactly axis 2 of
+        // a rank-4 tensor -- leaving the original `Concat`, which is
+        // axis-generic, untouched.
+        let past_rank = graph.value(past).shape.len();
+        let normalized_axis = node
+            .attr("axis")
+            .and_then(Attribute::as_int)
+            .and_then(|axis| {
+                let axis = if axis < 0 {
+                    axis + past_rank as i64
+                } else {
+                    axis
+                };
+                usize::try_from(axis).ok()
+            });
+        if past_rank != 4 || normalized_axis != Some(2) {
+            continue;
+        }
+
         let mut candidate = Node::new(
             node_id,
             KV_CAPACITY_APPEND_OP,

@@ -536,3 +536,163 @@ fn kv_capacity_append_eager_execute_rejects_out_of_capacity_position_without_wri
         ep.deallocate(buffer).expect("free CUDA test buffer");
     }
 }
+
+/// Every other test in this file fixes `batch == 1` and a single-token
+/// `current`/`position_ids` (the steady-state single-token decode step). The
+/// kernel's index decomposition (`b = rem / heads`,
+/// `position_ids[b * current_len + s]`) is written generically over both
+/// dimensions, but nothing above actually exercises `batch > 1` or
+/// `current_len > 1` (a multi-token/prefill-style append), so a batch- or
+/// row-stride indexing bug in either dimension would not be caught by this
+/// file in isolation. This test uses `batch = 2`, `current_len = 2`, and
+/// distinct, non-overlapping destination rows per batch, so a cross-batch or
+/// cross-row addressing mistake shows up as either a wrong value landing in
+/// the wrong (batch, row) slot or as an untouched slot being disturbed.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn kv_capacity_append_handles_multi_batch_multi_token_current_without_cross_talk() {
+    const MB_BATCH: usize = 2;
+    const MB_CURRENT_LEN: usize = 2;
+    const MB_TOTAL_ELEMS: usize = MB_BATCH * HEADS * CAPACITY * HEAD_DIM;
+    const MB_CURRENT_ELEMS: usize = MB_BATCH * HEADS * MB_CURRENT_LEN * HEAD_DIM;
+
+    let ep = require_cuda();
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 23);
+    graph.opset_imports.insert(DOMAIN.into(), 1);
+    let past = graph.create_named_value(
+        "past_key",
+        onnx_runtime_ir::DataType::Float32,
+        static_shape([MB_BATCH, HEADS, CAPACITY, HEAD_DIM]),
+    );
+    let current = graph.create_named_value(
+        "current_key",
+        onnx_runtime_ir::DataType::Float32,
+        static_shape([MB_BATCH, HEADS, MB_CURRENT_LEN, HEAD_DIM]),
+    );
+    let position_ids = graph.create_named_value(
+        "position_ids",
+        onnx_runtime_ir::DataType::Int64,
+        static_shape([MB_BATCH, MB_CURRENT_LEN]),
+    );
+    for input in [past, current, position_ids] {
+        graph.add_input(input);
+    }
+    let present = graph.create_named_value(
+        "present_key",
+        onnx_runtime_ir::DataType::Float32,
+        static_shape([MB_BATCH, HEADS, CAPACITY, HEAD_DIM]),
+    );
+    graph.add_output(present);
+    let mut node = Node::new(
+        NodeId(0),
+        OP,
+        vec![Some(past), Some(current), Some(position_ids)],
+        vec![present],
+    );
+    node.domain = DOMAIN.into();
+    let node_id = graph.insert_node(node);
+    let model = Model::new(&graph);
+    let shapes = vec![
+        vec![MB_BATCH, HEADS, CAPACITY, HEAD_DIM],
+        vec![MB_BATCH, HEADS, MB_CURRENT_LEN, HEAD_DIM],
+        vec![MB_BATCH, MB_CURRENT_LEN],
+    ];
+    let kernel = ep
+        .get_kernel(model.graph.node(node_id), &shapes, 1)
+        .expect("pkg.nxrt::KvCacheCapacityAppend must be supported on CUDA");
+
+    let past_present = upload(&ep, &bytes(&[SENTINEL; MB_TOTAL_ELEMS]));
+    // batch 0 writes rows [0, 1]; batch 1 writes rows [2, 3] -- disjoint
+    // destinations, so a cross-batch mix-up leaves a detectable footprint in
+    // either batch's untouched half.
+    let position_values: [i64; MB_BATCH * MB_CURRENT_LEN] = [0, 1, 2, 3];
+    let current_buffer = ep.allocate(MB_CURRENT_ELEMS * 4, 256).unwrap();
+    let position_buffer = ep.allocate(MB_CURRENT_ELEMS * 8, 256).unwrap();
+    let current_values: Vec<f32> = (0..MB_BATCH)
+        .flat_map(|b| {
+            (0..HEADS).flat_map(move |h| {
+                (0..MB_CURRENT_LEN).flat_map(move |s| {
+                    (0..HEAD_DIM).map(move |d| {
+                        1000.0 * b as f32 + 100.0 * s as f32 + 10.0 * h as f32 + d as f32
+                    })
+                })
+            })
+        })
+        .collect();
+    overwrite(&ep, &current_buffer, &bytes(&current_values));
+    overwrite(&ep, &position_buffer, &bytes(&position_values));
+
+    let past_shape = [MB_BATCH, HEADS, CAPACITY, HEAD_DIM];
+    let current_shape = [MB_BATCH, HEADS, MB_CURRENT_LEN, HEAD_DIM];
+    let position_shape = [MB_BATCH, MB_CURRENT_LEN];
+    let past_strides = compute_contiguous_strides(&past_shape);
+    let current_strides = compute_contiguous_strides(&current_shape);
+    let position_strides = compute_contiguous_strides(&position_shape);
+    let inputs = [
+        TensorView::new(
+            DevicePtr(past_present.as_ptr()),
+            onnx_runtime_ir::DataType::Float32,
+            &past_shape,
+            &past_strides,
+            past_present.device(),
+        ),
+        TensorView::new(
+            DevicePtr(current_buffer.as_ptr()),
+            onnx_runtime_ir::DataType::Float32,
+            &current_shape,
+            &current_strides,
+            current_buffer.device(),
+        ),
+        TensorView::new(
+            DevicePtr(position_buffer.as_ptr()),
+            onnx_runtime_ir::DataType::Int64,
+            &position_shape,
+            &position_strides,
+            position_buffer.device(),
+        ),
+    ];
+    let mut outputs = [TensorMut::new(
+        DevicePtrMut(past_present.as_ptr() as *mut std::ffi::c_void),
+        onnx_runtime_ir::DataType::Float32,
+        &past_shape,
+        &past_strides,
+        past_present.device(),
+    )];
+    kernel
+        .execute(&inputs, &mut outputs)
+        .expect("multi-batch multi-token KvCacheCapacityAppend decode step");
+
+    let observed = floats(&download(&ep, &past_present, MB_TOTAL_ELEMS * 4));
+    let mut expected = vec![SENTINEL; MB_TOTAL_ELEMS];
+    for b in 0..MB_BATCH {
+        for s in 0..MB_CURRENT_LEN {
+            let position = position_values[b * MB_CURRENT_LEN + s] as usize;
+            for h in 0..HEADS {
+                for d in 0..HEAD_DIM {
+                    let dst = ((b * HEADS + h) * CAPACITY + position) * HEAD_DIM + d;
+                    let src = ((b * HEADS + h) * MB_CURRENT_LEN + s) * HEAD_DIM + d;
+                    expected[dst] = current_values[src];
+                }
+            }
+        }
+    }
+    assert_eq!(
+        observed, expected,
+        "each (batch, token) row must land at its own position_ids destination without \
+         disturbing any other batch's or row's contents"
+    );
+    assert_eq!(
+        ep.runtime().check_capture_error().unwrap(),
+        0,
+        "no bounds violation is expected: every position_ids value is within capacity"
+    );
+
+    for buffer in [position_buffer, current_buffer, past_present] {
+        ep.deallocate(buffer).expect("free CUDA test buffer");
+    }
+}

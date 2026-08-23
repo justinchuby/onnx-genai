@@ -156,6 +156,19 @@ pub(crate) fn unsupported_reason(
              {past_dtype:?} and {current_dtype:?}"
         ));
     }
+    // A packed/sub-byte dtype (e.g. `Int4`/`Uint4`/`Float4E2M1`) has
+    // `byte_size() == 0` -- `execute`'s `elem_bytes` call would only discover
+    // this the first time the rewritten node actually ran, hard-failing a
+    // decode step that a plain `Concat` (which never assumes a byte-addressable
+    // element) would have handled fine. Decline the claim here instead, the
+    // same "declined at build time, not crashed at run time" contract every
+    // other check in this function already upholds.
+    if past_dtype != DataType::Undefined && past_dtype.byte_size() == 0 {
+        return Some(format!(
+            "KvCacheCapacityAppend: past/current dtype {past_dtype:?} is packed or variable-width \
+             (not byte-addressable) on CUDA"
+        ));
+    }
 
     let past_shape = shape_at(0);
     let current_shape = shape_at(1);
@@ -514,6 +527,17 @@ mod tests {
     fn unsupported_reason_rejects_mismatched_past_current_dtype() {
         let shapes = shapes4x4x2([1, 2, 4, 8], [1, 2, 1, 8], [1, 1]);
         let dtypes = [DataType::Float32, DataType::Float16, DataType::Int64];
+        assert!(unsupported_reason(&shapes, &dtypes).is_some());
+    }
+
+    #[test]
+    fn unsupported_reason_rejects_packed_past_current_dtype() {
+        // Int4 has `byte_size() == 0`: `past == current` dtype-equality alone
+        // would let a packed/sub-byte KV-cache layout through, only to have
+        // `execute`'s `elem_bytes` hard-fail the first time the rewritten node
+        // actually ran. Must be declined here instead.
+        let shapes = shapes4x4x2([1, 2, 4, 8], [1, 2, 1, 8], [1, 1]);
+        let dtypes = [DataType::Int4, DataType::Int4, DataType::Int64];
         assert!(unsupported_reason(&shapes, &dtypes).is_some());
     }
 
