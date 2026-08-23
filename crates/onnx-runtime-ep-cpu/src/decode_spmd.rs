@@ -88,6 +88,8 @@
 //!    adaptive calibrator measures the persistent SPMD pool against the flat path
 //!    only.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -150,6 +152,52 @@ const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 /// Spin iterations between wall-clock checks, so `Instant::now()` (a vDSO read,
 /// ~20 ns) is amortised over the hot spin loop rather than read every iteration.
 const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
+
+/// How long [`SpmdDecodePools::build_with_schedule`]'s readiness barrier waits
+/// for every spawned worker to announce itself before declaring the pool
+/// unbuildable.
+///
+/// Deliberately far beyond any real startup: workers announce within
+/// microseconds, so this can only be reached when the condition has become
+/// unsatisfiable. It exists so that failure mode is a loud panic instead of an
+/// unbounded spin that holds a machine at full occupancy indefinitely.
+const POOL_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Both knobs below are scoped to the thread that builds the pool, not global. A
+// global knob is read by *every* concurrently-building pool in the same test
+// binary, so injecting a fault reaches pools belonging to unrelated tests --
+// which is exactly how the first version of this fault injection failed
+// `an_idle_gap_far_longer_than_the_blocktime_parks_the_workers`. A `Mutex` held
+// by the injecting tests does not fix that, because the tests being corrupted
+// never take it. Thread scoping needs no lock and cannot be forgotten by a
+// future test, since the builder thread is the test's own thread.
+#[cfg(test)]
+thread_local! {
+    /// Test override for [`POOL_READY_TIMEOUT`], in milliseconds; `0` means
+    /// "use the real one". A liveness backstop is only testable if the test
+    /// does not have to wait out the production deadline to observe it.
+    static POOL_READY_TIMEOUT_MS: Cell<u64> = const { Cell::new(0) };
+
+    /// Test fault injection: the global worker index that must die before
+    /// announcing readiness, or `usize::MAX` for none. Reproduces the one
+    /// failure the barrier cannot distinguish from slowness -- a worker that
+    /// will never arrive.
+    static FAIL_WORKER_BEFORE_READY: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Read on the builder thread only: both the barrier and the pre-spawn fault
+/// latch run there, so the thread-local scoping above is what makes this
+/// answer the injecting test's question rather than some other test's.
+fn pool_ready_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = POOL_READY_TIMEOUT_MS.with(Cell::get);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    POOL_READY_TIMEOUT
+}
 
 /// KMP_BLOCKTIME analog: the active-spin window a worker holds a core before
 /// parking on the futex, read once. `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` sets it
@@ -776,6 +824,11 @@ impl SpmdDecodePools {
         // with `Acquire`.
         let pin_failed: Arc<Vec<AtomicBool>> =
             Arc::new((0..total_threads).map(|_| AtomicBool::new(false)).collect());
+        // Latched here, on the builder thread, so the fault belongs to *this*
+        // pool. Reading it inside the spawned worker would read the worker's own
+        // (default) thread-local and silently never fire.
+        #[cfg(test)]
+        let fail_worker_before_ready = FAIL_WORKER_BEFORE_READY.with(Cell::get);
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let pin_failed = Arc::clone(&pin_failed);
@@ -790,6 +843,11 @@ impl SpmdDecodePools {
                             "worker {global_index} could not pin to cpu {cpu}: {message}"
                         ));
                     }
+                    #[cfg(test)]
+                    assert!(
+                        fail_worker_before_ready != global_index,
+                        "injected fault: worker {global_index} dies before announcing"
+                    );
                     worker_loop(shared, global_index);
                 })
                 .expect("spawn persistent SPMD decode worker");
@@ -801,8 +859,50 @@ impl SpmdDecodePools {
         // op's pending count for that worker, which would never arrive to
         // decrement it -- hanging the barrier. This counts spawned *threads*,
         // not compute shards: the dispatcher's shard has no thread to wait for.
+        //
+        // Spin briefly, then *yield*, then give up loudly. All three matter:
+        //
+        // * A pure `spin_loop` here waits on threads that need a core to make
+        //   progress, so where the builder and its workers contend for the same
+        //   CPU the spinner can starve the very workers it is waiting for. That
+        //   is a livelock, not slow progress, and it is most reachable exactly
+        //   where cores are scarcest -- an emulated target, a cpuset-confined
+        //   process, or a test harness building several pools at once.
+        // * A worker that dies before announcing readiness -- a panic anywhere
+        //   in its pre-loop setup -- makes the condition permanently
+        //   unsatisfiable. Spinning on it burns every core it holds forever,
+        //   which is indistinguishable from work: an aarch64 suite hung this
+        //   way for 5h40m at ~18 cores' worth of occupancy and was noticed only
+        //   because someone went looking at `/proc`.
+        //
+        // The deadline is a liveness backstop, not a performance bound. Workers
+        // announce readiness within microseconds of spawning, so a wait that
+        // reaches it is reporting a broken pool, not a slow one.
+        let ready_since = Instant::now();
+        let mut spins = 0u32;
         while shared.ready.load(Ordering::Acquire) < total_threads {
-            std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins < SPIN_LOOP_BUDGET {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+                if spins.is_multiple_of(CLOCK_CHECK_STRIDE)
+                    && ready_since.elapsed() >= pool_ready_timeout()
+                {
+                    let ready = shared.ready.load(Ordering::Acquire);
+                    // Best effort: let whatever workers did start leave their
+                    // loops rather than linger behind the panic.
+                    shared.shutdown.store(true, Ordering::Release);
+                    panic!(
+                        "persistent SPMD decode pool never became ready: {ready} of \
+                         {total_threads} workers announced within {:?}. \
+                         A worker most likely panicked before entering its loop; \
+                         failing here rather than spinning on a condition that can \
+                         no longer be satisfied.",
+                        pool_ready_timeout()
+                    );
+                }
+            }
         }
 
         // Every worker has now recorded its pin outcome (it does so before
@@ -3245,6 +3345,97 @@ mod tests {
                 .join()
                 .unwrap_or(false)
             })
+    }
+
+    /// A worker that never announces must fail the build loudly, not spin.
+    ///
+    /// This is the defect that cost a shared host 5h40m: the barrier waited on
+    /// a condition that had become unsatisfiable, and did it by spinning, so it
+    /// held ~18 cores' worth of occupancy indefinitely while looking exactly
+    /// like a long-running job. A hang that burns the machine is strictly worse
+    /// than one that blocks, because nothing distinguishes it from work.
+    ///
+    /// Both knobs are thread-local and `catch_unwind` keeps the build on this
+    /// thread, so the fault reaches this pool and no other. An earlier global
+    /// version of this test injected a worker panic into whichever unrelated
+    /// pool happened to be building concurrently.
+    #[test]
+    fn a_worker_that_never_announces_fails_the_build_instead_of_spinning() {
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(250));
+        FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(1));
+        // The injected worker panic is expected; keep it off the test log.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(|| {
+            SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 3,
+                }],
+                DecodeSchedule::Fixed,
+                false,
+            )
+        });
+
+        std::panic::set_hook(previous);
+        FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(usize::MAX));
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+
+        let panic = outcome
+            .err()
+            .expect("a pool missing a worker cannot be built; the barrier must not report success");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("never became ready"),
+            "the build must say why it gave up, got: {message}"
+        );
+        assert!(
+            message.contains("2 of 3"),
+            "the diagnostic must report how many workers did arrive, got: {message}"
+        );
+        // Bounds the *test*, and with it the claim: an unbounded barrier fails
+        // this by never returning at all rather than by returning late.
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the barrier gave up, but took {:?} to do it",
+            started.elapsed()
+        );
+    }
+
+    /// The backstop must not fire on a pool that is merely slow to start.
+    ///
+    /// A liveness guard that trips under load is worse than none: it converts a
+    /// scheduling hiccup into a crash, which is why the production deadline is
+    /// far beyond any real startup rather than tuned close to it.
+    #[test]
+    fn a_healthy_pool_never_trips_the_readiness_backstop() {
+        assert_eq!(
+            FAIL_WORKER_BEFORE_READY.with(Cell::get),
+            usize::MAX,
+            "no fault may be injected on the thread building a healthy pool"
+        );
+        // A deadline this tight would trip on any real stall; the pool still
+        // builds, because healthy workers announce in microseconds.
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(2_000));
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers: 4,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+        assert_eq!(pools.total_workers(), 4);
+        pools.shutdown();
     }
 
     /// A pool that reports its width honestly must also *place* honestly.
