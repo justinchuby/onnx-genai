@@ -149,10 +149,6 @@ const DECODE_BLOCKTIME_ENV: &str = "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US";
 /// pure spinning and only genuinely idle gaps ramp into yielding then parking.
 const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 
-/// Spin iterations between wall-clock checks, so `Instant::now()` (a vDSO read,
-/// ~20 ns) is amortised over the hot spin loop rather than read every iteration.
-const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
-
 /// How long [`SpmdDecodePools::build_with_schedule`]'s readiness barrier waits
 /// for every spawned worker to announce itself before declaring the pool
 /// unbuildable.
@@ -721,7 +717,28 @@ impl SharedState {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
-                if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= blocktime {
+                // Check the clock on *every* yield, not on a stride -- the same
+                // correction #1825 made to the readiness barrier below, which
+                // missed this site. The clock is never read during the pure
+                // spin phase here, so a stride amortised nothing: its only
+                // effect was to multiply the granularity of the blocktime
+                // deadline by 64 yields. `SPIN_LOOP_BUDGET` (4096) is itself a
+                // multiple of that removed 64-iteration stride, so the yield
+                // phase began exactly on a stride boundary -- the deadline was
+                // evaluated once, on the first yield, and then not again for 64
+                // more. A yield costs microseconds to milliseconds under
+                // contention, and contention is exactly when a worker holding a
+                // core past the window it was told to release at does the most
+                // damage. `Instant::now()` is a vDSO read against a yield that
+                // costs orders of magnitude more -- measured on this host,
+                // 32ns per read against 1214ns for an *uncontended*
+                // `yield_now`, i.e. 2.6%, and the fraction only shrinks as
+                // contention makes the yield slower. Checking every time is
+                // free exactly where it matters.
+                // With the stride gone this file has no clock-stride constant
+                // left: its only use was in the phase its own doc comment said
+                // it did not apply to.
+                if start.elapsed() >= blocktime {
                     break;
                 }
             }
