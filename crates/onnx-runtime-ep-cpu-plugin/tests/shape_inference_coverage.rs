@@ -106,7 +106,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       ORT has no kernel for these at all, so handing them over does not
     //       get a faster implementation — it gets a load failure.
     ("", "LinearAttention"),
-    ("com.microsoft", "CausalConvWithState"),
     ("com.microsoft", "LinearAttention"),
 ];
 

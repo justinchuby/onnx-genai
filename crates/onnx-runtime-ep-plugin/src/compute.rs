@@ -187,6 +187,14 @@ pub enum ShapeInference {
         /// e.g. the `input_skip_bias_sum` output of SkipLayerNormalization.
         full_shape_outputs: Vec<usize>,
     },
+    /// `CausalConvWithState`: two outputs with *different* shapes, which is why
+    /// neither `SameAsInput` nor `SameAsInputMultiOutput` covers it.
+    ///
+    /// Output 0 is the convolution result and keeps the input's `[B, C, L]`.
+    /// Output 1 is the carry state `[B, C, K-1]`, whose width comes from the
+    /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
+    /// has to be read off input 1.
+    CausalConvWithState,
     /// Op with no modelled shape rule — Compute will error with op details.
     Declined { op_type: String, domain: String },
 }
@@ -286,6 +294,13 @@ impl ShapeInference {
             | "TensorScatter"
             | "Trilu"
             | "Clip" => Self::SameAsInput(0),
+
+            // Two outputs of differing shape; see the variant's note. Claimed
+            // for both the `com.microsoft` contrib spelling and the standard
+            // ai.onnx opset-27 one, which have identical semantics. Leaving it
+            // declined handed the node to ORT, which has no kernel for it at
+            // all — that is a load failure, not merely a slower run.
+            "CausalConvWithState" => Self::CausalConvWithState,
 
             // ── Shape-preserving normalisation ops ───────────────────────
             "Softmax"
@@ -468,6 +483,13 @@ impl ShapeInference {
             | "TensorScatter"
             | "Trilu"
             | "Clip" => Self::SameAsInput(0),
+
+            // Two outputs of differing shape, so neither `SameAsInput` nor
+            // `SameAsInputMultiOutput` fits. Covers both the `com.microsoft`
+            // contrib spelling and the standard ai.onnx opset-27 one, which
+            // share a contract. Declining handed it to ORT, which has no
+            // kernel for it at all — a load failure, not a slower run.
+            "CausalConvWithState" => Self::CausalConvWithState,
 
             // ── LayerNorm / SkipLayerNorm family ──────────────────────────
             "LayerNormalization" | "RMSNormalization" | "SimplifiedLayerNormalization" => {
@@ -3708,6 +3730,33 @@ fn infer_shapes(
                 ));
             }
             Ok(vec![inputs[idx].shape.to_vec()])
+        }
+
+        ShapeInference::CausalConvWithState => {
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "CausalConvWithState: needs input and weight, got {} inputs",
+                    inputs.len()
+                ));
+            }
+            let input = inputs[0].shape;
+            let weight = inputs[1].shape;
+            if input.len() != 3 {
+                return Err(format!(
+                    "CausalConvWithState: input must be rank 3 (batch, channels, length), got {input:?}"
+                ));
+            }
+            if weight.len() != 3 {
+                return Err(format!(
+                    "CausalConvWithState: weight must be rank 3 (channels, 1, k), got {weight:?}"
+                ));
+            }
+            // The carry holds the last k-1 positions, so a degenerate k == 0
+            // would underflow rather than merely producing an odd shape.
+            let carry = weight[2]
+                .checked_sub(1)
+                .ok_or_else(|| "CausalConvWithState: kernel width must be non-zero".to_string())?;
+            Ok(vec![input.to_vec(), vec![input[0], input[1], carry]])
         }
 
         ShapeInference::SameAsInputMultiOutput { idx, count } => {
