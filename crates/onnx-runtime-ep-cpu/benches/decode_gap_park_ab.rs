@@ -51,6 +51,7 @@
 //! | `vcsw` / `ivcsw` | voluntary / involuntary context switches per token. `vcsw` is the kernel's independent view of parking and should track `park/tok` |
 //! | `rss_mb` | `ru_maxrss`, a process **high-water mark**. Absolute, never a delta -- a high-water mark cannot be differenced, and doing so prints noise that looks like a leak |
 //! | `foreign_%` | CPU consumed by *other processes* on this process's confined core set, as a percentage of one core, median over the reps that were measurable. Read this **before** `ms_tok`: a dispatch is a barrier, so foreign work on the confined set costs the whole dispatch and `ms_tok` is not comparable across rows with different values here. `cpu_ms` is. Prints `n/a` if no rep could be measured and suffixes `*` if only some could -- never a clean `0.0` for an unmeasured window |
+//! | `sib_%` | busiest **SMT sibling** of the confined set -- a core we share silicon with but are not allowed to run on -- as a percentage of one core, **peak** over the reps rather than median. `foreign_%` cannot see these by construction: a decode budget of N pins to N *physical* cores, so every partner thread is outside the mask, and a co-runner there halves one worker while `foreign_%` reads `0.0`. Peak rather than median because one saturated repetition invalidates that repetition rather than being an outlier to discard. Same `n/a` / `*` contract as `foreign_%` |
 //! | `spread%` | `(max - min) / median` of `ms_tok` across repetitions |
 //!
 //! # Controls
@@ -177,20 +178,33 @@
 //! Twelve launches across three configurations: every configuration produced
 //! both regimes. This matters more than any single row here, for two reasons.
 //!
-//! **Resolved: it is foreign CPU on the confined core set.** See the
-//! `foreign_%` column and the `onnx-runtime-hostmon` crate. `ONNX_GENAI_CPU_DECODE_THREADS=N`
+//! **Resolved: it is foreign CPU on the confined core set, or on its SMT
+//! siblings.** See the `foreign_%` and `sib_%` columns and the
+//! `onnx-runtime-hostmon` crate. `ONNX_GENAI_CPU_DECODE_THREADS=N`
 //! confines the process to N CPUs, and a dispatch is a *barrier*, so one
 //! unrelated thread on one of those N cores costs the whole dispatch rather than
 //! a share of it -- every other worker finishes and idles waiting. The workers
 //! really are asleep rather than thrashing, which is why the slow regime burns
 //! less CPU; they are asleep waiting on a shard whose core is being timeshared
 //! with somebody else. Injecting one `taskset`-pinned spinner reproduces the
-//! slow regime on demand and removing it restores the fast one, while the same
-//! spinner placed *outside* the confined set changes nothing.
+//! slow regime on demand and removing it restores the fast one.
+//!
+//! The confined set is not the whole story, and the correction matters more than
+//! the original claim. A budget of N pins to N *physical* cores, so on an SMT
+//! host every partner thread is **outside** the mask and invisible to
+//! `foreign_%` -- which is why an earlier version of this note recorded that a
+//! spinner placed outside the confined set "changes nothing". It does, if the
+//! outside core is a sibling. Pinning one verified-100%-busy hog to the sibling
+//! of a named decode worker made that same worker the slowest in the barrier in
+//! 5 of 6 launches, against 0 of 3 for a hog on a core that is neither in the
+//! set nor a sibling of it (p ~ 2e-5 against the null that the slow worker is
+//! uniform over the width). `foreign_%` read `0.0`--`8.4` throughout. Hence
+//! `sib_%`: read **both** columns before `ms_tok`.
 //!
 //! The two paragraphs below are kept because their methodological point stands
 //! on its own and is what led here -- but the cause is no longer unknown, and a
-//! run is no longer un-diagnosable: read `foreign_%` before reading `ms_tok`.
+//! run is no longer un-diagnosable: read `foreign_%` and `sib_%` before reading
+//! `ms_tok`.
 //!
 //! **A small sample will hand you a confident wrong answer.** Three launches of
 //! an explicit `ONNX_GENAI_CPU_DECODE_THREADS=16` arm against three of the
@@ -859,7 +873,7 @@ fn main() {
     common::report_decode_width();
 
     println!(
-        "{:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>7} {:>8} {:>9}",
+        "{:>6} {:>7} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>9} {:>9} {:>7} {:>8} {:>8} {:>7} {:>9} {:>9} {:>7} {:>8} {:>9} {:>7}",
         "kind",
         "gap_us",
         "gap_act",
@@ -879,6 +893,7 @@ fn main() {
         "rss_mb",
         "spread_%",
         "foreign_%",
+        "sib_%",
     );
 
     let mut decode_hashes: Vec<(String, u64)> = Vec::new();
@@ -895,7 +910,7 @@ fn main() {
             0.0
         };
         println!(
-            "{:>6} {:>7.0} {:>8.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.1} {:>9.1} {:>9.1} {:>7.1} {:>8.2} {:>8.2} {:>7.2} {:>9.1} {:>9.1} {:>7.1} {:>8.1} {:>9}",
+            "{:>6} {:>7.0} {:>8.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.1} {:>9.1} {:>9.1} {:>7.1} {:>8.2} {:>8.2} {:>7.2} {:>9.1} {:>9.1} {:>7.1} {:>8.1} {:>9} {:>7}",
             cell.label(),
             gap,
             pick(|p| p.gap_act_us),
@@ -915,6 +930,7 @@ fn main() {
             pick(|p| p.rss_mb),
             spread,
             host_contention::foreign_column(&rows.iter().map(|p| p.contention).collect::<Vec<_>>(),),
+            host_contention::sibling_column(&rows.iter().map(|p| p.contention).collect::<Vec<_>>(),),
         );
 
         if cell.decode {
@@ -922,14 +938,42 @@ fn main() {
         }
 
         if rows.iter().any(|p| p.contention.is_contended()) {
-            let worst = rows
-                .iter()
-                .map(|p| p.contention.foreign_pct)
-                .fold(0.0_f64, f64::max);
+            // Worst rather than median, because this line exists to say how bad
+            // it got -- and `n/a` rather than a seeded zero when the axis was
+            // never read. A `fold(0.0, max)` over an empty iterator returns the
+            // seed, which prints as a measured-looking quiet reading for a
+            // window nobody measured. That is precisely the substitution the
+            // rest of this instrument refuses to make, and it is reachable on
+            // both axes: a row condemned by a busy sibling alone can have no
+            // measurable foreign figure, and a row condemned by foreign CPU
+            // alone can have unreadable topology.
+            let worst =
+                |values: Vec<f64>| match values.into_iter().fold(f64::NEG_INFINITY, f64::max) {
+                    v if v.is_finite() => format!("{v:.1}"),
+                    _ => "n/a".to_string(),
+                };
+            // Reported separately rather than combined into one number: they are
+            // different mechanisms with different remedies. Foreign CPU on the
+            // set timeshares a core we are running on; a busy sibling halves a
+            // core we own outright. A run can be condemned by either alone,
+            // which is why a `sib_%` of 97 beside a `foreign_%` of 0.0 is a
+            // complete diagnosis rather than a contradiction.
+            let foreign = worst(
+                rows.iter()
+                    .filter(|p| p.contention.measured)
+                    .map(|p| p.contention.foreign_pct)
+                    .collect(),
+            );
+            let sibling = worst(
+                rows.iter()
+                    .filter(|p| p.contention.siblings_known)
+                    .map(|p| p.contention.sibling_peak_pct)
+                    .collect(),
+            );
             println!(
-                "  CONTENDED foreign_%={worst:.1} of one CPU on this process's confined core \
-                 set -- a dispatch is a barrier, so this row's wall time is not comparable to a \
-                 clean one (cpu_ms is)"
+                "  CONTENDED foreign_%={foreign} of one CPU on this process's confined core \
+                 set, sib_%={sibling} on its busiest SMT sibling -- a dispatch is a \
+                 barrier, so this row's wall time is not comparable to a clean one (cpu_ms is)"
             );
         }
 

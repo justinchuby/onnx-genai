@@ -105,6 +105,7 @@ CRATES_FULL=(
     onnx-runtime-dlpack
     onnx-runtime-comm
     onnx-std-python
+    onnx-runtime-hostmon
 )
 
 # Subset that compiles without ort-sys or cmake-based build scripts.
@@ -138,6 +139,7 @@ CRATES_NO_FFI=(
     onnx-runtime-dlpack
     onnx-runtime-comm
     onnx-std-python
+    onnx-runtime-hostmon
 )
 
 # ─── Target installation ───────────────────────────────────────────────────

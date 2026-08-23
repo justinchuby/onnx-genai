@@ -22,6 +22,63 @@
 //! changes nothing, so this is contention *on the confined set* specifically and
 //! not general host load.
 //!
+//! # The blind spot the confined set has by construction: SMT siblings
+//!
+//! That control row is true as written and misleading as a general rule, because
+//! cpu 5 is not the SMT sibling of any CPU in that set. A decode budget of `N`
+//! confines the process to `N` *physical cores* -- on an SMT host the pool picks
+//! one logical CPU per core, so the partner logical CPU of every core it runs on
+//! is **outside** the mask. Foreign work there is invisible to `foreign_pct` by
+//! construction: it is not on an allowed CPU, so it is never counted, and yet it
+//! shares the core's execution resources with a decode worker.
+//!
+//! That is not a hypothetical. Measured on a 16-core/32-thread host at a budget
+//! of 12, with a verified 100%-busy spinner pinned to one chosen CPU and the
+//! per-worker profile from `decode_spmd` naming which worker slowed down:
+//!
+//! | spinner on | predicted slow worker | observed slow worker | `foreign_%` |
+//! |---|---|---|---|
+//! | cpu 19 (sibling of core 18) | 18 | **18** | 5.7 / 8.4 |
+//! | cpu 3 (sibling of core 2) | 2 | **2** (3 of 3) | 26.1 / 0.0 / 1.4 |
+//! | cpu 27 (sibling of core 26, **not** in the set or its siblings) | — | miss (3 of 3) | 13.5 / 27.5 / 4.5 |
+//!
+//! Five of six sibling arms named the predicted worker (p ~ 2e-5 against a
+//! uniform choice among 12), the off-set control named it zero times out of
+//! three, and the affected worker's in-shard time rose ~1.7x for an exactly equal
+//! row segment -- while `foreign_%` read as low as **0.0**. A dispatch is a
+//! barrier, so that one worker set the whole dispatch: wall went 3.2 -> 5.2-7.3
+//! ms/token.
+//!
+//! So [`Contention`] also reports [`sibling_peak_pct`](Contention::sibling_peak_pct):
+//! the busiest single logical CPU that is an SMT sibling of an allowed CPU and is
+//! not itself allowed. Two properties make it a cleaner measurement than
+//! `foreign_pct` rather than a weaker one:
+//!
+//! * **No own-time subtraction is needed.** This process cannot run on those CPUs,
+//!   so every busy jiffy there is foreign by definition. The
+//!   [`own_time_complete`](Contention::own_time_complete) caveat does not apply.
+//! * **Peak, not sum.** Under a barrier one saturated sibling gates the dispatch
+//!   and a dozen lukewarm ones do not, so summing would let ambient noise spread
+//!   across a wide set outvote the single core that is actually being halved.
+//!   This is the opposite normalisation from `foreign_pct` for the opposite
+//!   reason, and the two are not interchangeable.
+//!
+//! The two columns were then cross-validated against each other end to end, with
+//! a bounded hog whose own occupancy is read from `/proc/stat` rather than
+//! assumed. Decode budget 4 (cpus 0, 2, 4, 6), 60 tokens x 3 reps:
+//!
+//! | injected | `foreign_%` | `sibling_peak_%` | ms/token | hog occupancy |
+//! |---|---|---|---|---|
+//! | nothing | 0.0 | 12.1 | 9.14 | — |
+//! | hog on cpu 1 (sibling of decode cpu 0) | **1.1** | **100.6** | 15.39 | 100.1% |
+//! | hog on cpu 4 (a decode CPU) | **48.1** | 6.4 | 17.96 | 100.2% |
+//!
+//! Each figure moves for its own mechanism and stays put for the other's, which
+//! is the property that makes the pair worth carrying: either arm on its own is
+//! equally consistent with a second column that merely mirrors the first. The
+//! middle row is the case this whole section exists for -- a 1.68x regression
+//! that the pre-existing column certifies as clean.
+//!
 //! # Why a load-average gate cannot substitute for this
 //!
 //! One runnable foreign thread out of 32 CPUs does not move field 4 of
@@ -144,6 +201,62 @@ pub fn online_cpus() -> Option<usize> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn online_cpus() -> Option<usize> {
+    None
+}
+
+/// The SMT siblings of `allowed` that are **not** themselves in `allowed`,
+/// sorted and deduplicated, given a reader for one CPU's sibling list.
+///
+/// Split from the sysfs read so the set arithmetic can be tested against
+/// fabricated topologies -- a host with SMT off, a host whose partner CPU is
+/// already inside the mask, and a host with more than two threads per core all
+/// have to behave, and none of them can be conjured on the machine running the
+/// test.
+///
+/// `read_list` returns the contents of
+/// `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`, which is a
+/// kernel CPU list in range notation, the same format [`parse_cpu_list`] takes.
+///
+/// Returns `None` if **any** allowed CPU's list is missing or malformed, rather
+/// than the siblings it managed to find. A partial sibling set would report a
+/// quiet peak for a host whose hot sibling happened to be the one that failed to
+/// parse, turning "topology unknown" into "topology known and clean" -- the same
+/// substitution this crate exists to prevent one level up.
+pub fn siblings_outside<F>(allowed: &[usize], read_list: F) -> Option<Vec<usize>>
+where
+    F: Fn(usize) -> Option<String>,
+{
+    let mut siblings = Vec::new();
+    for &cpu in allowed {
+        let list = read_list(cpu)?;
+        for sibling in parse_cpu_list(&list)? {
+            if sibling != cpu && !allowed.contains(&sibling) {
+                siblings.push(sibling);
+            }
+        }
+    }
+    siblings.sort_unstable();
+    siblings.dedup();
+    Some(siblings)
+}
+
+/// [`siblings_outside`] against the running host's sysfs topology.
+///
+/// An empty vector is a real answer -- SMT disabled, or a mask that already
+/// contains both threads of every core it uses -- and is distinct from `None`,
+/// which means the topology could not be read at all.
+#[cfg(target_os = "linux")]
+pub fn smt_siblings_outside(allowed: &[usize]) -> Option<Vec<usize>> {
+    siblings_outside(allowed, |cpu| {
+        std::fs::read_to_string(format!(
+            "/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        ))
+        .ok()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn smt_siblings_outside(_allowed: &[usize]) -> Option<Vec<usize>> {
     None
 }
 
@@ -310,6 +423,12 @@ pub struct ContentionSnapshot {
     /// own-CPU subtraction is incomplete and the foreign figure is a *lower
     /// bound* rather than an estimate.
     off_mask: Option<usize>,
+    /// SMT siblings of `allowed` that are not themselves allowed, and their busy
+    /// jiffies, paired positionally. `None` when the topology could not be read,
+    /// which is distinct from `Some(vec![])` -- "no siblings" is a measurement
+    /// and "topology unknown" is not.
+    siblings: Option<Vec<usize>>,
+    sibling_busy: Vec<u64>,
 }
 
 /// Foreign CPU observed on the confined set over one window.
@@ -338,6 +457,38 @@ pub struct Contention {
     /// window. Sampling more often would narrow that hole without closing it,
     /// so it is stated rather than papered over.
     pub own_time_complete: bool,
+    /// The busiest single SMT sibling of the confined set that is not itself in
+    /// the set, as a percentage of that one CPU.
+    ///
+    /// Bounded below at zero and *not* clamped above it, for the same reason
+    /// [`foreign_pct`](Contention::foreign_pct) claims no upper bound: jiffy
+    /// accounting is coarse and the two reads are not simultaneous, so a
+    /// saturated sibling routinely differences to a little over `100.0`. A
+    /// clamp would turn that measurement artefact into a silent one.
+    ///
+    /// This is the contention `foreign_pct` cannot see: a decode budget picks one
+    /// logical CPU per physical core, so the partner CPU of every core in use is
+    /// outside the mask, and a co-runner there halves a core while contributing
+    /// nothing to any allowed CPU's busy total. See the module docs for the
+    /// pinned-spinner experiment that establishes both the effect and the
+    /// blindness.
+    ///
+    /// **Peak, not sum**, and deliberately not the same normalisation as
+    /// `foreign_pct`: a dispatch is a barrier, so one saturated sibling gates it
+    /// while a dozen lightly-loaded ones do not. Summing would let ambient noise
+    /// spread over a wide set outvote the single core actually being halved.
+    ///
+    /// Needs no own-time subtraction -- this process cannot run on these CPUs, so
+    /// every busy jiffy there is foreign by construction. `own_time_complete`
+    /// therefore does not qualify this figure.
+    pub sibling_peak_pct: f64,
+    /// Whether the sibling topology was readable and stable across the window.
+    ///
+    /// `false` means `sibling_peak_pct` is **not measured**, never "measured and
+    /// zero". Separated from `measured` because the CPU-time reads and the sysfs
+    /// topology read can fail independently, and a foreign figure is still worth
+    /// having when only the topology is missing.
+    pub siblings_known: bool,
 }
 
 impl Contention {
@@ -355,7 +506,8 @@ impl Contention {
     /// measurable barrier tax, and the cost of over-flagging is a re-run while
     /// the cost of under-flagging is a published wrong number.
     pub fn is_contended(&self) -> bool {
-        self.measured && self.foreign_pct > 5.0
+        (self.measured && self.foreign_pct > 5.0)
+            || (self.siblings_known && self.sibling_peak_pct > SIBLING_CONTENDED_PCT)
     }
 
     /// Whether this window can be relied on as *clean*.
@@ -369,9 +521,32 @@ impl Contention {
     /// condition, and a caller that gates a benchmark on `!is_contended()` gets
     /// the weaker one by accident.
     pub fn is_clean(&self) -> bool {
-        self.measured && self.own_time_complete && self.foreign_pct <= 5.0
+        self.measured
+            && self.own_time_complete
+            && self.foreign_pct <= 5.0
+            && self.siblings_known
+            && self.sibling_peak_pct <= SIBLING_CLEAN_PCT
     }
 }
+
+/// A sibling above this is provably co-running with a decode worker.
+///
+/// Set well above the ambient sibling occupancy measured on a shared host
+/// (peaks of 12-22% with nothing pathological happening) and well below the
+/// 75-98% observed when a real co-tenant lands on a sibling, so the two cannot
+/// be confused in either direction. Half a core is also the point past which the
+/// partner core's throughput loss stops being arguable.
+pub const SIBLING_CONTENDED_PCT: f64 = 50.0;
+
+/// A window is not certified clean unless every sibling is below this.
+///
+/// Lower than [`SIBLING_CONTENDED_PCT`], for the same asymmetry that separates
+/// [`Contention::is_contended`] from [`Contention::is_clean`] on `foreign_pct`:
+/// the band between the two is "not proven contended, not certifiable as quiet",
+/// and a caller asking whether it may publish a number must land outside it.
+/// Calling that band clean would certify exactly the readings most likely to be
+/// mildly and invisibly degraded.
+pub const SIBLING_CLEAN_PCT: f64 = 25.0;
 
 /// Renders the `foreign_%` cell for a group of repetitions.
 ///
@@ -416,6 +591,39 @@ pub fn foreign_column(reps: &[Contention]) -> String {
     // safe direction.
     if reps.iter().any(|c| c.measured && !c.own_time_complete) {
         cell.push('!');
+    }
+    cell
+}
+
+/// Renders the `sib_%` cell for a group of repetitions.
+///
+/// Peak over the repetitions, not median, and this is the one place the two
+/// columns deliberately disagree on their summary statistic. `foreign_%` takes a
+/// median because it is estimating a level that persisted through the window.
+/// `sibling_peak_pct` is already a peak over CPUs, and it exists to answer "did a
+/// co-runner appear on any core I was using": a co-tenant that saturated a
+/// sibling for one repetition of three invalidates that repetition, and a median
+/// would discard it as the odd one out. Taking the max keeps the evidence.
+///
+/// `n/a` when no repetition had readable topology, and `*` when only some did --
+/// same contract as [`foreign_column`], for the same reason: a cell backed by
+/// fewer samples than its neighbours has to say so.
+pub fn sibling_column(reps: &[Contention]) -> String {
+    let seen: Vec<f64> = reps
+        .iter()
+        .filter(|c| c.siblings_known)
+        .map(|c| c.sibling_peak_pct)
+        .collect();
+    if seen.is_empty() {
+        return "n/a".to_string();
+    }
+    let peak = seen
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, |a, b| if b > a { b } else { a });
+    let mut cell = format!("{peak:.1}");
+    if seen.len() < reps.len() {
+        cell.push('*');
     }
     cell
 }
@@ -471,6 +679,32 @@ pub fn snapshot() -> Option<ContentionSnapshot> {
 
     let own_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let own = own_jiffies_of_self_stat(&own_stat)?;
+    // Read from the same `/proc/stat` text as `busy`, so the sibling and allowed
+    // figures describe the same instant rather than two reads a syscall apart.
+    let siblings = smt_siblings_outside(&allowed.cpus);
+    let mut sibling_busy = Vec::new();
+    let mut siblings = siblings;
+    if let Some(list) = &siblings {
+        for &cpu in list {
+            let prefix = format!("cpu{cpu} ");
+            match stat
+                .lines()
+                .find(|l| l.starts_with(&prefix))
+                .and_then(busy_jiffies_of_cpu_line)
+            {
+                Some(jiffies) => sibling_busy.push(jiffies),
+                // A sibling the topology named but `/proc/stat` does not carry
+                // (offlined between the two reads) makes the set incomplete.
+                // Drop to "topology unknown" rather than report a peak over the
+                // CPUs that happened to still be there.
+                None => {
+                    siblings = None;
+                    sibling_busy.clear();
+                    break;
+                }
+            }
+        }
+    }
     // Anchored here rather than in the struct literal below, so the timestamp
     // sits next to the jiffy reads it has to be differenced against. The
     // thread scan that follows is bounded by the number of threads, and leaving
@@ -485,6 +719,8 @@ pub fn snapshot() -> Option<ContentionSnapshot> {
         busy,
         own,
         off_mask,
+        siblings,
+        sibling_busy,
     })
 }
 
@@ -549,6 +785,25 @@ pub fn contention(
     // than report a negative contention, which would read as an anomaly.
     let foreign_s = (total_s - own_s).max(0.0);
 
+    // The sibling peak is computed independently of the foreign arithmetic
+    // above: it needs no own-time subtraction, so it survives a window whose
+    // `foreign_pct` is only a lower bound. Requires the sibling *set* to be
+    // identical at both ends for the same reason the allowed set must be --
+    // differencing per-CPU counters across a set that moved compares different
+    // CPUs.
+    let (sibling_peak_pct, siblings_known) = match (&before.siblings, &after.siblings) {
+        (Some(b), Some(a)) if b == a && before.sibling_busy.len() == after.sibling_busy.len() => {
+            let peak = after
+                .sibling_busy
+                .iter()
+                .zip(&before.sibling_busy)
+                .map(|(a, b)| a.saturating_sub(*b) as f64 / tick / window * 100.0)
+                .fold(0.0f64, f64::max);
+            (peak, true)
+        }
+        _ => (0.0, false),
+    };
+
     Contention {
         foreign_pct: foreign_s / window * 100.0,
         total_pct: total_s / window * 100.0,
@@ -559,6 +814,8 @@ pub fn contention(
         // strictly stronger, though still a boundary property -- see
         // `own_time_complete`.
         own_time_complete: before.off_mask == Some(0) && after.off_mask == Some(0),
+        sibling_peak_pct,
+        siblings_known,
     }
 }
 
@@ -594,6 +851,34 @@ impl ContentionSnapshot {
             busy,
             own,
             off_mask,
+            siblings: None,
+            sibling_busy: Vec::new(),
+        }
+    }
+
+    /// As [`from_parts`](Self::from_parts) but carrying a sibling set and its
+    /// busy jiffies, so a test can construct an SMT topology the host running
+    /// the test does not have.
+    ///
+    /// Defaults elsewhere leave `siblings` as `None` -- "topology unknown" --
+    /// which keeps every pre-existing test asserting exactly what it asserted
+    /// before rather than silently acquiring a second, unexamined dimension.
+    pub fn from_parts_with_siblings(
+        taken: Instant,
+        allowed: Vec<usize>,
+        busy: Vec<u64>,
+        own: u64,
+        siblings: Option<Vec<usize>>,
+        sibling_busy: Vec<u64>,
+    ) -> Self {
+        Self {
+            taken,
+            allowed,
+            busy,
+            own,
+            off_mask: Some(0),
+            siblings,
+            sibling_busy,
         }
     }
 }

@@ -10,10 +10,12 @@ use onnx_genai_engine::logits::{
     MinPProcessor, RepetitionPenaltyProcessor, TemperatureProcessor, TopKProcessor, TopPProcessor,
 };
 use onnx_genai_engine::{
-    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, GenerateOptions, GeneratePrompt,
-    GenerateRequest, NativeDecodeDevice, NativeDecodeSession, PipelineGenerateRequest,
-    ProcessorChain, SpeculativeMode, SpeculativeStats, parse_resource_limit,
+    DecodePrecision, Engine, EngineConfig, EngineDecodeBackend, FinishReason, GenerateOptions,
+    GeneratePrompt, GenerateRequest, GenerateResult, NativeDecodeDevice, NativeDecodeSession,
+    PipelineGenerateRequest, ProcessorChain, SpeculativeMode, SpeculativeStats, TokenLogprob,
+    parse_resource_limit,
 };
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::{DataType, Tokenizer, Value, available_execution_providers, profile};
 use onnx_runtime_session::InferenceSession;
 
@@ -196,7 +198,11 @@ struct Args {
     /// HF-style repetition penalty applied host-side to the output logits before
     /// token selection (divides positive / multiplies negative logits of tokens
     /// already in the prompt+generated stream). Default 1.0 is OFF and keeps the
-    /// captured device-argmax greedy fast path byte-identical.
+    /// captured device-argmax greedy fast path byte-identical. A non-default
+    /// value can move the argmax, so -- like `--top-p`/`--top-k`/`--min-p` --
+    /// it requires `--steady`/`--pipeline`: raw/default mode's decode loop
+    /// never materializes host logits to apply it and bails rather than
+    /// silently ignoring it.
     #[arg(long, default_value_t = 1.0)]
     repetition_penalty: f32,
     /// Optional window: only penalize the most recent N tokens of the combined
@@ -426,7 +432,7 @@ fn tokenizer_file(path: &Path) -> PathBuf {
 fn generate(
     session: &mut NativeDecodeSession,
     prompt_tokens: &[u32],
-    tokenizer: &Tokenizer,
+    _tokenizer: &Tokenizer,
     tokens: usize,
     args: &Args,
 ) -> Result<Vec<u32>> {
@@ -440,8 +446,187 @@ fn generate(
     // otherwise the penalty/min-p run host-side on the output logits, outside
     // the captured graph replay.
     let chain = sampling_chain(args);
-    let result = session.generate(prompt_tokens, &options, &chain, tokenizer)?;
+    let result = native_session_generate(session, prompt_tokens, &options, &chain)?;
     Ok(result.token_ids)
+}
+
+/// Greedy-only stand-in for the pre-#1723 public `NativeDecodeSession::generate`.
+///
+/// #1723 ("one interpreter executes every package's declared workflow")
+/// privatized the sampling-chain-aware multi-token loop on `NativeDecodeSession`
+/// (it now requires a private `&WorkflowRuntime`, obtainable only from an
+/// `Engine`) so that every multi-token decode goes through the one interpreter
+/// loop rather than a second one. This CLI's raw/default profiling mode (no
+/// `--steady`/`--pipeline`) deliberately has no `Engine` — it exists to
+/// exercise the native decode kernels directly, the same reason
+/// `greedy_decode_host`/`greedy_decode_ongpu` below hand-roll their own loop —
+/// so it cannot reach `Engine::generate_native_from_token_ids` either. This
+/// keeps that same "bare session, host-side loop" shape instead of
+/// reintroducing a second workflow-aware loop, at the cost of only supporting
+/// greedy decoding: a non-default sampling policy is refused with an
+/// actionable message rather than silently ignored.
+fn native_session_generate(
+    session: &mut NativeDecodeSession,
+    prompt_tokens: &[u32],
+    options: &GenerateOptions,
+    chain: &ProcessorChain,
+) -> Result<GenerateResult> {
+    if !options.greedy || !chain.preserves_argmax() {
+        // `chain.preserves_argmax()` is the same eligibility test the engine's
+        // own device-greedy fast path uses (`processors::device_sampling_plan`):
+        // an empty chain or one containing only argmax-preserving processors
+        // (e.g. stop sequences) gives the identical selected token whether or
+        // not it is applied first, so skipping it here (this loop never
+        // materializes the chain at all) is safe. Anything else -- a
+        // non-default `--repetition-penalty`, DRY, constraints -- can change
+        // which token is selected and this raw/default-mode loop does not
+        // apply the chain to host logits before argmax, so it must bail
+        // rather than silently produce a wrong token.
+        bail!(
+            "profile_native's raw/default mode (no --steady/--pipeline) only drives greedy \
+             decoding on a bare NativeDecodeSession: #1723 moved the sampling-chain-aware \
+             multi-token loop behind the private engine decode core, reachable only through an \
+             Engine. Pass --steady or --pipeline to use --temperature/--top-p/--top-k/--min-p/\
+             --repetition-penalty."
+        );
+    }
+    if options.stop_on_eos {
+        bail!(
+            "profile_native's raw/default-mode generation helper does not implement \
+             --stop-on-eos (neither existing call site sets it); pass --steady/--pipeline instead"
+        );
+    }
+    if prompt_tokens.is_empty() {
+        bail!("native generation requires at least one prompt token");
+    }
+    session.reset()?;
+    let mut logits = session
+        .decode(prompt_tokens, 0)?
+        .pop()
+        .context("prefill produced no logits")?;
+    let mut token_ids = Vec::with_capacity(options.max_new_tokens);
+    let mut logprobs = options
+        .top_logprobs
+        .map(|_| Vec::with_capacity(options.max_new_tokens.max(1)));
+    for _ in 0..options.max_new_tokens {
+        if let (Some(k), Some(collected)) = (options.top_logprobs, logprobs.as_mut()) {
+            collected.push(token_logprob(&logits, k));
+        }
+        let token = {
+            // Matches `decode_loop::select_and_commit_step`'s `loop.sampling`
+            // span: the token-selection step, timed apart from the forward
+            // pass that produced the logits it selects from.
+            let _span = onnx_genai_ort::prof_span!("loop.sampling");
+            argmax_lowest_index(&logits)
+        };
+        token_ids.push(token);
+        if token_ids.len() >= options.max_new_tokens {
+            break;
+        }
+        let past = session.current_len();
+        logits = {
+            // Matches `decode_loop::forward_step`'s `loop.next_logits` span:
+            // the forward pass that computes the next step's logits.
+            let _span = onnx_genai_ort::prof_span!("loop.next_logits");
+            session
+                .decode(&[token], past)?
+                .pop()
+                .context("decode produced no logits")?
+        };
+    }
+    Ok(GenerateResult {
+        text: String::new(),
+        token_ids,
+        finish_reason: FinishReason::MaxTokens,
+        prefix_cache_hit_len: 0,
+        logprobs,
+        budget_cap: None,
+    })
+}
+
+/// Explicit I/O contract for [`synthetic_decoder::build_synthetic_decoder`].
+///
+/// Its `input_ids`/`attention_mask`/`position_ids` graph inputs are all
+/// `Int64, [-1, -1]`, so shape/dtype auto-resolution cannot disambiguate which
+/// port is the token stream (`NativeDecodeSession::from_session` reports "3
+/// ports match" and refuses to guess); KV ports have no auto-detection at all
+/// and must always be declared. Mirrors
+/// `crates/onnx-genai-bench/tests/fused_batch_prefill.rs`'s `synthetic_io()`
+/// for the same graph.
+fn synthetic_decoder_io() -> DecoderAbi {
+    DecoderAbi {
+        sequence_source: Some(SequenceInputKind::TokenIds),
+        kv_ownership: Some(KvOwnership::Owned),
+        token_input: Some("input_ids".into()),
+        attention_mask_input: Some("attention_mask".into()),
+        position_ids_input: Some("position_ids".into()),
+        logits_output: Some("logits".into()),
+        kv_inputs: Some(vec![
+            "past_key_values.0.key".into(),
+            "past_key_values.0.value".into(),
+            "past_key_values.1.key".into(),
+            "past_key_values.1.value".into(),
+        ]),
+        kv_outputs: Some(vec![
+            "present_key_values.0.key".into(),
+            "present_key_values.0.value".into(),
+            "present_key_values.1.key".into(),
+            "present_key_values.1.value".into(),
+        ]),
+        ..DecoderAbi::default()
+    }
+}
+
+/// Log-softmax the full vocabulary and return the selected (greedy) token's
+/// log-probability plus its top-`k` alternatives, descending.
+///
+/// Mirrors `decode_loop::logprob_for_token`'s NaN/Inf handling (that function
+/// is `pub(crate)` and unreachable from this bench crate, so this is a
+/// standalone reimplementation, not a call-through): non-finite logits are
+/// filtered out of both the max/log-sum-exp reduction and the ranked
+/// alternatives, and ranking uses `total_cmp` instead of a `partial_cmp`
+/// that would panic on a NaN produced by `inf - inf` if an overflowed logit
+/// slipped through. A native decode kernel producing garbage logits is
+/// exactly the failure mode this `--dump-logprobs` bisection tool exists to
+/// surface, so it must not itself panic on that input.
+fn token_logprob(logits: &[f32], k: usize) -> TokenLogprob {
+    let max = logits
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    let log_sum_exp = max
+        + logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .map(|v| (v - max).exp())
+            .sum::<f32>()
+            .ln();
+    let selected = argmax_lowest_index(logits);
+    let selected_logprob = logits
+        .get(selected as usize)
+        .copied()
+        .filter(|v| v.is_finite())
+        .map_or(f32::NEG_INFINITY, |v| v - log_sum_exp);
+    let mut ranked: Vec<(u32, f32)> = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, v)| v.is_finite())
+        .map(|(index, value)| (index as u32, value - log_sum_exp))
+        .collect();
+    ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    ranked.truncate(k);
+    if !ranked.iter().any(|(id, _)| *id == selected) {
+        ranked.push((selected, selected_logprob));
+        ranked.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    }
+    TokenLogprob {
+        token_id: selected,
+        logprob: selected_logprob,
+        top: ranked,
+    }
 }
 
 /// Prompt ids parsed from `--prompt-ids`, published once by [`init_prompt_ids`]
@@ -1729,7 +1914,7 @@ fn drive_ragged_batch(
         bail!("drive_ragged_batch requires at least one prompt");
     }
     let lens: Vec<usize> = prompts.iter().map(Vec::len).collect();
-    if lens.iter().any(|&len| len == 0) {
+    if lens.contains(&0) {
         bail!("drive_ragged_batch requires every prompt to be non-empty");
     }
     let lmax = lens.iter().copied().max().expect("non-empty prompt set");
@@ -2142,7 +2327,7 @@ fn run_ongpu_argmax_bench(args: &Args, model_dir: &Path, device: NativeDecodeDev
     let tokenizer_path = tokenizer_file(model_dir);
     let tokenizer =
         Tokenizer::from_file(&tokenizer_path).context("load tokenizer.json beside decoder")?;
-    let mut session = NativeDecodeSession::load_with_resolved_io(&model_file(model_dir), device)
+    let mut session = NativeDecodeSession::load_with_resolved_io(model_file(model_dir), device)
         .with_context(|| format!("load native decoder {}", model_dir.display()))?;
 
     let prompt_text = qwen_chat_wrap(&args.prompt);
@@ -3049,10 +3234,19 @@ fn run_steady(args: &Args, model_dir: &Path, device: NativeDecodeDevice) -> Resu
 }
 
 /// Time one generation's first token and report what it actually processed.
+/// `cold_start` forces the request through the engine's full-KV-reset path
+/// (`GenerateOptions::cold_start`) instead of the session-persistent prefix
+/// reuse `generate_with_pipeline_callbacks` otherwise prefers. This is the
+/// public per-request equivalent of the pre-#1723 `Pipeline::clear_prefix_cache`
+/// (which mutated now-private `Engine` fields that no longer exist): forcing
+/// one request cold rather than clearing shared engine state leaves every
+/// other measured point free to reuse a cache the way production traffic
+/// would.
 fn time_first_token(
     args: &Args,
     engine: &mut Engine,
     prompt_tokens: &[u32],
+    cold_start: bool,
 ) -> Result<(f64, usize)> {
     let start = Instant::now();
     let mut first: Option<std::time::Duration> = None;
@@ -3062,11 +3256,10 @@ fn time_first_token(
         }
         Ok(())
     };
+    let mut request = pipeline_request(args, 1, prompt_tokens)?;
+    request.request.options.cold_start = cold_start;
     let result = engine
-        .generate_with_callback(
-            pipeline_request(args, 1, prompt_tokens)?,
-            Some(&mut callback),
-        )
+        .generate_with_pipeline_callbacks(request, None, Some(&mut callback))
         .context("prefill sweep generation")?;
     let elapsed = first.context("generation emitted no tokens")?;
     Ok((elapsed.as_secs_f64() * 1_000.0, result.prefix_cache_hit_len))
@@ -3098,7 +3291,7 @@ fn run_prefill_sweep(
 
     // One throwaway generation absorbs process startup so the first measured
     // point does not carry it.
-    time_first_token(args, engine, &ids[..WARMUP_TOKENS.min(ids.len())])
+    time_first_token(args, engine, &ids[..WARMUP_TOKENS.min(ids.len())], false)
         .context("prefill sweep warmup")?;
 
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(lengths.len());
@@ -3107,8 +3300,7 @@ fn run_prefill_sweep(
         // `len` tokens; there is no detokenize/re-encode round trip to distort
         // the count the engine really sees.
         let window = &ids[..len];
-        engine.clear_prefix_cache();
-        let (ms, hit) = time_first_token(args, engine, window)?;
+        let (ms, hit) = time_first_token(args, engine, window, true)?;
         if hit > 0 {
             bail!(
                 "prefill sweep measured a {hit}-token prefix cache hit after clearing the \
@@ -3193,7 +3385,7 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         ExecutionProvider::Cuda => NativeDecodeDevice::Cuda { index: None },
     });
     apply_vram_limit_env(&mut config)?;
-    let mut engine = Engine::from_dir_with_config(model_dir, config)
+    let mut engine = Engine::from_dir(model_dir, config)
         .with_context(|| format!("load pipeline engine {}", model_dir.display()))?;
     let tokenizer =
         Tokenizer::from_file(tokenizer_file(model_dir)).context("load pipeline tokenizer.json")?;
@@ -3249,20 +3441,20 @@ fn run_pipeline(args: &Args, model_dir: &Path) -> Result<()> {
         let mut reference_tokens = None;
         let mut reference_text = None;
         for run in 1..=args.runs {
-            if args.no_prefix_cache {
-                engine.clear_prefix_cache();
-            }
             let start = Instant::now();
             let mut token_times = Vec::with_capacity(args.tokens);
             let mut callback = |_| {
                 token_times.push(start.elapsed());
                 Ok(())
             };
+            // `--no-prefix-cache` forces this one request cold (full KV reset)
+            // via `GenerateOptions::cold_start` — the public per-request
+            // replacement for the pre-#1723 `Pipeline::clear_prefix_cache`,
+            // which mutated now-nonexistent private `Engine` fields.
+            let mut request = pipeline_request(args, args.tokens, &prompt_tokens)?;
+            request.request.options.cold_start = args.no_prefix_cache;
             let result = engine
-                .generate_with_callback(
-                    pipeline_request(args, args.tokens, &prompt_tokens)?,
-                    Some(&mut callback),
-                )
+                .generate_with_pipeline_callbacks(request, None, Some(&mut callback))
                 .context("steady pipeline measured generation")?;
             let cache_hit = result.prefix_cache_hit_len;
             if token_times.len() <= args.decode_skip {
@@ -3514,7 +3706,8 @@ fn main() -> Result<()> {
         }
         let native = InferenceSession::from_graph(synthetic_decoder::build_synthetic_decoder())
             .context("build synthetic native session")?;
-        NativeDecodeSession::from_session(native).context("wrap synthetic native decoder")?
+        NativeDecodeSession::from_session_with_io(native, &synthetic_decoder_io())
+            .context("wrap synthetic native decoder")?
     } else {
         NativeDecodeSession::load_with_resolved_io(&model, device.clone())
             .with_context(|| format!("load native decoder {}", model.display()))?
@@ -3627,11 +3820,11 @@ fn main() -> Result<()> {
             top_logprobs: Some(args.logprobs_k),
             ..GenerateOptions::default()
         };
-        let result = session.generate(
+        let result = native_session_generate(
+            &mut session,
             &dump_prompt_tokens,
             &options,
             &ProcessorChain::new(),
-            &tokenizer,
         )?;
         let logprobs = result
             .logprobs
@@ -3881,5 +4074,52 @@ mod tests {
         .unwrap();
         let error = validate_backend(&args).unwrap_err().to_string();
         assert!(error.contains("bench-native,bench-ort,cuda"), "{error}");
+    }
+
+    #[test]
+    fn token_logprob_ranks_descending_and_selects_the_argmax() {
+        let logits = vec![1.0_f32, 3.0, 2.0, 0.5];
+        let result = token_logprob(&logits, 2);
+        assert_eq!(result.token_id, 1, "index of the largest logit (3.0)");
+        assert!(result.logprob < 0.0, "a log-probability must be <= 0");
+        assert_eq!(result.top.len(), 2, "truncated to k=2");
+        assert!(
+            result.top.windows(2).all(|w| w[0].1 >= w[1].1),
+            "top must be sorted descending: {:?}",
+            result.top
+        );
+        assert_eq!(
+            result.top[0].0, 1,
+            "the top entry must be the selected token"
+        );
+    }
+
+    /// Regression for a reviewer finding on the initial `token_logprob`
+    /// reimplementation: an overflowed (`+inf`) logit made `max` infinite, so
+    /// every `(v - max)` -- including the max entry's own `inf - inf` -- became
+    /// NaN, and the old `partial_cmp(..).expect("logits must not be NaN")`
+    /// sort comparator panicked on the resulting NaNs. A native decode kernel
+    /// producing a garbage/overflowed logit is exactly the failure mode this
+    /// `--dump-logprobs` bisection tool exists to surface, so it must report a
+    /// (possibly degenerate) result instead of panicking.
+    #[test]
+    fn token_logprob_does_not_panic_on_infinite_logits() {
+        let logits = vec![1.0_f32, f32::INFINITY, 2.0, f32::NEG_INFINITY];
+        let result = token_logprob(&logits, 4);
+        assert_eq!(result.token_id, 1, "argmax_lowest_index still picks +inf");
+        assert!(
+            result.top.iter().all(|(_, lp)| !lp.is_nan()),
+            "no NaN log-probabilities may reach the caller: {:?}",
+            result.top
+        );
+        // The two finite logits (index 0 and 2) must still be ranked relative
+        // to each other; the +inf/-inf entries are excluded from the
+        // finite-only softmax normalization.
+        let finite: Vec<_> = result
+            .top
+            .iter()
+            .filter(|(id, _)| *id == 0 || *id == 2)
+            .collect();
+        assert_eq!(finite.len(), 2);
     }
 }
