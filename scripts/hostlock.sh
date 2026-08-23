@@ -251,14 +251,17 @@ holder_alive() {
     # pthread_exit() while other threads keep running, /proc/<tgid>/stat
     # reports Z for a fully live process (`ps` shows `Zl ... <defunct>`).
     # Treating that as dead reaps a LIVE holder mid-benchmark, which is the
-    # worse of the two errors by a wide margin. Threads: separates them
-    # exactly: a true zombie has one, a live leader has more. Fail toward
-    # "alive" if /proc/<pid>/status cannot be read at all.
+    # worse of the two errors by a wide margin. Threads: is signal->nr_threads
+    # -- non-reaped tasks in the group -- so a true zombie reads 1 and a live
+    # leader reads more. If status cannot be read at all we have no evidence
+    # of death, so the lock stands: there is deliberately no numeric default
+    # here, because a default is a constant nothing tests.
     if [ "$state" = Z ]; then
         local threads
         threads=$(awk '/^Threads:/ { print $2; exit }' "/proc/${pid}/status" 2>/dev/null)
-        [ -n "$threads" ] || threads=2
-        [ "$threads" -le 1 ] && return 1
+        if [ -n "$threads" ] && [ "$threads" -le 1 ]; then
+            return 1
+        fi
     fi
     # A recycled pid has a different start time, so this is not just "does
     # some process with this number exist".
@@ -304,7 +307,15 @@ reapable() {
     # minutes, so routing a live-but-unverifiable holder through it does not
     # prevent the theft, it schedules it.
     if [ -n "$a" ] && [ -z "$s" ] && [ -d "/proc/${a}" ]; then
-        return 1
+        # ...but do not void the holder's OWN declared expiry while doing it.
+        # Returning unconditionally here replaced a bounded wedge with an
+        # unbounded one: a lock with a live anchor and no readable start_time
+        # would outlive any ttl forever, `wait` would block on a lock everyone
+        # agrees has expired, and EXPIRED would be unreachable for that whole
+        # class. The anti-theft property only needs the CLOCK-BASED grace
+        # disabled, not the expiry the holder asked for.
+        holder_expired
+        return $?
     fi
     if [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]; then
         local mtime now

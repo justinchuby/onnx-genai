@@ -287,6 +287,8 @@ chk "the wrapped command is a child of the runner" \
 # terminated, because an orphan is reparented to pid 1 -- the assertion would
 # be inert, passing with the teardown kill removed entirely.
 wrapped_kid=$(pgrep -P "$runner" 2>/dev/null | head -1)
+chk "and the test actually found it" \
+    "$([ -n "$wrapped_kid" ] && echo found || echo missing)" "found"
 sig "$runner" 15
 chk "runner terminates on SIGTERM" "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
 sleep 1
@@ -634,6 +636,15 @@ sleep 2
 chk "an expired-but-live lock is still EXPIRED" "$(st state)" "EXPIRED"
 chk "and is still declared -- the box IS claimed" \
     "$($HL provenance | sed -n 's/^declared=//p')" "yes"
+# The human branch has to say so too, and this is the arm that gets it wrong:
+# an EXPIRED holder is by definition ALIVE, so "is gone; next acquire will
+# reap it" is the same false-abandonment message one arm over. Read through
+# `status` rather than `acquire`, because an expired lock is reapable and
+# acquire would simply take it.
+exp_text=$($HL status 2>&1 | tr '\n' ' ')
+chk "the EXPIRED message does not say the holder is gone" \
+    "$(echo "$exp_text" | grep -c 'is gone')" "0"
+chk "and it says EXPIRED" "$(echo "$exp_text" | grep -c 'EXPIRED')" "1"
 sig "$holder" 9
 wait "$holder" 2>/dev/null
 cleanup
@@ -760,13 +771,20 @@ chk "identity is corroborated against the kernel, not just declared" \
 # "the holder's uid" from "the reader's uid" -- and `uid=$(id -u)` in the
 # writer, which reports whoever READ the lock, passes it while destroying the
 # only thing the field is for: attribution when you are looking at somebody
-# else's lock. Anchor to pid 1 instead, which is root and is never us.
-cleanup
-$HL acquire --owner leon --pid 1 --ttl 600 --reason "foreign anchor" >/dev/null 2>&1
-chk "held_uid is the HOLDER's uid, not the reader's" \
-    "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_uid=//p')" "0"
-chk "and the reader is demonstrably not that user" \
-    "$([ "$(id -u)" = 0 ] && echo root || echo notroot)" "notroot"
+# else's lock. Anchor to pid 1 instead, whose uid is derived here rather than
+# assumed: hardcoding 0 fails as root (the default in most CI containers) and
+# under a rootless or user-namespaced pid 1, for reasons that have nothing to
+# do with hostlock. Skipped entirely when pid 1 is unreadable (hidepid=) or is
+# us, because then it discriminates nothing.
+pid1_uid=$(awk '/^Uid:/ { print $2; exit }' /proc/1/status 2>/dev/null)
+if [ -n "$pid1_uid" ] && [ "$pid1_uid" != "$(id -u)" ]; then
+    cleanup
+    $HL acquire --owner leon --pid 1 --ttl 600 --reason "foreign anchor" >/dev/null 2>&1
+    chk "held_uid is the HOLDER's uid, not the reader's" \
+        "$($HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_uid=//p')" "$pid1_uid"
+else
+    echo "  SKIP  held_uid vs a foreign anchor (pid 1 uid unreadable or same as ours)"
+fi
 cleanup
 $HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
 row=$($HL provenance --oneline --expect-runnable 100000)
@@ -935,20 +953,48 @@ touch -d "@$(( $(date +%s) - 4000 ))" "$LOCK"
 chk "a live holder with no start_time keeps its box past the grace too" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
 chk "and is still the owner after the grace lapses" "$(st owner)" "alice"
+# ...but the anti-theft guard must disable the CLOCK-BASED grace only, not the
+# expiry the holder itself declared. Returning "not reapable" unconditionally
+# here replaced a bounded wedge with an unbounded one: the lock would outlive
+# any ttl forever, `wait` would block on a lock everyone agrees has expired,
+# and EXPIRED would be unreachable for this whole class of lock.
+printf 'owner=alice\nanchor_pid=%s\nacquired_epoch=%s\nttl=1\nreason=live but overrun\n' \
+    "$h" "$(( $(date +%s) - 4000 ))" >"$LOCK/meta"
+chk "a live holder with no start_time still honours its own ttl" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
 sig "$h" 9
 wait "$h" 2>/dev/null
+cleanup
+# The converse of the guard above: an anchor pid that is PRESENT and DEAD,
+# with no start_time. Nothing else in this file has that shape -- every other
+# fixture either carries a start_time or has no anchor_pid at all -- so
+# deleting the `[ -d /proc/$a ]` liveness test from that guard made every
+# unparseable lock permanently unreapable, which is the exact wedge this
+# commit exists to avoid, and left the suite green.
+dead=$(dead_pid)
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nacquired_epoch=%s\nttl=3600\nreason=dead anchor, old script\n' \
+    "$dead" "$(date +%s)" >"$LOCK/meta"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
+chk "a dead anchor with no start_time is still protected inside the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
+chk "a dead anchor with no start_time is reapable past the grace" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+chk "and that takeover is labelled unverifiable too" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "unverifiable"
 cleanup
 # The grace itself must be pinned. Every assertion above creates its lock
 # immediately before checking, so now-mtime is 0 and ANY grace >= 1 passes --
 # UNPARSEABLE_GRACE could be cut from 300 to 2 with the suite still green.
-# Here the anchor pid is genuinely dead, so age is the only thing deciding.
-dead=$(dead_pid)
+# Bracketed at 200s and 400s, so the constant is pinned to within a factor of
+# two rather than the two orders of magnitude a 30s/4000s pair allows.
 mkdir -p "$LOCK"
 printf 'owner=ghost\nacquired_epoch=%s\nttl=3600\nreason=unreadable\n' "$(date +%s)" >"$LOCK/meta"
-touch -d "@$(( $(date +%s) - 30 ))" "$LOCK"
+touch -d "@$(( $(date +%s) - 200 ))" "$LOCK"
 chk "an unreadable lock inside the grace is held" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
-touch -d "@$(( $(date +%s) - 4000 ))" "$LOCK"
+touch -d "@$(( $(date +%s) - 400 ))" "$LOCK"
 chk "an unreadable lock past the grace is reapable" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
 # ...but the takeover must not CLAIM the holder was dead. The script never
@@ -956,7 +1002,6 @@ chk "an unreadable lock past the grace is reapable" \
 # have, and it is the reassuring direction.
 chk "and the takeover is labelled unverifiable, not stale_pid" \
     "$($HL provenance | sed -n 's/^takeover=//p')" "unverifiable"
-: "$dead"
 cleanup
 
 echo "-- R6: a SIGKILLed holder is recoverable --"
@@ -1056,6 +1101,18 @@ chk "a Z leader with live threads keeps its box" "$(st state)" "HELD"
 chk "and is not reaped out from under the run" \
     "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
 chk "and the owner is unchanged" "$(st owner)" "alice"
+# KNOWN GAP, recorded rather than hidden: the "unreadable status means no
+# evidence of death, so the lock stands" direction is NOT pinned. Producing a
+# process that is Z with a readable /proc/<pid>/stat and an unreadable
+# /proc/<pid>/status needs hidepid= or a pid namespace, or losing a
+# microsecond race between the two reads; the alternative is a HOSTLOCK_PROC
+# test hook in production, which would also be a way to spoof liveness and
+# steal a lock. Mutation `[ "${threads:-1}" -le 1 ]` leaves this suite green.
+# What makes that acceptable: every ACCIDENTAL form of the regression is safe
+# by construction. Dropping the `-n` guard gives `[ "" -le 1 ]`, which exits 2
+# ("integer expression expected"), so the `if` is false and the holder is
+# still treated as alive. Only writing an explicit numeric default flips the
+# direction, and that is a deliberate rewrite rather than a drift.
 sig "$zlparent" 9
 wait "$zlparent" 2>/dev/null
 rm -f "$LOCK.zlpid"
@@ -1102,7 +1159,7 @@ cleanup
 # `timeout -s`/`timeout -k` send signals and are matched; bare `timeout` is
 # not, because --timeout/GATE_TIMEOUT would swamp it.
 kills=$(sed -E '/^[[:space:]]*#/d' "$HL" \
-    | grep -oEi '(p?kill(all)?|killpg|pthread_kill)|timeout[[:space:]]+-[sk]|\bxargs\b' | wc -l)
+    | grep -oEi '(p?kill(all)?|killpg|pthread_kill|fuser)|timeout[[:space:]]+(-[sk]|--signal|--kill-after)|\bxargs\b' | wc -l)
 chk "exactly one call in the kill family anywhere in the script" "$kills" "1"
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
 chk "and it targets the command the script itself started" \
@@ -1110,11 +1167,20 @@ chk "and it targets the command the script itself started" \
 # ...and it verifies that pid before signalling. Pids on this box cycle at
 # ~1.5M in four days, so signalling on "the pid still exists" would let the
 # one place this script signals anything hit a process it never started.
-# Structural because the recycled-pid window is microseconds wide and cannot
-# be produced on demand.
+#
+# Asserted as a whole canonicalised function body, not as a grep for the
+# comparison. `grep -c` counts LINES, so appending `|| [ -d "/proc/$child" ]`
+# to the guard leaves the literal intact and the count at 1 -- restoring
+# exactly the "pid still exists" behaviour while the suite stays green. The
+# recycled-pid window is microseconds wide and cannot be produced on demand,
+# so a behavioural test would need a test-only hook in production; a golden
+# body is the cheaper honest option. It is brittle to legitimate refactoring,
+# which is a false FAIL and the safe direction.
+teardown_body=$(awk '/^run_teardown\(\) \{/,/^\}/' "$HL" \
+    | sed -E '/^[[:space:]]*#/d; s/^[[:space:]]+//; s/[[:space:]]+$//; /^$/d' | tr '\n' '|')
 # shellcheck disable=SC2016  # matching source text literally, not expanding it
-chk "and only after confirming the child's start time" \
-    "$(grep -c '\[ "\$now" = "\$RUN_CHILD_START" \]' "$HL")" "1"
+chk "and the teardown guard is exactly a start-time comparison" "$teardown_body" \
+'run_teardown() {|local child=$1 name=$2 code=$3|if [ -n "$child" ] && [ -n "$RUN_CHILD_START" ]; then|local now|now=$(proc_start_time "$child" 2>/dev/null || echo "")|if [ "$now" = "$RUN_CHILD_START" ]; then|kill -TERM "$child" 2>/dev/null|wait "$child" 2>/dev/null|fi|fi|remove_lock_if_mine|echo "hostlock: released (${name})" >&2|exit "$code"|}|'
 
 echo
 echo "passed=${pass} failed=${fail}"
