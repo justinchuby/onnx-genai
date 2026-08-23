@@ -3706,8 +3706,8 @@ fn configured_decode_threads() -> Option<usize> {
 ///
 /// It honors `ONNX_GENAI_CPU_DECODE_THREADS` when set (`0` opts out), but when
 /// the variable is unset it uses a *different, higher* default than the flat
-/// pool: [`default_persistent_threads`] (about half the logical CPUs) instead of
-/// the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
+/// pool: [`default_persistent_threads`] (one worker per allowed physical core)
+/// instead of the flat pool's eight-worker ceiling. The flat Rayon pool caps at eight
 /// because its per-op fork/join regresses beyond that; the persistent pool
 /// replaces that fork/join with one hot broadcast barrier, so it keeps scaling
 /// with cores until it hits the memory-bandwidth knee (measured plateau ~half
@@ -4418,6 +4418,26 @@ fn prefill_worker_name(index: usize) -> String {
 /// back to the halving proxy only when it is not. `None` from the topology
 /// means "unknown", never "one" — capping on a guess is how a 32-thread host
 /// silently becomes a 1-thread host.
+///
+/// # What this is *not* evidenced by
+///
+/// Both measurements behind the old rule — the plateau at "~half the logical
+/// CPUs" on a 2-socket Xeon 8480C, and the 1.4 tok/s at 96 workers against 28.7
+/// at 48 on a 96-logical-CPU host — were taken on SMT hosts, where half the
+/// logical CPUs *is* the physical-core count. Neither one distinguishes the two
+/// rules, so neither one supports this change on a **non-SMT** host, where
+/// `cores == available` and the default moves from half the machine to all of
+/// it. That case is an inference, not a measurement, and no non-SMT host was
+/// available to check it.
+///
+/// What makes the inference safe rather than merely plausible is that the
+/// consuming path reserves dispatcher headroom:
+/// `decode_spmd`'s `reserve_single_group_headroom` turns a request for `n`
+/// on `n` cores into `n - 1` spawned workers plus the inline dispatcher's own
+/// shard, so the fully-subscribed spinning layout that produced the 1.4 tok/s
+/// cliff is not reachable through this default. Verified on a 16-core host
+/// pinned to one CPU per core: 15 threads named `onnx-genai-spmd` on 15 leader
+/// CPUs, with the sixteenth core left free for the dispatcher.
 fn default_persistent_threads(
     available: usize,
     allowed_physical_cores: Option<usize>,
@@ -4808,18 +4828,22 @@ thread_local! {
 /// The lazily built `numa-split` decode layout, or `None` when the mode is not
 /// requested or the host cannot be split (fallback, logged once).
 ///
-/// It is sized from [`configured_persistent_decode_threads`] (about half the
-/// logical CPUs), *not* the flat pool's eight-worker ceiling. `numa-split` is
+/// It is sized from [`configured_persistent_decode_threads`] (one worker per
+/// allowed physical core), *not* the flat pool's eight-worker ceiling. `numa-split` is
 /// the two-level, node-pinned mirror of the persistent SPMD pool (see
 /// [`crate::decode_spmd`]) and its whole purpose is to reach *both* sockets'
 /// memory bandwidth; the eight-worker flat ceiling would leave only ~four
 /// row-sharded workers per node, far too few to saturate either memory
 /// controller, so it could never realize the bandwidth win the layout exists
-/// for. Half the logical CPUs, split across the nodes, lands each per-node
-/// sub-pool at the measured bandwidth knee while leaving cores for the
-/// dispatcher and co-tenants (a *fully*-subscribed split oversubscribes the
-/// cores and collapses throughput). `ONNX_GENAI_CPU_DECODE_THREADS` still
-/// overrides the count (and `0` opts out).
+/// for. One worker per physical core, split across the nodes, lands each
+/// per-node sub-pool at the measured bandwidth knee; [`reserve_split_headroom`]
+/// is what then leaves room for the dispatcher, since a *fully*-subscribed split
+/// oversubscribes the cores and collapses throughput.
+/// `ONNX_GENAI_CPU_DECODE_THREADS` still overrides the count (and `0` opts out).
+///
+/// Note the per-node reserve frees one *logical* CPU rather than a physical
+/// core, so on an SMT host the on-node dispatcher gets a sibling rather than a
+/// free core; tracked separately as issue 1791.
 fn numa_pools() -> Option<&'static crate::decode_numa::NumaDecodePools> {
     static NUMA_POOLS: OnceLock<Option<crate::decode_numa::NumaDecodePools>> = OnceLock::new();
     NUMA_POOLS
@@ -16943,7 +16967,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_decode_thread_default_is_half_the_logical_cpus() {
+    fn persistent_decode_thread_default_is_half_the_logical_cpus_when_topology_is_unknown() {
         // The persistent pool scales past the flat pool's 8-worker ceiling: unset
         // -> half the logical CPUs (topology-derived, rule 2), not the flat cap.
         // With no discoverable core count the halving proxy still applies.
@@ -16976,7 +17000,6 @@ mod tests {
         // A core count can never exceed the CPUs actually available, and can
         // never round down to zero.
         assert_eq!(default_persistent_threads(4, Some(9)), Some(4));
-        assert_eq!(default_persistent_threads(1, Some(1)), Some(1));
         // `Some(0)` is nonsense from the topology layer; treat it as unknown
         // rather than building a zero-worker pool.
         assert_eq!(default_persistent_threads(8, Some(0)), Some(4));
