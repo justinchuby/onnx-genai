@@ -1944,15 +1944,6 @@ fn explicit_decode_affinity_set() -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-/// Resolve the node shards for `total` workers: the multi-node split when the
-/// (cpuset-restricted) topology exposes >=2 nodes, otherwise a single group.
-///
-/// In both cases the pinned-worker count is capped so the inline dispatcher
-/// always keeps at least one allowed CPU free (see [`DISPATCHER_RESERVED_CPUS`]
-/// and [`reserve_single_group_headroom`] / [`reserve_split_headroom`]). Without
-/// that reservation a fully-subscribed cpuset (workers == allowed CPUs) pins a
-/// spinning worker on every core, starving the dispatcher and collapsing
-/// throughput.
 /// What an explicit [`DECODE_AFFINITY_ENV`] request means for the persistent
 /// pool's CPU set.
 ///
@@ -2014,14 +2005,18 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
     if request == ExplicitAffinity::Malformed {
         // Re-parse purely for the message, so the accepted-modes menu stays
         // owned by `decode_affinity` rather than restated here.
-        if let Err(message) = crate::decode_affinity::DecodeAffinity::parse(raw.as_deref()) {
+        if let Err(message) =
+            crate::decode_affinity::DecodeAffinity::parse(raw.as_deref().map(str::trim))
+        {
             crate::kernels::matmul_nbits::report_decode_affinity_policy(&format!(
                 "{message}; the persistent decode pool is using default placement instead"
             ));
         }
     }
-    explicit_affinity_shards_for(request, total, || {
-        match crate::decode_affinity::plan_decode_affinity(total) {
+    explicit_affinity_shards_for(
+        request,
+        total,
+        || match crate::decode_affinity::plan_decode_affinity(total) {
             Ok(plan) => {
                 if let Some(message) = plan.log {
                     crate::kernels::matmul_nbits::report_decode_affinity_policy(&message);
@@ -2038,8 +2033,9 @@ fn explicit_affinity_shards(total: usize) -> Option<Vec<NodeShard>> {
                 ));
                 None
             }
-        }
-    })
+        },
+        crate::decode_affinity::allowed_cpus,
+    )
 }
 
 /// The shard decision itself, with topology supplied by the caller.
@@ -2052,17 +2048,35 @@ fn explicit_affinity_shards_for(
     request: ExplicitAffinity,
     total: usize,
     planned_cpus: impl FnOnce() -> Option<Vec<usize>>,
+    allowed_cpus: impl FnOnce() -> Option<Vec<usize>>,
 ) -> Option<Vec<NodeShard>> {
     match request {
         ExplicitAffinity::DeferToDefault | ExplicitAffinity::Malformed => None,
-        // No CPUs means no pinning (see `SpmdDecodePools::build_with_schedule`),
-        // and unpinned workers cannot pin the dispatcher out of a core, so the
-        // headroom reservation has nothing to reserve against.
-        ExplicitAffinity::Unpinned => Some(vec![NodeShard {
-            index: 0,
-            cpus: Vec::new(),
-            workers: total,
-        }]),
+        // An empty CPU list is how `SpmdDecodePools::build_with_schedule` reads
+        // "do not pin": it resolves `cpus.get(worker % len.max(1))` to `None`
+        // and skips the pin, keeping every worker.
+        //
+        // The worker *count* is still reserved against the allowed set, because
+        // `off` means "do not pin", not "also run wider". Dropping the
+        // reservation here would add an oversubscription mode that does not
+        // exist today: under an external `taskset` of K CPUs with a requested
+        // width of K, the pool would run K spinning workers plus the inline
+        // dispatcher on K CPUs, and the dispatcher's preemption makes it the
+        // straggler the whole barrier waits on. Reserving costs nothing on an
+        // unconfined host, where an explicit request already stands the
+        // process self-confinement down (`bound_process_to_decode_budget`) and
+        // the allowed set is the whole machine.
+        ExplicitAffinity::Unpinned => {
+            let allowed = allowed_cpus().unwrap_or_default();
+            let core_count = crate::core_topology::host()
+                .map_or(0, |cores| cores.leaders_within(&allowed).len());
+            let workers = reserve_single_group_headroom(total, allowed.len(), core_count);
+            Some(vec![NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers,
+            }])
+        }
         ExplicitAffinity::FromPlan => {
             let cpus = planned_cpus()?;
             if cpus.is_empty() {
@@ -2085,6 +2099,19 @@ fn explicit_affinity_shards_for(
     }
 }
 
+/// Resolve the node shards for `total` workers: the multi-node split when the
+/// (cpuset-restricted) topology exposes >=2 nodes, otherwise a single group.
+///
+/// In both cases the pinned-worker count is capped so the inline dispatcher
+/// always keeps at least one allowed CPU free (see [`DISPATCHER_RESERVED_CPUS`]
+/// and [`reserve_single_group_headroom`] / [`reserve_split_headroom`]). Without
+/// that reservation a fully-subscribed cpuset (workers == allowed CPUs) pins a
+/// spinning worker on every core, starving the dispatcher and collapsing
+/// throughput.
+///
+/// An explicit affinity request is resolved first (see
+/// [`explicit_affinity_shards`]); it selects the CPU *set*, and the worker
+/// count is still capped by the same reservation.
 fn node_shards(total: usize) -> Vec<NodeShard> {
     node_shards_with(total, explicit_affinity_shards)
 }
@@ -2902,9 +2929,12 @@ mod tests {
             ExplicitAffinity::Malformed
         );
         assert!(
-            explicit_affinity_shards_for(ExplicitAffinity::Malformed, 4, || {
-                panic!("a malformed value must not consult topology")
-            })
+            explicit_affinity_shards_for(
+                ExplicitAffinity::Malformed,
+                4,
+                || panic!("a malformed value must not consult topology"),
+                || panic!("a malformed value must not consult topology"),
+            )
             .is_none(),
             "a malformed value must leave default placement in charge"
         );
@@ -2915,10 +2945,14 @@ mod tests {
     /// every worker: unpinned workers cannot pin the dispatcher out of a core,
     /// so there is nothing for the headroom reservation to protect.
     #[test]
-    fn affinity_off_leaves_the_pool_unpinned_with_every_worker() {
-        let shards = explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 16, || {
-            panic!("`off` must not consult topology")
-        })
+    fn affinity_off_leaves_the_pool_unpinned_without_widening_it() {
+        // Plenty of headroom: 4 workers over 16 allowed CPUs.
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || Some((0..16).collect()),
+        )
         .expect("`off` is an explicit request");
         assert_eq!(shards.len(), 1);
         assert!(
@@ -2926,7 +2960,38 @@ mod tests {
             "`off` must produce no CPUs to pin to, got {:?}",
             shards[0].cpus
         );
-        assert_eq!(shards[0].workers, 16);
+        assert_eq!(
+            shards[0].workers, 4,
+            "`off` must not narrow a pool with headroom"
+        );
+
+        // `off` means "do not pin", not "also run wider": a fully subscribed
+        // allowed set still reserves a slot for the inline dispatcher, because
+        // an unpinned spinning worker preempts it just as a pinned one does.
+        let saturated = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || Some(vec![0, 1, 2, 3]),
+        )
+        .expect("`off` is an explicit request");
+        assert!(saturated[0].cpus.is_empty());
+        assert!(
+            saturated[0].workers < 4,
+            "a saturated `off` pool must still leave the dispatcher somewhere to run, got {}",
+            saturated[0].workers
+        );
+
+        // No knowable allowed set (pinning unsupported): nothing to reserve
+        // against, so the requested width stands -- same as the default path.
+        let unknown = explicit_affinity_shards_for(
+            ExplicitAffinity::Unpinned,
+            4,
+            || panic!("`off` must not consult the affinity plan"),
+            || None,
+        )
+        .expect("`off` is an explicit request");
+        assert_eq!(unknown[0].workers, 4);
     }
 
     /// A `compact` / `node:<index>` request takes its CPU set from the shared
@@ -2937,9 +3002,13 @@ mod tests {
     #[test]
     fn a_planned_affinity_request_pins_to_the_planned_cpus() {
         let planned = vec![8, 9, 10, 11];
-        let shards =
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || Some(planned.clone()))
-                .expect("a planned request is honored");
+        let shards = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            4,
+            || Some(planned.clone()),
+            || panic!("a planned request must not consult the allowed set"),
+        )
+        .expect("a planned request is honored");
         assert_eq!(shards.len(), 1);
 
         // The request decides *which* CPUs: exactly the planned set, nothing
@@ -2948,23 +3017,23 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, planned, "the planned CPU set must be honored exactly");
 
-        // ...and the placement policy decides the order. Dropping the spread
-        // from this arm fails here on any host with core topology.
-        let cores = crate::core_topology::host();
-        assert_eq!(
-            shards[0].cpus,
-            crate::decode_affinity::order_pin_targets(&planned, cores),
-            "an explicit request must use the shared physical-core spread"
-        );
-        if let Some(cores) = cores {
-            // What the spread is actually for: the leading pin targets are one
-            // per physical core, so the first workers never share a front end.
-            let leaders = cores.leaders_within(&planned);
-            assert_eq!(
-                shards[0].cpus[..leaders.len()],
-                leaders[..],
-                "the first pin targets must be one per physical core"
-            );
+        // ...and the placement policy decides the order. Asserted as the
+        // property rather than by comparing against `order_pin_targets`, which
+        // would just be restating the implementation: the leading pin targets
+        // must land on *distinct physical cores*, so the first workers never
+        // share a front end. Dropping the spread from this arm fails here on
+        // any host with core topology.
+        if let Some(cores) = crate::core_topology::host() {
+            let core_count = cores.leaders_within(&planned).len();
+            let mut seen_cores = std::collections::BTreeSet::new();
+            for &cpu in &shards[0].cpus[..core_count] {
+                let core = cores.leaders_within(&[cpu]).first().copied().unwrap_or(cpu);
+                assert!(
+                    seen_cores.insert(core),
+                    "cpu {cpu} shares a physical core with an earlier pin target in {:?}",
+                    shards[0].cpus
+                );
+            }
         }
 
         // Fully subscribed (4 workers, 4 CPUs), so the inline dispatcher still
@@ -2978,9 +3047,12 @@ mod tests {
         );
 
         // With genuine headroom the requested count is untouched.
-        let roomy = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 2, || {
-            Some(vec![0, 1, 2, 3, 4, 5, 6, 7])
-        })
+        let roomy = explicit_affinity_shards_for(
+            ExplicitAffinity::FromPlan,
+            2,
+            || Some(vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            || panic!("a planned request must not consult the allowed set"),
+        )
         .expect("a planned request is honored");
         assert_eq!(roomy[0].workers, 2);
     }
@@ -2990,15 +3062,29 @@ mod tests {
     /// in charge rather than the pool silently running unpinned.
     #[test]
     fn an_unresolvable_plan_falls_back_to_default_placement() {
-        assert!(explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || None).is_none());
+        let no_allowed = || panic!("the allowed set is only for `off`");
         assert!(
-            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || Some(Vec::new()))
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, || None, no_allowed)
                 .is_none()
         );
         assert!(
-            explicit_affinity_shards_for(ExplicitAffinity::DeferToDefault, 4, || Some(vec![0, 1]))
-                .is_none(),
-            "deferring must not consult the plan"
+            explicit_affinity_shards_for(
+                ExplicitAffinity::FromPlan,
+                4,
+                || Some(Vec::new()),
+                no_allowed
+            )
+            .is_none()
+        );
+        assert!(
+            explicit_affinity_shards_for(
+                ExplicitAffinity::DeferToDefault,
+                4,
+                || panic!("deferring must not consult the plan"),
+                || panic!("deferring must not consult the allowed set"),
+            )
+            .is_none(),
+            "deferring must consult nothing at all"
         );
     }
 
@@ -3011,10 +3097,12 @@ mod tests {
     #[test]
     fn different_affinity_requests_do_not_collapse_to_the_same_placement() {
         let planned = || Some(vec![16, 17, 18, 19]);
-        let off = explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, planned)
-            .expect("`off` is honored");
-        let node = explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, planned)
-            .expect("`node:<index>` is honored");
+        let off =
+            explicit_affinity_shards_for(ExplicitAffinity::Unpinned, 4, planned, || Some(vec![16]))
+                .expect("`off` is honored");
+        let node =
+            explicit_affinity_shards_for(ExplicitAffinity::FromPlan, 4, planned, || Some(vec![16]))
+                .expect("`node:<index>` is honored");
         assert_ne!(
             off[0].cpus, node[0].cpus,
             "`off` and `node:<index>` must not resolve to the same CPU set"
