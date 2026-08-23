@@ -72,10 +72,47 @@ pub fn floats(len: usize, seed: f32) -> Vec<f32> {
         .collect()
 }
 
-pub fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box<dyn Kernel> {
+/// Whether the workload supplies a fourth, asymmetric zero-points input.
+///
+/// This axis is not cosmetic. Symmetric int4 takes the implicit midpoint 8 and
+/// never reads a zero-points byte, so the whole unpack -- and, before #1783,
+/// the integer divisions inside it -- sits behind an `Option` null check that
+/// the symmetric route never enters. A measurement of zero-point handling
+/// taken without this set is timing a branch that does not run.
+pub fn asymmetric_zero_points() -> bool {
+    std::env::var("PROBE_ZERO_POINTS").is_ok_and(|v| v.trim() == "1")
+}
+
+/// Packed asymmetric zero points, two int4 nibbles per byte, one per block.
+///
+/// Values sit near the symmetric midpoint 8 the way a real round-to-nearest
+/// quantizer's do; the exact values change the arithmetic they feed, not the
+/// instruction count.
+pub fn packed_zero_points(blocks: usize, n: usize) -> Vec<u8> {
+    let per_row = blocks.div_ceil(2);
+    let mut bytes = vec![0u8; n * per_row];
+    for row in 0..n {
+        for block in 0..blocks {
+            let value = 7u8 + ((row + block) % 3) as u8;
+            bytes[row * per_row + block / 2] |= value << ((block % 2) * 4);
+        }
+    }
+    bytes
+}
+
+pub fn build_kernel(
+    k: usize,
+    n: usize,
+    block_size: usize,
+    accuracy: i64,
+    zero_points: bool,
+) -> Box<dyn Kernel> {
     let blocks = k.div_ceil(block_size);
     let blob = block_size / 2;
-    let shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
+    let mut shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
+    if zero_points {
+        shapes.push(vec![n, blocks.div_ceil(2)]);
+    }
     let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
     node.domain = "com.microsoft".into();
     for (name, value) in [
@@ -90,7 +127,11 @@ pub fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box
     let mut kernel = CpuExecutionProvider::new()
         .get_kernel(&node, &shapes, 1)
         .expect("CPU EP must register MatMulNBits");
-    kernel.set_constant_inputs(&[false, true, true]);
+    if zero_points {
+        kernel.set_constant_inputs(&[false, true, true, true]);
+    } else {
+        kernel.set_constant_inputs(&[false, true, true]);
+    }
     kernel
 }
 
@@ -98,12 +139,24 @@ pub fn build_kernel(k: usize, n: usize, block_size: usize, accuracy: i64) -> Box
 pub struct Weight {
     pub b: Tensor,
     pub scales: Tensor,
+    pub zero_points: Option<Tensor>,
     pub k: usize,
     pub n: usize,
 }
 
+impl Weight {
+    /// The kernel inputs for one projection, with the optional fourth.
+    pub fn inputs<'a>(&'a self, activation: &'a Tensor) -> Vec<super::TensorView<'a>> {
+        let mut inputs = vec![activation.view(), self.b.view(), self.scales.view()];
+        if let Some(zero_points) = self.zero_points.as_ref() {
+            inputs.push(zero_points.view());
+        }
+        inputs
+    }
+}
+
 /// Build the shared, deterministic weight set for one configuration.
-pub fn weights(block_size: usize) -> Vec<Weight> {
+pub fn weights(block_size: usize, asymmetric: bool) -> Vec<Weight> {
     projections()
         .iter()
         .enumerate()
@@ -118,6 +171,8 @@ pub fn weights(block_size: usize) -> Vec<Weight> {
             Weight {
                 b: Tensor::u8(&[n, blocks, blob], &packed),
                 scales: Tensor::floats(FloatDType::F32, &[n, blocks], &scales),
+                zero_points: asymmetric
+                    .then(|| Tensor::u8(&[n, blocks.div_ceil(2)], &packed_zero_points(blocks, n))),
                 k,
                 n,
             }

@@ -207,7 +207,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::Tensor;
-use common::decode_workload::{Weight, build_kernel, floats, weights};
+use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_cpu::{decode_spmd, with_decode_pool_scope};
 
@@ -467,7 +467,8 @@ fn main() {
         .map(|v| v.trim().parse().expect("PROBE_GAP_US_LIST must be numbers"))
         .collect();
 
-    let weights: Vec<Weight> = weights(block_size);
+    let asymmetric = asymmetric_zero_points();
+    let weights: Vec<Weight> = weights(block_size, asymmetric);
 
     // Build the cell list once, so every repetition walks it in the same order
     // and a cell's repetitions are separated in time by the rest of the matrix.
@@ -526,7 +527,9 @@ fn main() {
         if decode {
             for _ in 0..layers {
                 for weight in &weights {
-                    kernels.push(build_kernel(weight.k, weight.n, block_size, accuracy));
+                    kernels.push(build_kernel(
+                        weight.k, weight.n, block_size, accuracy, asymmetric,
+                    ));
                     activations.push(Tensor::floats(
                         common::FloatDType::F32,
                         &[1, weight.k],
@@ -546,11 +549,7 @@ fn main() {
          -> (Vec<Box<dyn Kernel>>, Vec<Tensor>) {
             for (index, kernel) in kernels.iter().enumerate() {
                 let weight = &weights[index % weights.len()];
-                let ins = vec![
-                    activations[index].view(),
-                    weight.b.view(),
-                    weight.scales.view(),
-                ];
+                let ins = weight.inputs(&activations[index]);
                 kernel
                     .execute(&ins, &mut [outputs[index].view_mut()])
                     .expect("execute");

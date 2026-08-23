@@ -16,14 +16,29 @@
 //! | `m = 1` through the fused GEBP | default env, built with the row gates forced to 1 |
 //! | today's decode routes | `ONNX_GENAI_CPU_MM_INT4_GEBP=0` |
 //!
-//! Both arms come from one binary. The second reproduces today's behaviour
-//! exactly, because today no int4 prefill route is gated below `m = 2`.
+//! Both arms come from one binary.
+//!
+//! **Stale claim, corrected 2026-08-23 (#1783).** This used to say the second
+//! arm "reproduces today's behaviour exactly, because today no int4 prefill
+//! route is gated below `m = 2`". That is no longer true:
+//! `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` is **1**, so for any block size that
+//! is not a multiple of 32 the GEBP gate `m >= 1` admits a *decode* row. At
+//! those block sizes the default arm is GEBP and the two arms differ.
 //!
 //! Env:
-//! - `PROBE_BLOCK` -- quantization block size (default 32). 16 routes below the
-//!   gate to `borrowed_affine_int4_matmul`; 32/64/128 route to
-//!   `borrowed_affine_int4_matmul_nblock`, a different and much stronger
-//!   competitor.
+//! - `PROBE_BLOCK` -- quantization block size (default 32). 32/64/128 route to
+//!   `borrowed_affine_int4_matmul_nblock`, the N-blocked decode kernel.
+//!
+//!   **`16` does not measure a decode kernel at all, and this line used to say
+//!   it routed to `borrowed_affine_int4_matmul`.** It does not.
+//!   `int4_prefill_gebp_min_rows` returns
+//!   `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED == 1` for any block size that is
+//!   not a multiple of 32, so at `m = 1` the GEBP gate is already satisfied
+//!   and block 16 runs the *fused prefill* kernel `quant_prefill_gebp`.
+//!   Falsifier: `ONNX_GENAI_CPU_MM_INT4_GEBP=0` changes the block-16 checksum
+//!   (844.702358 -> 844.714874) and its time, and leaves block 32 untouched
+//!   (979.199155 either way). Any block-16 row taken here is a GEBP row.
+//!   Set `ONNX_GENAI_CPU_MM_INT4_GEBP=0` to reach the decode kernel at 16.
 //! - `PROBE_ACCURACY` -- `accuracy_level` (default 0). **4 is the only value
 //!   that reaches the packed-nibble kernel**, so without this axis that route
 //!   had no decode-loop row at all and only ever appeared in single-op benches.
@@ -81,7 +96,7 @@ mod common;
 use std::time::Instant;
 
 use common::Tensor;
-use common::decode_workload::{Weight, build_kernel, floats, weights};
+use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_cpu::with_decode_pool_scope;
 
@@ -89,6 +104,10 @@ fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     samples[samples.len() / 2]
 }
+
+/// Set by every session; read once after the measured phases. See the checksum
+/// comment in the session loop.
+static CHECKSUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
@@ -125,11 +144,17 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
-    let weights: Vec<Weight> = weights(block_size);
+    let asymmetric = asymmetric_zero_points();
+    let weights: Vec<Weight> = weights(block_size, asymmetric);
 
     println!(
-        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd}",
-        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into())
+        "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd} zero_points={}",
+        std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into()),
+        if asymmetric {
+            "asymmetric"
+        } else {
+            "symmetric"
+        }
     );
     println!(
         "{:>10} {:>12} {:>12} {:>14} {:>9}",
@@ -144,7 +169,9 @@ fn main() {
         let mut outputs: Vec<Tensor> = Vec::new();
         for _ in 0..layers {
             for weight in &weights {
-                kernels.push(build_kernel(weight.k, weight.n, block_size, accuracy));
+                kernels.push(build_kernel(
+                    weight.k, weight.n, block_size, accuracy, asymmetric,
+                ));
                 activations.push(Tensor::floats(
                     common::FloatDType::F32,
                     &[1, weight.k],
@@ -164,11 +191,7 @@ fn main() {
          -> (Vec<Box<dyn Kernel>>, Vec<Tensor>) {
             for (index, kernel) in kernels.iter().enumerate() {
                 let weight = &weights[index % weights.len()];
-                let ins = vec![
-                    activations[index].view(),
-                    weight.b.view(),
-                    weight.scales.view(),
-                ];
+                let ins = weight.inputs(&activations[index]);
                 kernel
                     .execute(&ins, &mut [outputs[index].view_mut()])
                     .expect("execute");
@@ -205,6 +228,30 @@ fn main() {
             state = returned;
             samples.push(elapsed);
         }
+        // Written by every session, last writer wins. That is well defined
+        // rather than racy in substance: the sessions share one deterministic
+        // weight set and one deterministic activation, so every session
+        // computes the same sum and any of them is the right answer. It is an
+        // atomic store read after the scope joins, so there is no UB either.
+        //
+        // Route proof, not decoration. An arm that supplies a fourth input the
+        // kernel silently ignored would time the *symmetric* route while
+        // claiming the asymmetric one, and every number taken from it would be
+        // attributed to a branch never entered. The checksum is the cheapest
+        // evidence the zero points were consumed: symmetric uses the implicit
+        // midpoint 8 and asymmetric uses 7/8/9, so the two arms cannot agree
+        // unless the input was dropped.
+        let checksum: f64 = state
+            .1
+            .iter()
+            .map(|out| {
+                let view = out.view();
+                let len: usize = view.shape.iter().product();
+                let values = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
+                values.iter().map(|v| *v as f64).sum::<f64>()
+            })
+            .sum();
+        CHECKSUM.store(checksum.to_bits(), std::sync::atomic::Ordering::Relaxed);
         samples
     };
 
@@ -260,6 +307,11 @@ fn main() {
         };
         println!("{phase:>10} {ms:>12.3} {p90:>12.3} {total:>14.1} {spread:>9.1}");
     }
+
+    println!(
+        "checksum={:.6}",
+        f64::from_bits(CHECKSUM.load(std::sync::atomic::Ordering::Relaxed))
+    );
 
     // After the phases, never before: the pool is built at first decode, so this
     // is the earliest point the realized width exists to be read.
