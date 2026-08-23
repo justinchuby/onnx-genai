@@ -3087,10 +3087,12 @@ mod decode_core_coverage_tests {
     fn nothing_the_decode_core_covers_is_composite_elsewhere() {
         let mut corpus = maintained_workflows();
 
-        // A `binding` wearing the decoder's roles. The old scan counted every
-        // component as a decoder candidate, so this made the real decoder
-        // ambiguous: `is_single_decoder_workflow` said "composite" while the
-        // contract-only cover check still said "the decode core has this".
+        // A `binding` wearing the decoder's roles. The old recognizer counted
+        // every component as a decoder candidate, so two candidates made
+        // `sole_decoder_component` yield `None` and `is_single_decoder_workflow`
+        // therefore say "not a single decoder" — not because the graph count
+        // rose, but because the decoder had become ambiguous. The contract-only
+        // cover check meanwhile still said "the decode core has this".
         let mut binding_decoy = single_decoder_workflow();
         let decoder_roles = binding_decoy.components["decoder"].ports.roles.clone();
         binding_decoy

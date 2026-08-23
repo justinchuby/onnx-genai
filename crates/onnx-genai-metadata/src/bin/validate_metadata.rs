@@ -73,7 +73,7 @@ validate_metadata — check inference metadata
 
     validate_metadata --shape [...]
         Also report how each package classifies: a single decoder (with or
-        without the decode contract), or a composite pipeline and how many ONNX
+        without the decode contract), or a composite pipeline and how many graph
         components it names. This is the triage question when migrating a fleet.
 ";
 
@@ -108,8 +108,13 @@ fn shape_of(metadata: &onnx_genai_metadata::InferenceMetadata) -> String {
         return "no workflow".to_string();
     };
     let classification = onnx_genai_metadata::classify_workflow(&pipeline.workflow);
+    // "graph component", not "ONNX component": an `adapter` is an artifact the
+    // package ships and something has to execute, and it counts here exactly as
+    // the classification counts it. Saying "ONNX" would report three for a
+    // package with one graph and two adapters, and the republishing step tells
+    // a publisher to check this number against the one they expect.
     match classification.cardinality() {
-        NoGraph => "workflow with no ONNX component".to_string(),
+        NoGraph => "workflow with no graph component".to_string(),
         SingleGraph if classification.contracted_single_decoder().is_some() => {
             "single-decoder workflow".to_string()
         }
@@ -117,11 +122,11 @@ fn shape_of(metadata: &onnx_genai_metadata::InferenceMetadata) -> String {
             "single-decoder workflow, no decode contract".to_string()
         }
         SingleGraph if classification.decoder_evidence().contradictory() => {
-            "one ONNX component declaring the decode contract but no port roles".to_string()
+            "one graph component declaring the decode contract but no port roles".to_string()
         }
-        SingleGraph => "one ONNX component, not a decoder".to_string(),
+        SingleGraph => "one graph component, not a decoder".to_string(),
         Composite => format!(
-            "composite workflow ({} ONNX components)",
+            "composite workflow ({} graph components)",
             classification.graph_component_count()
         ),
     }

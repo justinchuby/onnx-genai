@@ -246,16 +246,19 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- \
 gigabytes, and requiring its weights before its metadata could be checked would
 mean nobody checks metadata before uploading it.
 
-`--shape` reports both layers of the shared classification. It has six possible
-answers, and the triage verdict for each:
+`--shape` reports both layers of the shared classification. It has seven
+possible answers, and the triage verdict for each. A *graph component* is one
+the package ships an artifact for — an `onnx` component or an `adapter`; a
+`binding` is a step the runtime implements and is not counted.
 
 | Reported shape | What it means | Action |
 |---|---|---|
-| `single-decoder workflow` | one ONNX graph, recognized by its roles, naming the decode contract | already canonical; the decode core covers it |
-| `single-decoder workflow, no decode contract` | one ONNX graph, recognized by its roles, but no component names `onnx-genai.autoregressive-decode` | the document is valid; add the contract before a runtime will drive its generation loop |
-| `composite workflow (N ONNX components)` | several graphs, executed by the interpreter | already canonical; confirm `N` is the number you expect |
-| `one ONNX component, not a decoder` | one graph that consumes no autoregressive sequence — an encoder, a CTC head, a rollout step | already canonical for what it is; it is not a generation package and no decode step applies |
-| `one ONNX component declaring the decode contract but no port roles` | contradictory: the step is named, but nothing says how to drive it | a producer error; declare the port roles |
+| `single-decoder workflow` | one graph, recognized as a decoder by its roles, naming the decode contract | already canonical; the fused decode core covers it |
+| `single-decoder workflow, no decode contract` | one graph, recognized as a decoder by its roles, but no component names `onnx-genai.autoregressive-decode` | already canonical, and it generates: the interpreter runs the declared loop as-is. Adding the contract only opts the package into the fused decode core |
+| `composite workflow (N graph components)` | several graphs, executed by the interpreter | already canonical; confirm `N` is the number you expect |
+| `one graph component, not a decoder` | one graph that decodes nothing: it consumes no autoregressive sequence, or it consumes one but produces no logits and owns no attention state — an encoder, a CTC head, a rollout step | already canonical for what it is; it is not a generation package and no decode step applies |
+| `one graph component declaring the decode contract but no port roles` | contradictory: the step is named, but nothing says how to drive it | a producer error; declare the port roles |
+| `workflow with no graph component` | a workflow whose every component is a `binding` | there is no artifact to execute; check this is really the package you meant to publish |
 | `no workflow` | the document declares no `pipeline.workflow` | needs conversion |
 
 ## Republishing a hub package
@@ -303,7 +306,7 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- --metadata-only --sh
 
 | Repo | Revision audited | Metadata | Status |
 |---|---|---|---|
-| `justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` | `541afaea12e85222766b694cccc30153ea6dd3c1` | `inference_metadata.yaml` | **Already canonical.** Declares `pipeline.workflow`, no `model.io`. Validates against this branch. Classified `composite workflow` (186 ONNX components). **No action.** |
+| `justinchuby/sensenova-u1.5-8b-mot-onnx-canonical` | `541afaea12e85222766b694cccc30153ea6dd3c1` | `inference_metadata.yaml` | **Already canonical.** Declares `pipeline.workflow`, no `model.io`. Validates against this branch. Classified `composite workflow (186 graph components)`. **No action.** |
 | `justinchuby/gemma-4-e2b-it-onnx` | `9bcf2cb1c2878b1c68a5f94db037272dfb278384` | 13 × `genai_config.json` (NF4, Q4_K_M, bf16, f16, openvino × cpu/cuda/webgpu) | **No action.** `genai_config.json` is a *foreign* producer's format, not `model.io`. The importer converts it in memory to a canonical workflow, so these load unchanged. |
 
 **No published package requires metadata replacement.** The retired `model.io`
