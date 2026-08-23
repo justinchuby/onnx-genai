@@ -666,8 +666,21 @@ pub(crate) fn build_handle_with_authorities(
     let model_dir = spec.path.as_path();
     let model_id = spec.id.clone();
     let chat_template = load_chat_template(model_dir)?;
+    // Every package declares a workflow, including a single decoder — so
+    // "declares a workflow" no longer distinguishes a composed pipeline. The one
+    // shared recognizer answers that, keeping this decision identical to the one
+    // the engine makes when it picks an executor.
     if let Some(directory) = PipelineModelDirectory::load_if_declared(model_dir)
         .map_err(|e| anyhow::anyhow!("Failed to discover pipeline directory: {e}"))?
+        .filter(|directory| {
+            !directory
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.pipeline.as_ref())
+                .is_some_and(|pipeline| {
+                    onnx_genai_metadata::is_single_decoder_workflow(&pipeline.workflow)
+                })
+        })
     {
         onnx_genai_engine::validate_pipeline_backend_request(config.engine_config.decode_backend)?;
         // The directory already parsed this package's metadata; re-reading it

@@ -370,7 +370,7 @@ pub(crate) fn recurrent_state_bytes_per_sequence(
 #[cfg(feature = "native-cuda")]
 pub(crate) fn recurrent_state_bytes_from_graph(
     graph: &onnx_runtime_ir::Graph,
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> anyhow::Result<u64> {
     let declared: std::collections::HashSet<&str> = io
         .and_then(|io| io.state_pairs.as_deref())

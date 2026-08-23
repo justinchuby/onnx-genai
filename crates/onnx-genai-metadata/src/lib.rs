@@ -99,8 +99,8 @@ pub mod capabilities {
 }
 
 pub mod cache;
-mod canonical;
 mod decoder_abi;
+pub mod decoder_workflow;
 pub mod identity;
 mod lowering;
 pub mod parser;
@@ -108,12 +108,7 @@ pub mod schema;
 pub mod validation;
 
 pub use cache::{CacheDependencies, cache_dependencies};
-pub use canonical::{
-    AUTOREGRESSIVE_DECODE_CONTRACT, CANONICAL_CONTRACT_VERSION, DECODER_COMPONENT, LoweringError,
-    POLICY_COMPONENT, TOKEN_POLICY_CONTRACT, TOKENS_OUTPUT, canonical_workflow_document,
-    lower_decoder_abi, lower_decoder_metadata,
-};
-pub use decoder_abi::{decoder_abi, sole_decoder_component};
+pub use decoder_abi::{decoder_abi, is_single_decoder_workflow, sole_decoder_component};
 pub use identity::{IDENTITY_SCHEME, semantic_identity, semantic_identity_of_str};
 pub use lowering::{CompiledWorkflow, compile_workflow};
 pub use parser::{

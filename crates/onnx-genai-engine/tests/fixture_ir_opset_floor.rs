@@ -38,7 +38,7 @@ const OWNED_SOURCES: &[&str] = &[
     "tests/native_workflow_smoke.rs",
     "tests/one_runtime_e2e.rs",
     "tests/gemma4_chained_workflow.rs",
-    "tests/canonical_lowering_corpus.rs",
+    "tests/real_model_workflow_corpus.rs",
     "tests/common/chained.rs",
 ];
 

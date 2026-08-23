@@ -20,27 +20,27 @@ use onnx_genai_ort::{PipelineModels, SessionOptions};
 
 use crate::config::{EngineConfig, GenerateRequest, GenerateResult, GenerateTokenCallback};
 use crate::engine::Engine;
-/// Where a runtime's canonical workflow came from.
+/// What kind of workflow a runtime executes.
 ///
-/// Kept distinct from "is a workflow package" so an operator-facing report can
-/// say *lowered* without claiming the package serializes a workflow.
+/// Every package declares a workflow; this reports its *shape*, which is the
+/// thing an operator can act on. It never implies the runtime built the
+/// workflow — nothing does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WorkflowProvenance {
-    /// `pipeline.workflow` is declared in the package on disk.
-    Authored,
-    /// The runtime compiled the package's `model.io` into an in-memory
-    /// canonical workflow. The package still declares `model.io` alone.
-    Lowered,
-    /// The package declares neither, so it has no canonical workflow.
+pub enum WorkflowShapeReport {
+    /// One ONNX component consuming the sequence and producing logits.
+    SingleDecoder,
+    /// Several components, driven step by step by the generic interpreter.
+    Composite,
+    /// No workflow at all, which no loaded package can be.
     None,
 }
 
-impl WorkflowProvenance {
+impl WorkflowShapeReport {
     /// Stable operator-facing label.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Authored => "authored",
-            Self::Lowered => "lowered",
+            Self::SingleDecoder => "single_decoder",
+            Self::Composite => "composite",
             Self::None => "none",
         }
     }
@@ -52,54 +52,36 @@ use crate::pipeline::{
 };
 
 impl Engine {
-    /// How this package's canonical workflow was obtained.
-    ///
-    /// Reported verbatim so a diagnostic never implies the package serializes
-    /// something it does not: `Authored` means `pipeline.workflow` is on disk,
-    /// `Lowered` means the runtime compiled the package's own `model.io` into an
-    /// in-memory workflow and the file still declares `model.io` alone.
-    pub fn workflow_provenance(&self) -> WorkflowProvenance {
-        if self.workflow.is_some() {
-            WorkflowProvenance::Authored
-        } else if self.canonical_workflow_document().is_ok() {
-            WorkflowProvenance::Lowered
-        } else {
-            WorkflowProvenance::None
+    /// The shape of the workflow this runtime executes.
+    pub fn workflow_shape(&self) -> WorkflowShapeReport {
+        match self.package_workflow() {
+            Some(workflow) => {
+                if onnx_genai_metadata::sole_decoder_component(workflow).is_some() {
+                    WorkflowShapeReport::SingleDecoder
+                } else {
+                    WorkflowShapeReport::Composite
+                }
+            }
+            None => WorkflowShapeReport::None,
         }
     }
 
-    /// The canonical workflow this package lowers to, as the exact document the
-    /// runtime compiled.
+    /// The workflow this package declares, exactly as authored.
     ///
-    /// Deterministic in the package's declared ABI and never written back, so
-    /// printing it cannot change what the package says. Errors for a package
-    /// that already declares a workflow — that one *is* the canonical form.
-    pub fn canonical_workflow_document(&self) -> anyhow::Result<String> {
-        anyhow::ensure!(
-            self.workflow.is_none(),
-            "this package declares pipeline.workflow, which is already canonical; there is \
-             nothing to lower"
-        );
-        let io = self
-            .metadata
-            .decoder_io()
-            .context("this package declares no decoder ABI to lower")?;
-        onnx_genai_metadata::canonical_workflow_document(io)
-            .map_err(|error| anyhow::anyhow!("{error}"))
+    /// There is one workflow and it comes from the package. Nothing is
+    /// synthesized, so a diagnostic that prints this is printing what the
+    /// package on disk says, not a runtime reconstruction of it.
+    pub fn package_workflow(&self) -> Option<&onnx_genai_metadata::WorkflowSpec> {
+        crate::engine::canonical_workflow(self.workflow.as_deref(), self.lowered_workflow.as_ref())
+            .ok()
     }
 
-    /// The canonical workflow this package lowers to.
-    pub fn canonical_workflow(&self) -> anyhow::Result<onnx_genai_metadata::WorkflowSpec> {
-        anyhow::ensure!(
-            self.workflow.is_none(),
-            "this package declares pipeline.workflow, which is already canonical; there is \
-             nothing to lower"
-        );
-        let io = self
-            .metadata
-            .decoder_io()
-            .context("this package declares no decoder ABI to lower")?;
-        onnx_genai_metadata::lower_decoder_abi(io).map_err(|error| anyhow::anyhow!("{error}"))
+    /// The package's workflow rendered as the document it was read from.
+    pub fn package_workflow_document(&self) -> anyhow::Result<String> {
+        let workflow = self
+            .package_workflow()
+            .context("this package declares no pipeline.workflow")?;
+        serde_yaml::to_string(workflow).map_err(Into::into)
     }
 
     /// Drop the canonical workflow, so the next request has no path to take.

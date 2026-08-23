@@ -96,7 +96,7 @@ pub(crate) async fn debug_config(
     Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
         pipeline: handle.engine.is_workflow(),
-        workflow_provenance: handle.engine.workflow_provenance(),
+        workflow_shape: handle.engine.workflow_shape(),
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,

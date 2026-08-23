@@ -7,7 +7,7 @@
 //! path needs is already there.
 //!
 //! This module reads that one representation and produces the resolved
-//! [`ModelIoSpec`] the optimized decode path consumes. It is a *lowering*: the
+//! [`DecoderAbi`] the optimized decode path consumes. It is a *lowering*: the
 //! result is derived, never serialized, and never a second place a producer can
 //! state a different answer. A package that carries a workflow therefore needs
 //! no `model.io` block, and the legacy blocks that still exist are import-only
@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use crate::schema::{
-    KvCacheLayout, KvOwnership, LoopStatePair, ModelIoSpec, PortRole, SequenceInputKind,
+    DecoderAbi, KvCacheLayout, KvOwnership, LoopStatePair, PortRole, SequenceInputKind,
     StateGroupContract, StateKind, StatePortRole, StateUpdate, StaticCacheIoSpec, WorkflowSpec,
 };
 
@@ -135,6 +135,16 @@ pub fn sole_decoder_component(workflow: &WorkflowSpec) -> Option<&str> {
     Some(name.as_str())
 }
 
+/// Whether a workflow is a single-decoder package.
+///
+/// The one place this question is answered. Every caller that needs to know
+/// whether a package is "just a decoder" — the engine choosing an executor, the
+/// CLI and server deciding whether to build multimodal input specs — asks here,
+/// so no two of them can reach different conclusions about the same package.
+pub fn is_single_decoder_workflow(workflow: &WorkflowSpec) -> bool {
+    sole_decoder_component(workflow).is_some()
+}
+
 /// Find the single port of `component` carrying `role`.
 ///
 /// The role declaration is what names the port. `declared` is consulted only to
@@ -177,7 +187,7 @@ fn port_with_role<'a>(
 /// that declares no roles yields an empty ABI rather than an error: not every
 /// component is a decoder, and the caller decides whether an empty ABI is
 /// usable.
-pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<ModelIoSpec> {
+pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAbi> {
     let declaration = workflow.components.get(component)?;
     let roles = &declaration.ports.roles;
     let inputs = &declaration.ports.inputs;
@@ -200,15 +210,28 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<ModelIoSp
     let mut aliasing = None;
     let mut kv_layout = None;
     let mut static_cache = None;
+    let mut writes_attention_state = false;
 
     for (_, group) in &groups {
         let Some(ports) = GroupPorts::collect(group, component) else {
             continue;
         };
         if is_self_attention(group.kind) {
+            // A group whose update is `indexed_scatter` is a fixed-capacity
+            // cache. Its buffers are fully described by the static-cache ABI, so
+            // they must not *also* appear as growing past/present pairs: a
+            // runtime that saw both would build a paged bridge over a buffer
+            // that never grows and address it with the wrong discipline.
+            let scatter = matches!(group.update, Some(StateUpdate::IndexedScatter { .. }));
             for (input, output) in ports.pairs() {
-                kv_inputs.push(input.to_string());
-                kv_outputs.push(output.to_string());
+                // A pair exists only where the component writes a `present`
+                // back, which is exactly what "owns this state" means. A
+                // read-only sharer binds the group but yields no pairs.
+                writes_attention_state = true;
+                if !scatter {
+                    kv_inputs.push(input.to_string());
+                    kv_outputs.push(output.to_string());
+                }
             }
             // The strictest aliasing any owning group declares governs the
             // component: a runtime may not alias one group's buffers on the
@@ -243,10 +266,16 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<ModelIoSp
     // A component with no owning group either reads state another decoder
     // advances or holds none at all. Both are `shared` from this graph's point
     // of view: it does not consume a past buffer it is responsible for.
-    let kv_ownership = Some(if kv_inputs.is_empty() {
-        KvOwnership::Shared
-    } else {
+    // A component with no owning group either reads state another decoder
+    // advances or holds none at all. Both are `shared` from this graph's point
+    // of view: it does not advance a past buffer it is responsible for. This is
+    // asked of the group bindings rather than of `kv_inputs`, because a
+    // fixed-capacity decoder owns its cache while reporting it as a static
+    // cache rather than as growing pairs.
+    let kv_ownership = Some(if writes_attention_state {
         KvOwnership::Owned
+    } else {
+        KvOwnership::Shared
     });
 
     let sequence_source = match (&token_input, &inputs_embeds_input) {
@@ -263,7 +292,7 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<ModelIoSp
     // rather than inventing a presence key that no caller supplies.
     let optional_inputs = BTreeMap::new();
 
-    Some(ModelIoSpec {
+    Some(DecoderAbi {
         sequence_source,
         kv_ownership,
         kv_layout,

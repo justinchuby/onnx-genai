@@ -7,54 +7,67 @@ use crate::memory_authority::{
 };
 
 impl Engine {
-    /// Whether `model_dir` declares a `pipeline.workflow` package.
+    /// What shape of workflow a package declares.
     ///
-    /// Resolved from the package itself so a caller never has to know — and can
-    /// never disagree about — which shape it loaded. This is the one place the
-    /// distinction is made; every constructor below routes on it.
-    fn declares_workflow(model_dir: &Path) -> anyhow::Result<bool> {
-        // A package that cannot be resolved *as a pipeline* is not one. The
-        // compatibility branch of `load_if_declared` recognizes a multi-component
-        // shape from `genai_config.json` and then requires native metadata to
-        // build it; a hybrid text decoder can pass the first check and fail the
-        // second. Treating that failure as "not a workflow package" keeps such a
-        // package on the decoder loader it has always used, instead of turning a
-        // shape guess into a hard load error.
-        match onnx_genai_ort::PipelineModelDirectory::load_if_declared(model_dir) {
-            Ok(directory) => Ok(directory.is_some()),
-            Err(error) => {
-                tracing::debug!(
-                    model_dir = %model_dir.display(),
-                    %error,
-                    "package is not resolvable as a pipeline; loading it as a decoder"
-                );
-                Ok(false)
-            }
+    /// Every package declares one: a single decoder is a workflow with one ONNX
+    /// component, not a different kind of package. The distinction here is not
+    /// *whether* to run the workflow but *which executor implements its decoder
+    /// component* — a fused decode session that owns its KV on device, or the
+    /// generic per-step interpreter. Both execute the same declared workflow.
+    fn declared_workflow_shape(model_dir: &Path) -> anyhow::Result<WorkflowShape> {
+        // An authored package answers from its own metadata. Only a package
+        // that ships none needs the `genai_config.json` importer, which converts
+        // that foreign format into this project's one representation — and which
+        // needs a resolvable model directory, something a composite workflow
+        // package (components in subdirectories) deliberately does not present.
+        let metadata = match onnx_genai_metadata::parser::load_metadata_from_dir(model_dir)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+        {
+            Some(metadata) => Some(metadata),
+            None => onnx_genai_ort::ModelDirectory::load(model_dir)
+                .ok()
+                .and_then(|directory| load_inference_metadata(&directory).ok()),
+        };
+        let Some(workflow) = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pipeline.as_ref())
+            .map(|pipeline| pipeline.workflow.clone())
+        else {
+            // A package from before the workflow existed reaches here. It is
+            // refused rather than repaired: synthesizing a workflow at load
+            // would mean the package on disk says one thing and the runtime
+            // executes another, which is the second authoritative answer the
+            // canonical rule exists to prevent.
+            anyhow::bail!(
+                "{}: this package declares no pipeline.workflow.\n\n\
+                 A single decoder is declared exactly like every other pipeline: a workflow with \
+                 one ONNX component whose ports carry roles, a state_service group owning its KV \
+                 cache, and a generation loop. Packages carrying the retired `model.io` block are \
+                 no longer loadable.\n\n\
+                 Convert the package once, offline:\n    \
+                 migrate_model_io {}\n",
+                model_dir.display(),
+                model_dir.display()
+            );
+        };
+        // Recognized structurally, never by name, through the one shared
+        // recognizer every caller uses.
+        if onnx_genai_metadata::is_single_decoder_workflow(&workflow) {
+            return Ok(WorkflowShape::SingleDecoder(Box::new(workflow)));
         }
+        Ok(WorkflowShape::Composite)
     }
 
-    /// Compile this package's authored `model.io` into its canonical workflow.
+    /// Adopt the package's declared workflow as the one this runtime executes.
     ///
-    /// Runs once, at load, for every bare-decoder package: the result is what
-    /// the interpreter executes, so a package that cannot be lowered must fail
-    /// here rather than reach generation and find no path to take. The package
-    /// on disk is untouched — `model.io` stays its sole serialized answer.
-    fn install_canonical_workflow(mut self) -> anyhow::Result<Self> {
-        if self.workflow.is_some() {
-            // An authored workflow is already the canonical form.
-            return Ok(self);
-        }
-        let io = self.metadata.decoder_io().context(
-            "this package declares neither pipeline.workflow nor model.io, so there is no \
-             executable graph ABI to lower into a canonical workflow",
-        )?;
-        let lowered = onnx_genai_metadata::lower_decoder_abi(io).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to lower this package's model.io into a canonical workflow: {error}"
-            )
-        })?;
-        crate::pipeline::canonical_decode::assert_canonical_contracts(&lowered)?;
-        self.lowered_workflow = Some(lowered);
+    /// Nothing is synthesized and nothing is written back: this is the document
+    /// the package ships, and it is what the decode loop reads its body from.
+    fn adopt_package_workflow(
+        mut self,
+        workflow: onnx_genai_metadata::WorkflowSpec,
+    ) -> anyhow::Result<Self> {
+        crate::pipeline::canonical_decode::assert_canonical_contracts(&workflow)?;
+        self.lowered_workflow = Some(workflow);
         Ok(self)
     }
 
@@ -66,11 +79,12 @@ impl Engine {
     /// caller gets the same type either way, and both execute through the
     /// interpreter.
     pub fn from_dir(model_dir: &Path, config: EngineConfig) -> anyhow::Result<Self> {
-        if Self::declares_workflow(model_dir)? {
+        let WorkflowShape::SingleDecoder(workflow) = Self::declared_workflow_shape(model_dir)?
+        else {
             return Self::from_pipeline_dir(model_dir, config);
-        }
+        };
         Self::from_dir_impl(model_dir, config, SessionOptions::default(), false, None)?
-            .install_canonical_workflow()
+            .adopt_package_workflow(*workflow)
     }
 
     /// Load a package using a caller-owned device authority provider.
@@ -79,11 +93,12 @@ impl Engine {
         config: EngineConfig,
         provider: Arc<dyn MemoryAuthorityProvider>,
     ) -> anyhow::Result<Self> {
-        if Self::declares_workflow(model_dir)? {
+        let WorkflowShape::SingleDecoder(workflow) = Self::declared_workflow_shape(model_dir)?
+        else {
             return Self::from_pipeline_dir_with_memory_authority_provider(
                 model_dir, config, provider,
             );
-        }
+        };
         Self::from_dir_impl(
             model_dir,
             config,
@@ -91,7 +106,7 @@ impl Engine {
             false,
             Some(provider),
         )?
-        .install_canonical_workflow()
+        .adopt_package_workflow(*workflow)
     }
 
     /// Load a package from a directory with explicit ORT session options.
@@ -100,16 +115,17 @@ impl Engine {
         config: EngineConfig,
         session_options: SessionOptions,
     ) -> anyhow::Result<Self> {
-        if Self::declares_workflow(model_dir)? {
+        let WorkflowShape::SingleDecoder(workflow) = Self::declared_workflow_shape(model_dir)?
+        else {
             return crate::pipeline::WorkflowRuntime::from_dir_with_session_options(
                 model_dir,
                 config,
                 session_options,
             )
             .and_then(Self::from_workflow);
-        }
+        };
         Self::from_dir_impl(model_dir, config, session_options, true, None)?
-            .install_canonical_workflow()
+            .adopt_package_workflow(*workflow)
     }
 
     fn from_dir_impl(
@@ -1142,7 +1158,7 @@ fn maybe_fill_hybrid_io_from_graph(metadata: &mut InferenceMetadata, model_path:
 fn mtp_seeded_decoder_io(
     metadata: &InferenceMetadata,
     model_root: &Path,
-) -> Option<onnx_genai_metadata::ModelIoSpec> {
+) -> Option<onnx_genai_metadata::DecoderAbi> {
     let io = metadata.decoder_io()?;
     let descriptor = onnx_genai_metadata::detect_speculator(model_root)?;
     let onnx_genai_metadata::SpeculatorProposerStatus::Mtp(spec) = descriptor.proposer else {
@@ -1159,9 +1175,9 @@ fn mtp_seeded_decoder_io(
 /// reads as "declared" everywhere downstream.
 #[cfg(feature = "native-backend")]
 fn decoder_io_seeded_with(
-    io: &onnx_genai_metadata::ModelIoSpec,
+    io: &onnx_genai_metadata::DecoderAbi,
     target_hidden_output: &str,
-) -> Option<onnx_genai_metadata::ModelIoSpec> {
+) -> Option<onnx_genai_metadata::DecoderAbi> {
     if !io.hidden_output.as_deref().unwrap_or_default().is_empty() {
         return None;
     }
@@ -2834,7 +2850,7 @@ pipeline:
 mod mtp_seed_tests {
     use super::*;
 
-    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::ModelIoSpec {
+    fn io_with_hidden_output(hidden_output: Option<&str>) -> onnx_genai_metadata::DecoderAbi {
         let mut value = serde_json::json!({});
         if let Some(name) = hidden_output {
             value["hidden_output"] = serde_json::json!(name);
@@ -2908,7 +2924,7 @@ mod pool_sizing_tests {
             .canonicalize()?)
     }
 
-    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::ModelIoSpec> {
+    fn tiny_llm_io() -> anyhow::Result<onnx_genai_metadata::DecoderAbi> {
         let metadata_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml")
             .canonicalize()?;
@@ -3523,4 +3539,17 @@ mod pool_sizing_tests {
         assert!(!kv_config.page_geometry_required);
         assert_eq!(scheduler.bytes_per_token, None);
     }
+}
+
+/// Which executor implements a package's declared decoder component.
+///
+/// Both variants execute the package's `pipeline.workflow`. What differs is the
+/// executor bound to the decoder step, which is a backend choice beneath the
+/// workflow rather than a second runtime beside it.
+enum WorkflowShape {
+    /// One ONNX component consuming the sequence and producing logits, driven by
+    /// the fused decode session that owns its KV on device.
+    SingleDecoder(Box<onnx_genai_metadata::WorkflowSpec>),
+    /// Several components, driven step by step by the generic interpreter.
+    Composite,
 }

@@ -1036,7 +1036,7 @@ fn governor_tokens_per_page(config: &EngineConfig) -> anyhow::Result<u64> {
 }
 
 pub(crate) fn model_io_declares_only_fixed_state(
-    io: Option<&onnx_genai_metadata::ModelIoSpec>,
+    io: Option<&onnx_genai_metadata::DecoderAbi>,
 ) -> bool {
     let Some(io) = io else {
         return false;
@@ -1530,7 +1530,7 @@ mod tests {
 
     #[test]
     fn state_only_metadata_is_a_valid_non_paged_cache_not_unknown_geometry() {
-        let io: onnx_genai_metadata::ModelIoSpec = serde_json::from_value(serde_json::json!({
+        let io: onnx_genai_metadata::DecoderAbi = serde_json::from_value(serde_json::json!({
             "state_pairs": [
                 { "input": "conv_state_in", "output": "conv_state_out" }
             ]

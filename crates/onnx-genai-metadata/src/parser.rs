@@ -205,6 +205,7 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
+    reject_retired_model_io(&content)?;
 
     let metadata: InferenceMetadata = match path.extension().and_then(|e| e.to_str()) {
         Some("yaml" | "yml") => serde_yaml::from_str(&content)
@@ -223,6 +224,35 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
     };
 
     Ok(metadata)
+}
+
+/// Refuse a document that still declares the retired `model.io` block.
+///
+/// The schema has no field for it, so `serde` would simply drop the key and the
+/// package would fail later with a puzzled "declares no workflow". Recognizing
+/// the retired shape here — and *only* to explain it — turns that into an
+/// actionable error naming the conversion. This is the one place the old spelling
+/// appears, and it never produces a value: it produces a refusal.
+fn reject_retired_model_io(content: &str) -> Result<(), crate::MetadataError> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        // Not parseable as YAML at all; the real parser reports why.
+        return Ok(());
+    };
+    let declares_retired_io = document
+        .get("model")
+        .and_then(|model| model.get("io"))
+        .is_some_and(|io| !io.is_null());
+    if !declares_retired_io {
+        return Ok(());
+    }
+    Err(crate::MetadataError::Parse(
+        "this package declares the retired `model.io` block, which is no longer a way to state \
+         a graph ABI. A single decoder is declared exactly like every other pipeline: a \
+         `pipeline.workflow` with one ONNX component whose ports carry roles, a state_service \
+         group owning its KV cache, and a generation loop. Convert the package once, offline, \
+         with `migrate_model_io <package-dir>`."
+            .to_string(),
+    ))
 }
 
 /// Load inference metadata together with its canonical semantic identity.

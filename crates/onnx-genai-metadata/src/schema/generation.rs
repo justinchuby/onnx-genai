@@ -89,7 +89,7 @@ pub struct SpeculatorConfig {
     /// `kv_ownership` selects private past/present state versus references to
     /// target-owned cache, and the output fields assign semantic roles.
     #[serde(default)]
-    pub io: Option<ModelIoSpec>,
+    pub io: Option<DecoderAbi>,
 
     /// Target backbone hidden size `H` shared with the proposer.
     ///

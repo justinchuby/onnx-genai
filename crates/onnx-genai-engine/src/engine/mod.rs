@@ -81,7 +81,8 @@ pub(crate) use runtime::canonical_workflow;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
-pub use workflow_api::WorkflowProvenance;
+pub use metadata::graph_port_contracts;
+pub use workflow_api::WorkflowShapeReport;
 
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
@@ -108,7 +109,7 @@ mod tests {
     };
     use crate::sampling::Sampler;
     #[cfg(feature = "native-backend")]
-    use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+    use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
     #[cfg(feature = "native-backend")]
     use onnx_runtime_ir::{Attribute, DataType as IrDataType, Graph, Node, NodeId, Shape};
     use proptest::prelude::*;
@@ -581,8 +582,8 @@ mod tests {
     }
 
     #[cfg(feature = "native-backend")]
-    fn tiny_dense_decoder_io() -> ModelIoSpec {
-        ModelIoSpec {
+    fn tiny_dense_decoder_io() -> DecoderAbi {
+        DecoderAbi {
             sequence_source: Some(SequenceInputKind::TokenIds),
             kv_ownership: Some(KvOwnership::Owned),
             kv_layout: None,

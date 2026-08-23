@@ -79,6 +79,19 @@ impl Default for RuntimeCapabilities {
                 capability::PREFIX_CACHE.to_string(),
                 capability::CONTINUOUS_BATCHING.to_string(),
                 capability::CONTROL_FLOW_LOOP.to_string(),
+                // Structural workflow capabilities. Every package now declares
+                // its execution as a workflow, including a single decoder, so a
+                // runtime that executes workflows implements these by
+                // definition. Listing them is what keeps the "declares a
+                // capability I do not implement" warning meaningful instead of
+                // firing on every load until operators learn to ignore it.
+                capability::WORKFLOW_SSA.to_string(),
+                capability::LINEAR_EFFECTS.to_string(),
+                capability::SERVING_SERVICE_CONTRACT.to_string(),
+                capability::NESTED_CONTROL_FLOW.to_string(),
+                capability::LOOP_INDUCTION_VALUES.to_string(),
+                capability::TYPED_EMIT.to_string(),
+                capability::STREAMING_EMIT.to_string(),
             ],
         }
     }
@@ -329,8 +342,6 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
 /// Validate document-level invariants independent of runtime capabilities.
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
-
-    validate_model_io_against_workflow(metadata, &mut errors);
 
     if let Some(pipeline) = &metadata.pipeline
         && let Err(error) = validate_pipeline_spec(pipeline)
@@ -934,58 +945,6 @@ fn require_compatible_tensor_contracts(
             "{path} has a contract incompatible with its adapter output port"
         ));
     }
-}
-
-/// Reject a serialized `model.io` beside the workflow that supersedes it.
-///
-/// `pipeline.workflow` is the canonical serialized expression of a package's
-/// executable graph ABI: component ports carry the port inventory, `ports.roles`
-/// carry what each port means, and `state_service` groups carry the cache pairs,
-/// their aliasing, and how the graph writes into them. Everything an optimized
-/// single-graph decode path needs is recoverable from it, so `model.io` beside a
-/// workflow is not additional information — it is a second writable answer to a
-/// question already answered.
-///
-/// A second answer is a fork, not redundancy. Nothing forces the two to agree,
-/// and when they disagree which one a runtime obeys is decided by whichever code
-/// path reached it first. Rejecting the pair is what keeps "the workflow says X"
-/// a complete answer.
-///
-/// An earlier revision permitted the pair and cross-checked it, because a
-/// workflow then had nowhere to name the static cache's control ports — two
-/// rank-1 integer vectors that are indistinguishable from each other. The
-/// missing fact now lives on the binding that consumes it
-/// (`update.write_indices_ports` and `update.kv_length_ports`), which removes
-/// the reason to keep a second surface at all.
-fn validate_model_io_against_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
-    let (Some(model), Some(_)) = (
-        metadata.model.as_ref(),
-        metadata
-            .pipeline
-            .as_ref()
-            .map(|pipeline| &pipeline.workflow),
-    ) else {
-        return;
-    };
-    if model.legacy_io().is_none() {
-        return;
-    }
-
-    // The workflow is the canonical serialized expression of a package's
-    // executable graph ABI, and a second serialized expression of the same
-    // facts is not redundancy but a fork: the moment the two disagree, which
-    // one a runtime obeys is decided by whichever code path reached it first.
-    // Rejecting the pair is what keeps "the workflow says X" a complete answer.
-    errors.push(
-        "model.io and pipeline.workflow both declare this package's executable graph ABI; the \
-         workflow is canonical, so remove model.io and declare ports at \
-         pipeline.workflow.components.<component>.ports (with ports.roles for token_ids, \
-         inputs_embeds, attention_mask, position_ids, logits, hidden_states, \
-         encoder_hidden_states, and audio_features), model state at \
-         pipeline.workflow.serving.state_service.groups, and fixed-capacity writes at that \
-         group's update.kind: indexed_scatter"
-            .to_string(),
-    );
 }
 
 /// All structural problems found in a pipeline specification.

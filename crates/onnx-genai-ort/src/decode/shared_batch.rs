@@ -55,7 +55,7 @@ struct SharedBufferRoles {
 impl SharedBufferRoles {
     fn resolve(
         session: &Session,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         kv_pairs: &[KvPair],
     ) -> Result<Self> {
         Self::resolve_from_ports(session.inputs(), session.outputs(), io, kv_pairs)
@@ -64,7 +64,7 @@ impl SharedBufferRoles {
     fn resolve_from_ports(
         inputs: &[TensorInfo],
         outputs: &[TensorInfo],
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         kv_pairs: &[KvPair],
     ) -> Result<Self> {
         use crate::io_roles::{
@@ -171,7 +171,7 @@ impl<'a> BatchedSharedBufferDecodeSession<'a> {
     pub fn new_with_io(
         session: &'a Session,
         options: SharedBufferBatchOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let batch_size = usize::try_from(options.batch_size).map_err(|_| {
             OrtError::InvalidArgument(format!(
@@ -606,7 +606,7 @@ impl<'a> BatchedDecodeSession<'a> for BatchedSharedBufferDecodeSession<'a> {
 mod tests {
     use super::*;
     use crate::{DataType, TensorInfo};
-    use onnx_genai_metadata::ModelIoSpec;
+    use onnx_genai_metadata::DecoderAbi;
 
     fn tensor(name: &str, dtype: DataType, shape: &[i64]) -> TensorInfo {
         TensorInfo {
@@ -625,7 +625,7 @@ mod tests {
         }
     }
 
-    fn io_with_roles() -> ModelIoSpec {
+    fn io_with_roles() -> DecoderAbi {
         serde_json::from_str(
             r#"{
                 "token_input": "opaque_tokens",

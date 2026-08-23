@@ -305,7 +305,7 @@ impl<'a> DecodeSession<'a> {
     pub fn new_with_io(
         session: &'a Session,
         options: DecodeSessionOptions,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
         let kv_pairs = infer_kv_pairs(session, io)?;
         let excluded = kv_pairs

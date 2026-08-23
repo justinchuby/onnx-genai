@@ -48,7 +48,7 @@ pub(crate) struct ActiveGenerate {
 pub(crate) struct DraftModel {
     pub(crate) session: Box<Session>,
     pub(crate) decode_path: ModelDecodePath,
-    pub(crate) io: Option<onnx_genai_metadata::ModelIoSpec>,
+    pub(crate) io: Option<onnx_genai_metadata::DecoderAbi>,
     pub(crate) kv_model: Option<KvModelInfo>,
     pub(crate) kv_cache: PagedKvCache,
 }

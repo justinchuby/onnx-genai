@@ -45,7 +45,7 @@ pub(crate) struct EngineDriver {
     /// Resolved from the loaded runtime, not from a caller-supplied flag.
     pub(crate) is_workflow: bool,
     /// Where the canonical workflow came from: `authored`, `lowered`, `none`.
-    pub(crate) workflow_provenance: &'static str,
+    pub(crate) workflow_shape: &'static str,
 }
 
 /// Server-facing summary of an engine's batching capability, combining the
@@ -300,7 +300,7 @@ impl EngineDriver {
         let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(Box::new(engine));
         let is_workflow = owner.0.is_workflow();
-        let workflow_provenance = owner.0.workflow_provenance().as_str();
+        let workflow_shape = owner.0.workflow_shape().as_str();
         let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         thread::Builder::new()
@@ -326,7 +326,7 @@ impl EngineDriver {
             device_authority,
             batching,
             is_workflow,
-            workflow_provenance,
+            workflow_shape,
         }
     }
 
@@ -338,7 +338,7 @@ impl EngineDriver {
         let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
         let owner = EngineOwner(Box::new(engine));
         let is_workflow = owner.0.is_workflow();
-        let workflow_provenance = owner.0.workflow_provenance().as_str();
+        let workflow_shape = owner.0.workflow_shape().as_str();
         let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
         // A pipeline engine owns its components' caches rather than one page
@@ -370,7 +370,7 @@ impl EngineDriver {
             device_authority,
             batching: Arc::new(BatchingReport::pipeline()),
             is_workflow,
-            workflow_provenance,
+            workflow_shape,
         }
     }
 
@@ -452,15 +452,13 @@ impl EngineDriver {
         self.is_workflow
     }
 
-    /// How the runtime obtained the canonical workflow it executes.
+    /// The shape of the workflow this runtime executes.
     ///
-    /// Distinct from [`Self::is_workflow`] on purpose: that answers "does the
-    /// package serialize a workflow", this answers "where did the workflow the
-    /// runtime runs come from". A lowered decoder is `lowered` while
-    /// `is_workflow()` stays false, so no report claims the package contains
-    /// something it does not.
-    pub(crate) fn workflow_provenance(&self) -> &'static str {
-        self.workflow_provenance
+    /// Distinct from [`Self::is_workflow`] on purpose: that answers "which
+    /// executor drives the decoder step", this answers "what does the package's
+    /// workflow look like". Every loaded package has one.
+    pub(crate) fn workflow_shape(&self) -> &'static str {
+        self.workflow_shape
     }
 
     pub(crate) async fn generate(
@@ -2038,7 +2036,7 @@ mod admission_tests {
             .expect("fill command queue");
         let driver = EngineDriver {
             is_workflow: false,
-            workflow_provenance: "none",
+            workflow_shape: "none",
             commands,
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,

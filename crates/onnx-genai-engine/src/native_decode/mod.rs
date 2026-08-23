@@ -7,7 +7,7 @@ use crate::logits::{ProcessorChain, TokenId};
 use crate::pipeline::canonical_decode::{CanonicalDecodeRequest, run_canonical_decode};
 use crate::sampling::sample_greedy;
 use anyhow::{Context, bail};
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_genai_ort::Tokenizer;
 use onnx_runtime_ir::{DataType, DeviceType, Dim, SymbolId};
 use onnx_runtime_session::{
@@ -1220,7 +1220,7 @@ impl NativeDecodeSession {
 
     /// Run one target step with arbitrary named tensors supplied by pipeline
     /// routing. Generated roles (token ids, attention mask, and position ids)
-    /// come from `ModelIoSpec`; every other non-KV graph input is resolved by its
+    /// come from `DecoderAbi`; every other non-KV graph input is resolved by its
     /// exact graph port name from `step_inputs`.
     pub(crate) fn decode_with_step_inputs(
         &mut self,

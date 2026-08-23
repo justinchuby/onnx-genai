@@ -42,6 +42,7 @@ pub use batched::{
 };
 pub use connector_bridge::{ConnectorLookupOutcome, ConnectorStats};
 pub use embedding::{EmbeddingOptions, EmbeddingPooling};
+pub use engine::graph_port_contracts;
 pub use engine::{
     DecisionSource, DevicePolicy, DevicePolicyParseError, DryConfig, Eagle3Config, Engine,
     EngineConfig, EngineConfigError, EngineDecodeBackend, EngineGovernorError,
@@ -52,7 +53,7 @@ pub use engine::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PrioritizedGenerateRequest, PrioritizedGenerateResult, RewindTokenCount, SamplingOverrides,
     ScheduledGenerateArrival, SessionCheckpoint, SessionForkCapability, SessionId, SessionPosition,
-    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, WorkflowProvenance,
+    SpeculativeMode, TokenLogprob, WeightAccessPattern, WeightPlacementReport, WorkflowShapeReport,
     XtcConfig, parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};

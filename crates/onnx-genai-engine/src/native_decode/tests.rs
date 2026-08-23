@@ -2,7 +2,7 @@ use super::kv_commit::KvCommitLayout;
 use super::*;
 #[cfg(feature = "native-cuda")]
 use onnx_genai_metadata::LoopStatePair;
-use onnx_genai_metadata::{KvOwnership, ModelIoSpec, SequenceInputKind};
+use onnx_genai_metadata::{DecoderAbi, KvOwnership, SequenceInputKind};
 use onnx_runtime_ir::{Attribute, Graph, Node, NodeId, Shape, SymbolId, TensorData};
 use prost::Message;
 use std::collections::BTreeMap;
@@ -1508,8 +1508,8 @@ fn native_decoder_auto_derive_skips_dense_ambiguous_decoder() {
     assert!(error.to_string().contains("token_input"), "{error:#}");
 }
 
-fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
-    ModelIoSpec {
+fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
+    DecoderAbi {
         sequence_source: Some(sequence_source),
         kv_ownership: Some(KvOwnership::Owned),
         kv_layout: None,
@@ -1533,8 +1533,8 @@ fn target_io(sequence_source: SequenceInputKind) -> ModelIoSpec {
     }
 }
 
-fn tiny_decoder_io() -> ModelIoSpec {
-    ModelIoSpec {
+fn tiny_decoder_io() -> DecoderAbi {
+    DecoderAbi {
         sequence_source: Some(SequenceInputKind::TokenIds),
         kv_ownership: Some(KvOwnership::Owned),
         kv_layout: None,

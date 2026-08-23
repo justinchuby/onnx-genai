@@ -239,18 +239,50 @@ impl GenAiConfig {
         );
         insert_usize(&mut model, "vocab_size", self.model.vocab_size);
 
-        if shape == ModelShape::SingleDecoder {
-            let io = self.decoder_io_json(false, decoder_graph);
-            if !io.is_empty() {
-                model.insert("io".into(), Value::Object(io));
-            }
-        }
-
         let mut root = Map::new();
         root.insert("schema_version".into(), json!(SCHEMA_VERSION));
         root.insert("model".into(), Value::Object(model));
         if let Some(generation) = self.generation_json() {
             root.insert("generation".into(), generation);
+        }
+
+        // `genai_config.json` is a *foreign* producer's format, so importing it
+        // is a conversion, not a fallback: the result is stated in this project's
+        // one representation, `pipeline.workflow`. Emitting the retired
+        // `model.io` block here would reintroduce the second answer through the
+        // side door — the importer would be the only remaining producer of a
+        // shape nothing else can read.
+        let io = self.decoder_io_json(false, decoder_graph);
+        if !io.is_empty() {
+            let abi: onnx_genai_metadata::DecoderAbi = serde_json::from_value(Value::Object(io))?;
+            let workflow = onnx_genai_metadata::decoder_workflow::decoder_workflow(
+                &abi,
+                self.model
+                    .decoder
+                    .filename
+                    .as_deref()
+                    .unwrap_or("model.onnx"),
+                &onnx_genai_metadata::decoder_workflow::DecoderFacts {
+                    max_sequence_length: self.max_sequence_length(),
+                    // When the caller supplied the decoder's graph, state the
+                    // ports it actually has. Guessing a state tensor's rank
+                    // produces a contract the session validator rejects for
+                    // whichever package happens to disagree.
+                    port_contracts: decoder_graph
+                        .map(port_contracts_from_graph)
+                        .unwrap_or_default(),
+                },
+            )
+            .map_err(|error| {
+                incomplete(&format!(
+                    "this genai_config.json describes a decoder that cannot be stated as a \
+                 workflow: {error}"
+                ))
+            })?;
+            root.insert(
+                "pipeline".into(),
+                json!({ "workflow": serde_json::to_value(&workflow)? }),
+            );
         }
 
         Ok(serde_json::from_value(Value::Object(root))?)
@@ -654,7 +686,7 @@ impl GenAiConfig {
         })
     }
 
-    /// Best-effort auto-derived [`ModelIoSpec`] for a stock decoder export whose
+    /// Best-effort auto-derived [`DecoderAbi`] for a stock decoder export whose
     /// sidecar declares no `io` block, built purely from an ONNX graph's port
     /// inventory.
     ///
@@ -664,7 +696,7 @@ impl GenAiConfig {
     /// guarded [`derive_decoder_io_from_graph`](Self::derive_decoder_io_from_graph)
     /// classifier, applies the recurrent-hybrid safety gate (non-empty
     /// `state_pairs`), binds the conventional non-KV ports by name-presence in the
-    /// graph interface, and assembles the `ModelIoSpec`.
+    /// graph interface, and assembles the `DecoderAbi`.
     ///
     /// Returns `None` (leaving the caller's `io = None` shape-inference path
     /// untouched) unless the derivation yields at least one recurrent state pair —
@@ -672,8 +704,8 @@ impl GenAiConfig {
     /// (no state pairs) always return `None`.
     pub fn derive_model_io_spec_from_graph(
         graph: &ModelGraphInfo,
-    ) -> Option<onnx_genai_metadata::ModelIoSpec> {
-        use onnx_genai_metadata::{LoopStatePair, ModelIoSpec};
+    ) -> Option<onnx_genai_metadata::DecoderAbi> {
+        use onnx_genai_metadata::{DecoderAbi, LoopStatePair};
 
         let derived = Self::derive_decoder_io_from_graph(graph)?;
         // Safety gate: derive only when the graph actually yielded KV ports.
@@ -720,7 +752,7 @@ impl GenAiConfig {
         // an empty list, so downstream cannot read "declared, and empty" as
         // different from "not applicable".
         let state_pairs = (!state_pairs.is_empty()).then_some(state_pairs);
-        Some(ModelIoSpec {
+        Some(DecoderAbi {
             sequence_source: None,
             kv_ownership: None,
             kv_layout: None,
@@ -790,4 +822,29 @@ pub(crate) fn required_str<'a>(
     value
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| incomplete(field))
+}
+
+/// The dtype and rank of every port a decoder graph exposes.
+fn port_contracts_from_graph(
+    graph: &ModelGraphInfo,
+) -> std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract> {
+    graph
+        .inputs
+        .iter()
+        .chain(graph.outputs.iter())
+        .map(|tensor| {
+            (
+                tensor.name.clone(),
+                onnx_genai_metadata::TensorContract {
+                    dtype: tensor.dtype.clone(),
+                    rank: tensor.dimensions.len(),
+                    // The graph's own shape is authoritative; restating it here
+                    // would be a second place it could drift.
+                    shape: None,
+                    optional: false,
+                    batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+                },
+            )
+        })
+        .collect()
 }

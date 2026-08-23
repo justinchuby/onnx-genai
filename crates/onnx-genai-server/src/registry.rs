@@ -868,7 +868,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         EngineDriver {
             is_workflow: false,
-            workflow_provenance: "none",
+            workflow_shape: "none",
             commands: tx,
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,

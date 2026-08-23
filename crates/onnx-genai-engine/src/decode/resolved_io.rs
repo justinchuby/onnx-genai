@@ -162,7 +162,7 @@ fn resolve_state_pairs(
 ///
 fn resolve_position_program(
     session: &dyn GraphIo,
-    io: &onnx_genai_metadata::ModelIoSpec,
+    io: &onnx_genai_metadata::DecoderAbi,
     positions: Option<&PositionProgram>,
 ) -> anyhow::Result<Option<String>> {
     let Some(program) = positions else {
@@ -274,7 +274,7 @@ impl ResolvedIo {
     /// Resolve port bindings from explicit metadata or unambiguous tensor shape.
     pub(crate) fn resolve_with_positions(
         session: &dyn GraphIo,
-        io: Option<&onnx_genai_metadata::ModelIoSpec>,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         match io {
@@ -340,7 +340,7 @@ impl ResolvedIo {
 
     fn from_spec(
         session: &dyn GraphIo,
-        io: &onnx_genai_metadata::ModelIoSpec,
+        io: &onnx_genai_metadata::DecoderAbi,
         positions: Option<&PositionProgram>,
     ) -> anyhow::Result<Self> {
         let has_input = |name: &str| session.inputs().iter().any(|info| info.name == name);

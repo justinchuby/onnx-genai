@@ -106,6 +106,14 @@ enum BodyStep {
 /// contract this runtime does not implement, or a body that never applies a
 /// policy, and execution fails here instead of quietly doing something else.
 fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<Vec<BodyStep>> {
+    // The decoder is recognized structurally — the sole component consuming the
+    // autoregressive sequence and producing logits — so no component name, model
+    // name, or bespoke contract decides what runs. A package renames its
+    // component freely and this still works.
+    let decoder = onnx_genai_metadata::sole_decoder_component(workflow).context(
+        "this workflow presents no single decoder component, so it is not a single-row \
+         autoregressive package and must be executed by the generic interpreter",
+    )?;
     let loop_body = workflow
         .steps
         .iter()
@@ -114,29 +122,31 @@ fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<
             _ => None,
         })
         .context(
-            "the canonical workflow declares no loop; an autoregressive decoder's token stream \
+            "the workflow declares no loop; an autoregressive decoder's token stream \
              is a loop by construction",
         )?;
     let mut body = Vec::with_capacity(loop_body.len());
     for step in loop_body {
         match step {
+            WorkflowStep::Invoke { component, .. } if component == decoder => {
+                body.push(BodyStep::Decode)
+            }
             WorkflowStep::Invoke { component, .. } => {
                 let declaration = workflow.components.get(component).with_context(|| {
-                    format!("canonical loop invokes undeclared component '{component}'")
+                    format!("the loop invokes undeclared component '{component}'")
                 })?;
                 let contract = declaration.contract.as_ref().with_context(|| {
                     format!(
-                        "canonical component '{component}' declares no contract, so this runtime \
-                         cannot tell what it is asked to execute"
+                        "component '{component}' is neither the decoder nor declares a contract, \
+                         so this runtime cannot tell what it is asked to execute"
                     )
                 })?;
                 match contract.id.as_str() {
-                    onnx_genai_metadata::AUTOREGRESSIVE_DECODE_CONTRACT => {
-                        body.push(BodyStep::Decode)
+                    onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT => {
+                        body.push(BodyStep::TokenPolicy)
                     }
-                    onnx_genai_metadata::TOKEN_POLICY_CONTRACT => body.push(BodyStep::TokenPolicy),
                     other => anyhow::bail!(
-                        "canonical loop invokes component '{component}' with contract '{other}', \
+                        "the loop invokes component '{component}' with contract '{other}', \
                          which this runtime does not implement"
                     ),
                 }
@@ -144,7 +154,7 @@ fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<
             WorkflowStep::Emit { output, .. } => {
                 anyhow::ensure!(
                     workflow.outputs.contains_key(output),
-                    "the canonical loop emits into '{output}', which the workflow does not \
+                    "the loop emits into '{output}', which the workflow does not \
                      declare as an output"
                 );
                 body.push(BodyStep::Emit {
@@ -152,7 +162,7 @@ fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<
                 })
             }
             other => anyhow::bail!(
-                "the canonical loop body may only invoke components and emit; found {other:?}"
+                "the generation loop body may only invoke components and emit; found {other:?}"
             ),
         }
     }
@@ -168,11 +178,12 @@ fn resolve_body(workflow: &onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<
     anyhow::ensure!(
         body.iter().any(|step| matches!(
             step,
-            BodyStep::Emit { output } if output == onnx_genai_metadata::TOKENS_OUTPUT
+            BodyStep::Emit { output }
+                if output == onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT
         )),
         "the canonical loop body never emits '{}', so it would decode without producing the \
          token stream the caller reads",
-        onnx_genai_metadata::TOKENS_OUTPUT
+        onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT
     );
     Ok(body)
 }
@@ -334,31 +345,12 @@ pub(crate) fn run_canonical_decode<B: DecodeLoopBackend + ?Sized>(
 pub(crate) fn assert_canonical_contracts(
     workflow: &onnx_genai_metadata::WorkflowSpec,
 ) -> anyhow::Result<()> {
-    for (component, expected) in [
-        (
-            onnx_genai_metadata::DECODER_COMPONENT,
-            onnx_genai_metadata::AUTOREGRESSIVE_DECODE_CONTRACT,
-        ),
-        (
-            onnx_genai_metadata::POLICY_COMPONENT,
-            onnx_genai_metadata::TOKEN_POLICY_CONTRACT,
-        ),
-    ] {
-        let declared = workflow
-            .components
-            .get(component)
-            .with_context(|| format!("the canonical workflow declares no '{component}' component"))?
-            .contract
-            .as_ref()
-            .with_context(|| format!("canonical component '{component}' declares no contract"))?;
-        anyhow::ensure!(
-            declared.id == expected,
-            "canonical component '{component}' declares contract '{}', but this runtime \
-             implements '{expected}'",
-            declared.id
-        );
-    }
-    Ok(())
+    // Resolving the body *is* the check: it recognizes the decoder structurally,
+    // requires a token policy this runtime implements, and requires the loop to
+    // emit the token stream a caller reads. Anything a separate assertion could
+    // add here would be a second, weaker statement of the same rule that could
+    // drift from the one execution actually uses.
+    resolve_body(workflow).map(|_| ())
 }
 
 /// The canonical workflow a test double stands in for.
@@ -369,10 +361,19 @@ pub(crate) fn assert_canonical_contracts(
 /// keeps the double honest instead of weakening the guard for everyone.
 #[cfg(test)]
 pub(crate) fn test_canonical_workflow() -> onnx_genai_metadata::WorkflowSpec {
-    let io: onnx_genai_metadata::ModelIoSpec =
-        serde_yaml::from_str("token_input: input_ids\nlogits_output: logits\n")
-            .expect("minimal decoder ABI");
-    onnx_genai_metadata::lower_decoder_abi(&io).expect("minimal decoder lowers")
+    let abi = onnx_genai_metadata::DecoderAbi {
+        token_input: Some("input_ids".to_string()),
+        logits_output: Some("logits".to_string()),
+        kv_inputs: Some(vec!["past.key".to_string(), "past.value".to_string()]),
+        kv_outputs: Some(vec!["present.key".to_string(), "present.value".to_string()]),
+        ..onnx_genai_metadata::DecoderAbi::default()
+    };
+    onnx_genai_metadata::decoder_workflow::decoder_workflow(
+        &abi,
+        "model.onnx",
+        &onnx_genai_metadata::decoder_workflow::DecoderFacts::default(),
+    )
+    .expect("a minimal decoder is expressible as a workflow")
 }
 
 #[cfg(test)]
@@ -432,7 +433,7 @@ mod tests {
                     !matches!(
                         step,
                         WorkflowStep::Invoke { component, .. }
-                            if component == onnx_genai_metadata::DECODER_COMPONENT
+                            if component == onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT
                     )
                 });
             },
@@ -448,7 +449,7 @@ mod tests {
                     !matches!(
                         step,
                         WorkflowStep::Invoke { component, .. }
-                            if component == onnx_genai_metadata::POLICY_COMPONENT
+                            if component == onnx_genai_metadata::decoder_workflow::POLICY_COMPONENT
                     )
                 });
             },
@@ -480,13 +481,15 @@ mod tests {
         );
     }
 
+    /// The decoder is recognized structurally, but every *other* component in
+    /// the loop must name a contract this runtime implements.
     #[test]
     fn an_unimplemented_contract_is_refused() {
         refuses(
             |workflow| {
                 if let Some(component) = workflow
                     .components
-                    .get_mut(onnx_genai_metadata::DECODER_COMPONENT)
+                    .get_mut(onnx_genai_metadata::decoder_workflow::POLICY_COMPONENT)
                     && let Some(contract) = component.contract.as_mut()
                 {
                     contract.id = "vendor.some-other-thing".to_string();

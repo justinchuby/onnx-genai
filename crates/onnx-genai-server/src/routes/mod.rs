@@ -154,7 +154,7 @@ pub(crate) struct DebugConfigResponse {
     ///
     /// Deliberately unchanged in meaning: it answers a question about the file
     /// on disk. A decoder package whose workflow the runtime compiled in memory
-    /// reports `false` here and says so through `workflow_provenance`, because
+    /// reports `false` here and says so through `workflow_shape`, because
     /// claiming otherwise would assert the package contains something it does
     /// not.
     pipeline: bool,
@@ -162,7 +162,7 @@ pub(crate) struct DebugConfigResponse {
     /// `authored` (serialized in the package), `lowered` (compiled in memory
     /// from the package's own `model.io`, which remains the sole serialized
     /// answer), or `none`.
-    workflow_provenance: &'static str,
+    workflow_shape: &'static str,
     max_output_tokens: usize,
     max_sessions: usize,
     max_queue_depth: usize,

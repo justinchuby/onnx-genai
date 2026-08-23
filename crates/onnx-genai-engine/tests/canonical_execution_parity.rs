@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use onnx_genai_engine::{
     Engine, EngineConfig, FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest,
-    WorkflowProvenance,
+    WorkflowShapeReport,
 };
 
 fn decoder_package() -> PathBuf {
@@ -45,33 +45,33 @@ fn greedy(tokens: usize) -> GenerateRequest {
     }
 }
 
-/// A bare decoder is lowered at load, and says so.
+/// A single decoder is an ordinary workflow package, declared on disk.
 ///
-/// The package still declares `model.io` alone — nothing is serialized back —
-/// so `is_workflow()` stays false while the provenance reports `lowered`.
+/// Nothing is synthesized at load: the workflow the runtime executes is the one
+/// the package ships, and the decode ABI the fast path binds is *derived from
+/// that workflow* rather than from a second serialized block.
 #[test]
-fn a_bare_decoder_is_lowered_at_load() -> anyhow::Result<()> {
+fn a_single_decoder_is_an_authored_workflow() -> anyhow::Result<()> {
     let engine = engine()?;
-    assert!(
-        !engine.is_workflow(),
-        "a bare decoder must not claim to serialize a workflow"
-    );
-    assert_eq!(engine.workflow_provenance(), WorkflowProvenance::Lowered);
+    assert_eq!(engine.workflow_shape(), WorkflowShapeReport::SingleDecoder);
 
-    let workflow = engine.canonical_workflow()?;
-    assert!(
-        workflow
-            .components
-            .contains_key(onnx_genai_metadata::DECODER_COMPONENT)
+    let workflow = engine
+        .package_workflow()
+        .expect("a loaded package always declares a workflow");
+    // Recognized structurally — the component that consumes the sequence and
+    // produces logits — not by name.
+    assert_eq!(
+        onnx_genai_metadata::sole_decoder_component(workflow),
+        Some(onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT)
     );
     assert!(
         workflow
             .components
-            .contains_key(onnx_genai_metadata::POLICY_COMPONENT)
+            .contains_key(onnx_genai_metadata::decoder_workflow::POLICY_COMPONENT)
     );
-    // The package on disk is untouched: `model.io` remains its sole serialized
-    // answer, which is what keeps it valid under the existing rule.
-    assert!(engine.metadata().pipeline.is_none());
+    // The serialized document is the workflow, and there is no second place the
+    // graph ABI could be stated.
+    assert!(engine.metadata().pipeline.is_some());
     assert!(engine.metadata().decoder_io().is_some());
     Ok(())
 }
@@ -236,9 +236,10 @@ fn the_legacy_direct_decode_path_cannot_be_selected() -> anyhow::Result<()> {
         )?,
     ] {
         assert_eq!(
-            engine.workflow_provenance(),
-            WorkflowProvenance::Lowered,
-            "a decoder package must always load lowered; no constructor may skip it"
+            engine.workflow_shape(),
+            WorkflowShapeReport::SingleDecoder,
+            "a decoder package must always present its declared workflow; no constructor \
+             may skip it"
         );
     }
 
@@ -296,16 +297,11 @@ fn the_legacy_direct_decode_path_cannot_be_selected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An authored workflow package is executed as authored, never lowered beside
-/// its own workflow.
+/// A composite workflow package is driven by the generic interpreter.
 #[test]
-fn an_authored_workflow_is_executed_as_authored() -> anyhow::Result<()> {
+fn a_composite_workflow_is_executed_by_the_interpreter() -> anyhow::Result<()> {
     let engine = Engine::from_dir(&workflow_package(), EngineConfig::default())?;
-    assert_eq!(engine.workflow_provenance(), WorkflowProvenance::Authored);
+    assert_eq!(engine.workflow_shape(), WorkflowShapeReport::Composite);
     assert!(engine.is_workflow());
-    assert!(
-        engine.canonical_workflow().is_err(),
-        "an authored workflow must not also be lowered"
-    );
     Ok(())
 }

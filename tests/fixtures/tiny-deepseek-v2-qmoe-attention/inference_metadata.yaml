@@ -1,3 +1,9 @@
+# Canonical single-decoder package.
+#
+# The graph ABI is declared where every package declares it: the workflow's
+# component ports and roles, and the state_service group that owns the KV
+# cache. A single decoder is not a special package shape — it is a workflow
+# with one ONNX component and one runtime-bound token policy.
 required_capabilities:
 - kv_cache
 - multi_head_attention
@@ -8,14 +14,466 @@ model:
     num_kv_heads: 2
     head_dim: 8
   max_sequence_length: 16
-  io:
-    token_input: input_ids
-    attention_mask_input: attention_mask
-    position_ids_input: position_ids
-    logits_output: logits
-    kv_inputs:
-      - past_key_values.0.key
-      - past_key_values.0.value
-    kv_outputs:
-      - present.0.key
-      - present.0.value
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: {}
+      capabilities:
+      - linear_effects
+      - loop_induction_values
+      - nested_control_flow
+      - serving_service_contract
+      - streaming_emit
+      - typed_emit
+      - workflow_ssa
+    inputs:
+      application.attention_mask:
+        contract:
+          dtype: int64
+          rank: 2
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: attention_mask
+        required: true
+        externally_suppliable: true
+      application.position_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: application
+          name: position_ids
+        required: true
+        externally_suppliable: true
+      package.accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0
+      package.active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: true
+      package.done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: false
+      package.state_seed:
+        contract:
+          dtype: float32
+          rank: 4
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: opaque
+        source:
+          kind: literal
+        required: false
+        default: 0.0
+      request.input_ids:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role:
+          kind: runtime
+          version: '1.0'
+          role: prompt_tokens
+        source:
+          kind: request
+        required: true
+      request.max_iterations:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+          optional: false
+        role:
+          kind: runtime
+          version: '1.0'
+          role: max_iterations
+        source:
+          kind: request
+        required: false
+        default: 16
+    outputs:
+      tokens:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        role: tokens
+        stage: pre_adapter
+    components:
+      decoder:
+        implementation:
+          kind: onnx
+          artifact: model.onnx.textproto
+        ports:
+          inputs:
+            attention_mask:
+              dtype: int64
+              rank: 2
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            input_ids:
+              dtype: int64
+              rank: 2
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.key:
+              dtype: float32
+              rank: 4
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            past_key_values.0.value:
+              dtype: float32
+              rank: 4
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            position_ids:
+              dtype: int64
+              rank: 2
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            logits:
+              dtype: float32
+              rank: 3
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.0.key:
+              dtype: float32
+              rank: 4
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            present.0.value:
+              dtype: float32
+              rank: 4
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          roles:
+            attention_mask: attention_mask
+            input_ids: token_ids
+            logits: logits
+            position_ids: position_ids
+        application_overridable: false
+        effects: []
+      token_policy:
+        implementation:
+          kind: binding
+        ports:
+          inputs:
+            logits:
+              dtype: float32
+              rank: 3
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+          outputs:
+            accepted_len:
+              dtype: int64
+              rank: 1
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            active:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            done:
+              dtype: bool
+              rank: 1
+              shape:
+              - batch
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+            token:
+              dtype: int64
+              rank: 2
+              shape:
+              - batch
+              - sequence
+              optional: false
+              batch_layout:
+                kind: request_aligned
+                axis: 0
+        contract:
+          id: onnx-genai.token-policy
+          version: '1.0'
+          equivalence: semantic
+          bindings: {}
+          parameters: {}
+        application_overridable: false
+        effects: []
+    state:
+      accepted_len:
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.accepted_len
+        recurrence:
+          kind: invariant
+        management: workflow
+      active:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.active
+        recurrence:
+          kind: invariant
+        management: workflow
+      decoder_kv.0000:
+        contract:
+          dtype: float32
+          rank: 4
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      decoder_kv.0001:
+        contract:
+          dtype: float32
+          rank: 4
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.state_seed
+        recurrence:
+          kind: invariant
+        management: runtime
+        release_boundary: invocation
+        service_group: decoder_kv
+      done:
+        contract:
+          dtype: bool
+          rank: 1
+          shape:
+          - batch
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: package.done
+        recurrence:
+          kind: invariant
+        management: workflow
+      sequence:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - sequence
+          optional: false
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: invocation
+        initializer: request.input_ids
+        recurrence:
+          kind: invariant
+        management: workflow
+    effects: {}
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          decoder_kv:
+            kind: full_attention
+            sequence_axis: 2
+            layout: head_major_bnsh
+            aliasing: forbidden
+            reuse:
+              prefix_reusable: true
+              evictable_prefix: true
+            capabilities:
+              snapshot: true
+              fork: true
+            ports:
+              decoder:
+                decoder_kv.0000:
+                  input: past_key_values.0.key
+                  output: present.0.key
+                  role: key
+                  layer: 0
+                decoder_kv.0001:
+                  input: past_key_values.0.value
+                  output: present.0.value
+                  role: value
+                  layer: 0
+    steps:
+    - kind: loop
+      setup: []
+      steps:
+      - kind: invoke
+        component: decoder
+        inputs:
+          attention_mask: application.attention_mask
+          input_ids: request.input_ids
+          past_key_values.0.key: decoder_kv.0000
+          past_key_values.0.value: decoder_kv.0001
+          position_ids: application.position_ids
+        outputs:
+          logits: step.logits
+          present.0.key: body.decoder_kv.0000
+          present.0.value: body.decoder_kv.0001
+      - kind: invoke
+        component: token_policy
+        inputs:
+          logits: step.logits
+        outputs:
+          accepted_len: body.accepted_len
+          active: body.active
+          done: body.done
+          token: step.token
+      - kind: emit
+        value: step.token
+        when: active
+        output: tokens
+        mode: append
+      continue_when: active
+      max_iterations: request.max_iterations
+      termination: generation_eos
+      iteration:
+        value: loop.iteration
+        contract:
+          dtype: int64
+          rank: 1
+          shape:
+          - 1
+          optional: false
+      carried:
+      - cell: decoder_kv.0000
+        next: body.decoder_kv.0000
+      - cell: decoder_kv.0001
+        next: body.decoder_kv.0001
+      - cell: active
+        next: body.active
+      - cell: done
+        next: body.done
+      - cell: accepted_len
+        next: body.accepted_len
+      - cell: sequence
+        next: step.token
