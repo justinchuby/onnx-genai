@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node {
     output: "query"
@@ -46,15 +46,23 @@ graph {
     }
   }
   node {
+    output: "reduce_axes"
+    op_type: "Constant"
+    attribute {
+      name: "value"
+      t {
+        dims: 2
+        data_type: 7
+        raw_data: "\000\000\000\000\000\000\000\000\001\000\000\000\000\000\000\000"
+      }
+      type: TENSOR
+    }
+  }
+  node {
     input: "attention_mask"
+    input: "reduce_axes"
     output: "total_i64"
     op_type: "ReduceSum"
-    attribute {
-      name: "axes"
-      ints: 0
-      ints: 1
-      type: INTS
-    }
     attribute {
       name: "keepdims"
       i: 0
@@ -336,6 +344,19 @@ graph {
     }
   }
   value_info {
+    name: "reduce_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
     name: "total_i64"
     type {
       tensor_type {
@@ -388,7 +409,7 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 11
+  version: 24
 }
 opset_import {
   domain: "com.microsoft"

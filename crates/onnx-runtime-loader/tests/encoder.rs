@@ -577,6 +577,21 @@ fn uint8_opaque_initializer_round_trips_byte_exact() {
 fn empty_graph_round_trips() {
     let graph = Graph::new();
     let bytes = encode_model(&Model::new(&graph)).expect("encode empty");
+    // Model::new with no metadata and no opset import must stamp the loader
+    // defaults: IR 11 and a single default (ai.onnx) opset 24 (the fallback).
+    let proto = onnx::ModelProto::decode(&bytes[..]).expect("decode proto");
+    assert_eq!(proto.ir_version, 11, "Model::new stamps DEFAULT_IR_VERSION");
+    let defaults: Vec<i64> = proto
+        .opset_import
+        .iter()
+        .filter(|o| o.domain.is_empty() || o.domain == "ai.onnx")
+        .map(|o| o.version)
+        .collect();
+    assert_eq!(
+        defaults,
+        vec![24],
+        "empty-opset graph gets a single default opset 24"
+    );
     let (graph2, _store2) = load_model_bytes_with_weights(&bytes, ".").expect("decode empty");
     assert_eq!(graph2.num_nodes(), 0);
     assert!(graph2.initializers.is_empty());

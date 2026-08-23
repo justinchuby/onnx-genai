@@ -106,6 +106,9 @@ def _build_vocoder(path: Path, *, dual_output: bool) -> None:
     amplitude0 = constant("amplitude0", np.array(0.5, dtype=np.float32))
     amplitude1 = constant("amplitude1", np.array(0.4, dtype=np.float32))
     unsqueeze_axes = constant("unsqueeze_axes", np.array([2], dtype=np.int64))
+    # ReduceMean moved `axes` from an attribute to an input in opset 18, so the
+    # reduced axis is supplied as an int64 tensor input (opset-24 schema).
+    reducemean_axes = constant("reducemean_axes", np.array([1], dtype=np.int64))
 
     # Reduce the prompt tokens to a per-row scalar so the emitted waveform is a
     # deterministic, bounded function of the request.
@@ -117,9 +120,9 @@ def _build_vocoder(path: Path, *, dual_output: bool) -> None:
     )
     mean = node(
         "ReduceMean",
-        [tokens_f.outputs[0]],
+        [tokens_f.outputs[0], reducemean_axes.outputs[0]],
         "mean",
-        attributes=[ir.AttrInt64s("axes", [1]), ir.AttrInt64("keepdims", 1)],
+        attributes=[ir.AttrInt64("keepdims", 1)],
     )
     mean_scaled = node("Mul", [mean.outputs[0], mean_scale.outputs[0]], "mean_scaled")
     # [batch, 1] -> [batch, 1, 1] so it broadcasts across the sample axis.
@@ -156,6 +159,7 @@ def _build_vocoder(path: Path, *, dual_output: bool) -> None:
         amplitude0,
         amplitude1,
         unsqueeze_axes,
+        reducemean_axes,
         tokens_f,
         mean,
         mean_scaled,
@@ -185,11 +189,11 @@ def _build_vocoder(path: Path, *, dual_output: bool) -> None:
         [prompt_tokens],
         outputs,
         nodes=nodes,
-        opset_imports={"": 13},
+        opset_imports={"": 24},
         name="tiny_speech_wav_vocoder",
     )
     save_model(
-        ir.Model(graph, ir_version=8, producer_name="onnx-genai tiny-speech-wav fixture"),
+        ir.Model(graph, ir_version=11, producer_name="onnx-genai tiny-speech-wav fixture"),
         path,
     )
 

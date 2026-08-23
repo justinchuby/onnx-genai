@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node: [
     { input: ["X", "Y"] output: ["S"] op_type: "Add" },
@@ -40,5 +40,5 @@ graph {
   ]
 }
 opset_import: [{
-  version: 22
+  version: 24
 }]

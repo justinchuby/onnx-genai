@@ -1,7 +1,7 @@
 {
   "model": "model.onnx.textproto",
   "provider": "CPUExecutionProvider",
-  "onnxruntime_version": "1.27.0",
+  "onnxruntime_version": "1.28.0",
   "batch": 1,
   "seq": 8,
   "inputs": [

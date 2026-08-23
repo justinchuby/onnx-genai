@@ -57,7 +57,8 @@ pub mod writer;
 mod pathsafe;
 
 pub use encoder::{
-    DEFAULT_IR_VERSION, Model, ModelMetadata, encode_model, encode_model_proto, write_model,
+    DEFAULT_IR_VERSION, DEFAULT_OPSET_VERSION, Model, ModelMetadata, encode_model,
+    encode_model_proto, write_model,
 };
 pub use epcontext::{
     EmbedMode, EpContextBlob, EpContextNode, ep_context_node_ids, ep_context_nodes,

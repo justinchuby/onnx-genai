@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! <
-//!   ir_version: 10,
+//!   ir_version: 11,
 //!   opset_import: ["" : 21]
 //! >
 //! main (float[2, 3] X, float[2, 3] Y) => (float[2, 3] Z) {
@@ -401,7 +401,7 @@ mod tests {
     #[test]
     fn dumps_header_signature_and_node() {
         let text = to_text(&add_model());
-        assert!(text.contains("ir_version: 10"), "header:\n{text}");
+        assert!(text.contains("ir_version: 11"), "header:\n{text}");
         assert!(text.contains("opset_import: [\"\" : 21]"), "opset:\n{text}");
         assert!(
             text.contains("main (float[2, 3] X, float[2, 3] Y) => (float[2, 3] Z)"),

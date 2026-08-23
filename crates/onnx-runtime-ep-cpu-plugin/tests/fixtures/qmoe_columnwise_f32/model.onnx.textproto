@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node {
     input: "input"
@@ -491,7 +491,7 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 17
+  version: 24
 }
 opset_import {
   domain: "com.microsoft"

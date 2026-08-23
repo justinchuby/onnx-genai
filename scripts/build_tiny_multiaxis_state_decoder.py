@@ -50,10 +50,10 @@ def build_embedding(path: Path) -> None:
         [embeds.outputs[0]],
         nodes=[embeds],
         initializers=[table],
-        opset_imports={"": 12},
+        opset_imports={"": 24},
         name="tiny_position_state_embedding",
     )
-    save(ir.Model(graph, ir_version=8, producer_name="onnx-genai WP4 fixture"), path)
+    save(ir.Model(graph, ir_version=11, producer_name="onnx-genai WP4 fixture"), path)
 
 
 def build_decoder(path: Path) -> None:
@@ -84,11 +84,19 @@ def build_decoder(path: Path) -> None:
         )
 
     nodes: list[ir.Node] = []
+    # ReduceSum/Unsqueeze moved `axes` from an attribute to an input in opset 13,
+    # so the reduced/expanded axes are supplied as int64 tensor inputs (opset-24
+    # schema). These initializers are shared across the nodes that reduce over the
+    # same axes.
+    axes_0 = initializer("reduce_axes_0", np.array([0], dtype=np.int64))
+    axes_01 = initializer("reduce_axes_01", np.array([0, 1], dtype=np.int64))
+    axes_012 = initializer("reduce_axes_012", np.array([0, 1, 2], dtype=np.int64))
+    unsqueeze_axes_13 = initializer("unsqueeze_axes_13", np.array([1, 3], dtype=np.int64))
     pos_sum = node(
         "ReduceSum",
-        [position_ids],
+        [position_ids, axes_0],
         "position_sum_i64",
-        attributes=[ir.AttrInt64s("axes", [0]), ir.AttrInt64("keepdims", 0)],
+        attributes=[ir.AttrInt64("keepdims", 0)],
     )
     pos_float = node(
         "Cast",
@@ -98,16 +106,15 @@ def build_decoder(path: Path) -> None:
     )
     state_a_sum = node(
         "ReduceSum",
-        [state_a],
+        [state_a, axes_01],
         "state_a_sum",
-        attributes=[ir.AttrInt64s("axes", [0, 1]), ir.AttrInt64("keepdims", 0)],
+        attributes=[ir.AttrInt64("keepdims", 0)],
     )
     state_b_sum = node(
         "ReduceSum",
-        [state_b],
+        [state_b, axes_012],
         "state_b_sum",
         attributes=[
-            ir.AttrInt64s("axes", [0, 1, 2]),
             ir.AttrInt64("keepdims", 0),
         ],
     )
@@ -119,10 +126,9 @@ def build_decoder(path: Path) -> None:
     zero = initializer("zero", np.array(0.0, dtype=np.float32))
     routed_sum = node(
         "ReduceSum",
-        [routed],
+        [routed, axes_012],
         "routed_sum",
         attributes=[
-            ir.AttrInt64s("axes", [0, 1, 2]),
             ir.AttrInt64("keepdims", 0),
         ],
     )
@@ -136,9 +142,9 @@ def build_decoder(path: Path) -> None:
     token_zero = node("Mul", [token_float.outputs[0], zero], "token_zero")
     mask_sum = node(
         "ReduceSum",
-        [attention_mask],
+        [attention_mask, axes_01],
         "mask_sum_i64",
-        attributes=[ir.AttrInt64s("axes", [0, 1]), ir.AttrInt64("keepdims", 0)],
+        attributes=[ir.AttrInt64("keepdims", 0)],
     )
     mask_float = node(
         "Cast",
@@ -205,9 +211,8 @@ def build_decoder(path: Path) -> None:
 
     current = node(
         "Unsqueeze",
-        [token_float.outputs[0]],
+        [token_float.outputs[0], unsqueeze_axes_13],
         "current_kv",
-        attributes=[ir.AttrInt64s("axes", [1, 3])],
     )
     nodes.append(current)
     present_outputs: list[ir.Value] = []
@@ -257,11 +262,22 @@ def build_decoder(path: Path) -> None:
             state_b_out.outputs[0],
         ],
         nodes=nodes,
-        initializers=[zero, depth, one_hot_values, one, two, *value_offsets],
-        opset_imports={"": 12},
+        initializers=[
+            zero,
+            depth,
+            one_hot_values,
+            one,
+            two,
+            axes_0,
+            axes_01,
+            axes_012,
+            unsqueeze_axes_13,
+            *value_offsets,
+        ],
+        opset_imports={"": 24},
         name="tiny_multiaxis_state_decoder",
     )
-    save(ir.Model(graph, ir_version=8, producer_name="onnx-genai WP4 fixture"), path)
+    save(ir.Model(graph, ir_version=11, producer_name="onnx-genai WP4 fixture"), path)
 
 
 def write_tokenizer(path: Path) -> None:

@@ -1,4 +1,4 @@
-ir_version: 8
+ir_version: 11
 producer_name: "onnx-genai-regression"
 graph {
   node {
@@ -108,15 +108,10 @@ graph {
   }
   node {
     input: "mask_f32"
+    input: "kv_unsqueeze_axes"
     output: "current_kv"
     name: "kv_unsqueeze"
     op_type: "Unsqueeze"
-    attribute {
-      name: "axes"
-      ints: 1
-      ints: 3
-      type: INTS
-    }
   }
   node {
     input: "current_kv"
@@ -178,6 +173,12 @@ graph {
     float_data: 0.0
     float_data: 1.0
     name: "logit_bias"
+  }
+  initializer {
+    dims: 2
+    data_type: 7
+    name: "kv_unsqueeze_axes"
+    raw_data: "\001\000\000\000\000\000\000\000\003\000\000\000\000\000\000\000"
   }
   input {
     name: "input_ids"
@@ -364,6 +365,19 @@ graph {
     }
   }
   value_info {
+    name: "kv_unsqueeze_axes"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+            dim_value: 2
+          }
+        }
+      }
+    }
+  }
+  value_info {
     name: "input_ids_f32"
     type {
       tensor_type {
@@ -452,7 +466,7 @@ graph {
 }
 opset_import {
   domain: ""
-  version: 11
+  version: 24
 }
 opset_import {
   domain: "pkg.nxrt"

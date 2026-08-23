@@ -1,4 +1,4 @@
-ir_version: 10
+ir_version: 11
 graph {
   node: [
     { input: ["X"] output: ["Z"] op_type: "Softplus" }
@@ -28,5 +28,5 @@ graph {
   ]
 }
 opset_import: [{
-  version: 22
+  version: 24
 }]

@@ -63,8 +63,14 @@ use crate::proto::onnx::{
 use crate::weights::WeightStore;
 
 /// Default ONNX `ir_version` stamped when [`ModelMetadata`] does not override it
-/// (IR version 10, the version paired with opset 21).
-pub const DEFAULT_IR_VERSION: i64 = 10;
+/// (IR version 11, matching the maintained-fixture floor enforced by
+/// `onnx-std`'s `fixture_ir_opset_guard` and paired with default opset 24).
+pub const DEFAULT_IR_VERSION: i64 = 11;
+
+/// Default `ai.onnx` opset stamped for a graph that declares no default-domain
+/// opset import (IR >= 3 requires one). Kept in lock-step with
+/// [`DEFAULT_IR_VERSION`] and the maintained-fixture opset floor (24).
+pub const DEFAULT_OPSET_VERSION: i64 = 24;
 
 /// Model-level metadata that the IR [`Graph`] does not itself carry.
 ///
@@ -231,7 +237,7 @@ pub fn encode_model_proto(model: &Model) -> Result<ModelProto, LoaderError> {
         // IR >= 3 requires a default-domain import even for an empty graph.
         opset_import.push(OperatorSetIdProto {
             domain: String::new(),
-            version: 21,
+            version: DEFAULT_OPSET_VERSION,
         });
     }
     opset_import.sort_by(|a, b| a.domain.cmp(&b.domain));
