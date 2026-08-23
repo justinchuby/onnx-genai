@@ -259,9 +259,26 @@ pub struct SpmdCounters {
     /// consistent: fine for a threshold or a rate, not for an exact assertion
     /// taken immediately after the wake.
     pub spurious_wakes: u64,
-    /// Barriers where the dispatcher exhausted its spin budget waiting for a
-    /// straggler and yielded the core. Only reachable when a worker is
-    /// descheduled, so this is a direct oversubscription signal.
+    /// Barriers where the dispatcher exhausted its spin budget waiting for the
+    /// workers and yielded the core.
+    ///
+    /// **Strongly width- and regime-dependent; not an oversubscription signal.**
+    /// The dispatcher publishes the op, computes its own shard when it has one,
+    /// and only then spins on the completion counters, yielding once after
+    /// `DISPATCHER_SPIN_BEFORE_YIELD` (~10 us). So a yield means the *last*
+    /// worker lagged the dispatcher's own arrival at the barrier by more than
+    /// that -- a statement about spread across workers, not about how long the
+    /// op takes. Measured on an idle, un-oversubscribed host at zero gap:
+    /// 0.004 yields per dispatch at width 4, ~0.9 at width 16, with the
+    /// intervening widths non-monotonic. Read it as a straggler-spread
+    /// indicator, and only ever against a fixed width.
+    ///
+    /// (Two earlier versions of this doc were wrong in opposite directions --
+    /// first "only reachable when a worker is descheduled", then "any op longer
+    /// than the spin budget yields, so it saturates at 1.0/dispatch". Both were
+    /// reasoned from the code; the first was falsified by measuring at width 16
+    /// and the second by measuring at width 4. Neither had been measured across
+    /// the axis that actually moves it.)
     pub dispatcher_yields: u64,
 }
 
@@ -1618,6 +1635,26 @@ pub fn counters() -> Option<SpmdCounters> {
         Some(Some(pools)) => Some(pools.counters()),
         _ => None,
     }
+}
+
+/// The active-spin window a decode worker holds a core before parking, as the
+/// running process resolved it.
+///
+/// `decode_blocktime` latches into a `OnceLock` on the first `worker_wait`, so
+/// a sweep over `ONNX_GENAI_CPU_DECODE_BLOCKTIME_US` has to be *across process
+/// launches*; setting the variable a second time inside one process changes
+/// nothing and the two arms silently measure the same window (#1736's shape). A
+/// harness therefore has to report the window it actually ran with, and it has
+/// to read it from here rather than re-parse the environment itself -- a second
+/// parser is a second implementation that can drift from the one the workers
+/// obey, and would keep printing the requested value after the real policy
+/// changed.
+///
+/// Reading this *does* latch the window if nothing has yet, which is harmless
+/// (the value is a pure function of the environment) but means a harness should
+/// still call it at report time, after the decode it describes.
+pub fn blocktime() -> Duration {
+    decode_blocktime()
 }
 
 /// The width the caller asked for, recorded when the pool is resolved and before
@@ -3215,6 +3252,11 @@ mod tests {
     const BUDGET_LANE_MARKER: &str = "BUDGET_LANE_RESULT=";
     const BUDGET_LANE_SKIP_MARKER: &str = "BUDGET_LANE_SKIP=";
 
+    /// Total attempts for a single lane child before surfacing a failure. One
+    /// nominal attempt plus two retries: the environmental crash is rare, so a
+    /// small bound rides through it without masking a persistent problem.
+    const BUDGET_LANE_CHILD_MAX_ATTEMPTS: u32 = 3;
+
     /// End-to-end guard for #1746, across the process boundary the defect lived
     /// in.
     ///
@@ -3303,6 +3345,71 @@ mod tests {
 
     /// Spawns the lane child at `budget`, optionally pre-confining it to
     /// `confine` CPUs, and decodes its one result line.
+    /// Is this lane-child exit the known environmental Windows ARM64 crash?
+    ///
+    /// The child has two completion tokens, a result and a skip, and either one
+    /// means it finished its work — so a fault raised after one was printed is
+    /// not the environmental crash. Both must therefore be absent before a retry
+    /// is justified, which is why this asks the shared classifier about each
+    /// marker and requires them to agree.
+    fn lane_child_crash_is_environmental(
+        success: bool,
+        exit_code: Option<i32>,
+        stdout: &str,
+        stderr: &str,
+    ) -> bool {
+        [BUDGET_LANE_MARKER, BUDGET_LANE_SKIP_MARKER]
+            .iter()
+            .all(|marker| {
+                crate::test_support::is_environmental_access_violation_crash(
+                    success, exit_code, stdout, stderr, marker,
+                )
+            })
+    }
+
+    /// Locks the lane-child retry to *exactly* the known environmental Windows
+    /// ARM64 `STATUS_ACCESS_VIOLATION`, so a real regression can never be
+    /// retried into a false pass.
+    ///
+    /// The retry exists because that crash failed a documentation-only PR
+    /// (#1772), which no amount of correct code can prevent. The risk it
+    /// introduces is the opposite one: a genuine assertion failure that is
+    /// silently re-run until it passes. Every non-signature exit below must
+    /// therefore be classified non-retryable.
+    #[test]
+    fn lane_child_retry_covers_only_the_environmental_crash() {
+        const AV: Option<i32> = Some(crate::test_support::STATUS_ACCESS_VIOLATION);
+        let result = format!("{BUDGET_LANE_MARKER}16,1,16,16,2,2,1");
+        let skip = format!("{BUDGET_LANE_SKIP_MARKER}only one CPU online");
+
+        // The signature: unsuccessful, no completion token, no panic, AV code.
+        assert!(lane_child_crash_is_environmental(false, AV, "", ""));
+
+        // A real assertion failure must fail fast even with an AV code.
+        assert!(!lane_child_crash_is_environmental(
+            false,
+            AV,
+            "",
+            "thread 'main' panicked at src/foo.rs:1:1:\nassertion failed",
+        ));
+
+        // Success is never retryable, and neither is any other exit code.
+        assert!(!lane_child_crash_is_environmental(true, AV, &result, ""));
+        assert!(!lane_child_crash_is_environmental(false, Some(1), "", ""));
+        assert!(!lane_child_crash_is_environmental(false, None, "", ""));
+
+        // Both completion tokens mean the child finished its work, so a fault
+        // after either one is not the environmental crash. This is the part the
+        // shared classifier cannot express on its own: it takes a single marker,
+        // and a lane child may legitimately emit either.
+        assert!(!lane_child_crash_is_environmental(false, AV, &result, ""));
+        assert!(!lane_child_crash_is_environmental(false, AV, &skip, ""));
+
+        // Interleaved with the harness's own output, as `--nocapture` produces.
+        let noisy = format!("running 1 test\n{skip}\ntest budget_lane_child ... ok");
+        assert!(!lane_child_crash_is_environmental(false, AV, &noisy, ""));
+    }
+
     fn run_budget_lane_child(budget: usize, confine: Option<usize>) -> Option<BudgetLane> {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.arg("--exact")
@@ -3327,14 +3434,42 @@ mod tests {
         } else {
             cmd.env_remove(BUDGET_LANE_CONFINE_ENV);
         }
-        let output = cmd.output().expect("run decode-budget lane child");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        assert!(
-            output.status.success(),
-            "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stdout = {
+            // Native Windows ARM64 runners intermittently fault this child during
+            // SPMD pool build/teardown with `STATUS_ACCESS_VIOLATION` and empty
+            // stderr — not a Rust panic, not one of our assertions. It failed a
+            // documentation-only PR (#1772), so it fails PRs that cannot possibly
+            // have caused it. Retry only that exact signature; a real assertion
+            // failure still fails fast on the first attempt, and on Linux the
+            // signature never occurs, so behaviour there is unchanged.
+            let mut attempt = 1;
+            loop {
+                let output = cmd.output().expect("run decode-budget lane child");
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                let environmental = lane_child_crash_is_environmental(
+                    output.status.success(),
+                    output.status.code(),
+                    &stdout,
+                    &stderr,
+                );
+                if environmental && attempt < BUDGET_LANE_CHILD_MAX_ATTEMPTS {
+                    eprintln!(
+                        "note: retrying decode-budget lane child (budget={budget}) after \
+                         environmental STATUS_ACCESS_VIOLATION crash, attempt {attempt}"
+                    );
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+                assert!(
+                    output.status.success(),
+                    "budget {budget} child failed ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    crate::test_support::child_status_detail(&output.status),
+                );
+                break stdout;
+            }
+        };
         if let Some(reason) = stdout.lines().find_map(|line| {
             line.split_once(BUDGET_LANE_SKIP_MARKER)
                 .map(|(_, r)| r.trim())

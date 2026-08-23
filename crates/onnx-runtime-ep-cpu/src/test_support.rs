@@ -119,6 +119,75 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// The NTSTATUS code Windows reports for `STATUS_ACCESS_VIOLATION`
+/// (`0xC0000005`) surfaced through `ExitStatus::code()` as a signed `i32`.
+/// `ExitStatus::code()` is cross-platform, so this constant compiles on every
+/// target; the crash it names only ever occurs on native Windows ARM64.
+pub(crate) const STATUS_ACCESS_VIOLATION: i32 = -1_073_741_819;
+
+/// Render a child `ExitStatus` with enough detail to tell a crash from a
+/// failed assertion.
+///
+/// A Rust assertion failure in a child unwinds and prints `panicked at ...` to
+/// stderr. The environmental Windows ARM64 `STATUS_ACCESS_VIOLATION` unwinds
+/// nothing: it prints no panic line and leaves stderr completely empty, and its
+/// stdout simply stops mid-test. So the stdout/stderr pair alone cannot
+/// distinguish "the child crashed" from "the child's assertion failed", and the
+/// two want opposite responses. The exit status is the only evidence that
+/// survives a fault, and NTSTATUS codes are unrecognisable in the signed
+/// decimal `code()` returns (`0xC0000005` prints as `-1073741819`), so render
+/// hex as well.
+pub(crate) fn child_status_detail(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("{status} (code {code}, {:#010x})", code as u32),
+        None => format!("{status} (no exit code; killed by a signal)"),
+    }
+}
+
+/// Classify an unsuccessful child exit as the *known environmental*
+/// `STATUS_ACCESS_VIOLATION` crash (retryable) versus a real test failure (not
+/// retryable).
+///
+/// Native Windows ARM64 CI runners intermittently fault a spawned child during
+/// SPMD pool build/teardown with `0xC0000005` and empty stderr. It is not a
+/// Rust panic and not one of our assertions, and it will fail any PR that
+/// happens to land on it — including documentation-only changes. Retrying only
+/// this exact signature rides through it without ever masking a real failure.
+///
+/// A pure function so the exact signature is unit-testable and the retry stays
+/// narrowly scoped. All four conditions must hold to treat the exit as the
+/// environmental flake:
+///   1. the child exited unsuccessfully (`success` is `false`), AND
+///   2. it emitted no `success_marker`, AND
+///   3. its stderr shows no Rust panic (no `panicked at` / `assertion` text) —
+///      a genuine assertion failure must fail fast, never retry, AND
+///   4. the exit code is exactly the Windows `STATUS_ACCESS_VIOLATION`
+///      NTSTATUS. Matching that specific code keeps the retry Windows-only in
+///      practice while the code stays portable.
+///
+/// `success_marker` is the stdout token a child prints once it has actually
+/// completed its work, so a fault raised *after* the result was already emitted
+/// is correctly classified as non-environmental. Each caller passes its own
+/// marker, because the child-spawning helpers do not share one.
+pub(crate) fn is_environmental_access_violation_crash(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+    success_marker: &str,
+) -> bool {
+    if success {
+        return false;
+    }
+    if stdout.contains(success_marker) {
+        return false;
+    }
+    if stderr.contains("panicked at") || stderr.contains("assertion") {
+        return false;
+    }
+    exit_code == Some(STATUS_ACCESS_VIOLATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::EnvVarGuard;

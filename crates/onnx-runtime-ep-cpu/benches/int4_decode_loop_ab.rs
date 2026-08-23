@@ -30,12 +30,6 @@
 //! - `PROBE_SESSIONS` -- concurrent decode loops (default 1).
 //! - `PROBE_TOKENS` -- measured tokens per session (default 64).
 //! - `PROBE_LAYERS` -- projection chains per token (default 1).
-//! - `PROBE_ZERO_POINTS` -- `1` supplies a fourth (asymmetric) zero-points
-//!   input; the default `0` leaves it absent, which is the **symmetric**
-//!   route. This axis matters more than it looks: symmetric int4 takes the
-//!   implicit midpoint 8 and never touches a zero-points byte, so any
-//!   measurement of zero-point unpacking taken with the default is measuring
-//!   a branch that is never entered.
 //!
 //! To vary the decode pool width, set **`ONNX_GENAI_CPU_DECODE_THREADS`**.
 //! `RAYON_NUM_THREADS` does *not* size this pool -- `configured_decode_threads`
@@ -87,137 +81,17 @@ mod common;
 use std::time::Instant;
 
 use common::Tensor;
-use onnx_runtime_ep_api::{ExecutionProvider, Kernel};
-use onnx_runtime_ep_cpu::{CpuExecutionProvider, with_decode_pool_scope};
-use onnx_runtime_ir::{Attribute, Node, NodeId};
-
-/// One decode step's projections for a llama3-8B-shaped model, as `(k, n)`.
-/// A decode token pays all of these back to back, which is what makes the
-/// per-op fork/join cost a per-token cost rather than a one-off.
-const PROJECTIONS: &[(usize, usize, &str)] = &[
-    (4096, 6144, "qkv"),
-    (4096, 4096, "o"),
-    (4096, 14336, "gate"),
-    (4096, 14336, "up"),
-    (14336, 4096, "down"),
-];
-
-/// Qwen2.5-7B's decode projections. Not a cosmetic second model: its GQA head
-/// layout makes `qkv` **narrow** (n = 4608 against a k of 3584) and its MLP
-/// **much wider** relative to the hidden size (18944 vs llama's 14336 on a
-/// larger k). Both differences move the `n`-loop trip count, which is exactly
-/// the axis the N-blocked kernel's four-column grouping divides. A conclusion
-/// drawn only from llama shapes has not been tested against a different
-/// n/k ratio at all, and the tail behaviour at `n % 4` is invisible in a set
-/// where every `n` is a multiple of 4.
-const PROJECTIONS_QWEN: &[(usize, usize, &str)] = &[
-    (3584, 4608, "qkv"),
-    (3584, 3584, "o"),
-    (3584, 18944, "gate"),
-    (3584, 18944, "up"),
-    (18944, 3584, "down"),
-];
-
-fn projections() -> &'static [(usize, usize, &'static str)] {
-    match std::env::var("PROBE_MODEL")
-        .unwrap_or_else(|_| "llama".into())
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "qwen" => PROJECTIONS_QWEN,
-        "llama" => PROJECTIONS,
-        other => panic!("PROBE_MODEL must be llama or qwen, got {other:?}"),
-    }
-}
-
-fn packed_bytes(len: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 24) as u8
-        })
-        .collect()
-}
-
-fn floats(len: usize, seed: f32) -> Vec<f32> {
-    (0..len)
-        .map(|i| ((i as f32) * 0.0137 + seed).sin() * 0.5)
-        .collect()
-}
+use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
+use onnx_runtime_ep_api::Kernel;
+use onnx_runtime_ep_cpu::with_decode_pool_scope;
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     samples[samples.len() / 2]
 }
 
-fn build_kernel(
-    k: usize,
-    n: usize,
-    block_size: usize,
-    accuracy: i64,
-    zero_points: bool,
-) -> Box<dyn Kernel> {
-    let blocks = k.div_ceil(block_size);
-    let blob = block_size / 2;
-    let mut shapes = vec![vec![1, k], vec![n, blocks, blob], vec![n, blocks]];
-    if zero_points {
-        shapes.push(vec![n, blocks.div_ceil(2)]);
-    }
-    let mut node = Node::new(NodeId(0), "MatMulNBits", vec![], vec![]);
-    node.domain = "com.microsoft".into();
-    for (name, value) in [
-        ("K", Attribute::Int(k as i64)),
-        ("N", Attribute::Int(n as i64)),
-        ("bits", Attribute::Int(4)),
-        ("block_size", Attribute::Int(block_size as i64)),
-        ("accuracy_level", Attribute::Int(accuracy)),
-    ] {
-        node.attributes.insert(name.into(), value);
-    }
-    let mut kernel = CpuExecutionProvider::new()
-        .get_kernel(&node, &shapes, 1)
-        .expect("CPU EP must register MatMulNBits");
-    if zero_points {
-        kernel.set_constant_inputs(&[false, true, true, true]);
-    } else {
-        kernel.set_constant_inputs(&[false, true, true]);
-    }
-    kernel
-}
-
-/// Packed asymmetric zero points, two int4 nibbles per byte, one per block.
-///
-/// Values sit near the symmetric midpoint 8 the way a real round-to-nearest
-/// quantizer's do; the exact values do not change the instruction count, only
-/// the arithmetic they feed.
-fn packed_zero_points(blocks: usize, n: usize) -> Vec<u8> {
-    let per_row = blocks.div_ceil(2);
-    let mut bytes = vec![0u8; n * per_row];
-    for row in 0..n {
-        for block in 0..blocks {
-            let value = 7u8 + ((row + block) % 3) as u8;
-            let byte = &mut bytes[row * per_row + block / 2];
-            *byte |= value << ((block % 2) * 4);
-        }
-    }
-    bytes
-}
-
-/// A weight, shared across sessions the way a served model's weights are.
-struct Weight {
-    b: Tensor,
-    scales: Tensor,
-    zero_points: Option<Tensor>,
-    k: usize,
-    n: usize,
-}
-
-/// Set by every session; read once after the measured phase. See the checksum
-/// comment in `run_session`.
+/// Set by every session; read once after the measured phases. See the checksum
+/// comment in the session loop.
 static CHECKSUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn main() {
@@ -240,10 +114,6 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(64);
-    let asymmetric: bool = std::env::var("PROBE_ZERO_POINTS")
-        .ok()
-        .map(|v| v == "1")
-        .unwrap_or(false);
     let layers: usize = std::env::var("PROBE_LAYERS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -259,27 +129,8 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
 
-    let weights: Vec<Weight> = projections()
-        .iter()
-        .enumerate()
-        .map(|(index, &(k, n, _))| {
-            let blocks = k.div_ceil(block_size);
-            let blob = block_size / 2;
-            let packed = packed_bytes(n * blocks * blob, 7 + index as u64);
-            let scales = floats(n * blocks, 0.3)
-                .into_iter()
-                .map(|v| v.abs().max(0.01) * 0.02)
-                .collect::<Vec<_>>();
-            Weight {
-                b: Tensor::u8(&[n, blocks, blob], &packed),
-                scales: Tensor::floats(common::FloatDType::F32, &[n, blocks], &scales),
-                zero_points: asymmetric
-                    .then(|| Tensor::u8(&[n, blocks.div_ceil(2)], &packed_zero_points(blocks, n))),
-                k,
-                n,
-            }
-        })
-        .collect();
+    let asymmetric = asymmetric_zero_points();
+    let weights: Vec<Weight> = weights(block_size, asymmetric);
 
     println!(
         "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd} zero_points={}",
@@ -325,14 +176,7 @@ fn main() {
          -> (Vec<Box<dyn Kernel>>, Vec<Tensor>) {
             for (index, kernel) in kernels.iter().enumerate() {
                 let weight = &weights[index % weights.len()];
-                let mut ins = vec![
-                    activations[index].view(),
-                    weight.b.view(),
-                    weight.scales.view(),
-                ];
-                if let Some(zero_points) = weight.zero_points.as_ref() {
-                    ins.push(zero_points.view());
-                }
+                let ins = weight.inputs(&activations[index]);
                 kernel
                     .execute(&ins, &mut [outputs[index].view_mut()])
                     .expect("execute");
@@ -369,13 +213,13 @@ fn main() {
             state = returned;
             samples.push(elapsed);
         }
-        // Route proof, not decoration. A benchmark arm that supplies a fourth
-        // input the kernel silently ignores would time the *symmetric* route
-        // while claiming to time the asymmetric one, and every number taken
-        // from it would be attributed to a branch never entered. The checksum
-        // is the cheapest evidence the zero points were consumed: symmetric
-        // uses the implicit midpoint 8, asymmetric uses 7/8/9, so the two
-        // arms cannot agree unless the input was dropped.
+        // Route proof, not decoration. An arm that supplies a fourth input the
+        // kernel silently ignored would time the *symmetric* route while
+        // claiming the asymmetric one, and every number taken from it would be
+        // attributed to a branch never entered. The checksum is the cheapest
+        // evidence the zero points were consumed: symmetric uses the implicit
+        // midpoint 8 and asymmetric uses 7/8/9, so the two arms cannot agree
+        // unless the input was dropped.
         let checksum: f64 = state
             .1
             .iter()
