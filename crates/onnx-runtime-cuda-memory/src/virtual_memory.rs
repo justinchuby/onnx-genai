@@ -727,10 +727,14 @@ impl CudaVirtualBacking {
     /// `location`), so a `HostNuma` handle can never escape into a `Device`
     /// pool and vice versa.
     ///
-    /// The `pool` argument must have been created for `location`. No run-time
-    /// check is made; mismatches surface as a `cuMemCreate` failure when the
-    /// pool's backing prop does not match the requested location — which is
-    /// already an explicit error, not a silent wrong-answer.
+    /// The `pool` argument must have been created for `location`: this is
+    /// checked before anything else happens (before the capture-gate section
+    /// is even meaningfully used, before any lease charge, handle acquisition,
+    /// `cuMemMap`/`cuMemSetAccess`, or accounting mutation). A mismatch
+    /// returns `Err(CommitFailure { error: VirtualMemoryError::LocationMismatch, .. })`
+    /// with `residual_mapped` empty — nothing about `pool` or `reservation` is
+    /// touched. This one runtime check is the single authority over whether a
+    /// requested location matches its pool; do not add a second one.
     ///
     /// Every driver call (`cuMemCreate`, `cuMemMap`, `cuMemSetAccess`) is
     /// wrapped in `capture_gate::synchronizing_section()` exactly as the
@@ -752,6 +756,18 @@ impl CudaVirtualBacking {
         location: PhysicalLocation,
         pool: &Arc<PhysicalHandlePool>,
     ) -> Result<u64, CommitFailure> {
+        // Validated first, before the capture-gate section, before `bind`,
+        // before any lease charge/handle acquisition/mapping/accounting
+        // mutation: a location/pool mismatch is a caller-programming-error,
+        // not a driver refusal, and must have zero side effects on `pool` or
+        // `reservation` when rejected.
+        if location != pool.location() {
+            return Err(CommitFailure::clean(VirtualMemoryError::LocationMismatch {
+                requested: format!("{location:?}"),
+                actual: format!("{:?}", pool.location()),
+            }));
+        }
+
         let _section = crate::capture_gate::synchronizing_section();
         self.bind("committing CUDA memory at location")
             .map_err(CommitFailure::clean)?;
@@ -802,7 +818,6 @@ impl CudaVirtualBacking {
             });
         }
 
-        let _ = location; // Used for documentation; pool is already keyed by location.
         reservation
             .blocks
             .push(MappedBlock::new(offset, granularity, checkout.handle));

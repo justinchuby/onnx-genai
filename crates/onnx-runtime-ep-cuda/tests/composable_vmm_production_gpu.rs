@@ -485,3 +485,228 @@ fn commit_at_location_accounting_oscillation_returns_to_baseline() {
 
     println!("accounting_oscillation: PASS — 5 map/unmap cycles, clean baseline after drop");
 }
+
+// ---------------------------------------------------------------------------
+// Test 6, 7, 8: `commit_at_location` rejects a `location` argument that does
+// not match `pool.location()` — the fix for the blocking finding on #1823
+// (the argument was previously discarded via `let _ = location;`, so a
+// mismatch silently succeeded using `pool.location()`'s backing instead of
+// the caller's claimed `location`). Each test asserts the mismatch is
+// rejected *before* any lease charge/handle acquisition/mapping/accounting
+// change: the pool's counters and the reservation's block count must be
+// byte-for-byte identical before and after the rejected call.
+// ---------------------------------------------------------------------------
+
+/// `location = Device` but `pool` is actually `HostNuma`-backed: must be
+/// rejected with `LocationMismatch`, and must leave the pool's counters and
+/// the reservation untouched.
+#[test]
+#[ignore = "requires GPU"]
+fn commit_at_location_rejects_device_location_against_host_numa_pool() {
+    assert_gpu_idle_or_warn();
+    let (context, _guard) = require_cuda_context();
+
+    let cap = match host_numa_capability(0) {
+        Ok(cap) => cap,
+        Err(CapabilityGateFailure::Unsupported(reason)) => {
+            println!("SKIP: {reason}");
+            return;
+        }
+    };
+
+    let granularity = cap.granularity;
+    let governor = make_governor(0, 1 << 30, 1 << 30);
+
+    let host_pool = PhysicalHandlePool::get_or_create_at_location(
+        Arc::clone(&context),
+        0,
+        PhysicalLocation::HostNuma {
+            node: cap.host_numa_id,
+        },
+        granularity * 2,
+        governor,
+        HolderId::new(7),
+        MemoryRole::Weights,
+    )
+    .expect("host_numa pool");
+
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&host_pool));
+    let mut reservation =
+        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+
+    let stats = host_pool.stats();
+    let before_counters = stats.snapshot();
+    let before_blocks = reservation.mapped_blocks().len();
+
+    // Claim Device{0} while the pool is actually HostNuma-backed.
+    let result = backing.commit_at_location(
+        &mut reservation,
+        0,
+        PhysicalLocation::Device { ordinal: 0 },
+        &host_pool,
+    );
+
+    let err = result.expect_err("Device location against a HostNuma pool must be rejected");
+    assert!(
+        err.unwound_cleanly(),
+        "a rejected mismatch must never leave a residual mapped block"
+    );
+    match err.error {
+        onnx_runtime_virtual_memory::VirtualMemoryError::LocationMismatch { .. } => {}
+        other => panic!("expected LocationMismatch, got: {other:?}"),
+    }
+
+    let after_counters = stats.snapshot();
+    assert_eq!(
+        after_counters, before_counters,
+        "pool counters must be byte-for-byte unchanged after a rejected mismatch"
+    );
+    assert_eq!(
+        reservation.mapped_blocks().len(),
+        before_blocks,
+        "reservation must gain no block after a rejected mismatch"
+    );
+    println!("commit_at_location_rejects_device_location_against_host_numa_pool: PASS — {err}");
+}
+
+/// `location = HostNuma { node }` but `pool` is actually `Device`-backed:
+/// must be rejected the same way.
+#[test]
+#[ignore = "requires GPU"]
+fn commit_at_location_rejects_host_numa_location_against_device_pool() {
+    assert_gpu_idle_or_warn();
+    let (context, _guard) = require_cuda_context();
+
+    let cap = match host_numa_capability(0) {
+        Ok(cap) => cap,
+        Err(CapabilityGateFailure::Unsupported(reason)) => {
+            println!("SKIP: {reason}");
+            return;
+        }
+    };
+
+    let granularity = cap.granularity;
+    let governor = make_governor(0, 1 << 30, 1 << 30);
+
+    let device_pool = PhysicalHandlePool::get_or_create_at_location(
+        Arc::clone(&context),
+        0,
+        PhysicalLocation::Device { ordinal: 0 },
+        granularity * 2,
+        governor,
+        HolderId::new(8),
+        MemoryRole::Weights,
+    )
+    .expect("device pool");
+
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
+    let mut reservation =
+        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+
+    let stats = device_pool.stats();
+    let before_counters = stats.snapshot();
+    let before_blocks = reservation.mapped_blocks().len();
+
+    // Claim HostNuma{node} while the pool is actually Device-backed.
+    let result = backing.commit_at_location(
+        &mut reservation,
+        0,
+        PhysicalLocation::HostNuma {
+            node: cap.host_numa_id,
+        },
+        &device_pool,
+    );
+
+    let err = result.expect_err("HostNuma location against a Device pool must be rejected");
+    assert!(
+        err.unwound_cleanly(),
+        "a rejected mismatch must never leave a residual mapped block"
+    );
+    match err.error {
+        onnx_runtime_virtual_memory::VirtualMemoryError::LocationMismatch { .. } => {}
+        other => panic!("expected LocationMismatch, got: {other:?}"),
+    }
+
+    let after_counters = stats.snapshot();
+    assert_eq!(
+        after_counters, before_counters,
+        "pool counters must be byte-for-byte unchanged after a rejected mismatch"
+    );
+    assert_eq!(
+        reservation.mapped_blocks().len(),
+        before_blocks,
+        "reservation must gain no block after a rejected mismatch"
+    );
+    println!("commit_at_location_rejects_host_numa_location_against_device_pool: PASS — {err}");
+}
+
+/// Two `Device` pools for different ordinals (constructed against the same
+/// context's device 0, but claiming a *different* device ordinal in
+/// `location`) must also be rejected: the mismatch check compares the whole
+/// `PhysicalLocation` value, not just its variant tag.
+///
+/// This machine has multiple GPUs, so a genuinely different ordinal (any
+/// other visible device) is used for the mismatched claim -- the pool itself
+/// is still the real device-0 pool bound to this test's context, so this
+/// proves ordinal-level (not just Device-vs-HostNuma) discrimination.
+#[test]
+#[ignore = "requires GPU"]
+fn commit_at_location_rejects_mismatched_device_ordinal() {
+    assert_gpu_idle_or_warn();
+    let (context, _guard) = require_cuda_context();
+
+    let granularity = onnx_runtime_cuda_memory::virtual_memory::allocation_granularity_for_location(
+        PhysicalLocation::Device { ordinal: 0 },
+    );
+    let governor = make_governor(0, 1 << 30, 1 << 30);
+
+    let device_pool = PhysicalHandlePool::get_or_create_at_location(
+        Arc::clone(&context),
+        0,
+        PhysicalLocation::Device { ordinal: 0 },
+        granularity * 2,
+        governor,
+        HolderId::new(9),
+        MemoryRole::Weights,
+    )
+    .expect("device pool for ordinal 0");
+
+    let backing = CudaVirtualBacking::with_physical_pool(Arc::clone(&device_pool));
+    let mut reservation =
+        <CudaVirtualBacking as VirtualBacking>::reserve(&backing, granularity).expect("reserve");
+
+    let stats = device_pool.stats();
+    let before_counters = stats.snapshot();
+    let before_blocks = reservation.mapped_blocks().len();
+
+    // A pool that is really ordinal 0, but the caller claims ordinal 1 --
+    // must be rejected even though both are `Device` locations.
+    let result = backing.commit_at_location(
+        &mut reservation,
+        0,
+        PhysicalLocation::Device { ordinal: 1 },
+        &device_pool,
+    );
+
+    let err = result.expect_err("a different device ordinal must be rejected even within Device");
+    assert!(
+        err.unwound_cleanly(),
+        "a rejected mismatch must never leave a residual mapped block"
+    );
+    match err.error {
+        onnx_runtime_virtual_memory::VirtualMemoryError::LocationMismatch { .. } => {}
+        other => panic!("expected LocationMismatch, got: {other:?}"),
+    }
+
+    let after_counters = stats.snapshot();
+    assert_eq!(
+        after_counters, before_counters,
+        "pool counters must be byte-for-byte unchanged after a rejected mismatch"
+    );
+    assert_eq!(
+        reservation.mapped_blocks().len(),
+        before_blocks,
+        "reservation must gain no block after a rejected mismatch"
+    );
+    println!("commit_at_location_rejects_mismatched_device_ordinal: PASS — {err}");
+}
