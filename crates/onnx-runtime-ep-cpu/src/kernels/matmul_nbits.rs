@@ -20128,9 +20128,9 @@ mod tests {
         // reported independently of the verdict, so a suppressed verdict here
         // is still a failure.
         assert!(
-            honest.proc_readable,
-            "the control child could not read `/proc/self/task`, which a process can \
-             always read about itself, so the cross-check is not running at all ({honest:?})"
+            honest.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
+            "this process can read `/proc/self/task` but the control child could not, so \
+             the cross-check is not running at all ({honest:?})"
         );
         if !honest.fully_pinned {
             return;
@@ -20269,18 +20269,26 @@ mod tests {
             // it for all five. The per-width form catches what neither did:
             // verdicts disappearing for widths 4/8/16 while width 2 keeps
             // working.
-            // `/proc/self/task` is always readable *by the process itself* --
-            // `hidepid` restricts other processes' entries, not your own -- so
-            // on Linux an unanswerable `/proc` is a defect in the cross-check,
-            // not a host condition to tolerate. Asserting it rather than
-            // skipping on it is what keeps "the cross-check was disabled
-            // outright" a failure instead of a silent skip.
+            // Asserting `/proc` readability rather than skipping on it is what
+            // keeps "the cross-check was disabled outright" a failure instead
+            // of a silent skip -- an earlier version tolerated it and the
+            // mutation battery immediately showed P4 escaping through it.
+            //
+            // The escape hatch is the *parent's own* read, not a tolerated
+            // `false`: `hidepid` restricts other processes' entries and never
+            // your own, so the one host that legitimately cannot answer is one
+            // with no `/proc` mounted at all (minimal container, chroot,
+            // initramfs) -- and there this process cannot read it either.
+            // Checking it here rather than trusting the child's flag is the
+            // point: the parent's read is independent of whatever the child's
+            // cross-check does, so a broken cross-check on a normal host still
+            // fails.
             #[cfg(target_os = "linux")]
             assert!(
-                report.proc_readable,
-                "width {requested}: the child could not read the affinities in force from \
-                 `/proc/self/task`, which a process can always read about itself -- the \
-                 placement cross-check is not running ({report:?})"
+                report.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
+                "width {requested}: this process can read `/proc/self/task` but the child \
+                 could not, so the failure is in the cross-check rather than the host -- \
+                 the placement cross-check is not running ({report:?})"
             );
 
             #[cfg(target_os = "linux")]
