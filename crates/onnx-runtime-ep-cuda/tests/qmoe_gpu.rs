@@ -1602,32 +1602,43 @@ fn qmoe_deepseek_decode_bench() {
 // pattern, not graph replay), which is also the honest cost of the *current*
 // uncaptured decode step in production.
 //
-// IMPORTANT, verified-against-source caveat on what "host_us" actually means
-// here: unlike `MatMulNBitsKernel::run`, `QMoEKernel::execute` ends with
-// `let result = if capturing { Ok(()) } else { self.runtime.synchronize() };`
-// (`src/kernels/qmoe.rs`, end of `execute`) -- i.e. it performs a *full,
-// unconditional, blocking device synchronize inside every single call* when
-// not capturing, for both the M=1 fused-decode and the M>1 grouped path
-// alike. That means the host loop below can never race ahead of the device:
-// every `execute_once()` call is already a synchronous host<->device round
-// trip by construction, so `median_host_us` and `median_gpu_us` measure
-// nearly the same serialized per-call cost rather than "host dispatch"
-// isolated from "device execution" the way they do for `MatMulNBitsKernel`.
-// Measured on an idle A100: at M=1 the two numbers diverge a lot (host_us
-// ~25us vs. gpu_us 145-430us) because the fused-decode kernel itself is fast
-// enough that fixed per-call CPU-side bookkeeping (view construction, kernel
-// dispatch) is comparatively small; at M>1 they converge to within 7-38% of
-// each other and the gap shrinks further as M grows (e.g. GLM-5.2 M=8:
-// host_us=6652 vs gpu_us=7154, 93%). This is *not* evidence of a grouped-path-
-// specific extra sync -- both paths hit the identical `execute()` sync -- it
-// is evidence that, absent capture, QMoE pays a full host round trip on every
-// decode step, and that round trip's relative weight only becomes visible
-// once the per-call GPU work is large enough (grouped path) that CPU-side
-// bookkeeping is no longer the dominant term to notice separately. Any future
-// attempt to hide this cost behind pipelining (without graph capture) would
-// first need to remove this unconditional `synchronize()`, which is there
-// (per the surrounding code) to make the pooled scratch buffers
-// (`self.scratch`) safe to reuse across calls without capture.
+// CORRECTION (cycle-5 follow-up, superseding the paragraph this replaces):
+// `QMoEKernel::execute` used to end with
+// `let result = if capturing { Ok(()) } else { self.runtime.synchronize() };`,
+// and this comment originally attributed the host_us/gpu_us convergence below
+// to that call being an *unconditional, blocking* device synchronize. That
+// attribution was wrong, and was falsified by direct measurement: removing
+// the call entirely (`execute` is now unconditionally async on the
+// non-capturing path; see `src/kernels/qmoe.rs`) changed the numbers below by
+// <0.1%, run to run -- i.e. within measurement noise, not a regression fix.
+// The reason: `CudaRuntime::synchronize` has been a conditional, deferred
+// no-op by default since #1383 (`ONNX_GENAI_DEFER_EAGER_SYNC`, on by
+// default) -- *before* this probe existed -- so that call was never actually
+// blocking in the default configuration this probe (and #1383's own
+// production default) runs under.
+//
+// The real mechanism, confirmed with a temporary per-launch host timer
+// (`Instant`-bracketed, not committed): the grouped path's own CPU-side
+// dispatch cost -- every `nvrtc_function` lookup plus `cuLaunchKernel` call
+// across `launch_grouping`/`launch_gather`/`launch_grouped_linear`/
+// `launch_linear`/`launch_activation`/`launch_combine` -- is only ~40us
+// total for the heaviest probed case (GLM-5.2, M=8), nowhere near the
+// ~7ms `host_us` reported for that case. What actually converges `host_us`
+// toward `gpu_us` as M grows is queue-depth saturation: this harness's own
+// between-rep drain (see `median_us` below) was *also* the same no-op
+// `synchronize()` call, so back-to-back reps' asynchronously-enqueued
+// kernels were never drained between reps, and once the host can enqueue
+// faster than a genuinely memory-bandwidth-bound grouped kernel sequence
+// (3.5-25% of peak HBM bandwidth; see the measurements below) can drain, the
+// *enqueuing* `cuLaunchKernel` calls themselves start blocking on a full
+// queue -- an ordinary, expected consequence of a real device-bound
+// workload pushed through a bounded async queue, not a synchronization
+// defect. `median_us` below now drains for real between reps
+// (`drain_for_unmap`), which isolates each rep's own host-dispatch cost
+// instead of also capturing residual queue-depth blocking. At M=1
+// fused-decode the two numbers stay apart regardless, simply because that
+// path issues far fewer kernels per call and its GPU work is comparatively
+// tiny, so the queue never fills.
 // ---------------------------------------------------------------------------
 
 /// A100-SXM4-80GB HBM2e datasheet peak. Percent-of-peak below is only
@@ -2077,22 +2088,26 @@ fn setup_gemv_bench(
         device_id: ep.device_id(),
     };
     // First call also compiles the NVRTC module and (for the fused decode
-    // path) sets QMoE's `warmed` flag; never time it.
+    // path) sets QMoE's `warmed` flag; never time it. Use the unconditional
+    // drain (not `synchronize`, a no-op by default per #1383) so the first
+    // *timed* call in `median_us` never inherits overlap from this call.
     setup.execute_once()?;
-    runtime.synchronize()?;
+    runtime.drain_for_unmap()?;
     Ok(setup)
 }
 
 /// Times one sample: `batch` raw `execute()` calls bracketed by two CUDA
 /// events (single `event::synchronize` + `elapsed()`, divided by `batch`),
-/// and a separate wall-clock enqueue loop (synchronized only at its end).
-/// No graph capture is attempted (see the module doc above). Because
-/// `QMoEKernel::execute` itself blocks on `runtime.synchronize()` internally
-/// whenever it is not capturing (verified in `src/kernels/qmoe.rs`), the two
-/// numbers below are NOT a clean host-dispatch-vs-device-execution split the
-/// way they are for `MatMulNBitsKernel` -- both legs measure a serialized
-/// per-call round trip, and their ratio mainly reflects how large a fraction
-/// of that round trip is fixed CPU-side bookkeeping vs. actual device work.
+/// and a separate wall-clock enqueue loop (drained for real only between
+/// reps, via `drain_for_unmap` -- see the module doc's correction above for
+/// why not `synchronize`). No graph capture is attempted (see the module doc
+/// above). `execute()` is fully async on its non-capturing path (as of
+/// cycle-5; see `src/kernels/qmoe.rs`), so `median_host_us` reflects real
+/// per-batch host dispatch cost, not a per-call blocking round trip; at
+/// large M it can still approach `median_gpu_us` once the host enqueues
+/// faster than the (memory-bandwidth-bound) grouped kernels can drain and
+/// the driver's launch queue saturates -- an expected property of a
+/// genuinely device-bound workload, not a synchronization artifact.
 /// Returns `(median_gpu_us, median_host_us, sorted_gpu_samples_us)`.
 fn median_us(
     setup: &GemvBenchSetup,
@@ -2111,7 +2126,15 @@ fn median_us(
             setup.execute_once().unwrap();
         }
         host.push(enqueue_begin.elapsed().as_secs_f64() * 1e6 / batch as f64);
-        runtime.synchronize().unwrap();
+        // `drain_for_unmap`, not `synchronize`: the latter is a no-op under
+        // the default `defer_eager_sync` (on since #1383), so it would never
+        // actually drain the stream between reps, letting one rep's enqueued
+        // kernels bleed into the next rep's host timing window once the
+        // driver's launch queue is deep enough. This drain sits outside the
+        // timed window above, so it does not inflate `host_us` -- it only
+        // isolates one rep's host-dispatch measurement from the next rep's
+        // device work.
+        runtime.drain_for_unmap().unwrap();
     }
     host.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let host_us = host[host.len() / 2];
@@ -2408,4 +2431,349 @@ fn qmoe_occ_is_bit_identical() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle-5 regression coverage: `QMoEKernel::execute` no longer ends with an
+// unconditional `runtime.synchronize()` (see `src/kernels/qmoe.rs`). These
+// tests guard the two invariants that call used to (accidentally) protect --
+// scratch-growth-free safety and `Drop` teardown safety -- now that each is
+// its own explicit, narrowly-scoped drain, plus a direct check that `execute`
+// itself no longer blocks the host for device completion.
+// ---------------------------------------------------------------------------
+
+/// Builds one QMoE kernel from `template` (only `hidden`/`inter`/`experts`/
+/// `bits`/`top_k`/activation/etc. matter here; `template.rows` is ignored --
+/// shapes are never baked into kernel construction: `QMoEFactory::create`
+/// takes `_input_shapes` by name only, see `src/kernels/qmoe.rs`). The
+/// returned kernel is reused across many `execute()` calls with independently
+/// varying row counts, which is exactly what exercises `ScratchPool`'s
+/// growth path.
+fn build_qmoe_kernel(
+    ep: &CudaExecutionProvider,
+    template: Case,
+    dtype: DataType,
+) -> Box<dyn onnx_runtime_ep_api::Kernel> {
+    let inputs = case_inputs(template, dtype);
+    let output_shape = [template.rows, template.hidden];
+    let (graph, node) = model_node(&inputs, dtype, &output_shape, template);
+    let model = Model::new(&graph);
+    let concrete_shapes: Vec<_> = inputs
+        .iter()
+        .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+        .collect();
+    ep.get_kernel(model.graph.node(node), &concrete_shapes, 1)
+        .expect("QMoE kernel construction must succeed for a well-formed case")
+}
+
+/// Everything an in-flight `execute()` call owns until its output is read
+/// back. Splitting "enqueue" from "read back" (unlike a single helper that
+/// does both) lets a caller issue several `execute()` calls on one kernel
+/// back-to-back with **no** intervening drain -- which is the only way to
+/// create a genuine overlap window where a growth-triggered free in
+/// `ScratchPool::ensure` could race a still-in-flight previous launch. A
+/// helper that always reads back immediately (via `dtoh`, which
+/// unconditionally force-synchronizes -- see `CudaRuntime::dtoh`) would drain
+/// the stream after every single call, making such a race structurally
+/// impossible to observe regardless of whether `ensure`'s drain is present.
+struct PendingExecution {
+    buffers: Vec<Option<DeviceBuffer>>,
+    output_buffer: DeviceBuffer,
+    output_shape: [usize; 2],
+    dtype: DataType,
+}
+
+impl PendingExecution {
+    /// Reads back this call's output -- which force-synchronizes first (see
+    /// `CudaRuntime::dtoh`), so by the time this returns every kernel this
+    /// call (and any earlier still-pending call) enqueued has retired -- then
+    /// frees this call's device buffers.
+    fn read_back_and_free(
+        self,
+        ep: &CudaExecutionProvider,
+    ) -> onnx_runtime_ep_api::Result<Vec<f32>> {
+        let runtime = ep.runtime();
+        let output_bytes = self.output_shape[0] * self.output_shape[1] * self.dtype.byte_size();
+        let mut bytes = vec![0u8; output_bytes];
+        // SAFETY: `output_buffer` was sized `output_bytes`.
+        unsafe { runtime.dtoh(&mut bytes, cuptr(self.output_buffer.as_ptr()))? };
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(decode_output_bytes(&bytes, self.dtype))
+    }
+
+    /// Hands this call's device buffers to `ep.deallocate` (the provider's
+    /// deferred-release queue, ordered after this call's completion events --
+    /// see `CudaExecutionProvider::deallocate_with_unmapped`) **without**
+    /// reading the output back and therefore without forcing a drain. Unlike
+    /// `read_back_and_free`, this does not prove the launch has completed by
+    /// the time it returns -- it is used only to release a call's buffers
+    /// through the same safe, event-ordered path production code uses, while
+    /// deliberately leaving open the possibility that the launch is still
+    /// in flight when this returns (e.g. to test dropping the kernel itself
+    /// while a launch may still be outstanding).
+    fn free_without_readback(self, ep: &CudaExecutionProvider) -> onnx_runtime_ep_api::Result<()> {
+        for buffer in self.buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(self.output_buffer)?;
+        Ok(())
+    }
+}
+
+/// Uploads this call's inputs and issues one `execute()` call against an
+/// already-built kernel (unlike `run_gpu_impl`, which builds a fresh kernel
+/// every call), **without** reading the output back -- the returned
+/// [`PendingExecution`] must be read back (via `read_back_and_free`) for the
+/// result to be observed and for its device buffers to be freed.
+fn enqueue_with_existing_kernel(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    case: Case,
+    inputs: &[Option<HostTensor>],
+    dtype: DataType,
+) -> onnx_runtime_ep_api::Result<PendingExecution> {
+    let runtime = ep.runtime();
+    let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+    for input in inputs {
+        if let Some(input) = input {
+            let buffer = ep.allocate(input.bytes.len(), 256)?;
+            // SAFETY: allocation size equals the source tensor byte length.
+            unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+            buffers.push(Some(buffer));
+        } else {
+            buffers.push(None);
+        }
+    }
+    let strides: Vec<_> = inputs
+        .iter()
+        .map(|input| {
+            input
+                .as_ref()
+                .map(|input| compute_contiguous_strides(&input.shape))
+        })
+        .collect();
+    let views: Vec<_> = inputs
+        .iter()
+        .zip(&buffers)
+        .zip(&strides)
+        .enumerate()
+        .map(
+            |(index, ((input, buffer), strides))| match (input, buffer, strides) {
+                (Some(input), Some(buffer), Some(strides)) => TensorView::new(
+                    DevicePtr(buffer.as_ptr()),
+                    input.dtype,
+                    &input.shape,
+                    strides,
+                    ep.device_id(),
+                ),
+                _ => TensorView::absent(absent_dtype(index, dtype)),
+            },
+        )
+        .collect();
+    let output_shape = [case.rows, case.hidden];
+    let output_bytes = case.rows * case.hidden * dtype.byte_size();
+    let mut output_buffer = ep.allocate(output_bytes, 256)?;
+    let output_strides = compute_contiguous_strides(&output_shape);
+    kernel.execute(
+        &views,
+        &mut [TensorMut::new(
+            DevicePtrMut(output_buffer.as_mut_ptr()),
+            dtype,
+            &output_shape,
+            &output_strides,
+            ep.device_id(),
+        )],
+    )?;
+    drop(views);
+    Ok(PendingExecution {
+        buffers,
+        output_buffer,
+        output_shape,
+        dtype,
+    })
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_scratch_pool_regrows_and_shrinks_across_calls_matches_cpu() {
+    // One long-lived kernel instance, exercised with a row-count sequence
+    // that deliberately mixes: growth (1->8), a repeat at the same size
+    // (8->8, no realloc), shrink-without-realloc (8->2), and repeated
+    // re-growth (2->8, 8->16, 16->1, 1->16, 16->2) -- forcing
+    // `ScratchPool::ensure` to free-and-grow its slots (fc1/fc3/activation/
+    // route-output/grouping scratch) many times over the same kernel's
+    // lifetime. Consecutive calls are deliberately enqueued back-to-back with
+    // NO intervening drain/readback (via `enqueue_with_existing_kernel`,
+    // reading back one call behind): a helper that reads back immediately
+    // after every call would force a full stream drain each time (`dtoh`
+    // unconditionally calls `force_synchronize` -- see `CudaRuntime::dtoh`),
+    // which would make it structurally impossible to ever observe a missing
+    // drain in `ScratchPool::ensure`'s growth path, since the previous call's
+    // launches would always have already retired before the next call's
+    // `ensure()` could free anything. With no intervening drain, a call that
+    // triggers growth runs its free-then-realloc while the *previous* call's
+    // launches may genuinely still be in flight -- exactly the precondition a
+    // missing `drain_for_unmap` there would need to actually corrupt data
+    // (via this pool's shared, size-classed, cross-kernel free list handing
+    // the just-freed pointer to a concurrent allocation before the old
+    // launch finishes reading it). Every call's result is still checked
+    // against the CPU oracle: a fast wrong kernel must not pass.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    // Same shape as `qmoe_decode_fused_silu_fc3_matches_cpu`: satisfies the
+    // `fused_gate_up_decode` gate at rows==1, and the grouped path at
+    // rows>1, so both scratch-slot sets (decode vs. grouping) are exercised.
+    let template = Case {
+        experts: 4,
+        rows: 1,
+        hidden: 16,
+        inter: 16,
+        bits: 4,
+        top_k: 2,
+        activation: "silu",
+        swiglu_fusion: 0,
+        affine: true,
+        fc3: true,
+        biases: true,
+        normalize: true,
+        router_weights: false,
+    };
+    let kernel = build_qmoe_kernel(&ep, template, dtype);
+    let mut prior: Option<(Case, Vec<f32>, PendingExecution)> = None;
+    for &rows in &[1usize, 8, 8, 2, 8, 4, 16, 1, 16, 2] {
+        let mut case = template;
+        case.rows = rows;
+        let inputs = case_inputs(case, dtype);
+        let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+        let pending = enqueue_with_existing_kernel(&ep, kernel.as_ref(), case, &inputs, dtype)
+            .unwrap_or_else(|error| panic!("execute failed at rows={rows}: {error}"));
+        // Read back and check the *previous* call now, one call behind: its
+        // launch (and this call's, just issued) may both still be in flight
+        // at this point, since this call's `ensure()` (already run, above)
+        // had no intervening drain forced by the test harness itself.
+        if let Some((prev_case, prev_expected, prev_pending)) = prior.take() {
+            let actual = prev_pending
+                .read_back_and_free(&ep)
+                .unwrap_or_else(|error| {
+                    panic!("readback failed at rows={}: {error}", prev_case.rows)
+                });
+            assert_conforms(&actual, &prev_expected, prev_case, dtype);
+        }
+        prior = Some((case, expected, pending));
+    }
+    // Drain and check the final call too.
+    if let Some((case, expected, pending)) = prior {
+        let actual = pending
+            .read_back_and_free(&ep)
+            .unwrap_or_else(|error| panic!("final readback failed: {error}"));
+        assert_conforms(&actual, &expected, case, dtype);
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_execute_does_not_block_host_for_device_completion() {
+    // Direct regression test for the change under test: a single, uncaptured
+    // `execute()` call on a genuinely slow (memory-bandwidth-bound) grouped
+    // shape must return to the host in a small fraction of the time its own
+    // kernels take to actually finish on the device. This would fail if an
+    // unconditional device sync (`runtime.synchronize`/`force_synchronize`)
+    // were reintroduced at the end of `execute()`, independent of any queue-
+    // depth effects from batching (this test uses `batch=1`, one call per
+    // sample, each rep separated by a real drain).
+    let ep = require_cuda();
+    let runtime = ep.runtime();
+    let dtype = DataType::Float16;
+    let case = moe_bench_case(GLM_5_2_MOE, 8);
+    let inputs = fast_case_inputs(case, dtype);
+    let setup = setup_gemv_bench(&ep, case, dtype, &inputs).unwrap();
+
+    // batch=1: `median_us` cannot mask a reintroduced blocking sync behind
+    // queue-depth pipelining across many launches per sample.
+    let (median_gpu_us, median_host_us, _) = median_us(&setup, runtime, 10, 1);
+
+    assert!(
+        median_gpu_us > 500.0,
+        "expected a genuinely slow grouped-path sample to give this test signal, got \
+         median_gpu_us={median_gpu_us:.1}"
+    );
+    assert!(
+        median_host_us < median_gpu_us * 0.5,
+        "execute() appears to block the host for device completion: \
+         median_host_us={median_host_us:.3} is not a small fraction of \
+         median_gpu_us={median_gpu_us:.3} (an unconditional device sync at the end of \
+         execute() would make these converge)"
+    );
+
+    setup.teardown(&ep).unwrap();
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn qmoe_drop_after_inflight_launch_leaves_runtime_usable() {
+    // `Drop for QMoEKernel` now performs its own best-effort drain before
+    // freeing scratch (since `execute()` no longer syncs on every call, a
+    // just-issued launch may still be in flight when the kernel is dropped).
+    // Build a kernel, issue a heavy async call, drop the kernel immediately
+    // without waiting on it, then prove the runtime/stream is still correct
+    // for a completely independent subsequent operation -- both a fresh
+    // QMoE kernel and a plain host<->device round trip.
+    //
+    // Deliberately do NOT read the call's output back before dropping: `dtoh`
+    // unconditionally force-synchronizes (see `CudaRuntime::dtoh`), which
+    // would guarantee the launch has already retired by the time `drop(kernel)`
+    // runs -- making this test unable to ever exercise the case its name
+    // describes. `free_without_readback` releases the call's buffers through
+    // the provider's own deferred-release queue (event-ordered, not a raw
+    // synchronous free) without forcing that drain, so the launch may
+    // genuinely still be in flight when the kernel is dropped.
+    let ep = require_cuda();
+    let dtype = DataType::Float16;
+    let template = qmoe_64expert_case(64);
+    {
+        let kernel = build_qmoe_kernel(&ep, template, dtype);
+        let inputs = case_inputs(template, dtype);
+        let pending =
+            enqueue_with_existing_kernel(&ep, kernel.as_ref(), template, &inputs, dtype).unwrap();
+        pending.free_without_readback(&ep).unwrap();
+        // Immediately drop the kernel -- its heavy grouped launch may well
+        // still be in flight on the stream at this point.
+        drop(kernel);
+    }
+
+    // The runtime must still be correct for an unrelated follow-up op.
+    let runtime = ep.runtime();
+    let probe_bytes: Vec<u8> = (0u8..=255).collect();
+    let buffer = ep.allocate(probe_bytes.len(), 256).unwrap();
+    // SAFETY: allocation size equals `probe_bytes.len()`.
+    unsafe { runtime.htod(&probe_bytes, cuptr(buffer.as_ptr())).unwrap() };
+    let mut readback = vec![0u8; probe_bytes.len()];
+    // SAFETY: `buffer` was sized `probe_bytes.len()`.
+    unsafe { runtime.dtoh(&mut readback, cuptr(buffer.as_ptr())).unwrap() };
+    assert_eq!(
+        readback, probe_bytes,
+        "runtime state corrupted after kernel drop"
+    );
+    ep.deallocate(buffer).unwrap();
+
+    // And a fresh QMoE kernel on the same runtime must still compute
+    // correctly (proves the stream itself is still healthy, not just plain
+    // htod/dtoh).
+    let case = qmoe_64expert_case(8);
+    let inputs = case_inputs(case, dtype);
+    let expected = run_cpu(case, &rounded_cpu_inputs(&inputs, dtype));
+    let actual = run_gpu(&ep, case, &inputs, dtype).unwrap();
+    assert_conforms(&actual, &expected, case, dtype);
 }
