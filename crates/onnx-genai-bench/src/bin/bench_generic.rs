@@ -839,8 +839,9 @@ fn host_fields(host: &onnx_runtime_hostmon::Contention) -> String {
         "BOUNDED"
     };
     format!(
-        "host_foreign={} host_busy={:.1} host={verdict}",
+        "host_foreign={} host_sib={} host_busy={:.1} host={verdict}",
         onnx_runtime_hostmon::foreign_column(std::slice::from_ref(host)),
+        onnx_runtime_hostmon::sibling_column(std::slice::from_ref(host)),
         host.total_pct,
     )
 }
@@ -1448,12 +1449,16 @@ mod host_fields_tests {
     use super::*;
     use onnx_runtime_hostmon::Contention;
 
+    /// A reading on the `foreign_pct` axis, with the sibling axis pinned quiet
+    /// and known so that each test moves one variable.
     fn reading(foreign_pct: f64, own_time_complete: bool) -> Contention {
         Contention {
             foreign_pct,
             total_pct: 100.0,
             measured: true,
             own_time_complete,
+            sibling_peak_pct: 0.0,
+            siblings_known: true,
         }
     }
 
@@ -1507,6 +1512,50 @@ mod host_fields_tests {
                 "complete={complete}: {cell}"
             );
         }
+    }
+
+    /// The case `host_foreign` alone renders as a clean row.
+    ///
+    /// A co-runner on the SMT sibling of a core we own outright consumes none of
+    /// our confined set, so `foreign_pct` is genuinely zero while a decode
+    /// worker runs at half speed -- and a dispatch is a barrier, so the whole
+    /// dispatch pays it. Without the sibling term this row reads `CLEAN`.
+    #[test]
+    fn a_busy_sibling_condemns_a_row_whose_own_cores_are_quiet() {
+        let cell = host_fields(&Contention {
+            sibling_peak_pct: 97.0,
+            ..reading(0.0, true)
+        });
+        assert!(
+            cell.contains("host=CONTENDED"),
+            "a saturated sibling is contention even at foreign_pct 0: {cell}"
+        );
+        assert!(cell.contains("host_foreign=0.0"), "{cell}");
+        assert!(cell.contains("host_sib=97.0"), "{cell}");
+    }
+
+    /// Unreadable topology is `BOUNDED`, and says which term is missing.
+    ///
+    /// Restricted `/sys` in a container leaves the sibling set unknown while
+    /// `/proc/stat` still reads, so the foreign term is measured and the sibling
+    /// term is not. That cannot certify quiet -- but the reader has to be able to
+    /// see *why* a row with a low foreign figure refuses to be CLEAN, or the
+    /// verdict looks like a bug.
+    #[test]
+    fn unknown_topology_shows_the_missing_term_rather_than_an_unexplained_verdict() {
+        let cell = host_fields(&Contention {
+            siblings_known: false,
+            ..reading(0.4, true)
+        });
+        assert!(cell.contains("host=BOUNDED"), "{cell}");
+        assert!(
+            cell.contains("host_sib=n/a"),
+            "the unmeasured term has to be visible next to the verdict it caused: {cell}"
+        );
+        assert!(
+            !cell.contains("host_sib=0.0"),
+            "an unread sibling set must never print as a quiet zero: {cell}"
+        );
     }
 }
 
