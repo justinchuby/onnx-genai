@@ -3370,6 +3370,42 @@ fn index_share_mirrors_query_and_present_kv() {
 }
 
 #[test]
+fn kv_cache_capacity_append_reports_past_capacity_not_a_grown_concat() {
+    // The capacity write is in place and `present` aliases `past`, so the
+    // output keeps `past`'s shape even though `current` contributes tokens.
+    // The `Concat` this op replaces would report `S_past + S_cur` (7 + 1 = 8)
+    // for the same inputs, so 7-not-8 is the whole contract.
+    let n = with_domain(node("KvCacheCapacityAppend", 3, 1), "pkg.nxrt");
+    let outs = run(
+        &n,
+        vec![
+            f32in(vec![sym(0), c(2), c(7), c(24)]),
+            f32in(vec![sym(0), c(2), c(1), c(24)]),
+            tin(DataType::Int64, vec![sym(0), c(1)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(0), c(2), c(7), c(24)]);
+    assert_eq!(out_dtype(&outs), DataType::Float32);
+
+    // Shape and dtype both come from `past`, not from a fixed KV geometry and
+    // not from `current`. The dtypes differ deliberately: a capacity-backed
+    // cache may store `past` at a lower precision than the freshly computed
+    // `current`, and `present` aliases the storage, so f16 is the answer.
+    let outs = run(
+        &n,
+        vec![
+            tin(DataType::Float16, vec![sym(1), c(5), c(512), c(80)]),
+            tin(DataType::Float32, vec![sym(1), c(5), c(4), c(80)]),
+            tin(DataType::Int64, vec![sym(1), c(4)]),
+        ],
+        1,
+    );
+    assert_eq!(out_shape(&outs), vec![sym(1), c(5), c(512), c(80)]);
+    assert_eq!(out_dtype(&outs), DataType::Float16);
+}
+
+#[test]
 fn varlen_attention_preserves_packed_query_geometry() {
     let n = with_domain(node("VarlenAttention", 5, 1), "pkg.nxrt");
     let outs = run(
