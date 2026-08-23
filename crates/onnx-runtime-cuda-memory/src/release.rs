@@ -442,6 +442,10 @@ pub enum DriverOperation {
     Unmap,
     Remap,
     Dispose,
+    /// `cuMemSetAccess`. Only meaningful to the granule-transition primitive's
+    /// Phase 8, which is the only caller that grants access as a step
+    /// distinct from mapping.
+    SetAccess,
 }
 
 impl DriverOperation {
@@ -451,6 +455,7 @@ impl DriverOperation {
             Self::Unmap => "cuMemUnmap",
             Self::Remap => "cuMemMap",
             Self::Dispose => "cuMemRelease",
+            Self::SetAccess => "cuMemSetAccess",
         }
     }
 }

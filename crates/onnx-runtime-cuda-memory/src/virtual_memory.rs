@@ -2702,6 +2702,23 @@ impl CudaReservation {
         &self.quarantined
     }
 
+    /// Record `block` as quarantined: its handle is no longer trusted to be
+    /// mapped or unmapped cleanly, so it is retained here rather than either
+    /// reused or dropped on the floor.
+    ///
+    /// Used by the granule-transition primitive when a driver operation
+    /// leaves a handle's mapping state ambiguous (e.g. a new-map failure
+    /// whose old-mapping restore also fails): the handle must never re-enter
+    /// a reuse pool, and this reservation's own `Drop`/accounting must be
+    /// told about it so it is not silently lost.
+    ///
+    /// Also removes `block` from the mapped-blocks list if present, since a
+    /// quarantined block is by definition no longer trusted as mapped.
+    pub fn push_quarantined_block(&mut self, block: crate::release::MappedBlock) {
+        self.blocks.retain(|b| *b != block);
+        self.quarantined.push(block);
+    }
+
     /// Blocks mapped right now.
     pub fn mapped_blocks(&self) -> &[MappedBlock] {
         &self.blocks

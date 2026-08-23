@@ -109,14 +109,49 @@ pub enum TransitionOutcome {
     /// Refused because safe-point became invalid before the commit.
     /// Stable VA unchanged and all original mappings intact.
     Rejected { reason: &'static str },
-    /// Failure occurred before the stable-VA switch; rollback succeeded.
-    /// Stable VA unchanged and all original mappings intact.
+    /// Failure occurred with **zero** side effects on the stable VA: the old
+    /// mapping, its content, and its accounting are all exactly as they were
+    /// before this call. This is the *only* condition under which
+    /// `RolledBack` is returned — a partial commit or an ambiguous restore
+    /// is always `Fatal`, never `RolledBack`.
     RolledBack { fault: DriverFault },
-    /// Failure AND rollback also failed. VA range is permanently unusable.
+    /// A driver failure left this range in a state that cannot be reported as
+    /// fully rolled back: some granules may have committed to the new
+    /// backing, and/or a handle's mapping state could not be proven either
+    /// mapped or unmapped.
+    ///
+    /// This is not "the whole range is unusable" — the committed prefix and
+    /// the untouched suffix are reported exactly, so a caller can decide what
+    /// remains safely usable. Only [`Fatal::poisoned_range`] identifies bytes
+    /// that must never be read/written again.
     Fatal {
+        /// The failure that interrupted the transition.
         transition_fault: DriverFault,
-        rollback_fault: DriverFault,
+        /// The failure encountered while attempting to restore the old
+        /// mapping, if a restore was attempted. `None` when no restore was
+        /// attempted (e.g. the failure occurred with committed_count == 0
+        /// but at a point where restore was not applicable — should not
+        /// occur in practice, but kept `Option` for honesty).
+        rollback_fault: Option<DriverFault>,
+        /// Exact number of granules (from the start of the requested range)
+        /// that successfully switched to the new backing before the failure.
+        /// `reservation`'s block list already reflects this split: granules
+        /// `[0, committed_count)` are on the new backing, the remainder is
+        /// either still on the old backing (readable) or poisoned (see
+        /// `poisoned_range`).
+        committed_count: usize,
+        /// Physical handles whose ownership/mapping state is no longer
+        /// trusted (a mapping attempt AND its restore both failed, or a
+        /// handle could not be safely returned). These are also recorded in
+        /// `reservation`'s own `quarantined_blocks()` — this list is a copy
+        /// for the caller's immediate inspection, not a second authority.
         quarantined: Vec<MappedBlock>,
+        /// `Some((offset, len))` identifying a byte range within the request
+        /// whose content is no longer proven readable (its handle's mapping
+        /// state is ambiguous) — the caller must never route through this
+        /// range again. `None` when every granule outside the committed
+        /// prefix remains provably readable on its original backing.
+        poisoned_range: Option<(usize, usize)>,
     },
 }
 
@@ -124,8 +159,25 @@ impl TransitionOutcome {
     pub fn is_committed(&self) -> bool {
         matches!(self, Self::Committed { .. })
     }
+
+    /// Whether the *entire requested range* remains exactly as it was before
+    /// the call (no commit, no poison, no quarantine). `RolledBack` is the
+    /// only outcome besides `Rejected`/`Committed` (0 granules) for which
+    /// this is `true`.
     pub fn stable_va_intact(&self) -> bool {
-        !matches!(self, Self::Fatal { .. })
+        matches!(self, Self::RolledBack { .. } | Self::Rejected { .. })
+            || matches!(self, Self::Committed { granules: 0, .. })
+    }
+
+    /// Whether any part of the requested range is no longer safely readable.
+    pub fn has_poisoned_range(&self) -> bool {
+        matches!(
+            self,
+            Self::Fatal {
+                poisoned_range: Some(_),
+                ..
+            }
+        )
     }
 }
 
@@ -161,8 +213,81 @@ pub fn transition_granule_range(
     new_location: PhysicalLocation,
     old_pool: &Arc<PhysicalHandlePool>,
     new_pool: &Arc<PhysicalHandlePool>,
+    safe_point: &VerifiedSafePoint,
+    recheck_safe_point: impl Fn() -> ResizeSafePoint,
+) -> TransitionOutcome {
+    transition_granule_range_inner(
+        runtime,
+        reservation,
+        backing,
+        offset,
+        len,
+        new_location,
+        old_pool,
+        new_pool,
+        safe_point,
+        recheck_safe_point,
+        #[cfg(any(test, feature = "gpu-tests"))]
+        None,
+    )
+}
+
+/// Test-only entry point identical to [`transition_granule_range`] but with a
+/// [`onnx_runtime_cuda_memory::release::DriverFaultPlan`] that can force any
+/// individual Phase-8 `cuMemUnmap`/`cuMemMap`/`cuMemSetAccess` call (by 1-based
+/// call count across the whole Phase 8 loop, per operation) to fail
+/// deterministically, so `RolledBack`/`Fatal` classification, `committed_count`,
+/// quarantine population, and leak-freedom can be proven for granule 0 and
+/// later granules without relying on real, non-reproducible driver failures.
+///
+/// Not reachable from production: the parameter only exists under
+/// `#[cfg(any(test, feature = "gpu-tests"))]`, mirroring the pattern already
+/// used by [`onnx_runtime_cuda_memory::virtual_memory::CudaVirtualBacking::with_driver_faults`].
+#[cfg(any(test, feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+pub fn transition_granule_range_with_phase8_faults(
+    runtime: &CudaRuntime,
+    reservation: &mut CudaReservation,
+    backing: &CudaVirtualBacking,
+    offset: usize,
+    len: usize,
+    new_location: PhysicalLocation,
+    old_pool: &Arc<PhysicalHandlePool>,
+    new_pool: &Arc<PhysicalHandlePool>,
+    safe_point: &VerifiedSafePoint,
+    recheck_safe_point: impl Fn() -> ResizeSafePoint,
+    phase8_faults: Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>,
+) -> TransitionOutcome {
+    transition_granule_range_inner(
+        runtime,
+        reservation,
+        backing,
+        offset,
+        len,
+        new_location,
+        old_pool,
+        new_pool,
+        safe_point,
+        recheck_safe_point,
+        Some(phase8_faults),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn transition_granule_range_inner(
+    runtime: &CudaRuntime,
+    reservation: &mut CudaReservation,
+    backing: &CudaVirtualBacking,
+    offset: usize,
+    len: usize,
+    new_location: PhysicalLocation,
+    old_pool: &Arc<PhysicalHandlePool>,
+    new_pool: &Arc<PhysicalHandlePool>,
     _safe_point: &VerifiedSafePoint,
     recheck_safe_point: impl Fn() -> ResizeSafePoint,
+    #[cfg(any(test, feature = "gpu-tests"))] phase8_faults: Option<
+        Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>,
+    >,
 ) -> TransitionOutcome {
     // ── Phase 0: argument validation ─────────────────────────────────────────
     if len == 0 {
@@ -373,10 +498,74 @@ pub fn transition_granule_range(
 
     // ── Phase 8: per-granule atomic switch ────────────────────────────────────
     // All driver calls are inside one synchronizing_section (device-syncing ops).
+    //
+    // Every failure branch below must resolve to exactly one of:
+    //   - RolledBack: only when committed_count == 0 AND the old mapping/
+    //     access for the interrupted granule is proven restored (or never
+    //     touched). No handle is quarantined, no range is poisoned.
+    //   - Fatal: whenever committed_count > 0 (a real prefix already
+    //     switched, so the whole-range "old mapping intact" claim of
+    //     RolledBack would be false) OR whenever this granule's own mapping
+    //     state could not be proven either "new" or "restored old"
+    //     (poisoned_range is set for exactly that granule, never the whole
+    //     range, so untouched granules after it are correctly reported as
+    //     still old-backed and readable).
     let mut committed_count = 0usize;
     let mut total_new_owned: u64 = 0;
     let mut total_old_released: u64 = 0;
-    let mut fatal: Option<(DriverFault, DriverFault)> = None;
+
+    // Populated only on a Fatal exit from the loop below.
+    struct FatalState {
+        transition_fault: DriverFault,
+        rollback_fault: Option<DriverFault>,
+        quarantined: Vec<MappedBlock>,
+        poisoned_range: Option<(usize, usize)>,
+    }
+    let mut fatal: Option<FatalState> = None;
+
+    // Set device access at `addr`; returns whether it succeeded.
+    let set_access = |addr: CUdeviceptr| -> bool {
+        let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
+        access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id = device_ordinal;
+        access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        unsafe { cu::cuMemSetAccess(addr, granularity, &access, 1) == cu::CUresult::CUDA_SUCCESS }
+    };
+
+    // Deterministic fault injection (test/gpu-tests builds only): records one
+    // call of `op` against `phase8_faults` and reports whether it must be
+    // failed instead of issuing the real driver call. Every real Phase-8
+    // driver call below is routed through the matching `*_checked` helper so
+    // a scheduled fault always take effect regardless of which granule (0 or
+    // later) or which call site it targets.
+    #[cfg(any(test, feature = "gpu-tests"))]
+    let should_inject = |op: onnx_runtime_cuda_memory::release::DriverOperation| -> bool {
+        phase8_faults
+            .as_ref()
+            .is_some_and(|plan| plan.should_fail(op))
+    };
+
+    let unmap_checked = |addr: CUdeviceptr| -> bool {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if should_inject(onnx_runtime_cuda_memory::release::DriverOperation::Unmap) {
+            return false;
+        }
+        unsafe { cu::cuMemUnmap(addr, granularity) == cu::CUresult::CUDA_SUCCESS }
+    };
+    let map_checked = |addr: CUdeviceptr, handle: cu::CUmemGenericAllocationHandle| -> bool {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if should_inject(onnx_runtime_cuda_memory::release::DriverOperation::Remap) {
+            return false;
+        }
+        unsafe { cu::cuMemMap(addr, granularity, 0, handle, 0) == cu::CUresult::CUDA_SUCCESS }
+    };
+    let set_access_checked = |addr: CUdeviceptr| -> bool {
+        #[cfg(any(test, feature = "gpu-tests"))]
+        if should_inject(onnx_runtime_cuda_memory::release::DriverOperation::SetAccess) {
+            return false;
+        }
+        set_access(addr)
+    };
 
     {
         let _section = capture_gate::synchronizing_section();
@@ -388,150 +577,152 @@ pub fn transition_granule_range(
             let stable_addr = stable_base + stable_offset as u64;
             let staging_addr = staging_base + (i * granularity) as u64;
 
-            // (a) Unmap old from stable VA.
-            if unsafe { cu::cuMemUnmap(stable_addr, granularity) } != cu::CUresult::CUDA_SUCCESS {
-                // Old mapping intact. Unmap remaining staging handles.
+            // Common cleanup for every abort path: unmap all remaining
+            // staging mappings from `i` onward and return the still-staged
+            // new handles that will not be used.
+            let cleanup_remaining_staging_and_new = || {
                 for j in i..granule_count {
                     unsafe {
                         let _ =
                             cu::cuMemUnmap(staging_base + (j * granularity) as u64, granularity);
                     }
                 }
-                // Return remaining new handles.
                 for &(handle, _) in &new_handles[i..] {
                     new_pool.return_handle_unmapped(handle);
                 }
+            };
+
+            // (a) Unmap old from stable VA.
+            if !unmap_checked(stable_addr) {
+                // `cuMemUnmap` failed *before* any mutation: the driver never
+                // touched this mapping, so it is provably still old-backed
+                // and readable, exactly as documented for `RolledBack`. This
+                // fixes finding #3: this branch previously always reported
+                // `Fatal`, unlike the equivalent zero-side-effect failures in
+                // branches (b)/(c) below.
+                cleanup_remaining_staging_and_new();
                 let fault = DriverFault::new("cuMemUnmap (old, stable VA)", format!("granule {i}"));
                 if committed_count == 0 {
-                    fatal = Some((fault.clone(), fault));
-                } else {
-                    // Some committed; some still on old backing. Fatal partial state.
-                    fatal = Some((
-                        fault.clone(),
-                        DriverFault::new(
-                            "partial-committed-rollback-impossible",
-                            format!(
-                                "{committed_count} granules already switched, remaining on old backing"
-                            ),
-                        ),
-                    ));
+                    drop(_section);
+                    drop(staging_reservation);
+                    return TransitionOutcome::RolledBack { fault };
                 }
+                // A real prefix already switched to the new backing, so the
+                // whole-range "nothing changed" claim of RolledBack would be
+                // false. Report Fatal with the exact committed prefix; the
+                // interrupted granule and everything after it is untouched
+                // and remains readable on the old backing (poisoned_range is
+                // None — fixes finding #1/#2: no ambiguity, no empty
+                // quarantine claim, and the caller can see exactly how much
+                // committed).
+                fatal = Some(FatalState {
+                    transition_fault: fault,
+                    rollback_fault: None,
+                    quarantined: Vec::new(),
+                    poisoned_range: None,
+                });
                 break 'granules;
             }
 
             // (b) Map new at stable VA (double-mapping: staging + stable).
-            if unsafe { cu::cuMemMap(stable_addr, granularity, 0, new_handle, 0) }
-                != cu::CUresult::CUDA_SUCCESS
-            {
-                // Stable VA is UNMAPPED. Try to restore old mapping.
-                let restore = unsafe { cu::cuMemMap(stable_addr, granularity, 0, old_handle, 0) };
+            if !map_checked(stable_addr, new_handle) {
+                // Stable VA is UNMAPPED. Try to restore the old mapping.
                 let transition_fault =
                     DriverFault::new("cuMemMap (new, stable VA)", format!("granule {i}"));
-                if restore != cu::CUresult::CUDA_SUCCESS {
-                    // Restore also failed. Fatal.
-                    for j in i..granule_count {
-                        unsafe {
-                            let _ = cu::cuMemUnmap(
-                                staging_base + (j * granularity) as u64,
-                                granularity,
-                            );
-                        }
+                let restore_map_ok = map_checked(stable_addr, old_handle);
+                let restore_ok = restore_map_ok && set_access_checked(stable_addr);
+
+                cleanup_remaining_staging_and_new();
+
+                if !restore_ok {
+                    // Neither the new mapping nor the restore succeeded: the
+                    // stable VA at this offset is either unmapped or mapped
+                    // without correct access — not provably readable. This is
+                    // the true handle/mapping ambiguity (finding #4). Fix:
+                    // never silently drop `old_handle` here, and never route
+                    // it back through `old_pool` (which would either put it
+                    // back in the reuse pool for some unrelated future
+                    // caller, or `cuMemRelease` it outright) — either would
+                    // desync `reservation.quarantined` from the handle's
+                    // real, driver-visible ownership. The reservation's own
+                    // quarantine authority (not the pool, not a second
+                    // authority) is the sole owner of an ambiguous handle
+                    // from this point on.
+                    //
+                    // If the map itself succeeded but access failed, the
+                    // mapping must first be torn down so `old_handle` is not
+                    // simultaneously mapped at `stable_addr` AND quarantined.
+                    if restore_map_ok {
+                        let _ = unsafe { cu::cuMemUnmap(stable_addr, granularity) };
                     }
-                    for &(handle, _) in &new_handles[i..] {
-                        new_pool.return_handle_unmapped(handle);
-                    }
-                    fatal = Some((
+                    reservation.push_quarantined_block(old_block);
+                    let poisoned = MappedBlock::new(stable_offset, granularity, old_handle);
+                    fatal = Some(FatalState {
                         transition_fault,
-                        DriverFault::new(
+                        rollback_fault: Some(DriverFault::new(
                             "cuMemMap (restore old, stable VA)",
                             format!("granule {i}: restore also failed"),
-                        ),
-                    ));
+                        )),
+                        quarantined: vec![poisoned],
+                        poisoned_range: Some((stable_offset, granularity)),
+                    });
                     break 'granules;
                 }
-                // Restored old handle at stable VA. Set access.
-                let mut old_access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
-                old_access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-                old_access.location.id = device_ordinal;
-                old_access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                let _ = unsafe { cu::cuMemSetAccess(stable_addr, granularity, &old_access, 1) };
-                // Unmap remaining staging, return new handles.
-                for j in i..granule_count {
-                    unsafe {
-                        let _ =
-                            cu::cuMemUnmap(staging_base + (j * granularity) as u64, granularity);
-                    }
-                }
-                for &(handle, _) in &new_handles[i..] {
-                    new_pool.return_handle_unmapped(handle);
-                }
+
+                // Old mapping (+ access) fully restored: granule i is exactly
+                // as it was before this call.
                 if committed_count == 0 {
-                    // Clean rollback; return RolledBack.
-                    // Drop staging before returning.
                     drop(_section);
                     drop(staging_reservation);
                     return TransitionOutcome::RolledBack {
                         fault: transition_fault,
                     };
                 }
-                fatal = Some((
+                fatal = Some(FatalState {
                     transition_fault,
-                    DriverFault::new(
-                        "partial-committed",
-                        format!("{committed_count} committed before rollback at granule {i}"),
-                    ),
-                ));
+                    rollback_fault: None,
+                    quarantined: Vec::new(),
+                    poisoned_range: None,
+                });
                 break 'granules;
             }
 
             // (c) Set device access at stable VA for the new handle.
-            let mut access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
-            access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-            access.location.id = device_ordinal;
-            access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-            if unsafe { cu::cuMemSetAccess(stable_addr, granularity, &access, 1) }
-                != cu::CUresult::CUDA_SUCCESS
-            {
-                // New handle mapped at stable VA but no access. Unmap new, re-map old.
-                let _ = unsafe { cu::cuMemUnmap(stable_addr, granularity) };
-                let restore = unsafe { cu::cuMemMap(stable_addr, granularity, 0, old_handle, 0) };
+            if !set_access_checked(stable_addr) {
+                // New handle mapped at stable VA but access denied. Unmap
+                // new, re-map old, restore old's access.
+                let _ = unmap_checked(stable_addr);
                 let transition_fault =
                     DriverFault::new("cuMemSetAccess (new, stable VA)", format!("granule {i}"));
-                if restore != cu::CUresult::CUDA_SUCCESS {
-                    for j in i..granule_count {
-                        unsafe {
-                            let _ = cu::cuMemUnmap(
-                                staging_base + (j * granularity) as u64,
-                                granularity,
-                            );
-                        }
+                let restore_map_ok = map_checked(stable_addr, old_handle);
+                let restore_ok = restore_map_ok && set_access_checked(stable_addr);
+
+                cleanup_remaining_staging_and_new();
+
+                if !restore_ok {
+                    // Same handle-ambiguity fix as case (b): the mapping
+                    // state of `old_handle` is no longer trusted, so it must
+                    // go through the reservation's own quarantine authority
+                    // exclusively — never also through `old_pool` (which
+                    // would either recycle it to an unrelated caller or
+                    // `cuMemRelease` it, desyncing pool/reservation state).
+                    if restore_map_ok {
+                        let _ = unmap_checked(stable_addr);
                     }
-                    for &(handle, _) in &new_handles[i..] {
-                        new_pool.return_handle_unmapped(handle);
-                    }
-                    fatal = Some((
+                    reservation.push_quarantined_block(old_block);
+                    let poisoned = MappedBlock::new(stable_offset, granularity, old_handle);
+                    fatal = Some(FatalState {
                         transition_fault,
-                        DriverFault::new(
-                            "cuMemMap (restore old after set-access fail)",
+                        rollback_fault: Some(DriverFault::new(
+                            "cuMemMap/cuMemSetAccess (restore old after set-access fail)",
                             format!("granule {i}"),
-                        ),
-                    ));
+                        )),
+                        quarantined: vec![poisoned],
+                        poisoned_range: Some((stable_offset, granularity)),
+                    });
                     break 'granules;
                 }
-                let mut old_access: cu::CUmemAccessDesc = unsafe { std::mem::zeroed() };
-                old_access.location.type_ = cu::CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE;
-                old_access.location.id = device_ordinal;
-                old_access.flags = cu::CUmemAccess_flags::CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                let _ = unsafe { cu::cuMemSetAccess(stable_addr, granularity, &old_access, 1) };
-                for j in i..granule_count {
-                    unsafe {
-                        let _ =
-                            cu::cuMemUnmap(staging_base + (j * granularity) as u64, granularity);
-                    }
-                }
-                for &(handle, _) in &new_handles[i..] {
-                    new_pool.return_handle_unmapped(handle);
-                }
+
                 if committed_count == 0 {
                     drop(_section);
                     drop(staging_reservation);
@@ -539,13 +730,12 @@ pub fn transition_granule_range(
                         fault: transition_fault,
                     };
                 }
-                fatal = Some((
+                fatal = Some(FatalState {
                     transition_fault,
-                    DriverFault::new(
-                        "partial-committed-after-access-fail",
-                        format!("{committed_count} committed before rollback"),
-                    ),
-                ));
+                    rollback_fault: None,
+                    quarantined: Vec::new(),
+                    poisoned_range: None,
+                });
                 break 'granules;
             }
 
@@ -571,11 +761,13 @@ pub fn transition_granule_range(
 
     drop(staging_reservation);
 
-    if let Some((tf, rf)) = fatal {
+    if let Some(state) = fatal {
         return TransitionOutcome::Fatal {
-            transition_fault: tf,
-            rollback_fault: rf,
-            quarantined: Vec::new(),
+            transition_fault: state.transition_fault,
+            rollback_fault: state.rollback_fault,
+            committed_count,
+            quarantined: state.quarantined,
+            poisoned_range: state.poisoned_range,
         };
     }
 
