@@ -222,8 +222,21 @@ scripts/hostlock.sh run --owner leon \
 ```
 
 `run` is the form to use: it releases on success, on failure and on Ctrl-C.
+It is held by the harness for the whole run, so an interleaved A/B/null keeps
+the lock across every arm — sampling `ps` between two arms of someone else's
+A/B is how a host was declared free while a sweep was mid-flight.
 `--gate N` additionally waits for the *instantaneous runnable count* to fall to
 N before starting, which drains load from people who never took the lock.
+
+`SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
+directory behind. Nothing wedges: the lock carries its holder's pid **and**
+that pid's start time, and the next acquirer reclaims it as soon as that
+process is gone — including the case where the holder is a zombie its parent
+never reaped, which still resolves in `/proc`. The same is true of the
+internal guard that serialises reclaiming, so there is no state a kill can
+leave that requires a human with `rm -rf`. If you want to see it before
+trusting it: `hostlock.sh status` distinguishes FREE / HELD / STALE /
+EXPIRED, and `provenance` prints who holds it and since when.
 
 The lock and the gate decide whether to **start**. They cannot tell you
 afterwards whether the numbers are any good, because they sample instants: a

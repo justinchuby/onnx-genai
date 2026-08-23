@@ -27,7 +27,15 @@
 //!
 //! Platform: A100-SXM4-80GB, Linux, driver 580.105.08, CUDA 13.0,
 //! host_numa_id=3, granularity=2 MiB.
-
+//!
+//! Requires the `gpu-tests` feature. This file imports fault-injection helpers
+//! that the library gates on `#[cfg(any(test, feature = "gpu-tests"))]`, and an
+//! integration test is a separate compilation unit, so the library's `cfg(test)`
+//! does not apply to it — only the feature does. Without this guard, a plain
+//! `cargo test -p onnx-runtime-ep-cuda` (or CI's `cargo test --no-run`) fails to
+//! compile the whole target with an unresolved import, which is not a useful
+//! signal about a suite that cannot run on a machine with no GPU anyway.
+#![cfg(feature = "gpu-tests")]
 #![allow(
     clippy::too_many_arguments,
     clippy::uninlined_format_args,
