@@ -890,9 +890,20 @@ impl SpmdDecodePools {
                     && ready_since.elapsed() >= pool_ready_timeout()
                 {
                     let ready = shared.ready.load(Ordering::Acquire);
-                    // Best effort: let whatever workers did start leave their
-                    // loops rather than linger behind the panic.
-                    shared.shutdown.store(true, Ordering::Release);
+                    // Release the workers that *did* start, using the same
+                    // publish-then-wake sequence as `shutdown()`: the stop flag
+                    // alone is not enough, because a worker already parked on
+                    // the futex never re-reads it and would linger for the life
+                    // of the process. Deliberately not joined -- a build that
+                    // failed this way may have a wedged worker, and blocking on
+                    // it here would reintroduce exactly the unbounded wait this
+                    // backstop exists to remove. Woken threads exit on their
+                    // own; the panic does not wait for them.
+                    shared.shutdown.store(true, Ordering::SeqCst);
+                    for sense in &shared.node_sense {
+                        sense.0.fetch_add(1, Ordering::Release);
+                        atomic_wait::wake_all(&sense.0);
+                    }
                     panic!(
                         "persistent SPMD decode pool never became ready: {ready} of \
                          {total_threads} workers announced within {:?}. \
@@ -3345,6 +3356,118 @@ mod tests {
                 .join()
                 .unwrap_or(false)
             })
+    }
+
+    /// A failed build must not leave its surviving workers running.
+    ///
+    /// The backstop's whole purpose is to stop holding a machine, so panicking
+    /// while leaving parked or spinning workers behind would only relocate the
+    /// defect. Runs in a child process because thread identity cannot be
+    /// established in-process: `/proc/<pid>/task/*/comm` truncates at 15 bytes,
+    /// so every worker of every pool reports the same `onnx-genai-spmd`, and a
+    /// concurrently-running test's pool is indistinguishable from this one's.
+    /// A child owns all of its threads, which makes the count exact.
+    const READY_LEAK_CHILD_ENV: &str = "ONNX_GENAI_TEST_READY_LEAK_CHILD";
+
+    /// Threads in this process whose name marks them as SPMD decode workers.
+    ///
+    /// The 15-byte `comm` truncation is why this is a prefix test and why it is
+    /// only sound in a single-pool process.
+    #[cfg(target_os = "linux")]
+    fn live_spmd_worker_threads() -> usize {
+        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                std::fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|comm| comm.trim_end().starts_with("onnx-genai-spmd"))
+            })
+            .count()
+    }
+
+    #[test]
+    #[ignore = "child process driven by a_failed_build_leaves_no_workers_running"]
+    #[cfg(target_os = "linux")]
+    fn ready_leak_child() {
+        if std::env::var(READY_LEAK_CHILD_ENV).is_err() {
+            return;
+        }
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(250));
+        FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(3));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 6,
+                }],
+                DecodeSchedule::Fixed,
+                false,
+            )
+        });
+        std::panic::set_hook(previous);
+        assert!(outcome.is_err(), "the injected fault must fail the build");
+
+        // Poll rather than sleep a fixed interval: the claim is that they leave,
+        // not that they leave within one arbitrary instant. A worker that is
+        // parked on the futex and never woken never leaves, so this reports the
+        // steady state either way.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut live = live_spmd_worker_threads();
+        while live > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            live = live_spmd_worker_threads();
+        }
+        println!("spmd_threads_after={live}");
+    }
+
+    /// Panicking is not enough: the workers that did start have to go away.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
+    fn a_failed_build_leaves_no_workers_running() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("decode_spmd::tests::ready_leak_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(READY_LEAK_CHILD_ENV, "1")
+            // Park immediately. A worker still in its spin ramp would drift out
+            // on the stop flag alone, which would let a build that never wakes
+            // anyone pass this test; parked workers can only leave if they are
+            // actually woken.
+            .env(DECODE_BLOCKTIME_ENV, "0")
+            .env(PERSISTENT_POOL_ENV, "1")
+            .env_remove(DECODE_SCHEDULE_ENV)
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        let output = cmd.output().expect("run readiness-leak child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let live: usize = stdout
+            .split_once("spmd_threads_after=")
+            .map(|(_, rest)| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "child never reported its worker-thread count; \
+                     stdout: {stdout}\nstderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(
+            live, 0,
+            "a failed build left {live} decode worker(s) running; \
+             panicking while holding threads relocates the defect rather than \
+             fixing it"
+        );
     }
 
     /// A worker that never announces must fail the build loudly, not spin.
