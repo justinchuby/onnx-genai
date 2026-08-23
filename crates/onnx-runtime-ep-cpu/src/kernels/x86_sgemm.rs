@@ -839,10 +839,27 @@ impl Int4Weight<'_> {
                 scales[lane] = scale_at(col * self.block_count + block);
                 zeros[lane] = self.zero_point(col, block);
             }
-            let run = (block_size - depth % block_size).min(whole - p);
+            let offset_base = depth % block_size;
+            let run = (block_size - offset_base).min(whole - p);
             let mut q = 0usize;
             while q < run {
-                let offset_in_block = (depth + q) % block_size;
+                // The modulo is *gone*, and this needs no assumption about
+                // `block_size` -- in particular not that it is a power of two,
+                // which it is not required to be here (`block_size` 24 and 40
+                // are covered by
+                // `int4_dequant_panel_is_bit_identical_to_the_per_column_path`).
+                // It follows from the clipping alone: `run` is capped at
+                // `block_size - offset_base`, so `offset_base + q <
+                // block_size` for every `q < run`, and `depth - offset_base`
+                // is a multiple of `block_size`. Hence
+                // `(depth + q) % block_size == offset_base + q` exactly.
+                //
+                // Worth removing because this is the innermost loop of the
+                // pack -- one division per group of eight depths -- and
+                // because LLVM cannot remove it itself: `block_size` is a
+                // runtime field, and a `#[target_feature]` function is never
+                // inlined into a caller that might have narrowed it.
+                let offset_in_block = offset_base + q;
                 let mut vecs = [_mm256_setzero_ps(); DEQUANT_GROUP];
                 for (lane, vec) in vecs.iter_mut().enumerate() {
                     let col = jcol + slot + lane;
@@ -2104,7 +2121,16 @@ mod tests {
                     for &kc in &[1usize, 7, 8, 9, 16, 33, 64, 130] {
                         // `pc = 0` and a later panel, so the block arithmetic
                         // is exercised at a non-zero depth offset too.
-                        for &pc in &[0usize, 128] {
+                        // `pc` values that are group-aligned but land *inside*
+                        // a block for the non-power-of-two sizes (8 % 24 == 8,
+                        // 40 % 24 == 16, 200 % 40 == 0) are what exercise the
+                        // hoisted `offset_base`: the inner loop now derives
+                        // every within-block offset by adding to it instead of
+                        // recomputing `(depth + q) % block_size`, so a start
+                        // that is mid-block is the case that distinguishes the
+                        // two. `0` and `128` alone leave that untested for
+                        // several of the block sizes above.
+                        for &pc in &[0usize, 8, 40, 128, 200] {
                             if pc + kc > k {
                                 continue;
                             }

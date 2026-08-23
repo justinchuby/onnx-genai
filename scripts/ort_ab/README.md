@@ -201,3 +201,38 @@ arms within one run, never across sessions.
   output) is a large fraction of the smallest cells. Cells below roughly 100 µs
   are overhead-dominated and should be read as an upper bound on the kernel gap,
   not as the kernel gap.
+
+## Before you measure: take the host lock
+
+Every number produced by these scripts is a ratio between two arms timed on one
+machine, and that machine is shared. Contention has moved the *same* cell by
+**8.6x** between two windows here (197.2 vs 22.8 tok/s), and two *identical*
+binaries in an A/A null have disagreed by **45%** on one cell. Neither run
+looked wrong from the inside: intra-run spread stayed under 6% in some of the
+corrupted samples, because a tight spread only says the contention was steady,
+not that the host was quiet.
+
+So announce, and prefer the mechanical form:
+
+```sh
+scripts/hostlock.sh status                       # is anybody benchmarking?
+scripts/hostlock.sh run --owner leon \
+    --reason "softmax 28-cell matrix" --gate 4 \
+    -- python3 scripts/ort_ab/ab.py ...          # acquire, run, always release
+```
+
+`run` is the form to use: it releases on success, on failure and on Ctrl-C.
+`--gate N` additionally waits for the *instantaneous runnable count* to fall to
+N before starting, which drains load from people who never took the lock.
+
+Gate on that runnable count (`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`), not
+on the 1-minute load average: `loadavg` is an exponential moving average, so it
+stays high for a minute after a heavy run has ended and reads low while a burst
+is still in flight. It misleads in both directions.
+
+The lock is advisory. It cannot stop anyone from using the cores and does not
+try to; it makes "is somebody benchmarking right now, and who?" cheap enough to
+check that there is no excuse for not checking. Record the runnable count you
+measured at, and mark absolute timings taken on a busy host as indicative --
+interleaved *ratios* survive contention far better than absolute milliseconds,
+but neither survives it silently.
