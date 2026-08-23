@@ -2066,6 +2066,7 @@ fn node_shards_with(
         return shards;
     }
     let allowed = crate::decode_affinity::allowed_cpus();
+    let cores = crate::core_topology::host();
     if let Some(topology) = NumaTopology::detect() {
         let topology = topology.restrict_to_allowed(allowed.as_deref());
         if let Some(mut shards) = topology.split_workers(total) {
@@ -2074,13 +2075,17 @@ fn node_shards_with(
             // node's completion counter can be read without contending with a
             // pinned spinning worker.
             reserve_split_headroom(&mut shards);
+            for shard in shards.iter_mut() {
+                shard.cpus = crate::decode_affinity::order_pin_targets(&shard.cpus, cores);
+            }
             return shards;
         }
     }
     // Single-node / non-NUMA / no-pinning fallback: one group. Pin to the
     // process's allowed CPUs when known (best-effort), else leave unpinned.
-    let cpus = allowed.unwrap_or_default();
-    let workers = reserve_single_group_headroom(total, cpus.len());
+    let cpus = crate::decode_affinity::order_pin_targets(&allowed.unwrap_or_default(), cores);
+    let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
+    let workers = reserve_single_group_headroom(total, cpus.len(), core_count);
     vec![NodeShard {
         index: 0,
         cpus,
@@ -2112,8 +2117,25 @@ const DISPATCHER_RESERVED_CPUS: usize = 1;
 /// `ONNX_GENAI_CPU_DECODE_THREADS=N` on an exactly-N-CPU cpuset gets N-1 pinned
 /// workers (never zero); the single-CPU case is handled earlier by falling back
 /// to the flat path in [`build_from_env`].
-fn reserve_single_group_headroom(total: usize, allowed_count: usize) -> usize {
-    if allowed_count == 0 || total < allowed_count {
+fn reserve_single_group_headroom(total: usize, allowed_count: usize, core_count: usize) -> usize {
+    if allowed_count == 0 {
+        return total;
+    }
+    // Within the physical-core budget the pool runs one worker per core, so the
+    // inline dispatcher has nowhere to go but some worker's SMT sibling -- and
+    // that worker becomes a straggler the whole barrier waits for on every op.
+    // Measured on qwen int4 `accuracy_level=0` decode, 16 physical cores, no
+    // cpuset: 16 workers 4.41 ms/token against 15 workers 2.81 ms/token (1.57x).
+    // Past the core budget the workers already share cores because the user asked
+    // for more threads than there are cores, so the historical logical-CPU
+    // reserve applies instead -- reserving cores there is a 1.28x regression
+    // (8-logical/4-core cpuset: 7 workers 10.58 ms against 3 workers 13.56 ms).
+    if core_count > 0 && total <= core_count {
+        return total
+            .min(core_count.saturating_sub(DISPATCHER_RESERVED_CPUS))
+            .max(1);
+    }
+    if total < allowed_count {
         return total;
     }
     allowed_count
@@ -2559,6 +2581,56 @@ mod tests {
         );
     }
 
+    /// #1680: a shard must hand out one CPU per *physical* core before it reuses
+    /// any SMT sibling. `node_shards` previously returned `allowed_cpus()` in
+    /// kernel order, and workers pin to `cpus[worker % len]`, so on a host whose
+    /// siblings are adjacent (`0,1` one core, `2,3` the next) a 16-worker pool
+    /// packed onto 8 physical cores. Measured cost on qwen int4 `accuracy_level=0`
+    /// decode: 4.65 ms/token against 2.80 ms/token one-worker-per-core (1.66x).
+    ///
+    /// Skipped where the SMT map is unavailable, and vacuous-but-harmless on a
+    /// host without SMT (there every CPU is its own leader).
+    #[test]
+    fn shard_cpus_prefer_distinct_physical_cores() {
+        // Host-independent half. The loop below can only run where `/sys`
+        // exposes a sibling map, which a minimal container does not, so on its
+        // own this test passes vacuously exactly where it would be most useful.
+        // Assert the ordering contract the shard builder relies on against a
+        // synthetic SMT host first, so the property is covered everywhere.
+        let synthetic = crate::core_topology::CoreTopology::from_sibling_groups(
+            (0..8).map(|c| vec![c * 2, c * 2 + 1]),
+        );
+        let all: Vec<usize> = (0..16).collect();
+        let ordered = crate::decode_affinity::order_pin_targets(&all, Some(&synthetic));
+        let mut leaders = synthetic.leaders_within(&all);
+        leaders.sort_unstable();
+        let mut first_eight: Vec<usize> = ordered.iter().take(8).copied().collect();
+        first_eight.sort_unstable();
+        assert_eq!(
+            first_eight, leaders,
+            "the first workers must take one CPU per physical core before any \
+             worker doubles up on an SMT sibling: {ordered:?}"
+        );
+
+        let Some(cores) = crate::core_topology::host() else {
+            return;
+        };
+        for shard in node_shards(4) {
+            if shard.cpus.is_empty() {
+                continue;
+            }
+            let mut want = cores.leaders_within(&shard.cpus);
+            want.sort_unstable();
+            let mut got: Vec<usize> = shard.cpus.iter().take(want.len()).copied().collect();
+            got.sort_unstable();
+            assert_eq!(
+                got, want,
+                "shard {} must place one worker per physical core before reusing a sibling",
+                shard.index
+            );
+        }
+    }
+
     fn two_group_pool() -> SpmdDecodePools {
         let shards = vec![
             NodeShard {
@@ -2692,12 +2764,35 @@ mod tests {
         // `taskset -c 0-31` with THREADS=32). One CPU must be reserved for the
         // inline dispatcher, so 31 workers are pinned and the highest-index
         // allowed CPU stays free (workers pin to cpus[0..workers] round-robin).
-        assert_eq!(reserve_single_group_headroom(32, 32), 31);
+        // `core_count == 0` is "SMT map unavailable" and keeps the logical rule.
+        assert_eq!(reserve_single_group_headroom(32, 32, 0), 31);
         // Oversubscription (workers > allowed) is likewise capped to allowed - 1.
-        assert_eq!(reserve_single_group_headroom(40, 32), 31);
+        assert_eq!(reserve_single_group_headroom(40, 32, 0), 31);
         // Even an explicit THREADS=N on an exactly-N-CPU cpuset still reserves the
         // dispatcher core: N-1 workers, never N and never zero.
-        assert_eq!(reserve_single_group_headroom(2, 2), 1);
+        assert_eq!(reserve_single_group_headroom(2, 2, 0), 1);
+    }
+
+    /// #1680: on an SMT host the logical-CPU reserve never fires for the default
+    /// budget -- 16 workers against 32 allowed logical CPUs looks like headroom,
+    /// but the 16 workers occupy all 16 *physical* cores and the inline
+    /// dispatcher is left to share a core with one of them. Measured 4.41 ms/token
+    /// against 2.81 ms/token for 15 workers (qwen int4 `accuracy_level=0`).
+    #[test]
+    fn reserve_single_group_headroom_reserves_a_physical_core_within_the_core_budget() {
+        // The measured defect: 16-core SMT host, no cpuset, default budget.
+        assert_eq!(reserve_single_group_headroom(16, 32, 16), 15);
+        // Genuine headroom below the core budget is untouched.
+        assert_eq!(reserve_single_group_headroom(8, 32, 16), 8);
+        assert_eq!(reserve_single_group_headroom(1, 32, 16), 1);
+        // A cpuset of 4 cores / 8 logical CPUs, asked for exactly the core budget.
+        assert_eq!(reserve_single_group_headroom(4, 8, 4), 3);
+        // Past the core budget the user explicitly asked for SMT oversubscription,
+        // where reserving cores measured 1.28x slower (10.58 ms -> 13.56 ms), so
+        // the logical-CPU reserve still governs.
+        assert_eq!(reserve_single_group_headroom(16, 8, 4), 7);
+        // Single-core cpuset still yields a worker rather than zero.
+        assert_eq!(reserve_single_group_headroom(2, 2, 1), 1);
     }
 
     // --- #1792: the persistent pool must honor an explicit affinity request ---
@@ -2900,12 +2995,12 @@ mod tests {
     fn reserve_single_group_headroom_is_a_noop_when_headroom_exists_or_affinity_unknown() {
         // Requested workers < allowed CPUs: genuine headroom already exists, so
         // the count is unchanged (the numa-split / flat paths are untouched too).
-        assert_eq!(reserve_single_group_headroom(16, 32), 16);
-        assert_eq!(reserve_single_group_headroom(31, 32), 31);
+        assert_eq!(reserve_single_group_headroom(16, 32, 0), 16);
+        assert_eq!(reserve_single_group_headroom(31, 32, 0), 31);
         // allowed_count == 0 means the allowed set is unknown; workers run
         // unpinned and cannot occupy every core, so nothing is capped.
-        assert_eq!(reserve_single_group_headroom(32, 0), 32);
-        assert_eq!(reserve_single_group_headroom(1, 0), 1);
+        assert_eq!(reserve_single_group_headroom(32, 0, 0), 32);
+        assert_eq!(reserve_single_group_headroom(1, 0, 0), 1);
     }
 
     #[test]
@@ -3524,12 +3619,15 @@ mod tests {
 
         // Fully subscribed: `reserve_single_group_headroom` gave up a worker to
         // keep the dispatcher's CPU free, so the dispatcher computes that lane.
-        assert_eq!(reserve_single_group_headroom(4, 4), 3);
+        // Four allowed CPUs over four physical cores (no SMT), so the core
+        // budget and the logical budget agree and both reserve one.
+        assert_eq!(reserve_single_group_headroom(4, 4, 4), 3);
         assert!(dispatcher_owns_a_shard(&group(3), 4));
 
         // Headroom already existed: no CPU was reserved, so claiming a shard
-        // would make the pool one lane wider than the budget allows.
-        assert_eq!(reserve_single_group_headroom(4, 32), 4);
+        // would make the pool one lane wider than the budget allows. Four
+        // workers on a 32-logical/16-core host is far inside both budgets.
+        assert_eq!(reserve_single_group_headroom(4, 32, 16), 4);
         assert!(!dispatcher_owns_a_shard(&group(4), 4));
 
         // A NUMA split keeps the previous behavior: the dispatcher's node is not
