@@ -426,13 +426,18 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // Re-emitted by #1883. Both of these were hand-authored in #1832 as
+    // 11-component composites whose ten `policies/*.onnx` artifacts were never
+    // committed, so #1723's eager artifact resolution hard-failed on them.
+    // Re-emission dropped the unresolvable components, which is what moved
+    // these two rows to the single-decoder shape their siblings already have.
     row(
         "tests/fixtures/tiny-deepseek-v4-qmoe/inference_metadata.yaml",
-        11,
-        Composite,
-        Some("model"),
-        false,
-        None,
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
     ),
     row(
         "tests/fixtures/tiny-gemma4-assistant/inference_metadata.yaml",
@@ -450,13 +455,14 @@ const MATRIX: &[Row] = &[
         true,
         Some("decoder"),
     ),
+    // Re-emitted by #1883; see the note on tiny-deepseek-v4-qmoe above.
     row(
         "tests/fixtures/tiny-glm52-full-attention/inference_metadata.yaml",
-        11,
-        Composite,
-        Some("model"),
-        false,
-        None,
+        1,
+        SingleGraph,
+        Some("decoder"),
+        true,
+        Some("decoder"),
     ),
     row(
         "tests/fixtures/tiny-glm52-qmoe-indexshare/inference_metadata.yaml",
