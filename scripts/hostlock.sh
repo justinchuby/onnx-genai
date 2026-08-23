@@ -624,10 +624,19 @@ reaper_claim() {
 # Release only what we still own. If our guard was reclaimed while we were
 # descheduled, the directory at that path now belongs to a successor who may
 # be mid-reap; deleting it would hand the box to two agents at once.
+#
+# Ownership is pid AND start time, not pid alone, for the same reason the
+# lock's is: this box is at ~1.5M pids after four days, so a successor that
+# happens to land on our number is a recycled pid, not us. Checking only $$
+# here while `reaper_clear_if_dead` checks both would leave the asymmetry
+# exactly where the consequence is worst -- deleting a live successor's
+# guard rather than merely failing to clean up our own.
 reaper_release() {
-    local pid dead
+    local pid start dead
     pid=$(reap_meta_get anchor_pid) || return 0
     [ "$pid" = "$$" ] || return 0
+    start=$(reap_meta_get start_time) || return 0
+    [ "$start" = "$(proc_start_time "$$")" ] || return 0
     dead="${REAP_DIR}.rel.$$"
     if mv -T "$REAP_DIR" "$dead" 2>/dev/null; then
         rm -rf "$dead"

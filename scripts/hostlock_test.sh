@@ -419,6 +419,13 @@ chk "and the orphan still names its dead owner" "$(sed -n 's/^anchor_pid=//p' "$
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "a guard orphaned by SIGKILL does not wedge the next acquirer" "$(st owner)" "roy"
 chk "and recovery is immediate, not after REAPER_GRACE" "$([ -d "$LOCK.reaper" ] && echo leaked || echo clear)" "clear"
+# Checked BEFORE cleanup, deliberately: cleanup sweeps these globs, so an
+# assertion placed after it would pass whether or not the reap cycle tidies
+# up after itself. Rename-then-remove leaves a `.dead.`/`.rel.` directory
+# behind if the second half is ever dropped, and on a shared box that is
+# unbounded growth in the lock's own parent directory.
+chk "a reap cycle leaves no guard litter behind" \
+    "$(find "$(dirname "$LOCK")" -maxdepth 1 -name "$(basename "$LOCK").reaper.*" 2>/dev/null | wc -l)" "0"
 cleanup
 
 # R8.2 -- the mirror image: age is NOT evidence of death.
@@ -469,6 +476,31 @@ chk "a reaper whose guard was reclaimed leaves the successor's guard alone" \
     "$(sed -n 's/^anchor_pid=//p' "$LOCK.reaper/meta" 2>/dev/null)" "$successor"
 sig "$successor" 9
 wait "$successor" 2>/dev/null
+cleanup
+
+# R8.3b -- and "mine" means pid AND start time.
+#
+# ~1.5M pids in four days on this box, so a successor landing on our number
+# is a recycled pid, not us. A pid-only ownership check deletes that
+# successor's guard; the same forged-successor shape as above, with the
+# stalled reaper's own pid and a start time that is not its, is the
+# falsifier.
+forge_stale_lock
+rm -f "$LOCK.reaper/stalled_pid"
+HOSTLOCK_REAPER_STALL=4 $HL acquire --owner victim --ttl 600 >/dev/null 2>&1 &
+stall_parent=$!
+stalled=""
+for _ in $(seq 1 40); do
+    [ -s "$LOCK.reaper/stalled_pid" ] && { stalled=$(cat "$LOCK.reaper/stalled_pid"); break; }
+    sleep 0.25
+done
+chk "a third reaper is reachable inside its critical section" "$([ -n "$stalled" ] && echo yes)" "yes"
+rm -rf "$LOCK.reaper"
+mkdir -p "$LOCK.reaper"
+printf 'anchor_pid=%s\nstart_time=1\nowner=recycled\nclaimed_epoch=1\n' "$stalled" >"$LOCK.reaper/meta"
+wait "$stall_parent" 2>/dev/null
+chk "a guard on our pid but not our start time is somebody else's" \
+    "$(sed -n 's/^owner=//p' "$LOCK.reaper/meta" 2>/dev/null)" "recycled"
 cleanup
 
 # R8.5 -- the guard is only ever published complete.
@@ -1539,7 +1571,7 @@ chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_tea
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "244"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "247"
 
 echo
 echo "passed=${pass} failed=${fail}"
