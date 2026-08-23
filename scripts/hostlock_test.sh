@@ -654,5 +654,182 @@ for flag in --strict-reap --on-gate-timeout --expect-runnable --oneline --ttl --
 done
 
 echo
+echo "== REQUIREMENTS CONFORMANCE =="
+# The seven properties this lock exists to guarantee, each asserted directly
+# and named after the requirement rather than after the implementation. Three
+# of them (R1, R6, R7) had no test at all before this block: they were
+# properties of the design that nothing would have noticed the loss of.
+
+echo "-- R1: the holder is the outer harness, spanning every arm --"
+# The collision this encodes: an observer ran `ps`, saw the benchmark process
+# gone, concluded the host was clear, and started work -- but that process had
+# exited only because the harness had advanced from one arm of an interleaved
+# A/B to the next. Any liveness notion scoped to "is a bench binary running"
+# has that hole by construction, so the lock must be anchored to the parent
+# that spans all arms.
+cleanup
+rm -f "$LOCK.gaps" "$LOCK.rows"
+(
+    harness=$BASHPID
+    $HL acquire --owner harness --pid "$harness" --ttl 600 >/dev/null 2>&1
+    for _ in before after null; do
+        # An arm: a bench child that starts, runs, and exits.
+        bash -c 'exit 0'
+        # An observer sampling in the GAP between two arms, which is exactly
+        # when no bench process exists.
+        $HL status --porcelain | sed -n 's/^state=//p' >>"$LOCK.gaps"
+        $HL provenance --oneline | tr ' ' '\n' | sed -n 's/^held_by=//p' >>"$LOCK.rows"
+    done
+    $HL release >/dev/null 2>&1
+)
+chk "the lock is HELD in every gap between arms" \
+    "$(sort -u "$LOCK.gaps" | tr '\n' ',')" "HELD,"
+chk "three gaps were actually sampled" "$(wc -l <"$LOCK.gaps")" "3"
+chk "and every row names the harness, not an arm" \
+    "$(sort -u "$LOCK.rows" | tr '\n' ',')" "harness,"
+rm -f "$LOCK.gaps" "$LOCK.rows"
+cleanup
+
+# The negative half, which is what makes the positive half meaningful: a lock
+# anchored to a bench CHILD goes stale the moment that child exits, i.e.
+# between arms. This is the design being rejected.
+sleep 30 &
+arm=$!
+$HL acquire --owner per-child --pid $arm --ttl 600 >/dev/null 2>&1
+chk "a child-anchored lock is HELD while its arm runs" "$(st state)" "HELD"
+sig "$arm" 9
+wait "$arm" 2>/dev/null
+chk "and goes STALE the instant that arm ends -- the hole" "$(st state)" "STALE"
+cleanup
+
+echo "-- R2: emitted rows carry identity, state and occupancy --"
+cleanup
+$HL acquire --owner leon --ttl 600 --reason "moe matrix" >/dev/null 2>&1
+row=$($HL provenance --oneline --expect-runnable 100000)
+for field in hostlock_state declared held_by held_pid held_secs takeover gate runnable contended sampled_at; do
+    chk "the row carries $field" \
+        "$(echo "$row" | tr ' ' '\n' | grep -c "^${field}=")" "1"
+done
+chk "the row's state is the real state" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^hostlock_state=//p')" "HELD"
+chk "the row's owner is the real owner" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^held_by=//p')" "leon"
+chk "occupancy is a number, not a label" \
+    "$(echo "$row" | tr ' ' '\n' | sed -n 's/^runnable=//p' | grep -c '^[0-9][0-9]*$')" "1"
+cleanup
+
+echo "-- R3: FREE, HELD, STALE and EXPIRED are four distinct states --"
+# STALE (holder dead) and EXPIRED (holder alive, TTL lapsed) are the pair that
+# must not collapse: one means the box may still be loaded by an orphan, the
+# other means somebody is actively using it and has overrun.
+cleanup
+s_free=$(st state)
+sleep 30 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 600 >/dev/null 2>&1
+s_held=$(st state)
+sig "$h" 9
+wait "$h" 2>/dev/null
+s_stale=$(st state)
+cleanup
+sleep 30 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 1 >/dev/null 2>&1
+sleep 2
+s_expired=$(st state)
+sig "$h" 9
+wait "$h" 2>/dev/null
+cleanup
+chk "the four states are FREE/HELD/STALE/EXPIRED" \
+    "${s_free}/${s_held}/${s_stale}/${s_expired}" "FREE/HELD/STALE/EXPIRED"
+chk "and all four are distinct" \
+    "$(printf '%s\n' "$s_free" "$s_held" "$s_stale" "$s_expired" | sort -u | wc -l)" "4"
+
+echo "-- R4: both expiries fail closed --"
+cleanup
+# Admission expiry (the gate).
+chk "admission expiry fails closed (5)" \
+    "$($HL acquire --owner leon --gate 0 --gate-timeout 3 --ttl 600 >/dev/null 2>&1; echo $?)" "5"
+chk "and holds nothing afterwards" "$(st state)" "FREE"
+cleanup
+# Wait expiry, on the acquire path a harness actually uses -- `wait` alone was
+# covered, `acquire --wait` was not, and `run` goes through the latter.
+sleep 30 &
+h=$!
+$HL acquire --owner alice --pid $h --ttl 600 >/dev/null 2>&1
+chk "wait expiry on acquire fails closed (3)" \
+    "$($HL acquire --owner leon --wait --timeout 6 --ttl 600 >/dev/null 2>&1; echo $?)" "3"
+chk "and the incumbent still holds it" "$(st owner)" "alice"
+chk "run inherits the same failure, it does not run the command" \
+    "$($HL run --owner leon --timeout 6 -- bash -c 'echo RAN' 2>/dev/null | grep -c RAN)" "0"
+sig "$h" 9
+wait "$h" 2>/dev/null
+cleanup
+
+echo "-- R5: reaping compares start time, not just the pid --"
+# A recycled pid must not be able to masquerade as a live holder. Forge a lock
+# whose anchor pid is THIS script -- alive -- but whose recorded start time is
+# wrong, which is exactly what pid reuse looks like.
+cleanup
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nstart_time=1\nacquired_epoch=%s\nttl=600\nreason=recycled\ntakeover=none\n' \
+    "$$" "$(date +%s)" >"$LOCK/meta"
+chk "a live pid with the wrong start time is STALE, not HELD" "$(st state)" "STALE"
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "and is reaped as a stale pid" "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+# The converse: the same pid with the RIGHT start time is a live holder and
+# must never be reaped.
+mkdir -p "$LOCK"
+printf 'owner=ghost\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=600\nreason=live\ntakeover=none\n' \
+    "$$" "$(sed 's/.*) //' "/proc/$$/stat" | awk '{print $20}')" "$(date +%s)" >"$LOCK/meta"
+chk "the same pid with the right start time is HELD" "$(st state)" "HELD"
+chk "and is not reapable" "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+cleanup
+
+echo "-- R6: a SIGKILLed holder is recoverable --"
+# Not a forged lock: a real holder, really SIGKILLed, which is the failure the
+# design promises to survive because it is the one signal it cannot trap.
+cleanup
+sleep 300 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 600 --reason "killed mid-run" >/dev/null 2>&1
+chk "held while the anchor lives" "$(st state)" "HELD"
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+chk "SIGKILL leaves the lock behind, reported STALE" "$(st state)" "STALE"
+chk "the next acquirer recovers the box" \
+    "$($HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+chk "and is told it was a takeover, not a free box" \
+    "$($HL provenance | sed -n 's/^takeover=//p')" "stale_pid"
+cleanup
+
+echo "-- R7: the lock never kills anything it did not start --"
+# Reclaiming a lock does not stop the load: the dead holder's benchmark is
+# still on the cores. The tempting "fix" is for the reaper to kill it, which
+# would make this tool capable of destroying a colleague's forty-minute run on
+# the strength of a misparsed pid. It must never do that -- it warns instead.
+cleanup
+sleep 300 &
+orphan=$!
+sleep 300 &
+holder=$!
+$HL acquire --owner alice --pid $holder --ttl 600 >/dev/null 2>&1
+sig "$holder" 9
+wait "$holder" 2>/dev/null
+$HL acquire --owner leon --ttl 600 >/dev/null 2>&1
+chk "reaping leaves the dead holder's orphaned load running" \
+    "$(alive "$orphan" && echo alive || echo killed)" "alive"
+sig "$orphan" 9
+wait "$orphan" 2>/dev/null
+cleanup
+# Structural, because the behavioural test above can only cover the reap path.
+kills=$(grep -c '^[^#]*\bkill\b' "$HL")
+chk "there is exactly one kill in the whole script" "$kills" "1"
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "and it targets the command the script itself started" \
+    "$(grep -c 'kill -TERM "\$child"' "$HL")" "1"
+
+echo
 echo "passed=${pass} failed=${fail}"
 [ "$fail" -eq 0 ]
