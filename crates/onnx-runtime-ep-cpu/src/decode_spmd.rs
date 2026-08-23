@@ -89,7 +89,7 @@
 //!    only.
 
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -411,7 +411,10 @@ struct SharedState {
     ///
     /// Separate from `node_sense`, which runs the other direction (dispatcher to
     /// workers). Only the *last* worker of an op touches this, so it is one
-    /// extra RMW per dispatch, not per worker.
+    /// extra RMW per dispatch, not per worker. Each node's last worker does also
+    /// scan every node's pending counter on its way here, so the full per-op cost
+    /// is `node_count` scans plus the one RMW -- immaterial at the one or two
+    /// nodes a decode pool actually builds.
     completion_sense: Padded<AtomicU32>,
     /// Set while the dispatcher is parked, or committed to parking, on
     /// `completion_sense`. Lets the completing worker skip the `wake` syscall
@@ -479,7 +482,10 @@ impl SharedState {
     /// | 4 | 18.0 | **10.2** | 5 |
     ///
     /// At width 2 that is 3.2 ms of kernel time per dispatch against a ~7 ms
-    /// dispatch -- an entire core burned in the scheduler, producing nothing.
+    /// dispatch -- an entire core burned to produce nothing, with roughly 45% of
+    /// it inside `sched_yield` itself and the rest spent spinning between the
+    /// calls. The `sys` column is the part that is unambiguously attributable, so
+    /// it is the one quoted.
     ///
     /// Note this is *not* the same loop as [`SharedState::worker_wait`], where
     /// substituting spinning for yielding was measured to be a wash (kernel time
@@ -543,6 +549,13 @@ impl SharedState {
     /// dispatcher commits to the sleep. `atomic_wait::wait` re-checks the value
     /// under the futex bucket lock, so a bump that lands inside the call itself
     /// returns immediately rather than sleeping.
+    ///
+    /// That pair is necessary but *not* the whole argument: it only orders the
+    /// dispatcher against a worker that reaches the bump. The separate reason
+    /// some worker always does reach it lives on
+    /// [`SharedState::signal_completion`]. The `all_workers_done` call here is
+    /// only a fast-path gate and may stay `Acquire` -- missing a late store just
+    /// costs a park that the guaranteed bump then ends.
     fn park_until_complete(&self) {
         let observed = self.completion_sense.0.load(Ordering::SeqCst);
         self.dispatcher_parked.0.store(true, Ordering::SeqCst);
@@ -555,7 +568,23 @@ impl SharedState {
     /// Called by the worker that brought its node's pending count to zero. Wakes
     /// a parked dispatcher, and does nothing but one relaxed check when the
     /// dispatcher is still spinning -- which is the common case.
+    ///
+    /// The opening fence is load-bearing on any weakly ordered target, and its
+    /// absence is a deadlock rather than a slowdown. Each node's last worker
+    /// arrives here having just stored zero to *its own* counter and about to
+    /// load *every other* node's counter, which is the store-buffering shape: with
+    /// nothing but the release store and acquire loads, two nodes' last workers
+    /// may each read the other's pre-decrement value, so neither passes the gate
+    /// below, nobody bumps `completion_sense`, and a dispatcher that has already
+    /// parked sleeps until the process ends. The fence puts every such arrival
+    /// into one total order, and the worker whose fence is last in it is
+    /// sequenced after all the other zero stores, so it cannot miss them --
+    /// giving at least one signaller for any node count. `x86_64` hides this
+    /// because the `lock`-prefixed decrement is already a full barrier; `aarch64`
+    /// does not. It costs one fence per node per op and only on the path that was
+    /// about to signal anyway, so it is off the per-worker fast path entirely.
     fn signal_completion(&self) {
+        fence(Ordering::SeqCst);
         if !self.all_workers_done() {
             return;
         }
@@ -4925,16 +4954,18 @@ mod dispatch_claim_tests {
         }
     }
 
-    /// A `SharedState` with only the barrier fields populated: `pending` workers
-    /// outstanding on a single node, no spawned threads and no job. Enough to
-    /// drive the dispatcher-side publish/wait protocol directly.
-    fn barrier_only_shared_state(pending: usize) -> SharedState {
-        let nodes = usize::from(pending > 0);
+    /// A `SharedState` with only the barrier fields populated: one node per entry
+    /// of `pending`, each with that many workers outstanding, no spawned threads
+    /// and no job. Enough to drive the dispatcher-side publish/wait protocol
+    /// directly. An empty slice builds a pool with no nodes at all, which is the
+    /// degenerate shape the `DispatchClaim` tests want.
+    fn barrier_only_shared_state(pending: &[usize]) -> SharedState {
         SharedState {
-            node_sense: (0..nodes).map(|_| Padded(AtomicU32::new(0))).collect(),
+            node_sense: pending.iter().map(|_| Padded(AtomicU32::new(0))).collect(),
             job: UnsafeCell::new(None),
-            node_pending: (0..nodes)
-                .map(|_| Padded(AtomicUsize::new(pending)))
+            node_pending: pending
+                .iter()
+                .map(|count| Padded(AtomicUsize::new(*count)))
                 .collect(),
             worker_node: Vec::new(),
             ready: AtomicUsize::new(0),
@@ -4964,7 +4995,7 @@ mod dispatch_claim_tests {
     /// ordered target. It is argued for in `park_until_complete`, not asserted.
     #[test]
     fn a_parked_dispatcher_is_woken_by_the_last_worker_to_finish() {
-        let shared = std::sync::Arc::new(barrier_only_shared_state(1));
+        let shared = std::sync::Arc::new(barrier_only_shared_state(&[1]));
         let (tx, rx) = std::sync::mpsc::channel();
         let dispatcher = {
             let shared = std::sync::Arc::clone(&shared);
@@ -4987,19 +5018,29 @@ mod dispatch_claim_tests {
         dispatcher.join().expect("dispatcher thread");
     }
 
-    /// The park must survive many consecutive ops: `completion_sense` is
-    /// monotonic and re-read on every park, so a stale observed value would make
-    /// exactly one of these iterations sleep forever.
+    /// The park must survive many consecutive ops, with `completion_sense`
+    /// advancing under it and `dispatcher_parked` correctly cleared each time.
+    ///
+    /// Its unique coverage is the two post-conditions, not the wake itself --
+    /// that is already covered above. A dispatcher that failed to clear
+    /// `dispatcher_parked` on the way out would leave every later op paying a
+    /// `wake` syscall it does not need, which no pass/fail on timing would see.
+    ///
+    /// One rationale deliberately *not* claimed here, because I wrote it down and
+    /// then falsified it: that a stale `observed` would make an iteration sleep
+    /// forever. It would not. A stale `observed` fails the
+    /// `completion_sense == observed` guard, so `park_until_complete` skips the
+    /// `wait` entirely and the caller's loop still exits on `all_workers_done`.
     ///
     /// Every iteration sleeps before signalling for the same reason the single-op
-    /// test does. Without it the signal usually lands before the dispatcher has
-    /// exhausted its spin budget, `park_until_complete` returns on the pre-park
-    /// re-check, and the loop asserts nothing about waking -- verified: this test
-    /// passed unchanged with `wake_all` deleted until the sleep was added.
+    /// test does, and for the same duration -- a shorter one lets a loaded runner
+    /// land the signal before the dispatcher has parked, which quietly drops that
+    /// iteration onto the pre-park re-check. Verified: this test passed unchanged
+    /// with `wake_all` deleted until the sleep was added.
     #[test]
     fn repeated_parks_never_lose_a_wakeup() {
-        let shared = std::sync::Arc::new(barrier_only_shared_state(1));
-        for _ in 0..16 {
+        let shared = std::sync::Arc::new(barrier_only_shared_state(&[1]));
+        for iteration in 0..16 {
             shared.node_pending[0].0.store(1, Ordering::Release);
             let (tx, rx) = std::sync::mpsc::channel();
             let dispatcher = {
@@ -5009,19 +5050,73 @@ mod dispatch_claim_tests {
                     let _ = tx.send(());
                 })
             };
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(Duration::from_millis(50));
             if shared.node_pending[0].0.fetch_sub(1, Ordering::AcqRel) == 1 {
                 shared.signal_completion();
             }
             rx.recv_timeout(Duration::from_secs(10))
                 .expect("every op must release the dispatcher");
             dispatcher.join().expect("dispatcher thread");
+            assert_eq!(
+                shared.completion_sense.0.load(Ordering::SeqCst),
+                iteration + 1,
+                "each op must advance the completion sense exactly once"
+            );
+            assert!(
+                !shared.dispatcher_parked.0.load(Ordering::SeqCst),
+                "a dispatcher that has returned must no longer advertise itself \
+                 as parked, or every later op pays a wake syscall for nothing"
+            );
         }
+    }
+
+    /// A dispatcher parked across a multi-node barrier must be released by
+    /// whichever node's worker retires last, and must not be released by the
+    /// first node to drain.
+    ///
+    /// This covers the control flow of the cross-node scan in
+    /// `signal_completion` -- the path that exists only because more than one
+    /// worker can reach it per op. It does *not* cover the ordering hazard that
+    /// path's fence is there for: on x86 the `lock`-prefixed decrement is already
+    /// a full barrier, so the fence can be deleted and this still passes. That
+    /// argument is written out on `signal_completion` and is not asserted here.
+    ///
+    /// Verified by mutation: deleting the `wake_all` makes this time out.
+    #[test]
+    fn a_parked_dispatcher_waits_for_every_node_not_just_the_first() {
+        let shared = std::sync::Arc::new(barrier_only_shared_state(&[1, 1]));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dispatcher = {
+            let shared = std::sync::Arc::clone(&shared);
+            thread::spawn(move || {
+                shared.wait_with_yield_budget(0);
+                let _ = tx.send(());
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+
+        if shared.node_pending[0].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            shared.signal_completion();
+        }
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(250)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "draining one node of two must not release the dispatcher"
+        );
+
+        if shared.node_pending[1].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            shared.signal_completion();
+        }
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("the last node to drain must release the dispatcher");
+        dispatcher.join().expect("dispatcher thread");
     }
 
     #[test]
     fn an_uncontended_dispatch_releases_the_claim_for_the_next_one() {
-        let shared = barrier_only_shared_state(0);
+        let shared = barrier_only_shared_state(&[]);
         {
             let claim = DispatchClaim::try_claim(&shared)
                 .expect("an unclaimed pool must hand out the claim");
@@ -5041,7 +5136,7 @@ mod dispatch_claim_tests {
 
     #[test]
     fn a_panic_inside_the_critical_section_still_releases_the_claim() {
-        let shared = barrier_only_shared_state(0);
+        let shared = barrier_only_shared_state(&[]);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _claim = DispatchClaim::try_claim(&shared).expect("claim available");
             panic!("a worker poisoned the pool");
