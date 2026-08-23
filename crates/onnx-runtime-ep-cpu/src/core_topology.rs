@@ -148,7 +148,13 @@ impl CoreTopology {
         let mut cpus: Vec<usize> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_str()?;
+            // Skip an unreadable entry rather than abandoning the walk: a `?`
+            // here would let one odd name in the directory return `None` for
+            // the whole machine, and `None` silently disables every placement
+            // assertion in this crate.
+            let Some(name) = name.to_str() else {
+                continue;
+            };
             let Some(index) = name.strip_prefix("cpu") else {
                 continue;
             };
@@ -728,11 +734,14 @@ mod tests {
     /// indistinguishable from the check passing. A label nothing can check is
     /// a label that drifts, and a checker nothing can check is worse.
     ///
-    /// This cannot be flaky. `detect_linux` returns `None` only when
-    /// `/sys/devices/system/cpu` cannot be enumerated at all -- a CPU exposing
-    /// neither `core_cpus_list` nor `thread_siblings_list` still falls back to
-    /// being its own core, so any host with a readable `/sys` yields a
-    /// non-empty topology.
+    /// This cannot be flaky on a real kernel. After the `to_str` fix in this
+    /// change, `detect_linux` returns `None` in exactly two cases: the sysfs
+    /// directory cannot be read at all, or it contains no `cpuN` entries. A CPU
+    /// exposing neither `core_cpus_list` nor `thread_siblings_list` still falls
+    /// back to being its own core, and entry names are kernel-generated ASCII,
+    /// so any host that can run this crate's decode pool yields a non-empty
+    /// topology. A Linux host with neither a readable `/sys` nor a `cpu0`
+    /// cannot run the pool this asserts about either.
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_detection_succeeds_so_placement_checks_cannot_silently_skip() {
