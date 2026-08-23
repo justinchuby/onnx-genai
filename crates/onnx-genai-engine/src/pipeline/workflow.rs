@@ -1026,6 +1026,29 @@ impl<'a> WorkflowExecutionPlan<'a> {
     }
 }
 
+/// Contracts this runtime supplies an executor for.
+///
+/// Mirrors [`workflow_adapter_registry`]: a workflow names a contract, and the
+/// runtime either has an executor for it or the package declares something this
+/// build cannot run. Keeping the set in one place is what makes "which steps can
+/// this runtime implement?" a question with a single answer, rather than a
+/// property of whichever `match` arm a reader happens to find.
+///
+/// Membership here is *necessary but not sufficient*: a host still declines a
+/// contract it holds no resources for (no decode session, say), and the
+/// interpreter reports that as an unimplemented contract rather than silently
+/// continuing.
+pub(crate) fn runtime_contract_registry() -> &'static std::collections::HashSet<&'static str> {
+    static REGISTRY: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+        std::sync::LazyLock::new(|| {
+            std::collections::HashSet::from([
+                onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT,
+                onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT,
+            ])
+        });
+    &REGISTRY
+}
+
 /// A runtime-supplied executor for a workflow node the package does not ship a
 /// graph for.
 ///
@@ -1235,6 +1258,19 @@ impl WorkflowRuntime {
                             // outputs with the wrong tensors and let a declared
                             // step silently not happen.
                             if let Some(contract) = contract {
+                                // Two different problems, and an operator can act
+                                // on only one of them: a contract this build has
+                                // no executor for is a package/runtime version
+                                // mismatch, while a registered contract that went
+                                // unhandled means the host reached this step
+                                // without the resources to run it.
+                                if runtime_contract_registry().contains(contract) {
+                                    anyhow::bail!(
+                                        "workflow component '{component}' declares contract \
+                                         '{contract}', which this runtime implements but no \
+                                         executor was available for this request"
+                                    );
+                                }
                                 anyhow::bail!(
                                     "workflow component '{component}' declares contract \
                                      '{contract}', which no runtime executor implements"
@@ -5161,6 +5197,28 @@ mod node_host_tests {
             }
             Ok(true)
         }
+    }
+
+    /// The registry is the single answer to "can this runtime run this step?".
+    ///
+    /// A contract absent from it is a package this build cannot execute, and
+    /// the operator's fix is a version, not a retry. A contract present in it
+    /// but unhandled at runtime is a missing resource for *this request*. The
+    /// two errors say different things because they have different fixes.
+    #[test]
+    fn the_registry_names_exactly_the_contracts_this_runtime_implements() {
+        let registry = runtime_contract_registry();
+        assert!(
+            registry
+                .contains(onnx_genai_metadata::decoder_workflow::AUTOREGRESSIVE_DECODE_CONTRACT)
+        );
+        assert!(registry.contains(onnx_genai_metadata::decoder_workflow::TOKEN_POLICY_CONTRACT));
+        assert!(
+            !registry.contains("vendor.not-a-contract-we-implement"),
+            "an unregistered contract must not be claimed; a package naming it is one this \
+             build cannot run, and saying otherwise sends an operator looking for a bug that \
+             is really a version mismatch"
+        );
     }
 
     /// A binding whose contract no host implements is an error.
