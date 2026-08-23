@@ -1047,9 +1047,22 @@ impl SpmdDecodePools {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
-                if spins.is_multiple_of(CLOCK_CHECK_STRIDE)
-                    && ready_since.elapsed() >= pool_ready_timeout()
-                {
+                // Check the clock on *every* yield, not on a stride. The stride
+                // is right for the spin phase, where an iteration costs
+                // nanoseconds and `Instant::now()` would dominate; it is wrong
+                // here, because a yield under contention costs microseconds to
+                // milliseconds and a stride of N multiplies the deadline's
+                // granularity by N yields of an already-starved thread.
+                //
+                // Measured: with a 100ms deadline and workers delayed 300ms on
+                // a contended pair of CPUs, the loop reached spin 4141 in
+                // 312ms. The yield phase starts at 4096, so the only multiple
+                // of 64 it ever saw was 4096 itself -- the deadline was
+                // evaluated once, early, and never again, and a build that had
+                // blown its deadline by 3x completed as if nothing was wrong.
+                // The starvation this backstop exists to escape is exactly the
+                // condition that made the check unreachable.
+                if ready_since.elapsed() >= pool_ready_timeout() {
                     let ready = shared.ready.load(Ordering::Acquire);
                     // The loop condition and this load are two separate reads,
                     // so a worker can announce between them. Accept that pool
