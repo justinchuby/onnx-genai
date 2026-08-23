@@ -40,7 +40,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ran 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ran 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -372,14 +372,131 @@ chk "finished run did not steal the lock from the successor" "$(st owner)" "roy"
 cleanup
 
 echo "== a leaked reaper guard does not wedge stale recovery =="
-# The reaper guard is the one directory with no anchor and no owner, so a
-# crash inside its critical section would make every dead lock permanently
-# un-reapable and every acquirer permanently BUSY.
+# An UNATTRIBUTABLE guard -- no anchor, no owner -- is the only class the age
+# backstop still covers. This script cannot produce one (the guard is
+# published populated, by rename), but an older version or a stray mkdir can.
 forge_stale_lock
 mkdir -p "$LOCK.reaper"
 touch -d '10 minutes ago' "$LOCK.reaper"
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "an abandoned reaper guard is cleared" "$(st owner)" "roy"
+cleanup
+
+echo "== R8: the reaper guard cannot wedge the box =="
+# The guard providing mutual exclusion for reaping used to be a bare mkdir
+# with no anchor and no owner. One SIGKILL between its mkdir and its rmdir
+# orphaned a directory nothing could attribute, and from then on every
+# genuinely dead lock was un-reapable and every acquirer was told BUSY --
+# indistinguishable from legitimate occupancy. These four cells are the
+# falsifiers for the fix.
+
+# R8.1 -- KILL IN THE WINDOW, the defect exactly as reported.
+#
+# Deterministic, not opportunistic: the seam holds the critical section open
+# and publishes the pid that is inside it, so the kill lands in the window
+# every run rather than when the scheduler cooperates. Nothing here calls
+# cleanup between the kill and the recovery -- a cleanup there would sweep
+# the orphaned guard and the test would pass against the defect it exists to
+# catch, which is how this class of test usually dies.
+forge_stale_lock
+rm -f "$LOCK.reaper/stalled_pid"
+HOSTLOCK_REAPER_STALL=30 $HL acquire --owner victim --ttl 600 >/dev/null 2>&1 &
+stall_parent=$!
+stalled=""
+for _ in $(seq 1 40); do
+    [ -s "$LOCK.reaper/stalled_pid" ] && { stalled=$(cat "$LOCK.reaper/stalled_pid"); break; }
+    sleep 0.25
+done
+chk "a reaper is reachable inside its critical section" "$([ -n "$stalled" ] && echo yes)" "yes"
+sig "$stalled" 9
+wait "$stall_parent" 2>/dev/null
+# Assert the ORPHAN EXISTS before asserting recovery. Without this the next
+# two checks pass just as well when the guard was never leaked at all, and a
+# vacuous conformance test is worse than none: it reports coverage it does
+# not have.
+chk "killing it in the window really does orphan the guard" "$([ -d "$LOCK.reaper" ] && echo yes)" "yes"
+chk "and the orphan still names its dead owner" "$(sed -n 's/^anchor_pid=//p' "$LOCK.reaper/meta" 2>/dev/null)" "$stalled"
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+chk "a guard orphaned by SIGKILL does not wedge the next acquirer" "$(st owner)" "roy"
+chk "and recovery is immediate, not after REAPER_GRACE" "$([ -d "$LOCK.reaper" ] && echo leaked || echo clear)" "clear"
+cleanup
+
+# R8.2 -- the mirror image: age is NOT evidence of death.
+#
+# The previous rule cleared any guard older than REAPER_GRACE. A reaper that
+# is merely slow -- loaded box, qemu, a stalled stat -- would have its guard
+# taken while still inside the critical section, which is the double reap the
+# guard exists to prevent. Two agents would then both believe they own the
+# host, which is worse than a wedge because it is silent.
+forge_stale_lock
+sleep 120 &
+live_holder=$!
+mkdir -p "$LOCK.reaper"
+printf 'anchor_pid=%s\nstart_time=%s\nowner=slowpoke\nclaimed_epoch=1\n' \
+    "$live_holder" "$(sed 's/.*) //' "/proc/$live_holder/stat" | awk '{print $20}')" >"$LOCK.reaper/meta"
+touch -d '10 minutes ago' "$LOCK.reaper"
+$HL acquire --owner thief --ttl 600 >/dev/null 2>&1
+chk "an ancient guard held by a LIVE reaper is not stolen" "$(st owner)" "ghost"
+chk "and the live reaper still holds its guard" "$([ -d "$LOCK.reaper" ] && echo yes)" "yes"
+sig "$live_holder" 9
+wait "$live_holder" 2>/dev/null
+cleanup
+
+# R8.3 -- a reclaimed reaper must not delete its successor's guard.
+#
+# If a guard is reclaimed while its owner is descheduled, that owner wakes up
+# holding nothing. Releasing unconditionally would delete a successor's guard
+# mid-reap and hand the box to two agents at once -- the same failure as R8.2
+# reached from the other side.
+forge_stale_lock
+rm -f "$LOCK.reaper/stalled_pid"
+HOSTLOCK_REAPER_STALL=4 $HL acquire --owner victim --ttl 600 >/dev/null 2>&1 &
+stall_parent=$!
+stalled=""
+for _ in $(seq 1 40); do
+    [ -s "$LOCK.reaper/stalled_pid" ] && { stalled=$(cat "$LOCK.reaper/stalled_pid"); break; }
+    sleep 0.25
+done
+chk "a second reaper is reachable inside its critical section" "$([ -n "$stalled" ] && echo yes)" "yes"
+sleep 120 &
+successor=$!
+rm -rf "$LOCK.reaper"
+mkdir -p "$LOCK.reaper"
+printf 'anchor_pid=%s\nstart_time=%s\nowner=successor\nclaimed_epoch=1\n' \
+    "$successor" "$(sed 's/.*) //' "/proc/$successor/stat" | awk '{print $20}')" >"$LOCK.reaper/meta"
+wait "$stall_parent" 2>/dev/null
+chk "a reaper whose guard was reclaimed leaves the successor's guard alone" \
+    "$(sed -n 's/^anchor_pid=//p' "$LOCK.reaper/meta" 2>/dev/null)" "$successor"
+sig "$successor" 9
+wait "$successor" 2>/dev/null
+cleanup
+
+# R8.5 -- the guard is only ever published complete.
+#
+# Not reachable through behaviour: killing between a mkdir and the meta write
+# is a microsecond window and a seam wide enough to test it would be wider
+# than the bug. Asserted structurally instead, which is weaker evidence but
+# honest about being weaker: the guard directory must never be created in
+# place, only renamed into place already populated, so no kill can leave an
+# unattributable guard behind (that class is the one the age backstop covers,
+# and it should stay unreachable from this script).
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "the guard is never created in place" \
+    "$(grep -cE 'mkdir[^#]*\$REAP_DIR"' "$HL")" "0"
+# shellcheck disable=SC2016  # matching source text literally, not expanding it
+chk "it is renamed into place already populated" \
+    "$(grep -cF 'mv -T "$stage" "$REAP_DIR"' "$HL")" "1"
+
+# R8.4 -- the seam itself is inert unless asked for.
+#
+# A test seam in production code earns its place only if its absence is
+# asserted: an `if` that fired by default would stall every real reap.
+forge_stale_lock
+t0=$(date +%s)
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+t1=$(date +%s)
+chk "the stall seam does nothing when unset" "$([ "$((t1 - t0))" -lt 3 ] && echo fast || echo stalled)" "fast"
+chk "and the reap still happened" "$(st owner)" "roy"
 cleanup
 
 echo "== corrupt metadata fails safe =="
@@ -1422,7 +1539,7 @@ chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_tea
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "231"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "244"
 
 echo
 echo "passed=${pass} failed=${fail}"
