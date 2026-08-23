@@ -11871,6 +11871,17 @@ mod tests {
             (1, 128, 8, 32),
             (2, 64, 7, 32),
             (1, 256, 16, 128),
+            // Ragged tail blocks (`k` not a multiple of `block_size`) and a
+            // block size that is not a multiple of 32. Both send whole blocks
+            // down the kernel's scalar fallback, which contributes to the same
+            // running zero-point correction as the vector path -- so a change
+            // that reorganises that correction has to keep the two branches
+            // agreeing. Every case above divides evenly, which left the
+            // fallback's share of the correction unexercised.
+            (1, 100, 9, 32),
+            (2, 72, 6, 32),
+            (1, 200, 7, 128),
+            (1, 80, 5, 16),
         ] {
             for &asymmetric in &[false, true] {
                 let weights_nk: Vec<f32> = (0..n * k).map(|_| next()).collect();
