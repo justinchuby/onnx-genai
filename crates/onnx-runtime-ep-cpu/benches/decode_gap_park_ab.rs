@@ -50,7 +50,7 @@
 //! | `dy/tok` | dispatcher yields per token. Strongly **width-dependent**: the dispatcher publishes, computes its own shard, then spins ~10 us before yielding once, so a yield means the last worker lagged the dispatcher's own arrival by more than that. Measured at zero gap on an idle host: 0.004/dispatch at width 4, ~0.9 at width 16, non-monotonic between. Straggler spread, not contention, and only comparable at a fixed width |
 //! | `vcsw` / `ivcsw` | voluntary / involuntary context switches per token. `vcsw` is the kernel's independent view of parking and should track `park/tok` |
 //! | `rss_mb` | `ru_maxrss`, a process **high-water mark**. Absolute, never a delta -- a high-water mark cannot be differenced, and doing so prints noise that looks like a leak |
-//! | `foreign_%` | CPU consumed by *other processes* on this process's confined core set, as a percentage of one core. Read this **before** `ms_tok`: a dispatch is a barrier, so foreign work on the confined set costs the whole dispatch and `ms_tok` is not comparable across rows with different values here. `cpu_ms` is. Prints `n/a` when it could not be measured, never a clean `0.0` |
+//! | `foreign_%` | CPU consumed by *other processes* on this process's confined core set, as a percentage of one core, median over the reps that were measurable. Read this **before** `ms_tok`: a dispatch is a barrier, so foreign work on the confined set costs the whole dispatch and `ms_tok` is not comparable across rows with different values here. `cpu_ms` is. Prints `n/a` if no rep could be measured and suffixes `*` if only some could -- never a clean `0.0` for an unmeasured window |
 //! | `spread%` | `(max - min) / median` of `ms_tok` across repetitions |
 //!
 //! # Controls
@@ -163,7 +163,7 @@
 //! running it. Anything that shortens the window -- or replaces the yield ramp
 //! with a park -- moves that column; adding or removing wakes does not.
 //!
-//! # Second result, and a warning: the pool is bimodal per process launch
+//! # Second result: launches were bimodal, and the cause was off-process
 //!
 //! Read the table above as a distribution, not as four numbers. At width 16 and
 //! zero gap, repeated launches of the *same* binary with the *same* environment
@@ -795,11 +795,7 @@ fn main() {
             pick(|p| p.ivcsw_tok),
             pick(|p| p.rss_mb),
             spread,
-            if rows.iter().any(|p| p.contention.measured) {
-                format!("{:.1}", pick(|p| p.contention.foreign_pct))
-            } else {
-                "n/a".to_string()
-            },
+            host_contention::foreign_column(&rows.iter().map(|p| p.contention).collect::<Vec<_>>(),),
         );
 
         if rows.iter().any(|p| p.contention.is_contended()) {

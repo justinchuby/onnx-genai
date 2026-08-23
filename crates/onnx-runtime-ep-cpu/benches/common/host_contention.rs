@@ -35,8 +35,25 @@
 //!
 //! Busy jiffies accumulated on the allowed CPUs over the window, minus this
 //! process's own CPU over the same window. The remainder is foreign, and is
-//! reported as a percentage of the confined set's total capacity, so `100.0`
-//! means "an entire extra core's worth of somebody else was running on my set".
+//! reported as a percentage of **one core**, summed over the set, so `100.0`
+//! means "an entire extra core's worth of somebody else was running on my set"
+//! and the value ranges over `[0, 100 * allowed.len()]`. Normalising to one core
+//! rather than to set capacity is deliberate: under a barrier, one fully
+//! contended core costs the whole dispatch whatever `N` is, so the number that
+//! should trip a threshold must not be diluted by widening the set.
+//!
+//! # Precondition
+//!
+//! Busy time is restricted to the allowed CPUs, but this process's own time is
+//! read process-wide from `/proc/self/stat`. The subtraction is therefore only
+//! valid when *every* thread of the process is confined to the allowed set. It
+//! holds in this harness because the EP narrows the main thread's affinity
+//! during `initialize`, before any session or pool thread exists, and children
+//! inherit the narrowed mask. Reuse this where some thread runs off the set --
+//! an unconfined main thread, a library's background thread, or a failed
+//! affinity call leaving a pool wide -- and own time will be subtracted that was
+//! never counted in busy, which *under*-reports contention. That is the unsafe
+//! direction, so the precondition is worth re-checking before reusing this.
 #![allow(dead_code)]
 
 use std::time::Instant;
@@ -92,7 +109,7 @@ impl AllowedCpus {
         self.cpus.is_empty()
     }
 
-    /// `0,2` / `0-3,8` style, matching how `taskset` and `/proc` render a mask.
+    /// Flat comma list, e.g. `0,2`. Not `taskset`'s range notation.
     pub fn label(&self) -> String {
         self.cpus
             .iter()
@@ -135,13 +152,6 @@ pub struct Contention {
 }
 
 impl Contention {
-    /// Percent of a *single* allowed CPU that foreign work consumed. This is the
-    /// number that matters for a barrier: it is the worst-case slowdown of the
-    /// unluckiest shard, and therefore of the whole dispatch.
-    pub fn foreign_pct_of_one_cpu(&self) -> f64 {
-        self.foreign_pct
-    }
-
     /// A cell whose foreign CPU is above this is not comparable to a clean one.
     /// Deliberately low: at width 2 a foreign *tenth* of a core is already a
     /// measurable barrier tax, and the cost of over-flagging is a re-run while
@@ -149,6 +159,75 @@ impl Contention {
     pub fn is_contended(&self) -> bool {
         self.measured && self.foreign_pct > 5.0
     }
+}
+
+/// Renders the `foreign_%` cell for a group of repetitions.
+///
+/// The rule that matters is that an unmeasured repetition must never be able to
+/// influence the printed number. A `Contention` that was not measured carries a
+/// `foreign_pct` of `0.0`, so taking a median across *all* repetitions lets it
+/// vote for "quiet": at the usual three repetitions, two unmeasured ones force a
+/// printed `0.0` no matter how contended the third was. That would turn "not
+/// measured" into "measured and quiet", which is the exact failure this module
+/// exists to prevent, and it would silently cancel the unmeasured-on-mask-change
+/// guard in `contention()`.
+///
+/// So: median over the measured repetitions only, `n/a` when none were measured,
+/// and a `*` suffix when only some were, because a cell backed by fewer samples
+/// than its neighbours should say so rather than look equally solid.
+pub fn foreign_column(reps: &[Contention]) -> String {
+    let mut seen: Vec<f64> = reps
+        .iter()
+        .filter(|c| c.measured)
+        .map(|c| c.foreign_pct)
+        .collect();
+    if seen.is_empty() {
+        return "n/a".to_string();
+    }
+    seen.sort_by(|a, b| a.partial_cmp(b).expect("contention is never NaN"));
+    let median = seen[seen.len() / 2];
+    if seen.len() < reps.len() {
+        format!("{median:.1}*")
+    } else {
+        format!("{median:.1}")
+    }
+}
+
+/// Busy jiffies from one `cpuN ...` line of `/proc/stat`.
+///
+/// Columns are `user nice system idle iowait irq softirq steal guest guest_nice`.
+/// Busy is named explicitly rather than computed as `total - idle - iowait`,
+/// because the kernel folds `guest` into `user` and `guest_nice` into `nice`, so
+/// the subtractive form counts guest time twice. `iowait` is excluded: it is an
+/// idle state, and is the one column that is not reliably monotonic per CPU.
+/// `steal` is included -- a stolen cycle is one this process did not get, and it
+/// stalls a barrier exactly like a foreign thread does, but it is charged to no
+/// process's `utime`/`stime` and so would otherwise vanish.
+pub fn busy_jiffies_of_cpu_line(line: &str) -> Option<u64> {
+    let f: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .map(|f| f.parse().unwrap_or(0))
+        .collect();
+    if f.len() < 3 {
+        return None;
+    }
+    let at = |i: usize| f.get(i).copied().unwrap_or(0);
+    Some(at(0) + at(1) + at(2) + at(5) + at(6) + at(7))
+}
+
+/// `utime + stime` from the contents of `/proc/self/stat`.
+///
+/// `comm` is arbitrary bytes in parentheses and can itself contain spaces and
+/// parentheses, so the field walk starts from the *last* `)` rather than from
+/// the start of the line. After `comm`, field 0 is `state`, which puts `utime`
+/// at 11 and `stime` at 12.
+pub fn own_jiffies_of_self_stat(stat: &str) -> Option<u64> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    Some(utime + stime)
 }
 
 /// Reads the current affinity mask, `/proc/stat` and `/proc/self/stat` together.
@@ -160,34 +239,17 @@ pub fn snapshot() -> Option<ContentionSnapshot> {
     for &cpu in &allowed.cpus {
         let prefix = format!("cpu{cpu} ");
         let line = stat.lines().find(|l| l.starts_with(&prefix))?;
-        let fields: Vec<u64> = line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|f| f.parse().ok())
-            .collect();
-        // user nice system idle iowait irq softirq steal guest guest_nice.
-        // Idle and iowait are the only two that are not the CPU doing work;
-        // steal counts, because a stolen cycle is one this process did not get.
-        if fields.len() < 5 {
-            return None;
-        }
-        let total: u64 = fields.iter().sum();
-        busy.push(total.saturating_sub(fields[3]).saturating_sub(fields[4]));
+        busy.push(busy_jiffies_of_cpu_line(line)?);
     }
 
     let own_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
-    // `comm` can contain spaces and parentheses, so index from the last ')'.
-    let tail = &own_stat[own_stat.rfind(')')? + 1..];
-    let fields: Vec<&str> = tail.split_whitespace().collect();
-    // After `comm`, field 0 is `state`; `utime` is 11 and `stime` is 12.
-    let utime: u64 = fields.get(11)?.parse().ok()?;
-    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let own = own_jiffies_of_self_stat(&own_stat)?;
 
     Some(ContentionSnapshot {
         taken: Instant::now(),
         allowed: allowed.cpus,
         busy,
-        own: utime + stime,
+        own,
     })
 }
 
@@ -224,6 +286,11 @@ pub fn contention(
     // A mask that moved under the window makes the two ends incomparable: the
     // per-CPU deltas would be taken over different core sets. Report unmeasured
     // rather than difference them.
+    // A full ordered compare, not a length compare: the set relocating to
+    // different cores of the same size is exactly as invalidating as resizing.
+    // A mask that moved and moved *back* inside one window is not detectable
+    // here; it cannot arise in this harness, where the EP narrows affinity once
+    // during pool construction and never widens it again.
     if before.allowed != after.allowed || before.busy.is_empty() {
         return Contention::default();
     }

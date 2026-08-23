@@ -13,7 +13,12 @@
 #[path = "../benches/common/host_contention.rs"]
 mod host_contention;
 
-use host_contention::{AllowedCpus, ContentionSnapshot, clock_tick_hz, contention, snapshot};
+#[cfg(target_os = "linux")]
+use host_contention::{AllowedCpus, snapshot};
+use host_contention::{
+    Contention, ContentionSnapshot, busy_jiffies_of_cpu_line, clock_tick_hz, contention,
+    foreign_column, own_jiffies_of_self_stat,
+};
 use std::time::{Duration, Instant};
 
 /// One core-second's worth of jiffies.
@@ -121,6 +126,70 @@ fn a_mask_that_moved_under_the_window_is_reported_as_unmeasured() {
     );
 }
 
+/// The same, for a mask that *relocates* without changing size.
+///
+/// Separate from the case above because a length comparison would pass this one
+/// while still catching that one: `[0,2] -> [4,6]` differences this process's
+/// jiffies on cores 0 and 2 against a stranger's on cores 4 and 6, which is a
+/// fabricated number rather than a contention reading.
+#[test]
+fn a_mask_that_relocated_without_resizing_is_also_unmeasured() {
+    let taken = Instant::now();
+    let before = ContentionSnapshot::from_parts(taken, vec![0, 2], vec![0, 0], 0);
+    let after = ContentionSnapshot::from_parts(
+        taken + Duration::from_secs(1),
+        vec![4, 6],
+        vec![jiffies(1.0), jiffies(1.0)],
+        0,
+    );
+    assert!(
+        !contention(Some(&before), Some(&after)).measured,
+        "a set of the same size on different cores is still a different set"
+    );
+}
+
+/// `/proc/stat` column arithmetic, against a line with every column distinct.
+///
+/// `busy` is named explicitly rather than derived as `total - idle - iowait`,
+/// and this is the test that tells those apart: the subtractive form counts
+/// `guest`/`guest_nice` twice, because the kernel already folds them into
+/// `user`/`nice`. For this fixture it would yield 185 instead of 168.
+#[test]
+fn busy_jiffies_exclude_idle_iowait_and_the_guest_double_count() {
+    //                    user nice sys idle iowait irq soft steal guest gnice
+    let line = "cpu0 100 20 30 5000 40 5 6 7 8 9";
+    assert_eq!(
+        busy_jiffies_of_cpu_line(line),
+        Some(100 + 20 + 30 + 5 + 6 + 7)
+    );
+
+    // Kernels that stop short of `steal` must still parse, not silently vanish.
+    assert_eq!(
+        busy_jiffies_of_cpu_line("cpu0 100 20 30 5000"),
+        Some(100 + 20 + 30)
+    );
+    assert_eq!(busy_jiffies_of_cpu_line("cpu0 100"), None);
+}
+
+/// `utime`/`stime` must be read at the right offset, from the right anchor.
+///
+/// The offsets are the part of this module most likely to be silently wrong:
+/// `cutime`/`cstime` sit immediately after them and are normally `0`, so an
+/// off-by-two reads a plausible zero rather than failing. A zero `own` makes
+/// every one of this process's own cycles look foreign.
+#[test]
+fn own_jiffies_are_utime_plus_stime_anchored_on_the_last_paren() {
+    let stat = "1234 (bench) R 1 1234 1234 0 -1 4194560 100 0 0 0 700 300 11 13 20";
+    assert_eq!(own_jiffies_of_self_stat(stat), Some(1000));
+
+    // `comm` is arbitrary bytes and may contain spaces and parentheses, which is
+    // why the walk anchors on the *last* ')' rather than splitting from the left.
+    let awkward = "1234 (od d) na (me) R 1 1234 1234 0 -1 4194560 100 0 0 0 700 300 11 13 20";
+    assert_eq!(own_jiffies_of_self_stat(awkward), Some(1000));
+
+    assert_eq!(own_jiffies_of_self_stat("1234 (bench) R 1 2 3"), None);
+}
+
 /// The real mask must be readable on the host running this suite, since every
 /// other reading is scoped to it.
 #[test]
@@ -133,14 +202,18 @@ fn the_allowed_cpu_set_is_readable_and_non_empty() {
 }
 
 /// End to end against the live host: two real snapshots around a window in which
-/// this process deliberately burns a core must attribute that core to *us*.
+/// this process deliberately burns a core must attribute that core to *us* and
+/// not to a stranger.
 ///
-/// Deliberately asserts only the direction a busy host cannot break. A co-tenant
+/// Deliberately asserts only directions a busy host cannot break. A co-tenant
 /// can push `foreign_pct` up at any moment, so an upper bound on it would be
-/// flaky; our own core-second, though, must always appear in `total_pct`.
+/// flaky; but our own core-second must appear in `total_pct`, and it must
+/// *survive* the subtraction of our own time -- which is the only assertion here
+/// that depends on `own` being read at all, and so the only one that fails if
+/// the `/proc/self/stat` offsets are wrong.
 #[test]
 #[cfg(target_os = "linux")]
-fn our_own_cpu_burn_is_counted_in_the_total_for_the_set() {
+fn our_own_cpu_burn_is_attributed_to_us_and_not_to_a_stranger() {
     let before = snapshot().expect("snapshot");
     let deadline = Instant::now() + Duration::from_millis(600);
     let mut sink = 0u64;
@@ -157,4 +230,42 @@ fn our_own_cpu_burn_is_counted_in_the_total_for_the_set() {
         "we burned ~one core for the window, so the total must see it; got {}",
         c.total_pct
     );
+    assert!(
+        c.total_pct - c.foreign_pct > 50.0,
+        "our own core-second must be subtracted out as ours, leaving it out of \
+         foreign; total {} foreign {}",
+        c.total_pct,
+        c.foreign_pct
+    );
+}
+
+/// The printed cell must never let an unmeasured repetition vote for "quiet".
+///
+/// This is the property the whole module exists for, stated at the last place it
+/// can be lost: the median. An unmeasured `Contention` carries `foreign_pct ==
+/// 0.0`, so a median over every repetition would let two unmeasured ones bury a
+/// contended third under a clean-looking `0.0` -- and would quietly undo the
+/// unmeasured-on-mask-change guard, since that guard's whole output is a
+/// zero-valued unmeasured reading.
+#[test]
+fn an_unmeasured_repetition_can_never_be_printed_as_a_clean_zero() {
+    let clean = |pct: f64| Contention {
+        foreign_pct: pct,
+        total_pct: pct,
+        measured: true,
+    };
+    let unmeasured = Contention::default();
+
+    assert_eq!(foreign_column(&[unmeasured; 3]), "n/a");
+
+    // The case that motivated this: the median over all three would be 0.0.
+    assert_eq!(
+        foreign_column(&[unmeasured, unmeasured, clean(50.6)]),
+        "50.6*",
+        "a contended rep must survive two unmeasured neighbours, and the cell \
+         must admit it is short of samples"
+    );
+
+    assert_eq!(foreign_column(&[clean(0.1), clean(0.2), clean(0.3)]), "0.2");
+    assert_eq!(foreign_column(&[]), "n/a");
 }
