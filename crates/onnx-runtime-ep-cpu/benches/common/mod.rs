@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 pub mod decode_workload;
-pub mod host_contention;
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{

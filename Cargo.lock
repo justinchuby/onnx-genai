@@ -2035,6 +2035,7 @@ dependencies = [
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",
  "onnx-runtime-ep-cuda",
+ "onnx-runtime-hostmon",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-session",
@@ -2406,6 +2407,7 @@ dependencies = [
  "libm",
  "mlas-sys",
  "onnx-runtime-ep-api",
+ "onnx-runtime-hostmon",
  "onnx-runtime-ir",
  "onnx-runtime-loader",
  "onnx-runtime-memory-governor",
@@ -2523,6 +2525,13 @@ dependencies = [
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
  "onnx-std",
+]
+
+[[package]]
+name = "onnx-runtime-hostmon"
+version = "0.1.0-dev.5"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

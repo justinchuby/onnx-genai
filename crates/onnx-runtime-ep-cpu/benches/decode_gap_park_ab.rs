@@ -178,7 +178,7 @@
 //! both regimes. This matters more than any single row here, for two reasons.
 //!
 //! **Resolved: it is foreign CPU on the confined core set.** See the
-//! `foreign_%` column and `common::host_contention`. `ONNX_GENAI_CPU_DECODE_THREADS=N`
+//! `foreign_%` column and the `onnx-runtime-hostmon` crate. `ONNX_GENAI_CPU_DECODE_THREADS=N`
 //! confines the process to N CPUs, and a dispatch is a *barrier*, so one
 //! unrelated thread on one of those N cores costs the whole dispatch rather than
 //! a share of it -- every other worker finishes and idles waiting. The workers
@@ -224,9 +224,9 @@ use std::time::{Duration, Instant};
 
 use common::Tensor;
 use common::decode_workload::{Weight, asymmetric_zero_points, build_kernel, floats, weights};
-use common::host_contention::{self, Contention};
 use onnx_runtime_ep_api::Kernel;
 use onnx_runtime_ep_cpu::{decode_spmd, with_decode_pool_scope};
+use onnx_runtime_hostmon::{self as host_contention, Contention};
 
 /// Deterministic xorshift64*, so every cell sees the same gap sequence and two
 /// rows differ only by their gap parameters.
@@ -416,7 +416,7 @@ struct Pass {
     ivcsw_tok: f64,
     rss_mb: f64,
     /// Foreign CPU on the *confined* core set over this pass's window. See
-    /// `common::host_contention`: a decode dispatch is a barrier, so foreign
+    /// `onnx-runtime-hostmon`: a decode dispatch is a barrier, so foreign
     /// work on the confined set costs the whole dispatch rather than a share of
     /// it, and a host-wide load gate cannot see it.
     contention: Contention,

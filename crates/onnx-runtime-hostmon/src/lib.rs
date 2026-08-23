@@ -42,19 +42,29 @@
 //! contended core costs the whole dispatch whatever `N` is, so the number that
 //! should trip a threshold must not be diluted by widening the set.
 //!
-//! # Precondition
+//! # The own-time precondition, and why it is checked rather than documented
 //!
 //! Busy time is restricted to the allowed CPUs, but this process's own time is
 //! read process-wide from `/proc/self/stat`. The subtraction is therefore only
-//! valid when *every* thread of the process is confined to the allowed set. It
-//! holds in this harness because the EP narrows the main thread's affinity
-//! during `initialize`, before any session or pool thread exists, and children
-//! inherit the narrowed mask. Reuse this where some thread runs off the set --
-//! an unconfined main thread, a library's background thread, or a failed
-//! affinity call leaving a pool wide -- and own time will be subtracted that was
-//! never counted in busy, which *under*-reports contention. That is the unsafe
-//! direction, so the precondition is worth re-checking before reusing this.
-#![allow(dead_code)]
+//! valid when *every* thread of the process is confined to the allowed set. If
+//! some thread runs off the set -- an unconfined main thread, a library's
+//! background thread, or a failed affinity call leaving a pool wide -- own time
+//! is subtracted that was never counted in busy, and contention is
+//! *under*-reported. That is the unsafe direction: it moves a contended reading
+//! toward "clean".
+//!
+//! While this lived beside its single caller the precondition was documented and
+//! held by inspection, because the EP narrows the main thread's affinity during
+//! `initialize`, before any session or pool thread exists, and children inherit
+//! the narrowed mask. That reasoning does not travel with the code. So
+//! [`threads_off_mask`] checks it at both ends of the window, and
+//! [`Contention::own_time_complete`] records the answer: when it is false the
+//! figure is a *lower bound* rather than an estimate, [`foreign_column`] marks
+//! it with a trailing `!`, and [`Contention::is_clean`] refuses to certify the
+//! window. The check is a boundary property and does not see a thread that is
+//! spawned wide and joined entirely between the two snapshots; see
+//! [`Contention::own_time_complete`] for why that is stated rather than
+//! sampled around.
 
 use std::time::Instant;
 
@@ -119,6 +129,156 @@ impl AllowedCpus {
     }
 }
 
+/// The number of CPUs online on the host, independent of this process's mask.
+///
+/// [`AllowedCpus::current`] answers "which CPUs may I use"; this answers "how
+/// many exist". The pair is what distinguishes a process that was confined from
+/// one that simply has a small machine, and only the first is evidence of a
+/// narrowed budget.
+#[cfg(target_os = "linux")]
+pub fn online_cpus() -> Option<usize> {
+    // SAFETY: `sysconf` takes an int and returns a long; no pointers involved.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    if n > 0 { Some(n as usize) } else { None }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn online_cpus() -> Option<usize> {
+    None
+}
+
+/// Parses a kernel CPU list such as `0-3,8,12-13` into individual CPU numbers.
+///
+/// This is the format of `Cpus_allowed_list` in `/proc/<pid>/status`, which is
+/// range notation -- unlike [`AllowedCpus::label`], which is a flat comma list.
+/// A malformed field returns `None` rather than a partial set, because a
+/// silently truncated mask would read as "this thread is confined to fewer CPUs
+/// than it is", which is the direction that fabricates a passing check.
+pub fn parse_cpu_list(list: &str) -> Option<Vec<usize>> {
+    // No CPU above the affinity mask's own width can ever be in `allowed`, so a
+    // larger number is malformed rather than merely unusual. Bounded because
+    // `cpus.extend(lo..=hi)` allocates eagerly: a truncated or corrupt read of
+    // `0-18446744073709551614` would otherwise try to allocate exabytes and
+    // abort the benchmark. This module's whole argument is that it does not
+    // rely on "the kernel would never emit that".
+    let max_cpu = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((lo, hi)) => {
+                let (lo, hi) = (lo.trim().parse().ok()?, hi.trim().parse::<usize>().ok()?);
+                if hi < lo || hi >= max_cpu {
+                    return None;
+                }
+                cpus.extend(lo..=hi);
+            }
+            None => {
+                let cpu = part.trim().parse().ok()?;
+                if cpu >= max_cpu {
+                    return None;
+                }
+                cpus.push(cpu);
+            }
+        }
+    }
+    if cpus.is_empty() { None } else { Some(cpus) }
+}
+
+/// How many of this process's threads can run *outside* `allowed`.
+///
+/// # Why this is measured rather than assumed
+///
+/// Foreign CPU is `busy on the allowed set` minus `this process's own CPU`, but
+/// own CPU is read process-wide from `/proc/self/stat` while busy is restricted
+/// to the allowed set. The subtraction is only valid when every thread of the
+/// process is confined to that set. When one is not, its CPU is subtracted
+/// without ever having been added, and the result *under*-reports contention --
+/// it moves a contended reading toward "clean", which is the direction that
+/// publishes a wrong number rather than merely losing a row.
+///
+/// The original single-consumer version of this code carried that as a
+/// documented precondition, which held because the EP narrows the main thread's
+/// affinity before any pool thread exists and children inherit the mask. A
+/// documented precondition is fine for one caller who has checked it; it is not
+/// fine for a shared crate, where the first caller with an unconfined logging or
+/// telemetry thread gets a quiet under-report and no indication. So it is
+/// checked.
+///
+/// `None` when the thread list cannot be read at all, which is treated as
+/// "unknown" and therefore not-confined by callers -- unknown must not be
+/// allowed to certify a reading as complete.
+/// One thread's `/proc/<tid>/status`, as seen by the scan.
+#[derive(Clone, Copy, Debug)]
+pub enum ThreadStatus<'a> {
+    /// The file was read.
+    Read(&'a str),
+    /// The file was gone -- the thread exited between the directory listing and
+    /// the read.
+    Vanished,
+    /// The file existed but could not be read.
+    Unreadable,
+}
+
+/// Decides the off-mask count from a set of thread status blobs.
+///
+/// Split from the directory walk in [`threads_off_mask`] so the decision can be
+/// asserted. The cases that matter -- a live thread whose mask could not be
+/// established -- cannot be produced by pointing the real scan at a real
+/// `/proc`, so testing them through the I/O would mean not testing them at all.
+///
+/// The rule is that only a *vanished* thread may be skipped. Every other
+/// failure is a live thread of unknown affinity, and letting the remaining
+/// threads certify the subtraction over it is exactly the "number that was never
+/// measured" this crate exists to remove.
+pub fn off_mask_from_statuses(statuses: &[ThreadStatus<'_>], allowed: &[usize]) -> Option<usize> {
+    let mut off = 0usize;
+    let mut seen_any = false;
+    for status in statuses {
+        let text = match status {
+            ThreadStatus::Read(text) => *text,
+            ThreadStatus::Vanished => continue,
+            ThreadStatus::Unreadable => return None,
+        };
+        let line = text
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?;
+        let cpus = parse_cpu_list(line)?;
+        seen_any = true;
+        if cpus.iter().any(|c| !allowed.contains(c)) {
+            off += 1;
+        }
+    }
+    if seen_any { Some(off) } else { None }
+}
+
+#[cfg(target_os = "linux")]
+pub fn threads_off_mask(allowed: &[usize]) -> Option<usize> {
+    let mut statuses = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/task").ok()? {
+        let Ok(entry) = entry else {
+            return None;
+        };
+        statuses.push(match std::fs::read_to_string(entry.path().join("status")) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ThreadStatus::Vanished),
+            Err(_) => Err(ThreadStatus::Unreadable),
+        });
+    }
+    let borrowed: Vec<ThreadStatus<'_>> = statuses
+        .iter()
+        .map(|s| match s {
+            Ok(text) => ThreadStatus::Read(text),
+            Err(other) => *other,
+        })
+        .collect();
+    off_mask_from_statuses(&borrowed, allowed)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn threads_off_mask(_allowed: &[usize]) -> Option<usize> {
+    None
+}
+
 /// Busy jiffies per allowed CPU plus this process's own CPU, captured together
 /// so the two can be differenced against the same window.
 #[derive(Clone, Debug)]
@@ -136,6 +296,11 @@ pub struct ContentionSnapshot {
     busy: Vec<u64>,
     /// This process's own `utime + stime`, in jiffies.
     own: u64,
+    /// Threads able to run outside `allowed` at snapshot time; `None` when the
+    /// thread list could not be read. Any value other than `Some(0)` means the
+    /// own-CPU subtraction is incomplete and the foreign figure is a *lower
+    /// bound* rather than an estimate.
+    off_mask: Option<usize>,
 }
 
 /// Foreign CPU observed on the confined set over one window.
@@ -149,15 +314,53 @@ pub struct Contention {
     pub total_pct: f64,
     /// Whether the reading is trustworthy at all.
     pub measured: bool,
+    /// Whether every thread was confined to the set **at both ends of the
+    /// window**, which is the precondition that makes `foreign_pct` an estimate
+    /// rather than a lower bound. See [`threads_off_mask`].
+    ///
+    /// A boundary property, not a window property, and the difference is real:
+    /// a thread spawned wide, burning CPU off-set, and joined entirely between
+    /// the two snapshots is invisible to both, while its CPU still lands in the
+    /// process-wide `own` total. `true` therefore means "no off-mask thread was
+    /// observed at either boundary", which is exact for a stable thread set --
+    /// the case both shipped consumers are in, since the EP's decode pool and
+    /// ORT's intra-op pool are built once and persist -- and is not a guarantee
+    /// for a caller that spawns transient wide threads inside a measured
+    /// window. Sampling more often would narrow that hole without closing it,
+    /// so it is stated rather than papered over.
+    pub own_time_complete: bool,
 }
 
 impl Contention {
+    /// Whether this window is provably contended.
+    ///
+    /// Sound on a lower bound, and deliberately so: when
+    /// [`own_time_complete`](Self::own_time_complete) is false `foreign_pct`
+    /// under-reports, so a figure above the threshold proves the true value is
+    /// above it too. That is what lets an incomplete window still condemn a row,
+    /// and it is the property [`is_clean`](Self::is_clean) cannot share -- do
+    /// not "fix" this by requiring `own_time_complete` here.
+    ///
     /// A cell whose foreign CPU is above this is not comparable to a clean one.
     /// Deliberately low: at width 2 a foreign *tenth* of a core is already a
     /// measurable barrier tax, and the cost of over-flagging is a re-run while
     /// the cost of under-flagging is a published wrong number.
     pub fn is_contended(&self) -> bool {
         self.measured && self.foreign_pct > 5.0
+    }
+
+    /// Whether this window can be relied on as *clean*.
+    ///
+    /// Deliberately not `!is_contended()`. The two are asymmetric because an
+    /// incomplete own-time subtraction makes `foreign_pct` a lower bound: a
+    /// lower bound above the threshold still proves contention, so
+    /// [`is_contended`](Self::is_contended) stays sound without
+    /// `own_time_complete`, while a lower bound below the threshold proves
+    /// nothing at all. Concluding "quiet" therefore needs the stronger
+    /// condition, and a caller that gates a benchmark on `!is_contended()` gets
+    /// the weaker one by accident.
+    pub fn is_clean(&self) -> bool {
+        self.measured && self.own_time_complete && self.foreign_pct <= 5.0
     }
 }
 
@@ -186,11 +389,26 @@ pub fn foreign_column(reps: &[Contention]) -> String {
     }
     seen.sort_by(|a, b| a.partial_cmp(b).expect("contention is never NaN"));
     let median = seen[seen.len() / 2];
+    let mut cell = format!("{median:.1}");
     if seen.len() < reps.len() {
-        format!("{median:.1}*")
-    } else {
-        format!("{median:.1}")
+        cell.push('*');
     }
+    // A trailing `!` means the figure is a lower bound, not an estimate. Marked
+    // rather than suppressed: the bound is still usable to *flag* a row, and
+    // blanking it would hide a large positive reading that is real.
+    //
+    // Deliberately a suffix. The obvious spelling of a lower bound is a leading
+    // `>`, but this cell is a column in a table that gets parsed, and `awk
+    // '$NF + 0'` on `>9.0` yields `0.0` -- silently turning the most contended
+    // row in a matrix into the cleanest-looking one. That is precisely the
+    // failure this module exists to prevent, one hop downstream. With the marker
+    // trailing, the same awk yields `9.0`: the qualifier is lost but the number
+    // survives, and Python's `float()` raises instead of guessing. Both are the
+    // safe direction.
+    if reps.iter().any(|c| c.measured && !c.own_time_complete) {
+        cell.push('!');
+    }
+    cell
 }
 
 /// Busy jiffies from one `cpuN ...` line of `/proc/stat`.
@@ -244,12 +462,20 @@ pub fn snapshot() -> Option<ContentionSnapshot> {
 
     let own_stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     let own = own_jiffies_of_self_stat(&own_stat)?;
+    // Anchored here rather than in the struct literal below, so the timestamp
+    // sits next to the jiffy reads it has to be differenced against. The
+    // thread scan that follows is bounded by the number of threads, and leaving
+    // it inside the bracket would add a thread-count-dependent offset to
+    // `window` that is not present in `busy` or `own`.
+    let taken = Instant::now();
+    let off_mask = threads_off_mask(&allowed.cpus);
 
     Some(ContentionSnapshot {
-        taken: Instant::now(),
+        taken,
         allowed: allowed.cpus,
         busy,
         own,
+        off_mask,
     })
 }
 
@@ -318,29 +544,47 @@ pub fn contention(
         foreign_pct: foreign_s / window * 100.0,
         total_pct: total_s / window * 100.0,
         measured: true,
+        // Both ends must be clean. Requiring only the later snapshot would
+        // certify a window that a thread was off-mask for the whole first half
+        // of, since it may have been joined before the end. Checking both is
+        // strictly stronger, though still a boundary property -- see
+        // `own_time_complete`.
+        own_time_complete: before.off_mask == Some(0) && after.off_mask == Some(0),
     }
 }
 
 impl ContentionSnapshot {
     /// Builds a snapshot from known parts.
     ///
-    /// This exists because the tests live in `tests/bench_host_contention.rs`
-    /// rather than in a `#[cfg(test)]` module here. The benches that own this
-    /// file are `harness = false`, and a `#[cfg(test)]` module inside a
-    /// `harness = false` bench is compiled with its `#[test]` functions stripped
-    /// -- so tests written next to the code would never run, while still being
-    /// counted as passing. Putting them in a real test target makes them run,
-    /// and that costs one deliberate seam.
+    /// This exists because the tests are integration tests, so they see only
+    /// the public surface and cannot reach these fields directly. One
+    /// deliberate seam is cheaper than making the fields public, which would
+    /// let a caller construct a snapshot whose `allowed` and `busy` disagree in
+    /// length.
     ///
     /// Synthetic parts are also what the arithmetic tests want: differencing two
     /// fabricated snapshots asserts the formula, whereas sampling the real host
     /// asserts whatever the host happened to be doing.
     pub fn from_parts(taken: Instant, allowed: Vec<usize>, busy: Vec<u64>, own: u64) -> Self {
+        Self::from_parts_with_off_mask(taken, allowed, busy, own, Some(0))
+    }
+
+    /// As [`from_parts`](Self::from_parts) but with an explicit off-mask thread
+    /// count, so a test can construct the incomplete-subtraction case without
+    /// having to actually escape the affinity mask.
+    pub fn from_parts_with_off_mask(
+        taken: Instant,
+        allowed: Vec<usize>,
+        busy: Vec<u64>,
+        own: u64,
+        off_mask: Option<usize>,
+    ) -> Self {
         Self {
             taken,
             allowed,
             busy,
             own,
+            off_mask,
         }
     }
 }
