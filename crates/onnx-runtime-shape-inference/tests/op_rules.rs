@@ -283,8 +283,23 @@ fn assert_symbolic(dim: &DimExpr) {
 #[test]
 fn expanded_registry_catalog_count_is_pinned() {
     let registry = InferenceRegistry::default_registry();
-    assert_eq!(registry.operator_count(), 221);
-    assert_eq!(registry.entry_count(), 266);
+    assert_eq!(
+        registry.operator_count(),
+        221,
+        "shape-inference operator count moved: `left` is the live registry, `right` is this \
+         pin. If you added or removed a handler, repin to `left` in the same commit and cover \
+         the rule with a test (RULES.md §8); if you did not, a registration changed by \
+         accident. A stale pin reds `Fast (Linux x86_64)` -- a required check -- on main and \
+         on every open PR, so it is worth 30 seconds now."
+    );
+    assert_eq!(
+        registry.entry_count(),
+        266,
+        "shape-inference entry count moved: `left` is the live registry, `right` is this pin. \
+         One operator can carry several opset-versioned entries, so this count does not always \
+         move in step with the operator count -- read both numbers off the failure rather than \
+         assuming they shift together."
+    );
 }
 
 fn recurrent_node(op: &str, outputs: usize, direction: &str, hidden_size: i64) -> Node {
