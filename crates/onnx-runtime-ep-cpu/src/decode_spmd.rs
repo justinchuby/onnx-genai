@@ -139,6 +139,11 @@ const DEFAULT_BLOCKTIME: Duration = Duration::from_micros(500);
 /// Environment variable naming the worker active-spin window, in microseconds.
 const DECODE_BLOCKTIME_ENV: &str = "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US";
 
+/// Environment variable enabling the per-worker wake/work timing reported by
+/// [`SpmdDecodePools::worker_profiles`]. Off by default; see
+/// [`parse_worker_profile`].
+pub const WORKER_PROFILE_ENV: &str = "ONNX_GENAI_CPU_DECODE_WORKER_PROFILE";
+
 /// Pure `spin_loop` iterations at the start of the active window before the
 /// worker begins yielding the core to co-tenants between clock checks. A
 /// crossbeam-`Backoff`-style ramp: hammer the sense line first to catch the
@@ -191,6 +196,13 @@ thread_local! {
     /// one. A delay long enough to push the barrier onto its yield/clock path
     /// is what makes "slow is not the same as broken" an actual assertion.
     static DELAY_WORKER_BEFORE_READY_MS: Cell<u64> = const { Cell::new(0) };
+
+    /// Test override for [`WORKER_PROFILE_ENV`]: `Some(v)` forces the per-worker
+    /// timing gate to `v` for pools built on this thread. Thread-scoped for the
+    /// same reason as the knobs above, and additionally because the alternative
+    /// -- `set_var` around a build -- is a data race against every other test
+    /// thread's `getenv` and would need a lock this module does not have.
+    static FORCE_WORKER_PROFILE: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 /// Read on the builder thread only: both the barrier and the pre-spawn fault
@@ -230,6 +242,44 @@ fn decode_blocktime() -> Duration {
 fn parse_decode_blocktime(raw: Option<&str>) -> Duration {
     raw.and_then(|raw| raw.trim().parse::<u64>().ok())
         .map_or(DEFAULT_BLOCKTIME, Duration::from_micros)
+}
+
+/// Env gate for the per-worker wake/work timing in [`SpmdWorkerProfile`].
+///
+/// Read **once per pool build**, into [`SharedState::profile_workers`] --
+/// deliberately not into a `OnceLock`. A latched gate would make the obvious
+/// A/B (build a profiled pool, build an unprofiled one, compare) compare one
+/// configuration against itself and pass without measuring anything: that is
+/// #1736 exactly, and it is not a defect worth reintroducing in the very
+/// mechanism built to catch unmeasured claims. Production builds the pool once,
+/// so a per-build read costs one `getenv` for the process.
+fn parse_worker_profile(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim),
+        Some("1") | Some("on") | Some("true") | Some("TRUE") | Some("On") | Some("True")
+    )
+}
+
+fn worker_profile_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_WORKER_PROFILE.with(Cell::get) {
+        return forced;
+    }
+    parse_worker_profile(std::env::var(WORKER_PROFILE_ENV).ok().as_deref())
+}
+
+/// Process-wide monotonic origin for [`SpmdWorkerProfile`] timestamps. Only ever
+/// read while profiling is on, and only to produce differences, so the origin
+/// itself is arbitrary; it exists because `Instant` is not storable in an
+/// `AtomicU64` and the publish timestamp has to cross threads.
+fn profile_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+/// Nanoseconds since [`profile_epoch`], saturating at `u64::MAX` (585 years).
+fn profile_now_ns() -> u64 {
+    u64::try_from(profile_epoch().elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Spin iterations the (single, never-idle) dispatcher busy-waits on the
@@ -318,6 +368,20 @@ struct Job {
 struct NodeSense {
     wake: AtomicU32,
     ops: AtomicU32,
+    /// Nanoseconds since [`profile_epoch`] at which the current op was
+    /// published, written by the dispatcher only while
+    /// [`SharedState::profile_workers`] is set.
+    ///
+    /// Stored `Relaxed` *before* the `Release` bump of `ops`, so a worker whose
+    /// `Acquire` load of `ops` observes the new op also observes this value: the
+    /// release/acquire edge that already carries the job pointer carries this
+    /// too, and it needs no ordering of its own.
+    ///
+    /// Lives on the sense line rather than on its own because it is written by
+    /// the same thread, in the same instruction stream, as the two words beside
+    /// it -- and, when profiling is off, never written at all, so it costs a
+    /// disabled pool nothing.
+    publish_ns: AtomicU64,
 }
 
 /// Observable scheduling behaviour of the persistent SPMD decode pool.
@@ -410,6 +474,68 @@ struct WorkerCounters {
     spin_hits: AtomicU64,
     parks: AtomicU64,
     spurious_wakes: AtomicU64,
+    /// Ops this worker retired *last* within its node -- i.e. the shard the
+    /// dispatcher was still waiting on when every other shard was already done.
+    ///
+    /// Free: the barrier already computes it (the `fetch_sub` that returns 1 is
+    /// by definition the last acknowledgement), so this adds one uncontended
+    /// RMW on a line the worker owns, and only on the op it was last for. It is
+    /// therefore on unconditionally, unlike the ns timings beside it.
+    last_arrivals: AtomicU64,
+    /// Ops for which `wake_ns`/`work_ns` below were both accumulated. Not equal
+    /// to `spin_hits + parks`: those count *observations*, including the wake a
+    /// worker pays for a shutdown bump, whereas an op is only timed here if it
+    /// was actually run.
+    timed_ops: AtomicU64,
+    /// Summed nanoseconds from the dispatcher publishing an op to this worker
+    /// observing it. The wake-latency half of a straggler.
+    wake_ns: AtomicU64,
+    /// Summed nanoseconds this worker spent inside its shard closure. The
+    /// work-imbalance half of a straggler.
+    work_ns: AtomicU64,
+}
+
+/// One worker's share of the barrier, for attributing a slow dispatch to a
+/// *specific* worker rather than to the pool as a whole.
+///
+/// [`SpmdCounters`] sums across workers, which cannot distinguish "one worker is
+/// consistently late" from "all workers are uniformly slower" -- and those have
+/// different causes and different owners (a late single worker points at
+/// placement, wakeup or a co-tenant on one CPU; uniform slowness points at the
+/// kernel or at memory). No aggregate counter can separate them, which is why
+/// this exists.
+///
+/// `last_arrivals` is always populated. `wake_ns`/`work_ns`/`timed_ops` are zero
+/// unless the pool was built with [`WORKER_PROFILE_ENV`] set, because they cost
+/// two clock reads per worker per op (~4% at width 12 on a 400-barrier token)
+/// and must not be paid by production.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpmdWorkerProfile {
+    /// Global worker index. Spawned workers only; the dispatcher's own shard
+    /// never waits on the barrier and has no entry.
+    pub worker: usize,
+    /// The CPU this worker is pinned to, or `None` if unpinned or the pin
+    /// failed. Same realized-not-requested semantics as
+    /// [`SpmdDecodePools::worker_cpus`].
+    pub cpu: Option<usize>,
+    /// See [`SpmdCounters::spin_hits`].
+    pub spin_hits: u64,
+    /// See [`SpmdCounters::parks`].
+    pub parks: u64,
+    /// See [`SpmdCounters::spurious_wakes`].
+    pub spurious_wakes: u64,
+    /// Ops this worker was the last in its node to retire. Summed over a node's
+    /// workers this equals that node's dispatch count exactly, which is what
+    /// makes an *uneven* distribution meaningful: with `w` workers, chance alone
+    /// gives each `1/w` of them.
+    pub last_arrivals: u64,
+    /// Ops contributing to `wake_ns` and `work_ns`. Zero when profiling is off.
+    pub timed_ops: u64,
+    /// Summed publish-to-observe latency, nanoseconds. Zero when profiling is
+    /// off.
+    pub wake_ns: u64,
+    /// Summed in-shard time, nanoseconds. Zero when profiling is off.
+    pub work_ns: u64,
 }
 
 /// Dispatcher-side counters. Bumped by whichever thread owns the barrier, at
@@ -485,6 +611,10 @@ struct SharedState {
     /// at ~400 barriers per token is ~230 us/token of pure coherency traffic.
     dispatching: Padded<AtomicBool>,
     shutdown: AtomicBool,
+    /// Whether the per-worker ns timings are collected. Latched per *pool*, not
+    /// per process (see [`parse_worker_profile`]), and immutable after build so
+    /// every read is a plain load of a shared read-only word.
+    profile_workers: bool,
     /// One padded counter block per *spawned* worker, indexed by global worker
     /// index. The dispatcher's own shard (global index `total_threads`) never
     /// enters [`SharedState::worker_wait`], so it has no entry here.
@@ -536,6 +666,14 @@ impl SharedState {
         for (node, sense) in self.node_sense.iter().enumerate() {
             if counts.get(node).copied().unwrap_or(0) == 0 {
                 continue;
+            }
+            // Ordered before the `ops` bump for the same reason the counts above
+            // are: the Release/Acquire pair on `ops` is what publishes it.
+            if self.profile_workers {
+                sense
+                    .0
+                    .publish_ns
+                    .store(profile_now_ns(), Ordering::Relaxed);
             }
             // Ordered before the wake bump so a worker that observes the wake
             // (Acquire) also observes this.
@@ -838,6 +976,24 @@ impl SharedState {
         counters
     }
 
+    fn worker_profiles(&self, cpus: &[Option<usize>]) -> Vec<SpmdWorkerProfile> {
+        self.worker_counters
+            .iter()
+            .enumerate()
+            .map(|(worker, counters)| SpmdWorkerProfile {
+                worker,
+                cpu: cpus.get(worker).copied().flatten(),
+                spin_hits: counters.0.spin_hits.load(Ordering::Relaxed),
+                parks: counters.0.parks.load(Ordering::Relaxed),
+                spurious_wakes: counters.0.spurious_wakes.load(Ordering::Relaxed),
+                last_arrivals: counters.0.last_arrivals.load(Ordering::Relaxed),
+                timed_ops: counters.0.timed_ops.load(Ordering::Relaxed),
+                wake_ns: counters.0.wake_ns.load(Ordering::Relaxed),
+                work_ns: counters.0.work_ns.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
     fn panic_if_poisoned(&self) {
         let poisoned = self.poisoned_worker.load(Ordering::Acquire);
         if poisoned != 0 {
@@ -1052,6 +1208,7 @@ impl SpmdDecodePools {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            profile_workers: worker_profile_enabled(),
             worker_counters: (0..total_threads)
                 .map(|_| Padded(WorkerCounters::default()))
                 .collect(),
@@ -1317,6 +1474,23 @@ impl SpmdDecodePools {
         self.shared
             .as_ref()
             .map_or_else(SpmdCounters::default, |shared| shared.counters())
+    }
+
+    /// Per-worker barrier attribution, in global worker index order. See
+    /// [`SpmdWorkerProfile`].
+    ///
+    /// Monotonic since the pool was built, like [`Self::counters`], so a harness
+    /// subtracts two snapshots around the phase it cares about. Empty on the
+    /// `--features mlas` work-stealing schedule, which has no barrier of ours.
+    ///
+    /// The dispatcher's own shard is deliberately absent: it never waits to be
+    /// woken and never acknowledges the barrier, so every field here would be
+    /// either meaningless or zero for it, and including a permanently-zero row
+    /// would read as "this worker is never late" rather than "not measured".
+    pub fn worker_profiles(&self) -> Vec<SpmdWorkerProfile> {
+        self.shared
+            .as_ref()
+            .map_or_else(Vec::new, |shared| shared.worker_profiles(&self.worker_cpus))
     }
 
     fn uses_work_stealing(&self) -> bool {
@@ -1992,8 +2166,15 @@ impl WorkerCompletion<'_> {
     fn complete(self) {
         let shared = self.shared;
         let node = self.node;
+        let global_index = self.global_index;
         std::mem::forget(self);
         if shared.node_pending[node].0.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // This worker retired the node's final shard, so it is the one the
+            // dispatcher was still waiting on. Attributed here rather than
+            // derived from timing because the barrier already knows.
+            if let Some(counters) = shared.worker_counters.get(global_index) {
+                counters.0.last_arrivals.fetch_add(1, Ordering::Relaxed);
+            }
             shared.signal_completion();
         }
     }
@@ -2033,6 +2214,9 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
     let mut last_seen: u32 = 0;
     let mut last_op: u32 = 0;
     let blocktime = decode_blocktime();
+    // Hoisted so the hot loop pays a local branch rather than a shared load,
+    // and so a disabled pool never touches the timing path at all.
+    let profile = shared.profile_workers;
     // The `Release` half is load-bearing: it orders this worker's pre-readiness
     // stores -- notably `pin_failed[i]`, which the builder reads `Relaxed`
     // after the barrier -- before the builder's `Acquire` load of `ready`.
@@ -2063,6 +2247,22 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
         let op = shared.node_sense[node].0.ops.load(Ordering::Acquire);
         if op != last_op {
             last_op = op;
+            // Timed only when the op is actually run, so `timed_ops` counts ops
+            // and not observations (a shutdown bump advances `wake` but not
+            // `ops`, and must not be charged as a dispatch).
+            let observed_ns = if profile {
+                let published = shared.node_sense[node].0.publish_ns.load(Ordering::Relaxed);
+                let now = profile_now_ns();
+                if let Some(counters) = shared.worker_counters.get(global_index) {
+                    counters
+                        .0
+                        .wake_ns
+                        .fetch_add(now.saturating_sub(published), Ordering::Relaxed);
+                }
+                now
+            } else {
+                0
+            };
             // Read and run the published op. The acquire above, paired with the
             // Release bump in `publish`, established visibility of the job
             // pointer and the pending counts.
@@ -2079,6 +2279,16 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
             // SAFETY: `dispatch` keeps the closure alive until this worker
             // acknowledges through `completion`.
             unsafe { (job.call)(job.data, global_index) };
+            // Before `complete`, so the shard time excludes the barrier
+            // acknowledgement and the wake syscall it may issue -- this measures
+            // the shard, not the protocol around it.
+            if profile && let Some(counters) = shared.worker_counters.get(global_index) {
+                counters.0.work_ns.fetch_add(
+                    profile_now_ns().saturating_sub(observed_ns),
+                    Ordering::Relaxed,
+                );
+                counters.0.timed_ops.fetch_add(1, Ordering::Relaxed);
+            }
             completion.complete();
         }
         // Checked *after* retiring any outstanding shard, so a dispatch racing
@@ -2197,6 +2407,19 @@ pub fn decode_width() -> DecodeWidth {
 pub fn counters() -> Option<SpmdCounters> {
     match POOLS.get() {
         Some(Some(pools)) => Some(pools.counters()),
+        _ => None,
+    }
+}
+
+/// Snapshot the persistent decode pool's per-worker barrier attribution, or
+/// `None` when no persistent pool exists.
+///
+/// Peeks, never forces, for the same reason [`counters`] does. See
+/// [`SpmdWorkerProfile`] for what is always collected and what needs
+/// [`WORKER_PROFILE_ENV`].
+pub fn worker_profiles() -> Option<Vec<SpmdWorkerProfile>> {
+    match POOLS.get() {
+        Some(Some(pools)) => Some(pools.worker_profiles()),
         _ => None,
     }
 }
@@ -4620,9 +4843,146 @@ mod tests {
         pool.shutdown();
     }
 
-    /// A re-entrant dispatch degrades to inline rather than racing the barrier,
-    /// and the counter says so.
+    /// Profiling is a per-pool decision, not a per-process one.
     ///
+    /// The gate is read at every build rather than latched into a `OnceLock`,
+    /// so this test is a real A/B: the two arms genuinely take different
+    /// routes. Latch the gate and the second arm inherits the first's value,
+    /// the assertion below compares a configuration against itself, and the
+    /// test passes while measuring nothing -- #1736's exact shape.
+    #[test]
+    fn worker_timings_are_collected_only_when_the_pool_asked_for_them() {
+        let workers = 2usize;
+        let ops = 8u64;
+
+        FORCE_WORKER_PROFILE.with(|cell| cell.set(Some(false)));
+        let off = single_group_pool(workers);
+        FORCE_WORKER_PROFILE.with(|cell| cell.set(Some(true)));
+        let on = single_group_pool(workers);
+        FORCE_WORKER_PROFILE.with(|cell| cell.set(None));
+
+        for _ in 0..ops {
+            off.dispatch_index_tasks(workers, &|_| {});
+            on.dispatch_index_tasks(workers, &|_| {});
+        }
+
+        for profile in off.worker_profiles() {
+            assert_eq!(
+                (profile.timed_ops, profile.wake_ns, profile.work_ns),
+                (0, 0, 0),
+                "worker {} must pay no clock reads with profiling off",
+                profile.worker
+            );
+        }
+        let on_profiles = on.worker_profiles();
+        assert_eq!(on_profiles.len(), workers, "one row per spawned worker");
+        for profile in on_profiles {
+            assert_eq!(
+                profile.timed_ops, ops,
+                "worker {} ran every op and so must have timed every op",
+                profile.worker
+            );
+            // Only a lower bound: a shard doing nothing can legitimately take
+            // near-zero ns, so anything stronger would be a runner-speed
+            // assertion. Zero, though, means the accumulator never ran.
+            assert!(
+                profile.work_ns > 0,
+                "worker {} timed {} ops but accumulated no shard time",
+                profile.worker,
+                profile.timed_ops
+            );
+        }
+
+        off.shutdown();
+        on.shutdown();
+    }
+
+    /// Exactly one worker per node retires each op last, so the per-worker
+    /// counts sum to the dispatch count.
+    ///
+    /// An identity, not a measurement -- it holds whatever the runner is doing.
+    /// It is what makes an *uneven* distribution interpretable: the total is
+    /// fixed, so a worker holding more than its `1/w` share holds it at another
+    /// worker's expense.
+    #[test]
+    fn last_arrivals_sum_to_the_dispatch_count() {
+        let workers = 4usize;
+        let pool = single_group_pool(workers);
+        let ops = 24u64;
+        for _ in 0..ops {
+            pool.dispatch_index_tasks(workers, &|_| {});
+        }
+
+        let profiles = pool.worker_profiles();
+        let total: u64 = profiles.iter().map(|p| p.last_arrivals).sum();
+        assert_eq!(
+            total,
+            ops * pool.node_count() as u64,
+            "each of {ops} dispatches has exactly one last arriver per node, \
+             but the per-worker counts sum to {total}: {:?}",
+            profiles.iter().map(|p| p.last_arrivals).collect::<Vec<_>>()
+        );
+        pool.shutdown();
+    }
+
+    /// A shard that is slow on one worker is attributed to *that* worker.
+    ///
+    /// This is the whole point of the per-worker split: the aggregate counters
+    /// cannot tell "worker 1 is late every op" from "all four workers are
+    /// slightly slower", and those have different causes and different owners.
+    /// Verified by mutation -- attributing to the wrong index, or to whichever
+    /// worker happens to call in, fails this and passes
+    /// `last_arrivals_sum_to_the_dispatch_count`.
+    ///
+    /// The sleep is 2 ms against shards that do nothing, so the ordering is not
+    /// a close call on any host; the assertion is on *which* worker, never on
+    /// how long it took.
+    #[test]
+    fn the_slow_shard_is_attributed_to_the_worker_that_ran_it() {
+        let workers = 4usize;
+        let slow = 2usize;
+        let pool = single_group_pool(workers);
+        let ops = 8u64;
+        for _ in 0..ops {
+            pool.dispatch_index_tasks(workers, &|task| {
+                if task == slow {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            });
+        }
+
+        let profiles = pool.worker_profiles();
+        assert_eq!(
+            profiles[slow].last_arrivals,
+            ops,
+            "the deliberately slow worker must own every last arrival, got {:?}",
+            profiles.iter().map(|p| p.last_arrivals).collect::<Vec<_>>()
+        );
+        pool.shutdown();
+    }
+
+    #[test]
+    fn worker_profile_gate_accepts_only_affirmative_values() {
+        for raw in ["1", "on", "true", "TRUE", " on ", "True"] {
+            assert!(
+                parse_worker_profile(Some(raw)),
+                "{raw:?} must enable per-worker timing"
+            );
+        }
+        for raw in ["", "0", "off", "false", "yes", "2"] {
+            assert!(
+                !parse_worker_profile(Some(raw)),
+                "{raw:?} must not enable per-worker timing"
+            );
+        }
+        assert!(
+            !parse_worker_profile(None),
+            "unset must leave per-worker timing off"
+        );
+    }
+
+    /// A re-entrant dispatch degrades to inline rather than racing the barrier,
+    /// and the counter says so.    ///
     /// The pool has one job slot, so a shard closure that dispatches again --
     /// the nested fan-out shape, and the same shape two concurrent sessions
     /// produce -- must run every shard on the calling thread. That guarantee was
@@ -5825,6 +6185,7 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            profile_workers: false,
             worker_counters: Vec::new(),
             dispatch_counters: Padded(DispatchCounters::default()),
             completion_sense: Padded(AtomicU32::new(0)),
@@ -5843,6 +6204,7 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            profile_workers: false,
             worker_counters: vec![Padded(WorkerCounters::default())],
             dispatch_counters: Padded(DispatchCounters::default()),
             completion_sense: Padded(AtomicU32::new(0)),
