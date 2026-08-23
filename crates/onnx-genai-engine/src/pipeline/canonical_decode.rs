@@ -1,15 +1,16 @@
 //! The canonical autoregressive decode loop.
 //!
-//! A bare-decoder package has no serialized workflow; the loader compiles its
-//! `model.io` into one (`onnx_genai_metadata::canonical`). This module executes
-//! that lowered workflow, so a plain decoder is no longer a *second kind of
-//! package* that decodes without one.
+//! A single-decoder package declares a workflow like every other package: one
+//! ONNX component with port roles, a `state_service` group owning its cache,
+//! and a generation loop. This module executes that declared workflow, so a
+//! plain decoder is no longer a *second kind of package* that decodes without
+//! one.
 //!
-//! To be precise about what that does and does not mean: a lowered decoder and
-//! an authored workflow both execute a `WorkflowSpec`, but not through the same
-//! executor. An authored workflow runs the general interpreter
+//! To be precise about what that does and does not mean: a single decoder and a
+//! composite package both execute a `WorkflowSpec`, but not through the same
+//! executor. A composite workflow runs the general interpreter
 //! (`pipeline::workflow::run_workflow_node`) and may express token selection as
-//! an in-graph ONNX policy; a lowered decoder runs *this* body so it keeps the
+//! an in-graph ONNX policy; a single decoder runs *this* body so it keeps the
 //! rich Rust sampler, paged KV, sessions, and speculative decode — none of which
 //! has an in-graph representation. What is unified is that there is exactly one
 //! single-row autoregressive loop and one next-token policy, not that there is

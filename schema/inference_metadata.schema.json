@@ -5057,7 +5057,6 @@
           }
         },
         "required": [
-          "pipeline",
           "model"
         ]
       }

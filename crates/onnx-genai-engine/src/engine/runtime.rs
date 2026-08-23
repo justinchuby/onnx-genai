@@ -840,10 +840,10 @@ impl Engine {
         admission_callback: Option<&mut dyn FnMut()>,
         token_callback: Option<&mut GenerateTokenCallback<'_>>,
     ) -> anyhow::Result<GenerateResult> {
-        // One entry point, and one runtime beneath it. An authored
+        // One entry point, and one representation beneath it. A composite
         // `pipeline.workflow` is driven by the interpreter over its declared
-        // `tokens` output; a bare decoder is driven by the canonical workflow
-        // the loader compiled from its own `model.io`. There is no third path:
+        // `tokens` output; a single-decoder workflow is driven by the fused
+        // decode executor over the same declared loop. There is no third path:
         // a package that reached here without a canonical form is a load bug,
         // and saying so is what keeps "every request runs a canonical workflow"
         // checkable rather than asserted.
@@ -2140,9 +2140,10 @@ pub(crate) fn canonical_workflow<'a>(
         return Ok(workflow.workflow_spec());
     }
     lowered.context(
-        "this package has no canonical workflow: it declares no pipeline.workflow and its \
-         model.io was never lowered. The direct decode path it would once have taken no longer \
-         exists, so this is a loader bug rather than a package problem",
+        "this package has no canonical workflow: it declares no pipeline.workflow. The direct \
+         decode path it would once have taken no longer exists, and the loader refuses a \
+         package that declares no workflow, so reaching here is a loader bug rather than a \
+         package problem",
     )
 }
 

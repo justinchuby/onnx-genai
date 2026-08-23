@@ -1,28 +1,71 @@
-docs(metadata): record the completed model.io removal, and finish the audit
+fix: close the nine findings from the Opus review
 
-The design note already contained the staged removal path for `model.io`; this
-records that steps 2-4 are done and why step 3 was skipped — a warning that
-still loaded the package would have kept the second answer alive for another
-release, which is the opposite of the point.
+The review confirmed the removal itself was real — `decoder_io()` resolves only
+from the workflow, the compiler is deleted, the rejection fail-closes — but
+found the *audit* claim overstated, with two survivors that would have reached
+users. Both are fixed, along with the rest.
 
-Also finishes the audit the reversal implies:
+**The published JSON schema still described `model.io`.** `schema/mod.rs`
+unconditionally injected a constraint forbidding `io` *beside* a `pipeline` —
+correct when the block was still an import-only source, and wrong now: it
+accepted exactly the `model.io`-only documents the loader rejects. Since
+`ModelCapabilities` does not deny unknown fields, a producer validating against
+the published schema was told its package was valid and only learned otherwise
+when a runtime refused it. The constraint now forbids the key outright, matching
+`parser::reject_retired_model_io`, and `schema_sync` pins the stricter rule.
 
-* `schema/model_io.rs` is `schema/decoder_abi.rs`. The file no longer holds a
-  serialized block; it holds the *resolved* ABI type, which the design note
-  itself records being mistaken for the retired key often enough to be worth
-  renaming.
-* Comments across the importer, recognizer and parser that described `model.io`
-  as a live source now describe what actually holds. The retired spelling
-  survives in exactly two kinds of place: the rejection that explains it, and
-  the migration guidance that names the conversion.
-* `MODEL_METADATA.md`, `DESIGN.md` and `WORKFLOW_POLICY_COMPONENTS.md` no longer
-  describe an import-only fallback that does not exist.
+**A live error told operators to declare `model.io`.** `governor.rs`'s
+`UnknownKvGeometry` — a reachable path — instructed users to "declare
+model.io.kv_inputs and model.io.kv_outputs", and its test locked that string in.
+Following that advice produced a package the loader refuses. It now names
+`pipeline.workflow.serving.state_service.groups`, and the test asserts the
+remedy does *not* mention the retired block. The `onnx-genai-scheduler` crate
+had never been audited.
 
-Verified: fmt; clippy `-D warnings` across engine, metadata, server, CLI, C API
-and genai-config; H200 CUDA — canonical_execution_parity 8, gemma4_chained
-8, native_workflow_parity 12, one_runtime_e2e 5, fixture floor 3, real-model
-corpus green. **All five real foundry models are byte-identical to the
-pre-change baseline**, which is the load-bearing evidence: retiring the
-serialized block and executing every decoder as a workflow changed no token.
+**The advertised round-trip test did not exist.** `decoder_workflow.rs` claimed
+the property was asserted "for every converted fixture, by
+`decoder_workflow_roundtrip`". It now is: `tests/decoder_workflow_roundtrip.rs`
+loads all 14 converted packages, rebuilds each one's workflow from its own
+resolved ABI, and asserts the ABI comes back unchanged — which is what makes a
+mechanical conversion of fourteen YAML files checkable rather than hopeful.
+
+**Round-trip coverage matched the claim only partly.** Added cases for the
+static-cache inverse (the trickiest one — `interleave_halves`/`static_update` vs
+`derive_static_cache`), `kv_layout`, `hidden_output`, and recurrent carry
+*order* — which had only a length check, despite the KV path having a 12-layer
+test precisely because `BTreeMap` key order silently mis-binds layers. The
+module doc no longer says "reproduce the ABI it was given" without qualification:
+the round-trip is exact on everything the workflow expresses and *normalizing*
+on fields whose absence has a defined meaning (`aliasing: None` → `Forbidden`,
+`kv_layout: None` → `head_major_bnsh`, `optional_inputs` dropped). None of those
+change behaviour, and saying so keeps the claim from being read as more than it
+is.
+
+**A fourth place still classified packages independently.** CLI
+`model_inspection.rs` printed every single decoder as a one-component pipeline.
+It now asks `is_single_decoder_workflow` like the other three.
+
+**Comments and docs that had gone false.** `engine/model.rs`,
+`engine/runtime.rs`, `canonical_decode.rs` and `canonical_execution_parity.rs`
+still described a loader compiling `model.io`, two of them citing
+`onnx_genai_metadata::canonical` — a module deleted in this branch. §7 of
+`WORKFLOW_RUNTIME_UNIFICATION.md` still documented option A's in-memory
+lowering; it is rewritten to describe what landed and records that option A was
+shipped and then superseded, because keeping a second serialized ABI meant
+keeping a compiler, a fallback and a provenance distinction for it.
+`tiny-llm-scatter-workflow` and `tiny-llm-explicit-io` described an import-only
+path that no longer exists. A duplicated comment block in `decoder_abi.rs` is
+removed.
+
+Verified: 73/73 engine targets; 55/55 across metadata, scheduler, ort,
+genai-config, model-package, CLI, C API and server — exit 0, no flake this run;
+H200 CUDA — canonical_execution_parity 8, gemma4_chained 8,
+native_workflow_parity 12, one_runtime_e2e 5, fixture floor 3, corpus green;
+fmt; clippy `-D warnings` across every crate this branch touches. All five real
+foundry models remain byte-identical to the pre-change baseline.
+
+Pre-existing and not from this branch: dead-code lints in
+`onnx-genai-bench/src/bin/compare.rs` and literal-grouping lints in
+`onnx-runtime-ep-cuda`, neither of which this branch modifies.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

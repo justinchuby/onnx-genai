@@ -23,9 +23,19 @@
 //! module goes the other way. The two are only trustworthy as a pair, so
 //! [`decoder_workflow`] is required to round-trip: feeding its output back
 //! through the recognizer must reproduce the ABI it was given. That property is
-//! asserted in this module's tests and, for every converted fixture, by
-//! `decoder_workflow_roundtrip` in the metadata test suite — which is what makes
-//! a mechanical package conversion checkable rather than hopeful.
+//! asserted in this module's tests and, for every converted package, by
+//! `tests/decoder_workflow_roundtrip.rs` — which is what makes a mechanical
+//! conversion of fourteen packages checkable rather than hopeful.
+//!
+//! The round-trip is exact on everything the workflow can express, but it is
+//! *normalizing* rather than identity-preserving on fields whose absence has a
+//! defined meaning. A workflow states its aliasing and its layout, so an ABI
+//! that left them unset reads back with the defaults every consumer already
+//! applied (`aliasing: None` → `Forbidden`, `kv_layout: None` →
+//! `head_major_bnsh`). `optional_inputs` is dropped, because a workflow says a
+//! port may be omitted without naming the request key that signals its
+//! presence. None of these change behaviour; saying so is what keeps "it
+//! round-trips" from being read as more than it is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1283,5 +1293,113 @@ mod tests_support {
             ]),
             ..DecoderAbi::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod roundtrip_coverage {
+    use super::tests_support::dense_abi;
+    use super::*;
+    use crate::schema::{KvCacheLayout, LoopStatePair, StaticCacheIoSpec};
+
+    fn read_back(abi: &DecoderAbi) -> DecoderAbi {
+        let workflow = decoder_workflow(abi, "model.onnx", &DecoderFacts::default())
+            .expect("a complete decoder ABI must be expressible as a workflow");
+        let component = crate::decoder_abi::sole_decoder_component(&workflow).expect("one decoder");
+        crate::decoder_abi::decoder_abi(&workflow, component).expect("readable")
+    }
+
+    /// A fixed-capacity cache survives the conversion, including its control
+    /// ports and per-layer halves.
+    ///
+    /// This is the trickiest inverse in the module — `interleave_halves` and
+    /// `static_update` on the way out, `derive_static_cache` on the way back —
+    /// and getting it wrong binds the wrong buffer to the wrong layer without
+    /// any type error.
+    #[test]
+    fn a_static_cache_roundtrips() {
+        let abi = DecoderAbi {
+            token_input: Some("input_ids".to_string()),
+            logits_output: Some("logits".to_string()),
+            static_cache: Some(StaticCacheIoSpec {
+                write_indices_input: "write_indices".to_string(),
+                kv_sequence_length_input: "nonpad_kv_seqlen".to_string(),
+                key_cache_inputs: vec!["key_cache.0".to_string(), "key_cache.1".to_string()],
+                value_cache_inputs: vec!["value_cache.0".to_string(), "value_cache.1".to_string()],
+                key_cache_outputs: vec![
+                    "updated_key_cache.0".to_string(),
+                    "updated_key_cache.1".to_string(),
+                ],
+                value_cache_outputs: vec![
+                    "updated_value_cache.0".to_string(),
+                    "updated_value_cache.1".to_string(),
+                ],
+            }),
+            ..DecoderAbi::default()
+        };
+        let back = read_back(&abi);
+        assert_eq!(back.static_cache, abi.static_cache);
+        // A fixed-capacity cache is stated once. Reporting it *also* as growing
+        // pairs would make the paged KV bridge address a buffer that never
+        // grows.
+        assert_eq!(back.kv_inputs, None);
+        assert_eq!(back.kv_outputs, None);
+        assert_eq!(back.kv_ownership, Some(crate::schema::KvOwnership::Owned));
+    }
+
+    /// Recurrent carries keep their order and their names.
+    ///
+    /// The KV path has a layer index protecting it from `BTreeMap` key order;
+    /// recurrent pairs rely on the same mechanism, so they need the same
+    /// evidence rather than a length check that would pass on a shuffle.
+    #[test]
+    fn recurrent_state_keeps_its_order() {
+        let pairs: Vec<LoopStatePair> = (0..12)
+            .map(|layer| LoopStatePair {
+                input: format!("conv_state.{layer}.in"),
+                output: format!("conv_state.{layer}.out"),
+                init: None,
+                update: None,
+            })
+            .collect();
+        let abi = DecoderAbi {
+            token_input: Some("input_ids".to_string()),
+            logits_output: Some("logits".to_string()),
+            state_pairs: Some(pairs.clone()),
+            ..DecoderAbi::default()
+        };
+        assert_eq!(read_back(&abi).state_pairs, Some(pairs));
+    }
+
+    #[test]
+    fn a_distinct_hidden_output_roundtrips() {
+        let mut abi = dense_abi();
+        abi.hidden_output = Some("last_hidden_state".to_string());
+        assert_eq!(read_back(&abi).hidden_output, abi.hidden_output);
+    }
+
+    #[test]
+    fn a_declared_kv_layout_roundtrips() {
+        let mut abi = dense_abi();
+        abi.kv_layout = Some(KvCacheLayout::seq_major_bsnh());
+        assert_eq!(
+            read_back(&abi).kv_layout,
+            Some(KvCacheLayout::seq_major_bsnh())
+        );
+    }
+
+    /// Absence is normalized to the default every consumer already applies.
+    ///
+    /// Pinned rather than left implicit: a reader who sees "it round-trips"
+    /// would otherwise be entitled to expect `None` back, and the difference
+    /// matters when comparing a converted package against its source.
+    #[test]
+    fn unstated_defaults_read_back_as_the_defaults_they_always_meant() {
+        let mut abi = dense_abi();
+        abi.aliasing = None;
+        abi.kv_layout = None;
+        let back = read_back(&abi);
+        assert_eq!(back.aliasing, Some(StateAliasing::Forbidden));
+        assert_eq!(back.kv_layout, Some(KvCacheLayout::head_major_bnsh()));
     }
 }

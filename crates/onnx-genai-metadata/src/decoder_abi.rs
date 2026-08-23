@@ -264,9 +264,6 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
 
     // A component with no owning group either reads state another decoder
     // advances or holds none at all. Both are `shared` from this graph's point
-    // of view: it does not consume a past buffer it is responsible for.
-    // A component with no owning group either reads state another decoder
-    // advances or holds none at all. Both are `shared` from this graph's point
     // of view: it does not advance a past buffer it is responsible for. This is
     // asked of the group bindings rather than of `kv_inputs`, because a
     // fixed-capacity decoder owns its cache while reporting it as a static

@@ -1,8 +1,8 @@
 # Workflow-runtime unification: making `pipeline.workflow` the sole runtime
 
 Status: **Option A is implemented.** One public runtime type; no caller
-dispatches on package shape; a bare decoder is lowered at load into a canonical
-`WorkflowSpec` (its `model.io` staying the sole serialized answer) and **every
+dispatches on package shape; a single decoder *declares* a canonical
+`WorkflowSpec` like every other package and **every
 single-row autoregressive request executes that workflow** through
 `pipeline::canonical_decode::run_canonical_decode`, which reads its loop body
 from the spec and dispatches by contract id. The second token loop
@@ -213,12 +213,14 @@ that constructs and runs a canonical workflow.
   stays the single implementation. Backend executors stay `DecodeLoopBackend`
   (ORT) / native. §7 records the landed shape.
 
-- **Phase 2 — canonical single-decoder workflow lowering — LANDED (option A).**
-  `onnx-genai-metadata::canonical` compiles a plain `model.io` decoder into a
-  canonical `WorkflowSpec` **in memory at load**; nothing is serialized, so
-  `model.io` remains the sole on-disk answer and existing packages keep working
-  untouched. `Engine::install_canonical_workflow` runs it for every decoder
-  package and fails closed. §7 records the landed shape.
+- **Phase 2 — a single decoder *is* a workflow — LANDED (superseding option A).**
+  Option A compiled `model.io` into a `WorkflowSpec` in memory at load. That was
+  ratified and shipped, then superseded: keeping a second serialized way to
+  state a graph ABI meant keeping a compiler, a fallback and a provenance
+  distinction for it. `model.io` is now **deleted from the schema**, every
+  package declares `pipeline.workflow`, and one carrying the retired block is
+  refused at load with an error naming the offline `migrate_model_io`
+  conversion. §7 records the landed shape.
 
 - **Phase 3 — migrate callers to the sole runtime — LANDED.** Point server, CLI, bench,
   C ABI (`onnx-genai-capi`), and Python (`onnx-genai-python`) at the workflow
@@ -350,80 +352,68 @@ Shared infrastructure both engines already used — `engine/load.rs`,
 `placement.rs`, `session_state.rs` — is **kept**; it is not duplicated
 orchestration.
 
-## 7. Canonical lowering and execution (option A) — landed
+## 7. A single decoder is an ordinary workflow — landed
 
-### Lowering
+**One representation, declared not derived.** A single decoder ships a
+`pipeline.workflow` with one ONNX component: port `roles` name its semantic
+inputs and outputs, a `state_service` group owns its KV cache and declares the
+past/present aliases a runtime may exploit, and a `loop` step drives generation
+and emits tokens. These are the constructs a multi-component workflow uses;
+there is no decoder-shaped vocabulary.
 
-`onnx_genai_metadata::canonical` compiles a bare decoder's `model.io` into a
-canonical `WorkflowSpec`, in memory only.
+**The runtime's token policy is a component.** `token_policy` is a `binding`
+carrying the contract `onnx-genai.token-policy` — the schema's existing way for
+a workflow to say "a step happens here and the runtime implements it". That is
+what lets a single decoder keep the rich Rust sampler, paged KV, sessions and
+speculative decode, none of which has an in-graph representation, without
+needing a second package shape to hold them.
 
-* **Deterministic and derived** — same `ModelIoSpec` in, byte-identical document
-  out. Nothing writes it back, so `validate_model_io_against_workflow` never sees
-  a pair and no published package needs re-authoring.
-* **No schema change** — both canonical components are `binding` components
-  identified by contract id (`onnx-genai.autoregressive-decode`,
-  `onnx-genai.token-policy`), dispatched the way workflow adapters already are.
-* **KV stays with its executor** — lowered state cells are `management: runtime`,
-  so the paged / share-buffer / CUDA-graph executors keep owning their KV and no
-  per-step host round-trip is introduced.
-* **Honest provenance** — `/v1/debug/config.workflow_provenance` reports
-  `authored` | `lowered` | `none`; `pipeline` keeps its meaning (does the file
-  *serialize* a workflow), so a lowered decoder reports `pipeline: false`.
+**Recognition is structural.** `sole_decoder_component` finds the one component
+that consumes the autoregressive sequence and produces logits. No component
+name, model name, or architecture string decides anything — a package may name
+its component whatever it likes. `is_single_decoder_workflow` is the single
+recognizer every caller asks (engine loader, server state, server/CLI
+multimodal, CLI inspection), so no two of them can classify the same package
+differently.
 
-### Execution
+**KV stays with its executor.** State cells owned by a group are
+`management: runtime` with a `release_boundary`, which is the schema's existing
+word for buffers the runtime owns. Paged, shared-buffer and CUDA-graph KV stay
+device-resident; nothing round-trips through the interpreter as an SSA value.
 
-`run_canonical_decode` is the one single-row autoregressive loop. It resolves its
-body from the workflow (`resolve_body`) and dispatches each step by contract id,
-so the spec determines what runs and in what order — a body naming an
-unimplemented contract, or one that never applies a policy, is an error.
+**Two executors, one representation.** `WorkflowShape` picks the fused decode
+session for a single decoder and the generic interpreter for a composite
+package. That is a backend choice *beneath* the declared workflow — the same
+kind of choice as ORT versus native — not a second runtime beside it, and not a
+mode a caller can select.
 
-The per-step work is split so the loop owns the iteration and the executor owns
-the model:
+**Fail-closed, not mode-switched.** Every decode entry point resolves the
+package's workflow through the shared `canonical_workflow` accessor before it
+can decode, and all four native/batched guards run before scheduler admission so
+a refusal never consumes a slot. There is no declaration switch left to choose a
+legacy path with.
 
-* `decode_loop::forward_step` — one decoder forward pass, taking the device
-  greedy-argmax or device-sampling fast path when it applies.
-* `decode_loop::select_and_commit_step` — the logit-processor chain, sampler,
-  logprobs, KV commit, and stop/EOS detection.
-
-Both are the only implementations. `step_canonical_body` runs one iteration of
-the spec's body on them, and `run_canonical_decode` runs that same body to
-completion — so the scheduler's per-step drive and the run-to-completion path
-are one implementation, not two.
-
-**Fail-closed, not mode-switched.** `install_canonical_workflow` runs at load for
-every decoder package and asserts the lowered workflow declares the two contracts
-this runtime implements. Every decode entry point then resolves the canonical
-workflow through `canonical_workflow(..)` before decoding, so `generate`,
-`generate_in_session*` (the server's path), and `generate_with_sampler` are all
-refused if none is present — proven by
-`canonical_execution_parity::the_legacy_direct_decode_path_cannot_be_selected`,
-which exercises all three.
-
-### What remains, and why it is not duplication
-
-Two loops are not `run_canonical_decode`, because they are different algorithms:
-
-* **continuous batching** (`batched.rs`) advances N rows per forward pass;
-* **speculative decoding** (`speculative/mod.rs`, `native_speculative.rs`)
-  iterates a proposed block, not a token.
-
-Neither is a second *policy*: both drive the same primitives —
-`processors::select_next_token*`, `logprob_for_token`, `commit_selected_token`,
-`ensure_constrained_finish`, `finish_result` — so sampling and stopping have one
-implementation across all three loops. Folding their iteration shapes into the
-single-row loop would require a row-scoped policy seam and a block-scoped one;
-that is the honest next step, and it is a capability change rather than a
-deduplication.
+**Conversion is offline.** `migrate_model_io <package-dir>` rewrites a retired
+`model.io` block as the canonical workflow, reading the ONNX graph for real port
+contracts rather than guessing a state tensor's rank. It is deliberately not a
+load-time step: a runtime that repaired packages in memory would mean the
+package on disk said one thing and the runtime executed another.
 
 ### Evidence
 
-* Greedy goldens over 5 real models (phi35-mini int4, phi4-mini CUDA,
-  qwen2.5-0.5b CUDA, qwen3-0.6b, gpt-oss-20b) byte-identical to the pre-change
-  baseline at `c58eb5b2` — see [`.goldens/`](../../.goldens/).
-* `canonical_execution_parity` (8): lowering at load, prefill, cached decode on a
-  reused session, deterministic greedy, EOS stop, seeded sampling, batching where
-  supported, authored-stays-authored, and the legacy-path refusal on every entry
-  point.
-* `canonical_lowering_corpus` (5) over 7 real packages, which now **fails** if it
-  covered nothing unless `ONNX_GENAI_ALLOW_EMPTY_CORPUS=1` says the machine is
-  weightless.
+* `decoder_workflow` (ABI → workflow) and `decoder_abi` (workflow → ABI) are
+  inverses, asserted on synthetic cases *and* on all 14 converted packages
+  (`tests/decoder_workflow_roundtrip.rs`). The 12-layer cases exist because
+  state ports live in a `BTreeMap`, whose key order would otherwise bind layer
+  10 between 1 and 2.
+* `canonical_execution_parity` (8): a single decoder is an authored workflow,
+  prefill, cached decode, EOS, seeded sampling, batched generation held to the
+  same precondition, a composite package driven by the interpreter, and the
+  fail test proving the legacy direct path cannot be selected from any of four
+  entry points.
+* `real_model_workflow_corpus` (5) over the real packages this machine has,
+  which **fails** if it covered nothing.
+* The greedy goldens over five real foundry models are byte-identical across
+  the whole change, which is the load-bearing evidence that retiring the
+  serialized block changed no token.
+

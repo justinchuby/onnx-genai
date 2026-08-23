@@ -1,9 +1,8 @@
 //! Every generated request runs a canonical workflow.
 //!
-//! A bare-decoder package declares `model.io` and no `pipeline.workflow`. The
-//! loader compiles that ABI into a canonical workflow in memory
-//! (`onnx_genai_metadata::canonical`) and the interpreter's canonical decode
-//! loop executes it. These cases pin that end to end: the lowering happens, the
+//! A single-decoder package declares its `pipeline.workflow` like every other
+//! package, and the canonical decode loop reads its body out of that declared
+//! workflow. These cases pin it end to end: the package declares a workflow,
 //! execution goes through it, and the direct decode path that used to exist
 //! cannot be selected any more.
 //!

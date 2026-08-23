@@ -441,6 +441,19 @@ mod schema_helpers {
     use schemars::Schema;
     use serde_json::json;
 
+    /// Publish the retired `model.io` block's rejection in the JSON schema.
+    ///
+    /// `ModelCapabilities` does not deny unknown fields, so a validator working
+    /// from the schema alone would silently accept `model.io` and a producer
+    /// would not learn it had published an unloadable package until a runtime
+    /// refused it. The constraint therefore forbids the key outright — the same
+    /// rule `parser::reject_retired_model_io` enforces, so the published schema
+    /// and the loader cannot disagree about what is valid.
+    ///
+    /// An earlier revision forbade `model.io` only *beside* a `pipeline`, from
+    /// when the block was still an import-only source. It is not a source at
+    /// all now, so the narrower rule would accept exactly the documents the
+    /// loader rejects.
     pub(super) fn inference_metadata_constraints(schema: &mut Schema) {
         schema
             .ensure_object()
@@ -450,7 +463,7 @@ mod schema_helpers {
             .expect("allOf inserted as an array")
             .push(json!({
                 "not": {
-                    "required": ["pipeline", "model"],
+                    "required": ["model"],
                     "properties": {
                         "model": {
                             "required": ["io"]

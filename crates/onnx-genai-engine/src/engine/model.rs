@@ -20,14 +20,15 @@ pub struct Engine {
     /// Workflow interpreter state, present when the package declares
     /// `pipeline.workflow`.
     pub(crate) workflow: Option<Box<crate::pipeline::WorkflowRuntime>>,
-    /// The canonical workflow a bare-decoder package was lowered to.
+    /// The workflow a single-decoder package declares.
     ///
-    /// Compiled from the package's own `model.io` at load and held only here —
-    /// never written back, so the package still declares `model.io` alone. Its
-    /// presence is what makes "every generated request runs a canonical
-    /// workflow" a load-time fact rather than a hope: a decoder package that
-    /// could not be lowered fails to load instead of quietly taking a direct
-    /// path that no longer exists.
+    /// Read from the package, never synthesized. It is held separately from
+    /// [`Self::workflow`] because a single decoder is driven by the fused decode
+    /// executor rather than the generic interpreter — a backend choice beneath
+    /// one representation, not a second one. Its presence is what makes "every
+    /// generated request runs a declared workflow" a load-time fact rather than
+    /// a hope: a package that declares none fails to load instead of quietly
+    /// taking a direct path that no longer exists.
     pub(crate) lowered_workflow: Option<onnx_genai_metadata::WorkflowSpec>,
     /// Resolved decoder execution backend.
     pub(crate) decode_backend: EngineDecodeBackend,

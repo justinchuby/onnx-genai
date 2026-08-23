@@ -75,6 +75,9 @@ pub use onnx_genai_kv::{
     LocalTieredConfig,
 };
 pub use onnx_genai_metadata::GenerationDefaults;
+/// Re-exported so every caller asks one recognizer whether a package is a
+/// composed pipeline or a single decoder.
+pub use onnx_genai_metadata::is_single_decoder_workflow;
 pub use onnx_genai_scheduler::{
     FixedCapacity, GovernorReconfigureOutcome, GovernorSnapshot, ResourceLimit, ResourceLimits,
     resolve_limit,
