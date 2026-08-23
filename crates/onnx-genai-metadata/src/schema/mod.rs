@@ -16,17 +16,17 @@ where
     Ok(value)
 }
 
+mod decoder_abi;
 mod generation;
 mod hardware;
 mod ir;
-mod model_io;
 mod package;
 mod pipeline;
 
+pub use decoder_abi::*;
 pub use generation::*;
 pub use hardware::*;
 pub use ir::*;
-pub use model_io::*;
 pub use package::*;
 pub use pipeline::*;
 

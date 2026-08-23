@@ -1,64 +1,28 @@
-feat(metadata)!: retire model.io; a single decoder is an ordinary workflow
+docs(metadata): record the completed model.io removal, and finish the audit
 
-A single decoder was the last package shape with its own representation. It
-declared `model.io` — a second, parallel way to state a graph ABI — and the
-runtime had a matching second path to read it. This removes the shape, not the
-capability: a decoder is now a `pipeline.workflow` with one ONNX component,
-declared with exactly the constructs a multi-component workflow uses.
+The design note already contained the staged removal path for `model.io`; this
+records that steps 2-4 are done and why step 3 was skipped — a warning that
+still loaded the package would have kept the second answer alive for another
+release, which is the opposite of the point.
 
-**The block is gone from the schema.** `ModelCapabilities::legacy_io` and its
-accessor are deleted, `decoder_io()` resolves from `pipeline.workflow` and
-nowhere else, and `decoder_io_is_legacy()` — which existed to tell an operator
-*which* of two sources answered — has nothing left to distinguish. The
-regenerated JSON schema is 527 lines smaller. In-memory lowering
-(`metadata::canonical`, `Engine::install_canonical_workflow`) is deleted too:
-there is no compiler, no fallback, and nothing synthesized at load.
+Also finishes the audit the reversal implies:
 
-**A package that still declares it is refused, with the conversion named.**
-`ModelCapabilities` does not deny unknown fields, so `serde` would have dropped
-the key and left the package failing later with a puzzled "declares no
-workflow". `parser::reject_retired_model_io` recognizes the retired shape for
-the sole purpose of explaining it; it is the one place the old spelling appears
-and it never produces a value.
+* `schema/model_io.rs` is `schema/decoder_abi.rs`. The file no longer holds a
+  serialized block; it holds the *resolved* ABI type, which the design note
+  itself records being mistaken for the retired key often enough to be worth
+  renaming.
+* Comments across the importer, recognizer and parser that described `model.io`
+  as a live source now describe what actually holds. The retired spelling
+  survives in exactly two kinds of place: the rejection that explains it, and
+  the migration guidance that names the conversion.
+* `MODEL_METADATA.md`, `DESIGN.md` and `WORKFLOW_POLICY_COMPONENTS.md` no longer
+  describe an import-only fallback that does not exist.
 
-**Every maintained package is converted.** `metadata::decoder_workflow` is the
-inverse of the existing recognizer: it turns a decoder ABI into an authored
-workflow whose port roles, `state_service` group and generation loop the
-recognizer reads back. The two are only trustworthy as a pair, so round-trip
-equality is asserted — including a 12-layer case, because state ports live in a
-`BTreeMap` and a naive conversion silently binds layer 10 between 1 and 2.
-`migrate_model_io` is the offline tool the rejection names; it validates before
-writing and reads the graph for real port contracts rather than guessing a
-state tensor's rank, which is a lie that fails at load for whichever package
-happens to disagree. All 14 fixtures are converted with it.
-
-**`genai_config.json` still imports** — it is a foreign producer's format, and
-converting it is the whole point of an importer. It now states its result as a
-workflow like everything else, so the real-model corpus keeps working with no
-`model.io` anywhere.
-
-**Two latent bugs surfaced and are fixed at the cause:**
-
-* The recognizer reported a fixed-capacity cache as *both* a static-cache ABI
-  and growing past/present pairs. `resolve_kv_layers` reads the absence of
-  pairs as "this cache does not grow", so an authored static-cache workflow
-  would have had a paged bridge built over a buffer that never grows and
-  addressed with the wrong discipline. A scatter group now yields the
-  static-cache ABI and nothing else, and ownership is derived from whether the
-  component *writes* attention state rather than from the pair list — which
-  keeps read-only KV sharers `Shared`.
-* "Is this a pipeline?" was answered independently in three places (engine
-  loader, server state, CLI/server multimodal). Now that a decoder declares a
-  workflow, "declares a workflow" stopped distinguishing them and they
-  disagreed. `is_single_decoder_workflow` is the one recognizer all three ask.
-
-`RuntimeCapabilities::default` gains the structural workflow capabilities,
-because a runtime that executes workflows implements them by definition — and
-otherwise every load would warn until operators learned to ignore the warning.
-
-Verified: 73/73 engine targets (native-backend); metadata, ort, genai-config,
-model-package, CLI and C API green; server 239/240 with only the pre-existing
-`fim_stream_returns_headers_before_generation_finishes` load-flake, which
-passes 3/3 in isolation.
+Verified: fmt; clippy `-D warnings` across engine, metadata, server, CLI, C API
+and genai-config; H200 CUDA — canonical_execution_parity 8, gemma4_chained
+8, native_workflow_parity 12, one_runtime_e2e 5, fixture floor 3, real-model
+corpus green. **All five real foundry models are byte-identical to the
+pre-change baseline**, which is the load-bearing evidence: retiring the
+serialized block and executing every decoder as a workflow changed no token.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>

@@ -110,7 +110,6 @@ fn model_capabilities(
         runtime_configurable,
         sharding: None,
         mixture_of_experts: None,
-        ..Default::default()
     }
 }
 

@@ -9,9 +9,8 @@
 //! This module reads that one representation and produces the resolved
 //! [`DecoderAbi`] the optimized decode path consumes. It is a *lowering*: the
 //! result is derived, never serialized, and never a second place a producer can
-//! state a different answer. A package that carries a workflow therefore needs
-//! no `model.io` block, and the legacy blocks that still exist are import-only
-//! input to the same resolved type.
+//! state a different answer. There is no other source — a package states its
+//! graph ABI in its workflow or it does not load.
 //!
 //! What is derived, and from where:
 //!

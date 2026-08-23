@@ -544,7 +544,7 @@ mod tests {
     fn shared_buffer_declaration_becomes_permitted_aliasing() {
         // `past_present_share_buffer: true` is the legacy author's statement that
         // aliasing present onto past is legal for this graph. The new contract
-        // spells that `model.io.aliasing`, and it is the only thing that can let
+        // spells that as the state group's aliasing, and it is the only thing that can let
         // an imported package take the shared-buffer decode path.
         let raw = minimal();
         let config: GenAiConfig = serde_json::from_value(raw.clone()).expect("config");

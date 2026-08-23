@@ -645,6 +645,39 @@ pub(crate) fn scan_top_level_control_flow(model_path: &Path) -> Option<bool> {
     }))
 }
 
+/// The dtype and rank of every port an ONNX graph exposes.
+///
+/// Used by the offline package conversion so a generated workflow states the
+/// graph's real port contracts instead of a plausible guess. A guess is a lie
+/// that fails at load for whichever package happens to disagree, which is
+/// strictly worse than not converting.
+pub fn graph_port_contracts(
+    model_path: &Path,
+) -> Option<std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract>> {
+    let graph = onnx_runtime_loader::load_model(model_path).ok()?;
+    let mut contracts = std::collections::BTreeMap::new();
+    for id in graph.inputs.iter().chain(graph.outputs.iter()) {
+        let value = graph.value(*id);
+        let Some(name) = value.name.clone() else {
+            continue;
+        };
+        let rank = value.shape.len();
+        contracts.insert(
+            name,
+            onnx_genai_metadata::TensorContract {
+                dtype: ir_dtype_name(value.dtype).to_owned(),
+                rank,
+                // The graph's own symbols are its shape; restating them here
+                // would be a second place they could drift.
+                shape: None,
+                optional: false,
+                batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+            },
+        );
+    }
+    Some(contracts)
+}
+
 #[cfg(test)]
 mod metadata_hint_tests {
     use super::*;
@@ -1046,37 +1079,4 @@ mod metadata_hint_tests {
             "{error}"
         );
     }
-}
-
-/// The dtype and rank of every port an ONNX graph exposes.
-///
-/// Used by the offline package conversion so a generated workflow states the
-/// graph's real port contracts instead of a plausible guess. A guess is a lie
-/// that fails at load for whichever package happens to disagree, which is
-/// strictly worse than not converting.
-pub fn graph_port_contracts(
-    model_path: &Path,
-) -> Option<std::collections::BTreeMap<String, onnx_genai_metadata::TensorContract>> {
-    let graph = onnx_runtime_loader::load_model(model_path).ok()?;
-    let mut contracts = std::collections::BTreeMap::new();
-    for id in graph.inputs.iter().chain(graph.outputs.iter()) {
-        let value = graph.value(*id);
-        let Some(name) = value.name.clone() else {
-            continue;
-        };
-        let rank = value.shape.len();
-        contracts.insert(
-            name,
-            onnx_genai_metadata::TensorContract {
-                dtype: ir_dtype_name(value.dtype).to_owned(),
-                rank,
-                // The graph's own symbols are its shape; restating them here
-                // would be a second place they could drift.
-                shape: None,
-                optional: false,
-                batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
-            },
-        );
-    }
-    Some(contracts)
 }

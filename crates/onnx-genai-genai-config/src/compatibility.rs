@@ -274,7 +274,7 @@ impl GenAiConfig {
                 },
             )
             .map_err(|error| {
-                incomplete(&format!(
+                incomplete(format!(
                     "this genai_config.json describes a decoder that cannot be stated as a \
                  workflow: {error}"
                 ))
@@ -297,7 +297,8 @@ impl GenAiConfig {
     /// conversion is exact rather than approximate.
     ///
     /// `past_present_share_buffer` is deliberately absent here: it is a graph ABI
-    /// fact, not a generation default, and is carried by `model.io.aliasing`.
+    /// fact, not a generation default, and is carried by the workflow's
+    /// state-service group aliasing.
     fn generation_json(&self) -> Option<Value> {
         let search = &self.search;
         let mut defaults = Map::new();
@@ -475,7 +476,7 @@ impl GenAiConfig {
             }
         }
 
-        // Alias legality is a graph ABI fact, so it belongs to `model.io`, not to
+        // Alias legality is a graph ABI fact, so it belongs to the state group, not to
         // the generation defaults. Legacy `past_present_share_buffer: true` is
         // exactly the author's statement that `present.*` may be written over
         // `past_key_values.*` in one buffer; it is carried here so the runtime can
@@ -721,7 +722,7 @@ impl GenAiConfig {
         // fails the load with "per-layer KV page geometry is unknown".
         //
         // That is what blocks DeepSeek-V2 (MLA, #1012): its `genai_config.json`
-        // declares a single `decoder.head_size: 128` and no `model.io`, while its
+        // declares a single `decoder.head_size: 128` and no port ABI, while its
         // KV is asymmetric — key head_size 192 (qk_nope 128 + qk_rope 64), value
         // 128. A scalar cannot express that, but the graph shapes can, and
         // `kv_cache_bytes_for_tensors` already sums each tensor independently,

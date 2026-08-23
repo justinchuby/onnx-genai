@@ -301,11 +301,10 @@ pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::Me
     crate::validation::validate_pipeline_spec(pipeline)
         .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
     // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
-    // cannot see them. Without this call the rule that forbids a package from
-    // carrying both `model.io` and a workflow holds only for callers who reach
-    // for `validate_metadata` directly — which is nobody loading a package from
-    // disk, including the `validate_metadata` binary. A guarantee that a
-    // producer's own validation run cannot observe is not a guarantee.
+    // cannot see them. Without this call they hold only for callers who reach for
+    // `validate_metadata` directly — which is nobody loading a package from disk,
+    // including the `validate_metadata` binary. A guarantee that a producer's own
+    // validation run cannot observe is not a guarantee.
     crate::validation::validate_metadata(&metadata)
         .map_err(|errors| crate::MetadataError::Parse(errors.join("; ")))?;
     validate_package_artifacts(

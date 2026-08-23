@@ -8,9 +8,10 @@ what. `model:` holds package-wide baked facts (attention geometry, vocabulary an
 length limits, MoE structure, sharding), not port names.
 
 The flattened decode ABI a single-graph fast path wants is *derived* from that one
-representation by `InferenceMetadata::decoder_io()`, never serialized separately. The
-legacy top-level `model.io` block is import-only: it is read only when a document
-carries no workflow (the `genai_config.json` import path) and is rejected beside one.
+representation by `InferenceMetadata::decoder_io()`, never serialized separately.
+The retired top-level `model.io` block no longer exists: a package declaring it is
+refused at load with an error naming `migrate_model_io`, the offline conversion.
+A single decoder is a workflow with one ONNX component, not a second package shape.
 
 ## Workflow boundary
 
