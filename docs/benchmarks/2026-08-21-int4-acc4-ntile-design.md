@@ -50,6 +50,10 @@ vary it; the "flat line" was one configuration measured five times.
 
 Sweeping the real knob, block 32 / accuracy 4:
 
+> **Superseded (2026-08-23).** The t=1 and t=2 cells below are wrong and the
+> ±0.7% error bar on 8→16 is withdrawn — see the correction at the end of this
+> section.
+
 | `ONNX_GENAI_CPU_DECODE_THREADS` | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
 | ms/token | 22.949 | 22.893 | 11.584 | 5.866 | 3.302 | see §4* |
@@ -72,6 +76,37 @@ impose minimum task sizes) -- but I did not confirm it, and it is recorded here
 as an open question rather than an explanation. No conclusion in this document
 depends on it. Second, scaling decays past 16 (§4 could not measure t=32
 reliably).
+
+> **Correction (2026-08-23).** Both halves of the paragraph above are now
+> resolved, and the resolution is that the *table* is wrong rather than
+> unexplained.
+>
+> * **t=1 ≡ t=2 is false.** Re-measured with one process per cell and
+>   `realized=` verified from the binary, **t=2 is 1.96x t=1** (7.278 vs 14.300
+>   ms/token) against a **0.00% A/A null**. The granularity-floor hypothesis
+>   above is also wrong, but not because the gate refuses to split: at width 1
+>   the budget confines the process to a single CPU and `build_from_env`
+>   declines to construct the pool at all (no core for the dispatcher beside a
+>   spinning worker), so t=1 runs `path=flat` on one CPU while t=2 runs a real
+>   two-worker pool on two. Roughly 2x is therefore the *expected* result, which
+>   is what makes the recorded 1.002x a defect rather than a discovery. Cause
+>   was harness-side (#1771, #1740).
+> * **The "±0.7%" on 8→16 is withdrawn, and the t=32 instability may be the
+>   same phenomenon one column to the right.** Over six independent launches
+>   w=16 spans 1.476-9.064 ms/token (514%) while w=8 spans 3.195-3.509 (9.8%).
+>   At w≥16 the run holds every physical core and has no headroom, so a
+>   co-tenant takes throughput straight out of the measurement. The t=32
+>   samples recorded above (`1.801 / 3.178 / 3.170`) look like the same
+>   two-mode shape, though three points cannot establish that and the levels do
+>   not line up with today's w=16 modes; treat it as a suggestive parallel, not
+>   a result. The substantive point stands either way: the refusal to headline
+>   t=32 was right, and it should have been extended to t=16. Note this is
+>   *not* a claim that the three ±0.7% repetitions were secretly bimodal — the
+>   build has moved ~1.8x since (t=8: 5.87 → 3.31), so the old interval cannot
+>   now be re-checked. It is withdrawn as unverifiable, not as disproven.
+>
+> Full method and data:
+> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md).
 
 **Lesson, now written into the bench header: verify that the knob you are
 sweeping moves the thing you think it moves.** A wrong "does not scale" verdict
@@ -128,6 +163,16 @@ Later runs degraded badly: block 128 at t=32 returned 9.035, 2.355, 2.389,
 Block 32 at t=32 gave 1.801 then 3.178/3.170. t=8 and t=16 stayed within
 +-0.7% throughout; only the all-vCPU configuration is unstable, which is what
 sharing a 32-vCPU host with other jobs looks like.
+
+> **Correction (2026-08-23).** The last sentence is wrong about **t=16**. On a
+> re-measurement, `w=16` spans **1.476-9.064 ms/token over six independent
+> launches (514%)** while `w=8` spans 3.195-3.509 (9.8%). t=16 is *not* stable
+> on a shared host; it is bimodal, for the same reason t=32 is. `w=16` already
+> occupies all 16 **physical** cores of this box, so it has no headroom left to
+> absorb a co-tenant -- "all-vCPU" was the wrong boundary to draw, because the
+> relevant resource is physical cores, not vCPUs. The `+-0.7%` reported here
+> came from three repetitions within a single quiet window and is withdrawn.
+> Detail: [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md).
 
 Consequently **two questions are left open rather than answered wrongly**:
 
@@ -200,7 +245,9 @@ generous accounting).
 2. **The projected win is close to the noise floor.** The published
    single-cell floor for this harness is +-5.5% on a quiet host; today's host
    is at +-0.7% for t<=16 but 8x at t=32. A 15% effect is measurable at t=16
-   and invisible at t=32.
+   and invisible at t=32. *(Corrected 2026-08-23: the "+-0.7% for t<=16" half
+   of this is withdrawn -- t=16 is bimodal at 514% over independent launches.
+   The measurable width on a shared host is **t=8**, not t=16. See §4.)*
 3. **It reduces instructions, not bytes.** The N-tile removes activation
    *re-reads* (L1 traffic) and shared arithmetic; it does not shrink the
    139.7 MB/token that must cross the memory system. If the kernel is anywhere

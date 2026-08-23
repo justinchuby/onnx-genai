@@ -51,10 +51,15 @@
 //! reads `available_parallelism` and `ONNX_GENAI_CPU_DECODE_THREADS` only. A
 //! sweep of `RAYON_NUM_THREADS` therefore holds the width fixed while appearing
 //! to vary it, and reports a flat line that reads exactly like "this kernel
-//! does not scale". It does scale: measured here at block 32, accuracy 4,
-//! 8 threads -> 5.90 ms/token and 16 -> 3.32 ms/token (1.77x, +-0.7% over
-//! three interleaved repetitions). The default width already resolves to 16 on
-//! a 32-vCPU host, for both the persistent and the flat pool.
+//! does not scale". It does scale. The width curve once quoted here
+//! (`8 threads -> 5.90 ms/token and 16 -> 3.32 ms/token, 1.77x +-0.7% over
+//! three interleaved repetitions`) has been **withdrawn (2026-08-23)**: on a
+//! shared host `w=16` occupies every physical core and is bimodal, so no
+//! narrow interval is supportable there. Measure at `w=8`, which has headroom
+//! and held a 9.8% spread over six independent launches against `w=16`'s 514%.
+//! See `docs/benchmarks/2026-08-23-acc4-decode-width-remeasurement.md`. The
+//! default width already resolves to 16 on a 32-vCPU host, for both the
+//! persistent and the flat pool.
 
 //! # What `tokens_s_total` means (#1712)
 //!

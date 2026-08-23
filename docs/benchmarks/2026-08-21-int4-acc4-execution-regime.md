@@ -133,13 +133,22 @@ Five independent lines of evidence, all pointing the same way.
 | evidence | measured | expected if bandwidth-bound |
 |---|---|---|
 | single-thread byte rate | 5.86 GB/s = **18%** of the 32 GB/s 1-thread ceiling | at/near ceiling |
-| scaling 1->16 cores | **7.3x** | <=1.77x (the measured bandwidth curve) |
+| scaling 1->16 cores | **7.3x** | <=1.77x (the measured bandwidth curve)* |
 | block sweep 16->128 at **fixed weight bytes** | **3.73x** | 1.41x (163.6 -> 115.9 MB) |
 | `time = blocks*A + weights*B` fit | A = 2.850 ns/block, B = 24.15 ps/weight; per-block tail is **79%** of time at block 32 | tail ~0 |
 | per-column overhead (4096x14336 vs 14336x4096: identical weights *and* identical block count, 3.5x the columns) | wide-n shape **2.4% faster** | n/a |
 
 The fit independently reproduces #1619's own model (8.5 cyc/block,
 13.4 weights/cyc) at an assumed ~3 GHz.
+
+> \* **Note (2026-08-23):** the `1.77x` comparator in row 2 comes from a width
+> curve whose error bar has since been withdrawn — `w=16` is bimodal on a
+> shared host (see
+> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md)).
+> The conclusion drawn from that row is unaffected: the gap between 7.3x and
+> the bandwidth curve is far larger than any plausible revision of the
+> comparator, so the not-bandwidth-bound reading stands. Row 2 should not be
+> re-quoted as a precise figure.
 
 **The one place bandwidth does bind is full width.** At t=16 the kernel demands
 42.7 GB/s against a measured 56.6 GB/s ceiling (~75%), and that is exactly where
