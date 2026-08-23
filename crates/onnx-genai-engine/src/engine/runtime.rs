@@ -2797,9 +2797,18 @@ mod tests {
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
 
+    /// An engine whose package the interpreter drives, sharing one scheduler.
+    ///
+    /// `holds_decode_core()` is false here (no `session`, no `native_session`),
+    /// so generation takes the no-decode-core branch #1723 introduced and #1900
+    /// wired admission into. `budget_bytes` is the whole KV byte budget, which
+    /// is what decides whether a request is admitted at all.
+    ///
+    /// This literal was written out three times across these tests before it
+    /// was a helper; every field but the budget was identical in all three, and
+    /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+    fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2815,7 +2824,7 @@ mod tests {
             ModelKvConfig::known(10, 1),
             0,
         )?;
-        let mut engine = Engine {
+        Ok(Engine {
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
@@ -2829,7 +2838,7 @@ mod tests {
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
-                onnx_genai_scheduler::ByteBudget::new(10),
+                onnx_genai_scheduler::ByteBudget::new(budget_bytes),
             ),
             governor,
             sessions: HashMap::new(),
@@ -2854,7 +2863,13 @@ mod tests {
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
             _environment: None,
-        };
+        })
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;
         request.options.stop_on_eos = false;
@@ -2887,61 +2902,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
-        let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/fixtures/tiny-llm/tokenizer.json")
-            .canonicalize()?;
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-        let scheduler_config = onnx_genai_scheduler::SchedulerConfig {
-            bytes_per_token: Some(10),
-            ..onnx_genai_scheduler::SchedulerConfig::default()
-        };
-        let governor = EngineResourceGovernor::new(
-            ResourceLimits::default(),
-            false,
-            ModelKvConfig::known(10, 1),
-            0,
-        )?;
-        let mut engine = Engine {
-            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
-            workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
-            decode_backend: EngineDecodeBackend::Native,
-            metadata: InferenceMetadata::default(),
-            metadata_hints: MetadataHints::default(),
-            kv_cache: PagedKvCache::new(1, 1),
-            prefix_cache: PrefixCache::new(),
-            token_prefix_cache: Vec::new(),
-            kv_model: None,
-            decode_path: ModelDecodePath::Generic,
-            scheduler: Scheduler::with_byte_budget(
-                scheduler_config,
-                onnx_genai_scheduler::ByteBudget::new(10),
-            ),
-            governor,
-            sessions: HashMap::new(),
-            session: None,
-            native_session: None,
-            weight_placement: None,
-            memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
-            native_sessions: HashMap::new(),
-            native_active_session: None,
-            native_session_counter: 0,
-            native_access_counter: 0,
-            native_default_session: None,
-            native_max_sessions: 8,
-            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
-            draft: None,
-            mtp: None,
-            eagle3: None,
-            tokenizer: Some(tokenizer),
-            fim_config: None,
-            num_speculative_tokens: 1,
-            speculative_mode: SpeculativeMode::None,
-            last_speculative_stats: SpeculativeStats::default(),
-            connector: ConnectorBridge::null(),
-            _environment: None,
-        };
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
 
         // No decode core: this engine's sessions are workflow sessions,
         // opened through the same public `create_session` a real caller
@@ -2972,6 +2933,69 @@ mod tests {
              execution once an unbound loop value goes missing: {error}"
         );
         assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// The half of #1900 that a rejection test cannot reach: the reservation an
+    /// admitted request takes is handed back when it finishes.
+    ///
+    /// Both tests above assert a *refusal*, and a refusal is equally consistent
+    /// with an engine that admits nothing and with one that admits correctly
+    /// but never releases. So `scheduler.complete()` on this path was not under
+    /// test: deleting that one line left the whole 618-test lib suite green.
+    ///
+    /// The observable chosen here is the user-visible consequence rather than
+    /// the internal counter. On a budget sized for exactly one request, a leak
+    /// makes the *second* request fail admission -- the first never let go.
+    /// A test that asserts "refused because over budget" and a test that
+    /// asserts "not refused, because the previous request released" are
+    /// falsified by opposite mutations, which is the point of having both.
+    ///
+    /// The fixture cannot complete a generation -- its interpreted decoder
+    /// wants a KV value no component produces -- so neither call returns `Ok`.
+    /// That is exactly the case the release has to survive: `complete()` runs
+    /// on the error path too, and a request that admits and then fails must not
+    /// strand its bytes.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn an_admitted_interpreted_request_releases_its_reservation_for_the_next_one()
+    -> anyhow::Result<()> {
+        // One prompt token plus one new token at 10 bytes each, and nothing to
+        // spare: enough for a single request at a time, never for two at once.
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut refusals = Vec::new();
+        let mut admissions = 0usize;
+        for _ in 0..2 {
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = 1;
+            request.options.stop_on_eos = false;
+            let mut on_admitted = || admissions += 1;
+            if let Err(error) =
+                engine.generate_with_callbacks(request, Some(&mut on_admitted), None)
+            {
+                let error = error.to_string();
+                if error.contains("scheduler admission failed") {
+                    refusals.push(error);
+                }
+            }
+        }
+
+        assert!(
+            refusals.is_empty(),
+            "a request must not be refused for bytes an earlier finished request still holds: {}",
+            refusals.join(" | ")
+        );
+        assert_eq!(
+            admissions, 2,
+            "the admission callback fires once per request the scheduler accepted"
+        );
+        assert_eq!(
+            engine.scheduler.running_count(),
+            0,
+            "no sequence may still be running once every request has finished"
+        );
         Ok(())
     }
 
