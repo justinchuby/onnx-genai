@@ -17,6 +17,18 @@
 # now, and who?" -- and it makes the answer cheap enough to check that there
 # is no excuse for not checking.
 #
+# Reclaiming a lock does NOT stop the load that lock was covering. A holder
+# killed with SIGKILL leaves its benchmark orphaned and still burning cores,
+# and the next acquirer will reap the lock and start measuring on a host that
+# is not actually quiet. That is what `--gate` is for: the lock tells you
+# whether a participant claims the box, the runnable count tells you whether
+# anything is actually running on it. They answer different questions and you
+# want both.
+#
+# It assumes every participant runs as the same UID. /tmp is sticky, so under
+# mixed UIDs one user cannot rename or remove another's lock and takeover,
+# reaping and release all fail with EPERM.
+#
 # Usage:
 #   hostlock.sh status [--porcelain]    # who holds it, is that holder alive
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
@@ -43,7 +55,10 @@
 #   0 ok   1 usage/error   2 busy (acquire without --wait)   3 timed out
 #
 # The `run` form is the one to prefer: it releases on success, on failure and
-# on Ctrl-C, which is the failure mode that would otherwise wedge the box.
+# on Ctrl-C, and it stops the wrapped command when interrupted. Signals it
+# cannot catch (SIGKILL) leave the lock in place, where the pid anchor lets
+# the next acquirer reclaim it -- so a crash costs one stale lock, not a
+# wedged box.
 #
 # Liveness, and why there are two mechanisms rather than one.
 #
@@ -62,8 +77,10 @@
 # session alive for days, which fixes the stale-on-arrival bug and creates
 # the opposite one: a lock you forget to release survives for days. Hence the
 # TTL, which is a hard expiry and not merely a label. `run` is the exception
-# and the reason to prefer it: its anchor is its own pid, which is exact --
-# it dies with the command, on any exit path -- so it needs no expiry.
+# and the reason to prefer it: its anchor is its own pid, which is exact, so
+# it needs no expiry. Note the distinction between the anchor dying and the
+# lock being released -- on SIGKILL the directory survives, and it is the
+# dead anchor that lets the next acquirer reclaim it.
 
 set -uo pipefail
 
@@ -75,6 +92,7 @@ set -uo pipefail
 # believed. Override with HOSTLOCK_DIR only for testing.
 LOCK_DIR="${HOSTLOCK_DIR:-/tmp/onnx-genai-hostlock}"
 UNPARSEABLE_GRACE=300
+REAPER_GRACE=60
 REAP_DIR="${LOCK_DIR}.reaper"
 META="${LOCK_DIR}/meta"
 
@@ -97,6 +115,16 @@ runnable_now() {
     cut -d' ' -f4 /proc/loadavg | cut -d/ -f1
 }
 
+# Metadata is a file on a shared filesystem, so treat it as untrusted: a
+# corrupt or truncated `ttl=`/`acquired_epoch=` line must not make arithmetic
+# throw. Non-numeric degrades to the default, which fails safe (not expired).
+num_or() {
+    case "${1:-}" in
+        '' | *[!0-9]*) echo "$2" ;;
+        *) echo "$1" ;;
+    esac
+}
+
 meta_get() {
     [ -f "$META" ] || return 1
     sed -n "s/^$1=//p" "$META" | head -1
@@ -116,7 +144,7 @@ holder_alive() {
 
 lock_age() {
     local epoch now
-    epoch=$(meta_get acquired_epoch || echo 0)
+    epoch=$(num_or "$(meta_get acquired_epoch || echo 0)" 0)
     now=$(date +%s)
     echo $((now - epoch))
 }
@@ -125,8 +153,8 @@ lock_age() {
 # which is only safe when the anchor is exact (the `run` form).
 holder_expired() {
     local ttl
-    ttl=$(meta_get ttl || echo 0)
-    [ "${ttl:-0}" -gt 0 ] || return 1
+    ttl=$(num_or "$(meta_get ttl || echo 0)" 0)
+    [ "$ttl" -gt 0 ] || return 1
     [ "$(lock_age)" -gt "$ttl" ]
 }
 
@@ -151,6 +179,18 @@ reapable() {
 # Remove a reapable lock. Guarded so that two acquirers racing on the same
 # dead lock cannot both conclude they reaped it.
 reap_if_dead() {
+    # The reaper guard is the one directory here with no anchor and no owner,
+    # so a crash inside the critical section below would leak it and make
+    # every genuinely dead lock permanently un-reapable -- acquirers would be
+    # told BUSY forever with nothing holding anything. Bound it by age.
+    if [ -d "$REAP_DIR" ]; then
+        local rm_age rm_now
+        rm_age=$(stat -c %Y "$REAP_DIR" 2>/dev/null || echo 0)
+        rm_now=$(date +%s)
+        if [ "$((rm_now - rm_age))" -gt "$REAPER_GRACE" ]; then
+            rmdir "$REAP_DIR" 2>/dev/null
+        fi
+    fi
     mkdir "$REAP_DIR" 2>/dev/null || return 1
     local reaped=1
     if [ -d "$LOCK_DIR" ] && reapable; then
@@ -184,6 +224,13 @@ reap_if_dead() {
 # move it into place with rename(2). rename onto an existing NON-EMPTY
 # directory fails with ENOTEMPTY, which is exactly the exclusion we want, and
 # the lock becomes visible only in its finished state. There is no window.
+#
+# The exclusion rests on an invariant, not on rename alone: rename onto an
+# EMPTY directory SUCCEEDS, so this is only safe because a published lock is
+# never empty -- it always contains `meta`, and remove_lock takes the whole
+# directory away in one step rather than emptying it first. Anything that
+# creates $LOCK_DIR directly, with a bare mkdir anywhere, breaks that
+# invariant and reintroduces the three-winner bug.
 publish_lock() {
     local start stage
     start=$(proc_start_time "$ANCHOR_PID") || die "cannot read start time of anchor pid ${ANCHOR_PID}"
@@ -235,6 +282,24 @@ remove_lock() {
     fi
     rm -rf "$LOCK_DIR" 2>/dev/null
     return 0
+}
+
+# Release, but only if the lock is still ours.
+#
+# `run` used to tear down unconditionally. If its TTL expired mid-command and
+# somebody else legitimately took over, finishing the command then deleted
+# THEIR live lock -- and the next acquirer would be handed a host that two
+# people were already using. That is the exact doubling this tool exists to
+# prevent, arriving through the teardown path instead of the acquire path.
+remove_lock_if_mine() {
+    local pid
+    pid=$(meta_get anchor_pid 2>/dev/null || echo '')
+    if [ -n "$pid" ] && [ "$pid" != "$ANCHOR_PID" ]; then
+        echo "hostlock: NOT releasing -- the lock is now held by pid ${pid} ($(meta_get owner 2>/dev/null))." >&2
+        echo "hostlock: we were taken over mid-run, so both sets of numbers are suspect." >&2
+        return 1
+    fi
+    remove_lock
 }
 
 cmd_status() {
@@ -348,7 +413,10 @@ cmd_release() {
 
 cmd_wait() {
     local deadline=$((SECONDS + TIMEOUT))
-    while [ -d "$LOCK_DIR" ] && holder_alive; do
+    # Wait only while somebody actually has a live claim. An EXPIRED lock is
+    # one the next acquirer would take over, so blocking on it would disagree
+    # with what `status` and `acquire` both say.
+    while [ "$(lock_state)" = HELD ]; do
         if [ "$SECONDS" -ge "$deadline" ]; then
             echo "hostlock: still held after ${TIMEOUT}s" >&2
             return 3
@@ -358,17 +426,43 @@ cmd_wait() {
     echo "hostlock: free (runnable=$(runnable_now))"
 }
 
+# Kill the wrapped command, release, and exit with the conventional code.
+run_teardown() {
+    local child=$1 name=$2 code=$3
+    if [ -n "$child" ] && [ -e "/proc/${child}" ]; then
+        kill -TERM "$child" 2>/dev/null
+        wait "$child" 2>/dev/null
+    fi
+    remove_lock_if_mine
+    echo "hostlock: released (${name})" >&2
+    exit "$code"
+}
+
 cmd_run() {
     [ "$#" -gt 0 ] || die "run needs a command after --"
     DO_WAIT=1
     cmd_acquire || return $?
-    # Release on success, on failure, and on Ctrl-C. The uncaught-signal case
-    # is the one that would otherwise wedge the box until somebody notices.
-    trap 'remove_lock; echo "hostlock: released (interrupted)" >&2' INT TERM
-    "$@"
-    local rc=$?
-    trap - INT TERM
-    remove_lock
+
+    # Run the command in the BACKGROUND and wait for it, rather than inline.
+    #
+    # Bash does not run a trap until the current foreground command finishes.
+    # With `"$@"` inline, Ctrl-C during a forty-minute benchmark would not
+    # release the lock until that benchmark ended by itself -- prompt release
+    # failing in precisely the case it exists for. `wait` is interruptible,
+    # so this makes the signal handlers actually prompt. It also lets us stop
+    # the wrapped command, which the inline form left running.
+    local child rc
+    "$@" &
+    child=$!
+
+    trap 'run_teardown "$child" SIGINT 130' INT
+    trap 'run_teardown "$child" SIGTERM 143' TERM
+    trap 'run_teardown "$child" SIGHUP 129' HUP
+
+    wait "$child"
+    rc=$?
+    trap - INT TERM HUP
+    remove_lock_if_mine
     echo "hostlock: released (command exit ${rc})"
     return $rc
 }

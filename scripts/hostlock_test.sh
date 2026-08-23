@@ -32,7 +32,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".stage.* "$LOCK".dead.* "$LOCK".gate 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".dead.* "$LOCK".gate 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -76,6 +76,35 @@ race() {
     exec 4>&-
     wait
     rm -f "$gate"
+}
+
+# Is this pid running and not already a zombie? Avoids `kill -0`, and treats
+# a reaped-but-unwaited child as dead, which it is.
+alive() {
+    local st
+    st=$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}')
+    [ -n "$st" ] && [ "$st" != Z ]
+}
+
+# Wait for a child, but never forever.
+#
+# A runner that fails to die when signalled is exactly the defect these tests
+# exist to catch, and a bare `wait` on one hangs the suite instead of
+# reporting it -- which is how the SIGHUP falsifier ran for ten minutes and
+# said nothing. Bound it, kill the straggler, and return failure.
+wait_bounded() {
+    local pid=$1 limit=${2:-25} n=0
+    while alive "$pid" && [ "$n" -lt "$limit" ]; do
+        sleep 1
+        n=$((n + 1))
+    done
+    if alive "$pid"; then
+        sig "$pid" 9
+        wait "$pid" 2>/dev/null
+        return 1
+    fi
+    wait "$pid" 2>/dev/null
+    return 0
 }
 
 # Read one field from `status --porcelain`. Parsing positional fields of the
@@ -247,7 +276,7 @@ runner=$!
 sleep 2
 chk "held while the command runs" "$(st state)" "HELD"
 sig "$runner" 15
-wait "$runner" 2>/dev/null
+chk "runner terminates on SIGTERM" "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
 sleep 1
 chk "released after SIGTERM" "$(st state)" "FREE"
 
@@ -258,11 +287,87 @@ $HL run --owner leon --reason "hard kill" -- sleep 60 >/dev/null 2>&1 &
 runner=$!
 sleep 2
 sig "$runner" 9
-wait "$runner" 2>/dev/null
+wait_bounded "$runner" >/dev/null 2>&1
 sleep 1
 chk "SIGKILL leaves the lock behind" "$(st state)" "STALE"
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "next acquirer reaps the killed holder" "$(st owner)" "roy"
+cleanup
+
+echo "== run does not clobber a successor's lock =="
+# Review of #1806 demonstrated this one: `run` used to tear the lock down
+# unconditionally, so if its TTL expired mid-command and somebody else
+# legitimately took over, finishing the command deleted THEIR live lock and
+# the next acquirer was handed a host two people were already using.
+cleanup
+$HL run --owner leon --ttl 2 -- sleep 8 >/dev/null 2>&1 &
+runner=$!
+sleep 4
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+chk "successor takes over the expired run" "$(st owner)" "roy"
+wait_bounded "$runner" >/dev/null 2>&1
+chk "finished run leaves the successor holding it" "$(st state)" "HELD"
+chk "finished run did not steal the lock from the successor" "$(st owner)" "roy"
+cleanup
+
+echo "== a leaked reaper guard does not wedge stale recovery =="
+# The reaper guard is the one directory with no anchor and no owner, so a
+# crash inside its critical section would make every dead lock permanently
+# un-reapable and every acquirer permanently BUSY.
+forge_stale_lock
+mkdir -p "$LOCK.reaper"
+touch -d '10 minutes ago' "$LOCK.reaper"
+$HL acquire --owner roy --ttl 600 >/dev/null 2>&1
+chk "an abandoned reaper guard is cleared" "$(st owner)" "roy"
+cleanup
+
+echo "== corrupt metadata fails safe =="
+cleanup
+mkdir -p "$LOCK"
+printf 'anchor_pid=%s\nstart_time=%s\nowner=leon\nreason=r\nacquired_epoch=NOTANUMBER\nttl=ALSONOTANUMBER\nrunnable_at_acquire=1\n' \
+    "$PPID" "$(sed 's/.*) //' "/proc/$PPID/stat" | awk '{print $20}')" >"$LOCK/meta"
+err=$($HL status 2>&1 >/dev/null)
+chk "corrupt ttl/epoch produce no shell errors" "$(echo -n "$err" | wc -c)" "0"
+chk "corrupt metadata is treated as held, not expired" "$(st state)" "HELD"
+cleanup
+
+echo "== interrupting a run releases promptly, and stops the command =="
+# The property: release must not wait for the wrapped command to finish on
+# its own. With `"$@"` inline, bash defers the trap until the foreground
+# command completes, so signalling a `sleep 60` released only after the full
+# 60s -- and the old unbounded test PASSED by simply blocking that long.
+cleanup
+$HL run --owner leon --reason "prompt" -- sleep 47 >/dev/null 2>&1 &
+runner=$!
+sleep 2
+# Resolve the wrapped command's real pid and check THAT.
+#
+# `pgrep -f 'sleep 47'` cannot be used here: it matches this very test
+# script's own command line, which contains the string, so it reported the
+# command as still running no matter what. It also matched the orphaned
+# `sleep` left behind by the SIGKILL case above, which by design outlives its
+# wrapper. Neither has anything to do with the property under test.
+wrapped=$(pgrep -P "$runner" 2>/dev/null | head -1)
+started=$(date +%s)
+sig "$runner" 15
+wait_bounded "$runner" 30 >/dev/null 2>&1
+elapsed=$(($(date +%s) - started))
+chk "released within 10s of the signal, not after the command" \
+    "$([ "$elapsed" -lt 10 ] && echo yes || echo "no (${elapsed}s)")" "yes"
+chk "prompt release actually freed the lock" "$(st state)" "FREE"
+chk "the wrapped command was stopped too" \
+    "$(alive "$wrapped" && echo running || echo stopped)" "stopped"
+cleanup
+
+echo "== SIGHUP releases =="
+cleanup
+$HL run --owner leon --reason "hup" -- sleep 60 >/dev/null 2>&1 &
+runner=$!
+sleep 2
+sig "$runner" 1
+chk "runner terminates on SIGHUP" "$(wait_bounded "$runner" && echo yes || echo no)" "yes"
+sleep 1
+chk "released after SIGHUP" "$(st state)" "FREE"
 cleanup
 
 echo "== wait =="
@@ -270,6 +375,10 @@ cleanup
 chk "wait returns immediately on a free host" "$($HL wait --timeout 5 >/dev/null 2>&1; echo $?)" "0"
 $HL acquire --owner leon --ttl 600 >/dev/null 2>&1
 chk "wait times out (3) while held" "$($HL wait --timeout 6 >/dev/null 2>&1; echo $?)" "3"
+cleanup
+$HL acquire --owner leon --ttl 1 >/dev/null 2>&1
+sleep 2
+chk "wait does not block on an expired lock" "$($HL wait --timeout 5 >/dev/null 2>&1; echo $?)" "0"
 cleanup
 
 echo "== gate =="
