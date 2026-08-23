@@ -189,7 +189,12 @@ impl WorkflowRuntime {
                             plan.proposer
                         )
                     })?,
-                None => self.host_copy_of(value)?,
+                // A port with no position symbol binds exactly what the
+                // workflow's own invocation bound it, so it is passed through
+                // as it stands. Aliasing keeps a device-resident borrowed KV
+                // where it is; materializing it here would copy the largest
+                // tensor in the loop to learn nothing about it.
+                None => clone_value(value)?,
             };
             fixed.push((port.clone(), narrowed));
         }
@@ -211,25 +216,17 @@ impl WorkflowRuntime {
         }
 
         // Folded carry: carry_0 is the target output the contract names, taken
-        // at its most recent position (see `last_position_rows`).
-        let mut carry =
-            match &plan.folded_carry_seed_value {
-                Some(value_name) => {
-                    let seed = run.get(value_name).with_context(|| {
-                        format!(
-                            "folded_carry_seed names target output value '{value_name}', which the \
-                         verification pass did not produce"
-                        )
-                    })?;
-                    Some(last_position_rows(&self.host_copy_of(seed)?).context(
-                        "folded_carry_seed must name a float32 per-position hidden output",
-                    )?)
-                }
-                None => None,
-            };
-
-        let embedding = match plan.token_embedding {
-            Some((component, table)) => Some(self.embedding_table_cached(component, table)?),
+        // at its most recent position — and left where that output already is.
+        // The chain's residency follows from it: the carry is one half of every
+        // fused input the loop builds, so whatever device produced it is the
+        // device the fused input is assembled on.
+        let carry_seed = match &plan.folded_carry_seed_value {
+            Some(value_name) => Some(run.get(value_name).with_context(|| {
+                format!(
+                    "folded_carry_seed names target output value '{value_name}', which the \
+                     verification pass did not produce"
+                )
+            })?),
             None => None,
         };
 
@@ -254,6 +251,37 @@ impl WorkflowRuntime {
             "chained proposal driving requires a float32 fused input, found {:?}",
             fused_template.dtype()
         );
+        // Where the chain does its tensor algebra: where the proposer executes.
+        // That is configured, not discovered, so the fused input is built in the
+        // proposer's own memory from the first step rather than assembled on the
+        // host and uploaded once per draft token.
+        let residency = self.component_execution_residency()?;
+        let ops = super::device_ops::tensor_ops_for_residency(residency)?;
+
+        let mut carry = match carry_seed {
+            Some(seed) => {
+                // carry_0 comes from the target's verification pass, which may
+                // have left it wherever that pass emitted it. Narrow it first —
+                // one position out of the whole prompt — and adopt only that,
+                // once per proposal. Every carry after this one is produced by
+                // the proposer itself and is already here.
+                let narrowed =
+                    last_position_of_carry(super::device_ops::tensor_ops_for(seed)?.as_ref(), seed)
+                        .context("folded_carry_seed must name a per-position hidden output")?;
+                Some(self.adopt_into(ops.as_ref(), &narrowed).with_context(|| {
+                    format!("failed to bring the folded carry seed onto {residency}")
+                })?)
+            }
+            None => None,
+        };
+
+        let embedding = match plan.token_embedding {
+            Some((component, table)) => {
+                Some(self.embedding_table_resident(component, table, residency)?)
+            }
+            None => None,
+        };
+
         // One proposal step advances exactly one position, so the fused input a
         // step binds keeps the workflow's batch extent and its declared width
         // but holds a single position, whatever the single-pass binding's
@@ -272,23 +300,75 @@ impl WorkflowRuntime {
             })
             .context("fused proposer input has an unusable shape")?;
 
+        // The split between the two halves is loop-invariant — the embedding
+        // table's width and the carry's are both fixed by the package — so it
+        // is checked once here rather than rediscovered every step.
+        let leading = embedding
+            .as_ref()
+            .map(|table| table.hidden_size())
+            .unwrap_or(0);
+        match &carry {
+            Some(carry) => {
+                let (carry_rows, carry_width) = trailing_rows_and_width(carry, "folded carry")?;
+                anyhow::ensure!(
+                    carry_rows == batch_rows,
+                    "folded carry covers {carry_rows} batch rows, but the fused proposer input \
+                     has {batch_rows}"
+                );
+                anyhow::ensure!(
+                    leading + carry_width == fused_width,
+                    "fused proposer input is {fused_width} wide, but embed({leading}) + \
+                     carry({carry_width}) is {}",
+                    leading + carry_width
+                );
+            }
+            None => anyhow::ensure!(
+                leading == fused_width,
+                "fused proposer input is {fused_width} wide, but the gathered embedding is \
+                 {leading}"
+            ),
+        }
+
+        // One buffer for the whole chain, in the residency the halves live in.
+        // Rebuilding it per step would allocate — and on a device, upload — the
+        // concatenation the scatters below write in place.
+        let fused = ops
+            .zeros(&fused_shape, DataType::Float32)
+            .context("failed to allocate the fused proposer input")?;
+
         let outputs = self.proposer_output_bindings(&plan);
+        // Symbols the proposer's *outputs* declare that none of its inputs
+        // carry — a vocabulary, above all. The workflow already invoked this
+        // component in this very run, so its own bound output values prove the
+        // extents; without them the run cannot size a device buffer for those
+        // outputs and hands each one back through host memory.
+        let output_symbols = proposer_output_symbols(declaration, &plan, run);
         let mut tokens = Vec::with_capacity(options.width);
         tokens.push(options.guaranteed_token);
         let mut last_token = options.seed_token;
         let mut invocations = 0usize;
 
         for step in 0..options.width {
-            let fused = build_fused_input(
-                &fused_shape,
-                fused_width,
-                batch_rows,
-                embedding.as_deref(),
-                last_token,
-                carry.as_deref(),
-            )
-            .with_context(|| format!("failed to build fused proposer input at step {step}"))?;
-
+            if let Some(table) = embedding.as_ref() {
+                // The same token embeds into every batch row, so the gather is
+                // asked for that row once per row rather than broadcast — the
+                // scatter then needs no broadcasting rule to get wrong.
+                let embedded = ops
+                    .gather_rows(table.value(), &vec![last_token; batch_rows])
+                    .with_context(|| {
+                        format!("failed to gather the embedding of token {last_token}")
+                    })?;
+                ops.scatter_into_last_axis(&fused, 0, &embedded)
+                    .with_context(|| {
+                        format!("failed to place the embedding half of step {step}'s fused input")
+                    })?;
+            }
+            if let Some(carry) = carry.as_ref() {
+                ops.scatter_into_last_axis(&fused, leading, carry)
+                    .with_context(|| {
+                        format!("failed to place the carry half of step {step}'s fused input")
+                    })?;
+            }
             let mut bound: Vec<(&str, &Value)> = fixed
                 .iter()
                 .map(|(port, value)| (port.as_str(), value))
@@ -299,7 +379,7 @@ impl WorkflowRuntime {
             }
 
             let produced = self
-                .invoke_component_values(plan.proposer, &bound, &outputs)
+                .invoke_component_values(plan.proposer, &bound, &outputs, &output_symbols)
                 .with_context(|| {
                     format!("chained proposer '{}' step {step} failed", plan.proposer)
                 })?;
@@ -327,24 +407,30 @@ impl WorkflowRuntime {
             })?;
             // Four bytes back, not a vocabulary: the winning id is all this
             // step needs, and a device that produced the row can find it.
-            let drafted = i64::from(
-                *super::device_ops::tensor_ops_for(&logits)?
-                    .argmax_rows(&logits, 1)?
-                    .first()
-                    .context("device argmax returned no row")?,
-            );
+            let drafted = i64::from(self.argmax_token(&logits)?);
 
             if let Some(value) = next_carry {
-                carry = Some(
-                    last_position_rows(&self.host_copy_of(&value)?).with_context(|| {
-                        format!(
-                            "chained proposer '{}' folded carry output '{}' is not a float32 \
-                             per-position hidden state",
-                            plan.proposer,
-                            plan.folded_carry_output.unwrap_or_default()
-                        )
-                    })?,
-                );
+                // Narrow where the proposer left it, then adopt — the same two
+                // steps the seed takes. Deriving the operations from the value
+                // rather than from the chain's residency is what keeps this
+                // correct when a backend publishes an output somewhere other
+                // than where the chain assembles; on the common path the
+                // residencies already agree and the adoption is an O(1) alias.
+                let narrowed = last_position_of_carry(
+                    super::device_ops::tensor_ops_for(&value)?.as_ref(),
+                    &value,
+                )
+                .with_context(|| {
+                    format!(
+                        "chained proposer '{}' folded carry output '{}' is not a per-position \
+                         hidden state",
+                        plan.proposer,
+                        plan.folded_carry_output.unwrap_or_default()
+                    )
+                })?;
+                carry = Some(self.adopt_into(ops.as_ref(), &narrowed).with_context(|| {
+                    format!("failed to bring the folded carry onto {residency}")
+                })?);
             } else if plan.folded_carry_output.is_some() {
                 anyhow::bail!(
                     "chained proposer '{}' declares folded_carry_output '{}' but produced none",
@@ -495,24 +581,56 @@ impl WorkflowRuntime {
             let value = state
                 .get(cell)
                 .with_context(|| format!("rollback_state cell '{cell}' has no value to undo"))?;
-            let truncated = truncate_state_cell(value, axis, length)
+            // Narrowing happens where the cell already is. A rejection used to
+            // copy the entire KV cache to the host to drop a few positions and
+            // upload it again on the next bind — the single largest transfer in
+            // the workflow, paid per rejection.
+            let truncated = super::device_ops::tensor_ops_for(value)?
+                .truncate_axis(value, axis, length)
                 .with_context(|| format!("failed to roll back state cell '{cell}'"))?;
-            let truncated = match truncated {
-                Some(truncated) => truncated,
-                // Strided truncation still needs a host round trip. Copying the
-                // whole cache down and back is the single largest transfer in
-                // the workflow, so it is worth naming where it happens rather
-                // than leaving it implicit in a `host_copy_of` call.
-                None => {
-                    let host = self.host_copy_of(value)?;
-                    truncate_along_axis(&host, axis, length).with_context(|| {
-                        format!("failed to roll back state cell '{cell}' on the host")
-                    })?
-                }
-            };
             state.insert(cell.clone(), truncated);
         }
         Ok(())
+    }
+
+    /// Bring `value` into `ops`' residency, counting anything it brings back.
+    ///
+    /// Adoption is the seam's one sanctioned crossing, so this is the one place
+    /// besides an argmax read-back where a device byte can reach the host — and
+    /// therefore the one place besides [`Self::argmax_token`] that has to say
+    /// so. A value already in the right residency is aliased and counts
+    /// nothing.
+    fn adopt_into(
+        &self,
+        ops: &dyn super::device_ops::ResidentTensorOps,
+        value: &Value,
+    ) -> anyhow::Result<Value> {
+        let source = super::device_ops::residency_of(value)?;
+        if source != ops.residency() && ops.residency() == super::device_ops::Residency::Host {
+            let bytes = (value.numel() * value.dtype().size_of()) as u64;
+            self.device_readback_bytes
+                .set(self.device_readback_bytes.get().saturating_add(bytes));
+        }
+        ops.adopt(value)
+    }
+
+    /// The winning token id of a logits row, read where the row already is.
+    ///
+    /// Four bytes per row, and on a device-resident chain it is the only
+    /// per-step transfer there is. Counting it here — together with
+    /// [`Self::adopt_into`], the seam's one other crossing, and the
+    /// interpreter's own materialization, which counts itself in
+    /// `host_staging_count` — accounts for every byte a proposal brings back.
+    fn argmax_token(&self, logits: &Value) -> anyhow::Result<u32> {
+        let ops = super::device_ops::tensor_ops_for(logits)?;
+        let ids = ops.argmax_rows(logits, 1)?;
+        let id = *ids.first().context("argmax returned no row")?;
+        if ops.residency() != super::device_ops::Residency::Host {
+            let bytes = (ids.len() * std::mem::size_of::<u32>()) as u64;
+            self.device_readback_bytes
+                .set(self.device_readback_bytes.get().saturating_add(bytes));
+        }
+        Ok(id)
     }
 
     /// Sequence axis a state cell rolls back along, from its serving group.
@@ -565,25 +683,48 @@ impl WorkflowRuntime {
     /// The contract names both the component and the initializer, so this never
     /// guesses which weight is the embedding: a missing or non-2D initializer is
     /// an error naming the contract field that pointed at it.
-    /// The declared embedding table, read once and cached.
+    /// The declared embedding table, resident where the chain will gather it.
     ///
-    /// A loaded package's artifact cannot change under it, so re-reading the
-    /// initializer per proposal buys nothing and costs a full `[vocab, hidden]`
-    /// read every time a chain starts.
-    pub fn embedding_table_cached(
+    /// Read from the artifact once and — for a device residency — uploaded
+    /// once, for the runtime's life. A loaded package's artifact cannot change
+    /// under it, so re-reading a `[vocab, hidden]` initializer per proposal
+    /// buys nothing; re-uploading one per *draft token* would cost more than
+    /// the proposal it feeds. The cache is keyed by residency as well as by
+    /// name, because a host table and a device mirror are different tensors
+    /// answering the same question.
+    pub fn embedding_table_resident(
         &self,
         component: &str,
         table: &str,
+        residency: super::device_ops::Residency,
     ) -> anyhow::Result<std::rc::Rc<EmbeddingTable>> {
-        let key = (component.to_string(), table.to_string());
+        let key = (
+            component.to_string(),
+            table.to_string(),
+            residency.cache_key(),
+        );
         if let Some(cached) = self.embedding_tables.borrow().get(&key) {
             return Ok(std::rc::Rc::clone(cached));
         }
-        let loaded = std::rc::Rc::new(self.embedding_table(component, table)?);
+        let loaded = std::rc::Rc::new(self.embedding_table(component, table)?.into_residency(
+            residency,
+        ).with_context(|| {
+            format!("failed to make embedding table '{table}' of component '{component}' resident on {residency}")
+        })?);
         self.embedding_tables
             .borrow_mut()
             .insert(key, std::rc::Rc::clone(&loaded));
         Ok(loaded)
+    }
+
+    /// How many times an embedding table was read out of an artifact.
+    ///
+    /// The cache above is a performance contract, not an implementation detail:
+    /// a multi-round speculative decode that re-read the table would be correct
+    /// and unusably slow, which is the class of regression a throughput number
+    /// does not attribute. This is what a test holds to one read per table.
+    pub fn embedding_table_loads(&self) -> u64 {
+        self.embedding_table_loads.get()
     }
 
     pub fn embedding_table(&self, component: &str, table: &str) -> anyhow::Result<EmbeddingTable> {
@@ -638,20 +779,48 @@ impl WorkflowRuntime {
             .chunks_exact(std::mem::size_of::<f32>())
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect::<Vec<_>>();
+        self.embedding_table_loads
+            .set(self.embedding_table_loads.get().saturating_add(1));
         Ok(EmbeddingTable {
             vocab,
             hidden,
-            rows,
+            value: Value::from_vec_f32(
+                rows,
+                &[
+                    i64::try_from(vocab).context("embedding vocabulary exceeds i64")?,
+                    i64::try_from(hidden).context("embedding width exceeds i64")?,
+                ],
+            )
+            .map_err(|error| {
+                anyhow::anyhow!("failed to materialize embedding table '{table}': {error}")
+            })?,
         })
     }
 }
 
-/// A dense `[vocab, hidden]` row-major embedding table read from a component.
-#[derive(Debug, Clone, PartialEq)]
+/// A dense `[vocab, hidden]` row-major embedding table read from a component,
+/// held in one residency.
+///
+/// The table is a *tensor*, not a host array: the gather that reads it happens
+/// wherever the proposal chain runs, and a table that only ever exists on the
+/// host forces every gathered row across the bus. Holding it as a `Value` is
+/// what lets the same type describe the host copy and the device mirror.
 pub struct EmbeddingTable {
     vocab: usize,
     hidden: usize,
-    rows: Vec<f32>,
+    value: Value,
+}
+
+impl std::fmt::Debug for EmbeddingTable {
+    /// A table's contents are a `[vocab, hidden]` matrix that may not even be
+    /// host-readable, so the shape is the whole of what is printable.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingTable")
+            .field("vocab", &self.vocab)
+            .field("hidden", &self.hidden)
+            .field("shape", &self.value.shape())
+            .finish()
+    }
 }
 
 impl EmbeddingTable {
@@ -663,11 +832,55 @@ impl EmbeddingTable {
         self.hidden
     }
 
+    /// The table as a `[vocab, hidden]` tensor, for a residency-preserving
+    /// gather.
+    pub(crate) fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// This table mirrored into `residency`, uploading once if it must.
+    ///
+    /// Takes the table by value because a mirror *replaces* it: the host copy a
+    /// device chain was built from has no further reader, and at a real
+    /// vocabulary keeping it alive alongside the mirror would double the
+    /// footprint of the largest tensor in the package.
+    pub(crate) fn into_residency(
+        self,
+        residency: super::device_ops::Residency,
+    ) -> anyhow::Result<Self> {
+        if super::device_ops::residency_of(&self.value)? == residency {
+            return Ok(self);
+        }
+        anyhow::ensure!(
+            residency != super::device_ops::Residency::Host,
+            "an embedding table already resident on a device is not brought back to the host; \
+             gather it where it is, or run this package on the host backend"
+        );
+        // Adoption is the seam's own crossing, so this upload is ordered against
+        // the kernels that will read the table by the same fence every other
+        // device write goes through — rather than by an invariant this function
+        // would otherwise have to state and the next caller remember.
+        let mirror = super::device_ops::tensor_ops_for_residency(residency)?
+            .adopt(&self.value)
+            .with_context(|| {
+                format!(
+                    "failed to make a [{}, {}] embedding table resident on {residency}",
+                    self.vocab, self.hidden
+                )
+            })?;
+        Ok(Self {
+            vocab: self.vocab,
+            hidden: self.hidden,
+            value: mirror,
+        })
+    }
+
     /// The embedding row for `token`.
     ///
     /// An out-of-range id is an error rather than a clamp: a proposer that
     /// drafted an id the table cannot embed has left the declared vocabulary,
-    /// and silently embedding row 0 would hide that.
+    /// and silently embedding row 0 would hide that. A device-resident table
+    /// has no host rows to borrow and says so.
     pub fn row(&self, token: i64) -> anyhow::Result<&[f32]> {
         let index = usize::try_from(token)
             .ok()
@@ -678,7 +891,10 @@ impl EmbeddingTable {
                     self.vocab, self.hidden
                 )
             })?;
-        Ok(&self.rows[index * self.hidden..(index + 1) * self.hidden])
+        let rows = self.value.as_slice_f32().map_err(|error| {
+            anyhow::anyhow!("this embedding table's rows cannot be read from the host: {error}")
+        })?;
+        Ok(&rows[index * self.hidden..(index + 1) * self.hidden])
     }
 }
 
@@ -890,6 +1106,78 @@ fn position_symbol(
     }
 }
 
+/// Shape symbols a proposer's outputs declare that none of its inputs carry.
+///
+/// A chain step binds one position of each input, so every symbol an input
+/// declares is re-bound per step and must never be hinted. What is left is the
+/// symbols only the *outputs* mention — a vocabulary, a projected hidden width
+/// — whose extents the workflow's own invocation of this same component already
+/// proved: the SSA values it bound those outputs to are in this run, with
+/// concrete shapes.
+///
+/// Without those extents an output has no resolvable shape, so no device buffer
+/// can be sized for it and the run returns it through host memory — a download
+/// of the full logits row, per draft token, which is the transfer the whole
+/// chain exists to avoid.
+///
+/// A symbol two outputs disagree about is dropped rather than guessed: the
+/// consequence of omitting a hint is the host fallback that was there before,
+/// while the consequence of a wrong one would be a wrongly sized buffer.
+fn proposer_output_symbols(
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    plan: &ChainedPlan<'_>,
+    run: &PipelineTensors,
+) -> std::collections::HashMap<String, i64> {
+    let input_symbols = declaration
+        .ports
+        .inputs
+        .values()
+        .filter_map(|contract| contract.shape.as_ref())
+        .flatten()
+        .filter_map(|dimension| match dimension {
+            onnx_genai_metadata::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
+            onnx_genai_metadata::TensorDimension::Fixed(_) => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut hints: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut conflicted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (port, value_name) in &plan.proposer_outputs {
+        let Some(contract) = declaration.ports.outputs.get(port) else {
+            continue;
+        };
+        let Some(shape) = contract.shape.as_ref() else {
+            continue;
+        };
+        let Some(produced) = run.get(value_name) else {
+            continue;
+        };
+        if produced.shape().len() != shape.len() {
+            continue;
+        }
+        for (dimension, extent) in shape.iter().zip(produced.shape()) {
+            let onnx_genai_metadata::TensorDimension::Symbol(symbol) = dimension else {
+                continue;
+            };
+            if input_symbols.contains(symbol.as_str()) || *extent < 0 {
+                continue;
+            }
+            match hints.get(symbol.as_str()) {
+                Some(known) if known != extent => {
+                    conflicted.insert(symbol.clone());
+                }
+                _ => {
+                    hints.insert(symbol.clone(), *extent);
+                }
+            }
+        }
+    }
+    for symbol in conflicted {
+        hints.remove(&symbol);
+    }
+    hints
+}
+
 /// The axis of `port` carrying `symbol`, if the port declares it.
 fn symbol_axis(
     declaration: &onnx_genai_metadata::WorkflowComponent,
@@ -900,46 +1188,6 @@ fn symbol_axis(
     shape.iter().position(|dimension| {
         matches!(dimension, onnx_genai_metadata::TensorDimension::Symbol(name) if name == symbol)
     })
-}
-
-/// Keep only the final index of `axis`, preserving rank.
-pub(crate) fn last_position_along(value: &Value, axis: usize) -> anyhow::Result<Value> {
-    let shape = value.shape().to_vec();
-    anyhow::ensure!(
-        axis < shape.len(),
-        "position axis {axis} is out of range for a rank-{} tensor",
-        shape.len()
-    );
-    let extent = usize::try_from(shape[axis]).context("negative tensor extent")?;
-    anyhow::ensure!(extent > 0, "cannot take the last position of an empty axis");
-    if extent == 1 {
-        return clone_value(value);
-    }
-    let outer = shape[..axis]
-        .iter()
-        .try_fold(1usize, |total, dimension| {
-            usize::try_from(*dimension).ok().map(|d| total * d)
-        })
-        .context("negative tensor extent")?;
-    let inner = shape[axis + 1..]
-        .iter()
-        .try_fold(1usize, |total, dimension| {
-            usize::try_from(*dimension).ok().map(|d| total * d)
-        })
-        .context("negative tensor extent")?;
-    let element = value.dtype().size_of();
-    let bytes = value.as_raw_bytes()?;
-    let block = extent * inner * element;
-    let keep = inner * element;
-    let mut narrowed = Vec::with_capacity(outer * keep);
-    for index in 0..outer {
-        let start = index * block + (extent - 1) * keep;
-        narrowed.extend_from_slice(&bytes[start..start + keep]);
-    }
-    let mut new_shape = shape;
-    new_shape[axis] = 1;
-    Value::from_raw_bytes(narrowed, &new_shape, value.dtype())
-        .map_err(|error| anyhow::anyhow!("failed to narrow a proposer input: {error}"))
 }
 
 /// The shape one proposal step binds for the fused proposer input.
@@ -959,186 +1207,47 @@ fn single_position_shape(shape: &[i64]) -> Option<Vec<i64>> {
     Some(resolved)
 }
 
-/// The most recent position of a `[.., positions, features]` float32 value, one
-/// row per batch entry.
+/// The most recent position of a `[.., positions, features]` per-position
+/// value, left where it already is.
 ///
 /// A folded carry is a per-position hidden state: the seed covers every prompt
 /// position, and a proposer step covers one. Both reduce the same way — take the
 /// final position — so the loop never has to know which of the two it holds.
-fn last_position_rows(value: &Value) -> anyhow::Result<Vec<Vec<f32>>> {
-    let shape = value.shape();
-    let features = *shape.last().context("carry value has rank 0")?;
-    let features = usize::try_from(features).context("carry value has a negative width")?;
-    anyhow::ensure!(features > 0, "carry value has a zero-width feature axis");
-    let data = value.to_vec_f32().map_err(|error| {
-        anyhow::anyhow!("last_position_rows: carry value must be float32: {error}")
-    })?;
-    anyhow::ensure!(
-        data.len() % features == 0,
-        "carry value holds {} elements, which is not a multiple of its {features}-wide feature axis",
-        data.len()
-    );
-    let positions = if shape.len() >= 3 {
-        usize::try_from(shape[shape.len() - 2]).context("carry value has a negative extent")?
-    } else {
-        1
-    };
-    anyhow::ensure!(positions > 0, "carry value holds no positions");
-    let rows = data.len() / features / positions;
-    Ok((0..rows)
-        .map(|row| {
-            let start = (row * positions + positions - 1) * features;
-            data[start..start + features].to_vec()
-        })
-        .collect())
-}
-
-/// Build `concat(embed(last_token), carry)` for one proposer step.
 ///
-/// The fused input's declared width fixes the split: a folded carry occupies the
-/// trailing segment and the gathered embedding the leading one. A proposer with
-/// a recurrence but no folded carry has no trailing segment, so the whole fused
-/// input is the embedding.
-fn build_fused_input(
-    shape: &[i64],
-    width: usize,
-    rows: usize,
-    embedding: Option<&EmbeddingTable>,
-    token: i64,
-    carry: Option<&[Vec<f32>]>,
+/// The position axis is the one before the feature axis, which is the same
+/// layout [`single_position_shape`] collapses when it builds one step's fused
+/// input: a carry and the fused input it lands in cannot disagree about where
+/// positions are. A rank-2 or smaller carry has no separate position axis and
+/// already holds exactly one position.
+fn last_position_of_carry(
+    ops: &dyn super::device_ops::ResidentTensorOps,
+    value: &Value,
 ) -> anyhow::Result<Value> {
-    let embedded = match embedding {
-        Some(table) => Some(table.row(token)?),
-        None => None,
-    };
-    let leading = embedded.map(<[f32]>::len).unwrap_or(0);
-    if let Some(carry) = carry {
-        anyhow::ensure!(
-            carry.len() == rows,
-            "folded carry covers {} batch rows, but the fused proposer input has {rows}",
-            carry.len()
-        );
-        let carry_width = carry[0].len();
-        anyhow::ensure!(
-            leading + carry_width == width,
-            "fused proposer input is {width} wide, but embed({leading}) + carry({carry_width}) \
-             is {}",
-            leading + carry_width
-        );
-    } else {
-        anyhow::ensure!(
-            leading == width,
-            "fused proposer input is {width} wide, but the gathered embedding is {leading}"
-        );
+    let shape = value.shape();
+    anyhow::ensure!(
+        !shape.is_empty(),
+        "a folded carry has rank 0, so it has no feature axis"
+    );
+    match shape.len() >= 3 {
+        true => ops.last_along_axis(value, shape.len() - 2),
+        false => clone_value(value),
     }
-    let mut data = vec![0.0f32; rows * width];
-    for row in 0..rows {
-        let base = row * width;
-        if let Some(embedded) = embedded {
-            data[base..base + leading].copy_from_slice(embedded);
-        }
-        if let Some(carry) = carry {
-            data[base + leading..base + width].copy_from_slice(&carry[row]);
-        }
-    }
-    Value::from_vec_f32(data, shape)
-        .map_err(|error| anyhow::anyhow!("failed to materialize the fused proposer input: {error}"))
 }
 
-/// Copy a value's leading `length` positions along `axis`.
-/// Truncate a state cell without moving it, when the shape allows.
-///
-/// A rollback keeps a *prefix* along the sequence axis. When every axis before
-/// that one has extent 1 — a batch-1 seq-major cache, which is what the native
-/// backend declares — the kept elements are already a contiguous prefix of the
-/// same buffer, so the truncation is a smaller view of it: no copy, and a device
-/// tensor stays on the device.
-///
-/// That matters because the alternative is the largest transfer in the
-/// workflow. Rolling back a rejected proposal copied the entire KV cache to the
-/// host to drop a few positions, then uploaded it again on the next bind — per
-/// rejection.
-///
-/// Returns `None` when the kept elements are strided rather than contiguous, so
-/// the caller can fall back rather than this silently producing a tensor whose
-/// contents are wrong. A strided device truncate needs an execution-provider
-/// copy and is the remaining work here.
-fn truncate_state_cell(value: &Value, axis: usize, length: usize) -> anyhow::Result<Option<Value>> {
-    let shape = value.shape().to_vec();
+/// The `(rows, width)` of a `[.., width]` value, for the fused-input split.
+fn trailing_rows_and_width(value: &Value, role: &str) -> anyhow::Result<(usize, usize)> {
+    let shape = value.shape();
+    let width = usize::try_from(
+        *shape
+            .last()
+            .with_context(|| format!("the {role} has rank 0, so it has no feature axis"))?,
+    )
+    .with_context(|| format!("the {role} has a negative width"))?;
     anyhow::ensure!(
-        axis < shape.len(),
-        "sequence axis {axis} is out of range for a rank-{} tensor",
-        shape.len()
+        width > 0,
+        "the {role} has a zero-width feature axis (shape {shape:?})"
     );
-    let current = shape[axis] as usize;
-    if length > current {
-        return Ok(None);
-    }
-    // Elements before the truncated axis; the prefix is contiguous only when
-    // there is exactly one of them.
-    let leading: i64 = shape[..axis].iter().product();
-    if leading != 1 {
-        return Ok(None);
-    }
-    if length == current {
-        // Nothing to drop: alias rather than copy, so an unchanged cell also
-        // stays where it is.
-        return Ok(Some(clone_value(value)?));
-    }
-    let mut truncated = shape.clone();
-    truncated[axis] = length as i64;
-    // `alias_with_shape` takes an `Arc` to tie the view's lifetime to the buffer
-    // it borrows, which is the whole point: the view must not outlive what it
-    // points into. `Value` is not `Send`/`Sync` and this one never leaves the
-    // calling thread, so the atomic refcount is the API's price rather than a
-    // sharing claim.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let owner = std::sync::Arc::new(clone_value(value)?);
-    Value::alias_with_shape(owner, &truncated)
-        .map(Some)
-        .map_err(Into::into)
-}
-
-fn truncate_along_axis(value: &Value, axis: usize, length: usize) -> anyhow::Result<Value> {
-    let shape = value.shape().to_vec();
-    anyhow::ensure!(
-        axis < shape.len(),
-        "sequence axis {axis} is out of range for a rank-{} tensor",
-        shape.len()
-    );
-    let extent = usize::try_from(shape[axis]).context("negative tensor extent")?;
-    anyhow::ensure!(
-        length <= extent,
-        "cannot roll back to {length} positions: the tensor holds {extent}"
-    );
-    if length == extent {
-        return clone_value(value);
-    }
-    let outer = shape[..axis]
-        .iter()
-        .try_fold(1usize, |total, dimension| {
-            usize::try_from(*dimension).ok().map(|d| total * d)
-        })
-        .context("negative tensor extent")?;
-    let inner = shape[axis + 1..]
-        .iter()
-        .try_fold(1usize, |total, dimension| {
-            usize::try_from(*dimension).ok().map(|d| total * d)
-        })
-        .context("negative tensor extent")?;
-    let element = value.dtype().size_of();
-    let bytes = value.as_raw_bytes()?;
-    let mut truncated = Vec::with_capacity(outer * length * inner * element);
-    let block = extent * inner * element;
-    let keep = length * inner * element;
-    for index in 0..outer {
-        let start = index * block;
-        truncated.extend_from_slice(&bytes[start..start + keep]);
-    }
-    let mut new_shape = shape;
-    new_shape[axis] = i64::try_from(length).context("rollback length exceeds i64")?;
-    Value::from_raw_bytes(truncated, &new_shape, value.dtype())
-        .map_err(|error| anyhow::anyhow!("failed to materialize the rolled-back state: {error}"))
+    Ok((value.numel() / width, width))
 }
 
 /// Clone a workflow value without changing where it lives.
@@ -1315,86 +1424,109 @@ steps:
 #[cfg(test)]
 mod rollback_residency_tests {
     use super::*;
+    use crate::pipeline::device_ops::{HostTensorOps, ResidentTensorOps};
 
     /// A batch-1 seq-major cache truncates as a view, not a copy.
     ///
     /// This is the shape the native backend declares, and it is the case that
     /// used to copy the whole KV cache to the host and back on every rejection.
     #[test]
-    fn a_contiguous_prefix_truncates_without_moving() {
+    fn a_contiguous_prefix_truncates_to_the_kept_prefix() {
         // [batch=1, sequence=4, hidden=2]
         let value = Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], &[1, 4, 2])
             .expect("value");
-        let truncated = truncate_state_cell(&value, 1, 2)
-            .expect("truncation succeeds")
-            .expect("a contiguous prefix must not fall back to the host");
+        let truncated = HostTensorOps
+            .truncate_axis(&value, 1, 2)
+            .expect("truncation succeeds");
         assert_eq!(truncated.shape(), &[1, 2, 2]);
         assert_eq!(
             truncated.to_vec_f32().expect("host read"),
             vec![0.0, 1.0, 2.0, 3.0],
-            "the view must be the kept prefix, in order"
+            "the truncation must be the kept prefix, in order"
         );
     }
 
-    /// A strided truncation declines rather than producing wrong bytes.
+    /// A strided truncation keeps the declared elements rather than a prefix of
+    /// the buffer.
     ///
     /// `[batch, heads, sequence, head_dim]` keeps a prefix of axis 2, which is
-    /// interleaved across heads — not a prefix of the buffer. Returning a view
-    /// here would silently hand back the wrong elements, which is worse than
-    /// the copy it would have avoided.
+    /// interleaved across heads — not a prefix of the buffer. Handing back a
+    /// contiguous view here would silently return the wrong elements, so the
+    /// strided case copies within its own residency instead.
     #[test]
-    fn a_strided_truncation_declines() {
+    fn a_strided_truncation_keeps_the_declared_elements() {
         // [batch=1, heads=2, sequence=2, head_dim=1]
         let value = Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0], &[1, 2, 2, 1]).expect("value");
-        assert!(
-            truncate_state_cell(&value, 2, 1)
-                .expect("no error")
-                .is_none(),
-            "a head-major cache is strided along its sequence axis and must fall back"
+        let truncated = HostTensorOps
+            .truncate_axis(&value, 2, 1)
+            .expect("a head-major cache still truncates");
+        assert_eq!(truncated.shape(), &[1, 2, 1, 1]);
+        assert_eq!(
+            truncated.to_vec_f32().expect("host read"),
+            vec![0.0, 2.0],
+            "each head keeps its own first position, not the buffer's first two elements"
         );
     }
 
-    /// An unchanged length is still a view, so a no-op rollback does not move a
-    /// device tensor to the host.
+    /// An unchanged length is a no-op rollback, and still produces the cell.
     #[test]
-    fn an_unchanged_length_is_not_a_copy() {
+    fn an_unchanged_length_keeps_every_element() {
         let value = Value::from_slice_f32(&[0.0, 1.0], &[1, 2]).expect("value");
-        let kept = truncate_state_cell(&value, 1, 2)
-            .expect("no error")
-            .expect("an unchanged length must not fall back");
+        let kept = HostTensorOps
+            .truncate_axis(&value, 1, 2)
+            .expect("an unchanged length must succeed");
         assert_eq!(kept.shape(), &[1, 2]);
+        assert_eq!(kept.to_vec_f32().expect("host read"), vec![0.0, 1.0]);
     }
 
-    /// A length beyond the cell declines rather than aliasing past the buffer.
+    /// A length beyond the cell is refused, naming both extents, rather than
+    /// aliasing past the buffer.
     #[test]
-    fn a_length_beyond_the_cell_declines() {
+    fn a_length_beyond_the_cell_is_refused() {
         let value = Value::from_slice_f32(&[0.0, 1.0], &[1, 2]).expect("value");
-        assert!(
-            truncate_state_cell(&value, 1, 5)
-                .expect("no error")
-                .is_none()
-        );
+        let Err(error) = HostTensorOps.truncate_axis(&value, 1, 5) else {
+            panic!("a length past the end must be refused");
+        };
+        let message = format!("{error:#}");
+        assert!(message.contains('5') && message.contains('2'), "{message}");
     }
 
-    /// The host fallback and the view agree, element for element.
-    ///
-    /// They are two implementations of one operation, so the only thing that
-    /// makes the fast path safe is that it produces what the slow path would.
+    /// Truncation is a window of the one narrowing primitive, so the fast
+    /// contiguous path cannot disagree with the general one.
     #[test]
-    fn the_view_matches_the_host_truncation() {
+    fn truncation_agrees_with_the_slice_primitive() {
         let value =
             Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 3, 2]).expect("value");
         for length in 0..=3 {
-            let view = truncate_state_cell(&value, 1, length)
-                .expect("no error")
-                .expect("contiguous")
+            let truncated = HostTensorOps
+                .truncate_axis(&value, 1, length)
+                .expect("truncation")
                 .to_vec_f32()
                 .expect("host read");
-            let host = truncate_along_axis(&value, 1, length)
-                .expect("host truncation")
+            let sliced = HostTensorOps
+                .slice_axis(&value, 1, 0, length)
+                .expect("slice")
                 .to_vec_f32()
                 .expect("host read");
-            assert_eq!(view, host, "length {length}");
+            assert_eq!(truncated, sliced, "length {length}");
         }
+    }
+
+    /// A folded carry is narrowed to its final position wherever it lives, and
+    /// a carry that already holds one position is left alone.
+    #[test]
+    fn a_carry_reduces_to_its_final_position() {
+        // [batch=1, positions=3, features=2]
+        let seeded =
+            Value::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 3, 2]).expect("value");
+        let reduced = last_position_of_carry(&HostTensorOps, &seeded).expect("carry narrows");
+        assert_eq!(reduced.shape(), &[1, 1, 2]);
+        assert_eq!(reduced.to_vec_f32().expect("host read"), vec![4.0, 5.0]);
+
+        // Rank 2 has no separate position axis: it is already one position.
+        let flat = Value::from_slice_f32(&[7.0, 8.0], &[1, 2]).expect("value");
+        let kept = last_position_of_carry(&HostTensorOps, &flat).expect("carry passes through");
+        assert_eq!(kept.shape(), &[1, 2]);
+        assert_eq!(kept.to_vec_f32().expect("host read"), vec![7.0, 8.0]);
     }
 }

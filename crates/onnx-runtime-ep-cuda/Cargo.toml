@@ -34,7 +34,11 @@ cuda-13000 = [
     "onnx-runtime-cuda-memory/cuda-13000",
 ]
 # Opt-in for real CUDA integration tests. Without this feature they are reported as ignored.
-gpu-tests = []
+# Forwarded to onnx-runtime-cuda-memory so its own `gpu-tests`-gated test-only
+# APIs (e.g. `CudaVmmAllocator::install_driver_faults`, used by this crate's
+# `weight_paging.rs` fault-injection tests) are actually compiled in, instead
+# of silently failing to resolve only when this feature is enabled.
+gpu-tests = ["onnx-runtime-cuda-memory/gpu-tests"]
 
 [dependencies]
 onnx-runtime-ir = { workspace = true }

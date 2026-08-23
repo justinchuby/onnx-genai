@@ -62,6 +62,7 @@ pub mod hardmax;
 pub mod index_share;
 pub mod index_transform;
 pub mod indexing;
+pub mod kv_cache_capacity_append;
 pub(crate) mod kv_stride;
 pub mod linear_attention;
 pub mod log_softmax;
@@ -180,6 +181,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "SparseKvGather",
     "CompressedSparseAttention",
     "IndexShare",
+    "KvCacheCapacityAppend",
     "PackedVarlenAttention",
     "VarlenAttention",
     "Gemm",
@@ -1069,6 +1071,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("KvCacheCapacityAppend", "pkg.nxrt", 1),
+        Box::new(kv_cache_capacity_append::KvCacheCapacityAppendFactory {
             runtime: runtime.clone(),
         }),
     );

@@ -3,12 +3,16 @@
 #
 # Run: scripts/hostlock_test.sh
 #
-# Almost free: it is mkdir/rename traffic and short sleeps. The ONE exception
-# is the R2 occupancy assertion, which deliberately spins 6 of 32 logical cpus
-# for ~5s to prove the reported runnable count moves with real load -- without
-# it, `runnable_now() { echo 1; }` passes and silently disables every --gate.
-# So the suite is safe next to somebody's benchmark in every respect except
-# that one burst. Do not run it during a run you intend to publish; take the
+# Almost free: it is mkdir/rename traffic and short sleeps. There are two
+# exceptions, both deliberate and both unavoidable, because each one exists to
+# prove that a reported number tracks real load rather than being a constant:
+# R2 starts 6 spinners and kills them once occupancy has been read, about a
+# second later, and R2b runs three ~1.5s single-cpu cells. That is roughly
+# ten core-seconds in total -- 6 x ~1s plus 3 x ~1.5s -- and it is not zero.
+# (The spinners are written with a 5s cap they never reach; the cap is a
+# deadman, not the cost.) Without them, `runnable_now() { echo 1; }` silently
+# disables every --gate and a constant efficiency silently certifies every
+# run. Do not run this during a benchmark you intend to publish, and take the
 # real lock first, exactly as this tool asks everyone else to.
 #
 # The test that earned its place is the atomicity watcher. An earlier
@@ -36,7 +40,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1235,6 +1239,103 @@ wait "$zlparent" 2>/dev/null
 rm -f "$LOCK.zlpid"
 cleanup
 
+echo "-- R2b: a run that did not get its cores must say so --"
+# The occupancy snapshot in a published row is an ADMISSION control: it says
+# what the host looked like at two instants. Roy gated on exactly that,
+# sampled before and after each arm, and it reported "peak 2-4, clean" for
+# runs that were in fact getting 50-70% of a core -- a 2s arm has ample room
+# for a burst that starts after the opening sample and ends before the closing
+# one. His A/A null was 52%: the same binary against itself, disagreeing by
+# half. So the row can say `contended=no` about a ruined measurement, and
+# nothing in this tool would have contradicted it.
+#
+# --min-efficiency measures the run itself instead: CPU-seconds actually
+# consumed over cores x wall. It needs no quiet host and it is not a proxy.
+cleanup
+busy1s='import time
+t = time.time()
+while time.time() - t < 1.5:
+    pass'
+out=$($HL run --owner leon --reason "cpu ok" --expect-cores 1 --min-efficiency 0.8 \
+    -- python3 -c "$busy1s" 2>&1); rc=$?
+chk "a run that owns its core passes the efficiency gate" "$rc" "0"
+chk "and is reported as ok" "$(echo "$out" | grep -c 'verdict=ok')" "1"
+# The number has to be a MEASUREMENT, not a label: a constant 1.000 would pass
+# the assertion above forever. A sleeping command consumes no CPU at all, so
+# the same threshold must reject it.
+out=$($HL run --owner leon --reason "cpu idle" --expect-cores 1 --min-efficiency 0.8 \
+    -- sleep 1 2>&1); rc=$?
+chk "a run that never touched its core fails the efficiency gate" "$rc" "6"
+chk "and is reported as contended" "$(echo "$out" | grep -c 'verdict=contended')" "1"
+chk "and says which direction to disbelieve" \
+    "$(echo "$out" | grep -c 'treat its numbers as untrusted')" "1"
+chk "and names the gate that cannot see it" \
+    "$(echo "$out" | grep -c 'samples instants')" "1"
+chk "and the lock is released even when the run is rejected" "$(st state)" "FREE"
+# Kernel time counts too. Every cell above is a pure user-mode busy loop, so
+# `CPU_TICKS=$((cu))` -- dropping cstime -- leaves them all passing while
+# under-measuring anything syscall-bound by the whole system half. A real
+# benchmark here loads models, reads tensors and writes results, so that is
+# not a hypothetical shape. This cell spends most of its time in the kernel.
+syscall1s='import os, time
+fd = os.open("/dev/null", os.O_WRONLY)
+buf = b"x" * 64
+t = time.time()
+while time.time() - t < 1.5:
+    for _ in range(200):
+        os.write(fd, buf)'
+out=$($HL run --owner leon --reason "cpu sys" --expect-cores 1 --min-efficiency 0.8 \
+    -- python3 -c "$syscall1s" 2>&1); rc=$?
+chk "a run whose time is mostly kernel time still counts as using its core" "$rc" "0"
+chk "and is reported as ok rather than under-measured" \
+    "$(echo "$out" | grep -c 'verdict=ok')" "1"
+
+# The denominator must be the declared core count, not a constant 1. A
+# one-core load judged against two cores is half-efficient by construction,
+# so ignoring --expect-cores flips this cell and only this cell.
+out=$($HL run --owner leon --reason "cpu half" --expect-cores 2 --min-efficiency 0.8 \
+    -- python3 -c "$busy1s" 2>&1); rc=$?
+chk "one core of work judged against two cores is contended" "$rc" "6"
+chk "and the row records the denominator it used" \
+    "$(echo "$out" | grep -c 'cores_expected=2')" "1"
+# A failing command's own status is the more important signal. Reporting 6
+# for a crashed benchmark buries the crash under a host-quality complaint.
+out=$($HL run --owner leon --reason "cpu fail" --expect-cores 1 --min-efficiency 0.8 \
+    -- sh -c 'exit 42' 2>&1); rc=$?
+chk "a failing command keeps its own exit status" "$rc" "42"
+# Without a threshold the measurement is still emitted -- an unjudged number
+# in the log is what lets somebody re-examine a suspicious row later -- but
+# nothing is enforced and `run`'s documented contract is unchanged.
+out=$($HL run --owner leon --reason "cpu unjudged" -- sleep 1 2>&1); rc=$?
+chk "without a threshold the run is not judged" "$rc" "0"
+chk "but the measurement is still recorded" "$(echo "$out" | grep -c 'verdict=unjudged')" "1"
+chk "and it does not invent a denominator it was not given" \
+    "$(echo "$out" | grep -c 'cores_expected=unspecified')" "1"
+# Fail closed, twice over. A threshold with no denominator cannot be
+# evaluated, and defaulting it to 1 would pass every multi-threaded run; a run
+# too short to measure cannot be verified either. Both must refuse rather than
+# assume, and the first must refuse BEFORE the command runs.
+rm -f "$LOCK.ran"
+out=$($HL run --owner leon --reason "no denominator" --min-efficiency 0.8 \
+    -- touch "$LOCK.ran" 2>&1); rc=$?
+chk "a threshold with no denominator is a usage error" "$rc" "1"
+chk "and the command never ran" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
+chk "and no lock was left behind" "$(st state)" "FREE"
+rm -f "$LOCK.ran"
+out=$($HL run --owner leon --reason "too short" --expect-cores 1 --min-efficiency 0.8 \
+    -- true 2>&1); rc=$?
+chk "a run too short to measure is not certified as clean" "$rc" "6"
+chk "and says it could not be evaluated rather than that it passed" \
+    "$(echo "$out" | grep -c 'NOT verified')" "1"
+# ...and the same two knobs must not be silently accepted where they do
+# nothing. An inert knob that is believed in is worse than an absent one.
+out=$($HL status --expect-cores 4 2>&1); rc=$?
+chk "--expect-cores is refused outside run" "$rc" "1"
+out=$($HL acquire --owner leon --min-efficiency 0.5 --expect-cores 1 2>&1); rc=$?
+chk "--min-efficiency is refused outside run" "$rc" "1"
+chk "and refusing it did not leave a lock" "$(st state)" "FREE"
+cleanup
+
 echo "-- R7: the lock never kills anything it did not start --"
 # Reclaiming a lock does not stop the load: the dead holder's benchmark is
 # still on the cores. The tempting "fix" is for the reaper to kill it, which
@@ -1354,7 +1455,7 @@ $HL release >/dev/null 2>&1
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "213"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "236"
 
 echo
 echo "passed=${pass} failed=${fail}"

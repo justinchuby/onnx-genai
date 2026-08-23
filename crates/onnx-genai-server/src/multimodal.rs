@@ -244,8 +244,9 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     };
     // A single decoder declares a workflow like every other package, but it is
     // not a composed pipeline: it has no components to feed and no multimodal
-    // inputs to describe. Asking the one shared recognizer keeps this from
-    // drifting apart from the executor choice the engine makes.
+    // inputs to describe. This reads layer 1 of the shared classification; the
+    // engine's executor choice reads layer 2 of the same one, which is layer 1
+    // plus the decode contract, so the two cannot drift apart.
     if directory
         .metadata
         .as_ref()

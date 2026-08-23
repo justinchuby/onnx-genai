@@ -94,7 +94,7 @@ pub(crate) fn is_self_attention(kind: StateKind) -> bool {
 }
 
 /// Groups that bind `component`, in a deterministic order.
-fn groups_for<'a>(
+pub(crate) fn groups_for<'a>(
     workflow: &'a WorkflowSpec,
     component: &str,
 ) -> Vec<(&'a str, &'a StateGroupContract)> {
@@ -105,77 +105,6 @@ fn groups_for<'a>(
         .filter(|(_, group)| group.ports.contains_key(component))
         .map(|(name, group)| (name.as_str(), group))
         .collect()
-}
-
-/// The component a bare decoder package executes, if the workflow has exactly one.
-///
-/// A decoder is recognized structurally, never by name: it is the component that
-/// consumes the autoregressive sequence — a declared `token_ids` or
-/// `inputs_embeds` input role — and either produces logits or owns attention
-/// state. A workflow with several such components (speculative decoding, an
-/// encoder-decoder pair) has no single answer and returns `None`; those paths
-/// address components explicitly.
-pub fn sole_decoder_component(workflow: &WorkflowSpec) -> Option<&str> {
-    let mut candidates = workflow.components.iter().filter(|(name, component)| {
-        let roles = &component.ports.roles;
-        let consumes_sequence = roles
-            .values()
-            .any(|role| matches!(role, PortRole::TokenIds | PortRole::InputsEmbeds));
-        let produces_logits = roles.values().any(|role| *role == PortRole::Logits);
-        let owns_attention_state = groups_for(workflow, name)
-            .iter()
-            .any(|(_, group)| is_self_attention(group.kind));
-        consumes_sequence && (produces_logits || owns_attention_state)
-    });
-    let (name, _) = candidates.next()?;
-    if candidates.next().is_some() {
-        return None;
-    }
-    Some(name.as_str())
-}
-
-/// Whether a workflow is a single-decoder package.
-///
-/// Answers "does this workflow execute exactly one ONNX graph, and is that
-/// graph a decoder" from the component's declared *port roles*.
-///
-/// The CLI and server ask this when deciding whether to build multimodal input
-/// specs. The engine deliberately asks a different question — whether the sole
-/// graph component declares the `onnx-genai.autoregressive-decode` contract —
-/// because it is choosing an *executor* for a declared step, and a contract is
-/// what names a step. The two agree on every package the emitter produces,
-/// since it emits the roles and the contract together, but they are not the
-/// same predicate and nothing here pretends otherwise.
-///
-/// # This is not the same question as [`sole_decoder_component`]
-///
-/// That one asks *which* component is the decoder, and answers it for composite
-/// packages too: a vision-language package has one decoder among its encoder,
-/// projector and decoder components, which is exactly why the resolver exists.
-/// Treating "has a recognizable decoder" as "is only a decoder" would classify
-/// every VLM — and every any-to-any package with a text head — as a bare
-/// decoder, and route it to the fused single-graph executor that cannot run its
-/// other components at all.
-///
-/// So the question asked here is the one the phrase actually means: does this
-/// workflow execute **one** ONNX graph? Components the *runtime* implements
-/// (`binding`, such as the token policy) are not graphs and do not count; an
-/// adapter or a second ONNX component does.
-pub fn is_single_decoder_workflow(workflow: &WorkflowSpec) -> bool {
-    if sole_decoder_component(workflow).is_none() {
-        return false;
-    }
-    workflow
-        .components
-        .values()
-        .filter(|component| {
-            !matches!(
-                component.implementation,
-                crate::schema::ComponentImplementation::Binding
-            )
-        })
-        .count()
-        == 1
 }
 
 /// Find the single port of `component` carrying `role`.

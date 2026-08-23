@@ -262,6 +262,35 @@ that constructs and runs a canonical workflow.
     step's single position, derived from the declared port contracts — so a
     borrowed-KV drafter's `kv_sequence`-keyed mask is untouched while its
     `sequence`-keyed position ids are narrowed.
+  * Every tensor the chain touches stays in the residency that produced it.
+    `pipeline/device_ops.rs` is the backend-neutral seam that makes that
+    expressible: `slice_axis` (with `last_along_axis` / `truncate_axis` as its
+    two windows), `gather_rows`, `scatter_into_last_axis`, `zeros`, `argmax_rows`
+    and the single sanctioned crossing, `adopt`. A host implementation and a CUDA
+    implementation answer the same questions, and a value with no implementation
+    for where it lives is an error naming both remedies — never a quiet copy to
+    the host. Device writes issue on cudart's legacy stream while the providers
+    run kernels on non-blocking streams, so every write batch ends in one
+    barrier — two to three more per step than correctness strictly needs, and
+    deliberately so: a fence a caller can forget is a silent-wrong-answer class,
+    and what it replaces is orders of magnitude larger. A rejection therefore
+    truncates the declared KV cells *on the device* (the transfer that used to
+    dominate the workflow: the whole cache down and back, per rejection), a
+    step's `concat(embed(token), carry)` is
+    gathered and scattered into one device buffer allocated once per proposal,
+    and a draft token costs a four-byte argmax read-back instead of a
+    vocabulary-wide download. The declared embedding table is read out of the
+    artifact once and mirrored into the chain's residency once, for the
+    runtime's life.
+  * The chain's residency is where the proposer *executes*
+    (`WorkflowRuntime::component_execution_residency`), which is configured
+    rather than discovered, so the fused input is built in the right memory from
+    the first step. `invoke_component_values` takes the symbols a proposer's
+    outputs declare and its inputs do not — a vocabulary, above all — proven
+    from the workflow's own bound values, because an output whose shape cannot
+    be resolved has no device buffer sized for it and comes back through host
+    memory. A hint contradicting an input's actual extent is a validation
+    error, not an override.
 
   Deleted with it (Rule 3, no facade): `SpeculativeMode::SharedKv`,
   `SharedKvProposerConfig`, `SharedKvBinding`,
@@ -289,7 +318,18 @@ that constructs and runs a canonical workflow.
   Proven by `gemma4_chained_workflow` (8 cases) and
   `native_workflow_parity::chained_speculative_proposal_parity{,_native_cuda}` —
   identical proposals, identical accept/reject/rollback paths, and identical
-  tokens on ORT, native-CPU, and device-resident native-CUDA (H200).
+  tokens on ORT, native-CPU, and device-resident native-CUDA (H200) — and, for
+  *where* the work happened,
+  `native_workflow_parity::chained_proposal_stays_device_resident_native_cuda`:
+  zero device→host materializations across a full speculative decode, exactly
+  four bytes read back per proposer invocation, and every rolled-back state cell
+  still resident on its own device at the truncated length.
+  `repeated_proposals_do_not_retain_device_memory_native_cuda` holds free device
+  memory flat across a hundred proposals, which is what proves the aliases a
+  step holds release the buffers they borrow.
+  `device_ops::cuda_tests` is the differential layer beneath both: every device
+  slice, gather, scatter, argmax (ties and NaN included) and adoption must equal
+  what the host implementation produces, element for element.
 
 - **Phase 1b — autoregressive decode beneath the interpreter — LANDED.**
   The decode loop no longer hard-codes its own iteration: `pipeline/generation.rs`
@@ -442,13 +482,27 @@ what lets a single decoder keep the rich Rust sampler, paged KV, sessions and
 speculative decode, none of which has an in-graph representation, without
 needing a second package shape to hold them.
 
-**Recognition is structural.** `sole_decoder_component` finds the one component
-that consumes the autoregressive sequence and produces logits. No component
-name, model name, or architecture string decides anything — a package may name
-its component whatever it likes. `is_single_decoder_workflow` is the single
-recognizer every caller asks (engine loader, server state, server/CLI
-multimodal, CLI inspection), so no two of them can classify the same package
-differently.
+**Recognition is structural, and there is one of it.**
+`onnx_genai_metadata::classify_workflow` reads a workflow once and reports two
+nested layers: layer 1 (`is_single_decoder`) asks whether the workflow executes
+exactly one ONNX graph whose declared port `roles` make it a decoder — it
+consumes the autoregressive sequence and either produces logits or owns
+attention state — and layer 2 (`contracted_single_decoder`) asks layer 1 *plus*
+whether that graph declares `onnx-genai.autoregressive-decode`. No component
+name, model name, or architecture string decides anything; a package may name
+its components whatever it likes.
+
+Every caller reads that classification rather than scanning the components
+itself: the engine loader routes on layer 2, and server state, server/CLI
+multimodal and CLI inspection read layer 1 through the named views
+`is_single_decoder_workflow` and `sole_decoder_component`. Because layer 2 is
+*defined* as layer 1 plus the contract, the loader cannot route a package the
+other callers classify differently — the containment holds by construction, not
+by two scans happening to agree. `decoder_recognizer_agreement.rs` pins the
+whole matrix — every workflow-declaring document in the repository, with a
+coverage guard that walks the tree — plus the adversarial shapes no fixture has,
+and `engine/load.rs` asserts the containment again from the loader's own
+predicate.
 
 **KV stays with its executor.** State cells owned by a group are
 `management: runtime` with a `release_boundary`, which is the schema's existing
@@ -456,12 +510,13 @@ word for buffers the runtime owns. Paged, shared-buffer and CUDA-graph KV stay
 device-resident; nothing round-trips through the interpreter as an SSA value.
 
 **One representation, executors chosen by contract.** A component declaring
-`onnx-genai.autoregressive-decode` is run by the fused decode session when this
-runtime holds one and invoked from its own artifact when it does not. That is a
-backend choice *beneath* the declared workflow — the same kind of choice as ORT
-versus native — not a second runtime beside it, and not a mode a caller can
-select. `Engine::holds_decode_core()` asks whether the session exists, never
-what kind of package was loaded.
+`onnx-genai.autoregressive-decode` is run by the fused decode session when that
+component is the package's whole graph and this runtime holds one, and invoked
+from its own artifact when it is not. That is a backend choice *beneath* the
+declared workflow — the same kind of choice as ORT versus native — not a second
+runtime beside it, and not a mode a caller can select.
+`Engine::holds_decode_core()` asks whether the session exists, never what kind
+of package was loaded.
 
 **Fail-closed by construction, not by guard.** `Engine` holds one non-optional
 interpreter and the loader refuses a package that declares no workflow, so the

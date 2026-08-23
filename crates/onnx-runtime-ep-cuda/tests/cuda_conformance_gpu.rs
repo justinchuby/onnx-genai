@@ -2493,6 +2493,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "rope_capture_gpu.rs",
         "RoPE, graph-capture safe",
     ));
+    p.push(dedicated(
+        "KvCacheCapacityAppend",
+        "kv_cache_capacity_append_gpu.rs",
+        "S3 capacity-emission KV append, graph-capture safe",
+    ));
 
     // Normalization / softmax.
     p.push(dedicated(

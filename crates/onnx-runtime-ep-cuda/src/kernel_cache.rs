@@ -139,6 +139,14 @@ impl Fnv128 {
 fn nvrtc_version_tag() -> &'static str {
     static TAG: OnceLock<String> = OnceLock::new();
     TAG.get_or_init(|| {
+        // Load NVRTC through our own resolver first. cudarc dlopens it lazily by
+        // base name through the system search order, which does not include a
+        // wheel directory; ours builds full paths into the wheel layout. Without
+        // this the tag depends on some *other* code path having called `require`
+        // earlier — true on the decode path by luck of ordering, false for any
+        // caller that reaches the cache first, which then panics inside cudarc.
+        // Loading it here makes the cache key path self-sufficient.
+        let _ = crate::dynamic_library::require(crate::dynamic_library::CudaLibrary::Nvrtc);
         let mut major = 0i32;
         let mut minor = 0i32;
         // SAFETY: both out-params are live for the duration of the call. A

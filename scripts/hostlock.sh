@@ -86,6 +86,17 @@
 #                     the runaway kept burning cores.
 #   --pid N           liveness anchor; defaults to the invoking shell ($PPID)
 #
+# Options for run:
+#   --expect-cores N      how many cores the wrapped command should be able to
+#                         keep busy. Required by --min-efficiency, and
+#                         deliberately not defaulted: defaulting it to 1 would
+#                         report a 16-thread benchmark at efficiency 16.0 and
+#                         pass every threshold, which is the reassuring
+#                         direction and the wrong one.
+#   --min-efficiency F    after the command finishes, compare its measured CPU
+#                         time against N cores x wall time, and FAIL if the
+#                         ratio is below F (see "Believing a run" below).
+#
 # Options for provenance:
 #   --expect-runnable N   judge `contended=yes/no` against N; omitted means
 #                         `contended=unknown`, which is honest rather than a
@@ -95,12 +106,54 @@
 # Exit codes (acquire/release/wait):
 #   0 ok            1 usage/error       2 busy (acquire without --wait)
 #   3 timed out     4 reap refused      5 gate not satisfied
+#   6 CPU efficiency below --min-efficiency (`run` only, and only when the
+#     wrapped command itself succeeded -- a failing command's status wins,
+#     because it is the more important signal). Note this collides with a
+#     wrapped command that exits 6 by itself, exactly as 5 collides with the
+#     gate: `run` multiplexes two status spaces onto one, and the `cpu ...
+#     verdict=` line, not the exit code, is what tells them apart.
 #
-# `run` does NOT use this table: it returns the wrapped command's own status,
-# so a command exiting 5 is indistinguishable from a gate failure. When you
-# need to tell hostlock's failures apart from the command's, use `acquire` and
-# `release` around the command rather than `run`. Interrupted `run` returns
-# 128+signal (130 SIGINT, 143 SIGTERM) like any shell.
+# `run` otherwise does NOT use this table: it returns the wrapped command's
+# own status, so a command exiting 5 is indistinguishable from a gate failure.
+# When you need to tell hostlock's failures apart from the command's, use
+# `acquire` and `release` around the command rather than `run`. Interrupted
+# `run` returns 128+signal (130 SIGINT, 143 SIGTERM) like any shell. Passing
+# --min-efficiency is an explicit request to override that contract for one
+# case; without it, `run`'s status is unchanged.
+#
+# Believing a run, as opposed to starting one. The lock decides whether to
+# START and --gate decides whether the host looks quiet enough; neither can
+# tell you afterwards whether the numbers are any good. They are admission
+# controls, and admission controls sample instants:
+#
+#   Roy gated on the instantaneous runnable count, sampled before and after
+#   each arm, and it reported "peak 2-4, clean" for runs that were in fact
+#   getting 50-70% of a core. A 2-second arm has ample room for a burst that
+#   begins after the opening sample and ends before the closing one. His A/A
+#   null was 52% -- the same binary against itself, disagreeing by half.
+#
+# --min-efficiency measures the thing itself rather than a proxy for it: a
+# process that owns its cores spends ~1.00 CPU-seconds per core per wall
+# second, and anything less means it did not have them, whatever the runnable
+# count said at either end. It needs no quiet host; it tells you which reps to
+# throw away.
+#
+# It measures "did not have the cores", which is NOT the same claim as
+# "somebody stole them": a benchmark that sleeps, blocks on I/O, or leaves a
+# deliberate inter-token gap is legitimately below 1.0 and is not contended.
+# Only you know which your workload is, which is why the threshold is yours to
+# set and why there is no default. Set it from a measured quiet-host run, not
+# from an ideal. With it, that same collection went from a 52%
+# null to 0.04-0.56%. The two compose -- the gate decides whether to start,
+# this decides whether to believe -- and the credit for the technique is
+# Roy's.
+#
+#   hostlock.sh run --owner leon --reason "moe 6-width matrix" \
+#       --expect-cores 16 --min-efficiency 0.90 -- ./bench.sh
+#
+# CPU time comes from this shell's own reaped-children accounting
+# (/proc/self/stat cutime+cstime), so it covers the wrapped command and every
+# descendant it waited for, and costs nothing: no sampling, no extra process.
 #
 # Recording provenance. Emitting the lock state to a terminal helps whoever is
 # watching; embedding it in the rows is what helps six weeks later. Every
@@ -199,6 +252,88 @@ proc_state_and_start() {
 
 runnable_now() {
     cut -d' ' -f4 /proc/loadavg | cut -d/ -f1
+}
+
+# CPU time consumed by every child this shell has REAPED, in clock ticks.
+# Sets the global CPU_TICKS; deliberately not an echo, because the value must
+# be read in THIS process. fork() zeroes a child's RUSAGE_CHILDREN, so
+# `t=$(children_cpu_ticks)` -- and equally `times | awk` -- reads a freshly
+# zeroed counter in the subshell and always answers 0. `read < file` is a
+# builtin with a redirection and does not fork, so this is exact and free.
+read_children_cpu_ticks() {
+    local line rest fields cu cs
+    CPU_TICKS=""
+    read -r line < /proc/self/stat 2>/dev/null || return 1
+    # comm (field 2) is parenthesised and may contain spaces; everything from
+    # the last ") " is positional. First token after it is field 3 (state),
+    # so cutime (16) and cstime (17) are tokens 14 and 15.
+    rest=${line##*") "}
+    # shellcheck disable=SC2206  # deliberate word splitting: this is a field list
+    fields=($rest)
+    cu=${fields[13]:-}
+    cs=${fields[14]:-}
+    # Both must be present and numeric. The ':' separator means an empty
+    # field shows up as a leading or trailing colon, so those are the empty
+    # cases; an empty pattern could never match this word.
+    case "${cu}:${cs}" in
+        *[!0-9:]* | :* | *:) return 1 ;;
+    esac
+    CPU_TICKS=$((cu + cs))
+}
+
+wall_now() {
+    date +%s.%N
+}
+
+# Report, and optionally judge, how much CPU the wrapped command actually got.
+#
+# Prints one line whatever happens, because the number is worth recording even
+# when nothing is being enforced -- an unjudged measurement in the log is what
+# lets somebody re-examine a suspicious row later. Returns non-zero only when
+# a --min-efficiency was asked for and is not met, or cannot be evaluated.
+check_cpu_efficiency() {
+    local t0=$1 t1=$2 w0=$3 w1=$4 hz cpu wall verdict eff
+    hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    if [ -z "$t0" ] || [ -z "$t1" ]; then
+        # Unreadable /proc accounting. Say so; do not print a number.
+        echo "hostlock: cpu unmeasurable (could not read this shell's child CPU accounting)" >&2
+        [ -n "$MIN_EFFICIENCY" ] || return 0
+        echo "hostlock: WARNING --min-efficiency ${MIN_EFFICIENCY} cannot be evaluated, so this run is NOT verified" >&2
+        return 1
+    fi
+    cpu=$(awk -v a="$t0" -v b="$t1" -v hz="$hz" 'BEGIN { printf "%.3f", (b - a) / hz }')
+    wall=$(awk -v a="$w0" -v b="$w1" 'BEGIN { printf "%.3f", b - a }')
+    # Below ~50ms the clock-tick quantum (usually 10ms) is a large fraction of
+    # the measurement, so a ratio computed from it is noise wearing a decimal
+    # point. Refuse to publish one rather than publish a bad one.
+    if awk -v w="$wall" 'BEGIN { exit !(w < 0.05) }'; then
+        echo "hostlock: cpu wall=${wall}s cpu=${cpu}s efficiency=unmeasurable (run too short to judge)" >&2
+        [ -n "$MIN_EFFICIENCY" ] || return 0
+        echo "hostlock: WARNING --min-efficiency ${MIN_EFFICIENCY} cannot be evaluated on a ${wall}s run, so this run is NOT verified" >&2
+        return 1
+    fi
+    if [ -n "$EXPECT_CORES" ]; then
+        eff=$(awk -v c="$cpu" -v w="$wall" -v n="$EXPECT_CORES" 'BEGIN { printf "%.3f", c / (w * n) }')
+    else
+        eff=$(awk -v c="$cpu" -v w="$wall" 'BEGIN { printf "%.3f", c / w }')
+    fi
+    verdict=unjudged
+    local rc=0
+    if [ -n "$MIN_EFFICIENCY" ]; then
+        if awk -v e="$eff" -v m="$MIN_EFFICIENCY" 'BEGIN { exit !(e < m) }'; then
+            verdict=contended
+            rc=1
+        else
+            verdict=ok
+        fi
+    fi
+    echo "hostlock: cpu wall=${wall}s cpu=${cpu}s cores_expected=${EXPECT_CORES:-unspecified} efficiency=${eff} verdict=${verdict}" >&2
+    if [ "$rc" -ne 0 ]; then
+        echo "hostlock: WARNING measured CPU efficiency ${eff} is below --min-efficiency ${MIN_EFFICIENCY}" >&2
+        echo "hostlock: WARNING the command did not have ${EXPECT_CORES} core(s) to itself for the whole run; treat its numbers as untrusted" >&2
+        echo "hostlock: WARNING the runnable gate cannot see this -- it samples instants, this measures the whole window" >&2
+    fi
+    return "$rc"
 }
 
 # Metadata is a file on a shared filesystem, so treat it as untrusted: a
@@ -885,7 +1020,8 @@ cmd_run() {
     # failing in precisely the case it exists for. `wait` is interruptible,
     # so this makes the signal handlers actually prompt. It also lets us stop
     # the wrapped command, which the inline form left running.
-    local child rc
+    local child rc wall0 wall1 cpu0 cpu1
+    wall0=$(wall_now)
     "$@" &
     child=$!
 
@@ -899,11 +1035,27 @@ cmd_run() {
     trap 'run_teardown "$child" SIGHUP 129' HUP
     RUN_CHILD_START=$(proc_start_time "$child" 2>/dev/null || echo "")
 
+    # Baseline the child-CPU counter as late as possible: it accumulates only
+    # when a child is REAPED, so every fork above (the start-time read, the
+    # acquire's own helpers) is already folded into this reading and cancels
+    # out of the difference.
+    read_children_cpu_ticks || CPU_TICKS=""
+    cpu0=$CPU_TICKS
     wait "$child"
     rc=$?
+    read_children_cpu_ticks || CPU_TICKS=""
+    cpu1=$CPU_TICKS
+    wall1=$(wall_now)
     trap - INT TERM HUP
     remove_lock_if_mine
     echo "hostlock: released (command exit ${rc})"
+    # A failing command's own status always wins: it is the more important
+    # signal, and reporting "the cores were busy" for a run that crashed would
+    # bury the crash. Only a command that SUCCEEDED can be overridden, and
+    # only when --min-efficiency was explicitly asked for.
+    if ! check_cpu_efficiency "$cpu0" "$cpu1" "$wall0" "$wall1" && [ "$rc" -eq 0 ]; then
+        rc=6
+    fi
     return $rc
 }
 
@@ -922,6 +1074,9 @@ TAKEOVER=none
 EXPECT_RUNNABLE=""
 ONELINE=0
 RUN_CHILD_START=""
+EXPECT_CORES=""
+MIN_EFFICIENCY=""
+CPU_TICKS=""
 
 [ "$#" -ge 1 ] || {
     awk '/^# \(end of usage summary\)/ { exit } NR >= 3' "$0" >&2
@@ -949,9 +1104,15 @@ require_uint() {
     esac
 }
 
+require_ufloat() {
+    case "$2" in
+        '' | *[!0-9.]* | *.*.* | .) die "$1 takes a non-negative number, got: '$2'" ;;
+    esac
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --reason | --owner | --timeout | --gate | --gate-timeout | --ttl | --pid | --on-gate-timeout | --expect-runnable)
+        --reason | --owner | --timeout | --gate | --gate-timeout | --ttl | --pid | --on-gate-timeout | --expect-runnable | --expect-cores | --min-efficiency)
             [ "$#" -ge 2 ] || die "$1 requires a value"
             ;;
     esac
@@ -1014,6 +1175,17 @@ while [ "$#" -gt 0 ]; do
             require_uint "$1" "$EXPECT_RUNNABLE"
             shift 2
             ;;
+        --expect-cores)
+            EXPECT_CORES=$2
+            require_uint "$1" "$EXPECT_CORES"
+            [ "$EXPECT_CORES" -ge 1 ] || die "--expect-cores takes a positive integer, got: '$EXPECT_CORES'"
+            shift 2
+            ;;
+        --min-efficiency)
+            MIN_EFFICIENCY=$2
+            require_ufloat "$1" "$MIN_EFFICIENCY"
+            shift 2
+            ;;
         --oneline)
             ONELINE=1
             shift
@@ -1047,7 +1219,20 @@ if [ "$SUB" = run ]; then
        \`--ttl\` is for \`acquire\`, whose anchor is a shell that can outlive the benchmark by days."
     fi
     : "${TTL:=0}"
+    # A threshold with no denominator cannot be evaluated, and defaulting the
+    # denominator to 1 would pass every multi-threaded run. Fail at parse time
+    # rather than at the end of a forty-minute benchmark.
+    if [ -n "$MIN_EFFICIENCY" ] && [ -z "$EXPECT_CORES" ]; then
+        die "--min-efficiency requires --expect-cores N (how many cores the command should keep busy)"
+    fi
 else
+    # These two do nothing outside `run`, which has no wrapped command to
+    # measure. Accepting them silently is how a knob comes to be believed in
+    # while being inert -- the exact defect filed against the EP's affinity
+    # environment variable, where every setting produced identical placement.
+    if [ -n "$EXPECT_CORES" ] || [ -n "$MIN_EFFICIENCY" ]; then
+        die "--expect-cores/--min-efficiency apply to \`run\` only; ${SUB} has no command to measure"
+    fi
     : "${ANCHOR_PID:=$PPID}"
     : "${TTL:=3600}"
 fi

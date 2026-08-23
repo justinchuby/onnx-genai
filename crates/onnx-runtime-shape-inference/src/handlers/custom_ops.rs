@@ -41,6 +41,20 @@ pub fn sparse_kv_gather(ctx: &mut InferenceContext) -> Result<(), ShapeInferErro
     Ok(())
 }
 
+/// `pkg.nxrt::KvCacheCapacityAppend`: the CUDA-only in-place capacity-write
+/// replacement for a KV-cache-growth `Concat` (inputs `[past, current,
+/// position_ids]`, aliasing `present == past`). Its output shape is always
+/// exactly `past`'s shape -- the whole point of the physical-capacity write is
+/// that it never grows the tensor -- unlike the `Concat` it replaces, whose
+/// shape genuinely widens every step.
+pub fn kv_cache_capacity_append(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
+    require_outputs(ctx, 1)?;
+    if let Some(past) = ctx.input_type(0).cloned() {
+        ctx.set_output_type(0, past);
+    }
+    Ok(())
+}
+
 /// `pkg.nxrt::IndexShare`: selected-token attention. Output 0 mirrors the query
 /// `[B, num_heads, S_q, H]`. When the present KV cache is also returned (3
 /// outputs), outputs 1/2 are `[B, kv_num_heads, S_past + S_cur, H]`.
@@ -466,6 +480,12 @@ pub fn register(reg: &mut InferenceRegistry) {
     reg.register("pkg.nxrt", "BlockQuantizedMoE", 1, moe);
     reg.register("pkg.nxrt", "SparseKvGather", 1, sparse_kv_gather);
     reg.register("pkg.nxrt", "IndexShare", 1, index_share);
+    reg.register(
+        "pkg.nxrt",
+        "KvCacheCapacityAppend",
+        1,
+        kv_cache_capacity_append,
+    );
     reg.register("pkg.nxrt", "VarlenAttention", 1, varlen_attention);
     reg.register(
         "pkg.nxrt",

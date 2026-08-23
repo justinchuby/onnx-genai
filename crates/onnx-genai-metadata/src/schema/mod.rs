@@ -142,7 +142,7 @@ impl InferenceMetadata {
         self.decoder_io
             .get_or_init(|| {
                 let workflow = &self.pipeline.as_ref()?.workflow;
-                let component = crate::decoder_abi::sole_decoder_component(workflow)?;
+                let component = crate::graph_cardinality::sole_decoder_component(workflow)?;
                 crate::decoder_abi::decoder_abi(workflow, component)
             })
             .as_ref()
