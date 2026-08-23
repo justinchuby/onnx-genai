@@ -8,3 +8,6 @@ repository = "https://github.com/justinchuby/onnx-genai"
 
 [dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"

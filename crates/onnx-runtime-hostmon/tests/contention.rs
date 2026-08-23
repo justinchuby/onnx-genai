@@ -555,3 +555,28 @@ fn only_a_vanished_thread_may_be_skipped() {
         None
     );
 }
+
+/// `MAX_CPU` is a portable constant, but the thing it stands for -- the width of
+/// the platform's affinity mask -- is not. On Linux the two must agree, or the
+/// parser would reject a CPU that `AllowedCpus::current` can legitimately
+/// return, and every thread on a high-numbered core would read as off-mask --
+/// reporting the own-time subtraction incomplete on a correctly confined
+/// process.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_cpu_list_cap_covers_the_real_affinity_mask() {
+    let mask_width = 8 * std::mem::size_of::<libc::cpu_set_t>();
+    assert!(
+        onnx_runtime_hostmon::MAX_CPU >= mask_width,
+        "the parser cap ({}) must cover the affinity mask width ({mask_width})",
+        onnx_runtime_hostmon::MAX_CPU
+    );
+    if let Some(allowed) = host_contention::AllowedCpus::current() {
+        let highest = allowed.cpus.iter().copied().max().expect("non-empty");
+        assert_eq!(
+            parse_cpu_list(&highest.to_string()),
+            Some(vec![highest]),
+            "the parser must accept the highest CPU this host actually has"
+        );
+    }
+}
