@@ -246,7 +246,20 @@ holder_alive() {
     # its own pid is exact -- exact, and still resolving, to a dead process.
     # Every agent harness here launches long commands without an immediate
     # wait(), so this is the common shape, not the exotic one.
-    [ "$state" != Z ] || return 1
+    #
+    # But state Z is NOT proof of death. When a thread-group leader exits via
+    # pthread_exit() while other threads keep running, /proc/<tgid>/stat
+    # reports Z for a fully live process (`ps` shows `Zl ... <defunct>`).
+    # Treating that as dead reaps a LIVE holder mid-benchmark, which is the
+    # worse of the two errors by a wide margin. Threads: separates them
+    # exactly: a true zombie has one, a live leader has more. Fail toward
+    # "alive" if /proc/<pid>/status cannot be read at all.
+    if [ "$state" = Z ]; then
+        local threads
+        threads=$(awk '/^Threads:/ { print $2; exit }' "/proc/${pid}/status" 2>/dev/null)
+        [ -n "$threads" ] || threads=2
+        [ "$threads" -le 1 ] && return 1
+    fi
     # A recycled pid has a different start time, so this is not just "does
     # some process with this number exist".
     [ "$now" = "$start" ]
@@ -284,6 +297,15 @@ reapable() {
     local a s
     a=$(meta_get anchor_pid) || a=""
     s=$(meta_get start_time) || s=""
+    # Use the evidence we actually have before falling back to a clock. If
+    # the anchor pid is readable and that pid is running, the holder is not
+    # demonstrably dead -- unverifiable, but not dead -- and the age grace
+    # must not apply. The grace is 300s and the runs it protects are 40
+    # minutes, so routing a live-but-unverifiable holder through it does not
+    # prevent the theft, it schedules it.
+    if [ -n "$a" ] && [ -z "$s" ] && [ -d "/proc/${a}" ]; then
+        return 1
+    fi
     if [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]; then
         local mtime now
         mtime=$(stat -c %Y "$LOCK_DIR" 2>/dev/null || echo 0)
@@ -293,6 +315,16 @@ reapable() {
     fi
     ! holder_alive && return 0
     holder_expired
+}
+
+# True when a lock is reapable only because it aged out of the grace, i.e.
+# the script never established that the holder was dead. `stale_pid` is a
+# positive claim and must not be made on this evidence.
+reap_was_unverifiable() {
+    local a s
+    a=$(meta_get anchor_pid) || a=""
+    s=$(meta_get start_time) || s=""
+    [ ! -s "$META" ] || [ -z "$a" ] || [ -z "$s" ]
 }
 
 # Remove a reapable lock. Guarded so that two acquirers racing on the same
@@ -554,17 +586,27 @@ cmd_status() {
     pid=$(meta_get anchor_pid || echo '?')
     ttl=$(meta_get ttl || echo 0)
     age=$(lock_age)
-    if holder_alive; then
-        local state="HELD"
-        if holder_expired; then
-            state="EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over)"
-        fi
-        echo "${state} by ${owner} pid=${pid} for ${age}s since ${at}"
-        echo "  reason: ${reason}"
-        echo "  runnable=$(runnable_now)"
-        return 0
-    fi
-    echo "STALE  holder ${owner} pid=${pid} is gone; next acquire will reap it"
+    # Drive the human branch from lock_state, not from holder_alive directly.
+    # Keying off holder_alive made this print "STALE ... is gone; next acquire
+    # will reap it" for a lock that lock_state calls HELD and that acquire
+    # refuses to take -- and cmd_acquire dumps this text on the BUSY path, so
+    # the contradiction is exactly what a blocked agent reads. Telling a human
+    # the box is abandoned is how the box gets taken.
+    case "$(lock_state)" in
+        HELD)
+            echo "HELD by ${owner} pid=${pid} for ${age}s since ${at}"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        EXPIRED)
+            echo "EXPIRED (held ${age}s > ttl ${ttl}s; next acquire will take it over) by ${owner} pid=${pid} for ${age}s since ${at}"
+            echo "  reason: ${reason}"
+            echo "  runnable=$(runnable_now)"
+            ;;
+        *)
+            echo "STALE  holder ${owner} pid=${pid} is gone; next acquire will reap it"
+            ;;
+    esac
     return 0
 }
 
@@ -630,7 +672,18 @@ cmd_acquire() {
         # label it acquired_after_reap and, under --strict-reap, abort an
         # unattended harness over a takeover that did not happen.
         if reapable; then
-            if holder_alive; then TAKEOVER=ttl_expired; else TAKEOVER=stale_pid; fi
+            if holder_alive; then
+                TAKEOVER=ttl_expired
+            elif reap_was_unverifiable; then
+                # The lock aged out of the grace with unreadable metadata. We
+                # never established the holder was dead, so `stale_pid` would
+                # be a claim the script has no evidence for -- the same
+                # mislabelling `takeover=unknown` exists to prevent, one level
+                # down.
+                TAKEOVER=unverifiable
+            else
+                TAKEOVER=stale_pid
+            fi
             if reap_if_dead; then continue; fi
             TAKEOVER=none
         else
@@ -768,11 +821,16 @@ cmd_run() {
     local child rc
     "$@" &
     child=$!
-    RUN_CHILD_START=$(proc_start_time "$child" 2>/dev/null || echo "")
 
+    # Traps first. Reading the child's start time forks, and a signal arriving
+    # in that window would take the script's default action -- leaking the
+    # lock and orphaning the benchmark, the two failures this block exists to
+    # prevent. run_teardown tolerates an empty RUN_CHILD_START by declining to
+    # signal, which is the safe direction for a window this narrow.
     trap 'run_teardown "$child" SIGINT 130' INT
     trap 'run_teardown "$child" SIGTERM 143' TERM
     trap 'run_teardown "$child" SIGHUP 129' HUP
+    RUN_CHILD_START=$(proc_start_time "$child" 2>/dev/null || echo "")
 
     wait "$child"
     rc=$?
