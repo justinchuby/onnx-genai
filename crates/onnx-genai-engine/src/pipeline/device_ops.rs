@@ -48,6 +48,34 @@
 use anyhow::Context as _;
 use onnx_genai_ort::{DataType, Value};
 
+/// The workflow value currency's element type for a graph element type.
+///
+/// Partial on purpose: a graph may declare element types the interpreter's
+/// value pool does not carry (`Float64`, `String`, sub-byte ints). `None` says
+/// so, and lets each caller name the artifact, initializer or port it was
+/// reading rather than emitting one context-free diagnostic for all of them.
+pub(crate) fn value_dtype_from_ir(dtype: onnx_runtime_ir::DataType) -> Option<DataType> {
+    use onnx_runtime_ir::DataType as Ir;
+    Some(match dtype {
+        Ir::Float32 => DataType::Float32,
+        Ir::Float16 => DataType::Float16,
+        Ir::BFloat16 => DataType::BFloat16,
+        // ORT's single-precision f8 spellings are the ONNX FN/(non-UZ) variants.
+        Ir::Float8E4M3FN => DataType::Float8E4M3,
+        Ir::Float8E5M2 => DataType::Float8E5M2,
+        Ir::Int8 => DataType::Int8,
+        Ir::Int16 => DataType::Int16,
+        Ir::Int32 => DataType::Int32,
+        Ir::Int64 => DataType::Int64,
+        Ir::Uint8 => DataType::Uint8,
+        Ir::Uint16 => DataType::Uint16,
+        Ir::Uint32 => DataType::Uint32,
+        Ir::Uint64 => DataType::Uint64,
+        Ir::Bool => DataType::Bool,
+        _ => return None,
+    })
+}
+
 /// Where a value lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Residency {

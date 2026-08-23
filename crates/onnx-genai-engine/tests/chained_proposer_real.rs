@@ -155,7 +155,7 @@ fn real_chained_workflow_package_drives_through_the_interpreter() -> anyhow::Res
     // real target artifact — the check that a per-model heuristic would pass
     // vacuously and a contract read cannot.
     if let Some(source) = token_embedding {
-        let table = engine.embedding_table(&source.component, &source.table)?;
+        let table = engine.embedding_table(source)?;
         assert!(
             table.vocab_size() > 0 && table.hidden_size() > 0,
             "declared token_embedding table {}::{} resolved empty",

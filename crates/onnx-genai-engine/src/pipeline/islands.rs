@@ -1320,11 +1320,11 @@ fn island_invocation(node: &WorkflowNode) -> anyhow::Result<IslandInvocation> {
 ///
 /// Island fusion elides a value no later node reads. That is correct for the
 /// step list alone, but an interpreter construct driven from a completed pass —
-/// the chained speculative proposal reading its `folded_carry_seed` and the
-/// proposer's borrowed shared-KV bindings — is a real consumer the graph does
-/// not spell. Counting those uses here is what keeps a fused island from
-/// swallowing the tensors a proposal needs, instead of the driver having to
-/// reconstruct them.
+/// the chained speculative proposal reading its `folded_carry_seed`, the
+/// proposer's own bindings, and the value the owner of each read-only borrowed
+/// state cell published — is a real consumer the graph does not spell. Counting
+/// those uses here is what keeps a fused island from swallowing the tensors a
+/// proposal needs, instead of the driver having to reconstruct them.
 fn external_uses(values: &HashSet<String>, uses: &mut HashMap<String, usize>) {
     for value in values {
         *uses.entry(value.clone()).or_default() += 1;

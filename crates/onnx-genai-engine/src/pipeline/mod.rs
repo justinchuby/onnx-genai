@@ -57,6 +57,12 @@ pub use audio::buffered_pcm16_wav_output_names;
 
 pub type PipelineTensors = HashMap<String, Value>;
 
+/// What identifies one cached embedding table: the component and initializer it
+/// was read from, the residency it was made resident in, and the bit pattern of
+/// the declared normalizer applied to its rows. Bits rather than the float
+/// itself because a key has to be hashable and total.
+type EmbeddingTableKey = (String, String, i32, Option<u32>);
+
 /// Structured workflow outputs with request-aligned rows.
 ///
 /// Rows are positional: row `i` of a request-aligned output belongs to batch
@@ -193,16 +199,17 @@ pub(crate) struct WorkflowRuntime {
     /// tensor".
     device_readback_bytes: std::cell::Cell<u64>,
     /// Embedding tables read out of a component's artifact, cached for the
-    /// runtime's life, keyed by `(component, table, residency)`.
+    /// runtime's life.
     ///
     /// Re-reading a `[vocab, hidden]` initializer off disk once per proposal is
     /// pure waste — the file cannot change under a loaded package — and at real
     /// vocabularies it is the dominant cost of starting a proposal. The
     /// residency is part of the key because a device mirror and the host copy
     /// it was uploaded from are different tensors answering the same question,
-    /// and the mirror must be uploaded once, not once per draft token.
-    embedding_tables:
-        RefCell<HashMap<(String, String, i32), std::rc::Rc<speculative::EmbeddingTable>>>,
+    /// and the mirror must be uploaded once, not once per draft token. The
+    /// declared normalizer joins them for the same reason: it changes what the
+    /// cached rows are, not merely where they live.
+    embedding_tables: RefCell<HashMap<EmbeddingTableKey, std::rc::Rc<speculative::EmbeddingTable>>>,
     /// How many times an embedding table was read out of an artifact.
     embedding_table_loads: std::cell::Cell<u64>,
     /// Nodes this runtime executed through a declared contract, by contract id.
