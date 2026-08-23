@@ -100,3 +100,7 @@ roy_validate.log
 # Deckard local bench env + scratch (not for PR)
 .deckard_env.sh
 .scratch/
+
+# hostlock self-test scratch (scripts/hostlock_test.sh writes these into the repo
+# root deliberately -- /tmp is off-limits here -- and an aborted run leaves them)
+.hostlock-selftest*
