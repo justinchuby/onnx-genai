@@ -475,31 +475,62 @@ than the 1.79x row.** I am not claiming parity at t=16 on this evidence.
 ### The default path is untouched and is now the worse gap
 
 This kernel is gated to `accuracy_level = 4`. Production default is
-`accuracy_level = 0`, and measuring both sides there on the same host:
+`accuracy_level = 0`, and measuring both sides there on the same host
+(**this table is superseded — see the note directly below it**):
 
 | threads | ORT acc0 | native acc0 | gap |
 |---|---|---|---|
 | 1 | 30.632 ms/tok | 56.307 | **1.84x** |
 | 8 | — | 14.091 | — |
 
-> **Scope note (2026-08-23).** The `1.84x` is a **`threads = 1`** figure and is
-> the only acc0 cell with an ORT baseline — the t=8 row has no ORT number, so
-> **the acc0 gap at production width is unmeasured**. This is not a pedantic
-> label: on the acc4 table in this same document the gap moves from 3.01x at
-> t=1 to 1.47x at t=16, so width is among the largest effects here and 1.84x
-> should not be assumed to survive to t=8/16. At t=1 the native side also runs
-> `path=flat`, confined by the decode budget to one CPU with no pool built
-> (see
-> [2026-08-23-acc4-decode-width-remeasurement.md](2026-08-23-acc4-decode-width-remeasurement.md)),
-> so this row compares native-serial against ORT-single-thread specifically.
-> Measuring ORT acc0 at t=4/8 is the prerequisite for sizing acc0 work.
+> **Superseded 2026-08-23 — the table above is stale, not merely unlabelled.**
+> Re-measured on `e189244ba` with a matched core budget, arms interleaved and
+> the gap medianed over paired cells, the acc0 gap is **1.120x at t=1**
+> (range 1.112–1.128) and **1.120x at t=8** (1.089–1.145). The `t=4` cell reads
+> ~1.15x but does **not** resolve: its A/A null spans 0.868–1.150, so the gap
+> is inside its own noise floor there. The rows above were correct when taken;
+> they predate #1667 (broke the serial f32 reduction chain in the int4 decode
+> GEMV, 5.75x t=1), #1679 (enabled the register-blocked kernel *at
+> `accuracy_level = 0`*) and #1783 (folded the zero-point unpack), plus three
+> merges that change what a width means (#1728, #1794, #1746) and two that
+> changed the ruler (#1722, #1766).
+>
+> **The `t=1` and `t=8` rows are stale for different reasons, and only one of
+> them is the kernel.** An earlier version of this note argued from the ORT arm
+> reproducing (+4.4%, 30.632 → 31.99 ms) that "the whole movement is on our
+> side". That control is not sufficient — it shows the *ORT* ruler held still
+> and says nothing about the native one. Rebuilding `e9754e7ef`'s bench and
+> running it beside current main's, same host, `PROBE_REPS=1` on both, arms
+> interleaved: **t=1 is 1.64x kernel** [1.61–1.88, 12 paired cells], matching
+> the 1.59x the published pair implies. **t=8 is 1.82x kernel** [1.78–1.89,
+> 6 cells], *not* the 3.08x that pair implies.
+>
+> The missing 1.67x at t=8 is worker placement. `14.091` reproduces today to
+> 0.2% — but only **unpinned**. The old bench never called
+> `EpFactory::initialize`, so `bound_process_to_decode_budget()` never ran and
+> its eight workers scattered across 32 logical CPUs onto SMT siblings; that
+> function already existed at `e9754e7ef` and production always called it, so
+> the row measured a topology no served session used. #1766 added the call.
+> The same old binary pinned to eight physical cores gives 8.430 ms, and forced
+> onto `0-7` gives 16.121. This is the effect
+> [2026-08-21-decode-worker-cpu-placement.md](2026-08-21-decode-worker-cpu-placement.md)
+> already documented, landing on this table's own `t=8` row. Full record:
+> [2026-08-23-acc0-gap-vs-ort-by-width.md](2026-08-23-acc0-gap-vs-ort-by-width.md).
+>
+> **`t=16` is the open row.** Two guard-passing cells there read 1.831 and 1.456
+> (median **1.643x**), but that width's A/A null spans 0.969–1.295 and both arms
+> show 20–55% intra-run spread, so it does not resolve. It is the width closest
+> to an unconfined production process, and a confirmed ~1.64x there would
+> reverse the re-ranking below.
 
-So the honest summary is that we have moved the *opt-in* path from 3.01x to
-1.79x and left the *default* path at 1.84x, where it was. Those two numbers
-being nearly equal is a coincidence of this shape, not a shared cause: the acc4
-gap is now dominated by the t=8 scaling anomaly, while the acc0 gap is a
-different kernel entirely. **Closing acc0 is a separate, larger piece of work
-and nothing here should be read as progress on it.**
+So the honest summary *at the time of writing* was that we had moved the
+*opt-in* path from 3.01x to 1.79x and left the *default* path at 1.84x, where
+it was. Nothing in this document was progress on acc0, and that remains true of
+this document. What is no longer true is the conclusion drawn from it: acc0 is
+~1.12x on current main, and the figure here outlived the tree it measured.
+Roughly 1.6-1.8x of that closure is the three kernel merges listed in the note
+above; at `t=8` the rest is the worker placement the old bench never applied.
+**Do not rank work off this table.**
 
 Two implementation details cost more than they saved and are recorded so they
 are not re-tried:
