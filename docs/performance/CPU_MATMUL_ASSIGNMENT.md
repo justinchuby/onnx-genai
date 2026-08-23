@@ -1985,10 +1985,29 @@ time. That figure is now stale; the re-measurement replaces it.
 > a **zero-gap** decode loop, exactly where parking looks falsely free, so
 > nothing here licenses changing the shipped default; that needs #1395's
 > gap-aware harness. Next step is unchanged in target and sharper in aim:
-> localise the *idle* half with #1859's per-worker straggler attribution. Full
-> records:
+> localise the *idle* half with #1859's per-worker straggler attribution.
+> **That is now done** (`acc0_w16_worker_split.py`, 10/10 trusted): the idle is
+> **not** a wake problem -- `wake_frac` is only 0.051 at t=16 and the
+> pre-registered WAKE-BOUND condition did not fire -- it is a **barrier wait**.
+> The mean worker spends **22.2%** of the window waiting for a straggler doing
+> ~45% more work than the mean and holding **72%** of last-arrivals against a
+> 6.7% chance share, while an Amdahl calibration shows 20.4 of the remaining
+> points are constant-serial scaling and **not** a defect. So the recoverable
+> figure at t=16 is ~25 points, not the 46% residual. The straggler's identity
+> *moves between launches*, which excludes a static mis-partition, and
+> dispatcher/worker CPU collision was tested and excluded (one partial match in
+> four launches). Nothing can help it today: `DEFAULT_STEAL_TILES_PER_WORKER
+> = 1` makes `target == total_workers`, so `work_stealing_segments_aligned`
+> always falls back to static equal segments. Setting it to 2 measures
+> **+23% at t=16** with the predicted mechanism (`sys_frac` 0.280 -> 0.192) and
+> **no t=8 regression** -- but it is **REJECTED** by the pre-registered rule
+> and not proposed, because the t=16 A/A null in the same run is **+-21.5%**.
+> **The binding constraint at t=16 is now the measurement, not the kernel:**
+> until the A/A instability is understood no improvement of realistic size can
+> clear a pre-registered bar there. Full records:
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
-> [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md).
+> [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
+> [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone

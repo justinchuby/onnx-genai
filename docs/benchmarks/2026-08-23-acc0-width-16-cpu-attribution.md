@@ -250,12 +250,18 @@ width 16 and pays 11% more CPU per token. Both of our losses are addressable.
 
 Two follow-ups, in priority order:
 
-1. **Localise the idleness.** `ONNX_GENAI_CPU_DECODE_WORKER_PROFILE` and the
-   per-worker straggler attribution from #1859 exist for exactly this — decide
-   between load imbalance (one worker finishing late every op) and dispatch/
-   wake latency (all workers late off the line).
+1. **Localise the idleness.** ~~`ONNX_GENAI_CPU_DECODE_WORKER_PROFILE` and the
+   per-worker straggler attribution from #1859 exist for exactly this~~ —
+   **done**, in
+   [2026-08-23-acc0-width-16-worker-attribution.md](2026-08-23-acc0-width-16-worker-attribution.md).
+   The answer is neither of the two candidates named here: it is a **barrier
+   wait**. Wake latency is only 5.1 points and its pre-registered condition did
+   not fire; **22.2 points** are the mean worker waiting for a single straggler,
+   and a further 20.4 points are Amdahl-predicted serial time that is not a
+   defect at all. That document also finds that the width-16 A/A null (±21.5%)
+   is now the binding constraint on certifying *any* width-16 improvement.
 2. **Localise the burn.** Per-op attribution at width 8 versus width 16 on the
-   same shapes, against the 136.3 MB/token figure.
+   same shapes, against the 136.3 MB/token figure. Still open.
 
 ## Reproducing
 

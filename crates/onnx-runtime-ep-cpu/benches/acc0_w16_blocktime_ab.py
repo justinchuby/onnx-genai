@@ -75,6 +75,15 @@ import acc0_gap_matrix as H  # noqa: E402
 MODEL, BLOCK, ACC, SESSIONS = "llama", 32, 0, 1
 PRIMARY_WIDTH = 16
 CONTROL_WIDTH = 8
+
+# The knob under test. Defaults reproduce the blocktime A/B this harness was
+# written and validated for; `--env-name/--control/--test` point the SAME
+# pre-registered rule at a different single-variable intervention. The rule,
+# its thresholds, the A/A arm, the rotation and the width-8 regression guard
+# are untouched by that switch -- only which env var is varied changes. Reusing
+# a validated rule on a new intervention is legitimate; editing the rule to
+# suit a new result is not.
+DEFAULT_ENV = "ONNX_GENAI_CPU_DECODE_BLOCKTIME_US"
 CONTROL_BLOCKTIME = "500"
 TEST_BLOCKTIME = "0"
 
@@ -85,10 +94,19 @@ EFFECT_OVER_NULL = 3.0
 REGRESSION_RATIO = 0.95
 
 
-def arm(args, width, blocktime):
+def arm(args, width, value, extra=None):
+    env = {args.env_name: value}
+    # Held fixed across both arms rather than left at the shipped default: at
+    # the default blocktime the workers spin through idle, which masks exactly
+    # the barrier wait an imbalance intervention is meant to remove.
+    if args.hold:
+        for pair in args.hold:
+            k, _, v = pair.partition("=")
+            env[k] = v
+    if extra:
+        env.update(extra)
     return H.native(args.binary, MODEL, BLOCK, ACC, width, SESSIONS,
-                    args.tokens, args.reps,
-                    extra={"ONNX_GENAI_CPU_DECODE_BLOCKTIME_US": blocktime})
+                    args.tokens, args.reps, extra=env)
 
 
 def cpu_of(a):
@@ -129,15 +147,15 @@ def one_launch(args, launch):
     with H.LoadWatch() as watch:
         for width in (PRIMARY_WIDTH, CONTROL_WIDTH):
             if flip:
-                b = arm(args, width, TEST_BLOCKTIME)
-                a = arm(args, width, CONTROL_BLOCKTIME)
-                a2 = arm(args, width, TEST_BLOCKTIME)
-                aa_arm = TEST_BLOCKTIME
+                b = arm(args, width, args.test)
+                a = arm(args, width, args.control)
+                a2 = arm(args, width, args.test)
+                aa_arm = args.test
             else:
-                a = arm(args, width, CONTROL_BLOCKTIME)
-                b = arm(args, width, TEST_BLOCKTIME)
-                a2 = arm(args, width, CONTROL_BLOCKTIME)
-                aa_arm = CONTROL_BLOCKTIME
+                a = arm(args, width, args.control)
+                b = arm(args, width, args.test)
+                a2 = arm(args, width, args.control)
+                aa_arm = args.control
             ca, cb, ca2 = cpu_of(a), cpu_of(b), cpu_of(a2)
             if not (ca and cb and ca2):
                 trusted = False
@@ -147,7 +165,7 @@ def one_launch(args, launch):
             rec["widths"][str(width)] = {
                 "control": a, "test": b, "aa": a2, "aa_arm": aa_arm,
                 "ratio": cb[0] / ca[0],
-                "aa_ratio": (ca2[0] / ca[0]) if aa_arm == CONTROL_BLOCKTIME
+                "aa_ratio": (ca2[0] / ca[0]) if aa_arm == args.control
                             else (ca2[0] / cb[0]),
                 "sys_frac_control": ca[1], "sys_frac_test": cb[1],
                 "cpt_control": ca[2], "cpt_test": cb[2],
@@ -238,6 +256,14 @@ def report(cells):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True)
+    ap.add_argument("--control", default=CONTROL_BLOCKTIME,
+                    help="value of --env-name in the control arm")
+    ap.add_argument("--test", default=TEST_BLOCKTIME,
+                    help="value of --env-name in the test arm")
+    ap.add_argument("--env-name", default=DEFAULT_ENV,
+                    help="env var to vary between control and test arms")
+    ap.add_argument("--hold", action="append", default=None, metavar="K=V",
+                    help="env var held identical in every arm; repeatable")
     ap.add_argument("--launches", type=int, default=8)
     ap.add_argument("--tokens", type=int, default=384)
     ap.add_argument("--reps", type=int, default=3)
