@@ -1,31 +1,18 @@
-fix(engine): the CUDA-feature build compiled nothing this branch changed
+Merge remote-tracking branch 'origin/main' into feat/native-workflow-backend
 
-CI's "CUDA compile (Linux x86_64)" caught what a default-feature build could
-not: the `ort-cuda`-gated test module in `pipeline/mod.rs` still destructured
-`WorkflowRuntime` construction as one value and read a `resource_governor` field
-that moved to `Engine`, and two divergence audits called a native-session method
-whose signature now takes the interpreter.
+Taken to pick up `b9217fafc`, which gates the Linux-only import in
+`onnx-runtime-hostmon`'s contention test. That crate landed on `main` after the
+previous merge here and broke the macOS coverage job on this PR — a failure in a
+crate this branch does not touch, fixed upstream rather than worked around.
 
-The divergence audits are the interesting part. They opened `model.onnx`
-directly with `NativeDecodeSession::load` and drove a teacher-forced step against
-the raw graph. That was always measuring a decode no request can reach, and it
-is now impossible to express, because a decode runs the loop the *package*
-declares. They load through `Engine::from_dir` with the native backend and use a
-new `Engine::generate_native_from_token_ids`, which exists for exactly this
-purpose: feeding an oracle-agreed token prefix and reading the top
-log-probabilities of the single next token, which the text entry points cannot
-express because they tokenize a prompt.
+Clean merge, no conflicts.
 
-That also keeps `WorkflowRuntime` crate-private. Exposing it to let a test call
-the native session would have widened the public surface to work around a test.
+Note: `onnx-runtime-ep-cuda`'s `content_preserving_transition_gpu` test does not
+compile against `origin/main` either (`transition_granule_range_with_phase8_faults`
+is configured out of the non-GPU build), verified in a clean worktree at the same
+commit. Not from this branch.
 
-Also two `--features native-cuda` clippy findings: the `Arc<Value>` in
-`device_ops` needs the same non-Send/Sync allowance the production alias path
-uses, and the `cfg`-selected return in `tensor_ops_for` does not need a block.
-
-Verified: `cargo check`/`clippy -D warnings` under `--features native-cuda
---all-targets`; 12 `native_workflow_parity` and 9 `gemma4_chained_workflow` cases
-on an H200; engine, server and ort suites on the default features; fmt.
+Verified: engine and server suites; workspace check.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Signed-off-by: Copilot <223556219+Copilot@users.noreply.github.com>
