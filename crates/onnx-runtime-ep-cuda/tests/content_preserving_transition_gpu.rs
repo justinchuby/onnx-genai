@@ -542,7 +542,7 @@ extern "C" __global__ void spin_and_noop(long long cycles) {
     // Launch a 400M-cycle spin (~16ms on A100 at ~25GHz clocks).
     let cycles: i64 = 400_000_000;
     let mut launch = runtime.stream().launch_builder(&spin);
-    unsafe { launch.arg(&cycles) };
+    launch.arg(&cycles);
     unsafe {
         launch
             .launch(LaunchConfig::for_num_elems(1))
@@ -1029,15 +1029,15 @@ fn a100_benchmark_transition_timing_decomposition() {
 // Helper: determine transition direction
 // ---------------------------------------------------------------------------
 
-fn direction<'a>(
+fn direction(
     current: PhysicalLocation,
-    pools: &'a TestPools,
+    pools: &TestPools,
     _gran: usize,
 ) -> (
     PhysicalLocation,
-    &'a Arc<PhysicalHandlePool>,
-    &'a Arc<PhysicalHandlePool>,
-    &'a CudaVirtualBacking,
+    &Arc<PhysicalHandlePool>,
+    &Arc<PhysicalHandlePool>,
+    &CudaVirtualBacking,
 ) {
     if current == (PhysicalLocation::Device { ordinal: 0 }) {
         (
