@@ -276,6 +276,12 @@ impl Drop for DeviceGuard {
 
 /// A device allocation this process owns, freed when the guard drops.
 ///
+/// Every field is a plain integer, so `Send + Sync` come from the compiler
+/// rather than from an assertion — which is what
+/// [`crate::Value::from_external_memory_with_owner`]'s `Box<dyn Any + Send +
+/// Sync>` requires, and what a hand-written `unsafe impl` would only serve to
+/// keep true by fiat if a field ever became a raw pointer.
+///
 /// The address is a plain `usize` so it can be handed to
 /// [`crate::Value::from_external_memory_with_owner`] as a raw pointer while the
 /// guard travels with the value that borrows it: the allocation outlives every
@@ -289,11 +295,18 @@ pub struct CudaAllocation {
     device_id: i32,
 }
 
-// SAFETY: the guard owns nothing but a device address and the ordinal it was
-// allocated on. `cudaFree` is callable from any thread once the owning device is
-// current, which `Drop` makes it.
-unsafe impl Send for CudaAllocation {}
-unsafe impl Sync for CudaAllocation {}
+/// Device allocations this process holds through [`CudaAllocation`].
+///
+/// An owning wrapper's whole job is that the memory goes back, and "it went
+/// back" is not something a throughput number or a device-wide free-memory
+/// reading can attribute: another process on the same GPU moves that number
+/// under you. A process-local live count can be asserted exactly.
+static LIVE_ALLOCATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many [`CudaAllocation`]s this process currently holds.
+pub fn live_allocations() -> usize {
+    LIVE_ALLOCATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl CudaAllocation {
     /// Allocate `bytes` of device memory on `device_id`.
@@ -328,6 +341,7 @@ impl CudaAllocation {
                  returned a null device pointer"
             )));
         }
+        LIVE_ALLOCATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Self {
             device_ptr: device_ptr as usize,
             bytes,
@@ -353,6 +367,7 @@ impl CudaAllocation {
 
 impl Drop for CudaAllocation {
     fn drop(&mut self) {
+        LIVE_ALLOCATIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // Freeing on the wrong current device is a CUDA error, so pin first; a
         // failure here is best-effort (the process is already unwinding or
         // shutting down) and would have nowhere to be reported.

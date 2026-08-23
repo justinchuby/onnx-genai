@@ -1945,8 +1945,15 @@ impl WorkflowRuntime {
     /// them such an output has no resolvable shape, so no device buffer can be
     /// sized for it and the run has to hand it back through host memory: a
     /// per-invocation download of the very tensor the caller then wants scored
-    /// on the device. A hint that contradicts an input's actual extent is a
-    /// validation error, not a silent override, so a wrong hint fails closed.
+    /// on the device.
+    ///
+    /// A hint only ever *adds* resolution; it cannot change a shape the inputs
+    /// already determine, because a symbol an input carries is re-bound from
+    /// that input's actual extent and a disagreement is a validation error.
+    /// And a hint that is simply wrong fails closed rather than corrupting
+    /// data: an output binding is sized from the resolved shape and the session
+    /// requires it to equal the kernel's own output shape exactly, so a
+    /// mis-sized buffer is a run error naming both shapes, never a short read.
     pub(crate) fn invoke_component_values(
         &self,
         component: &str,

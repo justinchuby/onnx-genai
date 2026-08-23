@@ -255,7 +255,7 @@ impl WorkflowRuntime {
         // That is configured, not discovered, so the fused input is built in the
         // proposer's own memory from the first step rather than assembled on the
         // host and uploaded once per draft token.
-        let residency = self.component_execution_residency();
+        let residency = self.component_execution_residency()?;
         let ops = super::device_ops::tensor_ops_for_residency(residency)?;
 
         let mut carry = match carry_seed {
@@ -268,7 +268,7 @@ impl WorkflowRuntime {
                 let narrowed =
                     last_position_of_carry(super::device_ops::tensor_ops_for(seed)?.as_ref(), seed)
                         .context("folded_carry_seed must name a per-position hidden output")?;
-                Some(ops.adopt(&narrowed).with_context(|| {
+                Some(self.adopt_into(ops.as_ref(), &narrowed).with_context(|| {
                     format!("failed to bring the folded carry seed onto {residency}")
                 })?)
             }
@@ -410,16 +410,27 @@ impl WorkflowRuntime {
             let drafted = i64::from(self.argmax_token(&logits)?);
 
             if let Some(value) = next_carry {
-                carry = Some(
-                    last_position_of_carry(ops.as_ref(), &value).with_context(|| {
-                        format!(
-                            "chained proposer '{}' folded carry output '{}' is not a per-position \
-                             hidden state",
-                            plan.proposer,
-                            plan.folded_carry_output.unwrap_or_default()
-                        )
-                    })?,
-                );
+                // Narrow where the proposer left it, then adopt — the same two
+                // steps the seed takes. Deriving the operations from the value
+                // rather than from the chain's residency is what keeps this
+                // correct when a backend publishes an output somewhere other
+                // than where the chain assembles; on the common path the
+                // residencies already agree and the adoption is an O(1) alias.
+                let narrowed = last_position_of_carry(
+                    super::device_ops::tensor_ops_for(&value)?.as_ref(),
+                    &value,
+                )
+                .with_context(|| {
+                    format!(
+                        "chained proposer '{}' folded carry output '{}' is not a per-position \
+                         hidden state",
+                        plan.proposer,
+                        plan.folded_carry_output.unwrap_or_default()
+                    )
+                })?;
+                carry = Some(self.adopt_into(ops.as_ref(), &narrowed).with_context(|| {
+                    format!("failed to bring the folded carry onto {residency}")
+                })?);
             } else if plan.folded_carry_output.is_some() {
                 anyhow::bail!(
                     "chained proposer '{}' declares folded_carry_output '{}' but produced none",
@@ -582,14 +593,34 @@ impl WorkflowRuntime {
         Ok(())
     }
 
+    /// Bring `value` into `ops`' residency, counting anything it brings back.
+    ///
+    /// Adoption is the seam's one sanctioned crossing, so this is the one place
+    /// besides an argmax read-back where a device byte can reach the host — and
+    /// therefore the one place besides [`Self::argmax_token`] that has to say
+    /// so. A value already in the right residency is aliased and counts
+    /// nothing.
+    fn adopt_into(
+        &self,
+        ops: &dyn super::device_ops::ResidentTensorOps,
+        value: &Value,
+    ) -> anyhow::Result<Value> {
+        let source = super::device_ops::residency_of(value)?;
+        if source != ops.residency() && ops.residency() == super::device_ops::Residency::Host {
+            let bytes = (value.numel() * value.dtype().size_of()) as u64;
+            self.device_readback_bytes
+                .set(self.device_readback_bytes.get().saturating_add(bytes));
+        }
+        ops.adopt(value)
+    }
+
     /// The winning token id of a logits row, read where the row already is.
     ///
-    /// This is the *only* device→host transfer a proposal chain performs, and
-    /// it moves four bytes per row. Counting it here is therefore complete: any
-    /// other route from device memory to host bytes goes through the
+    /// Four bytes per row, and on a device-resident chain it is the only
+    /// per-step transfer there is. Counting it here — together with
+    /// [`Self::adopt_into`], the seam's one other crossing, and the
     /// interpreter's own materialization, which counts itself in
-    /// `host_staging_count`, so the two counters together account for every
-    /// byte the interpreter brings back.
+    /// `host_staging_count` — accounts for every byte a proposal brings back.
     fn argmax_token(&self, logits: &Value) -> anyhow::Result<u32> {
         let ops = super::device_ops::tensor_ops_for(logits)?;
         let ids = ops.argmax_rows(logits, 1)?;

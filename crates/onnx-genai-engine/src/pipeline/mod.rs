@@ -815,16 +815,27 @@ impl WorkflowRuntime {
     /// the host and letting the binding upload it once per draft token.
     ///
     /// Anything else — the ORT backend, or a native CPU device — is host, which
-    /// is what keeps a CPU or ORT run byte-identical to what it was.
-    pub(crate) fn component_execution_residency(&self) -> device_ops::Residency {
+    /// is what keeps a CPU or ORT run byte-identical to what it was. That is a
+    /// statement about where a construct *builds* its own tensors, not a claim
+    /// about every value it will see: an ORT session on a CUDA device can still
+    /// publish device-resident outputs, and a construct meeting one adopts it
+    /// explicitly rather than assuming.
+    pub(crate) fn component_execution_residency(&self) -> anyhow::Result<device_ops::Residency> {
         #[cfg(feature = "native-backend")]
         if let Some(components) = self.native_components.as_ref()
             && let Some(ordinal) = components.borrow().cuda_ordinal()
-            && let Ok(device) = i32::try_from(ordinal)
         {
-            return device_ops::Residency::Cuda(device);
+            let device = i32::try_from(ordinal).map_err(|_| {
+                anyhow::anyhow!(
+                    "the native backend reports CUDA device ordinal {ordinal}, which does not fit \
+                     in the i32 a CUDA device id is; select a device in 0..={} with \
+                     ONNX_GENAI_CUDA_DEVICE",
+                    i32::MAX
+                )
+            })?;
+            return Ok(device_ops::Residency::Cuda(device));
         }
-        device_ops::Residency::Host
+        Ok(device_ops::Residency::Host)
     }
 
     /// The workflow this runtime executes.

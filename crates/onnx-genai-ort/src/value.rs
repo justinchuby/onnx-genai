@@ -1143,11 +1143,16 @@ impl Value {
         let base = tensor_data_ptr(self.ptr.as_ptr())?;
         // SAFETY: `base` points at this host-resident tensor's row-major
         // allocation of `numel() * element` bytes, and the destination window
-        // was bounds-checked above. `u8` has alignment 1, and the source slice
-        // belongs to the caller, so the two never overlap.
+        // was bounds-checked above; `u8` has alignment 1, so any non-null
+        // `base` is suitably aligned. `copy` rather than `copy_nonoverlapping`
+        // because nothing in the signature stops `bytes` from borrowing a
+        // tensor that aliases this one -- an `alias_with_offset` view of the
+        // same allocation is an ordinary `Value` -- and an overlapping
+        // `copy_nonoverlapping` would be undefined behaviour rather than a
+        // wrong answer.
         unsafe {
             let destination = base.cast::<u8>().add(element_offset * element);
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+            std::ptr::copy(bytes.as_ptr(), destination, bytes.len());
         }
         Ok(())
     }

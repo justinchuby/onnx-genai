@@ -1006,17 +1006,24 @@ fn chained_proposal_stays_device_resident_native_cuda() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A thousand proposals hold no device memory.
+/// A hundred proposals hold no device memory.
 ///
 /// Every step of a device-resident chain allocates: a gathered embedding row, a
 /// narrowed carry aliasing the proposer's output binding, a truncated state
-/// cell. Each of those keeps its owner alive exactly as long as it is used, and
-/// the proof that the ownership is right is that free device memory comes back
-/// to where it started rather than drifting down — which a leak of one binding
-/// per draft token would not.
+/// cell. Each keeps its owner alive exactly as long as it is used, and the
+/// proof that the ownership is right is that the allocations go back.
+///
+/// The live count is the assertion because it is *attributable*: it counts this
+/// process's own device allocations, so it cannot be moved by another process
+/// on the same GPU. Device-wide free memory is checked too, but only as a
+/// bound — on a shared box it is a noisy signal, and a test that failed because
+/// a neighbour allocated would teach people to ignore it.
 #[cfg(feature = "native-cuda")]
 #[test]
 fn repeated_proposals_do_not_retain_device_memory_native_cuda() -> anyhow::Result<()> {
+    /// Free device memory this test tolerates a neighbouring process moving.
+    const SHARED_GPU_NOISE_BYTES: usize = 512 * 1024 * 1024;
+
     let root = chained::fixture_root();
     let mut native = chained::ChainedFixture::new(native_cuda_engine(&root)?)?;
 
@@ -1026,16 +1033,24 @@ fn repeated_proposals_do_not_retain_device_memory_native_cuda() -> anyhow::Resul
     for _ in 0..8 {
         native.propose(chained::PROMPT_TOKENS, 4)?;
     }
-    let settled = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
+    let settled_allocations = onnx_genai_ort::cuda_rt::live_allocations();
+    let settled_free = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
     for _ in 0..100 {
         native.propose(chained::PROMPT_TOKENS, 4)?;
     }
-    let after = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
+    assert_eq!(
+        onnx_genai_ort::cuda_rt::live_allocations(),
+        settled_allocations,
+        "100 proposals left device allocations behind that the first eight did not; an owning \
+         value is outliving the step that made it"
+    );
+    let free = onnx_genai_ort::cuda_rt::device_memory_info(0)?.free_bytes;
     assert!(
-        after >= settled,
-        "100 proposals retained {} bytes of device memory that the first eight did not; an alias \
-         is outliving the buffer it borrows",
-        settled - after
+        free + SHARED_GPU_NOISE_BYTES >= settled_free,
+        "100 proposals consumed {} bytes of device memory, beyond the {SHARED_GPU_NOISE_BYTES} \
+         this test allows a neighbouring process on the same GPU to move; something outside this \
+         process's own allocations is retaining device memory",
+        settled_free - free
     );
     Ok(())
 }

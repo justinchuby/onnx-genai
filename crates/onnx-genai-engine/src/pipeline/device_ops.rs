@@ -26,6 +26,15 @@
 //! paths answering "which elements survive" would be duplicated state, and the
 //! one that is exercised less is the one that would drift.
 //!
+//! # The one exception to residency preservation
+//!
+//! A result with *no elements* borrows no bytes and has no device address to
+//! publish — CUDA cannot allocate zero bytes, and ORT is entitled to hand back
+//! a null data pointer for such a tensor. An empty result is therefore
+//! published host-resident, which is how the component boundary already
+//! publishes an empty output. Emptiness is checked before anything else, so
+//! this answer never depends on which branch happened to be reachable.
+//!
 //! # What is and is not zero-copy
 //!
 //! Narrowing an axis whose leading axes are all extent 1 keeps a contiguous
@@ -352,7 +361,12 @@ impl ResidentTensorOps for HostTensorOps {
         match residency_of(value)? {
             Residency::Host => clone_resident(value),
             Residency::Cuda(device) => value.to_host_from_cuda(device).map_err(|error| {
-                anyhow::anyhow!("failed to adopt a device value onto the host: {error}")
+                anyhow::anyhow!(
+                    "failed to adopt a {:?} {:?} tensor from CUDA device {device} onto the host: \
+                     {error}",
+                    value.shape(),
+                    value.dtype()
+                )
             }),
         }
     }
@@ -483,6 +497,10 @@ impl CudaTensorOps {
     }
 
     /// Copy `count` bytes device-to-device on this implementation's device.
+    ///
+    /// Unfenced: the caller issues its whole write batch and then calls
+    /// [`Self::fence`] once. Fencing per copy would turn a row-wise gather into
+    /// one device-wide barrier per row.
     fn copy(&self, destination: usize, source: usize, count: usize) -> anyhow::Result<()> {
         if count == 0 {
             return Ok(());
@@ -490,6 +508,47 @@ impl CudaTensorOps {
         let _guard = onnx_genai_ort::cuda_rt::DeviceGuard::set(self.device)?;
         onnx_genai_ort::cuda_rt::memcpy_device_to_device(destination, source, count)
             .map_err(Into::into)
+    }
+
+    /// Make every device write this operation issued visible to the execution
+    /// provider's kernels.
+    ///
+    /// The copies above run on cudart's *legacy default stream*; both CUDA
+    /// execution providers run kernels on streams created with
+    /// `cudaStreamNonBlocking`, which are exempt from the legacy stream's
+    /// implicit ordering. Without this barrier a kernel launched immediately
+    /// after — the proposer step reading the fused input this seam just
+    /// assembled, or the target reading the KV cell a rejection just truncated
+    /// — can read a buffer that is still being filled. That is a silent wrong
+    /// answer proportional to how much of the copy is outstanding: never on a
+    /// 128-byte fixture, megabytes on a real cache.
+    ///
+    /// The same barrier, for the same reason, brackets the shared-KV grow copy;
+    /// see `onnx_genai_ort::cuda_rt::device_synchronize`.
+    ///
+    /// The other direction needs nothing here: every device value that *enters*
+    /// this seam was published by the component boundary, which drains the
+    /// producing stream before the value exists (`value_from_output_binding`
+    /// and `device_tensor_to_value` in `native_component.rs`), so a producer
+    /// kernel is never still writing what these copies read.
+    fn fence(&self) -> anyhow::Result<()> {
+        let _guard = onnx_genai_ort::cuda_rt::DeviceGuard::set(self.device)?;
+        onnx_genai_ort::cuda_rt::device_synchronize().map_err(Into::into)
+    }
+
+    /// A zeroed device tensor, without the fence.
+    ///
+    /// Used as the destination of a copy batch the caller fences at the end, so
+    /// allocating a destination costs no extra barrier.
+    fn zeroed_unfenced(&self, shape: &[i64], dtype: DataType) -> anyhow::Result<Value> {
+        let value = Value::empty_cuda(shape, dtype, self.device).with_context(|| {
+            format!(
+                "failed to allocate a {shape:?} {dtype:?} tensor on CUDA device {}",
+                self.device
+            )
+        })?;
+        value.fill_zero_device(self.device)?;
+        Ok(value)
     }
 }
 
@@ -516,22 +575,22 @@ impl ResidentTensorOps for CudaTensorOps {
             .copy_from_cuda(value, self.device)
             .map_err(|error| {
                 anyhow::anyhow!(
-                    "failed to adopt a {:?} tensor onto CUDA device {}: {error}",
+                    "failed to adopt a {:?} {:?} tensor from {} onto CUDA device {}: {error}",
                     value.shape(),
+                    value.dtype(),
+                    residency_of(value)
+                        .map(|residency| residency.to_string())
+                        .unwrap_or_else(|_| "an unreadable residency".to_string()),
                     self.device
                 )
             })?;
+        self.fence()?;
         Ok(adopted)
     }
 
     fn zeros(&self, shape: &[i64], dtype: DataType) -> anyhow::Result<Value> {
-        let value = Value::empty_cuda(shape, dtype, self.device).with_context(|| {
-            format!(
-                "failed to allocate a {shape:?} {dtype:?} tensor on CUDA device {}",
-                self.device
-            )
-        })?;
-        value.fill_zero_device(self.device)?;
+        let value = self.zeroed_unfenced(shape, dtype)?;
+        self.fence()?;
         Ok(value)
     }
 
@@ -544,6 +603,12 @@ impl ResidentTensorOps for CudaTensorOps {
     ) -> anyhow::Result<Value> {
         self.ensure_device(value, "slice input")?;
         let (narrowed, outer, inner, extent) = slice_plan(value, axis, start, len)?;
+        // Emptiness is decided before anything else so the answer cannot depend
+        // on which branch happened to be reachable; see the module's note on the
+        // one exception to residency preservation.
+        if len == 0 || inner == 0 || outer == 0 {
+            return HostTensorOps.zeros(&narrowed, value.dtype());
+        }
         // A contiguous window is a pointer view: no bytes move at all, on any
         // backend. This is what makes a rejection rollback free.
         if outer == 1
@@ -551,15 +616,10 @@ impl ResidentTensorOps for CudaTensorOps {
         {
             return Ok(view);
         }
-        if len == 0 || inner == 0 || outer == 0 {
-            // A window with no elements has no device allocation to publish, so
-            // it is a host tensor of the right type and shape by construction.
-            return HostTensorOps.zeros(&narrowed, value.dtype());
-        }
         // Strided: one device-to-device copy per leading block. Still no host
         // round trip, which is the property that matters.
         let element = value.dtype().size_of();
-        let destination = self.zeros(&narrowed, value.dtype())?;
+        let destination = self.zeroed_unfenced(&narrowed, value.dtype())?;
         let source_base = value.data_ptr_addr()?;
         let destination_base = destination.data_ptr_addr()?;
         let block = extent * inner * element;
@@ -572,6 +632,7 @@ impl ResidentTensorOps for CudaTensorOps {
                 keep,
             )?;
         }
+        self.fence()?;
         Ok(destination)
     }
 
@@ -586,7 +647,7 @@ impl ResidentTensorOps for CudaTensorOps {
         if ids.is_empty() {
             return HostTensorOps.zeros(&shape, table.dtype());
         }
-        let gathered = self.zeros(&shape, table.dtype())?;
+        let gathered = self.zeroed_unfenced(&shape, table.dtype())?;
         let table_base = table.data_ptr_addr()?;
         let gathered_base = gathered.data_ptr_addr()?;
         let row_bytes = hidden * element;
@@ -597,6 +658,7 @@ impl ResidentTensorOps for CudaTensorOps {
                 row_bytes,
             )?;
         }
+        self.fence()?;
         Ok(gathered)
     }
 
@@ -619,7 +681,7 @@ impl ResidentTensorOps for CudaTensorOps {
                 src_width * element,
             )?;
         }
-        Ok(())
+        self.fence()
     }
 
     fn argmax_rows(&self, logits: &Value, rows: usize) -> anyhow::Result<Vec<u32>> {
@@ -839,9 +901,11 @@ mod cuda_tests {
     ///
     /// The feature says this build *can* reach a device, not that one is
     /// present; a developer building with CUDA on a laptop still runs the
-    /// suite.
+    /// suite. The probe is deliberately *not* one of the primitives under test:
+    /// gating `empty_cuda`'s own tests on `empty_cuda` succeeding would turn a
+    /// regression in it into seven silently green tests.
     fn device() -> Option<i32> {
-        Value::empty_cuda(&[1], DataType::Float32, 0)
+        onnx_genai_ort::cuda_rt::device_memory_info(0)
             .ok()
             .map(|_| 0)
     }
