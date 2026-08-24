@@ -20197,7 +20197,7 @@ mod tests {
         }
     }
     ///
-    /// Split out from the `/proc` read so the decision itself is testable
+    /// Split out from the mask collection so the decision itself is testable
     /// against synthetic inputs. The interesting cases -- a pin the kernel did
     /// not apply, a reported CPU that is not the one in force -- cannot be
     /// produced on demand by building a real pool, so a predicate that could
