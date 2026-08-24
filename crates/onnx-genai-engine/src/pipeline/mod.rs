@@ -190,18 +190,6 @@ pub(crate) struct WorkflowRuntime {
     /// exclusive, so this is what makes that true rather than assumed — a
     /// second concurrent turn is refused with a name, not silently lost.
     workflow_session_leases: RefCell<std::collections::HashSet<String>>,
-    /// Leased state to bind at a component port, for the pass now running.
-    ///
-    /// Keyed by `(component, input port)` and consumed on first use: the lease
-    /// is what a group-backed cell's *first* read of the pass sees, and the
-    /// graph's own value is what every later read in the same pass sees, because
-    /// the state has advanced by then.
-    ///
-    /// Bound at the port rather than written over the SSA value the cell's
-    /// initializer names, because that value may be produced by a step — which
-    /// would overwrite the lease and restart the session with no error — and may
-    /// be read by consumers the group has nothing to do with.
-    workflow_session_port_leases: RefCell<HashMap<(String, String), Value>>,
     /// Device→host materializations this runtime performed.
     ///
     /// A proposal chain's whole point is that its per-token work stays on the
@@ -456,7 +444,6 @@ impl WorkflowRuntime {
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
             workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
-            workflow_session_port_leases: RefCell::new(HashMap::new()),
             host_staging_count: std::cell::Cell::new(0),
             device_readback_bytes: std::cell::Cell::new(0),
             embedding_tables: RefCell::new(HashMap::new()),
@@ -811,7 +798,6 @@ impl WorkflowRuntime {
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
                 workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
-                workflow_session_port_leases: RefCell::new(HashMap::new()),
                 host_staging_count: std::cell::Cell::new(0),
                 device_readback_bytes: std::cell::Cell::new(0),
                 embedding_tables: RefCell::new(HashMap::new()),

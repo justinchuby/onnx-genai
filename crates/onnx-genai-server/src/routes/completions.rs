@@ -152,13 +152,12 @@ async fn run_completion(
     let requested_logprobs = request.logprobs;
     let tokenizer = handle.tokenizer.clone();
     let prepared = prepare_completion(&request, &handle)?;
-    let carried_tokens =
-        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let conversational =
+        conversational_session_id(&prepared.generation, client_session_id.as_deref());
+    let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session_id =
-        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
-            .await?;
+    let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     let result = collect_generation_result(generation.events)
         .await
@@ -204,13 +203,12 @@ async fn stream_completion(
         .map(StopInput::into_texts)
         .unwrap_or_default();
     let prepared = prepare_completion(&request, &handle)?;
-    let carried_tokens =
-        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let conversational =
+        conversational_session_id(&prepared.generation, client_session_id.as_deref());
+    let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session_id =
-        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
-            .await?;
+    let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
@@ -1294,6 +1292,23 @@ async fn open_session_after_admission(
             .await
             .map(Some),
         None => Ok(None),
+    }
+}
+
+/// The session id a completion should be accounted and submitted under.
+///
+/// A fill-in-the-middle completion is not a turn in a conversation: the FIM
+/// submit path takes no session at all. Opening one for it would claim an LRU
+/// slot — closing another client's live conversation once the registry is full —
+/// for a request that never touches it, and would charge that conversation's
+/// tokens to a prefill FIM does not perform.
+fn conversational_session_id<'a>(
+    generation: &CompletionGeneration,
+    client_session_id: Option<&'a str>,
+) -> Option<&'a str> {
+    match generation {
+        CompletionGeneration::Plain(_) => client_session_id,
+        CompletionGeneration::Fim { .. } => None,
     }
 }
 

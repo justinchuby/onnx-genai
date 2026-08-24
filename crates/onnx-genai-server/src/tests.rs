@@ -4309,3 +4309,78 @@ async fn a_rejected_request_neither_opens_nor_evicts_a_session() {
     assert_eq!(status, StatusCode::OK, "{second}");
     assert!(session_tokens(&second) > session_tokens(&first));
 }
+
+/// A fill-in-the-middle completion is not a turn in a conversation, and never
+/// opens one.
+///
+/// The route refuses the combination outright, and `conversational_session_id`
+/// is the second answer to the same question for any caller that reaches
+/// `run_completion` another way: the FIM submit path takes no session, so
+/// opening one would claim an LRU slot — closing another client's live
+/// conversation once the registry is full — for a request that never touches it.
+#[tokio::test]
+async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load(&model_dir, Some("tiny-llm".to_string()))
+        .expect("load fixture")
+        .with_default_fim_config(Some(onnx_genai_engine::FimConfig {
+            prefix_token: "<PRE>".to_string(),
+            middle_token: "<MID>".to_string(),
+            suffix_token: "<SUF>".to_string(),
+            format: onnx_genai_engine::FimFormat::PSM,
+        }));
+    let router = app(state.clone());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-fim")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "prefix",
+                        "suffix": "suffix",
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a FIM completion cannot be a turn in a conversation"
+    );
+    assert_eq!(
+        state.sessions.get("sess-fim").expect("registry"),
+        None,
+        "and it opens no session on its way to being refused"
+    );
+
+    // Without the header the same request is an ordinary FIM completion.
+    let plain = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "tiny-llm",
+                        "prompt": "prefix",
+                        "suffix": "suffix",
+                        "max_tokens": 1
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plain.status(), StatusCode::OK);
+}

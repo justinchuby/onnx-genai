@@ -519,6 +519,49 @@ fn a_group_lease_is_bound_at_its_port_and_must_have_a_reader() -> anyhow::Result
     let initializer = &workflow.state["cache_0"].initializer;
     assert_eq!(initializer, "decoder.setup.present.0.key");
 
+    // A group-only lease is written to the value the step binds to the alias's
+    // `input` port, before the pass. That is what every way of invoking a
+    // component reads — generically, fused into an execution island, through a
+    // host contract, or redirected by an override — so a document where a step
+    // could then overwrite that value is refused rather than left to restart
+    // the session quietly. This fixture is that document: `cache_0`'s port is
+    // bound to a value the setup step produces.
+    {
+        let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("overwritten_lease_package");
+        let _ = std::fs::remove_dir_all(&scratch);
+        copy_package(&scratch)?;
+        let path = scratch.join("inference_metadata.yaml");
+        let mut document: serde_yaml::Value =
+            serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+        let state = document["pipeline"]["workflow"]["state"]
+            .as_mapping_mut()
+            .expect("workflow declares state");
+        state
+            .remove(serde_yaml::Value::String("conversation".into()))
+            .expect("the fixture declares a conversation");
+        let cache = state
+            .get_mut(serde_yaml::Value::String("cache_0".into()))
+            .expect("the fixture declares a cache cell");
+        cache["scope"] = serde_yaml::Value::String("session".into());
+        cache["release_boundary"] = serde_yaml::Value::String("session".into());
+        let carried = document["pipeline"]["workflow"]["steps"][0]["carried"]
+            .as_sequence_mut()
+            .expect("the loop carries state");
+        carried.retain(|carry| carry["cell"].as_str() != Some("cache_0"));
+        std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+        let metadata =
+            onnx_genai_metadata::load_metadata_from_dir(&scratch)?.expect("metadata was written");
+        let reported = onnx_genai_metadata::validate_metadata(&metadata)
+            .expect_err("a lease a step overwrites is not a carrier");
+        assert!(
+            reported
+                .iter()
+                .any(|error| error.contains("would overwrite the lease")),
+            "expected the overwrite refusal, got {reported:?}"
+        );
+    }
+
     // A group whose alias names a port no step binds is refused: the lease would
     // have no reader.
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unread_group_port_package");

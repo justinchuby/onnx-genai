@@ -2501,23 +2501,40 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                     // has to invoke that component and bind that port. An alias
                     // no step reaches is a lease with no reader.
                     if group_is_the_carrier {
+                        let produced = workflow_step_produced_values(&workflow.steps);
                         for (component, alias) in
                             group.ports.iter().filter_map(|(component, aliases)| {
                                 aliases.get(name).map(|alias| (component, alias))
                             })
                         {
-                            if !workflow_binds_component_port(
+                            match workflow_component_port_binding(
                                 &workflow.steps,
                                 component,
                                 &alias.input,
                             ) {
-                                errors.push(format!(
+                                None => errors.push(format!(
                                     "{path} is carried only by state service group \
                                      '{group_name}', whose alias reads component '{component}' \
                                      port '{}', but no step invokes that component binding that \
                                      port; the lease would have no reader",
                                     alias.input
-                                ));
+                                )),
+                                // The lease is written to that value before the
+                                // pass, which every way of invoking a component
+                                // reads — generically, fused into an execution
+                                // island, through a host contract, or redirected
+                                // by an override. A step that also defines it
+                                // would overwrite the lease and restart the
+                                // session with no error, so such a package is
+                                // refused rather than left to fail quietly.
+                                Some(bound) if produced.contains(bound) => errors.push(format!(
+                                    "{path} is carried only by state service group \
+                                     '{group_name}', but the value '{bound}' its alias reads is \
+                                     produced by a step in the same pass, which would overwrite \
+                                     the lease; bind the port to a workflow input, or carry the \
+                                     cell in the loop"
+                                )),
+                                Some(_) => {}
                             }
                         }
                     }
@@ -2692,32 +2709,82 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
     }
 }
 
-/// Whether some step invokes `component` binding `port` as an input.
-fn workflow_binds_component_port(steps: &[WorkflowStep], component: &str, port: &str) -> bool {
-    fn walk(step: &WorkflowStep, component: &str, port: &str) -> bool {
+/// The SSA value some step binds to `component`'s `port`.
+fn workflow_component_port_binding<'a>(
+    steps: &'a [WorkflowStep],
+    component: &str,
+    port: &str,
+) -> Option<&'a str> {
+    fn walk<'a>(step: &'a WorkflowStep, component: &str, port: &str) -> Option<&'a str> {
         match step {
             WorkflowStep::Sequence { steps } => {
-                steps.iter().any(|step| walk(step, component, port))
+                steps.iter().find_map(|step| walk(step, component, port))
             }
             WorkflowStep::Invoke {
                 component: invoked,
                 inputs,
                 ..
-            } => invoked == component && inputs.contains_key(port),
+            } => (invoked == component)
+                .then(|| inputs.get(port).map(String::as_str))
+                .flatten(),
             WorkflowStep::Loop { setup, steps, .. } => setup
                 .iter()
                 .chain(steps)
-                .any(|step| walk(step, component, port)),
-            WorkflowStep::Branch { cases, default, .. } => {
-                cases.values().any(|step| walk(step, component, port))
-                    || default
+                .find_map(|step| walk(step, component, port)),
+            WorkflowStep::Branch { cases, default, .. } => cases
+                .values()
+                .find_map(|step| walk(step, component, port))
+                .or_else(|| {
+                    default
                         .as_ref()
-                        .is_some_and(|step| walk(step, component, port))
-            }
-            WorkflowStep::Emit { .. } => false,
+                        .and_then(|step| walk(step, component, port))
+                }),
+            WorkflowStep::Emit { .. } => None,
         }
     }
-    steps.iter().any(|step| walk(step, component, port))
+    steps.iter().find_map(|step| walk(step, component, port))
+}
+
+/// Every SSA value a step defines.
+fn workflow_step_produced_values(steps: &[WorkflowStep]) -> BTreeSet<String> {
+    fn walk(step: &WorkflowStep, produced: &mut BTreeSet<String>) {
+        match step {
+            WorkflowStep::Sequence { steps } => steps.iter().for_each(|step| walk(step, produced)),
+            WorkflowStep::Invoke { outputs, .. } => produced.extend(outputs.values().cloned()),
+            WorkflowStep::Loop {
+                setup,
+                steps,
+                iteration,
+                carried,
+                ..
+            } => {
+                produced.extend(iteration.iter().map(|value| value.value.clone()));
+                produced.extend(carried.iter().map(|carry| carry.next.clone()));
+                setup
+                    .iter()
+                    .chain(steps)
+                    .for_each(|step| walk(step, produced));
+            }
+            WorkflowStep::Branch {
+                cases,
+                default,
+                outputs,
+                ..
+            } => {
+                produced.extend(outputs.keys().cloned());
+                cases.values().for_each(|step| walk(step, produced));
+                if let Some(default) = default {
+                    walk(default, produced);
+                }
+            }
+            WorkflowStep::Emit { output, .. } => {
+                produced.insert(output.clone());
+            }
+        }
+    }
+    let mut produced = BTreeSet::new();
+    steps.iter().for_each(|step| walk(step, &mut produced));
+    produced
 }
 
 /// Speculative regions may only contain effects and state that can be undone to
