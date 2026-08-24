@@ -1107,7 +1107,7 @@ fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<Workflo
              or this fixture proves nothing about sessions"
         );
     }
-    if shape != TestWorkflowShape::Stateless {
+    if shape != TestSessionShape::Stateless {
         // The lease and the capability are one statement, and the validator
         // says so: a reader that cannot honour leased state must be able to
         // see that it is being asked to. Both session shapes declare a lease,
