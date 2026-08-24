@@ -114,6 +114,104 @@ def is_cuda_test_target(target: str) -> bool:
     )
 
 
+# `ignore` as an attribute token, not as English. The first version of this
+# scan searched the item's head for the substring "ignore", and so passed on a
+# test whose doc comment happened to contain the words "a kernel that ignored
+# the attribute" -- the exact defect it was written to catch. Anchor on the
+# punctuation an attribute must have around it, and never look at doc text.
+IGNORE_ATTR = re.compile(r"(?:^|[\[(,\s])ignore\s*(?:=|\]|,|\)|$)")
+
+
+def attribute_lines_of_item(lines: list[str], index: int) -> list[str]:
+    """The attribute lines belonging to the `#[test]` item at `lines[index]`.
+
+    Collects the contiguous attribute block above the marker and any attributes
+    between it and the `fn`, since attribute order is not significant in Rust.
+    Doc comments are excluded: they are prose, and reading them as though they
+    were attributes is what made the first version of this check vacuous.
+    """
+    attributes: list[str] = []
+    pending = 0
+    for line in reversed(lines[:index]):
+        stripped = line.strip()
+        if not stripped:
+            break
+        if pending == 0 and stripped.startswith("//"):
+            continue
+        delta = stripped.count("]") + stripped.count(")") - stripped.count("[") - stripped.count("(")
+        # A multi-line attribute is met tail-first walking upward, so a line
+        # that closes more brackets than it opens starts a continuation.
+        if pending == 0 and delta <= 0 and not stripped.startswith("#["):
+            break
+        attributes.append(stripped)
+        pending = max(0, pending + delta)
+    pending = 0
+    for line in lines[index + 1 :]:
+        stripped = line.strip()
+        if pending == 0:
+            if stripped.startswith("//"):
+                continue
+            if not stripped.startswith("#["):
+                break
+        attributes.append(stripped)
+        pending = max(0, pending + stripped.count("[") + stripped.count("(") - stripped.count("]") - stripped.count(")"))
+    return attributes
+
+
+def test_name_at(lines: list[str], index: int) -> str:
+    for line in lines[index + 1 : index + 12]:
+        match = re.match(r"(?:pub\s+)?(?:async\s+)?fn\s+([A-Za-z0-9_]+)", line.strip())
+        if match:
+            return match.group(1)
+    return "<unknown fn>"
+
+
+def un_ignored_tests(source: str) -> list[tuple[int, str]]:
+    """Every `#[test]` in `source` that carries no ignore attribute, 1-based."""
+    lines = source.splitlines()
+    found: list[tuple[int, str]] = []
+    for index, line in enumerate(lines):
+        if line.strip() != "#[test]":
+            continue
+        attributes = attribute_lines_of_item(lines, index)
+        if any(IGNORE_ATTR.search(entry) for entry in attributes):
+            continue
+        found.append((index + 1, test_name_at(lines, index)))
+    return found
+
+
+def scan_source_for_missing_ignores() -> list[str]:
+    """Every `#[test]` in a policed CUDA target must carry an ignore.
+
+    The inventory check in this script is authoritative, but it needs two full
+    CUDA test builds, so it runs only on the CUDA lane -- which means feedback
+    on the single most common way to break that lane arrives after merge, and
+    only if the lane is green enough to be believed. Five tests were added
+    without an ignore in three days, each one reported by a red lane that was
+    already red for an unrelated reason.
+
+    This is the same rule read straight off the source in well under a second
+    with no CUDA toolchain, so it can run on every pull request. It does not
+    replace the inventory check: it cannot see macro-expanded tests, and it
+    cannot check inventory parity across the two feature configurations. It
+    catches one specific recurring omission early.
+    """
+    errors: list[str] = []
+    for test_dir in TEST_DIRS:
+        for path in sorted(test_dir.glob("*.rs")):
+            if not is_cuda_test_target(path.stem):
+                continue
+            source = path.read_text(encoding="utf-8")
+            for line_number, name in un_ignored_tests(source):
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{line_number}: {name} "
+                    "has no ignore attribute. Every test in a CUDA target must be ignored "
+                    "when gpu-tests is off, or it runs on a machine with no device: add "
+                    '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]'
+                )
+    return errors
+
+
 def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
     binaries: dict[str, Path] = {}
     for line in stdout.splitlines():
@@ -217,6 +315,24 @@ def compare_inventories(
         for test in sorted(base_only):
             errors.append(f"{target}::{test}: test exists only without gpu-tests enabled")
     return errors
+
+
+def known_names(
+    names: dict[str, list[str]], inventory: frozenset[str]
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Keep only outcome names Cargo actually inventoried for the target.
+
+    libtest reprints a failing test's captured stdout verbatim at column 0, so a
+    test that itself printed a line shaped like `test evil ... ok` would be
+    parsed as an outcome. That can only ever mislabel the annotation -- every
+    error here is decided by counts, never by names -- but an error message that
+    names a test which does not exist is worse than one that names none, so the
+    parse is intersected with the inventory rather than trusted.
+    """
+    return tuple(
+        (status, tuple(name for name in found if name in inventory))
+        for status, found in names.items()
+    )
 
 
 def validate_ignored_result(result: IgnoredResult) -> list[str]:
@@ -333,6 +449,13 @@ def self_test() -> None:
     if not any("sneaky_pass" in m for m in validate_active_no_cuda_result(active)):
         raise AssertionError("passing test was not named in the active-config message")
 
+    phantom = known_names(
+        {"FAILED": ["real_test", "evil"], "ok": [], "ignored": []},
+        frozenset({"real_test", "other_test"}),
+    )
+    if dict(phantom)["FAILED"] != ("real_test",):
+        raise AssertionError(f"uninventoried name was not dropped: {phantom!r}")
+
     parsed = {
         outcome.group("status"): outcome.group("name")
         for outcome in OUTCOME.finditer(
@@ -432,6 +555,36 @@ def self_test() -> None:
     if not any("executed without gpu-tests" in error for error in validate_ignored_result(silent_without_feature)):
         raise AssertionError("without-gpu-tests silent pass should fail")
 
+    # The first version of this scan searched the item head for the substring
+    # "ignore" and so accepted a test whose doc comment said "a kernel that
+    # ignored the attribute". That is the defect it exists to catch, and it is
+    # the second fixture below. Both controls are here on purpose: the ones
+    # that must be flagged, and the ones that must not.
+    for source, expected in (
+        ("#[test]\nfn a() {}\n", ["a"]),
+        ("/// a kernel that ignored the attribute entirely\n#[test]\nfn a() {}\n", ["a"]),
+        ("/// close for small |x|). We run\n#[test]\nfn a() {}\n", ["a"]),
+        ("#[cfg(feature = \"gpu-tests\")]\n#[test]\nfn a() {}\n", ["a"]),
+        ("#[ignore]\n#[test]\nfn a() {}\n", []),
+        ("#[test]\n#[ignore = \"needs a device\"]\nfn a() {}\n", []),
+        ("#[cfg_attr(not(feature = \"gpu-tests\"), ignore = \"x\")]\n#[test]\nfn a() {}\n", []),
+        ('''#[cfg_attr(\n    not(feature = "gpu-tests"),\n    ignore = "requires CUDA device"\n)]\n#[test]\nfn a() {}\n''', []),
+        ("/// doc\n#[cfg_attr(not(feature = \"gpu-tests\"), ignore = \"x\")]\n#[test]\nfn a() {}\n", []),
+        ("#[test]\nfn a() {}\n\n#[ignore]\n#[test]\nfn b() {}\n", ["a"]),
+        ("macro_rules! m {\n    () => {\n        #[ignore]\n        #[test]\n        fn a() {}\n    };\n}\n", []),
+        ("// let ignore = 1;\n#[test]\nfn a() {}\n", ["a"]),
+        # These two exist to make the two defences falsifiable rather than
+        # merely present. The first fails if IGNORE_ATTR is relaxed to a bare
+        # substring: "ignore" appears, but inside a string literal, not as an
+        # attribute. The second fails if doc comments are read as attributes:
+        # the prose ends "ignore," which is attribute-shaped punctuation.
+        ("#[should_panic(expected = \"ignore me\")]\n#[test]\nfn a() {}\n", ["a"]),
+        ("/// we do not ignore, ever\n#[test]\nfn a() {}\n", ["a"]),
+    ):
+        names = [name for _, name in un_ignored_tests(source)]
+        if names != expected:
+            raise AssertionError(f"source scan fixture returned {names!r}, expected {expected!r}: {source!r}")
+
     good_active = ActiveResult("fixture_active", inventory=2, passed=0, failed=2, ignored=0)
     silent_with_feature = ActiveResult("fixture_active_silent", inventory=1, passed=1, failed=0, ignored=0)
     if validate_active_no_cuda_result(good_active):
@@ -443,6 +596,11 @@ def self_test() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true", help="run parser fixtures only")
+    parser.add_argument(
+        "--source-scan",
+        action="store_true",
+        help="check the source for un-ignored CUDA tests; no cargo build, runs anywhere",
+    )
     args = parser.parse_args()
 
     self_test()
@@ -450,7 +608,17 @@ def main() -> int:
         print("CUDA honesty checker self-test passed")
         return 0
 
-    errors: list[str] = []
+    if args.source_scan:
+        source_errors = scan_source_for_missing_ignores()
+        if source_errors:
+            print("CUDA test source scan failed:", file=sys.stderr)
+            for error in source_errors:
+                print(f"  - {error}", file=sys.stderr)
+            return 1
+        print("CUDA test source scan passed: every test in a CUDA target carries an ignore")
+        return 0
+
+    errors: list[str] = scan_source_for_missing_ignores()
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
         if not declares_gpu_tests_feature(manifest):
@@ -474,7 +642,7 @@ def main() -> int:
             passed,
             failed,
             ignored,
-            tuple((key, tuple(values)) for key, values in names.items()),
+            known_names(names, inventory),
         )
         ignored_results.append(result)
         errors.extend(validate_ignored_result(result))
@@ -488,7 +656,7 @@ def main() -> int:
             passed,
             failed,
             ignored,
-            tuple((key, tuple(values)) for key, values in names.items()),
+            known_names(names, inventory),
         )
         active_results.append(result)
         errors.extend(validate_active_no_cuda_result(result))
