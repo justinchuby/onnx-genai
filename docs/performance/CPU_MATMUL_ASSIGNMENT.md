@@ -2208,6 +2208,36 @@ time. That figure is now stale; the re-measurement replaces it.
 > recorded rather than resolved by argument. Full record:
 > [`docs/benchmarks/2026-08-24-acc0-straggler-lead.md`](../benchmarks/2026-08-24-acc0-straggler-lead.md).
 >
+> **The contradiction is now resolved by measurement, and the source reading
+> won (2026-08-24).** The worker instrument already reported `timed_ops` per
+> lane and `derive()` was discarding it, taking `workers[0]` as *the* op count
+> -- silently assuming the thing in question. Reading all fifteen over 24
+> trusted launches gives `ops_spread` = **0.0000 in every launch**: the split
+> is exactly even, `output_chunk_len_for` is exonerated, and **the excess is
+> execution time on equal work rather than unequal assignment**.
+>
+> Two further mechanisms are excluded. **Placement**: one lane->cpu map across
+> all 24 launches (lane *i* on cpu *2i*, one per physical core -- #1729 working
+> as specified), yet the victim moves, with top lane and top cpu concentration
+> both 0.208 against a 0.5 bar. **Address layout**: with `setarch -R` holding
+> the layout byte-identical the concentration is **0.267, the same number as
+> under ASLR**, so layout does not select the victim either. The `setarch -R`
+> knob was verified to work before measuring, because #1792 on this project is
+> a user-facing placement control that is entirely inert and an inert knob here
+> would have manufactured exactly the observed REJECT.
+>
+> **The straggler survived its own null test.** `work_skew` is a maximum over
+> fifteen lanes and so cannot return zero; `straggler_share` has no null model
+> either, and both had been read as an imbalance across three records. Scaling
+> the window 4x separates a slow lane from max-of-noise: chance predicts the
+> excess over 1/15 decaying by 1/sqrt(4) = 0.50, and it instead **rose**,
+> R = **1.690**, with one lane last on a median **72% of 3840 ops**. The
+> straggler is real, persistent within a process, and worth ~0.31 of the
+> width-16 window. What picks the victim at startup is not placement, not
+> assignment and not address layout, and is deliberately left unnamed until
+> measured. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-straggler-identity.md`](../benchmarks/2026-08-24-acc0-straggler-identity.md).
+>
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
 > (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not
