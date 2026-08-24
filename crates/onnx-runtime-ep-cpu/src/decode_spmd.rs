@@ -4972,7 +4972,29 @@ mod tests {
             // Threads come and go under a scan that is not a snapshot, and the
             // one case this races with -- a worker leaving -- is the outcome the
             // callers are hoping for. Not blindness.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => CommRead::Vanished,
+            //
+            // Two errnos, because `read_to_string` is `open` then `read` and a
+            // task can vanish between them. Gone before the `open` is `ENOENT`;
+            // gone before the first `read` makes `comm_show` fail its
+            // `get_proc_task` and return `ESRCH` (`man 5 proc`: an exited
+            // thread's files give "ESRCH or ENOENT"). `ESRCH` has to be matched
+            // on the raw errno: Rust's `decode_error_kind` has no mapping for
+            // it, so it arrives as `ErrorKind::Uncategorized`, which is *also*
+            // what `EIO` arrives as -- and `EIO` is real blindness. Matching the
+            // kind rather than the errno would either panic on a correct
+            // teardown or excuse a broken one.
+            //
+            // This is not a theoretical window. `shutdown_join_child` counts
+            // immediately after `shutdown_pools` joins, and this file already
+            // documents that regime: "the futex that unblocks `join` is
+            // signalled before the kernel unhashes the task". That is the peak
+            // `ESRCH` window, entered on the *success* path.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                CommRead::Vanished
+            }
             Err(err) => CommRead::Blind(err.to_string()),
         }
     }
@@ -5101,21 +5123,59 @@ mod tests {
     }
 
     /// A task that exits mid-scan is the outcome the callers want, not a fault.
+    ///
+    /// Both errnos, because `read_to_string` is `open` then `read` and the task
+    /// can vanish between them. `ESRCH` is the one that bites: it is not in
+    /// Rust's errno mapping, so it arrives as `Uncategorized` and any
+    /// kind-based test for "vanished" misses it.
     #[test]
     #[cfg(target_os = "linux")]
     fn a_task_that_exits_mid_scan_is_not_blindness() {
         let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(classify_worker_comm(Err(gone)), CommRead::Vanished);
+
+        let raced = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert_ne!(
+            raced.kind(),
+            std::io::ErrorKind::NotFound,
+            "ESRCH now maps to NotFound, so the raw-errno arm below is dead \
+             code -- re-derive it rather than deleting either half"
+        );
+        assert_eq!(classify_worker_comm(Err(raced)), CommRead::Vanished);
+
         let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let raced = std::io::Error::from_raw_os_error(libc::ESRCH);
         assert_eq!(
             tally_worker_comms([
                 Ok(format!("{SPMD_THREAD_NAME_PREFIX}\n")),
                 Err(gone),
+                Err(raced),
                 Ok("main\n".to_string()),
             ]),
             Ok(1),
             "a worker leaving under the scan must not stop it counting"
         );
+    }
+
+    /// Blindness is decided by errno, not by `ErrorKind`.
+    ///
+    /// `ESRCH` and `EIO` are indistinguishable as kinds -- both arrive as
+    /// `Uncategorized` -- and they are opposite verdicts: the first is a
+    /// correct teardown, the second is an instrument that cannot see. A
+    /// kind-based rule has to be wrong about one of them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_uncategorized_error_is_not_by_itself_a_vanished_task() {
+        let unreadable = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(
+            unreadable.kind(),
+            std::io::Error::from_raw_os_error(libc::ESRCH).kind(),
+            "this test only means something while EIO and ESRCH share a kind"
+        );
+        assert!(matches!(
+            classify_worker_comm(Err(unreadable)),
+            CommRead::Blind(_)
+        ));
     }
 
     /// The empty tally is blindness, not "every worker left".
