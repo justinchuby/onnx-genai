@@ -4,7 +4,7 @@
 - **Date:** 2026-08-24
 - **Follows:** #1940 (merged: corrected audit + typed validator/oracle crate `onnx-genai-paged-attention`).
 - **Branch:** `squad/paged-attention-3a-cuda-latent` (based on `origin/main` @ `387f840b0`).
-- **Status:** NOT merged. Draft PR; independent review pending (reviewer excludes Leon; Gaff or Roy final approval).
+- **Status:** NOT merged. Draft PR #1955. Independent review (reviewer ≠ Leon): **APPROVE** — no blockers; one non-blocking observation (LATENT `rotary_dim` should mirror the op's multiple-of-16 rotary-cache contract) was **fixed** in follow-up commit `69e251202` with added tests. Gaff or Roy final approval still required before merge.
 
 ## What this slice lands (the KV-authority half of one-authority integration)
 
