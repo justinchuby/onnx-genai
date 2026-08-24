@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 
@@ -117,20 +117,36 @@ def is_cuda_test_target(target: str) -> bool:
     )
 
 
+def policed_cuda_targets_by_dir() -> dict[Path, list[Path]]:
+    """The policed CUDA test targets, kept separated by the directory they came from.
+
+    The census below needs per-directory counts, not a total. These crates
+    have split before -- the GPU tests moved out of the execution provider
+    into `onnx-runtime-cuda-memory`, which is why TEST_DIRS names two
+    directories -- and a total cannot distinguish "both present" from "one
+    emptied and the other still large enough to look healthy".
+    """
+    return {
+        test_dir: [
+            path
+            for path in sorted(test_dir.glob("*.rs"))
+            if is_cuda_test_target(path.stem)
+        ]
+        for test_dir in TEST_DIRS
+    }
+
+
 def policed_cuda_targets() -> list[Path]:
     """Every CUDA test target the source scan is responsible for.
 
-    Both scans and the census below enumerate through here rather than each
-    globbing for themselves. A census that walked its own copy of this loop
-    could disagree with the scans about what is in scope, and would then be
+    Both scans and the census enumerate through here rather than each globbing
+    for themselves. A census that walked its own copy of this loop could
+    disagree with the scans about what is in scope, and would then be
     reporting on a set nobody checks -- so the enumeration is shared to make
     that divergence unrepresentable rather than merely unlikely.
     """
     return [
-        path
-        for test_dir in TEST_DIRS
-        for path in sorted(test_dir.glob("*.rs"))
-        if is_cuda_test_target(path.stem)
+        path for targets in policed_cuda_targets_by_dir().values() for path in targets
     ]
 
 
@@ -690,26 +706,39 @@ def scan_source_for_inventory_drift() -> list[str]:
     return errors
 
 
-def census_errors(policed: Sequence[Path]) -> list[str]:
-    """The scan must have had something to scan.
+def census_errors(by_dir: Mapping[Path, Sequence[Path]]) -> list[str]:
+    """Every policed directory must have contributed something to scan.
 
-    Both source scans report per-target, so an empty target set produces no
-    findings and the scan reports success -- which is the very failure it
-    exists to catch, one level up. The #1875 defect had two shapes: a test that
-    runs where there is no device, and a test that leaves the inventory so the
-    lane goes green because the tests are not there. A guard keyed only on
-    per-target findings cannot see the second, because the fault removes the
-    things the guard reads. This one keys on the census instead, which the
-    fault cannot suppress without tripping it.
+    Both source scans report per-target, so a directory with no targets
+    produces no findings and reads as clean -- which is the second shape of
+    the #1875 defect (tests leave the inventory, the lane goes green because
+    the tests are not there) at directory granularity. A guard keyed on the
+    scans' findings cannot see it, because the fault removes the things the
+    guard reads.
+
+    The check is per-directory rather than on the total. An aggregate
+    non-empty test only defends the all-or-nothing case: with 61 targets in
+    one directory and 21 in the other, deleting the larger leaves the total
+    comfortably non-zero and the gate reports a confident pass over the
+    remainder. The crates have already split once for exactly this kind of
+    reason, so a move that lands one directory somewhere TEST_DIRS does not
+    point at is the realistic version of this fault, not the exotic one.
+
+    A missing directory contributes nothing and so fails here too, which is
+    the intent: TEST_DIRS is a constant in this file and the crate layout
+    around it is not, so the constant going stale must be loud.
     """
-    if policed:
-        return []
-    return [
-        "source scan found no CUDA test targets under "
-        f"{', '.join(str(d.relative_to(ROOT)) for d in TEST_DIRS)}. "
-        "Either the crate layout moved and this script is now scanning nothing, "
-        "or the targets were deleted; both make every check above vacuous."
-    ]
+    errors: list[str] = []
+    for test_dir, targets in by_dir.items():
+        if targets:
+            continue
+        errors.append(
+            f"{test_dir.relative_to(ROOT)} contributed no CUDA test targets to the scan. "
+            "Either it was deleted, or the crate layout moved and TEST_DIRS in this script "
+            "is now pointing at nothing. Every per-target check is vacuous for this "
+            "directory until that is resolved."
+        )
+    return errors
 
 
 def parse_test_binaries_from_json(stdout: str) -> list[TestBinary]:
@@ -1273,18 +1302,26 @@ def self_test() -> None:
     # Census fixtures. The two scans above are per-target and report nothing
     # when there are no targets, so `--source-scan` used to exit 0 with the
     # CUDA tests directory deleted -- reporting success for the inventory
-    # disappearance it is partly there to catch. The reject arm is the fixture
-    # that matters; the accept arm is here so a census that always reported
-    # "empty" could not pass for the wrong reason.
-    if census_errors([Path("crates/onnx-runtime-ep-cuda/tests/matmul_gpu.rs")]):
-        raise AssertionError("a non-empty census is the healthy case and must not be flagged")
-    if not any("found no CUDA test targets" in error for error in census_errors([])):
-        raise AssertionError("an empty census must fail: every per-target check above is vacuous")
-
-    # The census must read the same set the scans police. Enumerating
-    # separately would let it certify a set nobody checks.
-    if [path for path in policed_cuda_targets() if not is_cuda_test_target(path.stem)]:
-        raise AssertionError("the census must contain only policed targets")
+    # disappearance it is partly there to catch.
+    #
+    # These are pure: they pass literal mappings rather than reading the tree,
+    # so `--self-test` stays hermetic and the partial case below is expressible
+    # at all. It is not otherwise, since it needs one directory populated and
+    # one empty at the same instant.
+    ep_dir, memory_dir = TEST_DIRS
+    healthy = {ep_dir: [ep_dir / "matmul_gpu.rs"], memory_dir: [memory_dir / "pool_gpu.rs"]}
+    if census_errors(healthy):
+        raise AssertionError("a populated census is the healthy case and must not be flagged")
+    if len(census_errors({ep_dir: [], memory_dir: []})) != 2:
+        raise AssertionError("a wholly empty census must fail once per policed directory")
+    # The case an aggregate non-empty check cannot see: one directory emptied
+    # while the other still holds enough targets to look healthy. This is the
+    # realistic shape -- these crates have split once already.
+    partial = census_errors({ep_dir: [ep_dir / "matmul_gpu.rs"], memory_dir: []})
+    if len(partial) != 1 or str(memory_dir.relative_to(ROOT)) not in partial[0]:
+        raise AssertionError(
+            "one emptied directory must fail and must name itself, even while the other is full"
+        )
 
 
 def main() -> int:
@@ -1303,11 +1340,12 @@ def main() -> int:
         return 0
 
     if args.source_scan:
-        policed = policed_cuda_targets()
+        by_dir = policed_cuda_targets_by_dir()
+        policed = [path for targets in by_dir.values() for path in targets]
         source_errors = (
             scan_source_for_missing_ignores()
             + scan_source_for_inventory_drift()
-            + census_errors(policed)
+            + census_errors(by_dir)
         )
         if source_errors:
             print("CUDA test source scan failed:", file=sys.stderr)
@@ -1328,7 +1366,7 @@ def main() -> int:
     errors: list[str] = (
         scan_source_for_missing_ignores()
         + scan_source_for_inventory_drift()
-        + census_errors(policed_cuda_targets())
+        + census_errors(policed_cuda_targets_by_dir())
     )
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
