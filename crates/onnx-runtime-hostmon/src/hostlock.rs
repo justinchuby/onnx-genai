@@ -441,16 +441,24 @@ pub fn config_path() -> std::path::PathBuf {
 /// a filesystem, and so they can be stated once for comparison against the
 /// `sed` expression in the script.
 pub fn parse_conf_lock_dir(text: &str) -> Option<String> {
+    // ASCII whitespace only, deliberately, because the other implementation is
+    // `sed`'s `[[:space:]]`, which is ASCII even in a UTF-8 locale. Rust's
+    // `trim` follows Unicode `White_Space`, so a NO-BREAK SPACE beside the path
+    // would be stripped here and kept there -- and the two implementations
+    // would then resolve DIFFERENT directories from one config file, which is
+    // the state in which the reader stamps `free` on rows taken while a peer
+    // holds the box. An unlikely byte is not a reason to let the rule differ.
+    let ascii_ws = |c: char| c.is_ascii_whitespace();
     for line in text.lines() {
-        let line = line.trim_start();
+        let line = line.trim_start_matches(ascii_ws);
         let Some(rest) = line.strip_prefix("lock_dir") else {
             continue;
         };
-        let rest = rest.trim_start();
+        let rest = rest.trim_start_matches(ascii_ws);
         let Some(value) = rest.strip_prefix('=') else {
             continue;
         };
-        let value = value.split('#').next().unwrap_or("").trim();
+        let value = value.split('#').next().unwrap_or("").trim_matches(ascii_ws);
         return Some(value.to_string());
     }
     None
@@ -961,6 +969,13 @@ mod tests {
         assert_eq!(parse_conf_lock_dir("lock_dir_old=/a\n"), None);
         assert_eq!(parse_conf_lock_dir("# lock_dir=/a\n"), None);
         assert_eq!(parse_conf_lock_dir("other=1\n"), None);
+        // ASCII whitespace only, matching `sed`'s `[[:space:]]`. A NO-BREAK
+        // SPACE is part of the path on both sides, or the two implementations
+        // resolve different directories from one file.
+        assert_eq!(
+            parse_conf_lock_dir("lock_dir=/var/lib/hl\u{a0}\n").as_deref(),
+            Some("/var/lib/hl\u{a0}")
+        );
         // Present but empty is Some(""), NOT None: absent means "no opinion,
         // use the default", empty means "the admin tried to say something and
         // it is unusable". Collapsing them would silently send this process to

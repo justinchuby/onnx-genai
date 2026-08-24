@@ -1863,7 +1863,13 @@ chk "and the value is carried literally, not expanded" \
 
 # The announcement. Run with HOSTLOCK_PRIVATE_OK unset, so these cells are not
 # silenced by the suite-wide acknowledgement at the top of this file.
-priv_err() { { env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh "$@" >/dev/null; } 2>&1; }
+# HOSTLOCK_CONF is pinned at a path that does not exist, like the cells above,
+# so the expected "peers are over there" path is the documented default rather
+# than whatever this particular host has configured. Without it the cell would
+# fail on exactly the hosts this feature exists for -- the ones that adopted a
+# config -- and a suite that breaks when the feature is used is a suite that
+# gets its expectations loosened.
+priv_err() { { env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh "$@" >/dev/null; } 2>&1; }
 chk "a private lock announces itself on every invocation" \
     "$(priv_err status | grep -c 'PRIVATE lock')" "1"
 chk "and names the path peers are actually using, so the warning is actionable" \
@@ -1871,11 +1877,11 @@ chk "and names the path peers are actually using, so the warning is actionable" 
 chk "and says how to acknowledge it" \
     "$(priv_err status | grep -c 'HOSTLOCK_PRIVATE_OK=1')" "1"
 chk "the announcement is on stderr, not in the machine-readable output" \
-    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE')" "0"
+    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE')" "0"
 chk "acknowledging it silences it" \
-    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | wc -c)" "0"
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | wc -c)" "0"
 chk "and the acknowledgement is explicit: any other value still warns" \
-    "$(HOSTLOCK_PRIVATE_OK=yes HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | grep -c 'PRIVATE lock')" "1"
+    "$(HOSTLOCK_PRIVATE_OK=yes HOSTLOCK_CONF="$NOCONF" HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | grep -c 'PRIVATE lock')" "1"
 
 # The row has to carry it too. A console warning is gone by the time anyone
 # reads the table; `declared=yes` is only checkable if the row says which lock
