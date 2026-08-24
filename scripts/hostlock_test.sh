@@ -384,11 +384,12 @@ echo "== run: the wrapped command can recognise its own lock =="
 # these cells instead of the code under test.
 CHILDOWNER="$LOCK".childowner
 child_saw() { cat "$CHILDOWNER" 2>/dev/null; }
-# $0 is the report file; ${HOSTLOCK_OWNER:-<unset>} distinguishes "exported
-# empty" from "not exported at all", which is the whole question here.
+# $0 is the report file. The no-colon `${HOSTLOCK_OWNER-<unset>}` really does
+# distinguish "exported empty" from "not exported at all"; the colon form
+# reports both as unset, and those are different answers from `run`.
 # The child must expand these, not this shell: SC2016 is the point, not a bug.
 # shellcheck disable=SC2016
-SAY_OWNER='printf "%s" "${HOSTLOCK_OWNER:-<unset>}" > "$0"'
+SAY_OWNER='printf "%s" "${HOSTLOCK_OWNER-<unset>}" > "$0"'
 
 rm -f "$CHILDOWNER"
 env -u HOSTLOCK_OWNER $HL run --owner leon -- bash -c "$SAY_OWNER" "$CHILDOWNER" >/dev/null 2>&1
@@ -418,7 +419,7 @@ cleanup
 rm -f "$CHILDOWNER"
 # shellcheck disable=SC2016  # the child expands these, which is the point
 env -u HOSTLOCK_OWNER $HL run --owner leon -- bash -c \
-    'printf "%s %s" "${HOSTLOCK_OWNER:-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
+    'printf "%s %s" "${HOSTLOCK_OWNER-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
     "$CHILDOWNER" >/dev/null 2>&1
 chk "the exported name is the name in the lock, so the reader can say mine:" \
     "$(child_saw)" "leon leon"
@@ -432,10 +433,21 @@ cleanup
 rm -f "$CHILDOWNER"
 # shellcheck disable=SC2016  # the child expands these, which is the point
 env -u HOSTLOCK_OWNER $HL run -- bash -c \
-    'printf "%s|%s" "${HOSTLOCK_OWNER:-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
+    'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
     "$CHILDOWNER" >/dev/null 2>&1
 chk "an owner defaulted from \$USER is written to the lock but not exported" \
     "$(child_saw)" "<unset>|${USER:-unknown}"
+cleanup
+
+# ...and the flag that decides this cannot come from the environment either.
+# Bash imports an inherited variable as a shell variable, so a script that
+# read `${OWNER_DECLARED:-0}` without initialising it would let any caller who
+# happened to export that name obtain the export it never asked for -- of the
+# $USER default, which is exactly the false `mine:` the cell above rules out.
+# Found by review of the first version of this fix, which had that hole.
+rm -f "$CHILDOWNER"
+OWNER_DECLARED=1 env -u HOSTLOCK_OWNER $HL run -- bash -c "$SAY_OWNER" "$CHILDOWNER" >/dev/null 2>&1
+chk "an inherited OWNER_DECLARED cannot stand in for the flag" "$(child_saw)" "<unset>"
 cleanup
 
 # Inheriting into a nested acquire is deliberate, not incidental: a wrapped
@@ -2068,7 +2080,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "320"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "321"
 
 echo
 echo "passed=${pass} failed=${fail}"

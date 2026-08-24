@@ -1362,12 +1362,12 @@ run_teardown() {
 # `OWNER` cannot answer this: by the time anything reads it, the `$USER`
 # default is indistinguishable from an explicit `--owner "$USER"`. The two
 # sources are therefore checked at their origin -- the environment here, and
-# `--owner` through OWNER_DECLARED in the parse loop. OWNER_DECLARED may be
-# unset (this script runs under `set -u`), so it is read with a default
-# rather than initialised next to OWNER, which keeps this self-contained.
+# `--owner` through OWNER_DECLARED, which the defaults block assigns (so an
+# inherited OWNER_DECLARED cannot answer for a flag nobody passed) and the
+# parse loop sets.
 run_owner_is_declared() {
     [ -n "${HOSTLOCK_OWNER:-}" ] && return 0
-    [ "${OWNER_DECLARED:-0}" = 1 ] && return 0
+    [ "$OWNER_DECLARED" = 1 ] && return 0
     return 1
 }
 
@@ -1440,6 +1440,13 @@ cmd_run() {
 }
 
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
+# Initialised, not merely defaulted at the point of use: bash imports an
+# inherited environment variable as a shell variable, so reading
+# ${OWNER_DECLARED:-0} without this lets a caller who exports OWNER_DECLARED=1
+# claim an owner it never passed -- and the owner it would then export is the
+# $USER default, which is the false `mine:` this whole change exists to
+# prevent. Assigning here severs the environment from the flag.
+OWNER_DECLARED=0
 REASON=""
 DO_WAIT=0
 TIMEOUT=3600

@@ -570,10 +570,12 @@ pub fn field(before: &LockState, after: &LockState, self_owner: Option<&str>) ->
 /// `hostlock.sh`'s `--owner` has one. Every agent on this host runs as the same
 /// user, so `$USER` cannot distinguish one declaration from another, and
 /// defaulting to it would report `mine:` for a co-tenant's lock -- the one
-/// direction this module exists to prevent. Note also that `hostlock.sh run`
-/// does not export `--owner`, so passing the flag alone leaves a child unable
-/// to recognise its own parent's lock; that reports [`Held`](LockField::Held),
-/// which is unattributed and unprotected, and is the honest answer.
+/// direction this module exists to prevent. `hostlock.sh run` exports a
+/// *declared* owner (`--owner`, or `HOSTLOCK_OWNER` already in the
+/// environment) so a wrapped command can recognise its own lock, but never one
+/// it defaulted from `$USER`, for that same reason: with neither given the
+/// child is told nothing and this reports [`Held`](LockField::Held), which is
+/// unattributed and unprotected, and is the honest answer.
 pub fn field_from_env(before: &LockState, after: &LockState) -> LockField {
     let owner = std::env::var("HOSTLOCK_OWNER").ok();
     field(before, after, owner.as_deref())
