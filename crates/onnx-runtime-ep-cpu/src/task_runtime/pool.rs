@@ -418,12 +418,12 @@ impl Shared {
     fn spin_for_dispatch(&self, last_epoch: u32, spin_window: Duration) -> SpinOutcome {
         let start = Instant::now();
         let mut spins = 0u32;
-        loop {
+        let outcome = loop {
             if self.shutdown.load(Ordering::Acquire) {
-                return SpinOutcome::Shutdown;
+                break SpinOutcome::Shutdown;
             }
             if self.epoch.0.load(Ordering::Acquire) != last_epoch {
-                return SpinOutcome::Caught;
+                break SpinOutcome::Caught;
             }
             spins = spins.wrapping_add(1);
             if spins < SPIN_LOOP_BUDGET {
@@ -433,10 +433,10 @@ impl Shared {
                 // `Instant::now()` would dominate the phase. And the check
                 // has to run here at all, because at the converged idle
                 // window (`MIN_SPIN`, 20us) the deadline expires *before*
-                // the spin phase ends: 4096 `spin_loop`s measure 128us on
+                // the spin phase ends: 4096 `spin_loop`s measure 130us on
                 // this host.
                 if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= spin_window {
-                    return SpinOutcome::Expired;
+                    break SpinOutcome::Expired;
                 }
             } else {
                 spin_yield();
@@ -446,18 +446,29 @@ impl Shared {
                 // already-starved thread -- see #1825, which made this
                 // correction in `decode_spmd`'s readiness barrier. It bites
                 // whenever the window outlasts the spin phase, which is the
-                // whole grown range: 4096 `spin_loop`s measure 128us on
-                // this host, well under `MAX_SPIN` (500us), so every window
-                // above the floor reaches the yield phase. `MAX_SPIN`'s
-                // contract is that a process which stops inferencing
-                // returns to ~0% CPU in under a millisecond; a
-                // stride-gated check cannot honour that under exactly the
-                // load that makes it matter.
+                // upper part of the grown range rather than all of it: 4096
+                // `spin_loop`s measure 130us on this host, so windows from
+                // ~160us up -- including the `MAX_SPIN` (500us) ceiling a
+                // busy steady state converges on -- reach this phase, while
+                // the shorter windows above the floor expire in the spin
+                // phase above and never arrive here. `MAX_SPIN`'s contract
+                // is that a process which stops inferencing returns to ~0%
+                // CPU in under a millisecond; a stride-gated check cannot
+                // honour that under exactly the load that makes it matter:
+                // measured, a yield with four runnable siblings on one core
+                // costs 11.2ms, so a 64-yield stride holds the core 717ms
+                // past a 500us window.
                 if start.elapsed() >= spin_window {
-                    return SpinOutcome::Expired;
+                    break SpinOutcome::Expired;
                 }
             }
-        }
+        };
+        // Recorded on exit rather than per iteration: a thread-local bump
+        // inside the spin phase would be a sizeable fraction of a ~31ns
+        // `spin_loop` and would distort the very phase under test.
+        #[cfg(test)]
+        SPIN_COUNT.with(|c| c.set(spins as u64));
+        outcome
     }
 }
 
@@ -494,6 +505,14 @@ thread_local! {
     /// observable ("was it parked at T?") is not monotone that way and goes
     /// flaky beside 1700 siblings.
     static YIELD_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// `spin_loop` iterations the last [`Shared::spin_for_dispatch`] on this
+    /// thread ran before returning. The observable for the *spin*-phase
+    /// deadline, and monotone in the safe direction for the same reason
+    /// [`YIELD_COUNT`] is: a preempted thread accumulates wall time faster per
+    /// iteration, so it crosses the deadline in FEWER spins, never more. Load
+    /// can only push the guard below towards passing.
+    static SPIN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The yield in the spin loop's second phase, with a test-only injected cost.
@@ -735,6 +754,62 @@ fn slot_hint() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spin window's deadline must also be evaluated *inside* the pure
+    /// `spin_loop` phase, not only once that phase is exhausted.
+    ///
+    /// #1868 did two separable things at this site: it removed a stride from
+    /// the yield phase (guarded by the test below, #2022) and it *added* this
+    /// check to the spin phase. The second half was unguarded — deleting it
+    /// outright left the whole crate green at **1723 passed / 0 failed**.
+    ///
+    /// It matters at the bottom of the window's range, which is where a
+    /// mostly-idle process lives: the window halves on every park and floors
+    /// at `MIN_SPIN` (20us), while the spin phase runs 4096 `spin_loop`s,
+    /// measured at 130us on this host. Without a check inside that phase a
+    /// worker told to release its core after 20us cannot even look at the
+    /// clock until 130us have passed — a 6.5x overshoot at exactly the idle
+    /// floor the window exists to bound, and on a shared box that surplus
+    /// lands on a co-tenant.
+    ///
+    /// The observable is the spin count rather than elapsed time because it is
+    /// monotone in the safe direction: a preempted thread crosses the deadline
+    /// in fewer spins, never more, so load can only push this towards passing.
+    /// It also survives the interpreter — under Miri 4096 iterations take far
+    /// longer than 20us, so the correct code exits at the first stride
+    /// boundary and the defective code still runs the whole budget.
+    #[test]
+    fn the_spin_window_deadline_is_also_evaluated_during_the_pure_spin_phase() {
+        // Width 1 spawns no threads, so the epoch cannot move under us and the
+        // only way out of the loop is the deadline.
+        let pool = TaskPool::new(1);
+        let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
+        SLOW_YIELD_US.with(|c| c.set(0));
+        SPIN_COUNT.with(|c| c.set(0));
+
+        let outcome = pool.shared.spin_for_dispatch(last_epoch, MIN_SPIN);
+        let spins = SPIN_COUNT.with(std::cell::Cell::get);
+
+        assert_eq!(
+            outcome,
+            SpinOutcome::Expired,
+            "no dispatch was published, so the window must have expired"
+        );
+        // The first spin-phase evaluation is at the first stride boundary, so
+        // anything below it did not leave through the deadline at all.
+        assert!(
+            spins >= u64::from(CLOCK_CHECK_STRIDE),
+            "left after {spins} spins, fewer than one {CLOCK_CHECK_STRIDE}-iteration \
+             stride: the loop did not exit through the spin-phase deadline"
+        );
+        assert!(
+            spins < u64::from(SPIN_LOOP_BUDGET),
+            "ran the whole {SPIN_LOOP_BUDGET}-iteration spin budget against a \
+             {MIN_SPIN:?} window, i.e. the deadline was not evaluated during the \
+             pure-spin phase at all and could not be honoured until that phase \
+             ended -- ~130us on this host against a window of {MIN_SPIN:?}"
+        );
+    }
 
     /// The spin window's deadline must be re-read on every yield.
     ///

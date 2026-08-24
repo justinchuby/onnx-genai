@@ -80,6 +80,8 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
+      - "scripts/ort_ab/ab.py"
+      - "scripts/ort_ab/test_ab_lock.py"
       - ".github/workflows/hostlock.yml"
   push:
     branches:
@@ -87,6 +89,8 @@ on:
     paths:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
+      - "scripts/ort_ab/ab.py"
+      - "scripts/ort_ab/test_ab_lock.py"
       - ".github/workflows/hostlock.yml"
 
 permissions:
@@ -109,3 +113,11 @@ jobs:
       # trusted to mean what its name says.
       - name: Conformance suite
         run: bash scripts/hostlock_test.sh
+
+      # The admission gate in the A/B driver is lock conformance one layer up:
+      # it is what makes the outer harness hold the lock across every arm
+      # rather than each benchmark child holding it between them. Its cells
+      # drive the real `hostlock.sh` against a stub arm that prints a result
+      # line and exits, so they cost no measurable CPU and need no quiet host.
+      - name: A/B driver admission
+        run: python3 scripts/ort_ab/test_ab_lock.py
