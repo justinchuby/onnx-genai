@@ -2048,11 +2048,83 @@ time. That figure is now stale; the re-measurement replaces it.
 > ships **off**, and would need prefill in the matrix before it could ship on --
 > the dispatcher is the session thread and keeps its affinity after decode ends.
 > **The A/A null therefore remains open, and the +23% steal-tiles candidate
-> remains blocked behind it.** Full records:
+> remains blocked behind it.** **A third mechanism has now been tested and
+> rejected: transparent-hugepage backing of the weight arena.** THP is
+> `[always]` with `defrag=madvise` on this host, so a 2 MB fault that cannot be
+> served immediately falls back to 4 KB silently and permanently — a per-process
+> lottery that fits the null's shape exactly. It is not what is happening:
+> across 12 quiet-host launches `thp_frac` is **0.823–0.928** (range 0.104
+> against a pre-registered 0.20) with Spearman rho **-0.19** against a required
+> -0.70, while `ms_token` spans 1.725x over the same launches. **83–93% of
+> anonymous memory is already hugepage-backed in every launch, including every
+> slow one.** A four-launch reconnaissance of the same rule returned a *perfect*
+> rho of -1.0000 over a 0.023 range and was refused by the pre-registered range
+> guard — the same small-n manufacture that produced the 1.1910 dispatcher-pin
+> ACCEPT. **What the run did establish is sharper than the rejection: on a quiet
+> host the null is not a spread, it is two modes.** The slow cluster is five
+> launches agreeing to **1.05%**, the inter-cluster gap is **11x** the largest
+> within-cluster gap, launch order does not predict membership, and the mode
+> ratio is **1.687x** — against a 1.23x candidate it is blocking. So the target
+> is now a *discrete per-launch configuration*, not a variance to average down,
+> and three mechanisms are excluded (dispatcher placement, worker placement,
+> page backing). **A second quiet-host run reproduces both modes to within 1%**
+> (3.48-3.81 and 5.91-6.03), which makes them a property of the system rather
+> than of a run, and it **separates them**: `park_frac`, `sys_frac` and
+> `cpu_s_per_token` all overlap across the modes, but *effective lanes* —
+> `cpu_s_per_token / ms_token` — does not. **Mode A runs on 15.30-16.10 of the
+> sixteen lanes; mode B on 9.76-12.16, with no overlap and a 3.1-lane gap.** The
+> slow mode is not burning more CPU; it uses *less* per token and takes 1.55x
+> the wall time (**this sentence is wrong and is corrected below** — it
+> generalises from one B launch undercutting one A launch; mode B's *median*
+> CPU per token is above mode A's). So the question is now "why does a launch
+> that builds 15
+> workers on 15 verified distinct physical cores run at two-thirds of its width
+> for its entire life". **The foreign-load hypothesis has now been tested and
+> is REJECTED.** A per-launch `/proc/stat` read of the sixteen pinned CPUs minus
+> our own `getrusage` child CPU bounds non-ours time at **0.59 CPU-seconds
+> against ~34, a 1.7% ceiling in every launch**, where costing 3.7 of 16 lanes
+> needs 23%; Spearman rho is **+0.0210** and the *fastest* launch carries 1.6x
+> more foreign time than the slow one. That magnitude bound does not depend on
+> sampling the slow mode, which matters because that run drew only 1 slow launch
+> in 12 (incidence across three clean runs: 5/12, 6/14, 1/12 — **not a stable
+> rate, do not quote it**). **The same run relocates the target:** splitting CPU
+> per token into user and system, **user CPU per token spans 11% across both
+> modes while wall spans 1.69x**, and the slow launch is **+4.6% user, +170%
+> sys**. The work is identical; the lanes are lost to **waiting in
+> `worker_wait`'s yield loop** — a persistent straggler *inside* the process,
+> with placement, page backing and foreign load all now excluded. Remaining
+> candidates: weight-arena memory placement across the two L3/CCX domains, and
+> per-launch clock/boost state. Two unblocks this licenses for A/B work, neither
+> needing a pool fix: **stratify on an in-launch statistic that cannot see the
+> arm** (effective lanes, backed by three runs; `sys_frac` separates 0.315 vs
+> 0.140-0.200 but on one slow sample, so treat as hypothesis), and **score
+> work-reducing candidates on user CPU per token**, where the null is 15x
+> smaller — null-immune but narrow, since a pure load-balance change like the
+> +23% steal-tiles candidate moves wall and `sys` while leaving user CPU flat,
+> making it that candidate's *control* rather than its score. **The +23%
+> candidate has now been re-tested and is CLOSED.** 24 launches with the
+> unmodified rule: **ratio 0.9883, sign 38%**; stratified to the fast mode the
+> A/A half-width collapses **0.1478 → 0.0323**, an instrument 4.6x sharper that
+> would resolve anything above +9.7%, and the effect is **−0.0111**. The
+> original +23% is accounted for: its control arm drew the slow mode in 4 of 8
+> launches against the test arm's 1 of 8, and at the 1.687x mode ratio that
+> imbalance alone manufactures up to **+0.2576** — more than the +0.2327
+> observed. Its `sys_frac` "mechanism confirmation" inverts at n=24 (+0.0111,
+> 46% sign), because the slow mode is the high-`sys` mode and the mechanism was
+> downstream of the same nuisance variable. **A directionally-correct mechanism
+> reading corroborates nothing if it is not independent of the confound.**
+> Stratification is nonetheless validated as a method here (4.6x sharper null,
+> paired-imbalance gate passing at 8.3%) and costs ~3x the launches, since each
+> launch runs three independent width-16 processes that each draw the mode. The
+> 22.2-point straggler wait remains the open target; what is closed is the claim
+> that spare tiles collect it. Full records:
+
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md),
-> [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md).
+> [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
+> [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
+> [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
