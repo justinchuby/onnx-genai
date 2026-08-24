@@ -44,6 +44,18 @@ resources, device placement, and concurrency are generic services. Workflow valu
 declare active/done/accepted-length/slot data. Transfers are explicit and host code
 does not implement hidden reducers, scatter, append, scheduler, or sampler math.
 
+## Session concurrency
+
+Public session APIs are thread-safe, distinct sessions execute concurrently on a
+bounded pool of session workers, and a session is owned by exactly one worker for
+its whole life because backend handles are thread-affine. A second turn on a
+session whose lease declares `policy: exclusive` is refused by type rather than
+silently serialized, because silent serialization loses an update without
+reporting it. Backend handles are never made `Sync` by wrapping raw handles in
+locks: where a handle names a bound context or an owning stream, the design
+supplies a thread. See [SESSION_CONCURRENCY.md](SESSION_CONCURRENCY.md), which
+states what holds today and what the migration phases change.
+
 ## Representative lowerings
 
 Autoregressive decoding, VLM, diffusion, masked diffusion, speculative decoding,
