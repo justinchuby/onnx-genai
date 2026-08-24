@@ -241,6 +241,28 @@ the lock is the only statement about the interval, because it is a
 from people who never took the lock; it is a start admission control and
 nothing more.
 
+`ab.py` **enforces this rather than documenting it.** Before it launches a
+single arm it reads the lock and requires a declaration whose anchor is itself
+or one of its ancestors; anything else stops the run with exit 3 and prints the
+wrapping command. The ancestry test is what distinguishes the two shapes that
+both look like "a lock is held": a lock held by an *ancestor* spans every arm,
+while a lock held by a benchmark *child* is released between them, which is the
+gap a peer's sweep once started in. A peer's lock stops the run for the
+opposite reason — they declared the box.
+
+```sh
+scripts/hostlock.sh run --owner leon --reason "moe mt panel 6-cell" -- \
+    python3 scripts/ort_ab/ab.py --arms base=./a mine=./b --null-control ...
+```
+
+Every CSV row then carries `host_lock`, `lock_owner`, `lock_anchor_pid`,
+`runnable_at_start` and `contended`, and the label covers the **whole window**:
+the lock is read again at the end, and a run that changed hands halfway through
+is stamped `changed` rather than named after whoever happened to hold it last.
+`--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
+tests, never for anything publishable. `scripts/ort_ab/test_ab_lock.py` covers
+the admission table and runs in the `Host lock` workflow.
+
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
 that pid's start time, and the next acquirer reclaims it as soon as that

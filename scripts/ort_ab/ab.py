@@ -32,6 +32,8 @@ import sys
 from pathlib import Path
 from statistics import median
 
+HOSTLOCK = Path(__file__).resolve().parents[1] / "hostlock.sh"
+
 RESULT = re.compile(
     r"native=(?P<native>[\d.]+) ms .*?ort=(?P<ort>[\d.]+) ms .*?"
     r"native/ort=(?P<ratio>[\d.]+) native_p90=(?P<np90>[\d.]+) ort_p90=(?P<op90>[\d.]+) "
@@ -47,6 +49,168 @@ RESULT_NATIVE_ONLY = re.compile(
     r"native_min=(?P<nmin>[\d.]+)(?: ms)? "
     r"native_spread=(?P<nspread>[\d.]+).*?parity=(?P<parity>\w+)"
 )
+
+
+def parse_provenance(text: str) -> dict[str, str]:
+    """`hostlock.sh provenance --oneline` into a dict.
+
+    Values cannot contain spaces: the script sanitises owner and reason for
+    exactly this reason, so splitting on whitespace is the format's contract
+    rather than an assumption about it.
+    """
+    fields = {}
+    for token in text.split():
+        key, sep, value = token.partition("=")
+        if sep:
+            fields[key] = value
+    return fields
+
+
+def read_provenance(runner=subprocess.run) -> dict[str, str]:
+    """Asks the lock what it is doing. Empty on any failure.
+
+    An empty reading is fail-closed here: `lock_verdict` refuses anything it
+    cannot read as a live declaration held by this harness, so a missing or
+    broken `hostlock.sh` stops the run instead of silently ungating it.
+    """
+    try:
+        out = runner(
+            ["bash", str(HOSTLOCK), "provenance", "--oneline"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except Exception:
+        return {}
+    return parse_provenance(out.stdout)
+
+
+def parent_of(pid: int) -> int | None:
+    """`/proc/<pid>/stat` field 4.
+
+    The comm field is parenthesised and may itself contain spaces and
+    parentheses, so the split is anchored on the LAST `)` -- a naive
+    `split()[3]` reads the wrong column for a process whose name has a space
+    in it, and reads a plausible number rather than failing.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    _, _, rest = stat.rpartition(")")
+    parts = rest.split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def ancestry(pid: int, parent=parent_of, limit: int = 64) -> set[int]:
+    """This process and every ancestor of it, up to init.
+
+    `limit` and the seen-set are not paranoia: pid 1's parent is 0, a
+    namespaced or reparented process can report a parent that is already in
+    the chain, and a walk that trusted the chain to terminate would hang the
+    harness before it ran anything.
+    """
+    chain = {pid}
+    current = pid
+    for _ in range(limit):
+        nxt = parent(current)
+        if nxt is None or nxt <= 0 or nxt in chain:
+            break
+        chain.add(nxt)
+        current = nxt
+    return chain
+
+
+# The message is long on purpose: it is read by someone who has just been
+# stopped, and the remedy has to be in front of them rather than in a doc.
+_REMEDY = """
+Wrap the WHOLE matrix -- every arm, including the null control -- in the lock:
+
+    scripts/hostlock.sh run --owner <you> --reason "<what this measures>" -- \\
+        python3 scripts/ort_ab/ab.py <your args>
+
+Wrapping each benchmark child instead leaves the host looking idle in the gap
+between two arms, which is how one agent started a sweep in the middle of
+another's interleaved A/B. The holder must be the process that spans the arms.
+
+`--unlocked` runs anyway and stamps every row so the numbers cannot later be
+mistaken for protected ones. It is for smoke tests, not for anything you
+intend to publish."""
+
+
+def lock_verdict(prov: dict[str, str], chain: set[int]) -> tuple[str, str | None]:
+    """The `host_lock=` label for this run, and why it may not proceed.
+
+    Returns `(label, None)` when the run is covered by a declaration held by
+    this harness or one of its ancestors, and `(label, reason)` otherwise.
+
+    The ancestry test is the point, and it is stronger than "is the lock
+    held": a lock held by a *child* -- one `hostlock.sh run` per benchmark
+    invocation -- is released between arms, so it certifies each arm and
+    protects none of the comparison. A lock held by a *peer* is a reason to
+    stop rather than to start.
+    """
+    state = prov.get("hostlock_state", "")
+    owner = prov.get("held_by", "none")
+    try:
+        anchor = int(prov.get("held_pid", "none"))
+    except ValueError:
+        anchor = 0
+
+    if not prov:
+        return "unknown", "the host lock could not be read at all"
+    if state == "HELD" and anchor in chain:
+        return f"mine:{owner}", None
+    if state == "HELD":
+        return (
+            f"foreign:{owner}",
+            f"{owner} (pid {anchor}) holds this host, and that declaration is "
+            "not an ancestor of this harness",
+        )
+    if state == "EXPIRED":
+        return (
+            f"expired:{owner}",
+            "the declaration covering this host has expired, so a peer may "
+            "take the box mid-matrix. Re-acquire before measuring",
+        )
+    if state == "STALE":
+        return (
+            f"stale:{owner}",
+            f"the lock is held by a dead anchor ({owner}, pid {anchor}). "
+            "Reaping it does not stop whatever load it was covering, so "
+            "check the host before taking it",
+        )
+    if state == "UNUSABLE":
+        return (
+            "unusable",
+            "this host cannot take the lock at all (see `hostlock.sh status`). "
+            "Fix `lock_dir=` rather than measuring without one",
+        )
+    if state == "FREE":
+        return "free", "no declaration covers this run"
+    return state.lower() or "unknown", f"the lock reports {state or 'nothing'}"
+
+
+def window_label(label: str, before: dict[str, str], after: dict[str, str]) -> str:
+    """`changed` when custody moved during the run, else `label` unchanged.
+
+    A run that changed hands halfway through was protected for neither half,
+    and a label naming whoever happened to hold the lock at one end describes
+    the other end as something it was not. Both the owner and the anchor pid
+    are compared: the same agent re-acquiring under a new anchor is still a
+    gap in which the box was free, and on a host cycling ~1.5M pids in four
+    days the pid alone can repeat.
+    """
+    moved = (after.get("held_by"), after.get("held_pid")) != (
+        before.get("held_by"),
+        before.get("held_pid"),
+    )
+    return "changed" if moved else label
 
 
 def run_one(
@@ -126,7 +290,30 @@ def main() -> None:
         "run depresses the native arm (up to 6x on long cells here) and its "
         "noise swamps the comparison",
     )
+    ap.add_argument(
+        "--unlocked",
+        action="store_true",
+        help="run without a host-lock declaration covering the matrix. The "
+        "rows are stamped `unlocked:` so they cannot later be read as "
+        "protected. For smoke tests only",
+    )
     args = ap.parse_args()
+
+    # The lock is checked before anything is launched, because the whole point
+    # is to not put load on a host somebody else declared. Refusing after the
+    # first arm would already have contaminated their run and wasted ours.
+    prov = read_provenance()
+    lock_label, refusal = lock_verdict(prov, ancestry(os.getpid()))
+    if refusal:
+        if not args.unlocked:
+            sys.stderr.write(f"ab.py: refusing to measure: {refusal}.\n{_REMEDY}\n")
+            raise SystemExit(3)
+        lock_label = f"unlocked:{lock_label}"
+        sys.stderr.write(
+            f"ab.py: WARNING: running unlocked ({refusal}). Every row is "
+            f"stamped host_lock={lock_label} and none of them is publishable.\n"
+        )
+    print(f"host_lock={lock_label} runnable={prov.get('runnable', '?')}", flush=True)
 
     arms = {}
     for spec in args.arms:
@@ -183,6 +370,16 @@ def main() -> None:
                         flush=True,
                     )
 
+    # Read the lock again at the end, so the label covers the whole window
+    # rather than its first instant.
+    lock_label = window_label(lock_label, prov, read_provenance())
+    for r in rows:
+        r["host_lock"] = lock_label
+        r["lock_owner"] = prov.get("held_by", "none")
+        r["lock_anchor_pid"] = prov.get("held_pid", "none")
+        r["runnable_at_start"] = prov.get("runnable", "unknown")
+        r["contended"] = prov.get("contended", "unknown")
+
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     with args.csv.open("w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
@@ -191,6 +388,7 @@ def main() -> None:
 
     metric = "native ms" if args.native_only else "native/ort ratio"
     print(f"\n=== medians ({metric}, lower is better) ===")
+    print(f"host_lock={lock_label} (whole window)")
     keys = sorted({(r["model"], r["threads"]) for r in rows})
     for model, threads in keys:
         line = [f"{model:28s} t={threads:<3d}"]
