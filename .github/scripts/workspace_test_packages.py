@@ -262,12 +262,28 @@ _STEP_IF = re.compile(r"^\s*if:\s*(.+?)\s*$")
 _STEP_COE = re.compile(r"^\s*continue-on-error:\s*(.+?)\s*$")
 _JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
 _FALSEY = {"false", "${{ false }}", "'false'", '"false"'}
+_STEP_SHELL = re.compile(r"^\s*shell:\s*(.+?)\s*$")
+# A command whose failure is swallowed runs its tests and reports success
+# anyway. `||` does this unconditionally. A pipe does it only without pipefail,
+# which is the difference between GitHub's default Linux shell (`bash -e`) and
+# an explicit `shell: bash` (`bash --noprofile --norc -eo pipefail`).
+_TEST_CALL = r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b[^\n;&|]*"
+_OR_AFTER_TEST = re.compile(_TEST_CALL + r"\|\|")
+_PIPE_AFTER_TEST = re.compile(_TEST_CALL + r"\|(?!\|)")
+
+
+def _swallow_reason(block: str, pipefail: bool) -> str | None:
+    if _OR_AFTER_TEST.search(block):
+        return "`||` after a cargo test swallows its failure"
+    if not pipefail and _PIPE_AFTER_TEST.search(block):
+        return "cargo test piped without pipefail; its failure is masked"
+    return None
 _RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
 
 
-def job_steps(job_body: str) -> list[tuple[str | None, str]]:
-    """Each step of a job as (its `if:` expression or None, its YAML text)."""
-    steps: list[tuple[str | None, str]] = []
+def job_steps(job_body: str) -> list[tuple[str | None, str, str | None]]:
+    """Each step as (reason it must not be credited, its YAML text, its shell)."""
+    steps: list[tuple[str | None, str, str | None]] = []
     current: list[str] = []
     for line in job_body.splitlines():
         if _STEP_ITEM.match(line):
@@ -281,8 +297,8 @@ def job_steps(job_body: str) -> list[tuple[str | None, str]]:
     return steps
 
 
-def _step_entry(lines: list[str]) -> tuple[str | None, str]:
-    """(reason this step must not be credited, step text). None means credit it."""
+def _step_entry(lines: list[str]) -> tuple[str | None, str, str | None]:
+    """(reason this step must not be credited, step text, its `shell:`)."""
     first = lines[0]
     body_indent = len(first) - len(first.lstrip()) + 2
     keys: dict[str, str] = {}
@@ -302,6 +318,8 @@ def _step_entry(lines: list[str]) -> tuple[str | None, str]:
             keys.setdefault("if", match.group(1))
         elif match := _STEP_COE.match(text):
             keys.setdefault("continue-on-error", match.group(1))
+        elif match := _STEP_SHELL.match(text):
+            keys.setdefault("shell", match.group(1))
     reason: str | None = None
     condition = keys.get("if")
     if condition is not None and condition not in _RUNS_IN_A_PASSING_JOB:
@@ -309,7 +327,7 @@ def _step_entry(lines: list[str]) -> tuple[str | None, str]:
     tolerated = keys.get("continue-on-error")
     if reason is None and tolerated is not None and tolerated not in _FALSEY:
         reason = f"continue-on-error: {tolerated}"
-    return reason, "\n".join(lines)
+    return reason, "\n".join(lines), keys.get("shell")
 
 
 def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
@@ -325,14 +343,20 @@ def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
             # The job itself is allowed to fail, so nothing it runs can block a
             # merge. Refuse every block rather than a step at a time.
             return [], [f"continue-on-error: {match.group(1)} (job level)"]
-    for reason, text in job_steps(job_body):
+    for reason, text, shell in job_steps(job_body):
         blocks = run_blocks(text)
         if not blocks:
             continue
-        if reason is None:
-            kept.extend(blocks)
-        else:
+        if reason is not None:
             refused.append(reason)
+            continue
+        pipefail = shell is not None and shell.split()[0] == "bash"
+        for block in blocks:
+            swallowed = _swallow_reason(block, pipefail)
+            if swallowed:
+                refused.append(swallowed)
+            else:
+                kept.append(block)
     return kept, refused
 
 
@@ -503,6 +527,30 @@ _CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
     (
         "continue-on-error: false is credited",
         "      - name: x\n        continue-on-error: false\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "`|| true` after a cargo test is not credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha || true\n",
+        [],
+        ["`||` after a cargo test swallows its failure"],
+    ),
+    (
+        "piped cargo test without pipefail is not credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha | tee out.log\n",
+        [],
+        ["cargo test piped without pipefail; its failure is masked"],
+    ),
+    (
+        "piped under `shell: bash` (pipefail) is credited",
+        "      - name: x\n        shell: bash\n        run: cargo test -p pkg-alpha | tee out.log\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "an && chain is credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha && echo done\n",
         ["pkg-alpha"],
         [],
     ),
