@@ -1,9 +1,24 @@
-//! CPU parity oracle for frozen `pkg.nxrt::BlockQuantizedMoE` v1.
+//! CPU parity oracle for `pkg.nxrt::BlockQuantizedMoE` (mixed-projection ABI).
 //!
-//! This CPU kernel is memory-format-only today: it keeps expert weights in the
-//! native block-quantized wire layout at the operator boundary, then dequantizes
-//! each routed expert to dense f32 and runs the dense grouped MoE path. It does
-//! not perform quantized-domain expert compute.
+//! Each routed expert carries an independent native block-quantized format for
+//! every projection: `fc1_format` (gate/up), `fc2_format` (down), and
+//! `fc3_format` (the separate gate of an unfused SwiGLU / gated-GLU). This is a
+//! hard requirement of real GLM-5.2 GGUF checkpoints, whose routed experts pack
+//! `ffn_gate/up_exps` and `ffn_down_exps` at *different* qtypes and block widths
+//! (e.g. `IQ1_S` gate/up with `IQ3_XXS` down). A single uniform format cannot
+//! represent them.
+//!
+//! Every consumer — the schema/claim validator, this CPU oracle, and the CUDA
+//! claim gate — derives its byte offsets, strides and decode parameters from one
+//! property-typed [`ProjectionLayout`] contract (qtype, elements/block,
+//! bytes/block, logical K/N, per-row and per-expert bank strides, expert count).
+//! Unsupported native layouts (`Q2_K`/`Q3_K`/`Q5_K`/…) are typed-rejected at the
+//! boundary; they are never dequantized or dense-fallback executed.
+//!
+//! This CPU kernel is memory-format-only: it keeps expert weights in the native
+//! block-quantized wire layout at the operator boundary, then dequantizes each
+//! routed expert projection to dense f32 with that projection's own decoder and
+//! runs the dense grouped MoE path. It does not perform quantized-domain compute.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -42,27 +57,126 @@ const INPUT_NAMES: [&str; 9] = [
 static BLOCK_QUANTIZED_MOE_DENSE_F32_TEST_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Per-projection native block formats for one `BlockQuantizedMoE` node.
+///
+/// `fc1` (gate/up) and `fc2` (down) are always present; `fc3` (the separate gate
+/// of an unfused SwiGLU / gated-GLU) is present exactly when the `fc3` weights
+/// input is wired. The three formats are independent — this is the whole point
+/// of the mixed-projection ABI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionFormats {
+    fc1: BlockFormat,
+    fc2: BlockFormat,
+    fc3: Option<BlockFormat>,
+}
+
+/// One property-typed packed-projection layout contract, shared by the claim
+/// validator and the CPU oracle (and mirrored by the CUDA claim gate).
+///
+/// A packed projection tensor has shape `[experts, out_features, blocks_per_row,
+/// block_bytes]` where `blocks_per_row = ceil(in_features / qk)`. Scales/aux are
+/// embedded per block (the IQ/MXFP4 formats are self-describing), so there is no
+/// external scale or codebook tensor. Every byte offset the kernel touches is
+/// derived from this contract, never recomputed ad hoc.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectionLayout {
+    format: BlockFormat,
+    in_features: usize,
+    out_features: usize,
+    experts: usize,
+}
+
+impl ProjectionLayout {
+    fn new(format: BlockFormat, out_features: usize, in_features: usize, experts: usize) -> Self {
+        Self {
+            format,
+            in_features,
+            out_features,
+            experts,
+        }
+    }
+
+    fn qk(&self) -> usize {
+        self.format.qk()
+    }
+
+    fn block_bytes(&self) -> usize {
+        self.format.block_bytes()
+    }
+
+    fn blocks_per_row(&self) -> usize {
+        self.in_features.div_ceil(self.qk())
+    }
+
+    /// Packed tensor shape `[E, N, blocks_per_row, block_bytes]`.
+    fn packed_shape(&self) -> [usize; 4] {
+        [
+            self.experts,
+            self.out_features,
+            self.blocks_per_row(),
+            self.block_bytes(),
+        ]
+    }
+
+    /// Bank stride of one packed output row, in bytes.
+    fn row_stride_bytes(&self) -> Result<usize> {
+        self.blocks_per_row()
+            .checked_mul(self.block_bytes())
+            .ok_or_else(|| error("packed row byte stride overflow"))
+    }
+
+    /// Bank stride of one expert (all its output rows), in bytes.
+    fn expert_stride_bytes(&self) -> Result<usize> {
+        self.out_features
+            .checked_mul(self.row_stride_bytes()?)
+            .ok_or_else(|| error("packed expert byte stride overflow"))
+    }
+
+    /// Total packed bytes across every expert.
+    fn total_bytes(&self) -> Result<usize> {
+        self.experts
+            .checked_mul(self.expert_stride_bytes()?)
+            .ok_or_else(|| error("packed projection byte count overflow"))
+    }
+
+    /// Byte range `start..end` of one expert's bank within the packed tensor.
+    fn expert_byte_range(&self, expert: usize) -> Result<std::ops::Range<usize>> {
+        let stride = self.expert_stride_bytes()?;
+        let start = expert
+            .checked_mul(stride)
+            .ok_or_else(|| error("expert byte offset overflow"))?;
+        let end = start
+            .checked_add(stride)
+            .ok_or_else(|| error("expert byte range overflow"))?;
+        Ok(start..end)
+    }
+}
+
 pub struct BlockQuantizedMoEFactory;
 
 pub struct BlockQuantizedMoEKernel {
     attributes: MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
     constant_inputs: [bool; 9],
     weight_identities: [DenseWeightIdentity; 3],
     weight_cache: DenseWeightCache,
 }
 
+#[derive(Debug)]
 struct ValidatedMetadata {
     attributes: MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        let ValidatedMetadata { attributes, format } = validate_metadata(node, None)?;
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(node, None)?;
         Ok(Box::new(BlockQuantizedMoEKernel {
             attributes,
-            format,
+            formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
@@ -119,7 +233,7 @@ impl Kernel for BlockQuantizedMoEKernel {
         }
 
         let dimensions =
-            validate_runtime_shapes(inputs, &outputs[0], &self.attributes, self.format)?;
+            validate_runtime_shapes(inputs, &outputs[0], &self.attributes, self.formats)?;
         let Dimensions {
             rows,
             hidden,
@@ -164,6 +278,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                 fc1_size,
                 hidden,
                 experts,
+                self.formats.fc1,
             )?;
             let fc2 = self.dequantize_expert_cached(
                 self.constant_inputs[4].then_some(&self.weight_identities[1]),
@@ -173,9 +288,13 @@ impl Kernel for BlockQuantizedMoEKernel {
                 hidden,
                 inter,
                 experts,
+                self.formats.fc2,
             )?;
             let fc3 = optional_input(inputs, 6)
                 .map(|packed| {
+                    let fc3_format = self.formats.fc3.ok_or_else(|| {
+                        error("fc3_experts_weights present but fc3_format is missing")
+                    })?;
                     self.dequantize_expert_cached(
                         self.constant_inputs[6].then_some(&self.weight_identities[2]),
                         3,
@@ -184,6 +303,7 @@ impl Kernel for BlockQuantizedMoEKernel {
                         inter,
                         hidden,
                         experts,
+                        fc3_format,
                     )
                 })
                 .transpose()?;
@@ -238,18 +358,21 @@ impl BlockQuantizedMoEKernel {
         out_features: usize,
         in_features: usize,
         experts: usize,
+        format: BlockFormat,
     ) -> Result<Arc<Vec<f32>>> {
-        let expert_bytes =
-            expert_byte_count(packed, out_features, in_features, experts, self.format)?;
+        let layout = ProjectionLayout::new(format, out_features, in_features, experts);
+        // Validate the packed projection's total byte footprint against the
+        // shared layout contract before slicing any expert bank.
+        expert_byte_count(packed, &layout)?;
         if let Some(identity) = identity {
             let resolved = identity.resolve(
                 packed,
-                self.format,
+                format,
                 in_features,
                 out_features,
                 role,
                 Some(expert),
-                || packed_expert_bytes(packed, expert, expert_bytes),
+                || packed_expert_bytes(packed, &layout, expert),
             )?;
             let mut resolved_payload = resolved.payload;
             let (weight, status) =
@@ -258,9 +381,9 @@ impl BlockQuantizedMoEKernel {
                         BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
                         let packed = match resolved_payload.take() {
                             Some(packed) => packed,
-                            None => packed_expert_bytes(packed, expert, expert_bytes)?,
+                            None => packed_expert_bytes(packed, &layout, expert)?,
                         };
-                        dequantize_expert_slice(self.format, &packed, out_features, in_features)
+                        dequantize_expert_slice(format, &packed, out_features, in_features)
                     })?;
             if matches!(status, DenseWeightCacheStatus::Hit) {
                 BLOCK_QUANT_MOE_CACHED_DENSE_TEST_HITS.fetch_add(1, Ordering::Relaxed);
@@ -268,9 +391,9 @@ impl BlockQuantizedMoEKernel {
             Ok(weight)
         } else {
             BLOCK_QUANT_MOE_DENSE_EXPANSIONS.fetch_add(1, Ordering::Relaxed);
-            let packed = packed_expert_bytes(packed, expert, expert_bytes)?;
+            let packed = packed_expert_bytes(packed, &layout, expert)?;
             Ok(Arc::new(dequantize_expert_slice(
-                self.format,
+                format,
                 &packed,
                 out_features,
                 in_features,
@@ -292,7 +415,7 @@ fn validate_runtime_shapes(
     inputs: &[TensorView],
     output: &TensorMut,
     attributes: &MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
 ) -> Result<Dimensions> {
     let input_shape = inputs[0].shape;
     if !matches!(input_shape.len(), 2 | 3) {
@@ -355,16 +478,36 @@ fn validate_runtime_shapes(
             "fc1_experts_weights dimension 1 must be {expected_fc1}, got {fc1_size}"
         )));
     }
-    validate_packed_shape(2, inputs[2].shape, experts, fc1_size, hidden, format)?;
-    validate_packed_shape(4, inputs[4].shape, experts, hidden, inter, format)?;
+    validate_packed_shape(
+        2,
+        inputs[2].shape,
+        ProjectionLayout::new(formats.fc1, fc1_size, hidden, experts),
+    )?;
+    validate_packed_shape(
+        4,
+        inputs[4].shape,
+        ProjectionLayout::new(formats.fc2, hidden, inter, experts),
+    )?;
     validate_bias(inputs, 3, experts, fc1_size)?;
     validate_bias(inputs, 5, experts, hidden)?;
 
     let has_fc3 = optional_input(inputs, 6).is_some();
+    if has_fc3 != formats.fc3.is_some() {
+        return Err(error(
+            "fc3_format must be present exactly when fc3_experts_weights is wired",
+        ));
+    }
     if attributes.uses_separate_gate(has_fc3) {
         let fc3 = optional_input(inputs, 6)
             .ok_or_else(|| error("unfused swiglu requires input 6 fc3_experts_weights"))?;
-        validate_packed_shape(6, fc3.shape, experts, inter, hidden, format)?;
+        let fc3_format = formats
+            .fc3
+            .ok_or_else(|| error("fc3_experts_weights requires the fc3_format attribute"))?;
+        validate_packed_shape(
+            6,
+            fc3.shape,
+            ProjectionLayout::new(fc3_format, inter, hidden, experts),
+        )?;
         validate_bias(inputs, 7, experts, inter)?;
     } else {
         if has_fc3 {
@@ -393,20 +536,8 @@ fn validate_runtime_shapes(
     })
 }
 
-fn validate_packed_shape(
-    index: usize,
-    shape: &[usize],
-    experts: usize,
-    out_features: usize,
-    in_features: usize,
-    format: BlockFormat,
-) -> Result<()> {
-    let expected = [
-        experts,
-        out_features,
-        in_features.div_ceil(format.qk()),
-        format.block_bytes(),
-    ];
+fn validate_packed_shape(index: usize, shape: &[usize], layout: ProjectionLayout) -> Result<()> {
+    let expected = layout.packed_shape();
     if shape != expected {
         return Err(error(format!(
             "input {index} ('{}') must have shape {expected:?}, got {shape:?}",
@@ -416,20 +547,9 @@ fn validate_packed_shape(
     Ok(())
 }
 
-fn expert_byte_count(
-    packed: &TensorView,
-    out_features: usize,
-    in_features: usize,
-    experts: usize,
-    format: BlockFormat,
-) -> Result<usize> {
-    let expert_bytes = out_features
-        .checked_mul(in_features.div_ceil(format.qk()))
-        .and_then(|count| count.checked_mul(format.block_bytes()))
-        .ok_or_else(|| error("packed expert byte count overflow"))?;
-    let expected = expert_bytes
-        .checked_mul(experts)
-        .ok_or_else(|| error("packed projection byte count overflow"))?;
+fn expert_byte_count(packed: &TensorView, layout: &ProjectionLayout) -> Result<usize> {
+    let expert_bytes = layout.expert_stride_bytes()?;
+    let expected = layout.total_bytes()?;
     if packed.byte_size() != expected {
         return Err(error(format!(
             "packed projection contains {} bytes, expected {expected}",
@@ -441,8 +561,8 @@ fn expert_byte_count(
 
 fn packed_expert_bytes<'a>(
     packed: &'a TensorView<'_>,
+    layout: &ProjectionLayout,
     expert: usize,
-    expert_bytes: usize,
 ) -> Result<Cow<'a, [u8]>> {
     packed.validate()?;
     if packed.dtype != DataType::Uint8 {
@@ -457,20 +577,17 @@ fn packed_expert_bytes<'a>(
             packed.shape[0]
         )));
     }
-    let start = expert
-        .checked_mul(expert_bytes)
-        .ok_or_else(|| error("expert byte offset overflow"))?;
+    // The bank offset/stride is derived from the one shared layout contract.
+    let range = layout.expert_byte_range(expert)?;
+    let expert_bytes = range.len();
     if packed.is_contiguous() {
-        let end = start
-            .checked_add(expert_bytes)
-            .ok_or_else(|| error("expert byte range overflow"))?;
         let len = packed.byte_size();
         // SAFETY: the validated contiguous Uint8 view has `len` logical bytes,
-        // and `start..end` was derived from the already-validated expert-major
-        // shape. The returned borrow cannot outlive the input view.
+        // and `range` was derived from the already-validated expert-major shape.
+        // The returned borrow cannot outlive the input view.
         let bytes = unsafe { std::slice::from_raw_parts(packed.data_ptr::<u8>(), len) };
         return bytes
-            .get(start..end)
+            .get(range)
             .map(Cow::Borrowed)
             .ok_or_else(|| error("expert byte range exceeds packed projection"));
     }
@@ -530,15 +647,63 @@ fn validate_attributes(node: &Node) -> Result<()> {
                 | "activation_alpha"
                 | "activation_beta"
                 | "swiglu_limit"
-                | "format"
+                | "fc1_format"
+                | "fc2_format"
+                | "fc3_format"
                 | "block_layout_version"
         ) {
             return Err(error(format!(
-                "attribute '{name}' is not part of the frozen v1 ABI"
+                "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
             )));
         }
     }
     Ok(())
+}
+
+fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
+    node.attr(name)
+        .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
+        .as_str()
+        .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
+        .and_then(BlockFormat::parse)
+}
+
+fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
+    match node.attr(name) {
+        None => Ok(None),
+        Some(attr) => attr
+            .as_str()
+            .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
+            .and_then(BlockFormat::parse)
+            .map(Some),
+    }
+}
+
+/// Parse the per-projection formats. `fc3_format` must be present exactly when
+/// the `fc3_experts_weights` input (index 6) is wired on the node.
+fn parse_projection_formats(node: &Node) -> Result<ProjectionFormats> {
+    let fc1 = parse_format_attr(node, "fc1_format")?;
+    let fc2 = parse_format_attr(node, "fc2_format")?;
+    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
+    let fc3_attr = optional_format_attr(node, "fc3_format")?;
+    match (fc3_wired, fc3_attr) {
+        (true, Some(fc3)) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        }),
+        (true, None) => Err(error(
+            "fc3_experts_weights is wired but the required fc3_format attribute is missing",
+        )),
+        (false, Some(_)) => Err(error(
+            "fc3_format is only valid when fc3_experts_weights is wired",
+        )),
+        (false, None) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        }),
+    }
 }
 
 fn validate_metadata(
@@ -553,16 +718,14 @@ fn validate_metadata(
             "block_layout_version must be {LAYOUT_VERSION}, got {layout_version}"
         )));
     }
-    let format = node
-        .attr("format")
-        .ok_or_else(|| error("missing required string attribute 'format'"))?
-        .as_str()
-        .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
-        .and_then(BlockFormat::parse)?;
+    let formats = parse_projection_formats(node)?;
     if let Some((shapes, dtypes)) = claim_metadata {
-        validate_claim_metadata(node, shapes, dtypes, &attributes, format).map_err(error)?;
+        validate_claim_metadata(node, shapes, dtypes, &attributes, formats).map_err(error)?;
     }
-    Ok(ValidatedMetadata { attributes, format })
+    Ok(ValidatedMetadata {
+        attributes,
+        formats,
+    })
 }
 
 fn validate_claim_metadata(
@@ -570,7 +733,7 @@ fn validate_claim_metadata(
     shapes: &[Shape],
     dtypes: &[DataType],
     attributes: &MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
 ) -> std::result::Result<(), String> {
     if !(5..=9).contains(&node.inputs.len()) {
         return Err(format!(
@@ -658,7 +821,7 @@ fn validate_claim_metadata(
             shapes[6].len()
         ));
     }
-    validate_partial_claim_shapes(node, shapes, attributes, format)?;
+    validate_partial_claim_shapes(node, shapes, attributes, formats)?;
     Ok(())
 }
 
@@ -666,7 +829,7 @@ fn validate_partial_claim_shapes(
     node: &Node,
     shapes: &[Shape],
     attributes: &MoeAttributes,
-    format: BlockFormat,
+    formats: ProjectionFormats,
 ) -> std::result::Result<(), String> {
     let hidden = shapes[0].last().and_then(|dim| dim.as_static());
     let experts = shapes[1][1].as_static();
@@ -696,19 +859,19 @@ fn validate_partial_claim_shapes(
         ));
     }
     if let Some(block_bytes) = shapes[2][3].as_static()
-        && block_bytes != format.block_bytes()
+        && block_bytes != formats.fc1.block_bytes()
     {
         return Err(format!(
             "fc1 block byte width {block_bytes} must equal {}",
-            format.block_bytes()
+            formats.fc1.block_bytes()
         ));
     }
     if let Some(block_bytes) = shapes[4][3].as_static()
-        && block_bytes != format.block_bytes()
+        && block_bytes != formats.fc2.block_bytes()
     {
         return Err(format!(
             "fc2 block byte width {block_bytes} must equal {}",
-            format.block_bytes()
+            formats.fc2.block_bytes()
         ));
     }
     let fc1_size = shapes[2][1].as_static();
@@ -725,8 +888,8 @@ fn validate_partial_claim_shapes(
     if inter == Some(0) {
         return Err("inferred inter dimension must be non-zero".into());
     }
-    check_static_packed_shape(shapes, 2, experts, fc1_size, hidden, format)?;
-    check_static_packed_shape(shapes, 4, experts, hidden, inter, format)?;
+    check_static_packed_shape(shapes, 2, experts, fc1_size, hidden, formats.fc1)?;
+    check_static_packed_shape(shapes, 4, experts, hidden, inter, formats.fc2)?;
     check_static_optional_shape(node, shapes, 3, experts, fc1_size)?;
     check_static_optional_shape(node, shapes, 5, experts, hidden)?;
 
@@ -735,7 +898,10 @@ fn validate_partial_claim_shapes(
         if !has_fc3 {
             return Err("unfused swiglu requires fc3_experts_weights".into());
         }
-        check_static_packed_shape(shapes, 6, experts, inter, hidden, format)?;
+        let fc3_format = formats
+            .fc3
+            .ok_or_else(|| "fc3_experts_weights requires the fc3_format attribute".to_string())?;
+        check_static_packed_shape(shapes, 6, experts, inter, hidden, fc3_format)?;
         check_static_optional_shape(node, shapes, 7, experts, inter)?;
     } else if has_fc3 || node.inputs.get(7).is_some_and(Option::is_some) {
         return Err("fc3 inputs are only valid for unfused swiglu or silu gated-GLU".into());
@@ -899,7 +1065,8 @@ mod tests {
         swiglu_fusion: usize,
     ) -> Vec<(&'static str, Attribute)> {
         vec![
-            ("format", Attribute::String(b"mxfp4".to_vec())),
+            ("fc1_format", Attribute::String(b"mxfp4".to_vec())),
+            ("fc2_format", Attribute::String(b"mxfp4".to_vec())),
             ("block_layout_version", Attribute::Int(1)),
             (
                 "activation_type",
@@ -912,6 +1079,19 @@ mod tests {
             ),
             ("swiglu_fusion", Attribute::Int(swiglu_fusion as i64)),
         ]
+    }
+
+    /// Extend a uniform-format attribute set with `fc3_format` for the unfused
+    /// gated (fc3-wired) paths.
+    fn with_fc3_format(
+        mut spec: Vec<(&'static str, Attribute)>,
+        fc3_format: &str,
+    ) -> Vec<(&'static str, Attribute)> {
+        spec.push((
+            "fc3_format",
+            Attribute::String(fc3_format.as_bytes().to_vec()),
+        ));
+        spec
     }
 
     fn model_node(
@@ -978,6 +1158,34 @@ mod tests {
                 if output == input { scales[expert] } else { 0 }
             },
         )
+    }
+
+    /// Build a decodable packed projection tensor `[experts, out_features,
+    /// ceil(in_features/qk), block_bytes]` for an arbitrary native format. Each
+    /// block is filled with a deterministic byte pattern plus the format's own
+    /// scale header so every decoder accepts it. This is the fixture that lets a
+    /// single projection carry its own qtype/block width independently of the
+    /// other projections (the whole point of the mixed-projection ABI).
+    fn packed_for_format(
+        format: BlockFormat,
+        experts: usize,
+        out_features: usize,
+        in_features: usize,
+    ) -> Vec<u8> {
+        let block_bytes = format.block_bytes();
+        let blocks_per_row = in_features.div_ceil(format.qk());
+        let mut packed = vec![0u8; experts * out_features * blocks_per_row * block_bytes];
+        for (block_index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+            for (index, byte) in block.iter_mut().enumerate() {
+                *byte = block_index.wrapping_mul(29).wrapping_add(index * 17) as u8;
+            }
+            match format {
+                BlockFormat::Mxfp4 => block[0] = 127,
+                BlockFormat::Iq1M => block[48..56].fill(0),
+                _ => block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_le_bytes()),
+            }
+        }
+        packed
     }
 
     fn run(
@@ -1107,11 +1315,13 @@ mod tests {
             None,
         ];
         let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
-        let ValidatedMetadata { attributes, format } =
-            validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
         let mut kernel = BlockQuantizedMoEKernel {
             attributes,
-            format,
+            formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
             weight_cache: DenseWeightCache::new(),
@@ -1197,13 +1407,15 @@ mod tests {
                 Some((DataType::Uint8, vec![experts, H, 1, 17])),
                 None,
             ];
-            let attributes_spec = attrs(activation, 1, true, 0);
+            let attributes_spec = with_fc3_format(attrs(activation, 1, true, 0), "mxfp4");
             let (graph, node) = model_node(&shapes, &attributes_spec);
-            let ValidatedMetadata { attributes, format } =
-                validate_metadata(graph.node(node), None).expect("valid gated MoE metadata");
+            let ValidatedMetadata {
+                attributes,
+                formats,
+            } = validate_metadata(graph.node(node), None).expect("valid gated MoE metadata");
             let mut kernel = BlockQuantizedMoEKernel {
                 attributes,
-                format,
+                formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
@@ -1236,11 +1448,16 @@ mod tests {
 
             let expert_bytes = H * 17;
             let dense_fc1 =
-                dequantize_expert_slice(format, &fc1_values[..expert_bytes], H, H).unwrap();
+                dequantize_expert_slice(formats.fc1, &fc1_values[..expert_bytes], H, H).unwrap();
             let dense_fc2 =
-                dequantize_expert_slice(format, &fc2_values[..expert_bytes], H, H).unwrap();
-            let dense_fc3 =
-                dequantize_expert_slice(format, &fc3_values[..expert_bytes], H, H).unwrap();
+                dequantize_expert_slice(formats.fc2, &fc2_values[..expert_bytes], H, H).unwrap();
+            let dense_fc3 = dequantize_expert_slice(
+                formats.fc3.expect("fc3_format present for gated path"),
+                &fc3_values[..expert_bytes],
+                H,
+                H,
+            )
+            .unwrap();
             let expected = run_expert_grouped(
                 &input_values,
                 1,
@@ -1289,7 +1506,14 @@ mod tests {
                 }
             }
             let mut attributes_spec = attrs("identity", 1, true, 0);
-            attributes_spec[0] = ("format", Attribute::String(format_name.as_bytes().to_vec()));
+            attributes_spec[0] = (
+                "fc1_format",
+                Attribute::String(format_name.as_bytes().to_vec()),
+            );
+            attributes_spec[1] = (
+                "fc2_format",
+                Attribute::String(format_name.as_bytes().to_vec()),
+            );
             let shapes = vec![
                 Some((DataType::Float32, vec![1, hidden])),
                 Some((DataType::Float32, vec![1, experts])),
@@ -1301,9 +1525,12 @@ mod tests {
                 None,
             ];
             let (graph, node) = model_node(&shapes, &attributes_spec);
-            let ValidatedMetadata { attributes, format } =
-                validate_metadata(graph.node(node), None).expect("valid block format");
-            assert_eq!(format, expected_format);
+            let ValidatedMetadata {
+                attributes,
+                formats,
+            } = validate_metadata(graph.node(node), None).expect("valid block format");
+            assert_eq!(formats.fc1, expected_format);
+            assert_eq!(formats.fc2, expected_format);
             let input_values: Vec<f32> = (0..hidden)
                 .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
                 .collect();
@@ -1324,7 +1551,7 @@ mod tests {
 
             let uncached = BlockQuantizedMoEKernel {
                 attributes,
-                format,
+                formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
@@ -1336,7 +1563,7 @@ mod tests {
 
             let mut cached = BlockQuantizedMoEKernel {
                 attributes,
-                format,
+                formats,
                 constant_inputs: [false; 9],
                 weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
                 weight_cache: DenseWeightCache::new(),
@@ -1708,7 +1935,7 @@ mod tests {
 
         let (mut graph, node, shapes, dtypes) = claim_fixture();
         graph.node_mut(node).attributes.insert(
-            "format".into(),
+            "fc1_format".into(),
             Attribute::String(b"k3_unpublished".to_vec()),
         );
         let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
@@ -1724,7 +1951,7 @@ mod tests {
             rejected
                 .reason()
                 .unwrap()
-                .contains("not part of the frozen v1 ABI")
+                .contains("not part of the BlockQuantizedMoE ABI")
         );
 
         let (mut graph, node, mut shapes, mut dtypes) = claim_fixture();
@@ -1748,7 +1975,10 @@ mod tests {
             Some((DataType::Float32, vec![E, H])),
             Some((DataType::Float32, vec![1, E])),
         ];
-        let (graph, node) = model_node(&inputs, &attrs("swiglu", 1, false, 0));
+        let (graph, node) = model_node(
+            &inputs,
+            &with_fc3_format(attrs("swiglu", 1, false, 0), "mxfp4"),
+        );
         let mut shapes: Vec<Shape> = inputs
             .iter()
             .map(|input| {
@@ -1781,5 +2011,372 @@ mod tests {
         shapes[8][1] = E.saturating_add(1).into();
         let rejected = ep.supports_op(graph.node(node), 1, &shapes, &dtypes, &[]);
         assert!(rejected.reason().unwrap().contains("router_weights"));
+    }
+
+    #[test]
+    fn mixed_fc1_fc2_formats_match_per_projection_dense_reference() {
+        // Real GLM-5.2 UD-IQ1_S routed experts pack gate/up (fc1) at IQ1_S and
+        // down (fc2) at IQ3_XXS — different qtypes AND block byte widths on the
+        // same node. The frozen single-format v1 ABI could not represent this;
+        // each projection must decode with its own format.
+        const HID: usize = 256;
+        let experts = 2usize;
+        let fc1_format = BlockFormat::Iq1S;
+        let fc2_format = BlockFormat::Iq3Xxs;
+        assert_ne!(
+            fc1_format.block_bytes(),
+            fc2_format.block_bytes(),
+            "fixture must exercise different block widths per projection"
+        );
+
+        let fc1 = packed_for_format(fc1_format, experts, HID, HID);
+        let fc2 = packed_for_format(fc2_format, experts, HID, HID);
+
+        let mut spec = attrs("identity", 1, true, 0);
+        spec[0] = ("fc1_format", Attribute::String(b"iq1_s".to_vec()));
+        spec[1] = ("fc2_format", Attribute::String(b"iq3_xxs".to_vec()));
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, HID])),
+            Some((DataType::Float32, vec![1, experts])),
+            Some((
+                DataType::Uint8,
+                vec![experts, HID, 1, fc1_format.block_bytes()],
+            )),
+            None,
+            Some((
+                DataType::Uint8,
+                vec![experts, HID, 1, fc2_format.block_bytes()],
+            )),
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &spec);
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).expect("valid mixed-format metadata");
+        assert_eq!(formats.fc1, fc1_format);
+        assert_eq!(formats.fc2, fc2_format);
+        assert!(formats.fc3.is_none());
+
+        let kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::new(),
+        };
+
+        let input_values: Vec<f32> = (0..HID)
+            .map(|index| ((index * 7 % 23) as f32 - 11.0) / 16.0)
+            .collect();
+        let input = Owned::f32(&[1, HID], &input_values);
+        let logits = Owned::f32(&[1, experts], &[4.0, -4.0]);
+        let fc1_view = Owned::u8(&[experts, HID, 1, fc1_format.block_bytes()], &fc1);
+        let fc2_view = Owned::u8(&[experts, HID, 1, fc2_format.block_bytes()], &fc2);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1_view.view(),
+            TensorView::absent(DataType::Float32),
+            fc2_view.view(),
+            TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Uint8),
+            TensorView::absent(DataType::Float32),
+        ];
+        let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("execute mixed-format MoE");
+
+        // Reference: expert 0 is the top-1 routed expert; decode each projection
+        // with ITS OWN format from its own byte-exact expert bank derived from
+        // the shared layout contract.
+        let fc1_layout = ProjectionLayout::new(fc1_format, HID, HID, experts);
+        let fc2_layout = ProjectionLayout::new(fc2_format, HID, HID, experts);
+        let dense_fc1 = dequantize_expert_slice(
+            fc1_format,
+            &fc1[fc1_layout.expert_byte_range(0).unwrap()],
+            HID,
+            HID,
+        )
+        .unwrap();
+        let dense_fc2 = dequantize_expert_slice(
+            fc2_format,
+            &fc2[fc2_layout.expert_byte_range(0).unwrap()],
+            HID,
+            HID,
+        )
+        .unwrap();
+        let expected = run_expert_grouped(
+            &input_values,
+            1,
+            &dense_fc1,
+            None,
+            &dense_fc2,
+            None,
+            None,
+            None,
+            HID,
+            HID,
+            HID,
+            &attributes,
+        )
+        .expect("dense mixed-format reference");
+        assert_close(&output.to_f32(), &expected);
+    }
+
+    #[test]
+    fn mixed_unfused_gate_uses_independent_fc3_format() {
+        // Unfused gated GLU: up (fc1), down (fc2) and the separate gate (fc3)
+        // each carry an independent native qtype. Prove fc3 decodes with its
+        // own format, not fc1's.
+        const HID: usize = 256;
+        let experts = 2usize;
+        let fc1_format = BlockFormat::Iq1S; // up
+        let fc2_format = BlockFormat::Iq3Xxs; // down
+        let fc3_format = BlockFormat::Iq2Xxs; // gate — independent qtype
+        let fc1 = packed_for_format(fc1_format, experts, HID, HID);
+        let fc2 = packed_for_format(fc2_format, experts, HID, HID);
+        let fc3 = packed_for_format(fc3_format, experts, HID, HID);
+
+        let mut spec = attrs("swiglu", 1, true, 0);
+        spec[0] = ("fc1_format", Attribute::String(b"iq1_s".to_vec()));
+        spec[1] = ("fc2_format", Attribute::String(b"iq3_xxs".to_vec()));
+        let spec = with_fc3_format(spec, "iq2_xxs");
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, HID])),
+            Some((DataType::Float32, vec![1, experts])),
+            Some((
+                DataType::Uint8,
+                vec![experts, HID, 1, fc1_format.block_bytes()],
+            )),
+            None,
+            Some((
+                DataType::Uint8,
+                vec![experts, HID, 1, fc2_format.block_bytes()],
+            )),
+            None,
+            Some((
+                DataType::Uint8,
+                vec![experts, HID, 1, fc3_format.block_bytes()],
+            )),
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &spec);
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).expect("valid mixed gated metadata");
+        assert_eq!(formats.fc1, fc1_format);
+        assert_eq!(formats.fc2, fc2_format);
+        assert_eq!(formats.fc3, Some(fc3_format));
+
+        let kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::new(),
+        };
+        let input_values: Vec<f32> = (0..HID).map(|index| (index as f32) / 256.0 + 0.1).collect();
+        let input = Owned::f32(&[1, HID], &input_values);
+        let logits = Owned::f32(&[1, experts], &[4.0, -4.0]);
+        let fc1_view = Owned::u8(&[experts, HID, 1, fc1_format.block_bytes()], &fc1);
+        let fc2_view = Owned::u8(&[experts, HID, 1, fc2_format.block_bytes()], &fc2);
+        let fc3_view = Owned::u8(&[experts, HID, 1, fc3_format.block_bytes()], &fc3);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1_view.view(),
+            TensorView::absent(DataType::Float32),
+            fc2_view.view(),
+            TensorView::absent(DataType::Float32),
+            fc3_view.view(),
+            TensorView::absent(DataType::Float32),
+        ];
+        let mut output = Owned::f32(&[1, HID], &vec![0.0; HID]);
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("execute mixed gated MoE");
+
+        let fc1_layout = ProjectionLayout::new(fc1_format, HID, HID, experts);
+        let fc2_layout = ProjectionLayout::new(fc2_format, HID, HID, experts);
+        let fc3_layout = ProjectionLayout::new(fc3_format, HID, HID, experts);
+        let dense_fc1 = dequantize_expert_slice(
+            fc1_format,
+            &fc1[fc1_layout.expert_byte_range(0).unwrap()],
+            HID,
+            HID,
+        )
+        .unwrap();
+        let dense_fc2 = dequantize_expert_slice(
+            fc2_format,
+            &fc2[fc2_layout.expert_byte_range(0).unwrap()],
+            HID,
+            HID,
+        )
+        .unwrap();
+        let dense_fc3 = dequantize_expert_slice(
+            fc3_format,
+            &fc3[fc3_layout.expert_byte_range(0).unwrap()],
+            HID,
+            HID,
+        )
+        .unwrap();
+        let expected = run_expert_grouped(
+            &input_values,
+            1,
+            &dense_fc1,
+            None,
+            &dense_fc2,
+            None,
+            Some(&dense_fc3),
+            None,
+            HID,
+            HID,
+            HID,
+            &attributes,
+        )
+        .expect("dense mixed gated reference");
+        assert_close(&output.to_f32(), &expected);
+    }
+
+    #[test]
+    fn projection_layout_contract_is_byte_exact_and_ragged_safe() {
+        // Byte offsets, per-row and per-expert strides all derive from one
+        // contract; a ragged in_features (not a multiple of qk) still rounds up
+        // to whole blocks, and expert banks tile the tensor with no gap/overlap.
+        for (format, out, in_features) in [
+            (BlockFormat::Iq1S, 3usize, 256usize),
+            (BlockFormat::Iq3Xxs, 5, 257), // ragged: ceil(257/256) = 2 blocks
+            (BlockFormat::Mxfp4, 4, 33),   // ragged: ceil(33/32) = 2 blocks
+            (BlockFormat::Iq4Nl, 2, 96),
+        ] {
+            let experts = 4usize;
+            let layout = ProjectionLayout::new(format, out, in_features, experts);
+            let blocks = in_features.div_ceil(format.qk());
+            assert_eq!(
+                layout.packed_shape(),
+                [experts, out, blocks, format.block_bytes()]
+            );
+            assert_eq!(
+                layout.row_stride_bytes().unwrap(),
+                blocks * format.block_bytes()
+            );
+            assert_eq!(
+                layout.expert_stride_bytes().unwrap(),
+                out * blocks * format.block_bytes()
+            );
+            assert_eq!(
+                layout.total_bytes().unwrap(),
+                experts * out * blocks * format.block_bytes()
+            );
+
+            let stride = layout.expert_stride_bytes().unwrap();
+            let mut prev_end = 0usize;
+            for expert in 0..experts {
+                let range = layout.expert_byte_range(expert).unwrap();
+                assert_eq!(range.start, expert * stride);
+                assert_eq!(range.end - range.start, stride);
+                assert_eq!(range.start, prev_end, "expert banks must be contiguous");
+                prev_end = range.end;
+            }
+            assert_eq!(
+                prev_end,
+                layout.total_bytes().unwrap(),
+                "expert banks must cover the whole packed projection"
+            );
+        }
+    }
+
+    #[test]
+    fn projection_layout_rejects_overflowing_dimensions() {
+        // Offset/stride arithmetic is checked; degenerate dimensions must error
+        // rather than wrap and read out of bounds.
+        let layout = ProjectionLayout::new(BlockFormat::Iq1S, usize::MAX, usize::MAX, usize::MAX);
+        assert!(layout.expert_stride_bytes().is_err());
+        assert!(layout.total_bytes().is_err());
+        assert!(layout.expert_byte_range(0).is_err());
+    }
+
+    #[test]
+    fn unsupported_native_formats_typed_reject_without_fallback() {
+        // GLM's shared-expert and one-off routed layers use Q2_K/Q3_K/Q5_K/Q8_0,
+        // which this runtime does not decode. The claim boundary must
+        // typed-reject them, never silently dequantize or fall back to dense.
+        let shapes = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            None,
+            None,
+        ];
+        for native in ["q2_k", "q3_k", "q5_k", "q8_0"] {
+            let mut fc1_spec = attrs("identity", 1, false, 0);
+            fc1_spec[0] = ("fc1_format", Attribute::String(native.as_bytes().to_vec()));
+            let (graph, node) = model_node(&shapes, &fc1_spec);
+            let err = validate_metadata(graph.node(node), None)
+                .expect_err("native fc1 format must be typed-rejected");
+            assert!(
+                err.to_string().contains("unsupported format"),
+                "fc1 {native}: {err}"
+            );
+
+            let mut fc2_spec = attrs("identity", 1, false, 0);
+            fc2_spec[1] = ("fc2_format", Attribute::String(native.as_bytes().to_vec()));
+            let (graph, node) = model_node(&shapes, &fc2_spec);
+            let err = validate_metadata(graph.node(node), None)
+                .expect_err("native fc2 format must be typed-rejected");
+            assert!(
+                err.to_string().contains("unsupported format"),
+                "fc2 {native}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn fc3_format_wiring_mismatch_is_typed_rejected() {
+        // fc3 weights wired but fc3_format attribute missing.
+        let wired = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+        ];
+        let (graph, node) = model_node(&wired, &attrs("swiglu", 1, false, 0));
+        let err = validate_metadata(graph.node(node), None)
+            .expect_err("wired fc3 without fc3_format must be rejected");
+        assert!(err.to_string().contains("fc3_format"), "{err}");
+
+        // fc3_format attribute present but fc3 weights not wired.
+        let unwired = vec![
+            Some((DataType::Float32, vec![1, H])),
+            Some((DataType::Float32, vec![1, E])),
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![E, H, 1, 17])),
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(
+            &unwired,
+            &with_fc3_format(attrs("identity", 1, false, 0), "mxfp4"),
+        );
+        let err = validate_metadata(graph.node(node), None)
+            .expect_err("fc3_format without wired fc3 must be rejected");
+        assert!(
+            err.to_string().contains("fc3_format is only valid"),
+            "{err}"
+        );
     }
 }
