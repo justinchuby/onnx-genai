@@ -21,8 +21,7 @@ pub struct TensorContract {
     /// stay runtime-private.
     #[serde(default, skip_serializing_if = "BatchLayout::is_shared")]
     pub batch_layout: BatchLayout,
-    /// Workflow value whose booleans or integers mark which entries of this
-    /// tensor are real rather than padding.
+    /// Which entries of this tensor are real rather than padding.
     ///
     /// A dense tensor is the only shape a fixed-arity component can consume, so
     /// a batch whose rows carry different amounts of data has to be padded up to
@@ -31,7 +30,25 @@ pub struct TensorContract {
     /// schema refuses: the mask is named, typed, and validated like any other
     /// value. Absence means every entry is valid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pad_mask: Option<String>,
+    pub pad_mask: Option<PadMask>,
+}
+
+/// The mask that says which entries of a padded tensor are real, and the axis
+/// it marks them along.
+///
+/// The axis is stated rather than inferred. A rank-2 mask over a rank-5 clip
+/// tensor could plausibly mark frames, tiles, or patches, and a reader that
+/// guessed from rank alone would silently mark the wrong axis for any tensor
+/// whose padded axis is not the one the reader assumed. Naming it costs one
+/// integer and removes the guess.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PadMask {
+    /// Workflow value, or sibling port of the same component, whose booleans or
+    /// integers mark the valid entries.
+    pub value: String,
+    /// Axis of the masked tensor whose entries the mask marks.
+    pub axis: usize,
 }
 
 /// Structural relationship between a typed value and the runtime batch.
@@ -39,10 +56,12 @@ pub struct TensorContract {
 /// `shared` values are invariant across requests. `request_aligned` values carry
 /// exactly one entry per in-flight request along `axis`, so compaction permutes
 /// that axis. `token_packed` values are ragged: `offsets` names the
-/// request-aligned exclusive-prefix offset value and `owner` names the
-/// per-item owner mapping, which together let a runtime split and regroup the
-/// packed value without any serialized request ID. `runtime_sequence_state`
-/// marks a value whose per-sequence storage the runtime owns outright.
+/// exclusive-prefix offset value and `owner` names the per-item owner mapping,
+/// which together let a runtime split and regroup the packed value without any
+/// serialized request ID. A packing whose items belong to the items of another
+/// packing — frames inside clips inside request rows — names that enclosing
+/// packing in `owner_span`. `runtime_sequence_state` marks a value whose
+/// per-sequence storage the runtime owns outright.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BatchLayout {
@@ -60,12 +79,25 @@ pub enum BatchLayout {
         factor: usize,
     },
     TokenPacked {
-        /// Request-aligned value holding the exclusive prefix offset of each request's items.
+        /// Value holding the exclusive prefix offset of each owner's items.
+        ///
+        /// Request-aligned for a packing owned by request rows; aligned with the
+        /// enclosing packing's items when `owner_span` names one.
         offsets: String,
-        /// Item-aligned value mapping each packed item to its owning request row.
+        /// Item-aligned value mapping each packed item to the index of its owner.
         owner: String,
         /// Packed axis of this value.
         axis: usize,
+        /// Packed value whose items this packing's owner indices name.
+        ///
+        /// Absent means the owner map indexes request rows, which is where every
+        /// ownership chain ends. Present means one more level sits in between:
+        /// packed frames own into packed clips, and the clips own into rows.
+        /// Composition is bounded — validation rejects a chain deeper than
+        /// items inside spans inside request rows — because a runtime resolves
+        /// ownership by walking it on every compaction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_span: Option<String>,
     },
     RuntimeSequenceState,
 }
@@ -103,6 +135,15 @@ impl BatchLayout {
     pub fn packing(&self) -> Option<(&str, &str)> {
         match self {
             Self::TokenPacked { offsets, owner, .. } => Some((offsets.as_str(), owner.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Packed value whose items this packing's owner indices name, if this
+    /// packing nests inside another instead of owning into request rows.
+    pub fn owner_span(&self) -> Option<&str> {
+        match self {
+            Self::TokenPacked { owner_span, .. } => owner_span.as_deref(),
             _ => None,
         }
     }
@@ -809,8 +850,12 @@ pub struct ComponentBatchCapacity {
     ///
     /// A component that accepts several rows may still require them to agree on
     /// something the batch axis does not cover — an encoder whose artifact is
-    /// built for one spatial extent, say. Listing those axes lets a scheduler
-    /// group compatible rows instead of guessing from shapes it cannot compare.
+    /// built for one spatial extent, say, or one that batches clips only when
+    /// they carry the same number of frames. Spatial and temporal axes are
+    /// listed the same way: an axis is an axis, and the runtime compares the
+    /// dimensions it is told to compare rather than guessing which ones matter.
+    /// Listing them lets a scheduler group compatible rows instead of guessing
+    /// from shapes it cannot compare.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uniform_axes: Vec<usize>,
 }
@@ -917,7 +962,7 @@ pub enum WorkflowStep {
         #[serde(default)]
         termination: WorkflowLoopTermination,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        iteration: Option<WorkflowLoopIteration>,
+        iteration: Option<Box<WorkflowLoopIteration>>,
         #[serde(default)]
         carried: Vec<WorkflowCarry>,
     },
@@ -938,6 +983,9 @@ pub enum WorkflowStep {
         output: String,
         mode: WorkflowEmitMode,
         /// Axis along which the output grows; defaults to the final axis.
+        ///
+        /// A rank-four or deeper value must name it: the final axis of a media
+        /// tensor is a spatial extent, never the one an append concatenates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         axis: Option<usize>,
     },
@@ -978,7 +1026,7 @@ pub enum WorkflowNode {
         max_iterations: String,
         termination: WorkflowLoopTermination,
         /// Optional zero-based induction value, scoped to this loop's body and continue_when.
-        iteration: Option<WorkflowLoopIteration>,
+        iteration: Option<Box<WorkflowLoopIteration>>,
         carried: Vec<WorkflowLoopCarry>,
         effects: BTreeMap<String, WorkflowLoopEffect>,
     },
@@ -1004,6 +1052,7 @@ pub enum WorkflowNode {
         /// value whose sequence axis sits elsewhere - video frames in
         /// `[batch, channels, frames, height, width]`, for instance - names it
         /// here so incremental publication does not concatenate the wrong axis.
+        /// A rank-four or deeper value has no defensible default and must say.
         axis: Option<usize>,
         effect_name: String,
         effect: EffectTransition,

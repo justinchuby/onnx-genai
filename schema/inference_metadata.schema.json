@@ -808,7 +808,7 @@
       "type": "string"
     },
     "BatchLayout": {
-      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nrequest-aligned exclusive-prefix offset value and `owner` names the\nper-item owner mapping, which together let a runtime split and regroup the\npacked value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
+      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nexclusive-prefix offset value and `owner` names the per-item owner mapping,\nwhich together let a runtime split and regroup the packed value without any\nserialized request ID. A packing whose items belong to the items of another\npacking — frames inside clips inside request rows — names that enclosing\npacking in `owner_span`. `runtime_sequence_state` marks a value whose\nper-sequence storage the runtime owns outright.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -883,12 +883,19 @@
               "type": "string"
             },
             "offsets": {
-              "description": "Request-aligned value holding the exclusive prefix offset of each request's items.",
+              "description": "Value holding the exclusive prefix offset of each owner's items.\n\nRequest-aligned for a packing owned by request rows; aligned with the\nenclosing packing's items when `owner_span` names one.",
               "type": "string"
             },
             "owner": {
-              "description": "Item-aligned value mapping each packed item to its owning request row.",
+              "description": "Item-aligned value mapping each packed item to the index of its owner.",
               "type": "string"
+            },
+            "owner_span": {
+              "description": "Packed value whose items this packing's owner indices name.\n\nAbsent means the owner map indexes request rows, which is where every\nownership chain ends. Present means one more level sits in between:\npacked frames own into packed clips, and the clips own into rows.\nComposition is bounded — validation rejects a chain deeper than\nitems inside spans inside request rows — because a runtime resolves\nownership by walking it on every compaction.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -949,7 +956,7 @@
           ]
         },
         "uniform_axes": {
-          "description": "Axes whose dimensions must be equal across rows for those rows to share\none invocation.\n\nA component that accepts several rows may still require them to agree on\nsomething the batch axis does not cover — an encoder whose artifact is\nbuilt for one spatial extent, say. Listing those axes lets a scheduler\ngroup compatible rows instead of guessing from shapes it cannot compare.",
+          "description": "Axes whose dimensions must be equal across rows for those rows to share\none invocation.\n\nA component that accepts several rows may still require them to agree on\nsomething the batch axis does not cover — an encoder whose artifact is\nbuilt for one spatial extent, say, or one that batches clips only when\nthey carry the same number of frames. Spatial and temporal axes are\nlisted the same way: an axis is an axis, and the runtime compares the\ndimensions it is told to compare rather than guessing which ones matter.\nListing them lets a scheduler group compatible rows instead of guessing\nfrom shapes it cannot compare.",
           "items": {
             "format": "uint",
             "minimum": 0,
@@ -2208,6 +2215,27 @@
           "description": "Exact tokenizer, vocabulary, and special-token facts."
         }
       },
+      "type": "object"
+    },
+    "PadMask": {
+      "additionalProperties": false,
+      "description": "The mask that says which entries of a padded tensor are real, and the axis\nit marks them along.\n\nThe axis is stated rather than inferred. A rank-2 mask over a rank-5 clip\ntensor could plausibly mark frames, tiles, or patches, and a reader that\nguessed from rank alone would silently mark the wrong axis for any tensor\nwhose padded axis is not the one the reader assumed. Naming it costs one\ninteger and removes the guess.",
+      "properties": {
+        "axis": {
+          "description": "Axis of the masked tensor whose entries the mask marks.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "value": {
+          "description": "Workflow value, or sibling port of the same component, whose booleans or\nintegers mark the valid entries.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value",
+        "axis"
+      ],
       "type": "object"
     },
     "PipelineSpec": {
@@ -3771,11 +3799,15 @@
           "type": "boolean"
         },
         "pad_mask": {
-          "description": "Workflow value whose booleans or integers mark which entries of this\ntensor are real rather than padding.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na batch whose rows carry different amounts of data has to be padded up to\na common extent. Nothing in the padded tensor says where the real entries\nstop, and guessing from a sentinel is exactly the hidden heuristic this\nschema refuses: the mask is named, typed, and validated like any other\nvalue. Absence means every entry is valid.",
-          "type": [
-            "string",
-            "null"
-          ]
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PadMask"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which entries of this tensor are real rather than padding.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na batch whose rows carry different amounts of data has to be padded up to\na common extent. Nothing in the padded tensor says where the real entries\nstop, and guessing from a sentinel is exactly the hidden heuristic this\nschema refuses: the mask is named, typed, and validated like any other\nvalue. Absence means every entry is valid."
         },
         "rank": {
           "format": "uint",
@@ -5156,7 +5188,7 @@
           "additionalProperties": false,
           "properties": {
             "axis": {
-              "description": "Axis along which the output grows; defaults to the final axis.",
+              "description": "Axis along which the output grows; defaults to the final axis.\n\nA rank-four or deeper value must name it: the final axis of a media\ntensor is a spatial extent, never the one an append concatenates.",
               "format": "uint",
               "minimum": 0,
               "type": [

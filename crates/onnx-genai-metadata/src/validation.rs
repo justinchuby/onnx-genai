@@ -2532,26 +2532,64 @@ fn validate_contract_references(
         offsets,
         owner,
         axis,
+        owner_span,
     } = &contract.batch_layout
     {
-        validate_token_packed_layout(path, value, contract, *axis, offsets, owner, scope, errors);
+        validate_token_packed_layout(
+            PackedLayoutFacts {
+                path,
+                value,
+                contract,
+                axis: *axis,
+                offsets,
+                owner,
+                owner_span: owner_span.as_deref(),
+            },
+            scope,
+            errors,
+        );
     }
     if let Some(mask) = &contract.pad_mask {
         validate_pad_mask(path, value, contract, mask, scope, errors);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn validate_token_packed_layout(
-    path: &str,
-    value: Option<&str>,
-    contract: &crate::schema::TensorContract,
+/// How deep packings may nest before the document is describing a structure no
+/// runtime is expected to unpack.
+///
+/// Two is what the media actually needs: frames inside clips inside request
+/// rows. Every level costs the runtime another indirection to resolve an item
+/// back to the request that asked for it, and a document that needs more is far
+/// more likely to have looped its ownership than to have found a third real
+/// level of structure.
+const MAX_PACKED_OWNERSHIP_DEPTH: usize = 2;
+
+/// What one `token_packed` declaration says about itself, gathered so the
+/// checks below read as rules rather than as a parameter list.
+struct PackedLayoutFacts<'a> {
+    path: &'a str,
+    value: Option<&'a str>,
+    contract: &'a crate::schema::TensorContract,
     axis: usize,
-    offsets: &str,
-    owner: &str,
+    offsets: &'a str,
+    owner: &'a str,
+    owner_span: Option<&'a str>,
+}
+
+fn validate_token_packed_layout(
+    facts: PackedLayoutFacts<'_>,
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
+    let PackedLayoutFacts {
+        path,
+        value,
+        contract,
+        axis,
+        offsets,
+        owner,
+        owner_span,
+    } = facts;
     if axis >= contract.rank {
         errors.push(format!(
             "{path} packs items on axis {axis}, outside rank {}",
@@ -2565,19 +2603,32 @@ fn validate_token_packed_layout(
         ));
         return;
     }
+    // What one offset counts against: a request row for a terminal packing, an
+    // item of the enclosing packing for a nested one.
+    let per = match owner_span {
+        Some(_) => "enclosing span",
+        None => "request row",
+    };
     if offsets == owner {
         errors.push(format!(
             "{path} names '{offsets}' as both its packed offsets and its owner map; offsets hold \
-             one prefix offset per request row and the owner map holds one row index per packed \
+             one prefix offset per {per} and the owner map holds one owning index per packed \
              item, so one value cannot be both"
         ));
     }
     if value == Some(offsets) {
         errors.push(format!(
-            "{path} names itself as its own packed offsets; the offsets are a separate \
-             request-aligned value"
+            "{path} names itself as its own packed offsets; the offsets are a separate value, one \
+             entry per enclosing span"
         ));
     }
+
+    // An enclosing span turns this packing from "items in request rows" into
+    // "items in the spans of another packing", which changes what the offsets
+    // are counted against. Resolve it first so the offsets rule below knows
+    // which of the two it is applying.
+    let enclosing = owner_span
+        .and_then(|span| validate_owner_span(path, value, offsets, owner, span, scope, errors));
 
     if !scope.is_declared(offsets) {
         errors.push(format!(
@@ -2594,16 +2645,39 @@ fn validate_token_packed_layout(
         if offsets_contract.rank != 1 {
             errors.push(format!(
                 "{path} token_packed offsets '{offsets}' must be rank one with one prefix offset \
-                 per request row, not rank {}",
+                 per {per}, not rank {}",
                 offsets_contract.rank
             ));
         }
-        if offsets_contract.batch_layout.request_axis() != Some(0) {
-            errors.push(format!(
-                "{path} token_packed offsets '{offsets}' must declare a request_aligned \
-                 batch_layout on axis 0; the offsets describe the rows they are permuted with \
-                 when the runtime compacts the batch"
-            ));
+        match enclosing {
+            // Nested: one offset per span of the enclosing packing, so the
+            // offsets are themselves packed the way those spans are.
+            Some((span, span_offsets, span_owner)) => {
+                let packed_as_spans = offsets_contract.batch_layout.packing().is_some_and(
+                    |(packed_offsets, packed_owner)| {
+                        packed_offsets == span_offsets && packed_owner == span_owner
+                    },
+                ) && offsets_contract.batch_layout.packed_axis() == Some(0);
+                if !packed_as_spans {
+                    errors.push(format!(
+                        "{path} packs items inside the spans of '{span}', so its offsets \
+                         '{offsets}' must themselves be token_packed on axis 0 against offsets \
+                         '{span_offsets}' and owner map '{span_owner}'; there is one offset per \
+                         span, not one per request row, and the offsets are {} instead",
+                        request_axis_description(&offsets_contract.batch_layout)
+                    ));
+                }
+            }
+            // Terminal: one offset per request row.
+            None => {
+                if offsets_contract.batch_layout.request_axis() != Some(0) {
+                    errors.push(format!(
+                        "{path} token_packed offsets '{offsets}' must declare a request_aligned \
+                         batch_layout on axis 0; the offsets describe the rows they are permuted \
+                         with when the runtime compacts the batch"
+                    ));
+                }
+            }
         }
     }
 
@@ -2625,8 +2699,8 @@ fn validate_token_packed_layout(
     }
     if owner_contract.rank != 1 {
         errors.push(format!(
-            "{path} token_packed owner map '{owner}' must be rank one with one owning row index \
-             per packed item, not rank {}",
+            "{path} token_packed owner map '{owner}' must be rank one with one owning index per \
+             packed item, not rank {}",
             owner_contract.rank
         ));
     }
@@ -2636,6 +2710,7 @@ fn validate_token_packed_layout(
             offsets: owner_offsets,
             owner: owner_owner,
             axis: owner_axis,
+            owner_span: owner_owner_span,
         } => {
             if *owner_axis != 0 {
                 errors.push(format!(
@@ -2656,13 +2731,101 @@ fn validate_token_packed_layout(
                      owner map; an owner map describes its own items and must name itself"
                 ));
             }
+            if owner_owner_span.as_deref() != owner_span {
+                errors.push(format!(
+                    "{path} token_packed owner map '{owner}' {} but the value it owns {}; the map \
+                     and the items it indexes sit at the same level of the packing",
+                    owner_span_description(owner_owner_span.as_deref()),
+                    owner_span_description(owner_span)
+                ));
+            }
         }
         other => errors.push(format!(
             "{path} token_packed owner map '{owner}' declares a {} batch_layout; an owner map has \
-             one entry per packed item, not one per request row, so it is either shared or packed \
-             against the same offsets",
+             one entry per packed item, not one per enclosing span, so it is either shared or \
+             packed against the same offsets",
             other.kind_name()
         )),
+    }
+}
+
+/// Check the packing this one nests inside, and report its `(offsets, owner)`
+/// when it is usable — the caller needs them to check that this packing's
+/// offsets are counted per span rather than per request row.
+fn validate_owner_span<'a>(
+    path: &str,
+    value: Option<&str>,
+    offsets: &str,
+    owner: &str,
+    span: &'a str,
+    scope: &'a LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    if span.trim().is_empty() {
+        errors.push(format!(
+            "{path} declares an empty owner_span; omit owner_span to declare that its owner \
+             indices name request rows"
+        ));
+        return None;
+    }
+    if value == Some(span) || span == offsets || span == owner {
+        errors.push(format!(
+            "{path} names '{span}' as the packing its items sit inside, but that is this same \
+             packing; an enclosing span is a separate, coarser packing"
+        ));
+        return None;
+    }
+    if !scope.is_declared(span) {
+        errors.push(format!(
+            "{path} owner_span references '{span}', which this workflow does not declare as a \
+             value or as a port of the same component"
+        ));
+        return None;
+    }
+    let span_contract = scope.contract(span)?;
+    let Some((span_offsets, span_owner)) = span_contract.batch_layout.packing() else {
+        errors.push(format!(
+            "{path} owner_span '{span}' declares a {} batch_layout; its owner indices name the \
+             items of '{span}', so '{span}' is itself token_packed",
+            span_contract.batch_layout.kind_name()
+        ));
+        return None;
+    };
+    let mut depth = 1;
+    let mut visited = vec![span];
+    let mut cursor = span_contract.batch_layout.owner_span();
+    while let Some(next) = cursor {
+        if Some(next) == value || visited.contains(&next) {
+            errors.push(format!(
+                "{path} nests inside '{span}', whose enclosing spans loop back to '{next}'; \
+                 ownership walks outwards to request rows and cannot cycle"
+            ));
+            return None;
+        }
+        depth += 1;
+        if depth >= MAX_PACKED_OWNERSHIP_DEPTH {
+            errors.push(format!(
+                "{path} nests {} packings deep through '{span}', past the limit of \
+                 {MAX_PACKED_OWNERSHIP_DEPTH}; ownership composes at most that far before an \
+                 item is resolved against its request row",
+                depth + 1
+            ));
+            return None;
+        }
+        let Some(next_contract) = scope.contract(next) else {
+            break;
+        };
+        visited.push(next);
+        cursor = next_contract.batch_layout.owner_span();
+    }
+    Some((span, span_offsets, span_owner))
+}
+
+/// Where a packing's owner indices point, spelled for an error message.
+fn owner_span_description(owner_span: Option<&str>) -> String {
+    match owner_span {
+        Some(span) => format!("owns into the items of '{span}'"),
+        None => "owns into request rows".to_string(),
     }
 }
 
@@ -2670,17 +2833,22 @@ fn validate_pad_mask(
     path: &str,
     value: Option<&str>,
     contract: &crate::schema::TensorContract,
-    mask: &str,
+    mask: &crate::schema::PadMask,
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
-    if mask.trim().is_empty() {
+    let crate::schema::PadMask {
+        value: mask_value,
+        axis,
+    } = mask;
+    if mask_value.trim().is_empty() {
         errors.push(format!(
-            "{path} declares an empty pad_mask; omit pad_mask to declare that every entry is valid"
+            "{path} declares an empty pad_mask value; omit pad_mask to declare that every entry \
+             is valid"
         ));
         return;
     }
-    if value == Some(mask) {
+    if value == Some(mask_value.as_str()) {
         errors.push(format!(
             "{path} names itself as its own pad_mask; the mask is a separate value marking which \
              of this value's entries are real"
@@ -2689,39 +2857,66 @@ fn validate_pad_mask(
     }
     if let crate::schema::BatchLayout::TokenPacked { offsets, .. } = &contract.batch_layout {
         errors.push(format!(
-            "{path} is token_packed and declares pad_mask '{mask}'; packed items are contiguous \
-             and carry no padding, so their validity is already given by offsets '{offsets}'"
+            "{path} is token_packed and declares pad_mask '{mask_value}'; packed items are \
+             contiguous and carry no padding, so their validity is already given by offsets \
+             '{offsets}'"
         ));
         return;
     }
-    if !scope.is_declared(mask) {
+    // The masked axis is the one the rows were padded up to a common extent
+    // along — a frame count, a tile count, a token count. It is never the axis
+    // the rows themselves stack on: a compacted batch has no padding rows, and
+    // a mask that claimed otherwise would describe a batch the runtime never
+    // builds.
+    if *axis >= contract.rank {
         errors.push(format!(
-            "{path} pad_mask references '{mask}', which this workflow does not declare as a value \
-             or as a port of the same component"
+            "{path} declares pad_mask '{mask_value}' on axis {axis}, outside rank {}",
+            contract.rank
         ));
         return;
     }
-    let Some(mask_contract) = scope.contract(mask) else {
+    if contract.batch_layout.request_axis() == Some(*axis) {
+        errors.push(format!(
+            "{path} declares pad_mask '{mask_value}' on axis {axis}, which is the axis its \
+             request rows stack along; a mask marks padding within a row, and the batch itself \
+             carries no padding rows"
+        ));
+    }
+    if !scope.is_declared(mask_value) {
+        errors.push(format!(
+            "{path} pad_mask references '{mask_value}', which this workflow does not declare as a \
+             value or as a port of the same component"
+        ));
+        return;
+    }
+    let Some(mask_contract) = scope.contract(mask_value) else {
         return;
     };
     if mask_contract.dtype != "bool" && !is_integer_dtype(&mask_contract.dtype) {
         errors.push(format!(
-            "{path} pad_mask '{mask}' must have a bool or integer dtype marking valid entries, \
-             not '{}'",
+            "{path} pad_mask '{mask_value}' must have a bool or integer dtype marking valid \
+             entries, not '{}'",
             mask_contract.dtype
         ));
     }
     if mask_contract.rank == 0 || mask_contract.rank > contract.rank {
         errors.push(format!(
-            "{path} pad_mask '{mask}' has rank {}, which cannot mark the valid entries of a \
+            "{path} pad_mask '{mask_value}' has rank {}, which cannot mark the valid entries of a \
              rank-{} value",
             mask_contract.rank, contract.rank
+        ));
+    } else if contract.batch_layout.request_axis().is_some() && mask_contract.rank < 2 {
+        errors.push(format!(
+            "{path} pad_mask '{mask_value}' has rank {}, but the value it masks is \
+             request-scoped; the mask spans both the rows it is permuted with and axis {axis} it \
+             marks",
+            mask_contract.rank
         ));
     }
     if mask_contract.batch_layout.request_axis() != contract.batch_layout.request_axis() {
         errors.push(format!(
-            "{path} pad_mask '{mask}' is {} but the value it masks is {}; a mask is permuted with \
-             the rows it describes, so both must declare the same request axis",
+            "{path} pad_mask '{mask_value}' is {} but the value it masks is {}; a mask is \
+             permuted with the rows it describes, so both must declare the same request axis",
             request_axis_description(&mask_contract.batch_layout),
             request_axis_description(&contract.batch_layout)
         ));
@@ -2797,9 +2992,19 @@ fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         .collect::<Vec<_>>();
         for (direction, port, contract, axis) in &batched_ports {
             if *axis != capacity.axis {
+                // A packed port stacks items rather than rows, but the items of
+                // all the rows in one invocation are concatenated along that
+                // same axis, so it is still the axis the capacity governs.
+                let carries = match contract.batch_layout.packed_axis() {
+                    Some(packed) => format!(
+                        "packs the items of its rows on axis {packed}, which is where an \
+                         invocation's rows land"
+                    ),
+                    None => format!("batches rows on axis {axis}"),
+                };
                 errors.push(format!(
-                    "workflow component '{name}' {direction} port '{port}' batches on axis \
-                     {axis} but the component declares batch_capacity axis {}",
+                    "workflow component '{name}' {direction} port '{port}' {carries}, but the \
+                     component declares batch_capacity axis {}",
                     capacity.axis
                 ));
             }
@@ -4467,11 +4672,20 @@ fn validate_workflow_node(
             when,
             valid_length,
             output,
+            mode,
+            axis,
             effect_name,
             effect,
-            ..
         } => {
             require_workflow_value(value, values, &format!("{path}.value"), errors);
+            validate_emit_axis(
+                value_contracts.get(value),
+                mode,
+                *axis,
+                valid_length.is_some(),
+                path,
+                errors,
+            );
             if let Some(when) = when {
                 require_workflow_value(when, values, &format!("{path}.when"), errors);
                 if let Some(contract) = value_contracts.get(when) {
@@ -4560,6 +4774,45 @@ fn validate_workflow_node(
             }
         }
         WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+/// An incremental emit grows one axis of the output, and which axis that is has
+/// to be knowable from the document.
+///
+/// The default - the final axis - is right for a token sequence and wrong for
+/// anything whose growth axis sits inside the shape. A rank-four or deeper value
+/// is the shape a media tensor takes, `[batch, channels, frames, height, width]`
+/// or `[batch, frames, height, width]`, where the final axis is a spatial extent
+/// that must never be concatenated. Rather than guess which of several plausible
+/// axes was meant, such an emit names it.
+fn validate_emit_axis(
+    contract: Option<&crate::schema::TensorContract>,
+    mode: &crate::schema::WorkflowEmitMode,
+    axis: Option<usize>,
+    length_limited: bool,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(contract) = contract else {
+        return;
+    };
+    if let Some(axis) = axis {
+        if axis >= contract.rank {
+            errors.push(format!(
+                "{path}.axis is {axis}, outside the rank {} of value it emits",
+                contract.rank
+            ));
+        }
+        return;
+    }
+    let incremental = matches!(mode, crate::schema::WorkflowEmitMode::Append) || length_limited;
+    if incremental && contract.rank >= 4 {
+        errors.push(format!(
+            "{path} grows a rank-{} output but names no axis; the default final axis is a \
+             spatial extent for a value of this rank, so the axis it grows along must be stated",
+            contract.rank
+        ));
     }
 }
 

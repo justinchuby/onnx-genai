@@ -560,10 +560,10 @@ pub fn decoder_workflow(
             // special case.
             termination: crate::schema::WorkflowLoopTermination::GenerationEos,
             carried,
-            iteration: Some(crate::schema::WorkflowLoopIteration {
+            iteration: Some(Box::new(crate::schema::WorkflowLoopIteration {
                 value: LOOP_ITERATION.to_string(),
                 contract: scalar_contract(),
-            }),
+            })),
         }],
     };
     Ok(spec)
