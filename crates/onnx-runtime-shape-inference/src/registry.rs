@@ -78,8 +78,11 @@ impl InferenceRegistry {
 
     /// Every registered rule as `(domain, operator, min_opset)`, sorted.
     ///
-    /// This is the full identity of the catalog, and the thing to pin. Neither
-    /// count above can see a change that preserves them:
+    /// This is the full identity of the catalog — its keys and opset floors,
+    /// not its handler bodies — and the thing to pin. A swap of the
+    /// [`InferenceFn`] behind an unchanged triple is deliberately out of scope
+    /// here; that is what the behavioural rule tests cover. Neither count above
+    /// can see a change that preserves them:
     ///
     /// - a **rename** drops one key and adds another, so `operator_count` and
     ///   `entry_count` both hold;
