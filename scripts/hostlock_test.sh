@@ -43,12 +43,24 @@ set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 LOCK="$(pwd)/.hostlock-selftest"
 export HOSTLOCK_DIR="$LOCK"
+# Acknowledge the private lock, ONCE, for the suite.
+#
+# Every invocation below sets HOSTLOCK_DIR, which is a lock that coordinates
+# with nobody -- correct here (a suite that took the real host lock would
+# deadlock the box it runs on) and announced on stderr precisely because it is
+# indistinguishable from the shared one in every other respect. Three lines of
+# stderr on each of ~700 invocations is how a warning gets deleted for being
+# noise, so it is acknowledged here rather than silenced in the script. The
+# announcement itself, and the fact that this variable is what suppresses it,
+# are asserted in the path-resolution section below -- with HOSTLOCK_PRIVATE_OK
+# unset for those cells, so this line cannot make them vacuous.
+export HOSTLOCK_PRIVATE_OK=1
 HL=scripts/hostlock.sh
 
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1763,13 +1775,216 @@ chk "with the state field the row physically carries" \
 $HL release >/dev/null 2>&1
 cleanup
 
+echo "== which lock is this: path resolution, and saying so =="
+#
+# The defect: with HOSTLOCK_DIR set, `status` printed FREE and `status
+# --porcelain` printed state=FREE in bytes IDENTICAL to a genuinely free shared
+# host, while a peer held the real one. Nothing downstream, and no human
+# reading a scrollback, could tell a private lock from the shared one -- so the
+# lock that coordinates with nobody is the one that looks most available.
+#
+# These cells deliberately run with HOSTLOCK_DIR UNSET (`env -u`), because the
+# suite exports it and every other cell depends on it. That is also what makes
+# the announcement cells non-vacuous: HOSTLOCK_PRIVATE_OK is unset per-cell
+# where the warning itself is under test.
+cleanup
+CONF="$LOCK.conf"
+NOCONF="$LOCK.noconf-does-not-exist"
+rm -f "$NOCONF"
+
+# `status` is the only subcommand used with a real (non-scratch) resolution: it
+# reads and never creates, so a resolution that comes out pointing at the true
+# shared path cannot take, modify, or leave a lock on the actual host.
+hl_conf() { local c=$1; shift; env -u HOSTLOCK_DIR HOSTLOCK_CONF="$c" scripts/hostlock.sh "$@"; }
+cf() { hl_conf "$1" status --porcelain 2>/dev/null | sed -n "s/^$2=//p"; }
+
+chk "with no config and no env, the lock is the documented default path" \
+    "$(cf "$NOCONF" lock_dir)" "/tmp/onnx-genai-hostlock"
+chk "and is attributed to the default, not to a config nobody wrote" \
+    "$(cf "$NOCONF" lock_dir_source)" "default"
+chk "and is box-wide, which is the only scope that coordinates anything" \
+    "$(cf "$NOCONF" lock_scope)" "box"
+
+printf 'lock_dir=%s\n' "$LOCK.box" >"$CONF"
+chk "a machine-local config moves the lock for every invocation on the box" \
+    "$(cf "$CONF" lock_dir)" "$LOCK.box"
+chk "and the row says the path came from the config" \
+    "$(cf "$CONF" lock_dir_source)" "config"
+chk "and a configured path is still box-wide" "$(cf "$CONF" lock_scope)" "box"
+
+# The whole point of the distinction: a config is read by every process on the
+# box, an env var by one. They must not report the same scope.
+chk "HOSTLOCK_DIR overrides the config, because it is set later and per-process" \
+    "$(HOSTLOCK_CONF="$CONF" $HL status --porcelain | sed -n 's/^lock_dir=//p')" "$LOCK"
+chk "and is reported as PRIVATE, which is the fact that makes it dangerous" \
+    "$(HOSTLOCK_CONF="$CONF" $HL status --porcelain | sed -n 's/^lock_scope=//p')" "private"
+chk "and attributed to the environment" \
+    "$(HOSTLOCK_CONF="$CONF" $HL status --porcelain | sed -n 's/^lock_dir_source=//p')" "env"
+
+# Parsing rules, each one a way for the two implementations to drift apart
+# silently (crates/onnx-runtime-hostmon reads the same file).
+printf '  lock_dir =  %s   # box-wide\n' "$LOCK.box" >"$CONF"
+chk "whitespace around the value and a trailing comment are not part of the path" \
+    "$(cf "$CONF" lock_dir)" "$LOCK.box"
+printf 'lock_dir=%s\nlock_dir=/somewhere/else\n' "$LOCK.box" >"$CONF"
+chk "the first key wins, as the reader's head -1 does" "$(cf "$CONF" lock_dir)" "$LOCK.box"
+printf 'lock_dir_old=%s\n' "$LOCK.box" >"$CONF"
+chk "a key that merely starts the same way does not move the lock" \
+    "$(cf "$CONF" lock_dir)" "/tmp/onnx-genai-hostlock"
+printf '# lock_dir=%s\n' "$LOCK.box" >"$CONF"
+chk "a commented-out key is not a key" "$(cf "$CONF" lock_dir)" "/tmp/onnx-genai-hostlock"
+
+# A config that cannot be honoured must STOP the invocation. Falling back would
+# put half the box on the configured path and half on /tmp: both halves acquire
+# instantly, neither ever collides, and every row claims a declared host.
+printf 'lock_dir=relative/path\n' >"$CONF"
+chk "a relative lock_dir is refused rather than resolved" \
+    "$(hl_conf "$CONF" status --porcelain >/dev/null 2>&1; echo $?)" "1"
+chk "and it does NOT quietly fall back to the default path" \
+    "$(hl_conf "$CONF" status --porcelain 2>/dev/null | grep -c '^lock_dir=')" "0"
+chk "and says which file and which value, so it can be fixed" \
+    "$(hl_conf "$CONF" status 2>&1 >/dev/null | grep -c 'relative/path')" "1"
+printf 'lock_dir=\n' >"$CONF"
+chk "an empty lock_dir is an unusable value, not an absent key" \
+    "$(hl_conf "$CONF" status --porcelain >/dev/null 2>&1; echo $?)" "1"
+
+# The config sits at a fixed path any process on this box can write. Sourcing
+# it would make every hostlock invocation by every agent an execution vector.
+rm -f "$LOCK.sourced"
+# The single quotes are the point: this text must reach the parser unexpanded,
+# because that is what an attacker would write into the file.
+# shellcheck disable=SC2016
+printf 'lock_dir=/tmp/x$(touch %s)\n' "$LOCK.sourced" >"$CONF"
+hl_conf "$CONF" status --porcelain >/dev/null 2>&1
+chk "the config is parsed, never sourced" "$([ -e "$LOCK.sourced" ] && echo pwned || echo clean)" "clean"
+# shellcheck disable=SC2016
+chk "and the value is carried literally, not expanded" \
+    "$(cf "$CONF" lock_dir)" '/tmp/x$(touch '"$LOCK"'.sourced)'
+
+# The announcement. Run with HOSTLOCK_PRIVATE_OK unset, so these cells are not
+# silenced by the suite-wide acknowledgement at the top of this file.
+priv_err() { { env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh "$@" >/dev/null; } 2>&1; }
+chk "a private lock announces itself on every invocation" \
+    "$(priv_err status | grep -c 'PRIVATE lock')" "1"
+chk "and names the path peers are actually using, so the warning is actionable" \
+    "$(priv_err status | grep -c '/tmp/onnx-genai-hostlock')" "1"
+chk "and says how to acknowledge it" \
+    "$(priv_err status | grep -c 'HOSTLOCK_PRIVATE_OK=1')" "1"
+chk "the announcement is on stderr, not in the machine-readable output" \
+    "$(env -u HOSTLOCK_PRIVATE_OK HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status --porcelain 2>/dev/null | grep -c 'PRIVATE')" "0"
+chk "acknowledging it silences it" \
+    "$(HOSTLOCK_PRIVATE_OK=1 HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | wc -c)" "0"
+chk "and the acknowledgement is explicit: any other value still warns" \
+    "$(HOSTLOCK_PRIVATE_OK=yes HOSTLOCK_DIR="$LOCK" scripts/hostlock.sh status 2>&1 >/dev/null | grep -c 'PRIVATE lock')" "1"
+
+# The row has to carry it too. A console warning is gone by the time anyone
+# reads the table; `declared=yes` is only checkable if the row says which lock
+# the claim was made in.
+$HL acquire --owner leon --reason "path row" --ttl 600 >/dev/null 2>&1
+chk "provenance carries the lock directory into the row" \
+    "$($HL provenance | sed -n 's/^lock_dir=//p')" "$LOCK"
+chk "and its scope" "$($HL provenance | sed -n 's/^lock_scope=//p')" "private"
+chk "and where the path came from" "$($HL provenance | sed -n 's/^lock_dir_source=//p')" "env"
+chk "the one-line form carries the scope too, and is still one line" \
+    "$($HL provenance --oneline | tr ' ' '\n' | grep -c '^lock_scope=private$')" "1"
+chk "and remains exactly one line with the new fields" \
+    "$($HL provenance --oneline | wc -l)" "1"
+$HL release >/dev/null 2>&1
+
+echo "== migrating off the old path cannot silently double-book the box =="
+#
+# A config moves the lock for every process that re-reads it. It does NOT move
+# a peer already running against the old path: that holder cannot see the new
+# lock and cannot be negotiated with. So an acquire on the configured path
+# consults the legacy one READ-ONLY and fails closed while it is live.
+cleanup
+rm -rf "$LOCK.legacy" "$LOCK.box"
+printf 'lock_dir=%s\n' "$LOCK.box" >"$CONF"
+hl_legacy() { local c=$1; shift; env -u HOSTLOCK_DIR HOSTLOCK_CONF="$c" HOSTLOCK_LEGACY_DIR="$LOCK.legacy" scripts/hostlock.sh "$@"; }
+
+sleep 300 &
+legacy_holder_pid=$!
+legacy_start=$(sed 's/.*) //' "/proc/${legacy_holder_pid}/stat" | awk '{print $20}')
+mkdir -p "$LOCK.legacy"
+printf 'owner=roy\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\nreason=prefill matrix\n' \
+    "$legacy_holder_pid" "$legacy_start" "$(date +%s)" >"$LOCK.legacy/meta"
+
+chk "acquiring the new path is refused while the old one is live (2, busy)" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+chk "and it names the holder it is deferring to" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 2>&1 >/dev/null | grep -c 'held by roy')" "1"
+# Fail closed means no partial state: a refused acquire that left the new lock
+# published would block the whole box behind a lock nobody holds.
+chk "and takes no lock at the configured path" \
+    "$([ -e "$LOCK.box" ] && echo published || echo absent)" "absent"
+# Strictly read-only. The legacy holder is a live peer running a benchmark; a
+# migration that reaped it would be the takeover this whole tool exists to
+# prevent, performed by the one code path a peer cannot observe.
+chk "and never reaps, renames or rewrites the old lock" \
+    "$(sed -n 's/^owner=//p' "$LOCK.legacy/meta")" "roy"
+chk "the human status names the legacy holder rather than reporting FREE alone" \
+    "$(hl_legacy "$CONF" status 2>/dev/null | grep -c 'still held by roy')" "1"
+chk "and the machine row says which path was consulted" \
+    "$(hl_legacy "$CONF" status --porcelain 2>/dev/null | sed -n 's/^legacy_dir=//p')" "$LOCK.legacy"
+chk "and who was found there" \
+    "$(hl_legacy "$CONF" status --porcelain 2>/dev/null | sed -n 's/^legacy_held_by=//p')" "roy"
+chk "run is refused for the same reason, since it acquires first" \
+    "$(hl_legacy "$CONF" run -- touch "$LOCK.legacyran" >/dev/null 2>&1; echo $?)" "2"
+chk "and the wrapped command did not run" \
+    "$([ -e "$LOCK.legacyran" ] && echo ran || echo skipped)" "skipped"
+
+# The suite itself, and every test harness, uses HOSTLOCK_DIR. Applying the
+# legacy consult there would block every one of them behind whatever holds the
+# real host -- a test that cannot run on a busy box is a test that gets deleted.
+chk "an explicit private lock is not blocked by the legacy path" \
+    "$(HOSTLOCK_LEGACY_DIR="$LOCK.legacy" HOSTLOCK_CONF="$CONF" $HL acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+$HL release >/dev/null 2>&1
+chk "and reports no legacy consult, rather than an unexplained one" \
+    "$(HOSTLOCK_LEGACY_DIR="$LOCK.legacy" HOSTLOCK_CONF="$CONF" $HL status --porcelain | sed -n 's/^legacy_dir=//p')" "none"
+
+# A dead legacy holder must not block the migration forever: the consult is
+# liveness-checked with pid AND start time, exactly as the lock's own is.
+sig "$legacy_holder_pid" 9
+wait "$legacy_holder_pid" 2>/dev/null
+printf 'owner=roy\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\nreason=prefill matrix\n' \
+    "$legacy_holder_pid" "$legacy_start" "$(date +%s)" >"$LOCK.legacy/meta"
+chk "a dead legacy holder does not block the configured path" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+chk "and the lock it took is the configured one" \
+    "$([ -d "$LOCK.box" ] && echo published || echo absent)" "published"
+hl_legacy "$CONF" release >/dev/null 2>&1
+
+# A pid alone is not an identity. The box is at ~1.5M pids after four days, so
+# reuse is not theoretical: a legacy lock naming a pid that has since been
+# recycled by an unrelated process must not block the migration forever, and
+# `kill -0` cannot tell those apart.
+printf 'owner=roy\nanchor_pid=%s\nstart_time=1\nacquired_epoch=%s\nttl=0\nreason=recycled\n' \
+    "$$" "$(date +%s)" >"$LOCK.legacy/meta"
+chk "a legacy lock naming a RECYCLED pid does not block the configured path" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+hl_legacy "$CONF" release >/dev/null 2>&1
+rm -rf "$LOCK.box"
+
+# Unreadable legacy metadata is not evidence of a dead holder (the same rule
+# `reapable` applies to the lock itself) -- but the legacy path is never
+# reaped, so an ancient corpse there must not wedge the box forever.
+printf 'garbage\n' >"$LOCK.legacy/meta"
+chk "a fresh legacy lock with unreadable metadata is treated as busy" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "2"
+touch -d '-2 hours' "$LOCK.legacy"
+chk "one that aged out of the grace no longer blocks the migration" \
+    "$(hl_legacy "$CONF" acquire --owner leon --ttl 600 >/dev/null 2>&1; echo $?)" "0"
+hl_legacy "$CONF" release >/dev/null 2>&1
+rm -rf "$LOCK.legacy" "$LOCK.box" "$CONF"
+cleanup
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "268"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "314"
 
 echo
 echo "passed=${pass} failed=${fail}"

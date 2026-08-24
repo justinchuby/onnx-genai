@@ -355,11 +355,24 @@ pub fn classify(meta: Option<&str>, probe: impl Fn(u32) -> Option<ProcInfo>) -> 
 
 /// Reads the lock as it stands right now.
 ///
-/// Honours `HOSTLOCK_DIR` so a test can point somewhere harmless, exactly as
-/// `hostlock.sh` does.
+/// Resolves the directory exactly as `hostlock.sh` does -- `HOSTLOCK_DIR`, then
+/// the machine-local config's `lock_dir=`, then the default. The two
+/// implementations resolving it differently is not a cosmetic divergence: on a
+/// host whose config has moved the lock, a reader still looking at `/tmp` finds
+/// nothing and stamps `host_lock=free` on every row of a run that was taken
+/// while a peer held the box. That is the mislabelling this module exists to
+/// prevent, reintroduced one layer down, so the rule lives in
+/// [`resolve_lock_dir`] and both sides are held to it by
+/// `tests/agrees_with_hostlock_sh.rs`.
 #[cfg(target_os = "linux")]
 pub fn read() -> LockState {
-    let dir = std::env::var("HOSTLOCK_DIR").unwrap_or_else(|_| DEFAULT_LOCK_DIR.to_string());
+    let dir = match resolve_lock_dir() {
+        Ok(dir) => dir,
+        // A config we cannot honour is not evidence that nobody holds the lock.
+        // `hostlock.sh` refuses to run at all in this state; a reader has no
+        // such option, so it says it does not know.
+        Err(_) => return LockState::Unknown,
+    };
     let meta_path = std::path::Path::new(&dir).join("meta");
     classify_io(
         std::fs::read_to_string(&meta_path).map_err(|err| err.kind()),
@@ -381,6 +394,115 @@ pub fn read() -> LockState {
 #[cfg(not(target_os = "linux"))]
 pub fn read() -> LockState {
     LockState::Unknown
+}
+
+/// Why a lock directory could not be resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockDirError {
+    /// The config file that carries the unusable value.
+    pub config: std::path::PathBuf,
+    /// The value as written, so the message can name it.
+    pub value: String,
+}
+
+impl fmt::Display for LockDirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: lock_dir must be a non-empty absolute path (got '{}')",
+            self.config.display(),
+            self.value
+        )
+    }
+}
+
+/// The machine-local config file both implementations read.
+#[cfg(target_os = "linux")]
+pub fn config_path() -> std::path::PathBuf {
+    if let Ok(explicit) = std::env::var("HOSTLOCK_CONF")
+        && !explicit.is_empty()
+    {
+        return std::path::PathBuf::from(explicit);
+    }
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::PathBuf::from(
+            std::env::var("HOME").unwrap_or_else(|_| "/nonexistent".into()),
+        )
+        .join(".config"),
+    };
+    base.join("onnx-genai").join("hostlock.conf")
+}
+
+/// The `lock_dir=` value in a config file's text, before validation.
+///
+/// Pure, so the parsing rules -- first key wins, `#` starts a comment,
+/// whitespace around both sides is not part of the path -- are testable without
+/// a filesystem, and so they can be stated once for comparison against the
+/// `sed` expression in the script.
+pub fn parse_conf_lock_dir(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line.strip_prefix("lock_dir") else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(value) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let value = value.split('#').next().unwrap_or("").trim();
+        return Some(value.to_string());
+    }
+    None
+}
+
+/// `HOSTLOCK_DIR`, else the config's `lock_dir=`, else the default.
+///
+/// The env override is deliberately *not* equivalent to the config one: it is
+/// per process, so it yields a lock that coordinates with nobody. The script
+/// announces that on stderr; a library has nowhere to announce it, which is
+/// why `provenance`/`status --porcelain` carry `lock_dir=` into the row
+/// instead.
+#[cfg(target_os = "linux")]
+pub fn resolve_lock_dir() -> Result<std::path::PathBuf, LockDirError> {
+    let env_dir = std::env::var("HOSTLOCK_DIR").ok().filter(|d| !d.is_empty());
+    resolve_lock_dir_from(env_dir.as_deref(), &config_path())
+}
+
+/// [`resolve_lock_dir`], with its two inputs passed in.
+///
+/// The environment is process-global, so a test that set `HOSTLOCK_DIR` to
+/// exercise the real entry point would leak the override into every other test
+/// in the binary on any failing assertion. Taking the inputs as arguments is
+/// what lets the differential test drive the *resolution* -- precedence,
+/// absoluteness, the default fallback -- rather than only the parser, which
+/// would leave the rule that actually picks the directory unexercised while
+/// looking thoroughly tested.
+#[cfg(target_os = "linux")]
+pub fn resolve_lock_dir_from(
+    env_dir: Option<&str>,
+    config: &std::path::Path,
+) -> Result<std::path::PathBuf, LockDirError> {
+    if let Some(dir) = env_dir
+        && !dir.is_empty()
+    {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return Ok(std::path::PathBuf::from(DEFAULT_LOCK_DIR));
+    };
+    match parse_conf_lock_dir(&text) {
+        Some(value) if value.starts_with('/') => Ok(std::path::PathBuf::from(value)),
+        // Present but unusable. Falling back to the default here would put half
+        // the box on one path and half on the other, which is worse than either
+        // choice: the admin who wrote the file may have done so precisely
+        // because the default does not work on this host.
+        Some(value) => Err(LockDirError {
+            config: config.to_path_buf(),
+            value,
+        }),
+        None => Ok(std::path::PathBuf::from(DEFAULT_LOCK_DIR)),
+    }
 }
 
 /// Turns the result of reading the metadata file into a state.
@@ -816,6 +938,50 @@ mod tests {
         assert_eq!(meta_get("ownership=x\n", "owner"), None);
         // `start_time` and `time` must not answer for one another either.
         assert_eq!(meta_get("start_time=5\n", "time"), None);
+    }
+
+    /// The config parser is the half of the path rule that can drift silently:
+    /// a reader that resolves a different directory from the writer reports
+    /// `free` on a declared host, convincingly, forever.
+    #[test]
+    fn the_config_parser_matches_the_scripts_sed_expression() {
+        // Whitespace on both sides of `=`, and a trailing comment, are not
+        // part of the path.
+        assert_eq!(
+            parse_conf_lock_dir("  lock_dir = /var/lib/hl   # box-wide\n").as_deref(),
+            Some("/var/lib/hl")
+        );
+        // First key wins, as `head -1` does on the other side.
+        assert_eq!(
+            parse_conf_lock_dir("lock_dir=/a\nlock_dir=/b\n").as_deref(),
+            Some("/a")
+        );
+        // A key must match whole: `lock_dir_old=` is a different key, and
+        // answering for it would move the lock on the strength of a comment.
+        assert_eq!(parse_conf_lock_dir("lock_dir_old=/a\n"), None);
+        assert_eq!(parse_conf_lock_dir("# lock_dir=/a\n"), None);
+        assert_eq!(parse_conf_lock_dir("other=1\n"), None);
+        // Present but empty is Some(""), NOT None: absent means "no opinion,
+        // use the default", empty means "the admin tried to say something and
+        // it is unusable". Collapsing them would silently send this process to
+        // /tmp while the rest of the box followed a config it could not parse.
+        assert_eq!(parse_conf_lock_dir("lock_dir=\n").as_deref(), Some(""));
+    }
+
+    /// An unusable config must not be laundered into a location, nor into
+    /// `free`: `read` answers `Unknown` for it, which is the arm that stops a
+    /// row from being certified.
+    #[test]
+    fn an_unusable_config_is_an_error_rather_than_a_fallback() {
+        assert!(
+            parse_conf_lock_dir("lock_dir=relative/path\n").is_some_and(|v| !v.starts_with('/'))
+        );
+        let err = LockDirError {
+            config: std::path::PathBuf::from("/etc/hostlock.conf"),
+            value: "relative/path".to_string(),
+        };
+        assert!(err.to_string().contains("relative/path"));
+        assert!(err.to_string().contains("absolute"));
     }
 
     #[test]

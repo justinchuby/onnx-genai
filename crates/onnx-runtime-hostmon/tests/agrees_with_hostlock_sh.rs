@@ -53,6 +53,11 @@ fn hostlock(dir: &Path, args: &[&str]) -> (bool, String) {
         .arg(script())
         .args(args)
         .env("HOSTLOCK_DIR", dir)
+        // Acknowledge the private lock. Every invocation here sets
+        // `HOSTLOCK_DIR`, which the script now announces on stderr as
+        // coordinating with nobody -- correct, deliberate, and exactly what a
+        // test wants, but this helper folds stderr into the text it asserts on.
+        .env("HOSTLOCK_PRIVATE_OK", "1")
         .output()
         .expect("failed to run scripts/hostlock.sh");
     let text = format!(
@@ -299,7 +304,8 @@ fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
     corpse.wait().expect("reap");
 }
 
-/// The two implementations must look in the same place.
+/// The two implementations must look in the same place when nothing redirects
+/// them.
 ///
 /// Every other test in this file overrides `HOSTLOCK_DIR`, because a test that
 /// could release a colleague's lock is worse than no test -- which means the
@@ -308,37 +314,227 @@ fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
 /// default moved and the reader's did not, the reader would find no metadata
 /// file, report `free`, and every row would carry a confident `host_lock=free`
 /// on a locked host. That failure is silent in the direction that permits a
-/// run, so it is asserted here from the script's own text rather than trusted.
+/// run, so it is asserted here rather than trusted.
+///
+/// Asked of the script's BEHAVIOUR, not of its text. Since the path became a
+/// resolution (env, then config, then default) rather than a single
+/// assignment, no `LOCK_DIR=` line is the answer on its own, and a text scan
+/// would have to model shell control flow to know which one wins. `status`
+/// reads and never creates, so asking it about the real default cannot take,
+/// modify or leave a lock on the actual host. The constant is pinned as well,
+/// so a rename is still caught rather than silently checking nothing.
 #[test]
 fn the_default_lock_dir_matches_the_script() {
+    let (ok, out) = hostlock_conf(
+        Path::new("/nonexistent/onnx-genai/hostlock.conf"),
+        &["status", "--porcelain"],
+    );
+    assert!(ok, "status failed: {out}");
+    let seen = out
+        .lines()
+        .find_map(|l| l.strip_prefix("lock_dir="))
+        .unwrap_or_else(|| panic!("status --porcelain must say which lock it measured: {out}"));
+    assert_eq!(
+        seen,
+        onnx_runtime_hostmon::hostlock::DEFAULT_LOCK_DIR,
+        "the reader looks in a different directory than the script writes to, so it would report \
+         `free` on a held host"
+    );
+    assert!(
+        out.contains("lock_dir_source=default"),
+        "with no env override and no config, the path must be attributed to the default, or this \
+         test is comparing against whatever this host happens to be configured for: {out}"
+    );
+
     let text = std::fs::read_to_string(script()).expect("read hostlock.sh");
     let assignments: Vec<&str> = text
         .lines()
-        .filter(|l| l.trim_start().starts_with("LOCK_DIR="))
+        .filter(|l| l.trim_start().starts_with("HOSTLOCK_BUILTIN_DIR="))
         .collect();
     // Exactly one, not "the first one". Shell takes the last assignment that
-    // executes; this test takes the first that appears. Where those differ the
+    // executes; a scan takes the first that appears. Where those differ the
     // test would read a decoy and pass while the two implementations disagreed
     // -- checking nothing, and reporting it as agreement. Rather than model
     // shell control flow, refuse to answer when the question is ambiguous.
     let n = assignments.len();
     assert_eq!(
         n, 1,
-        "hostlock.sh must assign LOCK_DIR exactly once, found {n}: {assignments:?}. More than one \
-         assignment means this test cannot tell which default is the effective one, and guessing \
-         would let it pass while the reader looked somewhere the script never writes",
+        "hostlock.sh must assign HOSTLOCK_BUILTIN_DIR exactly once, found {n}: {assignments:?}. \
+         More than one assignment means this test cannot tell which default is the effective one, \
+         and guessing would let it pass while the reader looked somewhere the script never writes",
     );
-    let line = assignments[0];
-    let default = line
-        .split_once(":-")
-        .and_then(|(_, rest)| rest.split_once('}'))
-        .map(|(value, _)| value.to_string())
-        .expect("LOCK_DIR must have a `${HOSTLOCK_DIR:-<default>}` shape");
-
+    let default = assignments[0]
+        .trim()
+        .split_once('=')
+        .map(|(_, value)| value.trim().to_string())
+        .expect("HOSTLOCK_BUILTIN_DIR must have a value");
     assert_eq!(
         default,
         onnx_runtime_hostmon::hostlock::DEFAULT_LOCK_DIR,
-        "the reader looks in a different directory than the script writes to, so it would report \
-         `free` on a held host"
+        "the script's built-in default and the reader's constant have diverged"
     );
+}
+
+/// Runs the script with the machine-local config, and *without* `HOSTLOCK_DIR`,
+/// so the path under test is the one it resolves for itself.
+///
+/// `status` is the only subcommand used: it reads and never creates, so a
+/// resolution that came out wrong cannot leave a lock behind on a real path.
+fn hostlock_conf(conf: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new("bash")
+        .arg(script())
+        .args(args)
+        .env_remove("HOSTLOCK_DIR")
+        .env("HOSTLOCK_CONF", conf)
+        .output()
+        .expect("failed to run scripts/hostlock.sh");
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+fn write_conf(name: &str, text: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, text).expect("write config");
+    path
+}
+
+/// The two implementations must agree on *which directory* the lock is in.
+///
+/// This is the drift that is invisible until it matters: a reader resolving
+/// `/tmp` on a host whose config moved the lock finds no metadata, reports
+/// `free`, and stamps that on every row of a run taken while a peer held the
+/// box. No assertion in either codebase fails, and the reassuring answer is the
+/// wrong one. So the parsing rules are compared against the script itself
+/// rather than against my reading of the `sed` expression.
+#[test]
+fn the_reader_and_the_script_resolve_the_same_configured_directory() {
+    use onnx_runtime_hostmon::hostlock::{parse_conf_lock_dir, resolve_lock_dir_from};
+
+    let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    let target = base.join("configured-lock");
+    let target = target.to_str().expect("utf-8 path");
+
+    let cases: Vec<(String, String)> = vec![
+        (format!("lock_dir={target}\n"), target.to_string()),
+        // Whitespace around `=` and a trailing comment are not part of the path.
+        (
+            format!("  lock_dir =  {target}   # box-wide\n"),
+            target.to_string(),
+        ),
+        // First key wins on both sides.
+        (
+            format!("lock_dir={target}\nlock_dir=/somewhere/else\n"),
+            target.to_string(),
+        ),
+        // A commented-out key is not a key, and must not move the lock.
+        (
+            format!("# lock_dir={target}\nlock_dir={target}\n"),
+            target.to_string(),
+        ),
+    ];
+
+    for (i, (text, want)) in cases.iter().enumerate() {
+        let conf = write_conf(&format!("hostlock-conf-{i}.conf"), text);
+        let (ok, out) = hostlock_conf(&conf, &["status", "--porcelain"]);
+        assert!(ok, "status failed for config {text:?}: {out}");
+        let seen = out
+            .lines()
+            .find_map(|l| l.strip_prefix("lock_dir="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "status --porcelain must say which lock it measured, or a row \
+                     cannot be re-checked; got: {out}"
+                )
+            });
+        assert_eq!(seen, want, "the script resolved {seen} for {text:?}");
+        assert_eq!(
+            parse_conf_lock_dir(text).as_deref(),
+            Some(want.as_str()),
+            "the reader resolved a different directory from the writer for {text:?}"
+        );
+        assert!(
+            out.contains("lock_dir_source=config"),
+            "a configured path must be attributed to the config, not the default: {out}"
+        );
+        // The rule `read()` actually uses, not just the parser it calls. A
+        // reader whose resolution ignored the config would satisfy every
+        // assertion above and still look at the wrong directory.
+        assert_eq!(
+            resolve_lock_dir_from(None, &conf).expect("usable config"),
+            PathBuf::from(want),
+            "the reader resolved a different directory from the writer for {text:?}"
+        );
+        // And the env override outranks it on both sides, because it is set per
+        // process and therefore cannot be a box-wide decision.
+        assert_eq!(
+            resolve_lock_dir_from(Some("/elsewhere"), &conf).expect("env wins"),
+            PathBuf::from("/elsewhere")
+        );
+    }
+
+    // A key that merely starts the same way is a different key on both sides.
+    let conf = write_conf(
+        "hostlock-conf-otherkey.conf",
+        &format!("lock_dir_old={target}\n"),
+    );
+    let (ok, out) = hostlock_conf(&conf, &["status", "--porcelain"]);
+    assert!(ok, "status failed: {out}");
+    assert!(
+        out.contains("lock_dir=/tmp/onnx-genai-hostlock"),
+        "an unrelated key must leave the default path alone: {out}"
+    );
+    assert_eq!(
+        parse_conf_lock_dir(&format!("lock_dir_old={target}\n")),
+        None
+    );
+    assert_eq!(
+        resolve_lock_dir_from(None, &conf).expect("no usable key"),
+        PathBuf::from("/tmp/onnx-genai-hostlock"),
+        "an unrelated key must leave the reader on the default path too"
+    );
+    // A config that is not there at all is not an error: it is the default.
+    assert_eq!(
+        resolve_lock_dir_from(None, Path::new("/nonexistent/hostlock.conf")).expect("absent"),
+        PathBuf::from("/tmp/onnx-genai-hostlock")
+    );
+}
+
+/// A config that cannot be honoured must stop the run, not silently send this
+/// process to the default while the rest of the box follows the config.
+///
+/// Half a host on one path and half on the other is worse than either choice:
+/// both halves acquire instantly, neither ever collides, and every row claims a
+/// declared host.
+#[test]
+fn neither_implementation_falls_back_when_the_config_is_unusable() {
+    use onnx_runtime_hostmon::hostlock::parse_conf_lock_dir;
+
+    for (i, text) in ["lock_dir=relative/path\n", "lock_dir=\n"]
+        .iter()
+        .enumerate()
+    {
+        let conf = write_conf(&format!("hostlock-conf-bad-{i}.conf"), text);
+        let (ok, out) = hostlock_conf(&conf, &["status", "--porcelain"]);
+        assert!(!ok, "an unusable config must fail the command: {out}");
+        assert!(
+            !out.contains("lock_dir=/tmp/onnx-genai-hostlock"),
+            "it must not fall back to the default path: {out}"
+        );
+        // The reader's half of the same rule: present but not absolute is an
+        // error, and `read()` turns it into `Unknown` rather than `Free`.
+        let value = parse_conf_lock_dir(text).expect("the key is present");
+        assert!(
+            !value.starts_with('/'),
+            "the reader must not accept {value:?} as a lock directory"
+        );
+        let err = onnx_runtime_hostmon::hostlock::resolve_lock_dir_from(None, &conf)
+            .expect_err("an unusable config must not resolve to a directory");
+        assert_eq!(err.value, value);
+    }
 }
