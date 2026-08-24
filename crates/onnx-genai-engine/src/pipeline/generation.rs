@@ -886,8 +886,34 @@ pub(crate) fn serving_control_seeds(workflow: &WorkflowSpec) -> BTreeMap<String,
 /// nothing about what a package gets. Building it from the same emitter a real
 /// minimal decoder goes through keeps these cases on the production path
 /// instead of a bespoke shape that could diverge from it.
+/// The same canonical decoder workflow, but declaring its conversation
+/// session-scoped so a session can actually be opened over it.
+///
+/// [`test_decoder_runtime`] builds the canonical decoder workflow, whose state
+/// is `Invocation`-scoped: correct for that package, and it means
+/// `Engine::create_session` refuses it with
+/// `PackageCapabilityError::NoSessionState`. A test about what happens *inside*
+/// a session therefore cannot use it -- it would fail at `create_session`
+/// before reaching the behaviour under test, which is how such a test silently
+/// stops testing anything.
+///
+/// The loop already carries the sequence cell, so declaring it `Session` is the
+/// whole difference: `classify_session_state` then reports it as a
+/// `LoopCarry` carrier. Built from the same emitter for the same reason
+/// [`test_decoder_runtime`] is, and re-validated, so the fixture stays a
+/// package the validator blesses rather than a shape only this test accepts.
+#[cfg(all(test, feature = "native-backend"))]
+pub(crate) fn test_decoder_runtime_with_session_state() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(true)
+}
+
 #[cfg(test)]
 pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(false)
+}
+
+#[cfg(test)]
+fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRuntime> {
     let abi = onnx_genai_metadata::DecoderAbi {
         token_input: Some("input_ids".to_string()),
         logits_output: Some("logits".to_string()),
@@ -903,6 +929,16 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
     .map_err(|error| {
         anyhow::anyhow!("a minimal decoder is expressible as a workflow: {error:?}")
     })?;
+    let mut workflow = workflow;
+    if session_scoped {
+        let cell = workflow.state.get_mut("sequence").ok_or_else(|| {
+            anyhow::anyhow!(
+                "the canonical decoder workflow must declare a 'sequence' cell for this \
+                 fixture to scope it to a session"
+            )
+        })?;
+        cell.scope = onnx_genai_metadata::WorkflowStateScope::Session;
+    }
     validate_generation_workflow(&workflow)?;
     let directory = onnx_genai_ort::PipelineModelDirectory {
         root: std::path::PathBuf::from("."),

@@ -2972,6 +2972,22 @@ mod tests {
     /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_with_byte_budget_inner(budget_bytes, false)
+    }
+
+    /// The same engine over a package that declares a session-scoped
+    /// conversation, so `create_session` succeeds and a test can reach what
+    /// happens *inside* the session rather than failing in front of it.
+    #[cfg(feature = "native-backend")]
+    fn session_capable_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_with_byte_budget_inner(budget_bytes, true)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn interpreted_engine_with_byte_budget_inner(
+        budget_bytes: u64,
+        session_scoped: bool,
+    ) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2988,7 +3004,11 @@ mod tests {
             0,
         )?;
         Ok(Engine {
-            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow: if session_scoped {
+                Box::new(crate::pipeline::generation::test_decoder_runtime_with_session_state()?)
+            } else {
+                Box::new(crate::pipeline::generation::test_decoder_runtime()?)
+            },
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
@@ -3065,7 +3085,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
-        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        let mut engine = session_capable_engine_with_byte_budget(10)?;
 
         // No decode core: this engine's sessions are workflow sessions,
         // opened through the same public `create_session` a real caller
