@@ -51,6 +51,8 @@ struct DeferredValidationEp {
     synchronized_executions: Arc<AtomicUsize>,
     resets: Arc<AtomicUsize>,
     reset_failure_at: Arc<AtomicUsize>,
+    route_boundary_calls: Arc<AtomicUsize>,
+    route_boundary_before_sync: Arc<AtomicBool>,
 }
 
 impl DeferredValidationEp {
@@ -65,6 +67,8 @@ impl DeferredValidationEp {
             synchronized_executions: Arc::new(AtomicUsize::new(0)),
             resets: Arc::new(AtomicUsize::new(0)),
             reset_failure_at: Arc::new(AtomicUsize::new(0)),
+            route_boundary_calls: Arc::new(AtomicUsize::new(0)),
+            route_boundary_before_sync: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -175,6 +179,22 @@ impl ExecutionProvider for DeferredValidationEp {
         }
         Ok(self.validation_latch.load(Ordering::Relaxed))
     }
+
+    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+        // The production Slice-7C boundary caller lands here once per top-level
+        // request, after `sync()`. Record the call and prove the request-level
+        // synchronization boundary was crossed first (mirrors the latch check
+        // above): if the sync counter has not caught up to executions, the
+        // boundary fired too early.
+        if self.synchronized_executions.load(Ordering::Relaxed)
+            != self.executions.load(Ordering::Relaxed)
+        {
+            self.route_boundary_before_sync
+                .store(true, Ordering::Relaxed);
+        }
+        self.route_boundary_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 #[test]
@@ -226,6 +246,131 @@ fn deferred_device_validation_is_request_local_and_checked_after_sync() {
         resets.load(Ordering::Relaxed),
         4,
         "each request must reset the latch before execution and after checking it"
+    );
+}
+
+#[test]
+fn route_residency_boundary_fires_once_per_top_level_run_after_sync() {
+    // Slice-7C reachability: the boundary consumer must be driven from the real
+    // request lifecycle exactly once per top-level `run`, and only after the
+    // request synchronization boundary (`sync`), never per kernel.
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let input = graph.create_named_value("input", DataType::Float32, static_shape([2]));
+    graph.add_input(input);
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(input)],
+        vec![output],
+    ));
+    graph.add_output(output);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    // The boundary only fires on a clean validation latch, so keep every request
+    // healthy (the failing-latch path is covered by the request-local test).
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let boundary_calls = Arc::clone(&ep.route_boundary_calls);
+    let before_sync = Arc::clone(&ep.route_boundary_before_sync);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let input = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
+
+    for run in 1..=3 {
+        let out = executor.run(&[("input", &input)]).unwrap();
+        assert_eq!(out[0].to_vec_f32(), vec![3.0, 7.0]);
+        assert_eq!(
+            boundary_calls.load(Ordering::Relaxed),
+            run,
+            "the Slice-7C boundary consumer must fire exactly once per top-level request"
+        );
+    }
+    assert!(
+        !before_sync.load(Ordering::Relaxed),
+        "the boundary consumer must run only after the request synchronization boundary"
+    );
+}
+
+#[test]
+fn route_residency_boundary_skips_nested_control_flow_runs() {
+    // One top-level kernel plus one kernel inside a taken `If` branch (a nested
+    // `run_scoped_mode`). The Slice-7C boundary lives at the single top-level
+    // host boundary, so it must fire exactly once for the whole request and
+    // never for the nested subgraph run, even though two kernels execute.
+    fn deferred_branch() -> Graph {
+        let mut b = Graph::new();
+        b.opset_imports.insert(String::new(), 17);
+        // Producer-less "X": a capture bound from the enclosing scope by name.
+        let x = b.create_named_value("X", DataType::Float32, static_shape([2]));
+        let out = b.create_named_value("branch_out", DataType::Float32, static_shape([2]));
+        b.insert_node(Node::new(
+            NodeId(0),
+            "DeferredValidation",
+            vec![Some(x)],
+            vec![out],
+        ));
+        b.add_output(out);
+        b
+    }
+
+    let mut graph = Graph::new();
+    graph.opset_imports.insert(String::new(), 17);
+    let cond = graph.create_named_value("cond", DataType::Bool, static_shape([1]));
+    graph.add_input(cond);
+    let x = graph.create_named_value("X", DataType::Float32, static_shape([2]));
+    graph.add_input(x);
+    let top_out = graph.create_named_value("top_out", DataType::Float32, static_shape([2]));
+    graph.insert_node(Node::new(
+        NodeId(0),
+        "DeferredValidation",
+        vec![Some(x)],
+        vec![top_out],
+    ));
+    let y = graph.create_named_value("Y", DataType::Float32, static_shape([2]));
+    let if_node = graph.insert_node(Node::new(NodeId(0), "If", vec![Some(cond)], vec![y]));
+    graph
+        .subgraphs
+        .insert((if_node, "then_branch".to_string()), deferred_branch());
+    graph
+        .subgraphs
+        .insert((if_node, "else_branch".to_string()), deferred_branch());
+    graph.add_output(top_out);
+    graph.add_output(y);
+
+    let ep = Arc::new(DeferredValidationEp::new());
+    ep.fail_next.store(false, Ordering::Relaxed);
+    let boundary_calls = Arc::clone(&ep.route_boundary_calls);
+    let executions = Arc::clone(&ep.executions);
+    let before_sync = Arc::clone(&ep.route_boundary_before_sync);
+    let mut executor = Executor::build(
+        graph,
+        Arc::new(WeightStore::new()),
+        Arc::clone(&ep) as Arc<dyn ExecutionProvider>,
+    )
+    .unwrap();
+    let cond_t = Tensor::from_raw(DataType::Bool, vec![1], &[1u8]).unwrap();
+    let x_t = Tensor::from_f32(&[2], &[3.0, 7.0]).unwrap();
+
+    let out = executor.run(&[("cond", &cond_t), ("X", &x_t)]).unwrap();
+    assert_eq!(out.len(), 2);
+    assert_eq!(
+        executions.load(Ordering::Relaxed),
+        2,
+        "one top-level kernel plus one nested branch kernel must both execute"
+    );
+    assert_eq!(
+        boundary_calls.load(Ordering::Relaxed),
+        1,
+        "the boundary consumer must fire once for the request, never for the nested subgraph run"
+    );
+    assert!(
+        !before_sync.load(Ordering::Relaxed),
+        "the boundary consumer must run only after the request synchronization boundary"
     );
 }
 
@@ -3235,6 +3380,10 @@ impl KvCapacityAppendTestEp {
 }
 
 impl ExecutionProvider for KvCapacityAppendTestEp {
+    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "kv_capacity_append_test_ep"
     }
@@ -4138,6 +4287,10 @@ impl WeightDeliveryEp {
 }
 
 impl ExecutionProvider for WeightDeliveryEp {
+    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         if self.lazy {
             "nxrt_test_ep"

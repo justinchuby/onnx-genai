@@ -62,6 +62,7 @@ use crate::deferred_release::{
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
+use crate::route_residency::{RouteResidencyBoundary, RouteResidencyDiagnostics};
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 
@@ -766,6 +767,14 @@ pub struct CudaExecutionProvider {
     /// The context-owned queue that performs every final device release after
     /// both stream tails.
     release_queue: Arc<CudaDeferredReleaseQueue>,
+    /// Slice-7C boundary consumer wiring. `route_boundary` binds one expert
+    /// bank's producer window source + residency authorities for the coarse
+    /// safe-boundary consumer; it is `None` in production today (the reachable
+    /// seam has no live per-session registration yet, exactly like the 7A/7B
+    /// producer/consumer shipped) and is installed only by the Slice-7C tests.
+    /// `route_diag` carries the typed outcome of every boundary.
+    route_boundary: Mutex<Option<Arc<RouteResidencyBoundary>>>,
+    route_diag: Arc<RouteResidencyDiagnostics>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -1006,6 +1015,8 @@ impl CudaExecutionProvider {
             retired_memory_mechanisms: Vec::new(),
             retired_allocator_teardown: Vec::new(),
             release_queue,
+            route_boundary: Mutex::new(None),
+            route_diag: Arc::new(RouteResidencyDiagnostics::default()),
         };
         if let Some(residency) = provider.residency.as_ref() {
             residency
@@ -1579,6 +1590,65 @@ impl CudaExecutionProvider {
     /// rollbacks accumulate via the checkpoint journal.
     pub fn csa_metrics(&self) -> &Arc<CsaMetrics> {
         &self.csa_metrics
+    }
+
+    /// Install the Slice-7C route-residency boundary binding for this EP.
+    ///
+    /// Once installed, the coarse safe-boundary consumer (driven from
+    /// [`ExecutionProvider::consume_route_residency_at_boundary`] at
+    /// `Executor::finish_device_validation`) will, *when the default-off gate is
+    /// enabled*, snapshot → consume → reset this bank's window exactly once per
+    /// request boundary. Production has no live per-session registration yet, so
+    /// this is `#[doc(hidden)]` and used only by the Slice-7C wiring tests.
+    #[doc(hidden)]
+    pub fn install_route_residency_boundary(&self, boundary: Arc<RouteResidencyBoundary>) {
+        *self
+            .route_boundary
+            .lock()
+            .expect("cuda_ep route-residency boundary poisoned") = Some(boundary);
+    }
+
+    /// The typed reason/outcome surface for every route-residency boundary this
+    /// EP ran. Mirrors [`csa_metrics`](Self::csa_metrics); tests and diagnostics
+    /// read the counters and last reason from here.
+    pub fn route_residency_diagnostics(&self) -> &Arc<RouteResidencyDiagnostics> {
+        &self.route_diag
+    }
+
+    /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
+    /// that drives the installed boundary through the phase-8 driver-fault
+    /// consumer, so a deterministic unmap/map fault proves the *caller-driven*
+    /// transition rolls back range-precisely and quarantines like a real driver
+    /// failure. Same gate/lock/ordering as production; only the apply path
+    /// injects faults. Not reachable from production.
+    #[cfg(any(test, feature = "gpu-tests"))]
+    #[doc(hidden)]
+    pub fn consume_route_residency_at_boundary_with_phase8_faults(
+        &self,
+        phase8_faults: std::collections::HashMap<
+            onnx_runtime_ir::ValueId,
+            Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>,
+        >,
+    ) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(());
+        }
+        let boundary = {
+            let guard = self
+                .route_boundary
+                .lock()
+                .expect("cuda_ep route-residency boundary poisoned");
+            match guard.as_ref() {
+                Some(boundary) => Arc::clone(boundary),
+                None => return Ok(()),
+            }
+        };
+        crate::route_residency::run_route_residency_boundary_with_phase8_faults(
+            &self.runtime,
+            &boundary,
+            &self.route_diag,
+            phase8_faults,
+        )
     }
 
     /// Build a live GPU weight pager (WEIGHT_OFFLOAD Phase 3b) that binds an
@@ -3297,6 +3367,32 @@ impl ExecutionProvider for CudaExecutionProvider {
 
     fn check_device_capture_error(&self) -> Result<u32> {
         self.runtime.check_capture_error()
+    }
+
+    /// Slice-7C: the coarse safe-boundary route-telemetry consumer, called once
+    /// per top-level request from `Executor::finish_device_validation` (after
+    /// `sync()`, past capture/replay). Default-off and byte-identical: when the
+    /// gate is disabled — the shipped default — this is a single env read with
+    /// no lock, no snapshot, no allocation, no launch, and no telemetry reset.
+    /// When enabled but no boundary binding is installed (production today) it
+    /// is a lock + `None` check. Only when a binding is installed (the Slice-7C
+    /// tests) does it drive snapshot → consume → reset exactly once, recording
+    /// the typed outcome in [`route_residency_diagnostics`](Self::route_residency_diagnostics).
+    fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return Ok(());
+        }
+        let boundary = {
+            let guard = self
+                .route_boundary
+                .lock()
+                .expect("cuda_ep route-residency boundary poisoned");
+            match guard.as_ref() {
+                Some(boundary) => Arc::clone(boundary),
+                None => return Ok(()),
+            }
+        };
+        crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
