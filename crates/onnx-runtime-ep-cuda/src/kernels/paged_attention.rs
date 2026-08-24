@@ -323,6 +323,15 @@ pub fn unsupported_reason(
                 .to_string(),
         );
     }
+    // LATENT is single-cache: the absorbed KV lives in one head. Decide this at
+    // the supports_op gate so a multi-head-KV node is routed elsewhere rather
+    // than being claimed and then hard-failing at kernel creation.
+    let kv_num_heads = attr_int(op, "kv_num_heads", 0);
+    if kv_num_heads != 1 {
+        return Some(format!(
+            "cuda_ep PagedAttention (LATENT): kv_num_heads must be 1, got {kv_num_heads}"
+        ));
+    }
     // Quantized cache is explicitly out of scope for this slice.
     for name in [
         "k_quant_type",
@@ -549,8 +558,9 @@ impl Kernel for PagedAttentionLatentKernel {
         }
         let rotary_dim = if self.do_rotary {
             let cos = require_present(inputs, IN_COS_CACHE, "cos_cache")?;
-            let _sin = require_present(inputs, IN_SIN_CACHE, "sin_cache")?;
+            let sin = require_present(inputs, IN_SIN_CACHE, "sin_cache")?;
             expect_dtype(cos, dtype, "cos_cache")?;
+            expect_dtype(sin, dtype, "sin_cache")?;
             (*cos.shape.get(1).ok_or_else(|| {
                 EpError::KernelFailed("cuda_ep PagedAttention: cos_cache must be 2D".into())
             })? as i64)
@@ -582,6 +592,32 @@ impl Kernel for PagedAttentionLatentKernel {
         let batch = *past.shape.first().ok_or_else(|| {
             EpError::KernelFailed("cuda_ep PagedAttention: past_seqlens must be rank>=1".into())
         })? as i64;
+
+        // Cross-check that the attribute-derived geometry (num_heads/head_size
+        // from key_cache + past_seqlens) agrees with the actual query/key/cumseq
+        // extents. Without this, a schema-typed but geometry-inconsistent node
+        // (e.g. a num_heads attribute disagreeing with the query hidden dim)
+        // would drive out-of-bounds device reads that tear down the CUDA
+        // context, instead of the typed failure the kernel returns elsewhere.
+        if query.shape.get(1).map(|d| *d as i64) != Some(num_heads * hs) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep PagedAttention: query hidden dim {:?} must equal num_heads {num_heads} * head_size {hs}",
+                query.shape.get(1)
+            )));
+        }
+        if key.shape.get(1).map(|d| *d as i64) != Some(hs) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep PagedAttention (LATENT): key hidden dim {:?} must equal head_size {hs}",
+                key.shape.get(1)
+            )));
+        }
+        if cumseq.shape.first().map(|d| *d as i64) != Some(batch + 1) {
+            return Err(EpError::KernelFailed(format!(
+                "cuda_ep PagedAttention: cumulative_sequence_length length {:?} must equal batch+1 ({})",
+                cumseq.shape.first(),
+                batch + 1
+            )));
+        }
 
         // Output 0 shape/dtype.
         let out = outputs.first_mut().ok_or_else(|| {
@@ -815,6 +851,16 @@ mod tests {
         let reason =
             unsupported_reason(&node, &[], &[DataType::Float16]).expect("SEPARATE rejected");
         assert!(reason.contains("LATENT"), "{reason}");
+    }
+
+    #[test]
+    fn rejects_multi_head_kv() {
+        let mut node = latent_node();
+        node.attributes
+            .insert("kv_num_heads".into(), Attribute::Int(2));
+        let reason =
+            unsupported_reason(&node, &[], &[DataType::Float16]).expect("multi-head KV rejected");
+        assert!(reason.contains("kv_num_heads must be 1"), "{reason}");
     }
 
     #[test]

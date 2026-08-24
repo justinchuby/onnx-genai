@@ -1276,9 +1276,37 @@ fn latent_rejects_non_aliased_cache_out_and_missing_inputs() {
         );
     }
 
+    // 3) Geometry mismatch: a num_heads attribute that disagrees with the query
+    //    hidden dim must be a typed error, not an out-of-bounds device read.
+    {
+        let mut bad_node = build_node(&b);
+        bad_node.attributes.insert(
+            "num_heads".to_string(),
+            Attribute::Int(s.num_heads as i64 + 1),
+        );
+        let bad_kernel = PagedAttentionFactory {
+            runtime: ctx.runtime.clone(),
+        }
+        .create(&bad_node, &[])
+        .unwrap();
+        let inputs = run.inputs(&ctx, &strides);
+        let mut outputs = vec![TensorMut::new(
+            DevicePtrMut(out_mut_ptr),
+            dtype,
+            &run.out_shape,
+            &strides.out,
+            ctx.dev,
+        )];
+        let err = bad_kernel.execute(&inputs, &mut outputs).unwrap_err();
+        assert!(
+            format!("{err}").contains("num_heads"),
+            "expected num_heads geometry error, got: {err}"
+        );
+    }
+
     ctx.ep.deallocate(bogus).unwrap();
     run.free(&ctx);
-    println!("alias + missing-input rejections OK");
+    println!("alias + missing-input + geometry rejections OK");
 }
 
 #[cfg_attr(
