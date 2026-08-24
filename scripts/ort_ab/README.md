@@ -269,6 +269,40 @@ on the 1-minute load average: `loadavg` is an exponential moving average, so it
 stays high for a minute after a heavy run has ended and reads low while a burst
 is still in flight. It misleads in both directions.
 
+The Rust benchmarks read the lock and put the answer in the row. `bench_generic`
+and the `decode_gap_park_ab` matrix emit a `host_lock=` field covering the
+**whole measured window** -- read before the first run and again after the last,
+so a run that changed hands halfway through prints `changed` rather than naming
+whichever holder happened to be there at the end:
+
+| value | meaning |
+|---|---|
+| `mine:<owner>` | held throughout by a live anchor matching `HOSTLOCK_OWNER` -- the only value that certifies the row |
+| `foreign:<owner>` / `held:<owner>` | held by someone else, or by an owner that cannot be attributed because `HOSTLOCK_OWNER` was unset |
+| `unverified:<owner>` / `stale:<owner>` | held by an anchor whose liveness is unprovable, or provably gone |
+| `changed` | the window spans a change of custody; no single holder describes it |
+| `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
+
+Set `HOSTLOCK_OWNER` in the **environment**, not just `--owner` on the command
+line: `run` does not export the flag, so a child that inherits neither cannot
+tell your lock from a co-tenant's and reports `held:` rather than `mine:`.
+`HOSTLOCK_OWNER=leon scripts/hostlock.sh run --reason "..." -- ...` sets both at
+once, since `--owner` defaults to it.
+
+There is deliberately no fallback to `$USER`, even though the script uses one.
+Every agent on this host runs as the same user, so `$USER` cannot distinguish
+one declaration from another -- defaulting to it would report `mine:` for
+somebody else's lock, which is the one direction this field exists to prevent.
+An unset `HOSTLOCK_OWNER` genuinely cannot be attributed, and says so.
+
+This is orthogonal to the `foreign_%` / `sib_%` columns beside it and does not
+replace them: those measure what the host *did*, `host_lock` records what
+somebody *said they were doing*. Contention sampling reads instants and can
+miss a co-tenant that starts and finishes between two snapshots; a declaration
+covers the whole window but proves nothing about load. An unlocked run on a
+genuinely idle box is fine, and a locked run beside somebody's unannounced
+`cargo test` is not.
+
 The lock is advisory. It cannot stop anyone from using the cores and does not
 try to; it makes "is somebody benchmarking right now, and who?" cheap enough to
 check that there is no excuse for not checking. Record the runnable count you

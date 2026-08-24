@@ -1051,6 +1051,7 @@ fn cast_like_case(target: DataType) -> Case {
         dtype: target,
         shape: vec![1],
         bytes: vec![0u8; target.storage_bytes(1)],
+        absent: false,
     };
     Case {
         label: format!("CastLike[f32->{target:?}]"),
@@ -2462,6 +2463,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "GroupQueryAttention",
         "group_query_attention_gpu.rs",
         "GQA with KV cache",
+    ));
+    p.push(dedicated(
+        "MultiHeadAttention",
+        "multi_head_attention_gpu.rs",
+        "separate-QKV MHA with bias / mask / KV cache",
     ));
     p.push(dedicated(
         "VarlenAttention",
