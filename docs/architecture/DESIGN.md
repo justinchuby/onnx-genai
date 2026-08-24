@@ -45,10 +45,10 @@ declare active/done/accepted-length/slot data. Transfers are explicit and host c
 does not implement hidden reducers, scatter, append, scheduler, or sampler math.
 
 Grouping several independent items into one component invocation is the same kind
-of generic service, and is the one significant gap: the metadata vocabulary
-describes a packed encoder result, but no component declares a batching capacity,
-no runtime consumes a packed layout, and nothing expresses an item that nests —
-the frames of a video clip, the windows of an utterance. The design of record —
+of generic service, and is the gap in that list: the metadata vocabulary describes
+a packed encoder result, but no component declares a batching capacity, no runtime
+consumes a packed layout, and nothing expresses an item that nests — the frames of
+a video clip, the windows of an utterance. The design of record —
 encoder-motivated, modality-agnostic, with no model-specific booleans — is
 [ENCODER_BATCHING.md](../genai/ENCODER_BATCHING.md).
 
