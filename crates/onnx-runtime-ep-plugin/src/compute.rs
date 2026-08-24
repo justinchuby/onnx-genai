@@ -8,10 +8,12 @@
 //! an error naming the op and domain. This surfaces at Compute time — never
 //! silently producing a wrong-shape tensor.
 //!
-//! Callers should use `ShapeInference::for_node(node, input_shapes, num_outputs)`
-//! when node attributes are available. `for_op(op_type)` is kept for contexts
-//! where only the op name is known; it returns `Declined` for any op whose shape
-//! requires attributes (Reshape, Conv, reductions, etc.).
+//! [`ShapeInference::for_node`] is the single source of truth: it takes the
+//! compiled IR `Node`, its input shapes and its output count, and resolves the
+//! rule — reading attributes where the shape depends on them (Reshape, Conv,
+//! reductions, the LayerNorm family, …). There is deliberately no op-name-only
+//! entry point; every caller has a `Node` at capability and compile time, so a
+//! second, attribute-blind table would only be a place for rules to drift.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -200,185 +202,6 @@ pub enum ShapeInference {
 }
 
 impl ShapeInference {
-    /// Conservative shape inference from op name alone.
-    ///
-    /// Returns `Declined` for any op that requires node attributes to compute
-    /// its output shape correctly, rather than guessing.
-    pub fn for_op(op_type: &str) -> Self {
-        Self::for_op_domain(op_type, "")
-    }
-
-    fn for_op_domain(op_type: &str, domain: &str) -> Self {
-        match op_type {
-            // ── Elementwise broadcast ops ─────────────────────────────────
-            "Add" | "Sub" | "Mul" | "Div" | "Pow" | "Mod" | "And" | "Or" | "Xor" | "Equal"
-            | "Greater" | "Less" | "GreaterOrEqual" | "LessOrEqual" | "BitShift" | "BitwiseAnd"
-            | "BitwiseOr" | "BitwiseXor" | "Max" | "Min" | "Mean" | "Sum" | "Where"
-            | "PRelu" => Self::ElementwiseBroadcast,
-
-            // ── Unary / shape-preserving ──────────────────────────────────
-            "Relu"
-            | "Sigmoid"
-            | "Tanh"
-            | "Exp"
-            | "Log"
-            | "Sqrt"
-            | "Abs"
-            | "Neg"
-            | "Ceil"
-            | "Floor"
-            | "Round"
-            | "Reciprocal"
-            | "Not"
-            | "Sign"
-            | "Erf"
-            | "Gelu"
-            | "HardSigmoid"
-            | "HardSwish"
-            | "LeakyRelu"
-            | "Elu"
-            | "Celu"
-            | "Selu"
-            | "Mish"
-            | "Softplus"
-            | "Softsign"
-            // Trigonometric and hyperbolic ops. Unary and shape-preserving,
-            // so the name alone is enough.
-            | "Sin"
-            | "Cos"
-            | "Tan"
-            | "Asin"
-            | "Acos"
-            | "Atan"
-            | "Sinh"
-            | "Cosh"
-            | "Asinh"
-            | "Acosh"
-            | "Atanh"
-            | "ThresholdedRelu"
-            // `com.microsoft` shape-preserving activations. Absent from this
-            // table they resolve to `Declined`, and `GetCapability`'s
-            // fail-closed shape filter then drops the whole claim — so the EP
-            // never got these nodes at all, whatever `supports_op` said.
-            | "FastGelu"
-            | "QuickGelu"
-            | "BiasGelu"
-            | "Silu"
-            | "Swish"
-            | "Cast"
-            | "Identity"
-            | "Dropout"
-            | "IsNaN"
-            | "IsInf"
-            | "BitCount"
-            | "Bernoulli"
-            | "NegativeLogLikelihoodLoss"
-            // Shape-preserving ops on the attention / MoE / KV-cache path.
-            // Every one is registered by the CPU EP, and every one was absent
-            // here, so `GetCapability`'s fail-closed shape filter dropped the
-            // claim and ORT's CPU EP ran it -- the same silent mechanism that
-            // hid the activations until #1082 and the trigonometrics until
-            // #1097. `PackedMultiHeadAttention` is the sharpest case -- ORT
-            // has no CPU kernel for it at all, so giving it away cost a load
-            // failure rather than a slower run -- but ORT does run `MoE` and
-            // `QMoE` on CPU, so for those the decline was simply us not
-            // executing an op we implement.
-            | "MoE"
-            | "QMoE"
-            | "ScatterND"
-            | "ScatterElements"
-            // `TensorScatter` (opset 24) is the standardized KV-cache write. It
-            // models an in-place update of a fixed-capacity buffer, so the
-            // present cache carries exactly the past cache's shape even though
-            // the `update` input is shorter along the sequence axis.
-            | "TensorScatter"
-            | "Trilu"
-            | "Clip" => Self::SameAsInput(0),
-
-            // Two outputs of differing shape; see the variant's note. Claimed
-            // for both the `com.microsoft` contrib spelling and the standard
-            // ai.onnx opset-27 one, which have identical semantics. Leaving it
-            // declined handed the node to ORT, which has no kernel for it at
-            // all — that is a load failure, not merely a slower run.
-            "CausalConvWithState" => Self::CausalConvWithState,
-
-            // ── Shape-preserving normalisation ops ───────────────────────
-            "Softmax"
-            | "LogSoftmax"
-            | "Hardmax"
-            | "BatchNormalization"
-            | "InstanceNormalization"
-            | "GroupNormalization"
-            | "LpNormalization" => Self::SameAsInput(0),
-
-            // ── LayerNorm family: requires axis attribute for correct shape ──
-            // Decline here; for_node() resolves the axis.
-            "LayerNormalization"
-            | "RMSNormalization"
-            | "SkipLayerNormalization"
-            | "SkipSimplifiedLayerNormalization"
-            | "SimplifiedLayerNormalization" => Self::Declined {
-                op_type: op_type.to_string(),
-                domain: domain.to_string(),
-            },
-
-            // ── Matrix multiply ───────────────────────────────────────────
-            "MatMul" => Self::MatMul,
-            "QLinearMatMul" => Self::QLinearMatMul,
-            // `N` is an attribute, so the op-name-only entry point cannot
-            // resolve it and must decline rather than fall through to
-            // `Self::MatMul`, which would silently read the packed weight's
-            // `blob_size` as the output width.
-            "MatMulNBits" => Self::Declined {
-                op_type: op_type.to_string(),
-                domain: domain.to_string(),
-            },
-
-            // ── Safe defaults for attribute-having ops ────────────────────
-            "Concat" => Self::Concat { axis: 0 },
-            "Transpose" => Self::Transpose { perm: None },
-            "Gather" => Self::Gather { axis: 0 },
-            "GatherND" => Self::GatherND { batch_dims: 0 },
-            "GatherBlockQuantized" => Self::GatherBlockQuantized,
-            "Shape" => Self::ShapeOp {
-                start: 0,
-                end: None,
-            },
-            "Reshape" => Self::ReshapeData { allowzero: false },
-            "Slice" => Self::SliceData,
-            "RotaryEmbedding" => Self::RotaryEmbedding,
-            "PackedMultiHeadAttention" => Self::PackedMultiHeadAttention,
-
-            // ── Ops that require attributes — Declined ────────────────────
-            "Squeeze"
-            | "Unsqueeze"
-            | "ReduceMean"
-            | "ReduceSum"
-            | "ReduceProd"
-            | "ReduceMax"
-            | "ReduceMin"
-            | "ReduceL1"
-            | "ReduceL2"
-            | "ReduceLogSum"
-            | "ReduceLogSumExp"
-            | "ReduceSumSquare"
-            | "Conv"
-            | "ConvTranspose"
-            | "ConvInteger"
-            | "Gemm"
-            | "MultiHeadAttention"
-            | "GroupQueryAttention" => Self::Declined {
-                op_type: op_type.to_string(),
-                domain: domain.to_string(),
-            },
-
-            _ => Self::Declined {
-                op_type: op_type.to_string(),
-                domain: domain.to_string(),
-            },
-        }
-    }
-
     /// Full shape inference from a compiled IR `Node` plus the shapes
     /// of its inputs (may be empty slices for absent optional inputs).
     /// Each dimension is `Some(n)` for a statically known extent or `None`
@@ -473,9 +296,9 @@ impl ShapeInference {
             | "InstanceNormalization"
             | "GroupNormalization"
             | "LpNormalization"
-            // Shape-preserving attention / MoE / KV-cache ops. See the note on
-            // the same list in `for_op`: absent from this table they resolve to
-            // `Declined` and `GetCapability` hands them to ORT's CPU EP.
+            // Shape-preserving attention / MoE / KV-cache ops. Absent from this
+            // table they resolve to `Declined` and `GetCapability` hands them
+            // to ORT's CPU EP.
             | "MoE"
             | "QMoE"
             | "ScatterND"
@@ -4446,9 +4269,8 @@ fn infer_shapes(
 
         ShapeInference::Declined { op_type, domain } => Err(format!(
             "Op '{op_type}' (domain '{domain}') has no shape-inference rule. \
-             Call ShapeInference::for_node(node, input_shapes, num_outputs) instead \
-             of for_op to enable attribute-driven inference. If the op is not yet \
-             modelled, add a variant to ShapeInference and handle it in infer_shapes."
+             If the op is not yet modelled, add a variant to ShapeInference, \
+             resolve it in ShapeInference::for_node, and handle it in infer_shapes."
         )),
     }
 }
@@ -4775,19 +4597,26 @@ fn after() {}
 
     #[test]
     fn matmul_family_ops_resolve_to_their_own_strategies() {
+        use onnx_runtime_ir::{Node, NodeId};
+        let node = |op: &str, domain: &str| {
+            let mut n = Node::new(NodeId(0), op, Vec::new(), Vec::new());
+            n.domain = domain.to_string();
+            n
+        };
         assert!(matches!(
-            ShapeInference::for_op_domain("MatMul", ""),
+            ShapeInference::for_node(&node("MatMul", ""), &[], 1),
             ShapeInference::MatMul
         ));
         assert!(matches!(
-            ShapeInference::for_op_domain("QLinearMatMul", ""),
+            ShapeInference::for_node(&node("QLinearMatMul", ""), &[], 1),
             ShapeInference::QLinearMatMul
         ));
-        // `MatMulNBits` needs the `N` attribute, which the op/domain-only
-        // table cannot see, so it must decline rather than fall back to the
-        // plain-matmul rule.
+        // `MatMulNBits` derives its output width from the `N` attribute; a node
+        // without it is malformed, so `for_node` must decline rather than fall
+        // back to the plain-matmul rule (which would read the packed weight's
+        // `blob_size` as the output column count).
         assert!(matches!(
-            ShapeInference::for_op_domain("MatMulNBits", "com.microsoft"),
+            ShapeInference::for_node(&node("MatMulNBits", "com.microsoft"), &[], 1),
             ShapeInference::Declined { .. }
         ));
     }
@@ -4912,27 +4741,17 @@ fn after() {}
         ));
     }
 
-    // ── for_op: fail-closed fallback ──────────────────────────────────────────
+    // ── for_node: fail-closed fallback ────────────────────────────────────────
 
     #[test]
-    fn for_op_unknown_returns_declined() {
-        match ShapeInference::for_op("SomeCompletelyUnknownOp") {
+    fn for_node_unknown_returns_declined() {
+        use onnx_runtime_ir::{Node, NodeId};
+        let node = Node::new(NodeId(0), "SomeCompletelyUnknownOp", Vec::new(), Vec::new());
+        match ShapeInference::for_node(&node, &[], 1) {
             ShapeInference::Declined { op_type, .. } => {
                 assert_eq!(op_type, "SomeCompletelyUnknownOp");
             }
             other => panic!("expected Declined, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn for_op_attribute_dependent_returns_declined() {
-        for op in ["Unsqueeze", "ReduceMean", "ReduceSum", "Conv"] {
-            match ShapeInference::for_op(op) {
-                ShapeInference::Declined { op_type, .. } => {
-                    assert_eq!(op_type, op, "expected Declined for {op}");
-                }
-                other => panic!("{op}: expected Declined, got {other:?}"),
-            }
         }
     }
 
@@ -5911,14 +5730,20 @@ fn after() {}
         let _ = status; // may be null in test env (no ORT API)
     }
 
-    // ── for_op coverage ───────────────────────────────────────────────────────
+    // ── for_node coverage ─────────────────────────────────────────────────────
+
+    /// Build a bare node (no attributes) for the op/domain, to check the rule
+    /// `for_node` resolves from the op alone.
+    fn bare_node(op: &str) -> onnx_runtime_ir::Node {
+        onnx_runtime_ir::Node::new(onnx_runtime_ir::NodeId(0), op, Vec::new(), Vec::new())
+    }
 
     #[test]
-    fn for_op_elementwise_coverage() {
+    fn for_node_elementwise_coverage() {
         for op in ["Add", "Sub", "Mul", "Div", "Pow", "Where", "Max", "Min"] {
             assert!(
                 matches!(
-                    ShapeInference::for_op(op),
+                    ShapeInference::for_node(&bare_node(op), &[], 1),
                     ShapeInference::ElementwiseBroadcast
                 ),
                 "{op} should be ElementwiseBroadcast"
@@ -5927,66 +5752,75 @@ fn after() {}
     }
 
     #[test]
-    fn for_op_unary_coverage() {
+    fn for_node_unary_coverage() {
         for op in ["Relu", "Sigmoid", "Cast", "Identity", "Softmax"] {
             assert!(
-                matches!(ShapeInference::for_op(op), ShapeInference::SameAsInput(0)),
+                matches!(
+                    ShapeInference::for_node(&bare_node(op), &[], 1),
+                    ShapeInference::SameAsInput(0)
+                ),
                 "{op} should be SameAsInput(0)"
             );
         }
     }
 
     #[test]
-    fn for_op_layer_norm_requires_attributes() {
-        // LayerNorm family needs axis / input shapes — for_op must decline.
-        for op in [
-            "LayerNormalization",
-            "SimplifiedLayerNormalization",
-            "RMSNormalization",
-            "SkipLayerNormalization",
-            "SkipSimplifiedLayerNormalization",
+    fn for_node_layer_norm_family_resolves() {
+        // The LayerNorm family defaults axis to -1, so `for_node` resolves it
+        // to a `LayerNorm` rule from the op alone — no attribute required.
+        for (op, domain) in [
+            ("LayerNormalization", ""),
+            ("SimplifiedLayerNormalization", ""),
+            ("RMSNormalization", ""),
+            ("SkipLayerNormalization", "com.microsoft"),
+            ("SkipSimplifiedLayerNormalization", "com.microsoft"),
         ] {
+            let mut node = bare_node(op);
+            node.domain = domain.to_string();
             assert!(
-                matches!(ShapeInference::for_op(op), ShapeInference::Declined { .. }),
-                "{op} should be Declined in for_op (needs axis attribute)"
+                matches!(
+                    ShapeInference::for_node(&node, &[], 2),
+                    ShapeInference::LayerNorm { .. }
+                ),
+                "{op} should resolve to a LayerNorm rule"
             );
         }
     }
 
     #[test]
-    fn for_op_matmul_is_matmul() {
+    fn for_node_matmul_is_matmul() {
         assert!(matches!(
-            ShapeInference::for_op("MatMul"),
+            ShapeInference::for_node(&bare_node("MatMul"), &[], 1),
             ShapeInference::MatMul
         ));
     }
 
     #[test]
-    fn for_op_safe_defaults_exist() {
-        // These ops have reasonable attribute defaults, so for_op can give a
-        // useful (if not always perfect) result.
+    fn for_node_resolves_attribute_defaults() {
+        // These ops carry attributes, but their ONNX defaults let `for_node`
+        // resolve a rule from a bare node.
         assert!(matches!(
-            ShapeInference::for_op("Concat"),
+            ShapeInference::for_node(&bare_node("Concat"), &[], 1),
             ShapeInference::Concat { axis: 0 }
         ));
         assert!(matches!(
-            ShapeInference::for_op("Transpose"),
+            ShapeInference::for_node(&bare_node("Transpose"), &[], 1),
             ShapeInference::Transpose { perm: None }
         ));
         assert!(matches!(
-            ShapeInference::for_op("Gather"),
+            ShapeInference::for_node(&bare_node("Gather"), &[], 1),
             ShapeInference::Gather { axis: 0 }
         ));
         assert!(matches!(
-            ShapeInference::for_op("Reshape"),
+            ShapeInference::for_node(&bare_node("Reshape"), &[], 1),
             ShapeInference::ReshapeData { allowzero: false }
         ));
         assert!(matches!(
-            ShapeInference::for_op("Slice"),
+            ShapeInference::for_node(&bare_node("Slice"), &[], 1),
             ShapeInference::SliceData
         ));
         assert!(matches!(
-            ShapeInference::for_op("Shape"),
+            ShapeInference::for_node(&bare_node("Shape"), &[], 1),
             ShapeInference::ShapeOp {
                 start: 0,
                 end: None

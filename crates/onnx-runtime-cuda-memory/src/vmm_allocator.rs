@@ -1228,6 +1228,39 @@ impl CudaVmmAllocator {
         (arena.spans.committed, arena.spans.capacity())
     }
 
+    /// The [`DeviceKey`] this allocator's arena is bound to. Used by callers
+    /// that hold several allocators keyed by an unrelated identifier (e.g.
+    /// `ValueId`) to verify they all belong to the same physical device
+    /// before performing any cross-allocator device-scoped operation, rather
+    /// than assuming it.
+    pub fn device_key(&self) -> DeviceKey {
+        self.device
+    }
+
+    /// Execute a closure with exclusive access to the arena's reservation
+    /// and this allocator's `CudaVirtualBacking`.
+    ///
+    /// This is the one authorized path for `transition_granule_range`
+    /// (from `onnx-runtime-ep-cuda`) to reach the mutable
+    /// [`CudaReservation`] that backs a specific VMM allocation: the arena
+    /// lock is held across the closure, so no concurrent commit/decommit
+    /// can interleave.
+    ///
+    /// The closure receives `(&mut CudaReservation, &CudaVirtualBacking)`.
+    /// It **must not** attempt to re-lock this allocator (would deadlock).
+    ///
+    /// [`CudaReservation`]: onnx_runtime_virtual_memory::VirtualBacking::Reservation
+    pub fn with_reservation_mut<R, F>(&self, f: F) -> R
+    where
+        F: FnOnce(
+            &mut <CudaVirtualBacking as onnx_runtime_virtual_memory::VirtualBacking>::Reservation,
+            &CudaVirtualBacking,
+        ) -> R,
+    {
+        let mut arena = self.lock();
+        f(&mut arena.reservation, &self.backing)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Arena> {
         self.arena
             .lock()

@@ -11,7 +11,7 @@ use crate::error::{driver_err, not_implemented};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const BLOCK: u32 = 256;
-const MODULE: &str = "wave4_activations_float_v3";
+const MODULE: &str = "wave4_activations_float_v4";
 
 const SRC: &str = r#"
 #if __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>)
@@ -46,6 +46,15 @@ __device__ float op_selu(float v, float alpha, float gamma) {
     return gamma * (v >= 0.0f ? v : alpha * expm1f(v));
 }
 __device__ float op_thresholded_relu(float v, float alpha, float unused) { return v > alpha ? v : 0.0f; }
+// Celu(x) = max(0,x) + min(0, alpha*(exp(x/alpha)-1)).  NaN is propagated
+// explicitly because CUDA's fmaxf/fminf (like Rust's f32::max/min) return the
+// non-NaN operand when one argument is NaN, so both min/max terms would
+// collapse to 0 and Celu(NaN) would come out 0.  The CPU scalar does the same
+// isnan guard for the same reason.
+__device__ float op_celu(float v, float alpha, float unused) {
+    if (isnan(v)) return v;
+    return fmaxf(v, 0.0f) + fminf(0.0f, alpha * (expf(v / alpha) - 1.0f));
+}
 __device__ float op_swish(float v, float alpha, float unused) {
     const float z = alpha * v;
     float s;
@@ -72,6 +81,7 @@ DEFINE_ACT(clip, TYPE, SUFFIX) \
 DEFINE_ACT(softsign, TYPE, SUFFIX) \
 DEFINE_ACT(selu, TYPE, SUFFIX) \
 DEFINE_ACT(thresholded_relu, TYPE, SUFFIX) \
+DEFINE_ACT(celu, TYPE, SUFFIX) \
 DEFINE_ACT(swish, TYPE, SUFFIX)
 DEFINE_FOR_TYPE(float, f32)
 #ifdef NXRT_HAS_CUDA_HALF_HEADERS
@@ -140,6 +150,7 @@ pub enum ActivationOp {
     Softsign,
     Selu { alpha: f32, gamma: f32 },
     ThresholdedRelu { alpha: f32 },
+    Celu { alpha: f32 },
     Swish { alpha: f32 },
 }
 
@@ -153,6 +164,7 @@ impl ActivationOp {
             Self::Softsign => "softsign",
             Self::Selu { .. } => "selu",
             Self::ThresholdedRelu { .. } => "thresholded_relu",
+            Self::Celu { .. } => "celu",
             Self::Swish { .. } => "swish",
         }
     }
@@ -170,6 +182,7 @@ impl ActivationOp {
             Self::Softsign => "Softsign",
             Self::Selu { .. } => "Selu",
             Self::ThresholdedRelu { .. } => "ThresholdedRelu",
+            Self::Celu { .. } => "Celu",
             Self::Swish { .. } => "Swish",
         }
     }
@@ -179,6 +192,7 @@ impl ActivationOp {
             Self::LeakyRelu { alpha }
             | Self::Elu { alpha }
             | Self::ThresholdedRelu { alpha }
+            | Self::Celu { alpha }
             | Self::Swish { alpha } => (alpha, 0.0),
             Self::HardSigmoid { alpha, beta } => (alpha, beta),
             Self::Clip { min, max } => (min, max),
@@ -240,6 +254,9 @@ fn activation_from_node(name: &str, node: &Node) -> Result<ActivationOp> {
                 .unwrap_or(1.0507),
         },
         "ThresholdedRelu" => ActivationOp::ThresholdedRelu {
+            alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
+        },
+        "Celu" => ActivationOp::Celu {
             alpha: node.attr("alpha").and_then(|a| a.as_float()).unwrap_or(1.0),
         },
         "Swish" => ActivationOp::Swish {
@@ -482,7 +499,8 @@ impl ActivationKernel {
                 | ActivationOp::ThresholdedRelu { .. } => 1,
                 ActivationOp::HardSigmoid { .. } | ActivationOp::Softsign => 3,
                 ActivationOp::Elu { .. } | ActivationOp::Selu { .. } => 4,
-                ActivationOp::Swish { .. } => 5,
+                // Celu: div + exp + sub + mul + max + min + add ≈ 5 flops
+                ActivationOp::Celu { .. } | ActivationOp::Swish { .. } => 5,
             };
             (n as u64).saturating_mul(per_element)
         });
@@ -560,6 +578,7 @@ mod tests {
                 gamma: 1.0507,
             },
             ActivationOp::ThresholdedRelu { alpha: 1.0 },
+            ActivationOp::Celu { alpha: 1.0 },
             ActivationOp::Swish { alpha: 1.0 },
         ] {
             assert!(
@@ -678,6 +697,18 @@ mod tests {
         assert_eq!(
             activation_from_node("Swish", &swish).unwrap(),
             ActivationOp::Swish { alpha: 0.5 }
+        );
+
+        assert_eq!(
+            activation_from_node("Celu", &node("Celu")).unwrap(),
+            ActivationOp::Celu { alpha: 1.0 }
+        );
+        let mut celu = node("Celu");
+        celu.attributes
+            .insert("alpha".into(), Attribute::Float(2.0));
+        assert_eq!(
+            activation_from_node("Celu", &celu).unwrap(),
+            ActivationOp::Celu { alpha: 2.0 }
         );
     }
 }

@@ -91,7 +91,9 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+use std::sync::atomic::{
+    AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
+};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -1125,6 +1127,61 @@ pub struct SpmdDecodePools {
     /// underneath it was not -- the count was never the thing that was wrong.
     /// A label nothing can check is a label that drifts.
     worker_cpus: Vec<Option<usize>>,
+    /// The allowed CPU that [`DISPATCHER_RESERVED_CPUS`] freed for the inline
+    /// dispatcher, or `None` when the pool has no dispatcher shard or the
+    /// reservation could not be located (unpinned workers, empty CPU list).
+    ///
+    /// Reserving the CPU and *using* it are two different things. The
+    /// reservation is made in [`reserve_single_group_headroom`] /
+    /// [`reserve_split_headroom`] and only guarantees that no worker is pinned
+    /// there; the dispatcher itself is an ordinary unpinned thread that the
+    /// scheduler is free to leave on a worker's core while the reserved one
+    /// sits idle. Recording the reserved CPU here is what lets
+    /// [`Self::dispatcher_observed_cpu`] check whether that actually happens,
+    /// and [`DISPATCHER_PIN_ENV`] test whether closing the gap is worth
+    /// anything. Measured answer so far: it is worth 9.5%, which is below the
+    /// bar that was set for it.
+    dispatcher_cpu: Option<usize>,
+    /// OS thread id of the first thread to dispatch on this pool, or `0` before
+    /// any dispatch has happened.
+    ///
+    /// Recorded because the dispatcher is *not* the thread that owns the pool,
+    /// nor in general the process's main thread, so "which CPU is the
+    /// dispatcher on" cannot be answered by asking whoever is reporting. The
+    /// first attempt at this measurement read `sched_getcpu()` on the reporting
+    /// thread and produced an exactly inverted result -- with the dispatcher
+    /// unpinned the reporter sat on the reserved CPU (it is idle while the pool
+    /// works, so the scheduler parks it on the one free core), and pinning the
+    /// dispatcher *evicted* the reporter from that CPU. Both readings were of
+    /// the wrong thread.
+    ///
+    /// Written once per pool via `compare_exchange` from the dispatch path's
+    /// existing per-thread one-shot, so it costs one syscall per process and
+    /// nothing on the steady path.
+    dispatcher_tid: AtomicI64,
+    /// The CPU the dispatcher was last seen on, sampled every
+    /// [`DISPATCHER_CPU_SAMPLE_MASK`] + 1 dispatches, or `-1` before the first
+    /// sample.
+    ///
+    /// Sampled inside the dispatch path because the dispatcher is a transient
+    /// thread: by the time a harness reports, `/proc/self/task/<tid>` is
+    /// usually already gone, so its placement has to be recorded while it is
+    /// still running.
+    dispatcher_observed_cpu: AtomicI64,
+    /// How many consecutive dispatcher CPU samples differed from the one
+    /// before.
+    ///
+    /// A lower bound on migrations, not a count of them: sampling every
+    /// [`DISPATCHER_CPU_SAMPLE_MASK`] + 1 dispatches sees a thread that left
+    /// and came back as no change at all. That is the right direction for the
+    /// question it answers -- "does the unpinned dispatcher stay put?" -- since
+    /// any non-zero reading is a migration that definitely happened, while zero
+    /// is only evidence of stillness at this sampling rate.
+    ///
+    /// Sampled from one thread only (see `DISPATCHER_IS_RECORDED`), so a
+    /// successfully pinned dispatcher reads exactly zero and this doubles as a
+    /// check on the pin.
+    dispatcher_cpu_changes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1200,6 +1257,15 @@ impl SpmdDecodePools {
             *last += 1;
         }
         let total_workers = total_threads + usize::from(dispatcher_shard.is_some());
+        // The CPU the headroom reservation freed. Workers take `shard.cpus` in
+        // order (`worker % len`), so index `shard.workers` is the first CPU of
+        // that node that no worker was pinned to -- exactly the CPU the reserve
+        // exists to keep clear. The dispatcher's shard lives on the last node,
+        // so that node's spare is the one it should sit on.
+        let dispatcher_cpu = dispatcher_shard.and_then(|_| {
+            let last = shards.last()?;
+            last.cpus.get(last.workers).copied()
+        });
 
         #[cfg(feature = "mlas")]
         if schedule == DecodeSchedule::Steal {
@@ -1224,6 +1290,11 @@ impl SpmdDecodePools {
                 worker_cpus: Vec::new(),
                 total_workers: total_threads,
                 schedule,
+                // No inline dispatcher on this path, so nothing reserved one.
+                dispatcher_cpu: None,
+                dispatcher_tid: AtomicI64::new(0),
+                dispatcher_observed_cpu: AtomicI64::new(-1),
+                dispatcher_cpu_changes: AtomicU64::new(0),
             };
         }
 
@@ -1423,6 +1494,10 @@ impl SpmdDecodePools {
             total_workers,
             schedule,
             worker_cpus,
+            dispatcher_cpu,
+            dispatcher_tid: AtomicI64::new(0),
+            dispatcher_observed_cpu: AtomicI64::new(-1),
+            dispatcher_cpu_changes: AtomicU64::new(0),
         }
     }
 
@@ -1479,6 +1554,68 @@ impl SpmdDecodePools {
     /// See [`Self::placement_is_one_worker_per_physical_core`].
     pub fn worker_cpus(&self) -> &[Option<usize>] {
         &self.worker_cpus
+    }
+
+    /// The allowed CPU that the dispatcher reservation freed, if any.
+    ///
+    /// This is a *reservation*, not a placement: no worker is pinned here, but
+    /// nothing pins the dispatcher here either unless [`DISPATCHER_PIN_ENV`] is
+    /// on. Exposed so a harness can check the two independently -- which CPU
+    /// was kept clear, and which CPU the dispatching thread actually ran on --
+    /// rather than inferring one from the other.
+    pub fn dispatcher_cpu(&self) -> Option<usize> {
+        self.dispatcher_cpu
+    }
+
+    /// OS thread id of the thread that dispatched on this pool, once one has.
+    ///
+    /// `None` before the first dispatch, and on platforms with no stable
+    /// per-thread id. The dispatcher is neither the pool's builder nor
+    /// necessarily the process's main thread, so this is the only reliable way
+    /// to ask where the dispatcher is actually running.
+    pub fn dispatcher_thread_id(&self) -> Option<i64> {
+        let tid = self.dispatcher_tid.load(Ordering::Relaxed);
+        (tid != 0).then_some(tid)
+    }
+
+    /// The CPU the dispatcher was last sampled on, or `None` before any
+    /// dispatch (and on platforms without `sched_getcpu`).
+    ///
+    /// A *sample*, not a residence: an unpinned dispatcher migrates, so equality
+    /// with [`Self::dispatcher_cpu`] means "it was there when last looked", and
+    /// only a pinned dispatcher can be said to stay.
+    pub fn dispatcher_observed_cpu(&self) -> Option<usize> {
+        let cpu = self.dispatcher_observed_cpu.load(Ordering::Relaxed);
+        (cpu >= 0).then_some(cpu as usize)
+    }
+
+    /// Observed dispatcher CPU changes between consecutive samples.
+    ///
+    /// See [`Self::dispatcher_cpu_changes`]: a lower bound on migrations, and
+    /// necessarily zero once the dispatcher is pinned.
+    pub fn dispatcher_cpu_changes(&self) -> u64 {
+        self.dispatcher_cpu_changes.load(Ordering::Relaxed)
+    }
+
+    /// Record the calling thread's current CPU as the dispatcher's placement,
+    /// and count the sample as a change if it moved since the last one.
+    fn sample_dispatcher_cpu(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `sched_getcpu` takes no arguments and only reads the
+            // calling thread's current CPU.
+            let cpu = unsafe { libc::sched_getcpu() };
+            if cpu < 0 {
+                return;
+            }
+            let cpu = i64::from(cpu);
+            let previous = self.dispatcher_observed_cpu.swap(cpu, Ordering::Relaxed);
+            // `previous < 0` is the first sample, which has nothing to differ
+            // from and must not be counted as a move.
+            if previous >= 0 && previous != cpu {
+                self.dispatcher_cpu_changes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Whether the pinned workers occupy distinct physical cores.
@@ -1653,6 +1790,77 @@ impl SpmdDecodePools {
     /// dispatcher at a time. When another thread already owns them this runs
     /// the shards inline instead of waiting or racing -- see
     /// [`SharedState::dispatching`].
+    /// Record this thread as the dispatcher and, if [`DISPATCHER_PIN_ENV`] is
+    /// on, bind it to the CPU the headroom reserve freed. At most once per
+    /// thread.
+    ///
+    /// The tid is recorded whether or not the pin is requested: with the knob
+    /// off, "which CPU did the scheduler leave the dispatcher on" is the
+    /// measurement the knob exists to answer, and it needs the same identity.
+    ///
+    /// The pin attempt is recorded before it is made, so a host that refuses it
+    /// costs one failed syscall for the life of the thread rather than one per
+    /// op.
+    ///
+    /// Called from [`Self::dispatch`] rather than at build time because the
+    /// pool is a process-wide static built on whichever thread decodes first,
+    /// which need not be the thread that goes on to dispatch.
+    fn bind_dispatcher_to_reserved_cpu(&self) {
+        let tick = DISPATCHER_TICK.with(|t| {
+            let seen = t.get();
+            t.set(seen.wrapping_add(1));
+            seen
+        });
+        if tick != 0 {
+            if tick & DISPATCHER_CPU_SAMPLE_MASK == 0
+                && DISPATCHER_IS_RECORDED.with(std::cell::Cell::get)
+            {
+                self.sample_dispatcher_cpu();
+            }
+            return;
+        }
+        // First dispatcher wins the identity slot: it is the one whose
+        // placement is sampled from here on. Later dispatching threads still
+        // take the reserved CPU below -- the point of the reserve is that
+        // whoever is dispatching sits there -- they just do not report.
+        let recorded = match current_thread_os_id() {
+            Some(tid) => self
+                .dispatcher_tid
+                .compare_exchange(0, tid, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok(),
+            None => false,
+        };
+        DISPATCHER_IS_RECORDED.with(|flag| flag.set(recorded));
+        let Some(cpu) = self.dispatcher_cpu else {
+            if recorded {
+                self.sample_dispatcher_cpu();
+            }
+            return;
+        };
+        if !dispatcher_pin_requested() {
+            if recorded {
+                self.sample_dispatcher_cpu();
+            }
+            return;
+        }
+        match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
+            Ok(()) => report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on: dispatcher pinned to reserved cpu {cpu}"
+            )),
+            Err(message) => report_dispatcher_pin(&format!(
+                "{DISPATCHER_PIN_ENV} on, but pinning the dispatcher to reserved cpu \
+                 {cpu} failed: {message}; dispatcher left unpinned"
+            )),
+        }
+        // After the pin, never before: the first sample is the baseline every
+        // later one is compared against, so taking it pre-pin would score the
+        // pin itself as a migration and a successfully pinned dispatcher could
+        // never read zero.
+        if recorded {
+            self.sample_dispatcher_cpu();
+        }
+    }
+
     fn dispatch<F>(&self, job: &F)
     where
         F: Fn(usize) + Sync,
@@ -1671,6 +1879,7 @@ impl SpmdDecodePools {
             .as_ref()
             .expect("fixed SPMD dispatch requires shared worker state");
         shared.panic_if_poisoned();
+        self.bind_dispatcher_to_reserved_cpu();
         unsafe fn call<F>(data: *const (), global_index: usize)
         where
             F: Fn(usize) + Sync,
@@ -3057,6 +3266,99 @@ fn node_shards_with(
 /// subscribed.
 const DISPATCHER_RESERVED_CPUS: usize = 1;
 
+/// Opt-in: bind the inline dispatcher to the CPU [`DISPATCHER_RESERVED_CPUS`]
+/// reserved for it (`1`/`on`/`true`/`yes`). Default off.
+///
+/// The reservation already keeps one allowed CPU clear of workers, because a
+/// dispatcher sharing a core with a worker makes that worker a straggler the
+/// whole barrier waits on -- 1.57x on qwen int4 at 16 cores, which is why
+/// [`reserve_single_group_headroom`] exists. But reserving a CPU does not put
+/// anything on it: the dispatcher is an ordinary unpinned thread, and nothing
+/// stops the scheduler leaving it on a worker's core while the reserved CPU
+/// sits idle. Whether that happens is now measurable rather than assumed --
+/// [`SpmdDecodePools::dispatcher_observed_cpu`] samples the dispatcher's actual
+/// CPU during the run, and a harness can compare it against
+/// [`SpmdDecodePools::dispatcher_cpu`]. If the two diverge, the collision the
+/// reserve was built to prevent is happening anyway, non-deterministically per
+/// launch, which would also make it a candidate explanation for the
+/// launch-to-launch dispersion that swamps width-16 A/B work.
+///
+/// Off by default deliberately, and for two independent reasons.
+///
+/// The first is that it has not earned a default. Measured against the
+/// pre-registered single-knob rule on `7e274a4e2` -- 16 launches, 15 trusted --
+/// it is faster in **15 of 15** launches and the median gain is **1.0953**,
+/// under the 1.10 the rule requires: **REJECT**. A companion rule about
+/// launch-to-launch dispersion failed its own self-test and certified nothing.
+/// An earlier 6-launch run scored 1.1910 and ACCEPT; it did not replicate. The
+/// mechanism is also unproven -- the migration counter says the unpinned
+/// dispatcher moves at most once per launch, which is far too little to explain
+/// anything, so whatever this does is not "it stops migrating". See
+/// `docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`.
+///
+/// The second is that binding the dispatching thread is not free of
+/// consequence: it is the session thread, so it keeps that affinity after the
+/// decode loop ends, and a subsequent prefill on the same thread would run
+/// one-CPU-wide. Turning this into a default needs evidence that covers prefill
+/// as well as decode, and that evidence does not exist yet. The knob is here so
+/// the decode half can be measured at all.
+pub const DISPATCHER_PIN_ENV: &str = "ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN";
+
+/// Whether [`DISPATCHER_PIN_ENV`] asks for the dispatcher to be pinned.
+/// Read once per process, like every other decode knob, so a mid-run
+/// environment change cannot make two ops disagree.
+pub fn dispatcher_pin_requested() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var(DISPATCHER_PIN_ENV)
+            .ok()
+            .map(|raw| dispatcher_pin_from_raw(Some(raw.as_str())))
+            .unwrap_or(false)
+    })
+}
+
+/// Parse of [`DISPATCHER_PIN_ENV`], split out so the accepted spellings are
+/// directly testable without touching process environment.
+fn dispatcher_pin_from_raw(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "on" | "true" | "yes")
+    )
+}
+
+/// Sample the dispatcher's CPU once every this many dispatches (minus one).
+///
+/// The dispatcher's *placement* is the quantity under study, and it is not a
+/// constant: an unpinned thread migrates, so a single reading taken at the
+/// first dispatch describes startup rather than steady state. Sampling costs
+/// one `sched_getcpu` -- a vDSO read, no syscall -- per 1024 dispatches, which
+/// at ~400 barriers per token is under three tokens' spacing and immaterial
+/// beside the barrier itself.
+const DISPATCHER_CPU_SAMPLE_MASK: u32 = 1023;
+
+thread_local! {
+    /// Per-dispatching-thread tick. Zero means "this thread has not dispatched
+    /// before", which drives the one-shot identity record and pin attempt; the
+    /// low bits then drive periodic CPU sampling.
+    ///
+    /// The pin is attempted exactly once per thread, success or failure. A
+    /// retry loop would put a failing syscall on the hot path forever on any
+    /// host that refuses the pin.
+    static DISPATCHER_TICK: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Whether this thread is the one whose id the pool recorded.
+    ///
+    /// A process can dispatch from more than one thread over its life -- a
+    /// session per phase is enough -- and every one of them takes the reserved
+    /// CPU, which is the intended behaviour: the point is that whoever is
+    /// dispatching sits there. But *placement sampling* has to follow a single
+    /// thread or it reports thread changes as movement. Measured before this
+    /// distinction existed, a pinned dispatcher read 2 to 7 "moves" when it
+    /// could only ever have made one -- the samples were coming from different
+    /// threads.
+    static DISPATCHER_IS_RECORDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Cap a single pinned worker group so at least [`DISPATCHER_RESERVED_CPUS`]
 /// allowed CPU stays free for the inline dispatcher.
 ///
@@ -3111,8 +3413,40 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
     }
 }
 
-/// Log the first persistent-pool fallback/pinning problem once so a restricted
-/// or unsupported host surfaces the reason without spamming every worker.
+/// The calling thread's OS thread id, or `None` where the platform exposes no
+/// stable per-thread id. Linux only in practice: this exists so a harness can
+/// find the dispatcher's `/proc/self/task/<tid>` entry, which has no
+/// counterpart elsewhere.
+fn current_thread_os_id() -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `gettid` takes no arguments, cannot fail, and returns the
+        // calling thread's kernel id.
+        let tid = unsafe { libc::gettid() };
+        (tid > 0).then_some(i64::from(tid))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Report the dispatcher-pin outcome once. Separate static from
+/// [`report_spmd_fallback`]'s: this is not a fallback, and folding the two
+/// would let whichever fired first silence the other.
+fn report_dispatcher_pin(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(dispatcher_pin = %message, "cpu decode dispatcher pin");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: {message}");
+        }
+    }
+}
+
+/// Log the first persistent-pool fallback/pinning problem once so a restricted/// or unsupported host surfaces the reason without spamming every worker.
 /// Emitted as `tracing::debug!` when the `tracing` feature is enabled, or
 /// gated behind `NXRT_CALIB_DEBUG` otherwise.
 fn report_spmd_fallback(message: &str) {
@@ -3625,6 +3959,92 @@ mod tests {
             workers: threads,
         }];
         SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, true)
+    }
+
+    #[test]
+    fn dispatcher_pin_env_accepts_only_affirmative_spellings() {
+        for on in ["1", "on", "true", "yes", " ON ", "True"] {
+            assert!(
+                dispatcher_pin_from_raw(Some(on)),
+                "{on:?} should enable the dispatcher pin"
+            );
+        }
+        for off in ["0", "off", "false", "no", "", "  ", "maybe"] {
+            assert!(
+                !dispatcher_pin_from_raw(Some(off)),
+                "{off:?} should not enable the dispatcher pin"
+            );
+        }
+        // Unset is off: this knob never opts a host in by accident.
+        assert!(!dispatcher_pin_from_raw(None));
+    }
+
+    #[test]
+    fn dispatcher_cpu_is_the_cpu_the_headroom_reserve_freed() {
+        // A node with more CPUs than workers is exactly what the reserve
+        // produces, and the first unused CPU is the one it kept clear.
+        let shards = vec![NodeShard {
+            index: 0,
+            cpus: vec![0, 2, 4, 6],
+            workers: 3,
+        }];
+        let pools = SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, true);
+        assert_eq!(pools.dispatcher_cpu(), Some(6));
+        // The reserved CPU is precisely the one no worker claimed.
+        let taken: Vec<Option<usize>> = pools.worker_cpus().to_vec();
+        assert!(
+            !taken.contains(&Some(6)),
+            "reserved cpu must not also be a worker's pin target: {taken:?}"
+        );
+        pools.shutdown();
+    }
+
+    #[test]
+    fn dispatcher_cpu_is_none_without_a_reservation_or_a_dispatcher_shard() {
+        // Fully subscribed: every CPU has a worker, so nothing was reserved and
+        // there is no free CPU to name. Reporting one here would be the
+        // unverified-label failure the placement accessors exist to avoid.
+        let full = vec![NodeShard {
+            index: 0,
+            cpus: vec![0, 2],
+            workers: 2,
+        }];
+        let pools = SpmdDecodePools::build_with_schedule(&full, DecodeSchedule::Fixed, true);
+        assert_eq!(pools.dispatcher_cpu(), None);
+        pools.shutdown();
+
+        // No dispatcher shard: the dispatcher computes nothing, so the pool
+        // makes no claim on a CPU for it even when one is spare.
+        let spare = vec![NodeShard {
+            index: 0,
+            cpus: vec![0, 2, 4],
+            workers: 2,
+        }];
+        let pools = SpmdDecodePools::build_with_schedule(&spare, DecodeSchedule::Fixed, false);
+        assert_eq!(pools.dispatcher_cpu(), None);
+        pools.shutdown();
+    }
+
+    #[test]
+    fn dispatcher_cpu_comes_from_the_node_that_owns_the_dispatcher_shard() {
+        // `node_worker_counts` adds the dispatcher's shard to the *last* node,
+        // so the reserved CPU must come from that node -- taking node 0's spare
+        // would pin the dispatcher on the far side of the barrier it serves.
+        let shards = vec![
+            NodeShard {
+                index: 0,
+                cpus: vec![0, 2, 4],
+                workers: 2,
+            },
+            NodeShard {
+                index: 1,
+                cpus: vec![16, 18, 20],
+                workers: 2,
+            },
+        ];
+        let pools = SpmdDecodePools::build_with_schedule(&shards, DecodeSchedule::Fixed, true);
+        assert_eq!(pools.dispatcher_cpu(), Some(20));
+        pools.shutdown();
     }
 
     #[test]

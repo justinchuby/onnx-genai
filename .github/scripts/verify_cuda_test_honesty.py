@@ -43,6 +43,12 @@ SUMMARY = re.compile(
     r"(?P<ignored>\d+) ignored; (?P<measured>\d+) measured; (?P<filtered>\d+) filtered out"
 )
 
+# Per-test outcome lines. A count alone ("1 tests failed while checking ignored
+# status") does not say which test, and this checker's whole job is to be the
+# signal that a `_gpu` test was added without an ignore -- so it has to name the
+# test, or the next person pays for a bisect to find out what it meant.
+OUTCOME = re.compile(r"^test (?P<name>\S+) \.\.\. (?P<status>ok|FAILED|ignored)", re.MULTILINE)
+
 
 @dataclass(frozen=True)
 class FeatureConfig:
@@ -57,21 +63,34 @@ class TestBinary:
 
 
 @dataclass(frozen=True)
-class IgnoredResult:
+class LibtestResult:
     target: str
     inventory: int
     passed: int
     failed: int
     ignored: int
+    names: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    def named(self, status: str) -> str:
+        """`" (a, b)"` for the tests with `status`, or `""` if unknown.
+
+        Appended to a count so the message says which test, while still being
+        correct if the per-test lines could not be parsed.
+        """
+        for key, values in self.names:
+            if key == status and values:
+                return " (" + ", ".join(sorted(values)) + ")"
+        return ""
 
 
 @dataclass(frozen=True)
-class ActiveResult:
-    target: str
-    inventory: int
-    passed: int
-    failed: int
-    ignored: int
+class IgnoredResult(LibtestResult):
+    pass
+
+
+@dataclass(frozen=True)
+class ActiveResult(LibtestResult):
+    pass
 
 
 BASE_CONFIG = FeatureConfig("without-gpu-tests", "cuda")
@@ -156,7 +175,7 @@ def list_inventory(binary: TestBinary) -> frozenset[str]:
     return frozenset(line.removesuffix(": test") for line in result.stdout.splitlines() if line.endswith(": test"))
 
 
-def run_libtest(binary: TestBinary) -> tuple[int, int, int, int]:
+def run_libtest(binary: TestBinary) -> tuple[int, int, int, int, dict[str, list[str]]]:
     result = run([binary.executable, "--color", "never"])
     output = result.stdout + result.stderr
     matches = list(SUMMARY.finditer(output))
@@ -164,11 +183,15 @@ def run_libtest(binary: TestBinary) -> tuple[int, int, int, int]:
         print(output, file=sys.stderr, end="")
         raise RuntimeError(f"{binary.target} did not print a libtest summary")
     summary = matches[-1]
+    names: dict[str, list[str]] = {"ok": [], "FAILED": [], "ignored": []}
+    for outcome in OUTCOME.finditer(output):
+        names[outcome.group("status")].append(outcome.group("name"))
     return (
         result.returncode,
         int(summary.group("passed")),
         int(summary.group("failed")),
         int(summary.group("ignored")),
+        names,
     )
 
 
@@ -201,10 +224,14 @@ def validate_ignored_result(result: IgnoredResult) -> list[str]:
     if result.inventory == 0:
         errors.append(f"{result.target}: Cargo reported no integration tests")
     if result.failed:
-        errors.append(f"{result.target}: {result.failed} tests failed while checking ignored status")
+        errors.append(
+            f"{result.target}: {result.failed} tests failed while checking ignored status"
+            f"{result.named('FAILED')}"
+        )
     if result.passed:
         errors.append(
-            f"{result.target}: {result.passed} tests executed without gpu-tests; CUDA tests must be ignored, not pass"
+            f"{result.target}: {result.passed} tests executed without gpu-tests; "
+            f"CUDA tests must be ignored, not pass{result.named('ok')}"
         )
     if result.ignored != result.inventory:
         errors.append(
@@ -219,7 +246,8 @@ def validate_active_no_cuda_result(result: ActiveResult) -> list[str]:
         errors.append(f"{result.target}: Cargo reported no gpu-tests integration tests")
     if result.passed:
         errors.append(
-            f"{result.target}: {result.passed} tests passed with gpu-tests on a no-CUDA host; CUDA tests must fail loud or remain ignored"
+            f"{result.target}: {result.passed} tests passed with gpu-tests on a no-CUDA host; "
+            f"CUDA tests must fail loud or remain ignored{result.named('ok')}"
         )
     if result.failed + result.ignored != result.inventory:
         errors.append(
@@ -273,6 +301,49 @@ def self_test() -> None:
     ):
         if declares_gpu_tests_feature(manifest) is not expected:
             raise AssertionError(f"gpu-tests feature detection wrong for: {manifest!r}")
+
+    named = IgnoredResult(
+        "activations_gpu",
+        inventory=4,
+        passed=0,
+        failed=1,
+        ignored=3,
+        names=(("FAILED", ("mish_matches_cpu_including_the_saturating_tail",)),),
+    )
+    messages = validate_ignored_result(named)
+    if not any("mish_matches_cpu_including_the_saturating_tail" in m for m in messages):
+        raise AssertionError(f"failing test was not named in {messages!r}")
+    if not any("Cargo inventory has 4 tests but libtest reported 3 ignored" in m for m in messages):
+        raise AssertionError(f"ignored/inventory mismatch not reported in {messages!r}")
+
+    # Unparsed per-test lines must degrade to the count, not to a crash or a
+    # message with an empty "()" in it.
+    unnamed = IgnoredResult("t_gpu", inventory=1, passed=1, failed=0, ignored=0)
+    if any("(" in m for m in validate_ignored_result(unnamed)):
+        raise AssertionError("empty name list must not render parentheses")
+
+    active = ActiveResult(
+        "t_gpu",
+        inventory=2,
+        passed=1,
+        failed=0,
+        ignored=1,
+        names=(("ok", ("sneaky_pass",)),),
+    )
+    if not any("sneaky_pass" in m for m in validate_active_no_cuda_result(active)):
+        raise AssertionError("passing test was not named in the active-config message")
+
+    parsed = {
+        outcome.group("status"): outcome.group("name")
+        for outcome in OUTCOME.finditer(
+            "running 3 tests\n"
+            "test alpha ... ok\n"
+            "test beta ... FAILED\n"
+            "test gamma ... ignored\n"
+        )
+    }
+    if parsed != {"ok": "alpha", "FAILED": "beta", "ignored": "gamma"}:
+        raise AssertionError(f"libtest outcome parsing wrong: {parsed!r}")
 
     for cpu_target in (
         "deferred_release_queue",
@@ -396,15 +467,29 @@ def main() -> int:
 
     ignored_results: list[IgnoredResult] = []
     for target, inventory in sorted(base_inventory.items()):
-        _, passed, failed, ignored = run_libtest(base_by_target[target])
-        result = IgnoredResult(target, len(inventory), passed, failed, ignored)
+        _, passed, failed, ignored, names = run_libtest(base_by_target[target])
+        result = IgnoredResult(
+            target,
+            len(inventory),
+            passed,
+            failed,
+            ignored,
+            tuple((key, tuple(values)) for key, values in names.items()),
+        )
         ignored_results.append(result)
         errors.extend(validate_ignored_result(result))
 
     active_results: list[ActiveResult] = []
     for target, inventory in sorted(gpu_inventory.items()):
-        _, passed, failed, ignored = run_libtest(gpu_by_target[target])
-        result = ActiveResult(target, len(inventory), passed, failed, ignored)
+        _, passed, failed, ignored, names = run_libtest(gpu_by_target[target])
+        result = ActiveResult(
+            target,
+            len(inventory),
+            passed,
+            failed,
+            ignored,
+            tuple((key, tuple(values)) for key, values in names.items()),
+        )
         active_results.append(result)
         errors.extend(validate_active_no_cuda_result(result))
 
