@@ -891,7 +891,7 @@ pub(crate) fn serving_control_seeds(workflow: &WorkflowSpec) -> BTreeMap<String,
 /// The metadata crate computes this for its own validator but keeps it
 /// crate-private, so this fixture reads the same field rather than assuming the
 /// canonical decoder puts its loop at the top level.
-#[cfg(test)]
+#[cfg(all(test, feature = "native-backend"))]
 fn loop_carried_cell_names(
     steps: &[onnx_genai_metadata::WorkflowStep],
 ) -> std::collections::BTreeSet<String> {
@@ -925,7 +925,7 @@ fn loop_carried_cell_names(
 
 #[cfg(test)]
 pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(false)
+    test_decoder_runtime_inner(TestSessionShape::Stateless)
 }
 
 /// The same canonical decoder, declaring the conversation it carries.
@@ -945,11 +945,132 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
 /// unrelated fixtures.
 #[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(true)
+    test_decoder_runtime_inner(TestSessionShape::LoopCarried)
+}
+
+/// The same canonical decoder, declaring a `prompt_prefix` conversation.
+///
+/// [`test_session_decoder_runtime`] promotes the *loop-carried* cells, which
+/// makes the package session-capable but deliberately prepends nothing: a loop
+/// carry hands its lease back inside the graph, so
+/// [`WorkflowRuntime::session_prepended_prompt_len`] is zero for it by
+/// declaration. That is correct, and it is also why no test built on that
+/// fixture can reach the conversation charge on admission — the quantity is
+/// structurally zero there whatever the runtime does.
+///
+/// This fixture is the other carrier: a cell whose lease names a
+/// `prompt_prefix` continuation, which is the one shape whose tokens are
+/// prefilled again in front of every turn and therefore the one a request is
+/// charged for.
+#[cfg(all(test, feature = "native-backend"))]
+pub(crate) fn test_continuation_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(TestSessionShape::Continuation)
+}
+
+/// Which session shape a fixture declares.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestSessionShape {
+    /// Every cell `scope: invocation`; the package holds no session.
+    Stateless,
+    /// The loop-carried cells promoted to `scope: session`.
+    #[cfg(feature = "native-backend")]
+    LoopCarried,
+    /// A declared `prompt_prefix` conversation.
+    #[cfg(feature = "native-backend")]
+    Continuation,
+}
+
+/// Declare the conversation the canonical decoder omits, and return its cell.
+///
+/// Every name this reaches for is discovered through the role or the contract
+/// that makes it the right name, never spelled literally: the builder's input
+/// constants are private to `onnx-genai-metadata`, and a fixture that hardcoded
+/// them would keep compiling while naming an input the package no longer
+/// declares — producing a workflow the validator rejects for a reason that has
+/// nothing to do with the test using it.
+#[cfg(all(test, feature = "native-backend"))]
+fn declare_conversation(workflow: &mut onnx_genai_metadata::WorkflowSpec) -> anyhow::Result<()> {
+    let input_with_role = |role: onnx_genai_metadata::RuntimeInputRole| -> Option<String> {
+        workflow.inputs.iter().find_map(|(name, input)| {
+            matches!(
+                &input.role,
+                onnx_genai_metadata::SemanticInputRole::Runtime { role: declared, .. }
+                    if *declared == role
+            )
+            .then(|| name.clone())
+        })
+    };
+    let Some(prompt_input) = input_with_role(onnx_genai_metadata::RuntimeInputRole::PromptTokens)
+    else {
+        anyhow::bail!(
+            "a conversation prefixes the prompt_tokens input, and this package declares none"
+        )
+    };
+    // The decoder's own iteration bound, rather than an invented input: a
+    // continuation's `recurrence.max` must name a declared input that already
+    // has a value when the turn is admitted, and this one ships with a default.
+    let Some(bound_input) = input_with_role(onnx_genai_metadata::RuntimeInputRole::MaxIterations)
+    else {
+        anyhow::bail!(
+            "a conversation needs a declared growth bound, and this package declares none"
+        )
+    };
+    let Some(tokens_output) = workflow.outputs.iter().find_map(|(name, output)| {
+        (output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens).then(|| name.clone())
+    }) else {
+        anyhow::bail!(
+            "a conversation accumulates the tokens output, and this package publishes none"
+        )
+    };
+
+    // The prompt input's own contract: the validator requires a prefix to be
+    // the same kind of tensor as the thing it prefixes, so deriving it keeps
+    // the two in agreement instead of creating a second place to edit.
+    let contract = workflow
+        .inputs
+        .get(&prompt_input)
+        .expect("the input was just discovered in this map")
+        .contract
+        .clone();
+    let axis = contract.rank.saturating_sub(1);
+
+    workflow.state.insert(
+        "conversation".to_string(),
+        onnx_genai_metadata::WorkflowStateCell {
+            contract,
+            class: onnx_genai_metadata::WorkflowStateClass::Semantic,
+            scope: onnx_genai_metadata::WorkflowStateScope::Session,
+            initializer: prompt_input.clone(),
+            recurrence: onnx_genai_metadata::ShapeRecurrence::Bounded {
+                axis,
+                max: bound_input,
+            },
+            management: onnx_genai_metadata::StateManagement::Runtime,
+            release_boundary: Some(onnx_genai_metadata::StateReleaseBoundary::Session),
+            service_group: None,
+            session: Some(onnx_genai_metadata::SessionLeaseContract {
+                policy: onnx_genai_metadata::SessionMutationPolicy::Exclusive,
+                ttl_seconds: None,
+                optimistic_metadata_version: false,
+                continuation: Some(onnx_genai_metadata::SessionContinuation::PromptPrefix {
+                    prompt_input,
+                    tokens_output,
+                }),
+            }),
+        },
+    );
+    // The growth bound is a declared capability of its own; the session lease
+    // is added for every session shape by the caller.
+    workflow
+        .manifest
+        .capabilities
+        .insert("bounded_state_recurrence".to_string());
+    Ok(())
 }
 
 #[cfg(test)]
-fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRuntime> {
+fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<WorkflowRuntime> {
     let abi = onnx_genai_metadata::DecoderAbi {
         token_input: Some("input_ids".to_string()),
         logits_output: Some("logits".to_string()),
@@ -965,31 +1086,64 @@ fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRu
     .map_err(|error| {
         anyhow::anyhow!("a minimal decoder is expressible as a workflow: {error:?}")
     })?;
-    if session_scoped {
-        let carried = loop_carried_cell_names(&workflow.steps);
-        anyhow::ensure!(
-            !carried.is_empty(),
-            "the canonical decoder workflow is expected to carry state through its loop; \
-             promoting nothing would produce a package that still declares no session state \
-             and this fixture would silently build the stateless one"
-        );
-        let mut promoted = 0usize;
-        for (cell, state) in workflow.state.iter_mut() {
-            if carried.contains(cell) {
-                state.scope = onnx_genai_metadata::WorkflowStateScope::Session;
-                promoted += 1;
-            }
+    if shape != TestSessionShape::Stateless {
+        #[cfg(feature = "native-backend")]
+        if shape == TestSessionShape::Continuation {
+            declare_conversation(&mut workflow)?;
+            anyhow::ensure!(
+                onnx_genai_metadata::classify_session_state(&workflow)
+                    .prompt_continuation()
+                    .is_some(),
+                "the declared conversation must classify as a prompt continuation, or \
+                 `session_prepended_prompt_len` reports zero for it and every test built on \
+                 this fixture measures nothing"
+            );
         }
-        anyhow::ensure!(
-            promoted > 0,
-            "no declared state cell matched a loop carry, so this fixture would be \
-             indistinguishable from the stateless one"
-        );
+        #[cfg(feature = "native-backend")]
+        if shape == TestSessionShape::LoopCarried {
+            let carried = loop_carried_cell_names(&workflow.steps);
+            anyhow::ensure!(
+                !carried.is_empty(),
+                "the canonical decoder workflow is expected to carry state through its loop; \
+                 promoting nothing would produce a package that still declares no session state \
+                 and this fixture would silently build the stateless one"
+            );
+            let mut promoted = 0usize;
+            for (cell, state) in workflow.state.iter_mut() {
+                if carried.contains(cell) {
+                    state.scope = onnx_genai_metadata::WorkflowStateScope::Session;
+                    promoted += 1;
+                }
+            }
+            anyhow::ensure!(
+                promoted > 0,
+                "no declared state cell matched a loop carry, so this fixture would be \
+                 indistinguishable from the stateless one"
+            );
+        }
         anyhow::ensure!(
             crate::pipeline::workflow_carries_session_state(&workflow),
             "the promoted workflow must satisfy the same predicate `create_session` reads, \
              or this fixture proves nothing about sessions"
         );
+        // The lease and the capability are one statement, and the validator
+        // says so: a reader that cannot honour leased state must be able to
+        // see that it is being asked to. Declared for every session shape,
+        // because every session shape holds a lease -- the loop-carried
+        // fixture was building a package the document validator rejects, which
+        // went unnoticed while nothing asked it to validate.
+        workflow
+            .manifest
+            .capabilities
+            .insert("session_state_lease".to_string());
+        // The engine's own loop validator is not the document validator, and a
+        // fixture that only satisfied the first would be a package no real
+        // loader would accept -- so a test asserting runtime behaviour over it
+        // would be asserting over a shape that cannot reach a runtime.
+        onnx_genai_metadata::validate_pipeline_spec(&onnx_genai_metadata::PipelineSpec {
+            workflow: workflow.clone(),
+        })
+        .map_err(|error| anyhow::anyhow!("the fixture package must validate: {error:?}"))?;
     }
     validate_generation_workflow(&workflow)?;
     let directory = onnx_genai_ort::PipelineModelDirectory {

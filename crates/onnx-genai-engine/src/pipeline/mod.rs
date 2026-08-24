@@ -1017,6 +1017,42 @@ impl WorkflowRuntime {
             .retain(|(session, _), _| session != session_id);
     }
 
+    /// Give a session a conversation to continue, without running the turns
+    /// that would have accumulated one.
+    ///
+    /// Test-only. The cell is looked up through
+    /// [`onnx_genai_metadata::classify_session_state`] — the same classifier
+    /// [`Self::session_prepended_prompt_len`] reads — so the key written here
+    /// is by construction the key that function looks for. Naming the cell
+    /// literally would let the two drift, and a seeder that wrote a cell
+    /// nothing reads would leave every caller asserting against a conversation
+    /// of length zero while appearing to set one.
+    ///
+    /// A package that declares no prompt continuation is an error rather than
+    /// a no-op, for the same reason: seeding nothing is indistinguishable from
+    /// seeding successfully at the call site, and the difference is exactly
+    /// what a test about the carried charge is measuring.
+    #[cfg(all(test, feature = "native-backend"))]
+    pub(crate) fn seed_session_conversation(
+        &self,
+        session_id: &str,
+        tokens: &[i64],
+    ) -> anyhow::Result<()> {
+        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
+        let Some(cell) = facts.prompt_continuation() else {
+            anyhow::bail!(
+                "this package declares no prompt continuation, so it has no conversation to \
+                 seed; a test seeded against it would assert on a length that is zero for a \
+                 reason that has nothing to do with what it is testing"
+            );
+        };
+        let value = Value::from_slice_i64(tokens, &[1, tokens.len() as i64])?;
+        self.workflow_session_state
+            .borrow_mut()
+            .insert((session_id.to_string(), cell.to_string()), value);
+        Ok(())
+    }
+
     /// Length of the conversation this session has accumulated, when the
     /// package declares one.
     ///

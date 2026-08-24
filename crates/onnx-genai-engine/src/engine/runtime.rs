@@ -2979,7 +2979,7 @@ mod tests {
     /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
-        interpreted_engine_inner(budget_bytes, false)
+        interpreted_engine_inner(budget_bytes, TestPackageShape::Stateless)
     }
 
     /// The same fixture over a package that declares session-scoped state.
@@ -2991,11 +2991,32 @@ mod tests {
     /// and the two differ in exactly one declared property.
     #[cfg(feature = "native-backend")]
     fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
-        interpreted_engine_inner(budget_bytes, true)
+        interpreted_engine_inner(budget_bytes, TestPackageShape::LoopCarriedSession)
+    }
+
+    /// The same fixture over a package that declares a `prompt_prefix`
+    /// conversation — the one carrier whose tokens are prepended to the next
+    /// turn's prompt, and so the only one a request is charged for.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_continuation_engine_with_byte_budget(
+        budget_bytes: u64,
+    ) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(budget_bytes, TestPackageShape::Continuation)
     }
 
     #[cfg(feature = "native-backend")]
-    fn interpreted_engine_inner(budget_bytes: u64, session_scoped: bool) -> anyhow::Result<Engine> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TestPackageShape {
+        Stateless,
+        LoopCarriedSession,
+        Continuation,
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn interpreted_engine_inner(
+        budget_bytes: u64,
+        shape: TestPackageShape,
+    ) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -3012,10 +3033,14 @@ mod tests {
             0,
         )?;
         Ok(Engine {
-            workflow: Box::new(if session_scoped {
-                crate::pipeline::generation::test_session_decoder_runtime()?
-            } else {
-                crate::pipeline::generation::test_decoder_runtime()?
+            workflow: Box::new(match shape {
+                TestPackageShape::Stateless => crate::pipeline::generation::test_decoder_runtime()?,
+                TestPackageShape::LoopCarriedSession => {
+                    crate::pipeline::generation::test_session_decoder_runtime()?
+                }
+                TestPackageShape::Continuation => {
+                    crate::pipeline::generation::test_continuation_decoder_runtime()?
+                }
             }),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
@@ -3400,6 +3425,121 @@ mod tests {
                     },
                     if refuse { "refused" } else { "admitted" }
                 ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+
+    /// #1976: a continuing session must be charged for the conversation the
+    /// package will prepend in front of its prompt.
+    ///
+    /// `admit_interpreted_generate_request` adds
+    /// `session_prepended_prompt_len` to the request's own token count before
+    /// asking the scheduler, because a `prompt_prefix` package prefills every
+    /// earlier turn again in front of this one. Admitting on the request alone
+    /// under-reserves for exactly the turns that need the most — a long
+    /// conversation is admitted on the cost of its shortest message.
+    ///
+    /// Replacing that whole computation with `let carried = 0;` left the entire
+    /// engine suite green, which is what this test exists to change. Nothing
+    /// else could have caught it: the only session fixture in the crate
+    /// promotes *loop-carried* cells, and a loop carry hands its lease back
+    /// inside the graph, so its prepended length is zero by declaration however
+    /// the runtime behaves. Measuring the charge needs a package that declares
+    /// the one carrier that prepends.
+    ///
+    /// The three arms are one engine, one budget, one prompt, differing only in
+    /// how much conversation the session already holds:
+    ///
+    /// | conversation | charged tokens | vs budget | expected |
+    /// |---|---|---|---|
+    /// | none      | 2 + 0 + 1 = 3 | 30 ≤ 50 | admitted |
+    /// | 1 token   | 2 + 1 + 1 = 4 | 40 ≤ 50 | admitted |
+    /// | 5 tokens  | 2 + 5 + 1 = 8 | 80 > 50 | refused  |
+    ///
+    /// Two arms would not have been enough in either direction. Without the
+    /// refusing arm the test passes under `carried = 0`, which is the mutation
+    /// it is for. Without the two admitting arms it passes under a charge that
+    /// is merely *large* — `carried = 1_000_000` refuses all three and is just
+    /// as wrong, since a session that holds nothing must still be admitted. So
+    /// the assertion is on the boundary the real quantity puts between them,
+    /// not on the presence of a refusal.
+    ///
+    /// The session id is carried on the request rather than passed to the
+    /// admission call directly, so the arm also covers the second-order defect:
+    /// `workflow_api` re-derives "is this a known session" with its own
+    /// `contains_key`, and anything that pushes a turn down the mint branch
+    /// gets a fresh id that is absent from `workflow_sessions` by construction
+    /// — silently forcing the charge to zero without touching this line.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_continuing_session_is_charged_for_the_conversation_it_will_prepend() -> anyhow::Result<()>
+    {
+        // 10 bytes per token, as everywhere else in this fixture: 50 bytes is
+        // five tokens of room, and the request costs three before any
+        // conversation is counted.
+        const BUDGET_BYTES: u64 = 50;
+
+        let arms: Vec<(&str, Vec<i64>, bool)> = vec![
+            ("no conversation yet (control)", vec![], false),
+            ("a conversation that still fits", vec![7], false),
+            (
+                "a conversation that no longer fits",
+                vec![7, 8, 9, 10, 11],
+                true,
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, conversation, refuse) in arms {
+            let mut engine = interpreted_continuation_engine_with_byte_budget(BUDGET_BYTES)?;
+            assert!(!engine.holds_decode_core());
+
+            let session_id = engine.create_session()?;
+            engine
+                .workflow
+                .seed_session_conversation(&session_id.to_string(), &conversation)?;
+
+            // Assert the premise rather than trusting the fixture: if the
+            // package stopped declaring a continuation, or the seed landed
+            // under a key nothing reads, every arm would be charged zero and
+            // the whole table would collapse into "the budget has room", which
+            // passes for a reason unrelated to the charge.
+            let seen = engine
+                .workflow
+                .session_prepended_prompt_len(&session_id.to_string());
+            if seen != conversation.len() {
+                wrong.push(format!(
+                    "{label}: the package reports a prepended length of {seen} for a seeded \
+                     conversation of {}; this arm cannot measure the charge",
+                    conversation.len()
+                ));
+                continue;
+            }
+
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1, 2]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+            request.session_id = Some(session_id.to_string());
+
+            let error = engine
+                .generate_with_pipeline_callbacks(request, None, None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: the turn was admitted although the conversation it will prepend \
+                     puts it over the budget; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a turn the budget has room for was refused: {error}"
+                )),
+                _ => {}
             }
         }
 
