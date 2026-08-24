@@ -60,8 +60,13 @@ name: Host lock
 # work. Under `taskset -c 30,31` on the development host -- two cores, the
 # shape of a GitHub-hosted runner -- it passed 252/252 in 210s while consuming
 # 53% of a single core averaged over that window, i.e. it is mostly waiting.
-# (252 was the total at the time of that measurement; the assertions added
-# since are string-validation cells that add no wall time worth counting.)
+# (252 was the total at the time of that measurement.) The parenthetical that
+# used to stand here said the assertions added since were string-validation
+# cells adding no wall time worth counting. That stopped being true: the
+# unit/reason work added cells that run real 1.5-3s children, so the emulation
+# was re-taken rather than reasoned about -- 335/335 in 212s at 62% of a core,
+# same host, same two-core bind. The suite got 83 assertions heavier and 2s
+# slower, which is the point of re-measuring instead of arguing it is fine.
 # The first real run of this job on a GitHub-hosted runner then took 3m17s,
 # which is the number to trust, and it is why the emulation above is recorded
 # rather than deleted: it predicted the real one. The 20-minute timeout is ~6x

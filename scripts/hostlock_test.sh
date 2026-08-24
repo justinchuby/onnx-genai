@@ -1463,7 +1463,7 @@ out=$($HL run --owner leon --reason "cpu selfreport" --expect-cores 1 \
     -- python3 -c "$selfrep" "$LOCK.cpuself" 2>&1)
 hl_cpu=$(echo "$out" | sed -n 's/.*[^a-z]cpu=\([0-9.]*\)s.*/\1/p' | head -1)
 hl_wall=$(echo "$out" | sed -n 's/.*wall=\([0-9.]*\)s.*/\1/p' | head -1)
-hl_eff=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+hl_eff=$(echo "$out" | sed -n 's/.*efficiency_frac=\([0-9.]*\).*/\1/p' | head -1)
 child_cpu=$(cat "$LOCK.cpuself" 2>/dev/null)
 chk "the CPU seconds reported are the ones the child says it spent" \
     "$(awk -v a="${hl_cpu:-0}" -v b="${child_cpu:-0}" \
@@ -1491,7 +1491,7 @@ out=$($HL run --owner leon --reason "cpu ok" --expect-cores 1 --min-efficiency "
 # fails here regardless of what the rest of the box is doing. The two cells
 # below still assert the ok branch specifically, but this one is the part
 # that cannot be made vacuous by a busy host.
-eff_j=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+eff_j=$(echo "$out" | sed -n 's/.*efficiency_frac=\([0-9.]*\).*/\1/p' | head -1)
 chk "the verdict follows the number printed on the same row" \
     "$(echo "$out" | sed -n 's/.*verdict=\([a-z]*\).*/\1/p' | head -1):$rc" \
     "$(awk -v e="${eff_j:-0}" -v t="${thr:-1}" 'BEGIN { print (e + 0 >= t + 0) ? "ok:0" : "contended:6" }')"
@@ -1625,6 +1625,24 @@ chk "with --expect-cores the field is named as a fraction" \
     "$(echo "$out" | grep -c 'efficiency_frac=')" "1"
 chk "and the cores-form field is then absent, so neither can be misread" \
     "$(echo "$out" | grep -c 'efficiency_cores=')" "0"
+
+# The name is only half of it: the fraction has to actually be divided by the
+# denominator it names. With `--expect-cores 1` the two readings coincide, so
+# every cell that judges a single-core run is invariant to the very confusion
+# this field rename exists to remove -- including the one main added at
+# `and the efficiency is those seconds over cores x wall`. Two is the smallest
+# denominator that separates them, and the row is compared against its own
+# `cpu=` and `wall=`, so this holds under any load.
+out=$($HL run --owner leon --reason "unit naming, denominated by two" --expect-cores 2 -- \
+    bash -c "$spin2" 2>&1)
+den_cpu=$(echo "$out" | sed -n 's/.*[^a-z]cpu=\([0-9.]*\)s.*/\1/p' | head -1)
+den_wall=$(echo "$out" | sed -n 's/.*wall=\([0-9.]*\)s.*/\1/p' | head -1)
+den_frac=$(echo "$out" | sed -n 's/.*efficiency_frac=\([0-9.]*\).*/\1/p' | head -1)
+chk "and the fraction is divided by the cores it was told to expect" \
+    "$(awk -v f="${den_frac:--1}" -v c="${den_cpu:-0}" -v w="${den_wall:-0}" \
+        'BEGIN { x = (w > 0) ? c / (2 * w) : -1; d = f - x; if (d < 0) d = -d; \
+                 print (x >= 0 && d <= 0.02) ? "divided" : "not-divided(" f " vs " x ")" }')" \
+    "divided"
 
 # (b) needs a real bound. Bind to a cpu this process is actually ALLOWED to
 # use, read from the kernel rather than assumed: `taskset -c 0` fails outright
@@ -2047,7 +2065,7 @@ chk "and the machine row says which path was consulted" \
 chk "and who was found there" \
     "$(hl_legacy "$CONF" status --porcelain 2>/dev/null | sed -n 's/^legacy_held_by=//p')" "roy"
 chk "run is refused for the same reason, since it acquires first" \
-    "$(hl_legacy "$CONF" run -- touch "$LOCK.legacyran" >/dev/null 2>&1; echo $?)" "2"
+    "$(hl_legacy "$CONF" run --reason "legacy path refusal" -- touch "$LOCK.legacyran" >/dev/null 2>&1; echo $?)" "2"
 chk "and the wrapped command did not run" \
     "$([ -e "$LOCK.legacyran" ] && echo ran || echo skipped)" "skipped"
 
@@ -2104,7 +2122,7 @@ echo "== run hands its declared identity to the command, and only when declared 
 # was making the weaker label the easy one to reach (#1929).
 rm -f "$LOCK.owner"
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 -- \
+env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 --reason "identity export" -- \
     sh -c 'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(sed -n "s/^owner=//p" "$2/meta")" >"$1"' \
     _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
 # Asserted together, because the export is only worth anything if it matches
@@ -2124,7 +2142,7 @@ rm -f "$LOCK.owner"
 # and the reader reports `foreign:` -- a co-tenant's row -- which is worse than
 # the `held:` this issue is about.
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-HOSTLOCK_OWNER=env-owner "$HL" run --owner flag-owner -- \
+HOSTLOCK_OWNER=env-owner "$HL" run --owner flag-owner --reason "identity precedence" -- \
     sh -c 'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(sed -n "s/^owner=//p" "$2/meta")" >"$1"' \
     _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
 chk "a declared owner overrides an inherited one in the child, not just in the lock" \
@@ -2136,7 +2154,7 @@ chk "a declared owner overrides an inherited one in the child, not just in the l
 # produced by the naive one-line version of this fix.
 rm -f "$LOCK.owner"
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-env -u HOSTLOCK_OWNER "$HL" run -- \
+env -u HOSTLOCK_OWNER "$HL" run --reason "default owner is not exported" -- \
     sh -c 'printf %s "${HOSTLOCK_OWNER-<unset>}" >"$1"' _ "$LOCK.owner" >/dev/null 2>&1
 chk "an owner defaulted from the unix user is NOT exported" \
     "$(cat "$LOCK.owner" 2>/dev/null)" "<unset>"
@@ -2146,7 +2164,7 @@ chk "an owner defaulted from the unix user is NOT exported" \
 # records who took it, because a lock with no owner is a different regression.
 rm -f "$LOCK.owner"
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-env -u HOSTLOCK_OWNER "$HL" run -- \
+env -u HOSTLOCK_OWNER "$HL" run --reason "default owner is still recorded" -- \
     sh -c 'sed -n "s/^owner=//p" "$2/meta" >"$1"' _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
 chk "but the lock still records that defaulted owner" \
     "$(cat "$LOCK.owner" 2>/dev/null)" "${USER:-unknown}"
@@ -2157,7 +2175,7 @@ chk "but the lock still records that defaulted owner" \
 rm -rf "$LOCK.nested"
 rm -f "$LOCK.owner"
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 -- \
+env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 --reason "nested identity" -- \
     sh -c 'HOSTLOCK_DIR="$2" scripts/hostlock.sh acquire --ttl 60 >/dev/null 2>&1
            sed -n "s/^owner=//p" "$2/meta" >"$1"' _ "$LOCK.owner" "$LOCK.nested" >/dev/null 2>&1
 chk "a nested hostlock inherits that identity, deliberately" \
@@ -2188,7 +2206,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "334"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "335"
 
 echo
 echo "passed=${pass} failed=${fail}"
