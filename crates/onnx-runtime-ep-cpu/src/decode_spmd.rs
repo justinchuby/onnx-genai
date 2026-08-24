@@ -187,6 +187,21 @@ thread_local! {
     /// will never arrive.
     static FAIL_WORKER_BEFORE_READY: Cell<usize> = const { Cell::new(usize::MAX) };
 
+    /// Test mutation: skip the affinity syscall entirely and report the pin as
+    /// applied anyway.
+    ///
+    /// This reproduces, in-tree and permanently, the exact defect that makes a
+    /// planner-derived placement label untrustworthy -- pinning that answers
+    /// `Ok(())` and changes nothing. It is what a stubbed, `seccomp`-filtered
+    /// or emulated-away `sched_setaffinity` looks like from inside the pool,
+    /// and any placement check that stays green under it is reporting the plan
+    /// rather than the machine.
+    ///
+    /// Thread-scoped like its neighbours, and latched on the builder thread, so
+    /// a pool built by any other test is untouched. `cfg(test)` throughout: the
+    /// production build has no branch here at all.
+    static STUB_PIN_SYSCALL: Cell<bool> = const { Cell::new(false) };
+
     /// Test injection of the *other* case: every worker announces, but late.
     /// Without this the healthy-pool test is vacuous, because real workers
     /// announce within the spin budget and the deadline is never consulted at
@@ -205,6 +220,13 @@ thread_local! {
     /// Manufacturing real contention in a unit test is exactly the kind of
     /// load-dependent arrangement that flakes; injecting the yield *cost* makes
     /// the same regime deterministic.
+    ///
+    /// Read by [`slow_yield`], which both yield phases in this file call: the
+    /// readiness barrier, which runs on the *builder* thread like the knobs
+    /// above, and [`SharedState::worker_wait`], which runs on whichever thread
+    /// is waiting. A real pool's workers are other threads and so always see
+    /// `0`; only a test calling `worker_wait` on its own thread can reach that
+    /// second site. [`YIELD_COUNT`] counts the yields injected here.
     static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
 
     /// Test override for [`WORKER_PROFILE_ENV`]: `Some(v)` forces the per-worker
@@ -213,6 +235,26 @@ thread_local! {
     /// -- `set_var` around a build -- is a data race against every other test
     /// thread's `getenv` and would need a lock this module does not have.
     static FORCE_WORKER_PROFILE: Cell<Option<bool>> = const { Cell::new(None) };
+
+    /// Yields injected by [`slow_yield`] on this thread. The observable for the
+    /// stride, chosen because it is *monotone in the right direction under
+    /// load*: a starved thread accumulates wall time faster per yield, so it
+    /// crosses the deadline in FEWER yields, never more. A wall-clock
+    /// observable ("was it parked at T?") is not monotone that way and is
+    /// flaky in the parallel suite, which is how the first version of this test
+    /// failed -- passing alone and failing beside 1695 siblings.
+    static YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Injected yield cost, shared by both yield phases in this file. See
+/// [`SLOW_YIELD_US`], which documents which thread reads it at each site.
+#[cfg(test)]
+fn slow_yield() {
+    let us = SLOW_YIELD_US.with(Cell::get);
+    if us > 0 {
+        YIELD_COUNT.with(|c| c.set(c.get() + 1));
+        thread::sleep(Duration::from_micros(us));
+    }
 }
 
 /// Read on the builder thread only: both the barrier and the pre-spawn fault
@@ -884,6 +926,8 @@ impl SharedState {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
+                #[cfg(test)]
+                slow_yield();
                 // Check the clock on *every* yield, not on a stride -- the same
                 // correction #1825 made to the readiness barrier below, which
                 // missed this site. The clock is never read during the pure
@@ -1093,6 +1137,239 @@ impl Drop for DispatchClaim<'_> {
     }
 }
 
+/// What happened when a worker tried to take the CPU its plan named.
+///
+/// Three states because "no pin was asked for" and "a pin was asked for and did
+/// not happen" are different facts with different consequences, and folding
+/// either into success is the bug this whole type exists to prevent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinAttempt {
+    /// The plan left this worker unpinned, so nothing was attempted.
+    NotRequested,
+    /// The pin call returned success. Note carefully: this is the call's
+    /// *claim*, and on its own it proves nothing -- see
+    /// [`WorkerPlacement::observed`] for what the kernel actually did.
+    Applied,
+    /// The pin call returned an error, including targets that have no affinity
+    /// mechanism and say so.
+    Failed,
+}
+
+/// One spawned worker's realized placement, recorded by that worker about
+/// itself immediately after its pin attempt.
+///
+/// Every field is either something the worker did or something the worker
+/// asked the kernel; none of it is copied from the plan after the fact. That
+/// separation is the whole point. A placement report assembled on the builder
+/// thread from the assignment it just handed out is a restatement of the
+/// request, and it stays true when the pinning underneath it has stopped
+/// working.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerPlacement {
+    /// The worker's OS thread id, or `None` where the target exposes none.
+    /// Present so a report can be correlated with `/proc/self/task/<tid>` by a
+    /// human or an external tool.
+    pub tid: Option<i64>,
+    /// The CPU the plan named for this worker, `None` if it planned no pin.
+    pub attempted_cpu: Option<usize>,
+    /// What the pin call reported.
+    pub attempt: PinAttempt,
+    /// What the worker's own affinity mask actually was afterwards.
+    pub observed: crate::decode_affinity::ObservedAffinity,
+}
+
+impl WorkerPlacement {
+    /// The single CPU this worker is actually confined to, if it is confined to
+    /// one at all. A multi-bit mask is not a pin regardless of what was asked
+    /// for: the scheduler may use any CPU in it.
+    pub fn realized_cpu(&self) -> Option<usize> {
+        self.observed.pinned_cpu()
+    }
+
+    /// Does the observed mask match the pin this worker reports having taken?
+    ///
+    /// `None` when unanswerable (nothing was pinned here, or the mask could not
+    /// be read). `Some(false)` is the #1792 shape in miniature: a worker that
+    /// believes it is on a CPU the kernel never put it on.
+    pub fn report_is_honest(&self) -> Option<bool> {
+        let observed = self.observed.cpus()?;
+        match (self.attempt, self.attempted_cpu) {
+            (PinAttempt::Applied, Some(cpu)) => Some(observed == [cpu]),
+            // A retracted or absent pin claims nothing, so there is nothing to
+            // contradict -- but it must not be scored as honest *success*
+            // either, hence `None` rather than `Some(true)`.
+            _ => None,
+        }
+    }
+
+    /// Does this worker assert a placement that something could contradict?
+    ///
+    /// The difference between the two kinds of `None` [`Self::report_is_honest`]
+    /// returns, and the whole reason the pool-level verdict can be precise: a
+    /// worker that never asked for a pin claims nothing and cannot be lying,
+    /// while a worker that claims an applied pin and whose mask cannot be read
+    /// is an *unverified claim*. Only the second has to withdraw a verdict.
+    pub fn claims_a_pin(&self) -> bool {
+        matches!(self.attempt, PinAttempt::Applied) && self.attempted_cpu.is_some()
+    }
+}
+
+/// Why a realized-placement question could not be answered.
+///
+/// Named individually so a caller can fail closed on the ones that mean "this
+/// host should have been able to answer" while still skipping the ones that
+/// mean "no mechanism exists here". Collapsing them into one `None` is what
+/// lets a regression hide inside a legitimate skip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementBlindSpot {
+    /// The target has no per-thread affinity query at all (macOS and friends).
+    AffinityQueryUnsupported,
+    /// The query exists on this target but failed at runtime.
+    AffinityQueryFailed,
+    /// Core topology could not be detected, so siblings are unknown.
+    TopologyUndetected,
+}
+
+/// Whether the pool's workers *are* -- as observed, not as planned -- one per
+/// physical core.
+///
+/// Deliberately not `Option<bool>`. The old predicate returned `None` for both
+/// "nothing was pinned" and "we could not tell", and every caller then wrote
+/// `if let Some(ok) = ...`, which silently treats "could not tell" as "nothing
+/// to assert". That is a guard switched off by the failure it guards against.
+/// Here the unanswerable cases carry a reason and are trivially distinguishable
+/// from [`Self::OneWorkerPerPhysicalCore`], which is the *only* success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RealizedPlacement {
+    /// Every worker is confined to a single CPU and no two of those CPUs share
+    /// a physical core's front end.
+    OneWorkerPerPhysicalCore,
+    /// At least two workers can run on the same physical core -- either they
+    /// landed on sibling CPUs, or one of them is not confined to a single CPU
+    /// and so may land anywhere, including on top of a pinned peer.
+    SharedCore,
+    /// No worker is pinned, so the pool makes no placement claim to check.
+    Unpinned,
+    /// The question could not be answered, and this is never success.
+    Unobservable(PlacementBlindSpot),
+}
+
+impl RealizedPlacement {
+    /// True only for [`Self::OneWorkerPerPhysicalCore`].
+    ///
+    /// Provided so callers cannot accidentally write `!= SharedCore` and thereby
+    /// count an unobservable pool as placed.
+    pub fn is_one_worker_per_physical_core(&self) -> bool {
+        matches!(self, Self::OneWorkerPerPhysicalCore)
+    }
+}
+
+/// [`SpmdDecodePools::realized_placement`]'s decision, over supplied evidence.
+///
+/// Split out from the pool for the same reason
+/// `core_topology::topology_or_fail_closed` takes its input as an argument: the
+/// interesting cases here -- a target with no affinity query, a query that
+/// failed, an undetectable topology -- cannot be produced on demand by building
+/// a real pool on the hosts this suite runs on. A predicate reachable only
+/// through a real pool is a predicate whose blind-spot handling nothing proves,
+/// and blind-spot handling is the entire point of this type.
+///
+/// A global toggle would not do: the lib test binary is multi-threaded, so
+/// unrelated tests building pools concurrently would observe the injected state
+/// at random.
+fn realized_placement_of(
+    placements: &[WorkerPlacement],
+    topology: Option<&crate::core_topology::CoreTopology>,
+) -> RealizedPlacement {
+    if placements.is_empty()
+        || placements
+            .iter()
+            .all(|placement| placement.attempt == PinAttempt::NotRequested)
+    {
+        return RealizedPlacement::Unpinned;
+    }
+    // Answer the "we cannot see" cases before the "it is wrong" cases, so a
+    // blind spot is never reported as a defect and -- far more importantly --
+    // never as a success.
+    for placement in placements {
+        match &placement.observed {
+            crate::decode_affinity::ObservedAffinity::Unsupported => {
+                return RealizedPlacement::Unobservable(
+                    PlacementBlindSpot::AffinityQueryUnsupported,
+                );
+            }
+            crate::decode_affinity::ObservedAffinity::QueryFailed(_) => {
+                return RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed);
+            }
+            crate::decode_affinity::ObservedAffinity::Cpus(_) => {}
+        }
+    }
+    let Some(cores) = topology else {
+        return RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected);
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for placement in placements {
+        // Not confined to one CPU -- whether because no pin was asked for or
+        // because the pin did not take -- means this worker may land on any
+        // core, including on top of a pinned peer, so no distinctness claim
+        // survives it.
+        let Some(cpu) = placement.realized_cpu() else {
+            return RealizedPlacement::SharedCore;
+        };
+        let core: Vec<usize> = cores
+            .siblings_of(cpu)
+            .map_or_else(|| vec![cpu], <[usize]>::to_vec);
+        if !seen.insert(core) {
+            return RealizedPlacement::SharedCore;
+        }
+    }
+    RealizedPlacement::OneWorkerPerPhysicalCore
+}
+
+/// Whether every worker that claims a pin is observably on the CPU it claims.
+///
+/// `None` means *unanswerable*, and it is answered for the pool rather than
+/// per worker on purpose. Round-one review caught the obvious version of this
+/// returning `Some(true)` the moment a single worker verified clean, discarding
+/// the `None`s from workers whose masks could not be read -- the
+/// unanswerable-read-as-answered defect this whole change exists to remove,
+/// reintroduced one level up from where it was removed.
+///
+/// The two `None`s a worker can produce are *not* the same, and collapsing them
+/// would swing the check from too weak to too strict:
+///
+/// * a worker that never asked for a pin claims nothing, cannot contradict
+///   anything, and must not withdraw a verdict its peers can support -- a
+///   partially pinned pool would otherwise become permanently unanswerable;
+/// * a worker that claims an applied pin and cannot read its mask is an
+///   *unverified claim*, and one of those is enough to sink the pool's verdict.
+///
+/// A definite `Some(false)` outranks both: "this worker is not where it says it
+/// is" stays true however many of its peers went unchecked.
+///
+/// Taken as a free function over the evidence so the case that matters -- some
+/// workers readable, some not -- is testable at all. It cannot be produced by
+/// building a real pool on any host in CI, where readability is a property of
+/// the target and so is uniform across a pool's workers.
+fn placement_report_is_honest_of(placements: &[WorkerPlacement]) -> Option<bool> {
+    if placements
+        .iter()
+        .any(|placement| placement.report_is_honest() == Some(false))
+    {
+        return Some(false);
+    }
+    if placements
+        .iter()
+        .any(|placement| placement.claims_a_pin() && placement.report_is_honest().is_none())
+    {
+        return None;
+    }
+    placements
+        .iter()
+        .any(|placement| placement.report_is_honest() == Some(true))
+        .then_some(true)
+}
+
 /// A persistent SPMD decode pool: hot worker threads plus the shared barrier
 /// state that drives them.
 pub struct SpmdDecodePools {
@@ -1130,15 +1407,26 @@ pub struct SpmdDecodePools {
     dispatcher_shard: Option<usize>,
     total_workers: usize,
     schedule: DecodeSchedule,
-    /// The CPU each spawned worker was pinned to, global-worker-index order, or
-    /// `None` for an unpinned worker.
+    /// The CPU each spawned worker was *asked* to take, global-worker-index
+    /// order, with the request retracted to `None` where the pin call reported
+    /// failure.
     ///
-    /// Retained purely so the realized *placement* can be asserted. The pool
-    /// already reports its realized *width* (`decode_width`, `as_requested`),
-    /// and #1792 was the case where that report was honest while the placement
-    /// underneath it was not -- the count was never the thing that was wrong.
-    /// A label nothing can check is a label that drifts.
+    /// This is the **plan**, not the placement. It is derived from the
+    /// assignment and from what `pin_current_thread_to_cpu` *returned*, and a
+    /// return value is not an observation: a build where the syscall is stubbed,
+    /// seccomp-filtered or emulated away answers `Ok(())` while every worker
+    /// stays free to roam, and this field would record the pin as taken. What
+    /// the kernel actually enforced lives in [`Self::worker_placements`], and
+    /// realized-placement questions must be asked there.
     worker_cpus: Vec<Option<usize>>,
+    /// What each spawned worker observed about *itself* after its pin attempt,
+    /// global-worker-index order.
+    ///
+    /// Recorded by the worker thread, on the worker thread, by asking the kernel
+    /// for its own effective mask -- so it is evidence rather than intent. This
+    /// is the field #1792 needed and did not have: a pool could report
+    /// `realized=16 as_requested` with a placement nothing had ever looked at.
+    worker_placements: Vec<WorkerPlacement>,
     /// The allowed CPU that [`DISPATCHER_RESERVED_CPUS`] freed for the inline
     /// dispatcher, or `None` when the pool has no dispatcher shard or the
     /// reservation could not be located (unpinned workers, empty CPU list).
@@ -1300,6 +1588,9 @@ impl SpmdDecodePools {
                 // instead of "claimed nothing", and `worker_cpus()` documents
                 // the distinction.
                 worker_cpus: Vec::new(),
+                // Likewise: threads we neither spawned nor pinned have no
+                // placement of ours to observe.
+                worker_placements: Vec::new(),
                 total_workers: total_threads,
                 schedule,
                 // No inline dispatcher on this path, so nothing reserved one.
@@ -1336,35 +1627,67 @@ impl SpmdDecodePools {
         let mut handles = Vec::with_capacity(total_threads);
         let mut worker_cpus: Vec<Option<usize>> = assignment.iter().map(|&(_, cpu)| cpu).collect();
         // A pin target is a request, and this whole change exists because a
-        // request nobody verified is how #1729 and #1792 stayed invisible. So
-        // let each worker retract its own target if the pin actually failed,
-        // and report what the pool *realized* rather than what it intended.
-        // Read-back needs no further synchronization: a worker records this
+        // request nobody verified is how #1729 and #1792 stayed invisible. Each
+        // worker therefore records, about itself, what it attempted *and what
+        // the kernel actually gave it* -- one `sched_getaffinity` per worker on
+        // the one-time build path, nothing on the dispatch path.
+        //
+        // Read-back needs no further synchronization: a worker fills its slot
         // before incrementing `ready`, and the builder below waits on `ready`
-        // with `Acquire`.
-        let pin_failed: Arc<Vec<AtomicBool>> =
-            Arc::new((0..total_threads).map(|_| AtomicBool::new(false)).collect());
+        // with `Acquire`. `OnceLock` rather than a lock because exactly one
+        // writer touches each slot exactly once.
+        let placements: Arc<Vec<OnceLock<WorkerPlacement>>> =
+            Arc::new((0..total_threads).map(|_| OnceLock::new()).collect());
         // Latched here, on the builder thread, so the fault belongs to *this*
         // pool. Reading it inside the spawned worker would read the worker's own
         // (default) thread-local and silently never fire.
         #[cfg(test)]
         let fail_worker_before_ready = FAIL_WORKER_BEFORE_READY.with(Cell::get);
         #[cfg(test)]
+        let stub_pin_syscall = STUB_PIN_SYSCALL.with(Cell::get);
+        #[cfg(test)]
         let delay_worker_before_ready = DELAY_WORKER_BEFORE_READY_MS.with(Cell::get);
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
-            let pin_failed = Arc::clone(&pin_failed);
+            let placements = Arc::clone(&placements);
             let handle = thread::Builder::new()
                 .name(format!("onnx-genai-spmd-n{node_position}-{global_index}"))
                 .spawn(move || {
-                    if let Some(cpu) = cpu
-                        && let Err(message) = crate::decode_affinity::pin_current_thread_to_cpu(cpu)
-                    {
-                        pin_failed[global_index].store(true, Ordering::Relaxed);
-                        report_spmd_fallback(&format!(
-                            "worker {global_index} could not pin to cpu {cpu}: {message}"
-                        ));
-                    }
+                    let attempt = match cpu {
+                        None => PinAttempt::NotRequested,
+                        Some(cpu) => {
+                            #[cfg(test)]
+                            let pinned = if stub_pin_syscall {
+                                // The mutation: the syscall removed, success
+                                // reported. See `STUB_PIN_SYSCALL`.
+                                Ok(())
+                            } else {
+                                crate::decode_affinity::pin_current_thread_to_cpu(cpu)
+                            };
+                            #[cfg(not(test))]
+                            let pinned = crate::decode_affinity::pin_current_thread_to_cpu(cpu);
+                            match pinned {
+                                Ok(()) => PinAttempt::Applied,
+                                Err(message) => {
+                                    report_spmd_fallback(&format!(
+                                        "worker {global_index} could not pin to cpu {cpu}: \
+                                         {message}"
+                                    ));
+                                    PinAttempt::Failed
+                                }
+                            }
+                        }
+                    };
+                    // Read back *after* the attempt, on this thread, from the
+                    // kernel. This is the only line in the pool that can tell a
+                    // pin that happened from a pin that was merely accepted.
+                    let observed = crate::decode_affinity::observe_current_thread_cpus();
+                    let _ = placements[global_index].set(WorkerPlacement {
+                        tid: current_thread_os_id(),
+                        attempted_cpu: cpu,
+                        attempt,
+                        observed,
+                    });
                     #[cfg(test)]
                     assert!(
                         fail_worker_before_ready != global_index,
@@ -1413,12 +1736,7 @@ impl SpmdDecodePools {
             } else {
                 thread::yield_now();
                 #[cfg(test)]
-                {
-                    let slow = SLOW_YIELD_US.with(Cell::get);
-                    if slow != 0 {
-                        thread::sleep(Duration::from_micros(slow));
-                    }
-                }
+                slow_yield();
                 // Check the clock on *every* yield, not on a stride. The stride
                 // is right for the spin phase, where an iteration costs
                 // nanoseconds and `Instant::now()` would dominate; it is wrong
@@ -1491,13 +1809,50 @@ impl SpmdDecodePools {
             }
         }
 
-        // Every worker has now recorded its pin outcome (it does so before
+        // Every worker has now recorded its placement (it does so before
         // incrementing `ready`, which the `Acquire` load above synchronizes
-        // with), so retract the targets that were not achieved.
-        for (slot, failed) in worker_cpus.iter_mut().zip(pin_failed.iter()) {
-            if failed.load(Ordering::Relaxed) {
+        // with), so retract the targets whose pin call reported failure.
+        let worker_placements: Vec<WorkerPlacement> = placements
+            .iter()
+            .enumerate()
+            .map(|(index, slot)| {
+                slot.get().cloned().unwrap_or_else(|| {
+                    // Unreachable while `ready` counts the same threads that
+                    // fill these slots, and a placement that is missing must
+                    // read as "unknown", never as a successful pin.
+                    WorkerPlacement {
+                        tid: None,
+                        attempted_cpu: worker_cpus.get(index).copied().flatten(),
+                        attempt: PinAttempt::Failed,
+                        observed: crate::decode_affinity::ObservedAffinity::QueryFailed(
+                            "worker never recorded its placement".to_string(),
+                        ),
+                    }
+                })
+            })
+            .collect();
+        for (slot, placement) in worker_cpus.iter_mut().zip(worker_placements.iter()) {
+            if placement.attempt != PinAttempt::Applied {
                 *slot = None;
             }
+        }
+
+        // #1792 was invisible for as long as it was because nothing ever said
+        // out loud that the placement had collapsed -- the width label was
+        // honest and the placement label did not exist. Say it once, here, at
+        // build time, off the dispatch path entirely.
+        let realized = realized_placement_of(&worker_placements, crate::core_topology::host());
+        if !matches!(
+            realized,
+            RealizedPlacement::OneWorkerPerPhysicalCore | RealizedPlacement::Unpinned
+        ) {
+            report_spmd_placement(&format!(
+                "decode pool placement is {realized:?}: workers observed on {:?}",
+                worker_placements
+                    .iter()
+                    .map(|placement| (placement.attempted_cpu, placement.realized_cpu()))
+                    .collect::<Vec<_>>()
+            ));
         }
 
         // Snapshot the worker `Thread`s for teardown join only; the hot dispatch
@@ -1513,6 +1868,7 @@ impl SpmdDecodePools {
             total_workers,
             schedule,
             worker_cpus,
+            worker_placements,
             dispatcher_cpu,
             dispatcher_tid: AtomicI64::new(0),
             dispatcher_observed_cpu: AtomicI64::new(-1),
@@ -1570,7 +1926,7 @@ impl SpmdDecodePools {
     /// slice means this pool spawned workers and deliberately left them free
     /// (`ONNX_GENAI_CPU_DECODE_AFFINITY=off`, or a host without pinning).
     ///
-    /// See [`Self::placement_is_one_worker_per_physical_core`].
+    /// See [`Self::planned_placement_is_one_worker_per_physical_core`].
     pub fn worker_cpus(&self) -> &[Option<usize>] {
         &self.worker_cpus
     }
@@ -1645,22 +2001,28 @@ impl SpmdDecodePools {
         }
     }
 
-    /// Whether the pinned workers occupy distinct physical cores.
+    /// Whether the workers' **planned** CPUs occupy distinct physical cores.
     ///
-    /// `None` only when the question is unanswerable: an unpinned pool (no
-    /// placement claim to check) or an undiscoverable core topology.
-    /// `Some(false)` states literally that at least two pinned workers share a
-    /// core's front end. It is deliberately not qualified by whether that was
-    /// avoidable -- a pool asked for more workers than the host has cores must
-    /// still admit that it doubled up. The caller knows the budget; this does
-    /// not, and inferring it from the pinned set alone is circular, because a
-    /// collapsed placement covers exactly as few cores as it landed on.
+    /// Reads [`Self::worker_cpus`], which is the assignment plus whatever
+    /// `pin_current_thread_to_cpu` *returned*. That makes this a statement about
+    /// the plan, not about the machine, and it must never be described as
+    /// realized placement: it stays `Some(true)` on a build whose pinning does
+    /// nothing but reports success. [`Self::realized_placement`] is the one that
+    /// asks the kernel.
     ///
-    /// This is the placement counterpart to `decode_width().is_as_requested()`.
-    /// Width was always reported and asserted; placement was neither, and #1792
-    /// is what that costs -- a pool can report `realized=16 as_requested` while
-    /// running on half the cores it claims.
-    pub fn placement_is_one_worker_per_physical_core(&self) -> Option<bool> {
+    /// Retained because the plan is still worth testing on its own -- a planner
+    /// that scatters onto siblings is a defect even where pinning works -- and
+    /// because separating the two is what makes each of them checkable.
+    ///
+    /// `None` only when the question is unanswerable: an unpinned pool (no plan
+    /// to check) or an undiscoverable core topology. `Some(false)` states
+    /// literally that at least two planned CPUs share a core's front end. It is
+    /// deliberately not qualified by whether that was avoidable -- a pool asked
+    /// for more workers than the host has cores must still admit that it doubled
+    /// up. The caller knows the budget; this does not, and inferring it from the
+    /// pinned set alone is circular, because a collapsed placement covers
+    /// exactly as few cores as it landed on.
+    pub fn planned_placement_is_one_worker_per_physical_core(&self) -> Option<bool> {
         let cores = crate::core_topology::host()?;
         let pinned: Vec<usize> = self.worker_cpus.iter().flatten().copied().collect();
         if pinned.is_empty() {
@@ -1684,6 +2046,53 @@ impl SpmdDecodePools {
                 .map_or_else(|| vec![cpu], <[usize]>::to_vec);
             seen.insert(core)
         }))
+    }
+
+    /// What each spawned worker observed about its own placement.
+    ///
+    /// Empty for a pool that spawned nothing of its own (the `--features mlas`
+    /// work-stealing schedule).
+    pub fn worker_placements(&self) -> &[WorkerPlacement] {
+        &self.worker_placements
+    }
+
+    /// Whether the workers **are** one per physical core, as observed by the
+    /// workers themselves.
+    ///
+    /// This is the placement counterpart to `decode_width().is_as_requested()`,
+    /// and unlike [`Self::planned_placement_is_one_worker_per_physical_core`] it
+    /// cannot be satisfied by a pin that did not happen. Width was always
+    /// reported and asserted; placement was neither, and #1792 is what that
+    /// costs -- a pool can report `realized=16 as_requested` while running on
+    /// half the cores it claims.
+    ///
+    /// Three things have to hold for [`RealizedPlacement::OneWorkerPerPhysicalCore`]:
+    /// every worker was asked to pin, every worker's *observed* mask is a single
+    /// CPU, and those CPUs sit on distinct physical cores. A pool that pinned
+    /// only some of its workers is `SharedCore`, not a partial pass: a free
+    /// worker is schedulable onto any core, including one a pinned worker
+    /// already owns, so its pinned subset establishes nothing.
+    pub fn realized_placement(&self) -> RealizedPlacement {
+        realized_placement_of(&self.worker_placements, crate::core_topology::host())
+    }
+
+    /// Whether every worker that reports a pin is actually on the CPU it
+    /// reports.
+    ///
+    /// The **policy-neutral** half of the placement contract: it asserts nothing
+    /// about *where* workers should run -- spread, compact, one per core, two per
+    /// core are all equally acceptable to it -- only that
+    /// [`Self::worker_cpus`], which benchmark rows label placement from, is not
+    /// a claim the process failed to carry out.
+    ///
+    /// `None` when unanswerable: nothing was pinned, or a worker that claims a
+    /// pin could not have that claim checked. Answered from each worker's own
+    /// recorded mask rather than by scanning `/proc/self/task` for thread names,
+    /// so a second pool running concurrently cannot contaminate the answer. See
+    /// [`placement_report_is_honest_of`] for why the two unanswerable cases are
+    /// kept apart.
+    pub fn placement_report_is_honest(&self) -> Option<bool> {
+        placement_report_is_honest_of(&self.worker_placements)
     }
 
     /// Number of node groups in the layout.
@@ -3471,6 +3880,24 @@ fn current_thread_os_id() -> Option<i64> {
     }
 }
 
+/// Report a realized-placement anomaly once.
+///
+/// Its own static for the same reason [`report_dispatcher_pin`] has one: a
+/// placement that collapsed is not a fallback, and sharing a one-shot with
+/// anything else would let whichever fired first silence this permanently --
+/// which is materially how #1792 stayed unnoticed.
+fn report_spmd_placement(message: &str) {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::debug!(placement = %message, "cpu decode pool placement");
+        #[cfg(not(feature = "tracing"))]
+        if std::env::var("NXRT_CALIB_DEBUG").is_ok() {
+            eprintln!("onnx-genai: {message}");
+        }
+    }
+}
+
 /// Report the dispatcher-pin outcome once. Separate static from
 /// [`report_spmd_fallback`]'s: this is not a fallback, and folding the two
 /// would let whichever fired first silence the other.
@@ -5002,13 +5429,17 @@ mod tests {
         );
     }
 
-    /// A pool that reports its width honestly must also *place* honestly.
+    /// The **planner** must lay one worker out per physical core.
     ///
-    /// #1792's lesson: `decode_width()` said `realized=16 as_requested` while
-    /// the workers sat on 8 physical cores, and nothing checked. The width was
-    /// never the thing that was wrong. This asserts the half that was missing.
+    /// Scoped deliberately: this reads `worker_cpus()`, which is the assignment
+    /// plus what the pin call *returned*, so it tests the layout the pool asked
+    /// for and nothing about the layout the kernel granted. Stubbing
+    /// `sched_setaffinity` to a no-op that reports success leaves this green,
+    /// which is why it must never be described as realized placement.
+    /// `a_pinned_pool_is_observed_one_worker_per_physical_core` is the one that
+    /// asks the kernel.
     #[test]
-    fn a_pinned_pool_places_one_worker_per_physical_core() {
+    fn the_planner_lays_out_one_worker_per_physical_core() {
         let cores = match crate::core_topology::require_host_for_placement() {
             Ok(cores) => cores,
             Err(reason) => {
@@ -5048,16 +5479,17 @@ mod tests {
             "every worker of a pinned pool must have a pin target"
         );
         assert_eq!(
-            pools.placement_is_one_worker_per_physical_core(),
+            pools.planned_placement_is_one_worker_per_physical_core(),
             Some(true),
             "pinned workers landed on {pinned:?}, which shares a physical core"
         );
         pools.shutdown();
     }
 
-    /// The same predicate must be able to say *no*, or it is decoration.
+    /// The same **planner** predicate must be able to say *no*, or it is
+    /// decoration.
     #[test]
-    fn placement_reports_a_shared_core_as_a_defect() {
+    fn the_planner_reports_a_shared_core_as_a_defect() {
         // Fails closed. Under the mutation battery this test -- the negative
         // control, the one whose whole job is to prove the detector detects --
         // passed vacuously with detection forced to `None`. A control that
@@ -5087,10 +5519,531 @@ mod tests {
             false,
         );
         assert_eq!(
-            pools.placement_is_one_worker_per_physical_core(),
+            pools.planned_placement_is_one_worker_per_physical_core(),
             Some(false),
             "two workers on cpus {:?} share a core and must be reported as such",
             &pair[..2]
+        );
+        pools.shutdown();
+    }
+
+    /// The pool is **observed** to be one worker per physical core.
+    ///
+    /// The difference from `the_planner_lays_out_one_worker_per_physical_core`
+    /// is the whole reason this exists. That one reads `worker_cpus()`, which
+    /// is the assignment plus what the pin call *returned*. This one reads what
+    /// each worker asked the kernel about itself after pinning, so it cannot be
+    /// satisfied by a pin that was accepted and not enforced --
+    /// `a_pin_that_reports_success_without_the_syscall_fails_the_realized_check`
+    /// is the proof of that, and it is the mutation this test exists to survive.
+    #[test]
+    fn a_pinned_pool_is_observed_one_worker_per_physical_core() {
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping observed-placement check: {reason}");
+                return;
+            }
+        };
+        if cores.core_count() < 2 {
+            return; // one core cannot express "one per core" distinguishably
+        }
+        // Stated, not implied. Today no target can pin without also being able
+        // to read a mask back, so on every real host this is decided by
+        // `environment_can_pin` below -- but *that* gates on the pinning
+        // capability while everything after it needs the observation
+        // capability, and a guard standing in for a different capability than
+        // the one it protects is the defect this whole change is about.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping observed-placement check: this target has no per-thread affinity \
+                 query, so there is no realized placement to observe"
+            );
+            return;
+        }
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+            &(0..cores.logical_count()).collect::<Vec<_>>(),
+            Some(cores),
+        );
+        let workers = cores.core_count().min(4);
+        if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
+            // A sandbox that refuses `sched_setaffinity` is a genuine
+            // "unsupported here", stated rather than silent. It is *not*
+            // scored as a pass of the property below.
+            eprintln!(
+                "skipping observed-placement check: this environment refuses to pin to \
+                 {:?}",
+                &cpus[..workers.min(cpus.len())]
+            );
+            return;
+        }
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus,
+                workers,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+
+        // Fail closed, per worker: a pin this pool says it applied must be a
+        // pin the kernel can be seen to have applied. No `if let Some(..)`
+        // anywhere in here -- an unreadable mask on a target that has the query
+        // is a defect in the apparatus, and it panics.
+        let mut applied = 0usize;
+        let mut tids = std::collections::BTreeSet::new();
+        for (index, placement) in pools.worker_placements().iter().enumerate() {
+            assert_eq!(
+                placement.attempt,
+                PinAttempt::Applied,
+                "worker {index} did not take its pin after `environment_can_pin` said this \
+                 environment allows pinning ({placement:?})"
+            );
+            applied += 1;
+            let observed = match &placement.observed {
+                crate::decode_affinity::ObservedAffinity::Cpus(cpus) => cpus,
+                other => panic!(
+                    "worker {index} pinned successfully but could not read back its own \
+                     affinity on a target that has the query -- the observation is switched \
+                     off, which is the exact shape of a check that cannot fail ({other:?})"
+                ),
+            };
+            assert_eq!(
+                observed.as_slice(),
+                [placement
+                    .attempted_cpu
+                    .expect("an applied pin names the cpu it took")],
+                "worker {index} reports a pin the kernel did not enforce ({placement:?})"
+            );
+            if let Some(tid) = placement.tid {
+                assert!(
+                    tids.insert(tid),
+                    "two workers reported the same OS thread id {tid}, so the placement \
+                     report is not per-worker"
+                );
+            }
+        }
+        assert_eq!(
+            applied, workers,
+            "the pool must report one placement per spawned worker"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            tids.len(),
+            workers,
+            "every worker must report its own TID on Linux, or the report cannot be \
+             correlated with `/proc/self/task`"
+        );
+
+        assert_eq!(
+            pools.realized_placement(),
+            RealizedPlacement::OneWorkerPerPhysicalCore,
+            "workers observed themselves on {:?}, which is not one per physical core",
+            pools
+                .worker_placements()
+                .iter()
+                .map(WorkerPlacement::realized_cpu)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            pools.placement_report_is_honest(),
+            Some(true),
+            "the pool's reported CPUs and its workers' observed CPUs disagree"
+        );
+        pools.shutdown();
+    }
+
+    /// The observed predicate must be able to say *no*, or it is decoration.
+    ///
+    /// Two workers pinned onto SMT siblings of one physical core -- the #1729
+    /// layout -- judged from the masks the workers read for themselves.
+    #[test]
+    fn an_observed_shared_core_pool_is_reported_as_a_defect() {
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping observed shared-core control: {reason}");
+                return;
+            }
+        };
+        let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
+            .unwrap_or_else(|| (0..cores.logical_count()).collect())
+            .into_iter()
+            .collect();
+        // This control judges from observed masks, so it needs the observation
+        // capability specifically -- see the note on the positive case above.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping observed shared-core control: this target has no per-thread \
+                 affinity query"
+            );
+            return;
+        }
+        // Pick the sibling pair from CPUs this process may actually use, or a
+        // `taskset`ed runner -- the most common way this suite runs -- skips.
+        let pair = cores.cores().iter().find_map(|group| {
+            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
+            match (inside.next(), inside.next()) {
+                (Some(first), Some(second)) => Some([first, second]),
+                _ => None,
+            }
+        });
+        let Some(pair) = pair else {
+            eprintln!(
+                "skipping observed shared-core control: no physical core has two SMT \
+                 siblings inside the allowed set {allowed:?}"
+            );
+            return;
+        };
+        if !environment_can_pin(&pair) {
+            eprintln!(
+                "skipping observed shared-core control: this environment refuses to pin to \
+                 {pair:?}"
+            );
+            return;
+        }
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: pair.to_vec(),
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert_eq!(
+            pools.realized_placement(),
+            RealizedPlacement::SharedCore,
+            "two workers observed on cpus {pair:?} share a physical core and must be \
+             reported as such ({:?})",
+            pools.worker_placements()
+        );
+        // The layout is wrong and the *report* is still honest: these are two
+        // independent properties, and conflating them is how a policy change
+        // would quietly delete the honesty check.
+        assert_eq!(
+            pools.placement_report_is_honest(),
+            Some(true),
+            "a badly placed pool can still report its placement truthfully"
+        );
+        pools.shutdown();
+    }
+
+    /// **The mutation.** Pinning that reports success and does nothing.
+    ///
+    /// This is the falsifier for the whole apparatus, kept in-tree rather than
+    /// applied by hand, because the property it protects is not "the pool pins
+    /// correctly" but "the pool's placement label is evidence". With
+    /// `sched_setaffinity` removed and `Ok(())` returned in its place:
+    ///
+    /// * the planner's predicate still answers `Some(true)` -- it only ever saw
+    ///   the assignment and a return value, and both are unchanged; while
+    /// * the observed predicate answers something that is *not*
+    ///   `OneWorkerPerPhysicalCore`, because the workers read their real masks.
+    ///
+    /// Asserting both directions in one test is deliberate. The first half is
+    /// what makes the second half meaningful: it shows the two predicates
+    /// genuinely disagree here, so this is a demonstration that the old check
+    /// was a false oracle rather than merely a new check that happens to pass.
+    #[test]
+    fn a_pin_that_reports_success_without_the_syscall_fails_the_realized_check() {
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping pin-stub mutation: {reason}");
+                return;
+            }
+        };
+        if cores.core_count() < 2 {
+            return;
+        }
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+            &(0..cores.logical_count()).collect::<Vec<_>>(),
+            Some(cores),
+        );
+        let workers = cores.core_count().min(4).min(cpus.len());
+        if workers < 2 {
+            return;
+        }
+
+        STUB_PIN_SYSCALL.with(|slot| slot.set(true));
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: cpus.clone(),
+                workers,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        // Cleared immediately, and before any assertion, so a failure below
+        // cannot leave the mutation latched for anything else this thread
+        // builds.
+        STUB_PIN_SYSCALL.with(|slot| slot.set(false));
+
+        assert_eq!(
+            pools.planned_placement_is_one_worker_per_physical_core(),
+            Some(true),
+            "the mutation is supposed to be invisible to the planner's predicate; if it is \
+             not, this test is no longer demonstrating what it claims ({:?})",
+            pools.worker_cpus()
+        );
+
+        let realized = pools.realized_placement();
+        assert!(
+            !realized.is_one_worker_per_physical_core(),
+            "pinning did nothing at all and the observed-placement check still reported \
+             one worker per physical core, so it is reading the plan rather than the \
+             machine ({realized:?}, {:?})",
+            pools.worker_placements()
+        );
+        assert_ne!(
+            pools.placement_report_is_honest(),
+            Some(true),
+            "the pool vouched for CPUs its workers were never put on ({:?})",
+            pools.worker_placements()
+        );
+
+        // The two assertions above are the property, and they hold on every
+        // target. The two below are the *sharper* claim, and it is available
+        // only where a thread can read its own mask. Split rather than relaxed:
+        // each branch still names one exact expected value, so neither is a
+        // skip.
+        //
+        // The gate is `cfg!`-derived -- a property of the target -- and not
+        // "did the observation happen to work", which is the thing whose
+        // failure this test exists to report and so cannot be allowed to
+        // decide whether the test runs.
+        if crate::decode_affinity::affinity_observation_supported() {
+            assert_eq!(
+                realized,
+                RealizedPlacement::SharedCore,
+                "unpinned workers share whatever cores the scheduler picks; an \
+                 `Unobservable` on a target that has the affinity query means the masks \
+                 could not be read, which is a different failure ({:?})",
+                pools.worker_placements()
+            );
+            assert_eq!(
+                pools.placement_report_is_honest(),
+                Some(false),
+                "the pool reports CPUs its workers are not confined to, which is the #1792 \
+                 shape exactly ({:?})",
+                pools.worker_placements()
+            );
+        } else {
+            // macOS arm64 reaches here: the stub makes the pin *report* success
+            // on a target whose real `pin_current_thread_to_cpu` returns `Err`,
+            // and there is no affinity query to catch it out. Failing closed is
+            // the only correct answer, and it is worth an explicit assertion --
+            // this is the one lane that proves the blind-spot path is not
+            // decorative.
+            assert_eq!(
+                realized,
+                RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported),
+                "this target has no per-thread affinity query, so the only honest verdict \
+                 on a stubbed pin is that the placement is unobservable ({:?})",
+                pools.worker_placements()
+            );
+            assert_eq!(
+                pools.placement_report_is_honest(),
+                None,
+                "every worker claims a pin whose mask cannot be read, so the pool's report \
+                 is unverified and must not be scored either way ({:?})",
+                pools.worker_placements()
+            );
+        }
+        pools.shutdown();
+    }
+
+    /// A blind spot is never success -- asserted on the decision itself, over
+    /// evidence that cannot be produced on the hosts this suite runs on.
+    ///
+    /// `QueryFailed` is unreachable through a real pool anywhere in CI, and
+    /// `Unsupported` is reachable only on macOS, where nothing else in this
+    /// module can construct a pinned pool to observe. Reachable only through a
+    /// real pool would mean untested on most lanes, and "unanswerable must not
+    /// read as answered" is the single property the whole redesign turns on.
+    #[test]
+    fn an_unanswerable_placement_is_never_reported_as_placed() {
+        use crate::decode_affinity::ObservedAffinity;
+        let cores = crate::core_topology::host();
+        let worker = |observed: ObservedAffinity| WorkerPlacement {
+            tid: Some(1),
+            attempted_cpu: Some(0),
+            attempt: PinAttempt::Applied,
+            observed,
+        };
+
+        for blind in [
+            ObservedAffinity::Unsupported,
+            ObservedAffinity::QueryFailed("injected".to_string()),
+        ] {
+            let verdict = realized_placement_of(&[worker(blind.clone())], cores);
+            assert!(
+                !verdict.is_one_worker_per_physical_core(),
+                "an unreadable mask was reported as a realized placement: {verdict:?}"
+            );
+            assert!(
+                matches!(verdict, RealizedPlacement::Unobservable(_)),
+                "an unreadable mask must be reported as a blind spot, not as a defect and \
+                 not as success: {verdict:?}"
+            );
+        }
+
+        // An undetectable topology is the third blind spot, and it must not
+        // collapse into either of the others.
+        assert_eq!(
+            realized_placement_of(&[worker(ObservedAffinity::Cpus(vec![0]))], None),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected)
+        );
+
+        // Every blind spot, plus the two real verdicts, checked against the one
+        // predicate callers use. A future variant added without thought lands
+        // in the `match` below and has to be classified deliberately.
+        for placement in [
+            RealizedPlacement::OneWorkerPerPhysicalCore,
+            RealizedPlacement::SharedCore,
+            RealizedPlacement::Unpinned,
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected),
+        ] {
+            let expected = match placement {
+                RealizedPlacement::OneWorkerPerPhysicalCore => true,
+                RealizedPlacement::SharedCore
+                | RealizedPlacement::Unpinned
+                | RealizedPlacement::Unobservable(_) => false,
+            };
+            assert_eq!(
+                placement.is_one_worker_per_physical_core(),
+                expected,
+                "{placement:?} is classified wrongly"
+            );
+        }
+    }
+
+    /// Some workers readable, some not -- the case a real pool cannot produce.
+    ///
+    /// Readability is a property of the *target*, so every worker in a real
+    /// pool answers the same way and this mixture is unreachable through
+    /// `build`. It is also exactly where round-one review found the aggregator
+    /// wrong: it answered `Some(true)` on the strength of the one worker it
+    /// could check and threw away the unverified claim next to it. Injected as
+    /// evidence for that reason -- unreachable through a real pool would have
+    /// meant untested.
+    #[test]
+    fn an_unreadable_worker_mask_withdraws_the_whole_honesty_verdict() {
+        use crate::decode_affinity::ObservedAffinity;
+        let honest = WorkerPlacement {
+            tid: Some(1),
+            attempted_cpu: Some(0),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::Cpus(vec![0]),
+        };
+        let unverifiable = WorkerPlacement {
+            tid: Some(2),
+            attempted_cpu: Some(1),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::QueryFailed("injected".to_string()),
+        };
+        let lying = WorkerPlacement {
+            tid: Some(3),
+            attempted_cpu: Some(2),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::Cpus(vec![7]),
+        };
+        let claims_nothing = WorkerPlacement {
+            tid: Some(4),
+            attempted_cpu: None,
+            attempt: PinAttempt::NotRequested,
+            observed: ObservedAffinity::Cpus(vec![0, 1, 2, 3]),
+        };
+
+        assert_eq!(
+            placement_report_is_honest_of(std::slice::from_ref(&honest)),
+            Some(true),
+            "a single verified worker is a verified pool"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[honest.clone(), unverifiable.clone()]),
+            None,
+            "one worker verified and one unverifiable is not a verified pool -- this is \
+             the exact shape that read as `Some(true)` before"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable.clone(), honest.clone()]),
+            None,
+            "the verdict must not depend on which worker the loop reaches first"
+        );
+
+        // A definite contradiction outranks an unreadable mask: it stays true
+        // regardless of how many peers went unchecked, so it must not be
+        // downgraded to "cannot tell".
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable.clone(), lying.clone()]),
+            Some(false),
+            "a worker demonstrably not where it claims is a dishonest report, not an \
+             unanswerable one"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[honest.clone(), lying]),
+            Some(false)
+        );
+
+        // The other direction, and the reason the two `None`s are kept apart: a
+        // worker that never asked for a pin claims nothing, so it cannot
+        // withdraw a verdict its peers support. Collapsing both `None`s would
+        // make every partially pinned pool permanently unanswerable.
+        assert_eq!(
+            placement_report_is_honest_of(&[honest, claims_nothing.clone()]),
+            Some(true),
+            "a worker that claims no pin must not sink a verdict the pinned workers earned"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[claims_nothing]),
+            None,
+            "claiming nothing is not honest success"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[]),
+            None,
+            "no evidence is not success"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable]),
+            None,
+            "an unverified claim on its own is unanswerable"
+        );
+    }
+
+    /// A worker that was never asked to pin claims nothing, and "claims
+    /// nothing" must not be scored as honest success -- otherwise an entirely
+    /// unpinned pool would report a clean honesty verdict.
+    #[test]
+    fn an_unpinned_pool_is_observed_to_make_no_placement_claim() {
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers: 2,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        assert!(
+            pools
+                .worker_placements()
+                .iter()
+                .all(|placement| placement.attempt == PinAttempt::NotRequested),
+            "an empty CPU set must attempt no pins ({:?})",
+            pools.worker_placements()
+        );
+        assert_eq!(pools.realized_placement(), RealizedPlacement::Unpinned);
+        assert_eq!(
+            pools.placement_report_is_honest(),
+            None,
+            "a pool that claims no placement has no honesty verdict to give"
         );
         pools.shutdown();
     }
@@ -5136,7 +6089,7 @@ mod tests {
 
     /// The distinct-physical-core predicate, evaluated over masks the kernel
     /// reports rather than over what a pool claims. Mirrors
-    /// `placement_is_one_worker_per_physical_core`, which reads `worker_cpus`.
+    /// `planned_placement_is_one_worker_per_physical_core`, which reads `worker_cpus`.
     #[cfg(target_os = "linux")]
     fn distinct_cores_from_actual_masks(
         masks: &[(String, Vec<usize>)],
@@ -5161,7 +6114,7 @@ mod tests {
 
     /// Negative control against **actual TID masks**, not reported ones.
     ///
-    /// `placement_reports_a_shared_core_as_a_defect` above builds a pool and
+    /// `the_planner_reports_a_shared_core_as_a_defect` above builds a pool and
     /// asks it about `worker_cpus` -- the pool's own claim. That is the exact
     /// quantity #1792 showed can be wrong: the EP printed
     /// `requested=16 realized=16 as_requested` while running 16 workers on 8
@@ -5359,7 +6312,7 @@ mod tests {
             pools.worker_cpus()
         );
         assert_eq!(
-            pools.placement_is_one_worker_per_physical_core(),
+            pools.planned_placement_is_one_worker_per_physical_core(),
             Some(false),
             "a pool with an unplaced worker must not report one-per-core on the \
              strength of the workers it did place"
@@ -5397,7 +6350,7 @@ mod tests {
              cpu it failed to reach"
         );
         assert_eq!(
-            pools.placement_is_one_worker_per_physical_core(),
+            pools.planned_placement_is_one_worker_per_physical_core(),
             None,
             "a pool that placed nothing makes no placement claim"
         );
@@ -5421,7 +6374,10 @@ mod tests {
             pools.worker_cpus().iter().all(Option::is_none),
             "an empty CPU set must leave every worker unpinned"
         );
-        assert_eq!(pools.placement_is_one_worker_per_physical_core(), None);
+        assert_eq!(
+            pools.planned_placement_is_one_worker_per_physical_core(),
+            None
+        );
         pools.shutdown();
     }
 
@@ -7357,6 +8313,113 @@ mod dispatch_claim_tests {
             completion_sense: Padded(AtomicU32::new(0)),
             dispatcher_parked: Padded(AtomicBool::new(false)),
         })
+    }
+
+    /// The blocktime deadline must be re-evaluated on *every* yield, not on a
+    /// 64-iteration stride.
+    ///
+    /// #1868 removed that stride from `worker_wait`'s yield phase (and #1825
+    /// from the readiness barrier before it), but nothing guarded either site:
+    /// with the stride reinstated this crate still reported **1695 passed, 0
+    /// failed**. This is the guard, and it has this shape because the obvious
+    /// one does not work and the first version of this one was flaky.
+    ///
+    /// **Why not shrink the deadline and assert the backstop fires.** That
+    /// passes against the defect. An uncontended `yield_now` costs ~1.2us here,
+    /// so a 64-yield stride moves the deadline by ~78us -- invisible against
+    /// any deadline a test can afford to wait for. The defect's damage is
+    /// proportional to the *yield cost*, so that is the axis injected here.
+    ///
+    /// **Why the observable is a yield count and not a duration.** The first
+    /// version asked "was the worker parked when a bump landed at 400ms?". That
+    /// passed alone and failed in the parallel suite, because it is not monotone
+    /// under load: a starved thread can still be in the spin phase at 400ms for
+    /// reasons that have nothing to do with the stride. Counting yields is
+    /// monotone in the safe direction -- a starved thread accumulates wall time
+    /// faster per yield, so it crosses the deadline in FEWER yields, never more.
+    /// Load can only push this test towards passing, and the one way it could
+    /// go vacuous (deadline already expired before the first yield) is asserted
+    /// against rather than left to chance.
+    ///
+    /// The arithmetic, which is what makes the margin host-independent:
+    ///
+    /// | | first deadline check | exits after |
+    /// |---|---|---|
+    /// | checked every yield | yield 1 | ~`BLOCKTIME / YIELD` = 20 yields |
+    /// | checked on a stride | yield 1, then yield 65 | **65 yields** |
+    ///
+    /// `SPIN_LOOP_BUDGET` (4096) is a multiple of 64, so the strided form gets
+    /// its first check for free on yield 1 and then goes blind for 64 more --
+    /// which is why the deadline must expire *during* the yield phase for this
+    /// to discriminate at all. A deadline that has already expired when the
+    /// yield phase starts exits on yield 1 in both worlds.
+    #[test]
+    fn the_blocktime_deadline_is_evaluated_on_every_yield_not_on_a_stride() {
+        /// Cost of one injected yield: the contended regime, where a yield
+        /// costs microseconds to milliseconds rather than ~1.2us.
+        const YIELD: Duration = Duration::from_millis(10);
+        /// Long enough that the first yield's check does not already satisfy it
+        /// (or the strided form exits on yield 1 too and nothing is measured),
+        /// and long enough that the spin phase cannot plausibly consume it.
+        const BLOCKTIME: Duration = Duration::from_millis(200);
+        /// Later than the strided form's own exit (65 * 10ms = 650ms), so the
+        /// release cannot rescue the defect by ending its wait early. Only the
+        /// test's duration depends on this, never its verdict.
+        const RELEASE_AT: Duration = Duration::from_millis(1200);
+        /// One stride. The strided form cannot exit in fewer.
+        const STRIDE: u64 = 64;
+
+        let shared = one_worker_shared_state();
+        // Both knobs are read on this thread, which is the one that runs
+        // `worker_wait` below. A real pool's workers never see them.
+        SLOW_YIELD_US.with(|c| c.set(YIELD.as_micros() as u64));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        let last_seen = shared.node_sense[0].0.wake.load(Ordering::Acquire);
+        let release = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                thread::sleep(RELEASE_AT);
+                // The bare sense bump `publish` ends with -- enough to release a
+                // parked worker, which is all this thread is for.
+                let sense = &shared.node_sense[0].0.wake;
+                sense.fetch_add(1, Ordering::Release);
+                atomic_wait::wake_all(sense);
+            })
+        };
+
+        let observed = shared.worker_wait(0, 0, last_seen, BLOCKTIME);
+        release.join().expect("release thread panicked");
+
+        let yields = YIELD_COUNT.with(Cell::get);
+        // Cleared before asserting: a panic here would otherwise leave the knob
+        // set for whatever else libtest runs on this thread.
+        SLOW_YIELD_US.with(|c| c.set(0));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        assert_ne!(
+            observed, last_seen,
+            "worker_wait returned without observing the sense bump"
+        );
+        // Non-vacuity, asserted rather than hoped for: if the deadline had
+        // already expired when the yield phase began, both the strided and the
+        // every-yield form exit on yield 1 and this test discriminates nothing.
+        assert!(
+            yields >= 2,
+            "inconclusive: left the yield phase after {yields} yield(s), so the \
+             {BLOCKTIME:?} deadline had already expired before the second \
+             check. This test cannot tell a strided clock read from an \
+             unstrided one in that regime -- it is not a pass"
+        );
+        assert!(
+            yields < STRIDE,
+            "left the yield phase after {yields} yields against a {BLOCKTIME:?} \
+             deadline and {YIELD:?} yields, i.e. it did not re-check the clock \
+             for at least a full {STRIDE}-yield stride. The deadline is being \
+             evaluated on a stride in a phase where each iteration costs orders \
+             of magnitude more than the `Instant::now()` the stride was \
+             amortising"
+        );
     }
 
     /// Counts calls so a re-run of a retired op is visible.
