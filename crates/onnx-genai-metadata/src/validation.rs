@@ -343,8 +343,14 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
+    // An unreadable version is reported once, by `validate_schema_version`
+    // below. Falling back to the initial version here validates the rest of the
+    // document at the most permissive strictness rather than adding a second,
+    // derived complaint about the same missing fact.
+    let version = crate::version::normalize(metadata.schema_version.as_deref())
+        .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
     if let Some(pipeline) = &metadata.pipeline
-        && let Err(error) = validate_pipeline_spec(pipeline)
+        && let Err(error) = validate_pipeline_spec(pipeline, version)
     {
         errors.extend(error.errors);
     }
@@ -1151,9 +1157,18 @@ pub struct PipelineValidationError {
 }
 
 /// Validate the pipeline DAG and component references.
-pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidationError> {
+///
+/// `version` is the schema version the document declares, normalized. Almost
+/// every rule here is version-independent, because almost every rule describes a
+/// document that never worked. A rule that instead tightens what a *working*
+/// document must say is scoped to the version that introduced it, so a package
+/// on the shelf keeps loading: see [`validate_emit_axis`].
+pub fn validate_pipeline_spec(
+    spec: &PipelineSpec,
+    version: crate::version::SchemaVersion,
+) -> Result<(), PipelineValidationError> {
     let mut errors = Vec::new();
-    validate_workflow(&spec.workflow, &mut errors);
+    validate_workflow(&spec.workflow, version, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1661,7 +1676,11 @@ fn validate_adapter_service(
     }
 }
 
-fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+fn validate_workflow(
+    workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -2266,6 +2285,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     validate_workflow_node(
         &compiled.graph,
         workflow,
+        version,
         &mut values,
         &mut value_contracts,
         &mut effects,
@@ -4772,6 +4792,7 @@ fn validate_compaction_derivability(
                 ));
             }
             validate_packed_emit_companions(path, value, output, declared, workflow, errors);
+            validate_padded_emit_companions(path, value, output, declared, workflow, errors);
             let Some(contract) = value_contracts.get(value) else {
                 return;
             };
@@ -4783,16 +4804,18 @@ fn validate_compaction_derivability(
             }
             // The carve-out is deliberately narrow: a `shared` emitted value is
             // admitted only when it is one of the int64 rank-1 vectors some
-            // other emitted value's layout names, which is decidable from the
-            // declared outputs alone. Anything else `shared` and rank > 0 is
-            // still a per-request result with no way back to a request.
-            let is_ownership_companion = contract.dtype == "int64"
+            // other emitted value's contract names as the description of its own
+            // shape — an ownership offsets or owner map, or the valid_lengths of
+            // a padded dimension. All of those are decidable from the declared
+            // outputs alone. Anything else `shared` and rank > 0 is still a
+            // per-request result with no way back to a request.
+            let is_shape_companion = contract.dtype == "int64"
                 && contract.rank == 1
-                && ownership_companions(workflow).contains(output.as_str());
+                && output_companions(workflow).contains(output.as_str());
             if contract.rank > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
-                && !is_ownership_companion
+                && !is_shape_companion
             {
                 errors.push(format!(
                     "{path} emits per-request value '{value}' without a declared batch_layout; a \
@@ -4807,21 +4830,34 @@ fn validate_compaction_derivability(
     }
 }
 
-/// Every value any contract in this workflow names as an ownership companion.
+/// Every value a declared output's contract names as a description of its own
+/// shape: an ownership level's offsets or owner map, or a padded dimension's
+/// valid_lengths.
 ///
 /// These are `shared` by construction — a prefix-offset vector describes a whole
-/// packing rather than one row — so they are exactly the values the per-request
-/// emission rule above would otherwise reject. Publishing them is what makes a
-/// packed result splittable, so the rule that demands a row correspondence has
-/// to know which values are the mechanism by which that correspondence is
-/// stated.
-fn ownership_companions(workflow: &WorkflowSpec) -> BTreeSet<&str> {
+/// packing, and a length vector describes one entry per position outside the
+/// dimension it bounds — so they are exactly the values the per-request emission
+/// rule above would otherwise reject. Publishing them is what makes a packed or
+/// padded result readable, so the rule that demands a row correspondence has to
+/// know which values are the mechanism by which that correspondence is stated.
+fn output_companions(workflow: &WorkflowSpec) -> BTreeSet<&str> {
     workflow
         .outputs
         .values()
         .map(|output| &output.contract)
-        .flat_map(|contract| contract.batch_layout.companions())
-        .map(|(_, _, companion)| companion)
+        .flat_map(|contract| {
+            contract
+                .batch_layout
+                .companions()
+                .into_iter()
+                .map(|(_, _, companion)| companion)
+                .chain(
+                    contract
+                        .padding
+                        .iter()
+                        .map(|entry| entry.valid_lengths.as_str()),
+                )
+        })
         .collect()
 }
 
@@ -4855,10 +4891,42 @@ fn validate_packed_emit_companions(
     }
 }
 
+/// A padded result is only readable by whoever receives it if the lengths that
+/// say where the padding starts come with it.
+///
+/// This is the same obligation `validate_packed_emit_companions` states for a
+/// packing, for the other way a contract describes a shape the payload does not
+/// carry. A padded output whose valid_lengths is an internal SSA value hands the
+/// caller a tensor with trailing entries that mean nothing and no way to know
+/// how many — and the schema deliberately refuses a payload-shaped validity mask
+/// as the alternative, so the length vector is the only account there is.
+fn validate_padded_emit_companions(
+    path: &str,
+    value: &str,
+    output: &str,
+    declared: &crate::schema::WorkflowOutput,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    for entry in &declared.contract.padding {
+        if workflow.outputs.contains_key(&entry.valid_lengths) {
+            continue;
+        }
+        errors.push(format!(
+            "{path} emits '{value}' into output '{output}', which declares padding on dimension \
+             '{}' whose valid_lengths '{}' is not itself a declared workflow output; a caller can \
+             only tell a padded result's real entries from its padding with the lengths that \
+             bound them, so a padded emit publishes them",
+            entry.dimension, entry.valid_lengths
+        ));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_workflow_node(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
     values: &mut BTreeSet<String>,
     value_contracts: &mut BTreeMap<String, crate::schema::TensorContract>,
     effects: &mut BTreeMap<String, String>,
@@ -4875,6 +4943,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     node,
                     workflow,
+                    version,
                     values,
                     value_contracts,
                     effects,
@@ -4971,6 +5040,7 @@ fn validate_workflow_node(
             validate_workflow_node(
                 setup,
                 workflow,
+                version,
                 values,
                 value_contracts,
                 effects,
@@ -5122,6 +5192,7 @@ fn validate_workflow_node(
             validate_workflow_node(
                 body,
                 workflow,
+                version,
                 &mut body_values,
                 &mut body_contracts,
                 &mut body_effects,
@@ -5203,6 +5274,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     node,
                     workflow,
+                    version,
                     &mut case_values,
                     &mut case_contracts,
                     &mut case_effects,
@@ -5223,6 +5295,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     default,
                     workflow,
+                    version,
                     &mut default_values,
                     &mut default_contracts,
                     &mut default_effects,
@@ -5463,6 +5536,7 @@ fn validate_workflow_node(
                 mode,
                 *axis,
                 valid_length.is_some(),
+                version,
                 path,
                 errors,
             );
@@ -5566,11 +5640,24 @@ fn validate_workflow_node(
 /// or `[batch, frames, height, width]`, where the final axis is a spatial extent
 /// that must never be concatenated. Rather than guess which of several plausible
 /// axes was meant, such an emit names it.
+///
+/// Naming it is a requirement of the version that introduced video, not a
+/// retroactive judgement on the documents written before it. A diffusion package
+/// that appends latents along a rank-four final axis is correct and always was:
+/// the default is what it meant, and it had no way to say so explicitly because
+/// nothing asked. Refusing it now would be this crate deciding that shipped
+/// packages became invalid the day a video model was added. So the demand starts
+/// at [`BATCHING_SCHEMA_VERSION`](crate::version::BATCHING_SCHEMA_VERSION) —
+/// which is also the first version in which the ambiguity is real, since a
+/// rank-four media tensor is what that version introduced — and an older
+/// document keeps the final-axis default it was written against. An explicitly
+/// named axis is checked against the rank at every version.
 fn validate_emit_axis(
     contract: Option<&crate::schema::TensorContract>,
     mode: &crate::schema::WorkflowEmitMode,
     axis: Option<usize>,
     length_limited: bool,
+    version: crate::version::SchemaVersion,
     path: &str,
     errors: &mut Vec<String>,
 ) {
@@ -5584,6 +5671,9 @@ fn validate_emit_axis(
                 contract.rank
             ));
         }
+        return;
+    }
+    if version < crate::version::BATCHING_SCHEMA_VERSION {
         return;
     }
     let incremental = matches!(mode, crate::schema::WorkflowEmitMode::Append) || length_limited;

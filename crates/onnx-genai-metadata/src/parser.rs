@@ -346,8 +346,12 @@ pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::Me
             "metadata has no pipeline section".to_string(),
         ));
     };
-    crate::validation::validate_pipeline_spec(pipeline)
-        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    crate::validation::validate_pipeline_spec(
+        pipeline,
+        crate::version::normalize(metadata.schema_version.as_deref())
+            .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION),
+    )
+    .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
     // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
     // cannot see them. Without this call they hold only for callers who reach for
     // `validate_metadata` directly — which is nobody loading a package from disk,
@@ -478,10 +482,12 @@ fn validate_package_artifacts(
 /// Load and validate a metadata file's `pipeline` section.
 pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataError> {
     let metadata = load_metadata(path)?;
+    let version = crate::version::normalize(metadata.schema_version.as_deref())
+        .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
     let spec = metadata
         .pipeline
         .ok_or_else(|| crate::MetadataError::Parse("metadata has no pipeline section".into()))?;
-    crate::validation::validate_pipeline_spec(&spec)
+    crate::validation::validate_pipeline_spec(&spec, version)
         .map_err(|err| crate::MetadataError::Parse(err.to_string()))?;
     Ok(spec)
 }
