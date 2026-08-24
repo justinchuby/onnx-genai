@@ -1027,17 +1027,182 @@ pub(crate) fn order_pin_targets(
     ordered
 }
 
-/// Windows NUMA topology discovery and per-thread pinning.
+/// Byte-level layout of the records `GetLogicalProcessorInformationEx` writes,
+/// and the parser that walks them.
 ///
-/// All Win32 calls here are bounded (fixed-size or single-call-sized buffers),
-/// null-checked, and fall back gracefully (`None` / `Err`) instead of panicking
-/// so an unavailable API never aborts decode. CPU indices use the crate-wide
-/// `group * 64 + bit` encoding (see the module docs), which round-trips through
+/// # Why this is bytes rather than the Win32 structs
+///
+/// `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` is a header plus a union, and the
+/// union's size is set by its **largest** arm (`GROUP_RELATIONSHIP`, 72 bytes),
+/// not by the arm the OS actually wrote. A `RelationNumaNode` record is 48
+/// bytes and the OS counts 48 bytes into the buffer length, so reading the
+/// struct *by value* out of that buffer reads 80 bytes from a 48-byte
+/// allocation -- 32 bytes out of bounds, on every Windows pool build. Every
+/// byte the caller goes on to *use* is in bounds, so the parsed values were
+/// never wrong; the read simply touched memory the process does not own, and
+/// faulted with `STATUS_ACCESS_VIOLATION` whenever the allocator happened to
+/// place the block within 32 bytes of the end of a committed region. See #2024.
+///
+/// Reading the fields we need at fixed offsets, through bounds-checked slicing,
+/// makes that class of bug unrepresentable: there is no `unsafe` left in the
+/// walk at all. It also makes the walk **testable on every platform** rather
+/// than only on a host this workspace cannot execute, which matters more than
+/// the safety fix -- the previous parser had no test anywhere, which is why a
+/// 32-byte overread survived in it.
+///
+/// # Why hardcoded offsets are safe here
+///
+/// The layout is fixed by the Win32 ABI, not by our types. On Windows the
+/// constants below are *derived* from the real `windows-sys` types with
+/// [`core::mem::offset_of`], so they cannot drift from the crate we compile
+/// against; the literal values are additionally asserted against those on
+/// 64-bit Windows, so an ABI change is a compile error rather than a silent
+/// misparse. Off Windows the literals stand alone and exist to be tested.
+#[cfg(any(target_os = "windows", test))]
+mod lpi_ex {
+    /// `Relationship: LOGICAL_PROCESSOR_RELATIONSHIP` then `Size: u32`.
+    pub(super) const HEADER_LEN: usize = 8;
+    /// Offset of the record's `Relationship` discriminant.
+    pub(super) const RELATIONSHIP_OFFSET: usize = 0;
+    /// Offset of the record's own byte length.
+    pub(super) const SIZE_OFFSET: usize = 4;
+    /// `RelationNumaNode`, the only relationship this walk consumes.
+    pub(super) const RELATION_NUMA_NODE: u32 = 1;
+    /// Offset of `NUMA_NODE_RELATIONSHIP::NodeNumber`.
+    pub(super) const NODE_NUMBER_OFFSET: usize = HEADER_LEN;
+    /// Offset of the node's `GROUP_AFFINITY` (`NodeNumber` + `Reserved[18]` +
+    /// `GroupCount`, padded to the union's 8-byte alignment).
+    pub(super) const GROUP_MASK_OFFSET: usize = HEADER_LEN + 24;
+    /// Offset of `GROUP_AFFINITY::Mask` within the affinity.
+    pub(super) const AFFINITY_MASK_OFFSET: usize = 0;
+    /// Offset of `GROUP_AFFINITY::Group` within the affinity.
+    pub(super) const AFFINITY_GROUP_OFFSET: usize = 8;
+    /// Bytes a `RelationNumaNode` record must have for its affinity to be
+    /// readable: the header plus the whole `NUMA_NODE_RELATIONSHIP`.
+    pub(super) const NUMA_RECORD_MIN_LEN: usize = HEADER_LEN + 40;
+    /// Bits per processor group mask (`KAFFINITY` is 64-bit on x64/arm64
+    /// Windows), and the crate-wide CPU encoding's group stride.
+    pub(super) const GROUP_BITS: usize = 64;
+
+    /// Tie the literals above to the ABI of the `windows-sys` types actually
+    /// compiled against, so a struct change upstream breaks the build instead
+    /// of silently shifting a field. Restricted to 64-bit Windows because the
+    /// literals describe that ABI; on a 32-bit Windows target the derived
+    /// offsets in [`super::windows_imp`] still apply and these do not.
+    #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
+    const _: () = {
+        use core::mem::{offset_of, size_of};
+
+        use windows_sys::Win32::System::SystemInformation::{
+            GROUP_AFFINITY, NUMA_NODE_RELATIONSHIP, NUMA_NODE_RELATIONSHIP_0, RelationNumaNode,
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_0,
+        };
+
+        assert!(
+            offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Relationship)
+                == RELATIONSHIP_OFFSET
+        );
+        assert!(offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Size) == SIZE_OFFSET);
+        assert!(offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, Anonymous) == HEADER_LEN);
+        assert!(offset_of!(SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX_0, NumaNode) == 0);
+        assert!(offset_of!(NUMA_NODE_RELATIONSHIP, NodeNumber) == NODE_NUMBER_OFFSET - HEADER_LEN);
+        assert!(offset_of!(NUMA_NODE_RELATIONSHIP, Anonymous) == GROUP_MASK_OFFSET - HEADER_LEN);
+        assert!(offset_of!(NUMA_NODE_RELATIONSHIP_0, GroupMask) == 0);
+        assert!(offset_of!(GROUP_AFFINITY, Mask) == AFFINITY_MASK_OFFSET);
+        assert!(offset_of!(GROUP_AFFINITY, Group) == AFFINITY_GROUP_OFFSET);
+        assert!(size_of::<GROUP_AFFINITY>() * 8 >= GROUP_BITS);
+        assert!(HEADER_LEN + size_of::<NUMA_NODE_RELATIONSHIP>() == NUMA_RECORD_MIN_LEN);
+        assert!(RelationNumaNode as u32 == RELATION_NUMA_NODE);
+        // The whole point: the record we parse is smaller than the struct the
+        // old code read by value. If this ever stops holding, the overread this
+        // module exists to remove was not what #2024 said it was.
+        assert!(NUMA_RECORD_MIN_LEN < size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>());
+        // Windows is little-endian on every target it ships for; the readers
+        // below assume it rather than calling a byte-swap that can never run.
+        assert!(cfg!(target_endian = "little"));
+    };
+
+    fn u16_at(bytes: &[u8], offset: usize) -> Option<u16> {
+        let raw: [u8; 2] = bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
+        Some(u16::from_le_bytes(raw))
+    }
+
+    fn u32_at(bytes: &[u8], offset: usize) -> Option<u32> {
+        let raw: [u8; 4] = bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
+        Some(u32::from_le_bytes(raw))
+    }
+
+    fn u64_at(bytes: &[u8], offset: usize) -> Option<u64> {
+        let raw: [u8; 8] = bytes.get(offset..offset.checked_add(8)?)?.try_into().ok()?;
+        Some(u64::from_le_bytes(raw))
+    }
+
+    /// Expand a `GROUP_AFFINITY` (a group number and its 64-bit CPU mask) into
+    /// the crate-wide `group * 64 + bit` CPU indices it names.
+    pub(super) fn cpus_from_mask(group: u16, mask: u64) -> Vec<usize> {
+        let base = group as usize * GROUP_BITS;
+        (0..GROUP_BITS)
+            .filter(|bit| mask & (1u64 << bit) != 0)
+            .map(|bit| base + bit)
+            .collect()
+    }
+
+    /// Walk a `GetLogicalProcessorInformationEx(RelationNumaNode)` buffer and
+    /// return the `(node_index, cpu_indices)` pairs it names.
+    ///
+    /// `buffer` must be trimmed to the byte count the OS reported; anything
+    /// past it is not read, and a record that claims to extend past it ends the
+    /// walk rather than being parsed from whatever follows.
+    ///
+    /// Each record is sliced to its own declared length before any field is
+    /// read, so a record too short to hold the fields it declares is skipped by
+    /// the field reads themselves returning `None` -- one malformed entry does
+    /// not discard the nodes after it, and no separate minimum-length guard is
+    /// needed. That is deliberate: a guard the bounds checks make unreachable
+    /// is a branch no test can falsify.
+    pub(super) fn numa_nodes_from_records(buffer: &[u8]) -> Vec<(usize, Vec<usize>)> {
+        let mut nodes: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut offset = 0usize;
+        while offset + HEADER_LEN <= buffer.len() {
+            let record = &buffer[offset..];
+            let (Some(relationship), Some(size)) = (
+                u32_at(record, RELATIONSHIP_OFFSET),
+                u32_at(record, SIZE_OFFSET).map(|size| size as usize),
+            ) else {
+                break;
+            };
+            // A record shorter than its own header cannot be trusted to say
+            // where the next one starts, and a zero size would loop forever.
+            if size < HEADER_LEN || size > record.len() {
+                break;
+            }
+            let record = &record[..size];
+            if relationship == RELATION_NUMA_NODE {
+                let node = u32_at(record, NODE_NUMBER_OFFSET);
+                let mask = u64_at(record, GROUP_MASK_OFFSET + AFFINITY_MASK_OFFSET);
+                let group = u16_at(record, GROUP_MASK_OFFSET + AFFINITY_GROUP_OFFSET);
+                if let (Some(node), Some(mask), Some(group)) = (node, mask, group) {
+                    let cpus = cpus_from_mask(group, mask);
+                    if !cpus.is_empty() {
+                        nodes.push((node as usize, cpus));
+                    }
+                }
+            }
+            offset += size;
+        }
+        nodes
+    }
+}
+
+/// Windows implementations of NUMA discovery and thread pinning.
+///
+/// Uses `GetLogicalProcessorInformationEx(RelationNumaNode)` for topology and
+/// `SetThreadGroupAffinity`/`GetThreadGroupAffinity` for pinning, so a CPU is
 /// `GROUP_AFFINITY { Group, Mask }` and handles hosts with more than 64 logical
 /// CPUs (multiple processor groups) correctly.
 #[cfg(target_os = "windows")]
 mod windows_imp {
-    use std::mem::{size_of, zeroed};
+    use std::mem::zeroed;
 
     use windows_sys::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, RelationNumaNode, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
@@ -1046,23 +1211,17 @@ mod windows_imp {
         GetCurrentThread, GetThreadGroupAffinity, SetThreadGroupAffinity,
     };
 
-    /// Bits per processor group mask (`KAFFINITY` is 64-bit on x64/arm64 Windows).
-    const GROUP_BITS: usize = 64;
-
-    /// Expand a `GROUP_AFFINITY` (a group number and its 64-bit CPU mask) into the
-    /// crate-wide `group * 64 + bit` CPU indices it names.
-    fn cpus_from_mask(group: u16, mask: usize) -> Vec<usize> {
-        let base = group as usize * GROUP_BITS;
-        (0..GROUP_BITS)
-            .filter(|bit| mask & (1usize << bit) != 0)
-            .map(|bit| base + bit)
-            .collect()
-    }
+    use super::lpi_ex;
 
     /// Discover NUMA nodes as `(node_index, cpu_indices)` pairs via
     /// `GetLogicalProcessorInformationEx(RelationNumaNode)`. Returns `None` if the
     /// API cannot be queried; an empty/one-node result is left for the caller to
     /// reject.
+    ///
+    /// The records themselves are parsed by [`lpi_ex::numa_nodes_from_records`],
+    /// which reads bytes rather than the Win32 structs -- see that module for
+    /// why reading `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` by value out of
+    /// this buffer is an out-of-bounds read (#2024).
     pub(super) fn numa_nodes() -> Option<Vec<(usize, Vec<usize>)>> {
         // First call with a null buffer to learn the required byte length.
         let mut len: u32 = 0;
@@ -1090,45 +1249,10 @@ mod windows_imp {
         if ok == 0 {
             return None;
         }
-
-        let mut nodes: Vec<(usize, Vec<usize>)> = Vec::new();
-        let mut offset = 0usize;
-        let end = len as usize;
-        while offset + size_of::<u32>() * 2 <= end {
-            // Read an owned copy with `read_unaligned`: the records live in a
-            // `Vec<u8>` (alignment 1), so forming a `&SYSTEM_LOGICAL_PROCESSOR_
-            // INFORMATION_EX` reference would be unaligned-reference UB. The
-            // struct is `Copy`, so a by-value read is sound and cheap.
-            // SAFETY: `offset` leaves at least the header (`Relationship`+`Size`)
-            // inside the filled buffer, and the source is a valid, initialized
-            // record the OS wrote; `read_unaligned` needs no alignment guarantee.
-            let record = unsafe {
-                std::ptr::read_unaligned(
-                    buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX
-                )
-            };
-            let size = record.Size as usize;
-            if size == 0 || offset + size > end {
-                break;
-            }
-            if record.Relationship == RelationNumaNode {
-                // SAFETY: the record's relationship is RelationNumaNode, so the
-                // `NumaNode` union arm is the active one.
-                let numa = unsafe { record.Anonymous.NumaNode };
-                let node_index = numa.NodeNumber as usize;
-                // A NUMA node names its CPUs by a single `GroupMask` group
-                // affinity; recover the (group, mask) and expand to CPU indices.
-                // SAFETY: reading the `GroupMask` arm of the group-mask union is
-                // valid for a NUMA-node record.
-                let group_mask = unsafe { numa.Anonymous.GroupMask };
-                let cpus = cpus_from_mask(group_mask.Group, group_mask.Mask as usize);
-                if !cpus.is_empty() {
-                    nodes.push((node_index, cpus));
-                }
-            }
-            offset += size;
-        }
-        Some(nodes)
+        // The OS may report *fewer* bytes written than it asked for, so the walk
+        // is bounded by the returned length and not by the allocation.
+        let filled = (len as usize).min(buffer.len());
+        Some(lpi_ex::numa_nodes_from_records(&buffer[..filled]))
     }
 
     /// Pin the calling thread to `cpu` (encoded `group * 64 + bit`) via
@@ -1136,8 +1260,8 @@ mod windows_imp {
     /// hosts with more than 64 logical CPUs. Best-effort: a failure is returned
     /// as a message so the caller logs it once and continues unpinned.
     pub(super) fn pin_current_thread_to_cpu(cpu: usize) -> std::result::Result<(), String> {
-        let group = (cpu / GROUP_BITS) as u16;
-        let bit = cpu % GROUP_BITS;
+        let group = (cpu / lpi_ex::GROUP_BITS) as u16;
+        let bit = cpu % lpi_ex::GROUP_BITS;
         // SAFETY: `GROUP_AFFINITY` is plain-old-data; zeroing it and setting the
         // single group + mask we want is a valid initialization.
         let mut affinity =
@@ -1175,7 +1299,7 @@ mod windows_imp {
         if ok == 0 {
             return None;
         }
-        let cpus = cpus_from_mask(affinity.Group, affinity.Mask as usize);
+        let cpus = lpi_ex::cpus_from_mask(affinity.Group, affinity.Mask as u64);
         (!cpus.is_empty()).then_some(cpus)
     }
 }
@@ -1183,6 +1307,309 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build one `RelationNumaNode` record exactly as the OS lays it out: an
+    /// 8-byte header, then `NUMA_NODE_RELATIONSHIP`, then the node's
+    /// `GROUP_AFFINITY`. `size` overrides the declared length so a test can
+    /// describe a truncated or over-long record.
+    fn numa_record(node: u32, group: u16, mask: u64, size: Option<u32>) -> Vec<u8> {
+        let mut record = vec![0u8; lpi_ex::NUMA_RECORD_MIN_LEN];
+        let declared = size.unwrap_or(lpi_ex::NUMA_RECORD_MIN_LEN as u32);
+        record[lpi_ex::RELATIONSHIP_OFFSET..][..4]
+            .copy_from_slice(&lpi_ex::RELATION_NUMA_NODE.to_le_bytes());
+        record[lpi_ex::SIZE_OFFSET..][..4].copy_from_slice(&declared.to_le_bytes());
+        record[lpi_ex::NODE_NUMBER_OFFSET..][..4].copy_from_slice(&node.to_le_bytes());
+        let affinity = lpi_ex::GROUP_MASK_OFFSET;
+        record[affinity + lpi_ex::AFFINITY_MASK_OFFSET..][..8].copy_from_slice(&mask.to_le_bytes());
+        record[affinity + lpi_ex::AFFINITY_GROUP_OFFSET..][..2]
+            .copy_from_slice(&group.to_le_bytes());
+        record
+    }
+
+    /// Replicas of the four `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` union
+    /// arms, laid out exactly as `windows-sys` declares them. They exist so the
+    /// arithmetic behind #2024 -- the record is smaller than the struct that
+    /// nominally contains it -- can be asserted on **every** platform rather
+    /// than only on the Windows host this workspace cannot execute.
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaGroupAffinity {
+        mask: usize,
+        group: u16,
+        reserved: [u16; 3],
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaNumaNode {
+        node_number: u32,
+        reserved: [u8; 18],
+        group_count: u16,
+        group_mask: ReplicaGroupAffinity,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaProcessor {
+        flags: u8,
+        efficiency_class: u8,
+        reserved: [u8; 20],
+        group_count: u16,
+        group_mask: [ReplicaGroupAffinity; 1],
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaCache {
+        level: u8,
+        associativity: u8,
+        line_size: u16,
+        cache_size: u32,
+        cache_type: i32,
+        reserved: [u8; 18],
+        group_count: u16,
+        group_mask: ReplicaGroupAffinity,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaProcessorGroupInfo {
+        maximum_processor_count: u8,
+        active_processor_count: u8,
+        reserved: [u8; 38],
+        active_processor_mask: usize,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    #[derive(Clone, Copy)]
+    struct ReplicaGroup {
+        maximum_group_count: u16,
+        active_group_count: u16,
+        reserved: [u8; 20],
+        group_info: [ReplicaProcessorGroupInfo; 1],
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    union ReplicaUnion {
+        processor: ReplicaProcessor,
+        numa_node: ReplicaNumaNode,
+        cache: ReplicaCache,
+        group: ReplicaGroup,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ReplicaRecord {
+        relationship: i32,
+        size: u32,
+        anonymous: ReplicaUnion,
+    }
+
+    /// The arithmetic of #2024, asserted rather than asserted-about: a
+    /// `RelationNumaNode` record is 48 bytes, the struct whose union must hold
+    /// every arm is 80, and the OS sizes the buffer by the former. Reading the
+    /// struct by value out of that buffer -- which is what this module replaced
+    /// -- therefore read 32 bytes past the end of the allocation on every
+    /// Windows pool build.
+    ///
+    /// This runs on Linux and macOS too. That is the point: the defect was
+    /// pure layout arithmetic and needed no Windows host to catch, yet it
+    /// survived because nothing anywhere ever evaluated it.
+    #[test]
+    fn the_numa_record_is_thirty_two_bytes_smaller_than_the_struct_read_from_it() {
+        use std::mem::size_of;
+
+        assert_eq!(size_of::<ReplicaGroupAffinity>(), 16);
+        assert_eq!(size_of::<ReplicaNumaNode>(), 40);
+        assert_eq!(size_of::<ReplicaGroup>(), 72, "the largest union arm");
+        assert_eq!(size_of::<ReplicaUnion>(), 72);
+        assert_eq!(size_of::<ReplicaRecord>(), 80);
+        assert_eq!(
+            lpi_ex::NUMA_RECORD_MIN_LEN,
+            lpi_ex::HEADER_LEN + size_of::<ReplicaNumaNode>(),
+        );
+        assert_eq!(lpi_ex::NUMA_RECORD_MIN_LEN, 48);
+        assert_eq!(
+            size_of::<ReplicaRecord>() - lpi_ex::NUMA_RECORD_MIN_LEN,
+            32,
+            "bytes the old by-value read took from beyond the buffer",
+        );
+    }
+
+    /// The offsets the byte parser uses must be the offsets the ABI puts the
+    /// fields at. On Windows a `const` block asserts this against the real
+    /// `windows-sys` types; off Windows the replicas stand in, so a typo in a
+    /// constant fails on the lanes that run most often rather than only on the
+    /// one that runs least.
+    #[test]
+    fn the_parser_offsets_match_the_record_layout() {
+        use std::mem::offset_of;
+
+        assert_eq!(
+            offset_of!(ReplicaRecord, relationship),
+            lpi_ex::RELATIONSHIP_OFFSET
+        );
+        assert_eq!(offset_of!(ReplicaRecord, size), lpi_ex::SIZE_OFFSET);
+        assert_eq!(offset_of!(ReplicaRecord, anonymous), lpi_ex::HEADER_LEN);
+        assert_eq!(
+            lpi_ex::HEADER_LEN + offset_of!(ReplicaNumaNode, node_number),
+            lpi_ex::NODE_NUMBER_OFFSET,
+        );
+        assert_eq!(
+            lpi_ex::HEADER_LEN + offset_of!(ReplicaNumaNode, group_mask),
+            lpi_ex::GROUP_MASK_OFFSET,
+        );
+        assert_eq!(
+            offset_of!(ReplicaGroupAffinity, mask),
+            lpi_ex::AFFINITY_MASK_OFFSET
+        );
+        assert_eq!(
+            offset_of!(ReplicaGroupAffinity, group),
+            lpi_ex::AFFINITY_GROUP_OFFSET
+        );
+    }
+
+    /// A record of some other relationship, which the walk must step over
+    /// without consuming and without losing its place.
+    fn foreign_record(relationship: u32, size: usize) -> Vec<u8> {
+        let mut record = vec![0xAAu8; size];
+        record[lpi_ex::RELATIONSHIP_OFFSET..][..4].copy_from_slice(&relationship.to_le_bytes());
+        record[lpi_ex::SIZE_OFFSET..][..4].copy_from_slice(&(size as u32).to_le_bytes());
+        record
+    }
+
+    /// The defect in #2024 was not a wrong value -- every field the old parser
+    /// *used* was in bounds -- it was reading 32 bytes past a buffer that ends
+    /// flush with the last record. A slice cannot express that read at all, so
+    /// this asserts the observable half: a buffer sized to exactly one record,
+    /// with no slack whatsoever, parses correctly.
+    ///
+    /// Under Miri this is also the direct falsifier: the old by-value read of
+    /// `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` out of a 48-byte allocation is
+    /// exactly what Miri reports as an out-of-bounds access.
+    #[test]
+    fn a_numa_buffer_with_no_slack_past_the_last_record_still_parses() {
+        let buffer = numa_record(0, 0, 0b1111, None);
+        assert_eq!(buffer.len(), lpi_ex::NUMA_RECORD_MIN_LEN);
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(0usize, vec![0usize, 1, 2, 3])],
+        );
+    }
+
+    #[test]
+    fn every_node_in_a_multi_record_buffer_is_reported_with_its_own_cpus() {
+        let mut buffer = numa_record(0, 0, 0b0011, None);
+        buffer.extend(numa_record(1, 0, 0b1100, None));
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(0usize, vec![0usize, 1]), (1usize, vec![2, 3])],
+        );
+    }
+
+    /// CPUs are `group * 64 + bit`, so a second processor group must not
+    /// collide with the first. This is the case a host with more than 64
+    /// logical CPUs actually hits.
+    #[test]
+    fn a_second_processor_group_is_offset_by_sixty_four() {
+        let buffer = numa_record(3, 1, 0b101, None);
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(3usize, vec![64usize, 66])],
+        );
+    }
+
+    #[test]
+    fn a_record_of_another_relationship_is_stepped_over_not_consumed() {
+        let mut buffer = foreign_record(2, 64);
+        buffer.extend(numa_record(7, 0, 0b1, None));
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(7usize, vec![0usize])],
+        );
+    }
+
+    /// A record whose declared size runs past the buffer ends the walk: the
+    /// bytes it claims were never written by the OS, so parsing them would be
+    /// inventing topology out of whatever follows.
+    #[test]
+    fn a_record_claiming_more_bytes_than_were_written_ends_the_walk() {
+        let mut buffer = numa_record(0, 0, 0b1, None);
+        buffer.extend(numa_record(1, 0, 0b10, Some(4096)));
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(0usize, vec![0usize])],
+        );
+    }
+
+    /// A zero (or sub-header) size cannot say where the next record starts, and
+    /// advancing by it would spin forever. The walk must stop, not hang.
+    #[test]
+    fn a_zero_sized_record_terminates_the_walk_instead_of_looping() {
+        let mut buffer = numa_record(0, 0, 0b1, None);
+        buffer.extend(numa_record(1, 0, 0b10, Some(0)));
+        buffer.extend(numa_record(2, 0, 0b100, None));
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(0usize, vec![0usize])],
+        );
+    }
+
+    /// A NUMA record too short to contain the affinity it declares is skipped
+    /// rather than fatal, so one malformed entry does not discard the nodes
+    /// after it -- and nothing is read from beyond its declared length.
+    #[test]
+    fn a_numa_record_too_short_for_its_affinity_is_skipped_not_fatal() {
+        let short = lpi_ex::NUMA_RECORD_MIN_LEN - 8;
+        let mut buffer = numa_record(1, 0, 0b1, Some(short as u32));
+        buffer.truncate(short);
+        buffer.extend(numa_record(2, 0, 0b10, None));
+        assert_eq!(
+            lpi_ex::numa_nodes_from_records(&buffer),
+            vec![(2usize, vec![1usize])],
+        );
+    }
+
+    /// A node with an empty mask names no CPUs, so it is not a node.
+    #[test]
+    fn a_node_with_an_empty_cpu_mask_is_dropped() {
+        let buffer = numa_record(0, 0, 0, None);
+        assert!(lpi_ex::numa_nodes_from_records(&buffer).is_empty());
+    }
+
+    /// Every prefix of a well-formed buffer must terminate and never panic --
+    /// the OS reports the filled length separately from the allocation, so a
+    /// short read has to be survivable.
+    #[test]
+    fn every_truncation_of_a_valid_buffer_parses_without_panicking() {
+        let mut buffer = numa_record(0, 0, 0b1, None);
+        buffer.extend(numa_record(1, 0, 0b10, None));
+        for len in 0..=buffer.len() {
+            let nodes = lpi_ex::numa_nodes_from_records(&buffer[..len]);
+            assert!(nodes.len() <= 2, "prefix {len} invented a node: {nodes:?}");
+        }
+    }
+
+    /// The counts here are literals, not `lpi_ex::GROUP_BITS`. Written against
+    /// the constant, this test would follow the constant wherever it moved and
+    /// assert only that it equals itself -- it would pass with `GROUP_BITS` set
+    /// to 32, which is precisely the defect it exists to catch. A `KAFFINITY`
+    /// is 64 bits by the Win32 ABI, so 64 is the property.
+    #[test]
+    fn an_all_ones_mask_names_all_sixty_four_cpus_in_the_group() {
+        let buffer = numa_record(0, 0, u64::MAX, None);
+        let nodes = lpi_ex::numa_nodes_from_records(&buffer);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].1.len(), 64);
+        assert_eq!(nodes[0].1[63], 63);
+    }
 
     #[test]
     fn parses_affinity_modes() {
