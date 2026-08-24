@@ -18,7 +18,7 @@
 
 use std::borrow::Cow;
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -31,6 +31,9 @@ use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::driver_err;
 use crate::kernels::block_quantized_matmul::{BlockFormat, decoder_prelude};
+use crate::kernels::expert_route_telemetry::{
+    ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
+};
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "BlockQuantizedMoE";
@@ -84,7 +87,9 @@ extern "C" __global__ void bqmoe_route(
     const unsigned long long rows,
     const int experts,
     const int top_k,
-    const int normalize)
+    const int normalize,
+    unsigned int* route_telemetry_bitmap,
+    unsigned int* route_telemetry_header)
 {
     const unsigned long long first =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -116,6 +121,14 @@ extern "C" __global__ void bqmoe_route(
             }
             indices[slot] = best_index;
         }
+
+        // Fused, inert route telemetry (issue #1810 Slice 7A): one thread owns
+        // this row and has finalized indices[0..top_k]. Mark once; the helper is
+        // a no-op when telemetry pointers are null (disarmed), so the outputs
+        // below are byte-identical.
+        route_telemetry_mark_row(
+            route_telemetry_bitmap, route_telemetry_header,
+            indices, top_k, experts);
 
         if (router_weights) {
             const float* aggregation =
@@ -311,6 +324,11 @@ fn module_source() -> &'static str {
     static SOURCE: OnceLock<String> = OnceLock::new();
     SOURCE.get_or_init(|| {
         let mut source = decoder_prelude();
+        // Shared route-telemetry `__device__` helpers (issue #1810 Slice 7A) so
+        // `bqmoe_route`'s fused `route_telemetry_mark_row` call resolves. Uses
+        // only integer atomics; inert when the route kernel is passed null
+        // telemetry pointers.
+        source.push_str(MARK_DEVICE_SRC);
         source.push_str(KERNELS);
         source
     })
@@ -453,15 +471,32 @@ pub struct BlockQuantizedMoEFactory {
 }
 
 impl KernelFactory for BlockQuantizedMoEFactory {
-    fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+    fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(self.create_kernel(node, input_shapes)?))
+    }
+}
+
+impl BlockQuantizedMoEFactory {
+    /// Build a concrete [`BlockQuantizedMoEKernel`]. Exposed so route-telemetry
+    /// tests (issue #1810 Slice 7A) can obtain the concrete kernel and call its
+    /// `#[doc(hidden)]` arming API — the trait object returned by
+    /// [`KernelFactory::create`] cannot expose it. Crate-internal / test seam
+    /// only.
+    #[doc(hidden)]
+    pub fn create_kernel(
+        &self,
+        node: &Node,
+        _input_shapes: &[Vec<usize>],
+    ) -> Result<BlockQuantizedMoEKernel> {
         parse_layout_version(node)?;
         let attributes = MoeAttributes::from_node(node)?;
         let format = parse_format(node)?;
-        Ok(Box::new(BlockQuantizedMoEKernel {
+        Ok(BlockQuantizedMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
             format,
-        }))
+            telemetry: Mutex::new(None),
+        })
     }
 }
 
@@ -540,6 +575,133 @@ pub struct BlockQuantizedMoEKernel {
     runtime: Arc<CudaRuntime>,
     attributes: MoeAttributes,
     format: BlockFormat,
+    /// Inert, default-disabled route telemetry (issue #1810 Slice 7A). `None`
+    /// unless explicitly armed via
+    /// [`BlockQuantizedMoEKernel::arm_route_telemetry`]; while `None` the route
+    /// kernel receives null telemetry pointers and produces byte-identical
+    /// outputs.
+    telemetry: Mutex<Option<ArmedTelemetry>>,
+}
+
+impl BlockQuantizedMoEKernel {
+    /// Arm inert route telemetry (issue #1810 Slice 7A). Allocates the
+    /// persistent stable-VA record through the existing runtime allocator,
+    /// stamps request/device identity, and opens the first accumulation window
+    /// (`epoch = 1`); subsequent executions whose expert count matches
+    /// `config.num_experts` accumulate their routes into the current window via
+    /// the fused route-kernel marks. The window advances only at
+    /// [`reset_route_telemetry_boundary`](Self::reset_route_telemetry_boundary).
+    /// Returns a typed [`TelemetryUnsupported`] on a device mismatch or
+    /// unsupported property, in which case telemetry stays disabled and ordinary
+    /// inference is unaffected. Session/kernel-scoped, crate-internal/test only
+    /// and default-off.
+    ///
+    /// Caveat: re-arming (or [`disarm_route_telemetry`](Self::disarm_route_telemetry))
+    /// frees the previous record's device buffers, whose pointers an
+    /// instantiated CUDA graph bakes into its nodes; the caller MUST
+    /// `reset_graph` any capture that referenced the old record before
+    /// re-arming or disarming. Every current caller does so, and there is no
+    /// production caller.
+    #[doc(hidden)]
+    pub fn arm_route_telemetry(
+        &self,
+        config: RouteTelemetryConfig,
+    ) -> std::result::Result<(), TelemetryUnsupported> {
+        let armed = ArmedTelemetry::arm(&self.runtime, config)?;
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+        *telemetry = Some(armed);
+        Ok(())
+    }
+
+    /// Disarm and release any armed route-telemetry record. Idempotent. The
+    /// caller must first `reset_graph` any capture that referenced the record —
+    /// see [`arm_route_telemetry`](Self::arm_route_telemetry).
+    #[doc(hidden)]
+    pub fn disarm_route_telemetry(&self) {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        if let Some(previous) = telemetry.take() {
+            previous.free(&self.runtime);
+        }
+    }
+
+    /// Advance route telemetry to the next accumulation window at an explicit
+    /// **coarse safe boundary** (issue #1810 Slice 7A; design §2.3/§3). The
+    /// *only* place the epoch advances and the record is re-zeroed — the
+    /// execute path never resets it, so eager calls in a window accumulate the
+    /// routed-expert union and in-range count with a fixed epoch. Rejected
+    /// (returns `Err`) while the EP stream is capturing; otherwise drains prior
+    /// stream work through `drain_for_unmap` before re-stamping the header on the
+    /// host. No-op (`Ok`) when disarmed. Allocates nothing, moves no pointer.
+    /// Crate-internal / test-only; no production boundary-policy caller yet.
+    #[doc(hidden)]
+    pub fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        match telemetry.as_mut() {
+            Some(armed) => armed.reset_boundary(&self.runtime),
+            None => Ok(()),
+        }
+    }
+
+    /// Copy the current telemetry record to the host (test/observability only —
+    /// not the production CONSUME path; self-synchronizes). Returns `None` when
+    /// telemetry is not armed.
+    #[doc(hidden)]
+    pub fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        let telemetry = self
+            .telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned");
+        match telemetry.as_ref() {
+            Some(armed) => Ok(Some(armed.snapshot(&self.runtime)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Total device bytes held by the armed telemetry record (teardown /
+    /// accounting tests); `0` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_footprint_bytes(&self) -> usize {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned")
+            .as_ref()
+            .map_or(0, ArmedTelemetry::footprint_bytes)
+    }
+
+    /// Stable device VA of the armed telemetry bitmap (isolation / accounting
+    /// tests); `None` when disarmed.
+    #[doc(hidden)]
+    pub fn route_telemetry_bitmap_addr(&self) -> Option<u64> {
+        self.telemetry
+            .lock()
+            .expect("cuda_ep BQMoE telemetry poisoned")
+            .as_ref()
+            .map(ArmedTelemetry::bitmap_addr)
+    }
+}
+
+impl Drop for BlockQuantizedMoEKernel {
+    fn drop(&mut self) {
+        // Release any armed route-telemetry record (issue #1810 Slice 7A).
+        // `free` drains in-flight launches before returning the buffers.
+        if let Ok(telemetry) = self.telemetry.get_mut()
+            && let Some(armed) = telemetry.take()
+        {
+            armed.free(&self.runtime);
+        }
+    }
 }
 
 const WORKSPACE_ALIGNMENT: usize = 256;
@@ -966,6 +1128,31 @@ impl Kernel for BlockQuantizedMoEKernel {
         let activated = ptr(4);
         let route_output = ptr(5);
 
+        // Inert route telemetry (issue #1810 Slice 7A). When armed for this
+        // expert count, hand the stable-VA record pointers to the fused route
+        // kernel so its `atomicOr`/`atomicAdd` marks accumulate this call's
+        // routes into the *current window* (union bitmap + saturating count).
+        // There is deliberately **no reset/epoch launch here** — the window and
+        // its epoch advance only at an explicit `reset_route_telemetry_boundary`
+        // (design §2.3/§3), so consecutive eager calls accumulate rather than
+        // resetting per call. When disarmed — or armed for a different capacity —
+        // the pointers are null and the route kernel is byte-identical; a
+        // capacity mismatch leaves telemetry inert for this call and never fails
+        // inference. (BlockQuantizedMoE is not capture-capable — its trailing
+        // host sync predates this slice — so this adds no new synchronization.)
+        let (telemetry_bitmap, telemetry_header) = {
+            let telemetry = self
+                .telemetry
+                .lock()
+                .expect("cuda_ep BQMoE telemetry poisoned");
+            match telemetry.as_ref() {
+                Some(armed) if armed.matches_experts(experts) => {
+                    (armed.bitmap_ptr(), armed.header_ptr())
+                }
+                _ => (0u64, 0u64),
+            }
+        };
+
         self.launch_route(
             &inputs[1],
             router_weights,
@@ -973,6 +1160,8 @@ impl Kernel for BlockQuantizedMoEKernel {
             route_weights_ptr,
             rows,
             experts,
+            telemetry_bitmap,
+            telemetry_header,
         )?;
         self.launch_linear(
             tensor_ptr(&inputs[0]),
@@ -1043,6 +1232,7 @@ impl BlockQuantizedMoEKernel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch_route(
         &self,
         router_logits: &TensorView,
@@ -1051,6 +1241,8 @@ impl BlockQuantizedMoEKernel {
         route_weights: CUdeviceptr,
         rows: usize,
         experts: usize,
+        route_telemetry_bitmap: CUdeviceptr,
+        route_telemetry_header: CUdeviceptr,
     ) -> Result<()> {
         let function = self
             .runtime
@@ -1071,9 +1263,12 @@ impl BlockQuantizedMoEKernel {
             .arg(&rows_u64)
             .arg(&experts_i32)
             .arg(&top_k)
-            .arg(&normalize);
+            .arg(&normalize)
+            .arg(&route_telemetry_bitmap)
+            .arg(&route_telemetry_header);
         // SAFETY: scratch buffers cover rows*top_k entries and the scalar ABI
-        // matches `bqmoe_route`.
+        // matches `bqmoe_route`. Telemetry pointers are null when disarmed, which
+        // the kernel treats as inert.
         unsafe { builder.launch(config) }
             .map(|_| ())
             .map_err(|err| driver_err("launch BlockQuantizedMoE routing", err))

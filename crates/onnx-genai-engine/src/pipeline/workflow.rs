@@ -258,6 +258,12 @@ pub struct WorkflowExecutionPlan<'a> {
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
     max_iterations_only: bool,
+    /// Tokens this pass's prompt input carries, when a declared continuation
+    /// made them the conversation rather than just this turn's request.
+    ///
+    /// Kept because the cell this pass publishes is the whole conversation, and
+    /// the emitted stream alone is only its last turn.
+    continued_prompt: Option<Vec<i64>>,
 }
 
 #[derive(Default)]
@@ -520,6 +526,273 @@ fn session_state_value_name(cell: &str) -> String {
     format!("__session_state.{cell}")
 }
 
+/// The one cell whose lease says a conversation rejoins the next invocation
+/// through the prompt binding.
+///
+/// Validation admits at most one, so this returns the first rather than
+/// choosing between two: a package with two conversations was refused before it
+/// ever loaded.
+pub(crate) fn workflow_prompt_continuation(
+    workflow: &WorkflowSpec,
+) -> Option<(&str, &str, &str, &onnx_genai_metadata::WorkflowStateCell)> {
+    workflow.state.iter().find_map(|(cell, state)| {
+        let onnx_genai_metadata::SessionContinuation::PromptPrefix {
+            prompt_input,
+            tokens_output,
+        } = state.session.as_ref()?.continuation.as_ref()?;
+        Some((
+            cell.as_str(),
+            prompt_input.as_str(),
+            tokens_output.as_str(),
+            state,
+        ))
+    })
+}
+
+/// The declared upper bound on a continuation cell's length.
+///
+/// The validator makes the bound mandatory on a continuation and requires it to
+/// name a declared workflow input, so the value is bound before the pass starts
+/// and is knowable both when a turn is admitted and when it completes. Reading
+/// it here is what makes that statement load-bearing rather than decorative:
+/// nothing else checks it, because a continuation is deliberately not
+/// loop-carried and so never reaches the carry path's recurrence check.
+///
+/// A missing value is an error, not a skipped check. Returning "no bound" for a
+/// symbol the document named would be the silent version of the failure this
+/// exists to prevent.
+fn continuation_bound(
+    cell: &str,
+    state: &onnx_genai_metadata::WorkflowStateCell,
+    values: &PipelineTensors,
+) -> anyhow::Result<usize> {
+    let max = match &state.recurrence {
+        onnx_genai_metadata::ShapeRecurrence::Growing { max, .. }
+        | onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. } => max,
+        onnx_genai_metadata::ShapeRecurrence::Invariant => anyhow::bail!(
+            "session continuation state '{cell}' declares no growth bound, but a conversation \
+             grows with every turn"
+        ),
+    };
+    // Per-row bounds would be several conversations; a session is one, so the
+    // narrowest row is the bound the conversation has to keep.
+    workflow_usize_rows(values, max)?
+        .into_iter()
+        .min()
+        .with_context(|| {
+            format!("session continuation state '{cell}' bound '{max}' carries no value")
+        })
+}
+
+/// Read the tokens a session-scoped continuation cell holds, as a flat row.
+fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
+    let shape = value.shape();
+    let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+    anyhow::ensure!(
+        rows == 1,
+        "a session continues one conversation, but its state holds {rows} batch rows"
+    );
+    Ok(value.to_vec_i64()?)
+}
+
+/// Holds a session's exclusive lease for the length of one pass.
+///
+/// A lease declared `policy: exclusive` means one writer. Two turns that both
+/// read the conversation before either writes it would leave the loser's prompt
+/// and generation nowhere, and nothing would report that they were lost. The
+/// guard is released on drop, so a pass that fails or panics does not strand the
+/// session.
+struct SessionLeaseGuard<'a> {
+    leases: &'a RefCell<std::collections::HashSet<String>>,
+    session: String,
+}
+
+impl<'a> SessionLeaseGuard<'a> {
+    fn acquire(
+        leases: &'a RefCell<std::collections::HashSet<String>>,
+        session: &str,
+    ) -> anyhow::Result<Self> {
+        if !leases.borrow_mut().insert(session.to_string()) {
+            return Err(
+                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                    session: session.to_string(),
+                }
+                .into(),
+            );
+        }
+        Ok(Self {
+            leases,
+            session: session.to_string(),
+        })
+    }
+}
+
+impl Drop for SessionLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.leases.borrow_mut().remove(&self.session);
+    }
+}
+
+/// The SSA value a step binds to one component port.
+///
+/// The lease is written to that value, and not to a name only one of the ways a
+/// component can be invoked would consult: a component may run generically, be
+/// fused into an execution island, be implemented by a host contract, or be
+/// redirected by a component override, and all four resolve their inputs from
+/// the SSA value the step named. Validation refuses a document where a step
+/// could then overwrite it, so writing it before the pass is sound.
+fn session_group_port_binding<'a>(
+    steps: &'a [onnx_genai_metadata::WorkflowStep],
+    component: &str,
+    port: &str,
+) -> Option<&'a str> {
+    fn walk<'a>(
+        step: &'a onnx_genai_metadata::WorkflowStep,
+        component: &str,
+        port: &str,
+    ) -> Option<&'a str> {
+        use onnx_genai_metadata::WorkflowStep as Step;
+        match step {
+            Step::Sequence { steps } => steps.iter().find_map(|step| walk(step, component, port)),
+            Step::Invoke {
+                component: invoked,
+                inputs,
+                ..
+            } => (invoked == component)
+                .then(|| inputs.get(port).map(String::as_str))
+                .flatten(),
+            Step::Loop { setup, steps, .. } => setup
+                .iter()
+                .chain(steps)
+                .find_map(|step| walk(step, component, port)),
+            Step::Branch { cases, default, .. } => cases
+                .values()
+                .find_map(|step| walk(step, component, port))
+                .or_else(|| {
+                    default
+                        .as_ref()
+                        .and_then(|step| walk(step, component, port))
+                }),
+            Step::Emit { .. } => None,
+        }
+    }
+    steps.iter().find_map(|step| walk(step, component, port))
+}
+
+/// The SSA value a pass left in a group-backed session cell.
+///
+/// The group's alias names the `output` port that advances the state; the step
+/// that invoked the component names the value that port was bound to. Reading
+/// the port through the step is what keeps this independent of how any
+/// particular package spells its values.
+///
+/// The last binding wins: a component invoked several times in one pass has
+/// advanced the state each time, and the lease keeps where it ended.
+fn session_group_output_value(
+    workflow: &WorkflowSpec,
+    cell: &str,
+    values: &PipelineTensors,
+) -> Option<String> {
+    fn walk(
+        step: &onnx_genai_metadata::WorkflowStep,
+        component: &str,
+        port: &str,
+        values: &PipelineTensors,
+        found: &mut Option<String>,
+    ) {
+        use onnx_genai_metadata::WorkflowStep as Step;
+        match step {
+            Step::Sequence { steps } => {
+                steps
+                    .iter()
+                    .for_each(|step| walk(step, component, port, values, found));
+            }
+            Step::Invoke {
+                component: invoked,
+                outputs,
+                ..
+            } => {
+                if invoked == component
+                    && let Some(value) = outputs.get(port)
+                    && values.contains_key(value)
+                {
+                    *found = Some(value.clone());
+                }
+            }
+            Step::Loop { setup, steps, .. } => {
+                setup
+                    .iter()
+                    .chain(steps)
+                    .for_each(|step| walk(step, component, port, values, found));
+            }
+            Step::Branch { cases, default, .. } => {
+                cases
+                    .values()
+                    .for_each(|step| walk(step, component, port, values, found));
+                if let Some(default) = default {
+                    walk(default, component, port, values, found);
+                }
+            }
+            Step::Emit { .. } => {}
+        }
+    }
+    for (component, alias) in onnx_genai_metadata::session_group_aliases(workflow, cell) {
+        let Some(port) = alias.output.as_deref() else {
+            continue;
+        };
+        let mut found = None;
+        for step in &workflow.steps {
+            walk(step, component, port, values, &mut found);
+        }
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Tokens a pass published to one declared output.
+///
+/// This is the same selection [`super::PipelineOutputs`] makes and that the
+/// generate path reads — the aggregate value when the pass published one,
+/// otherwise the single request row. A conversation accumulates what a turn
+/// generated, and reading it by a second rule would let the session and the
+/// caller disagree about what was said.
+///
+/// A tokens output published as `mode: event` has no aggregate and no row, and
+/// the generate path already refuses such a package; there is nothing to
+/// accumulate here that a caller ever received.
+fn published_conversation_tokens(
+    values: &PipelineTensors,
+    row_outputs: &BTreeMap<String, Vec<String>>,
+    output: &str,
+) -> anyhow::Result<Vec<i64>> {
+    if let Some(value) = values.get(output) {
+        return continuation_tokens(value);
+    }
+    let rows = row_outputs.get(output).map(Vec::as_slice).unwrap_or(&[]);
+    anyhow::ensure!(
+        rows.len() <= 1,
+        "a session continues one conversation, but this pass published {} request rows to \
+         '{output}'",
+        rows.len()
+    );
+    match rows.first().and_then(|name| values.get(name)) {
+        Some(value) => continuation_tokens(value),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// Whether this workflow declares state a session can actually carry.
+///
+/// Answered by [`onnx_genai_metadata::classify_session_state`], which is also
+/// what the validator reads, so a package the document blesses and a package
+/// this runtime will open a session for are the same set. Computing it twice is
+/// how they came to disagree about state service groups.
+pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
+    onnx_genai_metadata::classify_session_state(workflow).carries_any()
+}
+
 impl WorkflowRuntime {
     fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
         if value.is_host_resident()? {
@@ -707,6 +980,69 @@ impl WorkflowRuntime {
     }
 }
 
+impl WorkflowRuntime {
+    /// Rejoin a session's conversation to this turn's prompt.
+    ///
+    /// Returns the request the pass actually runs and, when a continuation
+    /// applies, the token row the prompt input now carries. A request with no
+    /// session, or a package declaring no continuation, is returned untouched —
+    /// stateless generation is the same execution it always was, and this is
+    /// where that is guaranteed rather than in each caller.
+    fn continue_session_prompt(
+        &self,
+        request: GenerateRequest,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<(GenerateRequest, Option<Vec<i64>>)> {
+        let Some((cell, _, _, _)) = workflow_prompt_continuation(&self.workflow) else {
+            return Ok((request, None));
+        };
+        let Some(session_id) = session_id else {
+            return Ok((request, None));
+        };
+        let history = match self
+            .workflow_session_state
+            .borrow()
+            .get(&(session_id.to_string(), cell.to_string()))
+        {
+            Some(value) => continuation_tokens(value)
+                .with_context(|| format!("session state '{cell}' is not a conversation"))?,
+            None => Vec::new(),
+        };
+        let turn: Vec<i64> = match &request.prompt {
+            GeneratePrompt::TokenIds(tokens) => {
+                tokens.iter().map(|token| i64::from(*token)).collect()
+            }
+            GeneratePrompt::TokenRows(rows) => {
+                anyhow::ensure!(
+                    rows.len() == 1,
+                    "a session continues one conversation, but this request carries {} prompt \
+                     rows; batch several requests instead of several rows in a session",
+                    rows.len()
+                );
+                rows[0].iter().map(|token| i64::from(*token)).collect()
+            }
+            GeneratePrompt::Text(_) => anyhow::bail!(
+                "a session-continued prompt must reach the workflow as token ids; this request \
+                 still carries text"
+            ),
+        };
+        let mut conversation: Vec<i64> = history;
+        conversation.extend_from_slice(&turn);
+        let tokens = conversation
+            .iter()
+            .map(|token| u32::try_from(*token))
+            .collect::<Result<Vec<_>, _>>()
+            .context("a conversation token id does not fit the prompt token type")?;
+        Ok((
+            GenerateRequest {
+                prompt: GeneratePrompt::TokenIds(tokens),
+                options: request.options,
+            },
+            Some(conversation),
+        ))
+    }
+}
+
 impl<'a> WorkflowExecutionPlan<'a> {
     pub(crate) fn new(
         engine: &'a WorkflowRuntime,
@@ -736,6 +1072,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
         } = request;
         let workflow = &engine.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
+        // A conversation the package declares as a prompt prefix rejoins here,
+        // before anything is bound: every input derived from the prompt — the
+        // token tensor, its length, the mask the initializer builds from it —
+        // is then derived from the *whole* conversation, exactly as it would be
+        // for a caller who sent it in one request. Rewriting the bound tensors
+        // afterwards would leave the derived ones describing only this turn.
+        let (request, continued_prompt) =
+            engine.continue_session_prompt(request, session_id.as_deref())?;
         let host_supplied = if hosted.is_empty() {
             std::collections::HashSet::new()
         } else {
@@ -814,6 +1158,32 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         let input_names = values.keys().cloned().collect::<Vec<_>>();
+        // The bound the continuation cell declares is the package's own context
+        // limit, and this is the only place it can be checked: a continuation is
+        // deliberately not loop-carried, so it never reaches the carry path's
+        // recurrence check.
+        //
+        // It is checked against the conversation *and the budget this turn was
+        // admitted with*, because a turn refused after it has generated is a
+        // turn whose work and whose stream are thrown away. Admission is the
+        // last moment at which refusing costs nothing.
+        if let Some(conversation) = continued_prompt.as_deref()
+            && let Some((cell, _, _, state)) = workflow_prompt_continuation(workflow)
+        {
+            let bound = continuation_bound(cell, state, &values)?;
+            let budget = request.options.max_new_tokens;
+            let requested = conversation.len().saturating_add(budget);
+            if requested > bound {
+                return Err(
+                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                        cell: cell.to_string(),
+                        requested,
+                        bound,
+                    }
+                    .into(),
+                );
+            }
+        }
         let input_aliases = workflow
             .inputs
             .iter()
@@ -840,6 +1210,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             session_id,
             component_overrides,
             max_iterations_only: !request.options.stop_on_eos,
+            continued_prompt,
         })
     }
 
@@ -976,19 +1347,75 @@ impl<'a> WorkflowExecutionPlan<'a> {
             return Err(error);
         }
         let _adapter_context_guard = ActiveAdapterContextGuard(&engine.active_adapter_context);
-        for (cell, state) in &workflow.state {
-            if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
-                continue;
+        // A package may declare session state and still be asked for a single
+        // stateless generation — that is the first turn of every conversation,
+        // and it is also what `Engine::generate` is. Without a session there is
+        // no lease to read, so each cell starts from the initializer it
+        // declares; refusing here would make declaring a conversation cost a
+        // package the ability to answer one question.
+        let session_state = onnx_genai_metadata::classify_session_state(workflow);
+        // Taken before the lease is read and released when the pass ends,
+        // whichever way it ends. Declared session contracts validate as
+        // exclusive, and cells without one use the schema's exclusive default,
+        // so every carried session cell requires this guard.
+        let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
+            (Some(session_id), true) => {
+                match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        self.retain_inputs(&mut values);
+                        return Err(error);
+                    }
+                }
             }
-            let session_id = self.session_id.as_ref().with_context(|| {
-                format!("session-scoped workflow state '{cell}' requires a session id")
-            })?;
-            if let Some(value) = engine
-                .workflow_session_state
-                .borrow()
-                .get(&(session_id.clone(), cell.clone()))
-            {
-                values.insert(session_state_value_name(cell), clone_value(value)?);
+            _ => None,
+        };
+        if let Some(session_id) = self.session_id.as_ref() {
+            for (cell, carrier) in session_state.carried() {
+                let Some(value) = engine
+                    .workflow_session_state
+                    .borrow()
+                    .get(&(session_id.to_string(), cell.to_string()))
+                    .map(clone_value)
+                    .transpose()?
+                else {
+                    continue;
+                };
+                match carrier {
+                    // A loop reads its lease where it seeds the carry.
+                    onnx_genai_metadata::SessionStateCarrier::LoopCarry => {
+                        values.insert(session_state_value_name(cell), value);
+                    }
+                    // A group holds the storage, and the graph reaches it
+                    // through the `input` port its alias declares. The lease is
+                    // bound at that port rather than written over the SSA value
+                    // the cell's initializer names: that value may be produced
+                    // by a step — which would overwrite the lease and restart
+                    // the session with no error — and may be read by consumers
+                    // the group has nothing to do with.
+                    onnx_genai_metadata::SessionStateCarrier::StateServiceGroup => {
+                        for (component, alias) in
+                            onnx_genai_metadata::session_group_aliases(workflow, cell)
+                        {
+                            let bound = session_group_port_binding(
+                                &workflow.steps,
+                                component,
+                                &alias.input,
+                            )
+                            .with_context(|| {
+                                format!(
+                                    "session state '{cell}' is held by a state service group \
+                                     whose alias reads component '{component}' port '{}', but no \
+                                     step binds it",
+                                    alias.input
+                                )
+                            })?;
+                            values.insert(bound.to_string(), clone_value(&value)?);
+                        }
+                    }
+                    // Bound into the prompt before this plan was built.
+                    onnx_genai_metadata::SessionStateCarrier::PromptContinuation => {}
+                }
             }
         }
         let mut symbols = self.initial_symbols.clone();
@@ -1028,21 +1455,97 @@ impl<'a> WorkflowExecutionPlan<'a> {
             )?;
         }
         if let Some(session_id) = &self.session_id {
+            let continuation = workflow_prompt_continuation(workflow)
+                .map(|(cell, _, tokens_output, _)| (cell.to_string(), tokens_output.to_string()));
             let mut updates = Vec::new();
-            for (cell, state) in &workflow.state {
-                if state.scope != onnx_genai_metadata::WorkflowStateScope::Session {
+            for (cell, carrier) in session_state.carried() {
+                let state = workflow
+                    .state
+                    .get(cell)
+                    .expect("a classified cell is declared");
+                // The conversation this pass leaves behind is the prompt it ran
+                // — which already carried every earlier turn — followed by what
+                // it published. Reading it off the emitted stream alone would
+                // drop everything before this turn; reading it off the cell's
+                // final SSA value would drop the turn, because no step in the
+                // workflow writes the conversation.
+                if let Some((continued_cell, tokens_output)) = &continuation
+                    && continued_cell == cell
+                {
+                    let prompt = self.continued_prompt.as_deref().unwrap_or_default();
+                    let mut conversation = prompt.to_vec();
+                    conversation.extend(published_conversation_tokens(
+                        &values,
+                        &telemetry.row_outputs,
+                        tokens_output,
+                    )?);
+                    let length = conversation.len() as i64;
+                    // Admission already refused a turn whose conversation plus
+                    // budget exceeds the bound, so reaching this means the pass
+                    // published more tokens than it was admitted for. Storing it
+                    // would leave the session in a state its own declaration
+                    // forbids and every later turn would fail the same way with
+                    // no way back, so this refuses — and names the package,
+                    // because a caller cannot cause it.
+                    let bound = continuation_bound(cell, state, &values)?;
+                    if conversation.len() > bound {
+                        return Err(
+                            crate::engine::PackageCapabilityError::ConversationOverBound {
+                                cell: cell.to_string(),
+                                requested: conversation.len(),
+                                bound,
+                            }
+                            .into(),
+                        );
+                    }
+                    let shape = match state.contract.rank {
+                        1 => vec![length],
+                        2 => vec![1, length],
+                        rank => anyhow::bail!(
+                            "session continuation state '{cell}' must have rank 1 or 2, got {rank}"
+                        ),
+                    };
+                    updates.push((
+                        (session_id.clone(), cell.to_string()),
+                        Value::from_slice_i64(&conversation, &shape)?,
+                    ));
                     continue;
                 }
-                let value_ref = final_state_refs
-                    .get(cell)
-                    .map(String::as_str)
-                    .unwrap_or(&state.initializer);
+                // What the next lease holds is what this pass left in the
+                // cell. A loop carry records that in `final_state_refs`. A
+                // group-backed cell is advanced by the graph writing the
+                // alias's `output` port, so the value bound to that port is the
+                // one to keep — reading the initializer instead would store the
+                // value the pass *started* from and replay it forever.
+                let group_output =
+                    if carrier == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup {
+                        // Fail closed. Falling back to the initializer here would
+                        // store the value the pass *started* from, so the next turn
+                        // would replay this one — a wrong answer that looks like a
+                        // working session. A group cell advanced inside a branch is
+                        // the shape that reaches this.
+                        Some(session_group_output_value(workflow, cell, &values).with_context(|| {
+                        format!(
+                            "session state '{cell}' is held by a state service group, but this \
+                             pass bound no value to the group's output port for it, so the lease \
+                             could only be stored as the value the turn started from"
+                        )
+                    })?)
+                    } else {
+                        None
+                    };
+                let value_ref = group_output.as_deref().unwrap_or_else(|| {
+                    final_state_refs
+                        .get(cell)
+                        .map(String::as_str)
+                        .unwrap_or(&state.initializer)
+                });
                 let value = values.get(value_ref).with_context(|| {
                     format!(
                         "session-scoped workflow state '{cell}' has no final value '{value_ref}'"
                     )
                 })?;
-                updates.push(((session_id.clone(), cell.clone()), clone_value(value)?));
+                updates.push(((session_id.clone(), cell.to_string()), clone_value(value)?));
             }
             let mut session_state = engine.workflow_session_state.borrow_mut();
             for (key, value) in updates {

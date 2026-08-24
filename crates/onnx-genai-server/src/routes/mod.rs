@@ -17,8 +17,8 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, ResourceLimit, SamplingOverrides, TokenLogprob, XtcConfig,
-    parse_resource_limit,
+    MirostatConfig, MirostatVersion, PackageCapabilityError, ResourceLimit, SamplingOverrides,
+    TokenLogprob, XtcConfig, parse_resource_limit,
 };
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
@@ -389,9 +389,9 @@ struct ErrorBody {
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
-    kind: &'static str,
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    pub(crate) kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -413,12 +413,32 @@ pub(crate) enum CompletionGeneration {
         options: GenerateOptions,
     },
 }
+/// `error.type` for a request that conflicts with the state or the capability of
+/// what is loaded.
+///
+/// A 409 is never a fault: nothing broke, and the caller can act on it. Reporting
+/// one as `server_error` told a client to retry a crash.
+pub(crate) const CONFLICT_ERROR_KIND: &str = "conflict_error";
+
+/// `error.type` for a request the loaded package cannot serve as asked.
+pub(crate) const INVALID_REQUEST_ERROR_KIND: &str = "invalid_request_error";
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             kind: "server_error",
+            retry_after_secs: None,
+        }
+    }
+
+    /// A request the loaded package cannot serve, and no retry will change.
+    fn invalid_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: INVALID_REQUEST_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -450,11 +470,13 @@ impl ApiError {
         }
     }
 
+    /// The request conflicts with the state or the capability of what is
+    /// loaded.
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
-            kind: "server_error",
+            kind: CONFLICT_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -478,7 +500,33 @@ impl ApiError {
     }
 }
 
-fn generation_failure(error: DriverFailure) -> ApiError {
+/// Turn a session-creation failure into the status it actually is.
+///
+/// A package that declares no conversation is not a server fault and not a
+/// malformed request: the caller asked this package for something it does not
+/// support, which is what 409 says. Reporting it as a 500 told a client to retry
+/// something that will never succeed, and hid a package defect behind an
+/// operational one.
+pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
+    match onnx_genai_engine::package_capability_error(&error) {
+        Some(capability) => package_capability_failure(capability),
+        None => ApiError::internal(format!("session create failed: {error}")),
+    }
+}
+
+fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
+    match capability {
+        PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageCapabilityError::ConversationOverBound { .. } => {
+            ApiError::invalid_request(capability.to_string())
+        }
+        PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
+    }
+}
+
+pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
     match error.kind {
         DriverFailureKind::MemoryOverload => {
             tracing::warn!(
@@ -487,6 +535,12 @@ fn generation_failure(error: DriverFailure) -> ApiError {
             );
             ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
         }
+        // The caller asked this package for something it cannot serve as asked.
+        // A conversation past its declared bound is a request that is too large
+        // and the caller can shorten; a busy session is a conflict that the same
+        // request succeeds at once the turn in flight finishes. Both are read
+        // off the engine's own type, so neither status depends on wording.
+        DriverFailureKind::PackageCapability(capability) => package_capability_failure(capability),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }

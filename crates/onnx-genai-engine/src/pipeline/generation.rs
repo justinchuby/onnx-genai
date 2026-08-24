@@ -886,8 +886,70 @@ pub(crate) fn serving_control_seeds(workflow: &WorkflowSpec) -> BTreeMap<String,
 /// nothing about what a package gets. Building it from the same emitter a real
 /// minimal decoder goes through keeps these cases on the production path
 /// instead of a bespoke shape that could diverge from it.
+/// Cells any loop carries, at any nesting depth.
+///
+/// The metadata crate computes this for its own validator but keeps it
+/// crate-private, so this fixture reads the same field rather than assuming the
+/// canonical decoder puts its loop at the top level.
+#[cfg(test)]
+fn loop_carried_cell_names(
+    steps: &[onnx_genai_metadata::WorkflowStep],
+) -> std::collections::BTreeSet<String> {
+    use onnx_genai_metadata::WorkflowStep;
+    fn walk(step: &WorkflowStep, cells: &mut std::collections::BTreeSet<String>) {
+        match step {
+            WorkflowStep::Sequence { steps } => steps.iter().for_each(|step| walk(step, cells)),
+            WorkflowStep::Loop {
+                setup,
+                steps,
+                carried,
+                ..
+            } => {
+                cells.extend(carried.iter().map(|carry| carry.cell.clone()));
+                setup.iter().for_each(|step| walk(step, cells));
+                steps.iter().for_each(|step| walk(step, cells));
+            }
+            WorkflowStep::Branch { cases, default, .. } => {
+                cases.values().for_each(|step| walk(step, cells));
+                if let Some(default) = default {
+                    walk(default, cells);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut cells = std::collections::BTreeSet::new();
+    steps.iter().for_each(|step| walk(step, &mut cells));
+    cells
+}
+
 #[cfg(test)]
 pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(false)
+}
+
+/// The same canonical decoder, declaring the conversation it carries.
+///
+/// [`test_decoder_runtime`] builds a package whose state is all
+/// `scope: invocation` — correctly, because a bare decoder restarts from its
+/// own prompt every turn. `Engine::create_session` refuses exactly that
+/// package, so a test about *session* behaviour cannot use it and must not
+/// paper over the refusal: the refusal is the feature.
+///
+/// Promoting the loop-carried cells to `scope: session` is the smallest
+/// difference that makes the package session-capable, and it is the shape a
+/// real multi-turn decoder declares — the cells the loop already threads from
+/// one iteration to the next are the ones a session threads from one turn to
+/// the next. Nothing else about the workflow changes, so a session test and a
+/// stateless test still differ in one declared property rather than in two
+/// unrelated fixtures.
+#[cfg(test)]
+pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(true)
+}
+
+#[cfg(test)]
+fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRuntime> {
     let abi = onnx_genai_metadata::DecoderAbi {
         token_input: Some("input_ids".to_string()),
         logits_output: Some("logits".to_string()),
@@ -895,7 +957,7 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
         kv_outputs: Some(vec!["present.key".to_string(), "present.value".to_string()]),
         ..onnx_genai_metadata::DecoderAbi::default()
     };
-    let workflow = onnx_genai_metadata::decoder_workflow::decoder_workflow(
+    let mut workflow = onnx_genai_metadata::decoder_workflow::decoder_workflow(
         &abi,
         "model.onnx",
         &onnx_genai_metadata::decoder_workflow::DecoderFacts::default(),
@@ -903,6 +965,32 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
     .map_err(|error| {
         anyhow::anyhow!("a minimal decoder is expressible as a workflow: {error:?}")
     })?;
+    if session_scoped {
+        let carried = loop_carried_cell_names(&workflow.steps);
+        anyhow::ensure!(
+            !carried.is_empty(),
+            "the canonical decoder workflow is expected to carry state through its loop; \
+             promoting nothing would produce a package that still declares no session state \
+             and this fixture would silently build the stateless one"
+        );
+        let mut promoted = 0usize;
+        for (cell, state) in workflow.state.iter_mut() {
+            if carried.contains(cell) {
+                state.scope = onnx_genai_metadata::WorkflowStateScope::Session;
+                promoted += 1;
+            }
+        }
+        anyhow::ensure!(
+            promoted > 0,
+            "no declared state cell matched a loop carry, so this fixture would be \
+             indistinguishable from the stateless one"
+        );
+        anyhow::ensure!(
+            crate::pipeline::workflow_carries_session_state(&workflow),
+            "the promoted workflow must satisfy the same predicate `create_session` reads, \
+             or this fixture proves nothing about sessions"
+        );
+    }
     validate_generation_workflow(&workflow)?;
     let directory = onnx_genai_ort::PipelineModelDirectory {
         root: std::path::PathBuf::from("."),

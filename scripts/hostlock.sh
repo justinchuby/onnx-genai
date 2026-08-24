@@ -29,6 +29,28 @@
 # mixed UIDs one user cannot rename or remove another's lock and takeover,
 # reaping and release all fail with EPERM.
 #
+# WHERE THE LOCK LIVES
+#   Default: /tmp/onnx-genai-hostlock, and everyone on the box must resolve
+#   the same path or the lock coordinates nothing.
+#
+#   To move it (host with an unwritable, noexec, or per-service /tmp), write a
+#   MACHINE-LOCAL config, which every invocation by every agent reads:
+#       ~/.config/onnx-genai/hostlock.conf     (or $XDG_CONFIG_HOME, or
+#                                               $HOSTLOCK_CONF)
+#       lock_dir=/var/lib/onnx-genai/hostlock
+#   Absolute paths only; the file is parsed, never sourced. While a config is
+#   in effect, `acquire`/`run` still consult the old /tmp path READ-ONLY and
+#   refuse (exit 2) while a live holder is there, because a peer who has not
+#   re-read the config cannot see the new lock.
+#
+#   $HOSTLOCK_DIR also overrides the path, and is NOT the same thing: it is
+#   per process, so it does not move peers with you. It is a PRIVATE lock,
+#   which acquires instantly every time and collides with nobody, and every
+#   invocation says so on stderr unless HOSTLOCK_PRIVATE_OK=1 acknowledges it.
+#   `status --porcelain` and `provenance` emit lock_dir/lock_scope/
+#   lock_dir_source, so a recorded row says which lock its `declared=yes` is
+#   a claim about.
+#
 # Usage:
 #   hostlock.sh status [--porcelain]    # who holds it, is that holder alive
 #   hostlock.sh acquire [opts]          # take it, or fail / wait
@@ -40,7 +62,13 @@
 #
 # Options for acquire/run:
 #   --reason TEXT     what you are running (shown to whoever is blocked)
-#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER
+#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER.
+#                     `run` exports a DECLARED owner (--owner, or an inherited
+#                     $HOSTLOCK_OWNER) to the wrapped command, so a harness
+#                     that reads the lock can recognise its own. A $USER
+#                     default is never exported: every agent on a shared box
+#                     runs as the same unix user, so that would make every
+#                     lock read as ours. See #1929.
 #   --wait            block until free instead of failing immediately
 #   --timeout S       give up after S seconds (default 3600 with --wait)
 #   --gate N          after taking the lock, also wait until the instantaneous
@@ -222,22 +250,165 @@
 
 set -uo pipefail
 
-# Deliberately a fixed path, NOT $TMPDIR. A whole-host lock is only worth
-# anything if every agent on the box resolves it to the same directory, and
-# TMPDIR is per-session: one agent with it set would get a private lock,
-# acquire it instantly every time, and never once collide with anybody --
-# coordination that silently does nothing is worse than none, because it is
-# believed. Override with HOSTLOCK_DIR only for testing.
-LOCK_DIR="${HOSTLOCK_DIR:-/tmp/onnx-genai-hostlock}"
+die() {
+    echo "hostlock: $*" >&2
+    exit 1
+}
+
+# WHERE THE LOCK LIVES, and why it is not simply $TMPDIR or simply a constant.
+#
+# A whole-host lock is only worth anything if every agent on the box resolves
+# it to the same directory. TMPDIR is per-session: one agent with it set would
+# get a private lock, acquire it instantly every time, and never once collide
+# with anybody -- coordination that silently does nothing is worse than none,
+# because it is believed.
+#
+# HOSTLOCK_DIR has exactly that failure mode, and the reason it is still here
+# is that the test suite needs a lock it cannot deadlock the real host with.
+# So the two overrides are deliberately NOT equivalent:
+#
+#   env HOSTLOCK_DIR  -- PRIVATE. It is set per process, so two agents on one
+#                        box do not converge on it. Announced loudly (see
+#                        warn_if_private) because a private lock reports
+#                        FREE/HELD in bytes identical to the shared one.
+#   config lock_dir=  -- BOX-WIDE. A file on the machine is read by every
+#                        invocation by every agent, so redirecting the lock
+#                        there moves all of them together. This is the
+#                        supported way off /tmp for hosts where /tmp is
+#                        unwritable, noexec, per-service (systemd
+#                        PrivateTmp=), or where a policy forbids writing it.
+#
+# The config file is PARSED, never sourced: it is a fixed path that any
+# process on the box can write, so `.` would make it an execution vector for
+# every hostlock invocation by every agent.
+# The built-in path, and the seam that makes the legacy-holder consult
+# testable. The consult below reads whatever path this box used BEFORE a
+# config moved the lock -- which for every real host is /tmp. A conformance
+# suite cannot fabricate a live holder there: it would have to write the real
+# shared lock and deadlock the actual machine, so that branch would be the one
+# piece of this design that ships untested. HOSTLOCK_LEGACY_DIR redirects it,
+# and every row emits `legacy_dir=` so a run made with the seam active says so
+# rather than looking like a run that consulted the real path.
+HOSTLOCK_BUILTIN_DIR=/tmp/onnx-genai-hostlock
+HOSTLOCK_LEGACY_PATH="${HOSTLOCK_LEGACY_DIR:-$HOSTLOCK_BUILTIN_DIR}"
+HOSTLOCK_CONF_PATH="${HOSTLOCK_CONF:-${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/onnx-genai/hostlock.conf}"
+
+# Echo the configured lock_dir, or return 1 when there is no usable one.
+# Comments and surrounding whitespace are stripped; the first key wins.
+conf_lock_dir() {
+    local v
+    [ -f "$HOSTLOCK_CONF_PATH" ] || return 1
+    v=$(sed -n 's/^[[:space:]]*lock_dir[[:space:]]*=[[:space:]]*//p' "$HOSTLOCK_CONF_PATH" 2>/dev/null | head -1)
+    v=${v%%#*}
+    v=$(printf '%s' "$v" | sed 's/[[:space:]]*$//')
+    [ -n "$v" ] || return 1
+    printf '%s\n' "$v"
+}
+
+# SHARED_LOCK_DIR is where peers on this box coordinate, whatever THIS process
+# was told to use. Resolved unconditionally so the private-lock warning can
+# name the path the caller is failing to coordinate on -- "this is private" is
+# only actionable alongside "and everyone else is over there".
+if SHARED_LOCK_DIR=$(conf_lock_dir); then
+    case "$SHARED_LOCK_DIR" in
+        /*) ;;
+        *) SHARED_LOCK_DIR="" ;;
+    esac
+else
+    SHARED_LOCK_DIR=""
+fi
+
+if [ -n "${HOSTLOCK_DIR:-}" ]; then
+    LOCK_DIR="$HOSTLOCK_DIR"
+    LOCK_DIR_SOURCE="env"
+    LOCK_SCOPE=private
+elif [ -n "$SHARED_LOCK_DIR" ]; then
+    LOCK_DIR="$SHARED_LOCK_DIR"
+    LOCK_DIR_SOURCE=config
+    LOCK_SCOPE=box
+else
+    # A config that exists but whose lock_dir is unusable is a configuration
+    # ERROR, not a reason to quietly use /tmp: the admin who wrote it may have
+    # done so because /tmp does not work here, and half the box silently
+    # falling back is the lock-splitting defect this whole block exists to
+    # prevent. Only the env path (tests) skips this, because it never consults
+    # the config in the first place.
+    if [ -f "$HOSTLOCK_CONF_PATH" ] && grep -q '^[[:space:]]*lock_dir[[:space:]]*=' "$HOSTLOCK_CONF_PATH" 2>/dev/null; then
+        die "${HOSTLOCK_CONF_PATH}: lock_dir must be a non-empty absolute path (got '$(conf_lock_dir || true)')"
+    fi
+    LOCK_DIR="$HOSTLOCK_BUILTIN_DIR"
+    LOCK_DIR_SOURCE=default
+    LOCK_SCOPE=box
+fi
+[ -n "$SHARED_LOCK_DIR" ] || SHARED_LOCK_DIR="$HOSTLOCK_BUILTIN_DIR"
+
 UNPARSEABLE_GRACE=300
 REAPER_GRACE=60
 REAP_DIR="${LOCK_DIR}.reaper"
 REAP_META="${REAP_DIR}/meta"
 META="${LOCK_DIR}/meta"
 
-die() {
-    echo "hostlock: $*" >&2
-    exit 1
+# Say so, on every invocation, when this process is coordinating with nobody.
+#
+# The defect this closes: with HOSTLOCK_DIR set, `status` printed "FREE" and
+# `status --porcelain` printed `state=FREE` in bytes IDENTICAL to a genuinely
+# free shared host -- while a peer held the real one. The output was not
+# wrong about what it measured; it was silent about what it measured. Nothing
+# downstream, and no human reading a scrollback, could tell the two apart.
+#
+# HOSTLOCK_PRIVATE_OK=1 silences it, and the suite sets it: three lines of
+# stderr per invocation across hundreds of invocations is how a warning gets
+# deleted for being noise. It is an explicit acknowledgement, which is the
+# same shape as --gate's timeout decision: the caller must say the word.
+warn_if_private() {
+    [ "$LOCK_SCOPE" = private ] || return 0
+    [ "${HOSTLOCK_PRIVATE_OK:-0}" = 1 ] && return 0
+    echo "hostlock: WARNING: HOSTLOCK_DIR is set, so this is a PRIVATE lock at ${LOCK_DIR}." >&2
+    echo "hostlock: it coordinates with NOBODY -- peers on this host use ${SHARED_LOCK_DIR}." >&2
+    echo "hostlock: set HOSTLOCK_PRIVATE_OK=1 to acknowledge and silence (the test suite does)." >&2
+}
+
+# Is somebody still holding the OLD default path?
+#
+# Only asked when a config has moved this box off /tmp, and answered strictly
+# READ-ONLY: never reap it, never write to it, never touch its metadata. A
+# peer holding the legacy path is by definition running a version or a session
+# that has not re-read the config, so it will not see us move it and it cannot
+# be negotiated with -- it can only be waited out.
+#
+# Echoes "<owner> <pid>" for a live legacy holder, returns 1 otherwise.
+legacy_holder() {
+    local m pid start owner mtime age
+    [ "$LOCK_DIR_SOURCE" = config ] || return 1
+    [ "$LOCK_DIR" != "$HOSTLOCK_LEGACY_PATH" ] || return 1
+    [ -d "$HOSTLOCK_LEGACY_PATH" ] || return 1
+    m="${HOSTLOCK_LEGACY_PATH}/meta"
+    pid=$(sed -n 's/^anchor_pid=//p' "$m" 2>/dev/null | head -1)
+    start=$(sed -n 's/^start_time=//p' "$m" 2>/dev/null | head -1)
+    owner=$(sed -n 's/^owner=//p' "$m" 2>/dev/null | head -1)
+    if [ -z "$pid" ] || [ -z "$start" ]; then
+        # Unreadable metadata is not evidence of a dead holder (same rule as
+        # `reapable`), but an abandoned corpse on a path we will never reap
+        # must not block this host forever. Busy while fresh, ignored once it
+        # has clearly aged out.
+        mtime=$(stat -c %Y "$HOSTLOCK_LEGACY_PATH" 2>/dev/null || echo 0)
+        age=$(( $(date +%s) - mtime ))
+        [ "$age" -le "$UNPARSEABLE_GRACE" ] && { printf 'unknown ?\n'; return 0; }
+        return 1
+    fi
+    anchor_alive "$pid" "$start" || return 1
+    printf '%s %s\n' "${owner:-unknown}" "$pid"
+}
+
+# Fail closed while a legacy holder is live. Called before any acquire.
+refuse_if_legacy_held() {
+    local h
+    h=$(legacy_holder) || return 0
+    echo "hostlock: BUSY (legacy path)" >&2
+    echo "hostlock: ${HOSTLOCK_LEGACY_PATH} is held by ${h% *} (pid ${h#* }), which is the path this host used" >&2
+    echo "hostlock: before ${HOSTLOCK_CONF_PATH} moved the lock to ${LOCK_DIR}. That holder cannot see our lock," >&2
+    echo "hostlock: so taking this one would put two benchmarks on the box. Wait for it to release." >&2
+    return 2
 }
 
 # Start time (field 22) of a pid, robust to a comm containing spaces or
@@ -821,9 +992,11 @@ remove_lock_if_mine() {
 # are both "runnable > 1" and only one of them ruins a measurement. With no
 # expectation the field is `unknown`, which is a fact, unlike a guess.
 cmd_provenance() {
-    local state owner pid age reason takeover gate r r_acq contended uid
+    local state owner pid age reason takeover gate r r_acq contended uid legacy
     state=$(lock_state)
     r=$(runnable_now)
+    legacy=$(legacy_holder) || legacy=""
+    legacy=${legacy%% *}
     owner=none ; pid=none ; age=unknown ; reason='' ; takeover=unknown ; gate=unknown
     r_acq=unknown ; uid=unknown
     if [ -d "$LOCK_DIR" ]; then
@@ -878,6 +1051,17 @@ cmd_provenance() {
         "runnable_at_acquire=${r_acq:-unknown}"
         "runnable=${r}"
         "contended=${contended}"
+        # WHICH lock this row is about. Without it a private lock's row is
+        # byte-identical to a shared one, so a table of measurements taken
+        # with HOSTLOCK_DIR set -- coordinating with nobody -- reads exactly
+        # like a table taken under the real host lock. `declared=yes` is a
+        # claim about a host; it is only checkable if the row says which
+        # directory the claim was made in.
+        "lock_dir=${LOCK_DIR}"
+        "lock_scope=${LOCK_SCOPE}"
+        "lock_dir_source=${LOCK_DIR_SOURCE}"
+        "legacy_dir=$(legacy_consult_path)"
+        "legacy_held_by=${legacy:-none}"
         "sampled_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     )
     if [ "$ONELINE" = 1 ]; then
@@ -894,10 +1078,39 @@ cmd_provenance() {
     fi
 }
 
+# Which path the legacy consult actually reads, or `none` when no consult
+# applies. Emitted into every machine-readable row: `declared=yes` measured on
+# a box mid-migration means something different from `declared=yes` on a box
+# that never moved, and a row that does not say which cannot be re-checked.
+legacy_consult_path() {
+    if [ "$LOCK_DIR_SOURCE" = config ] && [ "$LOCK_DIR" != "$HOSTLOCK_LEGACY_PATH" ]; then
+        printf '%s\n' "$HOSTLOCK_LEGACY_PATH"
+    else
+        printf 'none\n'
+    fi
+}
+
+# The human `status` says WHICH lock it is about whenever that is not the
+# default. "FREE" is the answer most likely to be acted on and the one whose
+# meaning depends entirely on the directory it was measured in.
+status_lock_dir_note() {
+    local legacy=$1
+    [ "$LOCK_DIR_SOURCE" = default ] || echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
+    [ "$legacy" != none ] && echo "  legacy: ${HOSTLOCK_LEGACY_PATH} is still held by ${legacy%% *} (pid ${legacy##* }); acquire will refuse"
+    return 0
+}
+
 cmd_status() {
+    local legacy
+    legacy=$(legacy_holder) || legacy="none"
     if [ "$PORCELAIN" = 1 ]; then
         echo "state=$(lock_state)"
         echo "runnable=$(runnable_now)"
+        echo "lock_dir=${LOCK_DIR}"
+        echo "lock_scope=${LOCK_SCOPE}"
+        echo "lock_dir_source=${LOCK_DIR_SOURCE}"
+        echo "legacy_dir=$(legacy_consult_path)"
+        echo "legacy_held_by=${legacy%% *}"
         if [ -d "$LOCK_DIR" ]; then
             echo "owner=$(meta_get owner || echo '?')"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
@@ -909,6 +1122,7 @@ cmd_status() {
     fi
     if [ ! -d "$LOCK_DIR" ]; then
         echo "FREE  (runnable=$(runnable_now))"
+        status_lock_dir_note "$legacy"
         return 0
     fi
     local owner reason at pid age ttl
@@ -946,6 +1160,7 @@ cmd_status() {
             echo "FREE  (runnable=$(runnable_now))"
             ;;
     esac
+    status_lock_dir_note "$legacy"
     return 0
 }
 
@@ -964,6 +1179,7 @@ abandon_lock() {
 
 cmd_acquire() {
     local deadline=$((SECONDS + TIMEOUT)) rc
+    refuse_if_legacy_held || return $?
     while :; do
         if publish_lock; then
             meta_set takeover "$TAKEOVER"
@@ -1149,6 +1365,19 @@ cmd_run() {
     DO_WAIT=1
     cmd_acquire || return $?
 
+    # Hand the declared identity to the wrapped command, so a harness that
+    # reads the lock into its rows can tell its own parent's declaration from
+    # a co-tenant's. Without this, `--owner leon` is only a shell variable and
+    # the child reports `host_lock=held:leon` -- honest, but unattributed and
+    # deliberately not treated as certifying -- while the environment form
+    # reports `mine:leon`. The obvious invocation was the one that silently
+    # measured weaker (#1929).
+    #
+    # Only when the owner was actually declared: see OWNER_DECLARED.
+    if [ "$OWNER_DECLARED" = 1 ]; then
+        export HOSTLOCK_OWNER="$OWNER"
+    fi
+
     # Run the command in the BACKGROUND and wait for it, rather than inline.
     #
     # Bash does not run a trap until the current foreground command finishes.
@@ -1196,6 +1425,20 @@ cmd_run() {
     return $rc
 }
 
+# Whether the owner was DECLARED, or merely defaulted from the unix user.
+#
+# `run` exports a declared owner to its child (#1929) so a harness reading the
+# lock can tell its own parent's declaration from a co-tenant's, instead of
+# reporting an unattributed `held:`. That export must not manufacture an
+# attribution nobody made: every agent on this box runs as the same unix user,
+# so a $USER-derived owner handed to the child would make EVERY agent's lock
+# read as `mine:` to every other agent. That is the flattering error, and the
+# naive one-line export puts it on the DEFAULT path -- which is why the
+# default is recorded here as undeclared and never exported.
+OWNER_DECLARED=0
+if [ -n "${HOSTLOCK_OWNER:-}" ]; then
+    OWNER_DECLARED=1
+fi
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON=""
 DO_WAIT=0
@@ -1299,6 +1542,7 @@ while [ "$#" -gt 0 ]; do
         --owner)
             OWNER=${2:-}
             require_name "$1" "$OWNER"
+            OWNER_DECLARED=1
             shift 2
             ;;
         --wait)
@@ -1420,11 +1664,11 @@ fi
 [ -d "/proc/${ANCHOR_PID}" ] || die "anchor pid ${ANCHOR_PID} is not running"
 
 case "$SUB" in
-    status) cmd_status ;;
-    provenance) cmd_provenance ;;
-    acquire) cmd_acquire ;;
-    release) cmd_release ;;
-    wait) cmd_wait ;;
-    run) cmd_run "$@" ;;
+    status) warn_if_private; cmd_status ;;
+    provenance) warn_if_private; cmd_provenance ;;
+    acquire) warn_if_private; cmd_acquire ;;
+    release) warn_if_private; cmd_release ;;
+    wait) warn_if_private; cmd_wait ;;
+    run) warn_if_private; cmd_run "$@" ;;
     *) die "unknown subcommand: ${SUB}" ;;
 esac

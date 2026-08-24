@@ -68,10 +68,11 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 
 SEED = 0
-# Mobius commit that landed the DeepSeek-V4 dense-MoE->QMoE export (mobius#550)
-# and the linear_class routed-expert quantization fix (mobius#562) this
+# Mobius commit that landed the DeepSeek-V4 dense-MoE->QMoE export (mobius#550),
+# the linear_class routed-expert quantization fix (mobius#562), and the
+# EP-gated fused GroupQueryAttention dense-attention export (mobius#585) this
 # generator depends on. Update when regenerating against a newer commit.
-MOBIUS_COMMIT = "e71f4751791636bc165d67bc09fe03415ac5f416"
+MOBIUS_COMMIT = "7003bc73524a240de5741766e9838c40936b6da9"
 
 
 def _configure_mobius_imports(root: Path) -> None:

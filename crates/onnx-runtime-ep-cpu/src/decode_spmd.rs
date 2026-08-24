@@ -3962,8 +3962,12 @@ mod tests {
              worker doubles up on an SMT sibling: {ordered:?}"
         );
 
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping sibling-doubling check: {reason}");
+                return;
+            }
         };
         for shard in node_shards(4) {
             if shard.cpus.is_empty() {
@@ -4393,7 +4397,14 @@ mod tests {
         // must land on *distinct physical cores*, so the first workers never
         // share a front end. Dropping the spread from this arm fails here on
         // any host with core topology.
-        if let Some(cores) = crate::core_topology::host() {
+        let detected = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => Some(cores),
+            Err(reason) => {
+                eprintln!("skipping planned-affinity spread check: {reason}");
+                None
+            }
+        };
+        if let Some(cores) = detected {
             let core_count = cores.leaders_within(&planned).len();
             let mut seen_cores = std::collections::BTreeSet::new();
             for &cpu in &shards[0].cpus[..core_count] {
@@ -5022,16 +5033,25 @@ mod tests {
     /// never the thing that was wrong. This asserts the half that was missing.
     #[test]
     fn a_pinned_pool_places_one_worker_per_physical_core() {
-        let cpus: Vec<usize> = match crate::core_topology::host() {
-            // Two full physical cores' worth of CPUs, spread the way the
-            // placement policy spreads them.
-            Some(cores) if cores.core_count() >= 2 => crate::decode_affinity::order_pin_targets(
-                &(0..cores.logical_count()).collect::<Vec<_>>(),
-                Some(cores),
-            ),
-            _ => return,
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping pinned-pool placement check: {reason}");
+                return;
+            }
         };
-        let cores = crate::core_topology::host().expect("checked above");
+        // A single-core budget cannot express "one worker per core" as a
+        // distinguishable claim. That is a host fact and a legitimate skip;
+        // an unanswerable topology is not, and panics above.
+        if cores.core_count() < 2 {
+            return;
+        }
+        // Two full physical cores' worth of CPUs, spread the way the placement
+        // policy spreads them.
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+            &(0..cores.logical_count()).collect::<Vec<_>>(),
+            Some(cores),
+        );
         let workers = cores.core_count().min(4);
         if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
             return;
@@ -5062,8 +5082,16 @@ mod tests {
     /// The same predicate must be able to say *no*, or it is decoration.
     #[test]
     fn placement_reports_a_shared_core_as_a_defect() {
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        // Fails closed. Under the mutation battery this test -- the negative
+        // control, the one whose whole job is to prove the detector detects --
+        // passed vacuously with detection forced to `None`. A control that
+        // survives the removal of the thing it controls for is not a control.
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping shared-core control: {reason}");
+                return;
+            }
         };
         // Find one physical core with at least two siblings, and pin two
         // workers onto it -- exactly the layout #1729 removed.
@@ -5091,6 +5119,213 @@ mod tests {
         pools.shutdown();
     }
 
+    /// Read the calling *thread's* actual affinity mask from `/proc`.
+    ///
+    /// `/proc/thread-self` is the calling thread's own task directory -- i.e.
+    /// `/proc/self/task/<tid>` -- so this is per-TID kernel state, not the
+    /// process-wide mask in `/proc/self/status`. The distinction is the whole
+    /// point of this control and is asserted below rather than assumed.
+    #[cfg(target_os = "linux")]
+    fn actual_mask_of_calling_thread() -> Option<(String, Vec<usize>)> {
+        let tid = std::fs::read_link("/proc/thread-self")
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let list = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+        Some((tid, onnx_runtime_hostmon::parse_cpu_list(list)?))
+    }
+
+    /// Pin one real thread per CPU and return what the kernel says each one is
+    /// actually confined to.
+    #[cfg(target_os = "linux")]
+    fn actual_masks_of_threads_pinned_to(cpus: &[usize]) -> Option<Vec<(String, Vec<usize>)>> {
+        let handles: Vec<_> = cpus
+            .iter()
+            .map(|&cpu| {
+                thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).ok()?;
+                    actual_mask_of_calling_thread()
+                })
+            })
+            .collect();
+        let mut observed = Vec::with_capacity(cpus.len());
+        for handle in handles {
+            observed.push(handle.join().ok()??);
+        }
+        Some(observed)
+    }
+
+    /// The distinct-physical-core predicate, evaluated over masks the kernel
+    /// reports rather than over what a pool claims. Mirrors
+    /// `placement_is_one_worker_per_physical_core`, which reads `worker_cpus`.
+    #[cfg(target_os = "linux")]
+    fn distinct_cores_from_actual_masks(
+        masks: &[(String, Vec<usize>)],
+        cores: &crate::core_topology::CoreTopology,
+    ) -> Option<bool> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, mask) in masks {
+            // A pinned thread is confined to exactly one CPU. Anything wider
+            // means the pin did not take, and the question is unanswerable.
+            let [cpu] = mask.as_slice() else {
+                return None;
+            };
+            let core: Vec<usize> = cores
+                .siblings_of(*cpu)
+                .map_or_else(|| vec![*cpu], <[usize]>::to_vec);
+            if !seen.insert(core) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Negative control against **actual TID masks**, not reported ones.
+    ///
+    /// `placement_reports_a_shared_core_as_a_defect` above builds a pool and
+    /// asks it about `worker_cpus` -- the pool's own claim. That is the exact
+    /// quantity #1792 showed can be wrong: the EP printed
+    /// `requested=16 realized=16 as_requested` while running 16 workers on 8
+    /// physical cores, because the count was honest and placement was never
+    /// reported at all. A control built on the claim cannot catch a wrong claim.
+    ///
+    /// This one pins real threads and reads what the kernel says about each
+    /// TID, then runs the same distinct-core predicate over that. Both arms are
+    /// present deliberately: the shared-core arm must report a defect, and the
+    /// distinct-core arm must not, so a predicate that simply always answers
+    /// `Some(false)` fails here rather than looking like a working detector.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn actual_thread_masks_sharing_one_core_are_reported_as_a_defect() {
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping actual-mask control: {reason}");
+                return;
+            }
+        };
+
+        // Pick the sibling pair out of the CPUs this process may actually run
+        // on. Taking `cores()[0]` blindly picks CPUs the host has but a
+        // `taskset`ed or containerised runner cannot use, `environment_can_pin`
+        // then refuses, and the control skips -- on the *most common* way this
+        // suite is run. A skip that is invisible and environment-triggered is
+        // the same fail-open shape this change exists to remove.
+        let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
+            .unwrap_or_else(|| (0..cores.logical_count()).collect())
+            .into_iter()
+            .collect();
+        let shared = cores.cores().iter().find_map(|group| {
+            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
+            match (inside.next(), inside.next()) {
+                (Some(first), Some(second)) => Some([first, second]),
+                _ => None,
+            }
+        });
+        let Some(shared) = shared else {
+            eprintln!(
+                "skipping actual-mask control: no physical core has two SMT siblings inside \
+                 this process's allowed set {allowed:?}, so the bad layout is unrepresentable \
+                 here"
+            );
+            return;
+        };
+        if !environment_can_pin(&shared) {
+            eprintln!(
+                "skipping actual-mask control: this environment refuses to pin to {shared:?}"
+            );
+            return;
+        }
+
+        let observed = match actual_masks_of_threads_pinned_to(&shared) {
+            Some(observed) => observed,
+            // A refused pin is an environment fact, not a defect. It cannot be
+            // silently tolerated further down, because an unpinned thread has a
+            // wide mask and would answer `None`, so state it here.
+            None => {
+                eprintln!("skipping actual-mask control: threads could not be pinned");
+                return;
+            }
+        };
+
+        // This must be per-thread state. If `/proc/thread-self` were resolving
+        // to process-wide data, every mask would equal the process mask and the
+        // control would be measuring nothing -- the same "reading the wrong
+        // thing" failure the control exists to catch, one level down.
+        let process_mask = crate::decode_affinity::allowed_cpus().unwrap_or_default();
+        for (tid, mask) in &observed {
+            assert_eq!(
+                mask.len(),
+                1,
+                "thread {tid} was pinned to a single CPU but the kernel reports mask {mask:?}"
+            );
+            assert_ne!(
+                mask, &process_mask,
+                "thread {tid} reports the process-wide mask, so this control is reading \
+                 `/proc/self/status`-equivalent data and is not a per-TID check at all"
+            );
+        }
+
+        assert_eq!(
+            distinct_cores_from_actual_masks(&observed, cores),
+            Some(false),
+            "threads whose kernel-reported masks are {observed:?} occupy the SMT siblings \
+             of one physical core, and the placement predicate must call that a defect"
+        );
+
+        // Positive arm: two genuinely distinct cores must not be reported as a
+        // defect, otherwise the assertion above is satisfied by a predicate
+        // that is simply always false.
+        let distinct: Vec<usize> = cores
+            .cores()
+            .iter()
+            .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
+            .take(2)
+            .collect();
+        if distinct.len() < 2 || !environment_can_pin(&distinct) {
+            eprintln!(
+                "skipping the positive arm of the actual-mask control: two distinct physical \
+                 cores are not pinnable inside {allowed:?}"
+            );
+            return;
+        }
+        let Some(observed) = actual_masks_of_threads_pinned_to(&distinct) else {
+            eprintln!(
+                "skipping the positive arm of the actual-mask control: threads could not be \
+                 pinned to {distinct:?}"
+            );
+            return;
+        };
+        assert_eq!(
+            distinct_cores_from_actual_masks(&observed, cores),
+            Some(true),
+            "threads on distinct physical cores {distinct:?} were reported as sharing \
+             one, so the predicate answers `false` regardless of input and the negative \
+             arm above proves nothing"
+        );
+
+        // Say what was actually checked. Under `--nocapture` -- or in the
+        // captured output libtest replays for a *failing* test -- every exit
+        // from this test is either this line or an explicit skip line, so a run
+        // with neither did not execute.
+        //
+        // Under CI's default capture a passing test prints nothing either way,
+        // so this does **not** distinguish "ran" from "skipped" in a green CI
+        // log. Nothing can: the only capture-proof anti-vacuity signal is a
+        // failure, which is why the *topology* branch panics instead of
+        // printing. The two skips left here are genuinely environmental -- no
+        // SMT sibling inside the allowed set, or a sandbox that refuses
+        // `sched_setaffinity` -- and are stated rather than silent so they are
+        // recoverable from a local `--nocapture` run.
+        eprintln!(
+            "actual-mask control ran: shared-core arm on {shared:?}, distinct-core arm on \
+             {distinct:?}"
+        );
+    }
+
     /// A pool that pinned only half its workers has not placed one worker per
     /// core, and must not be scored on the half it did pin.
     ///
@@ -5099,8 +5334,12 @@ mod tests {
     /// count honest, placement unexamined, the exact shape of #1729.
     #[test]
     fn a_partially_pinned_pool_is_not_scored_on_its_pinned_half() {
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping partial-pin scoring check: {reason}");
+                return;
+            }
         };
         if cores.core_count() < 2 {
             return;

@@ -87,7 +87,6 @@
 //!     back to `WholeBankResident`) -- the whole group is rejected before
 //!     any mutation, exactly like tests 10/11/12.
 
-#![cfg(feature = "gpu-tests")]
 #![allow(
     clippy::too_many_arguments,
     clippy::uninlined_format_args,
@@ -110,7 +109,6 @@ use onnx_runtime_ep_api::{
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::{
     COARSE_RESIDENCY_ENABLE_ENV, apply_residency_plan_at_boundary,
-    apply_residency_plan_at_boundary_with_phase8_faults,
 };
 use onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency;
 use onnx_runtime_ir::{DataType, TensorData, WeightRef};
@@ -121,6 +119,74 @@ use onnx_runtime_loader::{
 use onnx_runtime_memory_governor::{
     DeviceAllocator, DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MemoryRole,
 };
+
+// ---------------------------------------------------------------------------
+// Fault-injection seam.
+//
+// `coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults` is
+// gated `#[cfg(any(test, feature = "gpu-tests"))]`. The `test` arm does not
+// reach here: an integration test is a separate crate linking the library
+// built *without* `cfg(test)`, so with `gpu-tests` off the item does not
+// exist and naming it from a top-level `use` is E0432. That is why this file
+// carried `#![cfg(feature = "gpu-tests")]`, and why it then reported zero
+// tests in the default configuration while reporting thirteen with the
+// feature on -- the inventory drift `verify_cuda_test_honesty.py` exists to
+// catch.
+//
+// Gating a *helper* instead keeps every test in both inventories, which is
+// what the honesty check requires. The name is kept identical so the call
+// sites below are unchanged. Precedent, same repo, same shape:
+// `crates/onnx-runtime-cuda-memory/tests/vmm_release_quarantine_gpu.rs`
+// (`install_faults`).
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "gpu-tests")]
+#[allow(clippy::too_many_arguments)]
+fn apply_residency_plan_at_boundary_with_phase8_faults(
+    runtime: &Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+    residency: &CudaWeightResidency,
+    plan: &onnx_runtime_ep_api::ResidencyPlan,
+    catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: &Arc<PhysicalHandlePool>,
+    host_pool: &Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expert_groups: &[ExpertWeightGroup],
+    phase8_faults: HashMap<ValueId, Arc<DriverFaultPlan>>,
+) -> onnx_runtime_ep_cuda::coarse_residency::BoundaryApplicationOutcome {
+    onnx_runtime_ep_cuda::coarse_residency::apply_residency_plan_at_boundary_with_phase8_faults(
+        runtime,
+        residency,
+        plan,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expert_groups,
+        phase8_faults,
+    )
+}
+
+#[cfg(not(feature = "gpu-tests"))]
+#[allow(clippy::too_many_arguments)]
+fn apply_residency_plan_at_boundary_with_phase8_faults(
+    _runtime: &Arc<onnx_runtime_ep_cuda::CudaRuntime>,
+    _residency: &CudaWeightResidency,
+    _plan: &onnx_runtime_ep_api::ResidencyPlan,
+    _catalogs: &HashMap<ValueId, WeightRegionCatalog>,
+    _allocators: &HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    _device_pool: &Arc<PhysicalHandlePool>,
+    _host_pool: &Arc<PhysicalHandlePool>,
+    _device_count: usize,
+    _device_ordinal: i32,
+    _expert_groups: &[ExpertWeightGroup],
+    _phase8_faults: HashMap<ValueId, Arc<DriverFaultPlan>>,
+) -> onnx_runtime_ep_cuda::coarse_residency::BoundaryApplicationOutcome {
+    unreachable!("Phase-8 fault injection is only compiled under the gpu-tests feature");
+}
 
 // ---------------------------------------------------------------------------
 // Serialize every test in this file — GPU tests must run one at a time.
