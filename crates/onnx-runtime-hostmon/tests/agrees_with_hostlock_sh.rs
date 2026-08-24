@@ -44,8 +44,37 @@ fn script() -> PathBuf {
 /// away is worse than no test.
 fn lock_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    // Restore permissions before removing. These tests deliberately create
+    // directories that cannot be written or listed, and `Mode` only unwinds
+    // them on panic: a `SIGKILL` or an OOM leaves a *non-empty* mode-500
+    // directory, on which `remove_dir_all` fails with `EACCES`. The error was
+    // being discarded here, so the next run inherited the fixture and failed
+    // somewhere else entirely -- a stale artifact wearing the costume of a real
+    // regression.
+    restore_modes(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// Best-effort `chmod 0700` down a tree, so a leftover fixture is removable.
+///
+/// Each directory is restored *before* it is listed, because a mode-600 one
+/// cannot be read until it is searchable again.
+fn restore_modes(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        restore_modes(&entry.path());
+    }
 }
 
 fn hostlock(dir: &Path, args: &[&str]) -> (bool, String) {
@@ -113,6 +142,7 @@ struct ScratchLock(PathBuf);
 
 impl Drop for ScratchLock {
     fn drop(&mut self) {
+        restore_modes(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -881,6 +911,31 @@ fn a_host_that_cannot_take_the_lock_reads_unusable_in_both_implementations() {
     );
     assert_eq!(state_at(&as_file), LockState::Unusable);
 
+    // The same fault one level up: an *intermediate* ancestor that is a regular
+    // file. It must be executable, or `access(X_OK)` refuses it and the guard
+    // passes for the wrong reason -- which is what made this the one branch the
+    // battery could delete without a single cell noticing. The walk stops at
+    // the nearest existing ancestor, so this is the arm that has to recognise
+    // it, not the leaf check above.
+    let not_a_dir = root.join("notdir");
+    std::fs::write(&not_a_dir, b"x").expect("fixture");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&not_a_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fixture");
+    }
+    let under_a_file = not_a_dir.join("hl");
+    let (_, out) = hostlock(&under_a_file, &["status", "--porcelain"]);
+    assert!(
+        out.contains("state=UNUSABLE"),
+        "a file as an intermediate ancestor is unusable to the script: {out}"
+    );
+    assert_eq!(
+        state_at(&under_a_file),
+        LockState::Unusable,
+        "an executable regular file passes access(W_OK|X_OK) and still cannot hold a lock"
+    );
+
     // Both permission bits, because a directory that is writable but not
     // searchable cannot hold entries either, and a `-w`-only check passes it.
     for (name, mode) in [("no-write", 0o500), ("no-search", 0o600)] {
@@ -947,4 +1002,37 @@ fn a_published_lock_outranks_a_host_that_could_not_have_created_it() {
     );
 
     anchor.retire();
+}
+
+/// A fixture stranded by a kill must be cleaned, not inherited.
+///
+/// The tests above create directories that cannot be written or listed, and
+/// their `Drop` guards only run on unwind. A `SIGKILL` leaves a **non-empty**
+/// mode-500 directory behind, and `remove_dir_all` fails on it with `EACCES` --
+/// so before [`restore_modes`] the next run started against a fixture from a
+/// previous one and failed somewhere unrelated. Asserted here rather than
+/// trusted, because the failure it prevents does not look like this test.
+#[test]
+fn a_fixture_stranded_by_a_kill_is_cleaned_rather_than_inherited() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stranded = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hostlock-stranded");
+    let _ = std::fs::remove_dir_all(&stranded);
+    std::fs::create_dir_all(stranded.join("hl")).expect("fixture");
+    std::fs::write(stranded.join("hl/meta"), b"owner=roy\n").expect("fixture");
+    std::fs::set_permissions(&stranded, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    // The bare removal the helper used to do, so the cell fails if this
+    // precondition ever stops holding and the recovery becomes untested.
+    assert!(
+        std::fs::remove_dir_all(&stranded).is_err(),
+        "a non-empty mode-500 directory must be the hard case; if it is not, \
+         this cell no longer pins anything"
+    );
+
+    let cleaned = lock_dir("hostlock-stranded");
+    assert!(
+        !cleaned.exists(),
+        "lock_dir must recover a stranded fixture, not leave it for the next run"
+    );
 }
