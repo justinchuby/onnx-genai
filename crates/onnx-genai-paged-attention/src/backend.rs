@@ -37,8 +37,10 @@ pub struct NativeSubset {
 
 impl NativeSubset {
     /// The exact subset the upstream **WebGPU** kernel implements: `SEPARATE`
-    /// only, every optional feature rejected. Encoded here so the native side
-    /// can be diffed against a known-good precedent.
+    /// only, every optional feature rejected. Packed-QKV *is* supported (the
+    /// kernel splits it via `RunSplitPackedQKV`, `webgpu/bert/paged_attention.cc`),
+    /// so it is allowed here. Encoded so the native side can be diffed against a
+    /// known-good precedent.
     #[must_use]
     pub fn webgpu_separate() -> Self {
         Self {
@@ -54,7 +56,7 @@ impl NativeSubset {
             quantized_cache: false,
             slot_mapping: false,
             attention_metadata: false,
-            packed_qkv: false,
+            packed_qkv: true,
         }
     }
 

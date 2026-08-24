@@ -253,7 +253,7 @@ fn narrower_v_head_size_requires_explicit_scale() {
     attrs.v_head_size = 16;
     attrs.rotary_offset = 16;
     attrs.do_rotary = true;
-    let inputs = latent_inputs(4, 2, 24, 1, 2, 16, 1, 8);
+    let inputs = latent_inputs(4, 2, 32, 1, 2, 16, 1, 16);
     let err = check_inputs(&attrs, &inputs).unwrap_err();
     assert!(err.is_invalid_argument());
     assert!(err.to_string().contains("scale"), "msg: {err}");
@@ -299,6 +299,74 @@ fn invalid_block_table_and_seqlens_rejected() {
     );
 }
 
+#[test]
+fn num_heads_must_be_multiple_of_kv_num_heads() {
+    // helper.h:425-428 — invalid GQA ratio (4 % 3 != 0) is a schema error.
+    let attrs = base_attrs(4, 3);
+    let inputs = separate_inputs(6, 4, 3, 16, 1, 1, 16, 1);
+    let err = check_inputs(&attrs, &inputs).unwrap_err();
+    assert!(err.is_invalid_argument(), "msg: {err}");
+    assert!(
+        err.to_string().contains("multiple of kv_num_heads"),
+        "msg: {err}"
+    );
+    // valid ratios still pass
+    assert!(
+        check_inputs(
+            &base_attrs(4, 2),
+            &separate_inputs(6, 4, 2, 16, 1, 1, 16, 1)
+        )
+        .is_ok()
+    );
+    assert!(
+        check_inputs(
+            &base_attrs(4, 4),
+            &separate_inputs(6, 4, 4, 16, 1, 1, 16, 1)
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn invalid_rotary_caches_rejected() {
+    let mut attrs = base_attrs(2, 2);
+    attrs.do_rotary = true;
+
+    // cos_cache dim 1 must be a multiple of 8 (rotary_dim a multiple of 16).
+    // head_size=32, cos dim1=4 → rotary_dim=8 → rejected.
+    let mut inputs = separate_inputs(4, 2, 2, 32, 1, 1, 16, 1);
+    inputs.cos_cache = Some(Shape::new(vec![64, 4]));
+    inputs.sin_cache = Some(Shape::new(vec![64, 4]));
+    inputs.rotary_dim = 8;
+    let err = check_inputs(&attrs, &inputs).unwrap_err();
+    assert!(
+        err.is_invalid_argument() && err.to_string().contains("multiple of 8"),
+        "msg: {err}"
+    );
+
+    // head_size must be a multiple of 16 when rotary caches are present.
+    let mut inputs = separate_inputs(4, 2, 2, 24, 1, 1, 16, 1);
+    inputs.cos_cache = Some(Shape::new(vec![64, 8]));
+    inputs.sin_cache = Some(Shape::new(vec![64, 8]));
+    inputs.rotary_dim = 16;
+    let err = check_inputs(&attrs, &inputs).unwrap_err();
+    assert!(
+        err.is_invalid_argument() && err.to_string().contains("multiple of 16"),
+        "msg: {err}"
+    );
+
+    // cos and sin dim 1 must match.
+    let mut inputs = separate_inputs(4, 2, 2, 32, 1, 1, 16, 1);
+    inputs.cos_cache = Some(Shape::new(vec![64, 8]));
+    inputs.sin_cache = Some(Shape::new(vec![64, 16]));
+    inputs.rotary_dim = 16;
+    let err = check_inputs(&attrs, &inputs).unwrap_err();
+    assert!(
+        err.is_invalid_argument() && err.to_string().contains("must be the same"),
+        "msg: {err}"
+    );
+}
+
 // ============================================================================
 // backend capability gate (typed NOT_IMPLEMENTED)
 // ============================================================================
@@ -320,7 +388,7 @@ fn webgpu_subset_rejects_every_unsupported_mode() {
     la.rotary_offset = 16;
     la.do_rotary = true;
     la.scale = Some(0.2);
-    let li = latent_inputs(4, 2, 24, 1, 2, 16, 1, 8);
+    let li = latent_inputs(4, 2, 32, 1, 2, 16, 1, 16);
     let lp = check_inputs(&la, &li).unwrap();
     let err = check_backend_support(&lp, &li, &sub).unwrap_err();
     assert!(
@@ -375,6 +443,55 @@ fn webgpu_subset_rejects_every_unsupported_mode() {
         err.is_not_implemented() && err.to_string().contains("quantized"),
         "msg: {err}"
     );
+
+    // local_window_size rejected
+    let mut wa = base_attrs(4, 2);
+    wa.local_window_size = 64;
+    let wi = separate_inputs(4, 4, 2, 16, 1, 2, 16, 1);
+    let wp = check_inputs(&wa, &wi).unwrap();
+    let err = check_backend_support(&wp, &wi, &sub).unwrap_err();
+    assert!(
+        err.is_not_implemented() && err.to_string().contains("local_window_size"),
+        "msg: {err}"
+    );
+
+    // rotary_offset rejected
+    let mut ra = base_attrs(4, 2);
+    ra.do_rotary = true;
+    ra.rotary_offset = 8;
+    let mut ri = separate_inputs(4, 4, 2, 32, 1, 2, 16, 1);
+    ri.cos_cache = Some(Shape::new(vec![64, 8]));
+    ri.sin_cache = Some(Shape::new(vec![64, 8]));
+    ri.rotary_dim = 16;
+    let rp = check_inputs(&ra, &ri).unwrap();
+    let err = check_backend_support(&rp, &ri, &sub).unwrap_err();
+    assert!(
+        err.is_not_implemented() && err.to_string().contains("rotary_offset"),
+        "msg: {err}"
+    );
+
+    // q/k norm rejected
+    let na = base_attrs(4, 2);
+    let mut ni = separate_inputs(4, 4, 2, 16, 1, 2, 16, 1);
+    ni.q_norm_weight = Some(Shape::new(vec![16]));
+    ni.k_norm_weight = Some(Shape::new(vec![16]));
+    let np = check_inputs(&na, &ni).unwrap();
+    let err = check_backend_support(&np, &ni, &sub).unwrap_err();
+    assert!(
+        err.is_not_implemented() && err.to_string().contains("norm_weight"),
+        "msg: {err}"
+    );
+
+    // attention_metadata rejected
+    let aa = base_attrs(4, 2);
+    let mut ai = separate_inputs(4, 4, 2, 16, 1, 2, 16, 1);
+    ai.attention_metadata = Some(Shape::new(vec![2]));
+    let ap = check_inputs(&aa, &ai).unwrap();
+    let err = check_backend_support(&ap, &ai, &sub).unwrap_err();
+    assert!(
+        err.is_not_implemented() && err.to_string().contains("attention_metadata"),
+        "msg: {err}"
+    );
 }
 
 #[test]
@@ -388,7 +505,7 @@ fn glm_dense_mla_subset_accepts_latent_rejects_rest() {
     la.rotary_offset = 16;
     la.do_rotary = true;
     la.scale = Some(0.2);
-    let li = latent_inputs(4, 2, 24, 1, 2, 16, 1, 8);
+    let li = latent_inputs(4, 2, 32, 1, 2, 16, 1, 16);
     let lp = check_inputs(&la, &li).unwrap();
     assert!(check_backend_support(&lp, &li, &sub).is_ok());
 
@@ -419,11 +536,11 @@ fn glm_dense_mla_subset_accepts_latent_rejects_rest() {
 
 #[test]
 fn separate_gqa_matches_naive_dense_with_partial_rope() {
-    let (nh, kvnh, hs) = (4usize, 2usize, 16usize);
+    let (nh, kvnh, hs) = (4usize, 2usize, 32usize);
     let t = 6usize;
     let group = nh / kvnh;
     let scale = 1.0 / (hs as f32).sqrt();
-    let rotary_dim = 8usize;
+    let rotary_dim = 16usize; // partial RoPE over the first 16 of 32 channels
     let (cos, sin) = build_cos_sin(64, rotary_dim, 10000.0);
 
     let mut rng = Lcg::new(42);
@@ -792,7 +909,7 @@ fn assert_absorbed_equals_decomposed(
 
 #[test]
 fn absorbed_latent_equals_decomposed_mla_tiny() {
-    assert_absorbed_equals_decomposed(2, 16, 8, 10, 6, 5, 8, 1234);
+    assert_absorbed_equals_decomposed(2, 16, 16, 10, 6, 5, 8, 1234);
 }
 
 #[test]

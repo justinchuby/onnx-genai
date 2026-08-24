@@ -117,7 +117,10 @@ The op **rejects with `INVALID_ARGUMENT`** unless all hold (helper line refs):
 4. `cumulative_sequence_length (batch+1)`, `past_seqlens (batch)`, `block_table`
    rank‑2 dim0==batch, `slot_mapping (num_tokens)` (`:224‑274`).
 5. `key_cache_out`/`value_cache_out`, if present, **alias** the inputs — the op
-   mutates in place and **allocates nothing** (`bert_defs.cc:1735‑1746` output docstrings).
+   mutates the KV cache in place and **allocates no KV cache of its own**
+   (`bert_defs.cc:1735‑1746` output docstrings). (The CUDA EP allocates transient
+   compute scratch — densified Q/K, gathered K/V, softmax‑LSE, decode partials —
+   but that is EP‑managed workspace, never a KV‑cache authority.)
 6. **LATENT** (`:477‑509`): `value` and `value_cache` **absent**; `kv_num_heads == 1`;
    V is the leading `v_head_size` channels of `key_cache`; `head_sink`, q/k‑norm,
    and `v_scale`/`v_quant_type`/`v_cache_dtype` **not supported** (typed rejects).
@@ -197,13 +200,14 @@ dense MLA), which is the direct refutation of Revision 1.
   configurable **token `page_size`** not constrained to any quantum.
 - The op's cache is **token‑major within a block**:
   `(num_blocks, block_size, kv_num_heads, head_size)` ⇒ `[block_size, head, dim]`,
-  `block_size` a power of two `≥ 16`; and the op **allocates nothing** — it only
-  reads/writes buffers the caller owns (`key_cache_out` must alias `key_cache`).
+  `block_size` a power of two `≥ 16`; and the op **allocates no KV cache** — it
+  only reads/writes KV buffers the caller owns (`key_cache_out` must alias
+  `key_cache`; any compute scratch is transient EP workspace, not a cache).
 
 **The op is one‑authority‑compatible.** Because the op is a pure
-consumer/mutator with no allocator of its own, the single authority remains
-`onnx-genai-kv`. What integration requires is **additive** on that existing
-authority, never a second manager:
+consumer/mutator with **no KV‑cache allocator of its own**, the single authority
+remains `onnx-genai-kv`. What integration requires is **additive** on that
+existing authority, never a second manager:
 
 > **One‑authority invariant.** `onnx-genai-kv` remains the sole allocator/owner of
 > KV pages, block tables, slot mapping, sequence lengths and lifetimes.
@@ -221,9 +225,9 @@ layout difference and the absence of a `block_table`/`slot_mapping` emitter toda
 are *missing additive capabilities on the existing authority*, not an ownership
 conflict. The precise, bounded work is: add a token‑major (and LATENT) page‑store
 layout option and a block‑table/slot‑mapping view to `onnx-genai-kv`. If a future
-kernel demanded that the op **allocate or resize** the cache itself, *that* would
-be a hard blocker (it would create a second authority) — but v1 explicitly does
-not: it aliases the caller's buffers and never allocates.
+kernel demanded that the op **allocate or resize** the KV cache itself, *that*
+would be a hard blocker (it would create a second authority) — but v1 explicitly
+does not: it aliases the caller's KV buffers and never allocates a cache.
 
 ## 5. Applicability matrix (property, not model name)
 

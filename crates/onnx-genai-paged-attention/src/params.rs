@@ -110,8 +110,9 @@ pub struct PagedAttentionInputs {
     pub v_scale: Option<Shape>,
     pub attention_metadata: Option<Shape>,
     /// The rotary `rotary_dim` implied by `cos_cache`/`sin_cache` last dim × 2.
-    /// `0` when there is no rotary cache. Kept here because the validator needs
-    /// it to enforce `rotary_offset + rotary_dim <= head_size`.
+    /// `0` when there is no rotary cache. This is a caller convenience only: the
+    /// validator DERIVES the authoritative `rotary_dim` from the `cos_cache`
+    /// shape (mirroring `CheckRotaryCaches`) and does not trust this field.
     pub rotary_dim: i64,
 }
 

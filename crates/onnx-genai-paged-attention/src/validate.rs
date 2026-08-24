@@ -38,6 +38,15 @@ pub fn check_inputs(
             "kv_num_heads must be a positive integer.",
         ));
     }
+    // helper.h:425-428. (The device guard `num_heads > max_threads_per_block`,
+    // helper.h:422-423, is intentionally omitted: it is device-specific and this
+    // is a host-side validator.)
+    if num_heads % kv_num_heads != 0 {
+        return Err(PagedAttentionError::invalid(format!(
+            "num_heads must be a multiple of kv_num_heads. Got num_heads % kv_num_heads == {}",
+            num_heads % kv_num_heads
+        )));
+    }
 
     let is_latent = attrs.kv_cache_layout.is_latent();
     let storage_dtype = inputs.key_cache_storage_dtype;
@@ -145,8 +154,12 @@ pub fn check_inputs(
     }
 
     // --- rotary cache (helper.h:540-560) ---
+    // helper.h:539-546 → group_query_attention_helper::CheckRotaryCaches. The op
+    // passes total_sequence_length=0 ("bypass checking rotary cache size"), so the
+    // dim-0 bound is skipped, but the shape/derivation checks still apply and
+    // rotary_dim is DERIVED from cos_cache dim 1 (× 2) — not taken on trust.
     let rotary_dim = match (&inputs.cos_cache, &inputs.sin_cache) {
-        (Some(_), Some(_)) => inputs.rotary_dim,
+        (Some(cos), Some(sin)) => check_rotary_caches(cos, sin, head_size)?,
         (None, None) => 0,
         _ => {
             return Err(PagedAttentionError::invalid(
@@ -482,6 +495,42 @@ fn check_block_table(block_table: &Shape, batch_size: i64) -> Res<i64> {
         )));
     }
     Ok(block_table.dims()[1])
+}
+
+/// `group_query_attention_helper::CheckRotaryCaches` (ORT 1.29.0), called by the
+/// PagedAttention helper with `total_sequence_length = 0` so the dim-0 bound is
+/// bypassed. Validates the cos/sin cache shapes and returns the derived
+/// `rotary_dim = cos_cache.dims[1] * 2`.
+fn check_rotary_caches(cos: &Shape, sin: &Shape, head_size: i64) -> Res<i64> {
+    if cos.rank() != 2 || sin.rank() != 2 {
+        return Err(PagedAttentionError::invalid(
+            "Inputs 'cos_cache' and 'sin_cache' must be 2D.",
+        ));
+    }
+    if head_size % 16 != 0 {
+        return Err(PagedAttentionError::invalid(format!(
+            "head_size shall be a multiple of 16. Got head_size % 16 == {}",
+            head_size % 16
+        )));
+    }
+    let cd1 = cos.dims()[1];
+    let sd1 = sin.dims()[1];
+    if cd1 > (head_size / 16) * 8 || cd1 % 8 != 0 {
+        return Err(PagedAttentionError::invalid(
+            "cos_cache dimension 1 must be <= head_size / 2 and a multiple of 8.",
+        ));
+    }
+    if sd1 > (head_size / 16) * 8 || sd1 % 8 != 0 {
+        return Err(PagedAttentionError::invalid(
+            "sin_cache dimension 1 must be <= head_size / 2 and a multiple of 8.",
+        ));
+    }
+    if cd1 != sd1 {
+        return Err(PagedAttentionError::invalid(
+            "cos_cache and sin_cache dimension 1 must be the same.",
+        ));
+    }
+    Ok(cd1 * 2)
 }
 
 /// helper.h CheckSlotMapping.
