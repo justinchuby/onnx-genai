@@ -1019,6 +1019,106 @@ Interactive world-model, robotics, and streaming-observation workloads enter as
 separate workflow invocations with session state in between; the portable IR
 adds no network-aware `receive` or `await` operation.
 
+#### 12.5a How the next invocation reaches leased state
+
+Scope says *keep this*. It does not say how the next invocation reaches what was
+kept, and a package that leaves that unanswered advertises a continuity it does
+not have — every turn restarts and the failure reaches a caller as a model that
+forgot what it was told. A lease is reached through exactly three mechanisms, and
+a document uses one of them. Which one each session cell uses is answered once,
+by `classify_session_state`, and read by both the validator and the runtime —
+computing it twice is how they came to disagree.
+
+- **A loop carries the cell.** Its lease is what seeds the carry when the pass
+  enters the loop, in place of the initializer the document names. This is what a
+  full-duplex or streaming package does.
+- **A state service group holds it.** The group's alias names the `input` port
+  the graph reads and the `output` port that advances it, so the lease replaces
+  the value the cell's initializer names and the alias's output is what the next
+  lease holds. An alias with no output port is refused: the lease could be read
+  and never advanced, so every turn would replay the first.
+- **The request binding rejoins it**, declared on the lease:
+
+  ```yaml
+  conversation:
+    contract: { dtype: int64, rank: 2, shape: [batch, conversation_length],
+                batch_layout: { kind: request_aligned, axis: 0 } }
+    class: semantic
+    scope: session
+    initializer: request.input_ids
+    recurrence: { kind: bounded, axis: 1, max: package.max_context }
+    management: runtime
+    release_boundary: session
+    session:
+      policy: exclusive
+      continuation:
+        kind: prompt_prefix
+        prompt_input: request.input_ids   # must carry role prompt_tokens
+        tokens_output: tokens             # must carry role tokens
+  ```
+
+  The value bound to `prompt_input` becomes the cell's value followed by the
+  caller's tokens; when the invocation completes the cell becomes that
+  concatenation followed by what was published to `tokens_output`. A session
+  holding nothing contributes nothing, so a conversation's first turn and a
+  request with no session are the same execution — declaring a conversation
+  costs a package nothing when nobody asks for one.
+
+  The `recurrence` bound is load-bearing: a continuation is not loop-carried and
+  so never reaches the carry path's recurrence check, and this is the only place
+  it is honoured. Separately, the conversation's *current* length is what a front
+  end adds to a request's own before enforcing a context limit, because a
+  prompt-prefix conversation really is prefilled again on every turn — and it is
+  the only carrier for which that is true. A turn whose conversation would exceed it is refused before it
+  runs, and a turn whose own generation would exceed it is refused rather than
+  stored — a session left in a state its own declaration forbids has no way
+  back. Neither refusal changes what the session already held; `reset_session`
+  releases it.
+
+  This is what a decoder whose prefill starts from empty state declares. Such a
+  package's cache is rebuilt from the conversation on each turn; nothing in the
+  document asks the prefill to accept a cache it was never authored to take, and
+  no runtime has to invent that it should.
+
+The validator enforces the corollaries. A continuation must be `scope: session`,
+`class: semantic`, `management: runtime`, `release_boundary: session`, and must
+grow along a bound that names a declared input with a value by the time a turn is
+admitted; it must name a declared `prompt_tokens` input and a declared `tokens`
+output whose contracts match the cell's; it must not also be loop-carried, which
+would be two answers about the same value; and a workflow declares at most one,
+because a package has one conversation. A session-scoped cell binding a
+`service_group` must resolve to a declared group that aliases it.
+
+A **semantic** session-scoped cell with none of the three is refused at load:
+nothing in the document says how the next invocation reaches it. Advisory state
+is exempt, because it is droppable by declaration.
+
+A package that publishes a token stream and declares no session state at all is
+refused a session at `create_session` rather than handed one whose turns silently
+restart. That refusal is typed — `PackageCapabilityError` — so a front end
+answers it as a request/package mismatch (HTTP 409) rather than as a server
+fault. A package that publishes no token stream has no conversation to lose and
+keeps its session handle.
+
+A lease declared `policy: exclusive` is single-flight: a second turn that starts
+while one is in flight is refused by name rather than allowed to read a
+conversation the first is about to replace.
+
+### 12.5b What a prompt-prefix conversation costs
+
+A `prompt_prefix` continuation carries the conversation as **tokens**, not as a
+cache: the package's own cache cells are invocation-scoped and released when the
+invocation ends, so turn *N* re-prefills every earlier turn. Over a conversation
+of *N* tokens that is O(N²) prefill work, against O(N) for a decode core whose
+paged KV survives the turn.
+
+That is the cost of continuing a conversation a package can *express*. A decoder
+whose prefill accepts only an empty cache has no port for a prior session length,
+so a runtime handing it the previous turn's cache would produce a mask and a
+cache that disagree. A package that wants the linear cost declares its cache
+session-scoped and is executed by a core that keeps it. A package that publishes no token stream has no
+conversation to lose, and its session is an ordinary handle.
+
 ### 12.6 Private state and checkpoints
 
 Internal state is private by default. An internal state cell is **not**
@@ -1446,6 +1546,48 @@ decoder, and requiring a declaration nothing reads would be noise.
 `port_contracts_do_not_substitute_for_a_declared_role` pins this.
 
 ---
+
+### 18.2 Session state: what tightened, and what it rejects
+
+`scope: session` used to validate on its own. It now has to say **how the next
+invocation reaches what the lease keeps** (§12.5a), because a lease nothing
+carries is written back on every pass and read by nothing — the package
+advertises a conversation that silently restarts every turn.
+
+A document that validated before and does not now is one of these. None is a
+rename; each is a statement the document was missing.
+
+| Rejected | Why | Fix |
+| --- | --- | --- |
+| a **semantic** session cell that no loop carries, no state service group holds, and whose lease names no `continuation` | nothing reaches the kept value | carry it in the loop, bind it to a group, or declare `session.continuation` |
+| a session cell naming a `service_group` the document does not declare | the lease has nothing to hold | declare the group, or drop `service_group` |
+| a session cell whose group declares no alias for it | same | add the alias, with `input` and `output` ports |
+| a group-only-carried cell whose alias declares no `output` port | the lease could be read and never advanced, so every turn replays the first | declare the port that advances the state |
+| a group-only-carried cell whose alias `input` port no step binds | the lease would have no reader | invoke the component binding that port |
+| a group-only-carried cell whose alias `input` port is bound to a value a step produces | the step would overwrite the lease | bind a workflow input, or carry the cell in the loop |
+| a `session.continuation` that is not `scope: session`, `class: semantic`, `management: runtime`, `release_boundary: session`, growing on the final axis, or is also loop-carried | the contract contradicts itself | see §12.5a |
+| a `session.continuation` whose `recurrence.max` names anything but a declared input with a value | the bound could not be read before the turn that would exceed it | name a required input, or an optional one with a default |
+| two `session.continuation` cells in one workflow | a package has one conversation | keep one |
+
+**Advisory session state is exempt** from the reachability rule: it is droppable
+by declaration, so a lease nothing reads costs correctness nothing.
+
+Runtime behaviour changed alongside it, for packages rather than documents:
+
+* a package that publishes a `tokens` output and declares no session state at all
+  still **loads and generates**, but `create_session` refuses it — typed, so a
+  server answers 409 rather than 500. Stateless generation is untouched;
+* a package that publishes no token stream is unaffected and keeps its session
+  handle;
+* `session_token_count` means the same thing on every backend (§12.5a). Whether
+  a request is *charged* for it is a different question, gated on one query —
+  `Engine::prepends_session_conversation`, read from the shared classifier. It is
+  true for `SessionStateCarrier::PromptContinuation` and nothing else, because
+  that is the one carrier whose mechanism is the prompt binding. A decode core
+  keeps its conversation in KV, and a loop-carried or group-held lease lives in a
+  cache the package bounds itself; charging either would count each turn twice,
+  inflating `usage`, halving the usable context and refusing requests at roughly
+  half the model's limit.
 
 ## 19. Invariants
 

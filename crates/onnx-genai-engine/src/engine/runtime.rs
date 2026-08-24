@@ -781,8 +781,28 @@ impl Engine {
             on_admitted,
             callback,
         )?;
+        // A package that declares its conversation knows how long it is; asking
+        // it is what keeps `session_token_count` the same number a decode-core
+        // session reports — prompt and generated tokens both — rather than the
+        // generated ones alone.
+        //
+        // The cost of that conversation is stated rather than hidden: a package
+        // whose lease is a prompt prefix re-prefills every earlier turn on each
+        // new one, because its invocation-scoped cache is released when the
+        // invocation ends. Over a conversation of N tokens that is O(N²) prefill
+        // work, against O(N) for a decode core whose paged KV survives the turn.
+        // It is the cost of continuing a conversation a package can express
+        // rather than one it cannot, and a package that wants the linear cost
+        // declares its cache session-scoped and is executed by a core that keeps
+        // it.
+        let declared = self
+            .workflow
+            .session_conversation_len(&session_id.to_string());
         if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
-            *count += result.token_ids.len();
+            match declared {
+                Some(length) => *count = length,
+                None => *count += result.token_ids.len(),
+            }
         }
         Ok(result)
     }
@@ -829,7 +849,17 @@ impl Engine {
         prompt: &GeneratePrompt,
         max_new_tokens: usize,
     ) -> anyhow::Result<(Option<GenerationBudgetCap>, usize)> {
-        let prompt_tokens = self.interpreted_prompt_token_count(prompt)?;
+        // What this request costs is its prompt plus whatever the runtime will
+        // put in front of it, which for a package continuing its conversation by
+        // prepending is every earlier turn. Admitting on the request alone
+        // under-reserves for exactly the turns that need the most.
+        let carried = if self.workflow_sessions.contains_key(&session_id) {
+            self.workflow
+                .session_prepended_prompt_len(&session_id.to_string())
+        } else {
+            0
+        };
+        let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens,
@@ -1468,6 +1498,26 @@ impl Engine {
         // Refusing here would have made "sessions" a property of which executor
         // runs the decode step, which is not what a caller is asking about.
         if !self.holds_decode_core() {
+            // What a caller opening a session asks for is that the next turn
+            // continue this one. A package that publishes a token stream is one
+            // whose turns are a conversation, so a session over it that carries
+            // nothing would silently restart every turn — a wrong answer that
+            // reads like a forgetful model. Say so instead, and name what the
+            // package has to declare. A package that publishes no tokens has no
+            // conversation to lose, and its session is an ordinary handle.
+            let workflow = self.workflow.workflow_spec();
+            let publishes_tokens = workflow
+                .outputs
+                .values()
+                .any(|output| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens);
+            if publishes_tokens && !crate::pipeline::workflow_carries_session_state(workflow) {
+                // A typed refusal, not a formatted string: what a front end has
+                // to decide is whether the caller asked for something this
+                // package cannot do, or whether the server failed. Matching on
+                // prose would make that a guess, and it was being reported as a
+                // 500 for a package that is simply stateless.
+                return Err(PackageCapabilityError::NoSessionState.into());
+            }
             self.workflow_session_counter += 1;
             let id = self.workflow_session_counter;
             self.workflow_sessions.insert(id, 0);
@@ -1603,6 +1653,21 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        // Resetting is the same promise for every package: the id stays usable
+        // and everything the conversation accumulated is gone. For an
+        // interpreted package that is exactly its session-scoped cells, so the
+        // lease is dropped and the token count returns to zero.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.contains_key(&session_id),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+                *count = 0;
+            }
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::reset(&mut NativeSessions(self), session_id);
@@ -1658,7 +1723,15 @@ impl Engine {
         session_state::close(&mut OrtSessions(self), session_id)
     }
 
-    /// Number of logical tokens retained in a persistent session.
+    /// Logical tokens this session's conversation holds — prompts and
+    /// generations alike, oldest turn first.
+    ///
+    /// One meaning for every backend. A decode core reports the tokens its KV
+    /// sequence covers; an interpreted package reports the length of the
+    /// conversation its workflow declares, or, for a package whose session state
+    /// is not a token conversation, the tokens its turns have generated. In
+    /// every case it is "how much has this session heard", never "how much did
+    /// the last turn produce".
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
         if !self.holds_decode_core() {
             return self
@@ -1673,6 +1746,96 @@ impl Engine {
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::token_count(&OrtSessionsRef(self), session_id)
+    }
+
+    /// Whether the loaded package continues a conversation by putting it in
+    /// front of the next turn's prompt.
+    ///
+    /// This answers only whether the authored workflow explicitly prepends a
+    /// token conversation. It is **false** for everything else:
+    ///
+    /// * a **decode core** keeps its conversation in KV, which the request does
+    ///   not carry and the prefill does not repeat;
+    /// * a **loop-carried** or **group-held** lease is handed back inside the
+    ///   graph, so the tokens it stands for live in a cache the package bounds
+    ///   itself rather than in front of a prompt;
+    /// * a package with no session state has no conversation at all.
+    ///
+    /// Answered from the shared classifier, never from "does this session hold
+    /// state": those are different questions with the same shape.
+    pub fn prepends_session_conversation(&self) -> bool {
+        if self.holds_decode_core() {
+            return false;
+        }
+        self.workflow.prepends_session_conversation()
+    }
+
+    /// What this session contributes ahead of the next prompt.
+    ///
+    /// ORT decode-core sessions append a turn to their retained sequence, so
+    /// that sequence is attended but served from KV rather than re-prefilled.
+    /// Native decode-core sessions replace their cached prefix with the
+    /// incoming prompt, so their retained tokens contribute neither value.
+    /// Prompt continuation contributes both; graph-carried state contributes
+    /// neither because the package bounds that cache itself.
+    pub fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<SessionPrefillCarry> {
+        if self.holds_decode_core() {
+            let retained = self.session_token_count(session_id)?;
+            #[cfg(feature = "native-backend")]
+            if self.decode_backend == EngineDecodeBackend::Native {
+                return Ok(SessionPrefillCarry::default());
+            }
+            return Ok(SessionPrefillCarry {
+                attended: retained,
+                reprefilled: 0,
+            });
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let prepended = self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string());
+        Ok(SessionPrefillCarry {
+            attended: prepended,
+            reprefilled: prepended,
+        })
+    }
+
+    /// The tokens a session's conversation holds, oldest first.
+    ///
+    /// `None` when the package carries its conversation somewhere a token list
+    /// cannot describe — a decode core's KV sequence, or a workflow whose
+    /// session state is not a declared prompt continuation. A caller reads this
+    /// to see what a session has heard without keeping a second copy of it,
+    /// which is the copy that drifts.
+    pub fn session_conversation(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<Vec<TokenId>>> {
+        if self.holds_decode_core() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        self.workflow
+            .session_conversation(&session_id.to_string())
+            .map(|conversation| {
+                conversation
+                    .into_iter()
+                    .map(|token| {
+                        TokenId::try_from(token)
+                            .context("a conversation token id does not fit the token type")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()
     }
 
     /// Get the loaded metadata.

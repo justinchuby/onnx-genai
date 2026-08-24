@@ -1073,6 +1073,40 @@ pub struct SessionLeaseContract {
     pub ttl_seconds: Option<u64>,
     #[serde(default)]
     pub optimistic_metadata_version: bool,
+    /// How this cell continues one invocation's work into the next.
+    ///
+    /// Absent means the lease is opaque: the runtime keeps the cell's value for
+    /// the session and hands it back as the cell's value, which is all a cell
+    /// consumed by the workflow's own steps needs. A cell the workflow never
+    /// reads — a conversation the *request binding* has to carry — has no such
+    /// reader, so it states which binding continues it here rather than leaving
+    /// a runtime to guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<SessionContinuation>,
+}
+
+/// How a session-scoped cell rejoins the next invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionContinuation {
+    /// The cell holds every token this session has seen, and each invocation's
+    /// prompt continues it.
+    ///
+    /// The value bound to `prompt_input` is the cell's value followed by the
+    /// caller's tokens; when the invocation completes, the cell becomes that
+    /// concatenation followed by the tokens published to `tokens_output`. A
+    /// session that holds no value yet contributes nothing, so the first turn
+    /// of a conversation and a request with no session are the same execution.
+    ///
+    /// This is what a package whose prefill starts from empty state declares:
+    /// the conversation is carried as tokens the next prefill consumes, not as
+    /// a cache the next prefill would have to be re-authored to accept.
+    PromptPrefix {
+        /// Workflow input carrying the `prompt_tokens` runtime role.
+        prompt_input: String,
+        /// Workflow output carrying the `tokens` role this cell accumulates.
+        tokens_output: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
