@@ -2631,3 +2631,176 @@ fn a_document_from_a_version_this_build_cannot_read_is_refused_for_that() {
         "the refusal must name the version it cannot read, got: {message}"
     );
 }
+
+/// A padded output with two padded dimensions, and a length vector for each.
+///
+/// The two are not the same shape. `max_tiles` is axis 1, so its lengths are one
+/// number per row: rank 1. `max_patches` is axis 2, so its lengths are one
+/// number per (row, tile): rank 2. A length vector has one entry per position of
+/// the axes *outer* to the dimension it bounds, so its rank is that dimension's
+/// axis index, and a rule that expected rank 1 of every companion would reject
+/// the second one for being what it has to be.
+fn two_padded_dimensions() -> String {
+    PADDED_EMIT_WORKFLOW
+        .replace(
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n",
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
+        )
+        .replace(
+            "      features:\n        contract:\n          dtype: float32\n          rank: 3\n          shape: [batch, max_tiles, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n",
+            "      features:\n        contract:\n          dtype: float32\n          rank: 4\n          shape: [batch, max_tiles, max_patches, hidden]\n          batch_layout: { kind: request_aligned, axis: 0 }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
+        )
+        .replace(
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+        )
+        .replace(
+            "            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n",
+            "            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n",
+        )
+        .replace(
+            "            features:\n              dtype: float32\n              rank: 3\n              shape: [batch, max_tiles, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding: [{ dimension: max_tiles, valid_lengths: lengths }]\n",
+            "            features:\n              dtype: float32\n              rank: 4\n              shape: [batch, max_tiles, max_patches, hidden]\n              batch_layout: { kind: request_aligned, axis: 0 }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
+        )
+        .replace(
+            "        inputs: { pixels: pixel_values, lengths: tile_lengths }\n",
+            "        inputs: { pixels: pixel_values, lengths: tile_lengths, patch_lens: patch_lengths }\n",
+        )
+        .replace(
+            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
+            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
+        )
+}
+
+/// The same two padded dimensions on a `token_packed` result.
+///
+/// The packed axis is 0 and the padded dimensions are 1 and 2, so the two kinds
+/// of raggedness sit on different axes of one value and are described by
+/// different companions: ownership for the packing, lengths for the padding.
+/// Both kinds have to pass the serving carve-out, at their own shapes.
+fn packed_two_padded_dimensions() -> String {
+    PACKED_EMIT_WORKFLOW
+        .replace(
+            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n",
+            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: image_owner }\n      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: tile_lengths }\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: patch_lengths }\n",
+        )
+        .replace(
+            "      features:\n        contract:\n          dtype: float32\n          rank: 2\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
+            "      features:\n        contract:\n          dtype: float32\n          rank: 4\n          shape: [items, max_tiles, max_patches, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n            levels:\n              - { offsets: image_offsets, owner: image_owner, extent: preserved }\n          padding:\n            - { dimension: max_tiles, valid_lengths: tile_lengths }\n            - { dimension: max_patches, valid_lengths: patch_lengths }\n",
+        )
+        .replace(
+            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      image_owner:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+        )
+        .replace(
+            "                  - { offsets: image_offsets, owner: image_owner }\n          outputs:\n",
+            "                  - { offsets: image_offsets, owner: image_owner }\n            lengths: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }\n            patch_lens: { dtype: int64, rank: 2, shape: [items, max_tiles], batch_layout: { kind: shared } }\n          outputs:\n",
+        )
+        .replace(
+            "            features:\n              dtype: float32\n              rank: 2\n              shape: [items, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n",
+            "            features:\n              dtype: float32\n              rank: 4\n              shape: [items, max_tiles, max_patches, hidden]\n              batch_layout:\n                kind: token_packed\n                axis: 0\n                levels:\n                  - { offsets: image_offsets, owner: image_owner, extent: preserved }\n              padding:\n                - { dimension: max_tiles, valid_lengths: lengths }\n                - { dimension: max_patches, valid_lengths: patch_lens }\n",
+        )
+        .replace(
+            "        inputs: { pixels: image_pixels }\n",
+            "        inputs: { pixels: image_pixels, lengths: tile_lengths, patch_lens: patch_lengths }\n",
+        )
+        .replace(
+            "      - kind: emit\n        value: image_owner\n        output: image_owner\n        mode: replace\n",
+            "      - kind: emit\n        value: image_owner\n        output: image_owner\n        mode: replace\n      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
+        )
+}
+
+#[test]
+fn a_length_companion_is_admitted_at_the_rank_its_padded_axis_requires() {
+    // The blocker this fixture exists for: the carve-out demanded rank 1 of
+    // every companion, which is right for an offsets or owner map and wrong for
+    // any length bounding a dimension that is not axis 1. A rank-2 length for a
+    // padded axis 2 is exactly correct and was refused as "a per-request value
+    // without a declared batch_layout" — advice that, followed, would have made
+    // it wrong.
+    validate_metadata(&parse(&two_padded_dimensions()))
+        .expect("two padded dimensions publish two differently shaped lengths");
+}
+
+#[test]
+fn a_packed_result_may_also_be_padded_on_the_axes_it_does_not_pack() {
+    // Packing and padding describe different axes of one value, and each is
+    // described by its own kind of companion. All of them are `shared`, all of
+    // them are int64, and they have three different ranks between them.
+    validate_metadata(&parse(&packed_two_padded_dimensions()))
+        .expect("a packed result publishes ownership and lengths together");
+}
+
+#[test]
+fn a_companion_is_admitted_at_its_own_rank_and_not_at_another_kinds() {
+    // The carve-out is keyed by what the naming declaration requires, so being
+    // named as a companion is not by itself enough. A length for a padded axis 2
+    // declared rank 1 is not a companion that happens to be short — it cannot
+    // index the positions it claims to describe.
+    let document = two_padded_dimensions()
+        .replace(
+            "{ dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+            "{ dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
+        )
+        .replace(
+            "patch_lens: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }",
+            "patch_lens: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }",
+        );
+    assert_reports(
+        &document,
+        "names as a padded dimension's valid_lengths at rank 2, but it is int64 at rank 1",
+    );
+}
+
+#[test]
+fn a_declared_companion_that_no_step_writes_is_not_published() {
+    // Declaring an output and emitting into it are different facts, and only the
+    // second delivers anything. A workflow that declares the lengths and never
+    // writes them satisfies the letter of "publishes them" while handing the
+    // caller a padded tensor and an empty vector, which is the failure the
+    // obligation exists to prevent.
+    let document = two_padded_dimensions().replace(
+        "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
+        "",
+    );
+    assert_reports(
+        &document,
+        "whose valid_lengths 'patch_lengths' is declared as a workflow output but never emitted",
+    );
+}
+
+#[test]
+fn a_declared_ownership_companion_that_no_step_writes_is_not_published_either() {
+    // The same hole on the packing side. A caller receiving a packed payload and
+    // an unwritten owner map cannot split it, exactly as if the map had never
+    // been declared.
+    let document = packed_two_padded_dimensions().replace(
+        "      - kind: emit\n        value: image_owner\n        output: image_owner\n        mode: replace\n",
+        "",
+    );
+    assert_reports(
+        &document,
+        "owner 'image_owner' is declared as a workflow output but never emitted",
+    );
+}
+
+#[test]
+fn a_shared_result_that_describes_nothing_is_still_refused() {
+    // The carve-out widened to admit a second companion kind at several ranks,
+    // so it is worth restating what it did not widen to. A `shared` rank-2
+    // result that no declared output names is a per-request answer with no way
+    // back to a request, whatever its rank.
+    let document = two_padded_dimensions()
+        .replace(
+            "      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      patch_lengths:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+        )
+        .replace(
+            "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n",
+            "      - kind: emit\n        value: patch_lengths\n        output: patch_lengths\n        mode: replace\n      - kind: emit\n        value: patch_lengths\n        output: unrelated\n        mode: replace\n",
+        );
+    assert_reports(
+        &document,
+        "emits per-request value 'patch_lengths' without a declared batch_layout",
+    );
+}
