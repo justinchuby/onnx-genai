@@ -76,21 +76,32 @@ impl InferenceRegistry {
         self.handlers.values().map(Vec::len).sum()
     }
 
-    /// Every registered `(domain, operator)` key, sorted.
+    /// Every registered rule as `(domain, operator, min_opset)`, sorted.
     ///
-    /// `operator_count` alone cannot distinguish a registration that moved from
-    /// one that was *renamed*: dropping one key and adding another leaves the
-    /// count identical, while every model using the dropped key silently falls
-    /// into the permissive "leave it unknown" path in [`Self::infer_node`].
-    /// Callers pinning the catalog should pin this, not the length of it.
-    pub fn operator_keys(&self) -> Vec<(&str, &str)> {
-        let mut keys: Vec<(&str, &str)> = self
+    /// This is the full identity of the catalog, and the thing to pin. Neither
+    /// count above can see a change that preserves them:
+    ///
+    /// - a **rename** drops one key and adds another, so `operator_count` and
+    ///   `entry_count` both hold;
+    /// - an **opset move** rewrites an existing entry's `min_opset` in place,
+    ///   so `entry_count` holds too.
+    ///
+    /// Both are silent in production rather than loud: [`Self::get`] returns
+    /// `None` for a key it does not know *and* for a version below every
+    /// registration, and [`Self::infer_node`] treats `None` permissively —
+    /// outputs are left unknown and the model still runs.
+    pub fn operator_versions(&self) -> Vec<(&str, &str, u64)> {
+        let mut rules: Vec<(&str, &str, u64)> = self
             .handlers
-            .keys()
-            .map(|(domain, op)| (domain.as_str(), op.as_str()))
+            .iter()
+            .flat_map(|((domain, op), entries)| {
+                entries
+                    .iter()
+                    .map(move |(min_opset, _)| (domain.as_str(), op.as_str(), *min_opset))
+            })
             .collect();
-        keys.sort_unstable();
-        keys
+        rules.sort_unstable();
+        rules
     }
 
     /// Infer a single node's outputs.
