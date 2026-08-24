@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2070,13 +2070,161 @@ chk "and that place is cmd_run, which is the only one with a child" \
 rm -rf "$LOCK.nested"
 cleanup
 
+# == a host that cannot take the lock must say so, not say FREE ==
+#
+# FREE is read as "the host is yours, go ahead". Where the lock directory
+# cannot be created that reading is false, and the tool used to make it in
+# three measured ways. All six lines below are what `origin/main` does, run
+# against these same two fixtures rather than reasoned about:
+#
+#   unwritable parent (chmod 500):
+#     status              FREE  (runnable=4)          rc 0   <-- fail open
+#     status --porcelain  state=FREE                  rc 0   <-- fail open
+#     wait                hostlock: free              rc 0   <-- fail open
+#     acquire / run       mkdir: ... Permission denied rc 1  <-- refuses, but
+#                                                              as "usage/error"
+#   lock path is a plain file:
+#     acquire --wait      timed out after 12s waiting for the lock, AND
+#                         prints FREE in the same breath                rc 3
+#
+# The first three tell a harness to proceed on the one host where the lock is
+# unavailable -- `status` is the README's own "is anybody benchmarking?" and
+# `wait` exists to be followed by a run. The fourth is a correct refusal with
+# a wrong classification: exit 1 is the code for a bad argument, so an
+# unattended caller cannot tell a broken host from its own typo. The fifth is
+# worse than either, because the box is idle and the tool spends the whole
+# --timeout before blaming peers for contention that does not exist -- while
+# printing FREE underneath it.
+#
+# This matters beyond the fixtures: the lock is mandatory for saturating runs,
+# and the default lock_dir is under /tmp, which not every host can use.
+UNUSABLE_PARENT="$LOCK.ro"
+rm -rf "$UNUSABLE_PARENT"
+mkdir -p "$UNUSABLE_PARENT"
+chmod 500 "$UNUSABLE_PARENT"
+UNUSABLE_DIR="$UNUSABLE_PARENT/hl"
+
+chk "status calls an uncreatable lock dir UNUSABLE, not FREE" \
+    "$(HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" status 2>/dev/null | head -1 | awk '{print $1}')" \
+    "UNUSABLE"
+chk "and porcelain says so in the state field" \
+    "$(HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" status --porcelain 2>/dev/null | sed -n 's/^state=//p')" \
+    "UNUSABLE"
+chk "porcelain names the reason rather than only the verdict" \
+    "$(HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" status --porcelain 2>/dev/null | sed -n 's/^lock_dir_problem=//p' | grep -c "$UNUSABLE_PARENT")" \
+    "1"
+# The negative control for the three above, and the reason the key is emitted
+# unconditionally: a consumer that learns the state from the key's PRESENCE
+# reads absence as "fine", which is the failure the field exists to report.
+chk "a usable free host emits the same key, empty" \
+    "$(HOSTLOCK_DIR="$LOCK" "$HL" status --porcelain 2>/dev/null | grep -c '^lock_dir_problem=$')" \
+    "1"
+chk "and still calls itself FREE" \
+    "$(HOSTLOCK_DIR="$LOCK" "$HL" status 2>/dev/null | head -1 | awk '{print $1}')" \
+    "FREE"
+
+# Both halves of the guard, separately. A directory that is writable but not
+# SEARCHABLE cannot host entries either -- `mkdir 0600-parent/sub` fails with
+# EACCES -- and every other fixture in this section is chmod 500, i.e. not
+# writable but executable, which exercises only the `-w` clause. Without this
+# cell, deleting `|| [ ! -x "$p" ]` is a one-line fail-open that the whole
+# suite stays green through.
+NOSEARCH_PARENT="$LOCK.nox"
+rm -rf "$NOSEARCH_PARENT"
+mkdir -p "$NOSEARCH_PARENT"
+chmod 600 "$NOSEARCH_PARENT"
+chk "a writable but unsearchable parent is UNUSABLE too" \
+    "$(HOSTLOCK_DIR="$NOSEARCH_PARENT/hl" "$HL" status --porcelain 2>/dev/null | sed -n 's/^state=//p')" \
+    "UNUSABLE"
+chmod 700 "$NOSEARCH_PARENT"
+rm -rf "$NOSEARCH_PARENT"
+
+HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" acquire --owner leon >/dev/null 2>&1
+chk "acquire exits 7, not 1 (a bad host is not a bad argument)" "$?" "7"
+HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" wait >/dev/null 2>&1
+chk "wait exits 7 instead of announcing free" "$?" "7"
+chk "and prints no free announcement at all" \
+    "$(HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" wait 2>/dev/null | grep -c free)" \
+    "0"
+chk "the refusal names the path, so it is actionable" \
+    "$(HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" acquire --owner leon 2>&1 >/dev/null | grep -c "$UNUSABLE_DIR")" \
+    "1"
+
+rm -f "$LOCK.ran"
+HOSTLOCK_DIR="$UNUSABLE_DIR" "$HL" run --owner leon -- touch "$LOCK.ran" >/dev/null 2>&1
+chk "run exits 7" "$?" "7"
+chk "and does not run the command" \
+    "$([ -e "$LOCK.ran" ] && echo ran || echo refused)" "refused"
+rm -f "$LOCK.ran"
+
+# A path that exists as a FILE can never become a lock dir, and this is the
+# fixture where the pre-fix loop is reachable: the staging dir is a SIBLING,
+# so it is created fine, and only the final `mv -T` onto the file fails --
+# which publish_lock reports the same way it reports "somebody got there
+# first". So the old code looped, slept, and after --timeout announced
+# contention on an idle box. Timed as well as coded, because a refusal that
+# takes --timeout to arrive is still the defect: `run` sets --wait
+# unconditionally, so this did not fail, it HUNG.
+: >"$LOCK.file"
+chk "a lock path that is a plain file is UNUSABLE" \
+    "$(HOSTLOCK_DIR="$LOCK.file" "$HL" status --porcelain 2>/dev/null | sed -n 's/^state=//p')" \
+    "UNUSABLE"
+t0=$SECONDS
+HOSTLOCK_DIR="$LOCK.file" "$HL" acquire --wait --timeout 30 --owner leon >/dev/null 2>&1
+rc=$?
+chk "acquire --wait refuses instead of waiting out the timeout" "$rc" "7"
+chk "and refuses promptly rather than blaming peers for 30s" \
+    "$([ "$((SECONDS - t0))" -lt 5 ] && echo prompt || echo slow)" "prompt"
+rm -f "$LOCK.file"
+
+# The check is on the PARENT, never the leaf. publish_lock stages at a SIBLING
+# of LOCK_DIR and renames it into place, so "can we create entries next to it"
+# is the real question -- and `mkdir -p` will build any missing intermediate
+# levels, so a deep path under a writable ancestor is usable too. A guard that
+# demanded the immediate parent exist would refuse this host wrongly, which is
+# the mirror-image failure: a lock that refuses a usable box is a lock nobody
+# keeps using.
+DEEP="$LOCK.deep/a/b/hl"
+rm -rf "$LOCK.deep"
+chk "a deep path under a writable ancestor is usable" \
+    "$(HOSTLOCK_DIR="$DEEP" "$HL" status --porcelain 2>/dev/null | sed -n 's/^state=//p')" \
+    "FREE"
+HOSTLOCK_DIR="$DEEP" "$HL" run --owner leon -- true >/dev/null 2>&1
+chk "and can actually be acquired, mkdir -p building the rest" "$?" "0"
+rm -rf "$LOCK.deep"
+
+# Usability must not leak into the occupied path: a HELD lock is HELD whatever
+# the directory's mode says, or the state that stops a second agent taking the
+# box would be answerable by a chmod.
+"$HL" acquire --owner leon-held --ttl 60 >/dev/null 2>&1
+chk "a held lock still reads HELD, not UNUSABLE" \
+    "$("$HL" status --porcelain 2>/dev/null | sed -n 's/^state=//p')" "HELD"
+
+# The sharp end of "the parent, never the leaf", and the cell that a mutant
+# testing LOCK_DIR itself survives without: a lock dir that EXISTS and is
+# unwritable is still perfectly publishable (the stage is a sibling), and the
+# honest answer for a second agent is BUSY -- somebody has the box. Reporting
+# UNUSABLE there would relabel real contention as a broken host, which is the
+# most expensive direction to get this wrong: it tells the agent to go fix its
+# config and try again, while a peer's benchmark is running.
+chmod 500 "$LOCK"
+"$HL" acquire --owner leon-other >/dev/null 2>&1
+chk "a held-but-unwritable lock dir is BUSY, not UNUSABLE" "$?" "2"
+chmod 700 "$LOCK"
+"$HL" release >/dev/null 2>&1
+rm -rf "$LOCK"
+
+chmod 700 "$UNUSABLE_PARENT" 2>/dev/null
+rm -rf "$UNUSABLE_PARENT"
+cleanup
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "321"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "340"
 
 echo
 echo "passed=${pass} failed=${fail}"
