@@ -117,6 +117,17 @@ impl LatentCacheGeometry {
                 self.rotary_dim
             )));
         }
+        // Mirror the op's rotary-cache contract: `rotary_dim = cos_cache.dims[1]
+        // * 2` with `cos_cache.dims[1] % 8 == 0` (see `check_rotary_caches`), so
+        // a non-zero rotary suffix is a multiple of 16. Reject a geometry the op
+        // would reject downstream rather than deferring the failure.
+        if self.rotary_dim != 0 && !self.rotary_dim.is_multiple_of(16) {
+            return Err(KvError::LatentGeometryInvalid(format!(
+                "rotary_dim ({}) must be a multiple of 16 (cos/sin cache last dim is rotary_dim/2 \
+                 and must be a multiple of 8)",
+                self.rotary_dim
+            )));
+        }
         if self.rotary_offset + self.rotary_dim > self.latent_dim {
             return Err(KvError::LatentGeometryInvalid(format!(
                 "rotary suffix (offset {} + dim {}) exceeds latent_dim {}",
@@ -448,6 +459,34 @@ mod tests {
             .validate(),
             Err(KvError::LatentGeometryInvalid(_))
         ));
+        // Even but not a multiple of 16 → rejected (mirrors the op's cos/sin
+        // cache contract).
+        assert!(matches!(
+            LatentCacheGeometry {
+                rotary_dim: 8,
+                ..base
+            }
+            .validate(),
+            Err(KvError::LatentGeometryInvalid(_))
+        ));
+        // A multiple of 16, and zero (no rotary), are both accepted.
+        assert!(
+            LatentCacheGeometry {
+                rotary_dim: 32,
+                ..base
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            LatentCacheGeometry {
+                rotary_dim: 0,
+                rotary_offset: 0,
+                ..base
+            }
+            .validate()
+            .is_ok()
+        );
         assert!(matches!(
             LatentCacheGeometry {
                 rotary_offset: 160,
