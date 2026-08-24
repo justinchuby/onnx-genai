@@ -4244,3 +4244,68 @@ async fn concurrent_turns_on_one_session_do_not_lose_a_conversation() {
         "the conversation is every turn's request and every turn's generation, once each"
     );
 }
+
+/// A request that fails admission must not open a session, and must not evict
+/// somebody else's.
+///
+/// Counting the conversation before admission is right; *creating* the session
+/// before admission was not. A client whose requests are all rejected would
+/// otherwise destroy one live conversation per rejection once the registry is
+/// full, and strand an engine session it never used.
+#[tokio::test]
+async fn a_rejected_request_neither_opens_nor_evicts_a_session() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+
+    // A live conversation.
+    let (status, first) = chat_turn(router.clone(), Some("sess-live"), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let live = state
+        .sessions
+        .get("sess-live")
+        .expect("registry")
+        .expect("the live session is registered");
+
+    // A request that cannot be admitted: more output than the model's context.
+    let rejected = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-session-id", "sess-rejected")
+                .body(Body::from(
+                    json!({
+                        "model": "workflow-multi-turn",
+                        "messages": [{"role": "user", "content": "hello world"}],
+                        "max_tokens": 1_000_000,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    assert_eq!(
+        state.sessions.get("sess-rejected").expect("registry"),
+        None,
+        "a rejected request opens no session"
+    );
+    assert_eq!(
+        state.sessions.get("sess-live").expect("registry"),
+        Some(live),
+        "a rejected request evicts nobody"
+    );
+
+    // And the live conversation still continues.
+    let (status, second) = chat_turn(router, Some("sess-live"), "the quick").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert!(session_tokens(&second) > session_tokens(&first));
+}

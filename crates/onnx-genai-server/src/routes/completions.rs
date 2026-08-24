@@ -152,10 +152,13 @@ async fn run_completion(
     let requested_logprobs = request.logprobs;
     let tokenizer = handle.tokenizer.clone();
     let prepared = prepare_completion(&request, &handle)?;
-    let (session_id, carried_tokens) =
-        resolve_session_prefill(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let session_id =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     let result = collect_generation_result(generation.events)
         .await
@@ -201,10 +204,13 @@ async fn stream_completion(
         .map(StopInput::into_texts)
         .unwrap_or_default();
     let prepared = prepare_completion(&request, &handle)?;
-    let (session_id, carried_tokens) =
-        resolve_session_prefill(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let session_id =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
@@ -402,10 +408,12 @@ async fn run_chat_completion(
     } else {
         None
     };
-    // The session is resolved before admission, because the tokens this turn is
-    // prefilled with are the conversation plus the request.
-    let (session_lookup, carried_tokens) =
-        resolve_session_prefill(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    // The conversation is counted before admission, because the tokens this
+    // turn is prefilled with are the conversation plus the request. The session
+    // itself is opened after, so a rejected request neither strands one nor
+    // evicts somebody else's on its way in.
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
@@ -416,6 +424,9 @@ async fn run_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
+    let session_lookup =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
 
     let session_for_count = session_lookup;
     let wants_constrained_json = request.wants_constrained_json();
@@ -568,8 +579,8 @@ async fn stream_chat_completion(
     } else {
         None
     };
-    let (session_lookup, carried_tokens) =
-        resolve_session_prefill(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
     let prompt_tokens = carried_tokens + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
@@ -582,6 +593,9 @@ async fn stream_chat_completion(
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
+    let session_lookup =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
     // One submission. The driver resolves how to execute it from the runtime it
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
@@ -1235,8 +1249,7 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
-/// Resolve a client session id and report how much conversation it already
-/// holds.
+/// How much conversation a client session already holds, without opening one.
 ///
 /// The tokens a turn is actually prefilled with are the conversation plus this
 /// turn's prompt, so admission, the context cap and `usage` all have to be
@@ -1244,21 +1257,44 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
 /// request only let an overlong session pass admission and fail inside the
 /// engine, and reported a conversation of thousands of tokens as a prompt of a
 /// dozen.
-async fn resolve_session_prefill(
+///
+/// A session is deliberately *not* created here. A request that then fails
+/// admission would leave an engine session nobody uses, and — once the registry
+/// is full — would evict and close another client's live conversation on its way
+/// in. The session is opened after admission, by the submit path.
+async fn carried_session_tokens(
     handle: &ModelHandle,
     sessions: &SessionRegistry,
     client_session_id: Option<&str>,
-) -> Result<(Option<SessionId>, usize), ApiError> {
+) -> Result<usize, ApiError> {
     let Some(client_id) = client_session_id else {
-        return Ok((None, 0));
+        return Ok(0);
     };
-    let session_id = get_or_create_session(&handle.engine, sessions, client_id).await?;
-    let carried = handle
+    let Some(session_id) = sessions
+        .get(client_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
+    else {
+        return Ok(0);
+    };
+    handle
         .engine
         .session_token_count(session_id)
         .await
-        .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))?;
-    Ok((Some(session_id), carried))
+        .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))
+}
+
+/// Open the client's session once the request has been admitted.
+async fn open_session_after_admission(
+    handle: &ModelHandle,
+    sessions: &SessionRegistry,
+    client_session_id: Option<&str>,
+) -> Result<Option<SessionId>, ApiError> {
+    match client_session_id {
+        Some(client_id) => get_or_create_session(&handle.engine, sessions, client_id)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
 }
 
 async fn get_or_create_session(

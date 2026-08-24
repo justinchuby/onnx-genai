@@ -2479,11 +2479,12 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                     // alias with no output names a port the runtime could read
                     // but never advance, so the second turn would replay the
                     // first.
-                    if cell
+                    let group_is_the_carrier = cell
                         .session
                         .as_ref()
                         .is_none_or(|lease| lease.continuation.is_none())
-                        && !carried.contains(name)
+                        && !carried.contains(name);
+                    if group_is_the_carrier
                         && group
                             .ports
                             .values()
@@ -2495,6 +2496,30 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
                              an alias for it declares no output port; the lease could be read \
                              and never advanced, so every turn would replay the first"
                         ));
+                    }
+                    // The lease enters at the alias's `input` port, so some step
+                    // has to invoke that component and bind that port. An alias
+                    // no step reaches is a lease with no reader.
+                    if group_is_the_carrier {
+                        for (component, alias) in
+                            group.ports.iter().filter_map(|(component, aliases)| {
+                                aliases.get(name).map(|alias| (component, alias))
+                            })
+                        {
+                            if !workflow_binds_component_port(
+                                &workflow.steps,
+                                component,
+                                &alias.input,
+                            ) {
+                                errors.push(format!(
+                                    "{path} is carried only by state service group \
+                                     '{group_name}', whose alias reads component '{component}' \
+                                     port '{}', but no step invokes that component binding that \
+                                     port; the lease would have no reader",
+                                    alias.input
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -2665,6 +2690,34 @@ fn validate_session_continuity(workflow: &WorkflowSpec, errors: &mut Vec<String>
             continuations.join(", ")
         ));
     }
+}
+
+/// Whether some step invokes `component` binding `port` as an input.
+fn workflow_binds_component_port(steps: &[WorkflowStep], component: &str, port: &str) -> bool {
+    fn walk(step: &WorkflowStep, component: &str, port: &str) -> bool {
+        match step {
+            WorkflowStep::Sequence { steps } => {
+                steps.iter().any(|step| walk(step, component, port))
+            }
+            WorkflowStep::Invoke {
+                component: invoked,
+                inputs,
+                ..
+            } => invoked == component && inputs.contains_key(port),
+            WorkflowStep::Loop { setup, steps, .. } => setup
+                .iter()
+                .chain(steps)
+                .any(|step| walk(step, component, port)),
+            WorkflowStep::Branch { cases, default, .. } => {
+                cases.values().any(|step| walk(step, component, port))
+                    || default
+                        .as_ref()
+                        .is_some_and(|step| walk(step, component, port))
+            }
+            WorkflowStep::Emit { .. } => false,
+        }
+    }
+    steps.iter().any(|step| walk(step, component, port))
 }
 
 /// Speculative regions may only contain effects and state that can be undone to

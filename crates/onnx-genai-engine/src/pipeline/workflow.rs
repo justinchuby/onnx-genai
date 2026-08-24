@@ -610,6 +610,15 @@ fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
     Ok(value.to_vec_i64()?)
 }
 
+/// Clears the pass's port leases when it ends, however it ends.
+struct SessionPortLeaseGuard<'a>(&'a RefCell<HashMap<(String, String), Value>>);
+
+impl Drop for SessionPortLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.borrow_mut().clear();
+    }
+}
+
 /// Holds a session's exclusive lease for the length of one pass.
 ///
 /// A lease declared `policy: exclusive` means one writer. Two turns that both
@@ -761,6 +770,35 @@ pub fn workflow_carries_session_state(workflow: &WorkflowSpec) -> bool {
 }
 
 impl WorkflowRuntime {
+    /// Rebind a component's input ports to any session state leased for them.
+    ///
+    /// Consumed on first use, so a component invoked once per turn reads the
+    /// lease and a component invoked once per loop iteration reads the lease on
+    /// the first iteration and its own advanced state thereafter.
+    fn bind_session_port_leases(
+        &self,
+        component: &str,
+        inputs: &mut std::collections::BTreeMap<String, String>,
+        values: &mut PipelineTensors,
+    ) -> anyhow::Result<()> {
+        if self.workflow_session_port_leases.borrow().is_empty() {
+            return Ok(());
+        }
+        for (port, bound) in inputs.iter_mut() {
+            let leased = self
+                .workflow_session_port_leases
+                .borrow_mut()
+                .remove(&(component.to_string(), port.clone()));
+            let Some(value) = leased else {
+                continue;
+            };
+            let name = format!("__session_lease.{component}.{port}");
+            values.insert(name.clone(), value);
+            *bound = name;
+        }
+        Ok(())
+    }
+
     fn materialize_workflow_value_copy(&self, value: &Value) -> anyhow::Result<Value> {
         if value.is_host_resident()? {
             return clone_value(value);
@@ -1311,6 +1349,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             return Err(error);
         }
         let _adapter_context_guard = ActiveAdapterContextGuard(&engine.active_adapter_context);
+        let _port_lease_guard = SessionPortLeaseGuard(&engine.workflow_session_port_leases);
         // A package may declare session state and still be asked for a single
         // stateless generation — that is the first turn of every conversation,
         // and it is also what `Engine::generate` is. Without a session there is
@@ -1349,17 +1388,22 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         values.insert(session_state_value_name(cell), value);
                     }
                     // A group holds the storage, and the graph reaches it
-                    // through the value the cell's initializer names — which is
-                    // the port the group's alias declares. Replacing it for the
-                    // pass is what makes the lease the `past` the component
-                    // reads, rather than the seed the caller sent.
+                    // through the `input` port its alias declares. The lease is
+                    // bound at that port rather than written over the SSA value
+                    // the cell's initializer names: that value may be produced
+                    // by a step — which would overwrite the lease and restart
+                    // the session with no error — and may be read by consumers
+                    // the group has nothing to do with.
                     onnx_genai_metadata::SessionStateCarrier::StateServiceGroup => {
-                        let initializer = &workflow
-                            .state
-                            .get(cell)
-                            .expect("a classified cell is declared")
-                            .initializer;
-                        values.insert(initializer.clone(), value);
+                        let mut leases = engine.workflow_session_port_leases.borrow_mut();
+                        for (component, alias) in
+                            onnx_genai_metadata::session_group_aliases(workflow, cell)
+                        {
+                            leases.insert(
+                                (component.to_string(), alias.input.clone()),
+                                clone_value(&value)?,
+                            );
+                        }
                     }
                     // Bound into the prompt before this plan was built.
                     onnx_genai_metadata::SessionStateCarrier::PromptContinuation => {}
@@ -1463,10 +1507,23 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 // alias's `output` port, so the value bound to that port is the
                 // one to keep — reading the initializer instead would store the
                 // value the pass *started* from and replay it forever.
-                let group_output = (carrier
-                    == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup)
-                    .then(|| session_group_output_value(workflow, cell, &values))
-                    .flatten();
+                let group_output =
+                    if carrier == onnx_genai_metadata::SessionStateCarrier::StateServiceGroup {
+                        // Fail closed. Falling back to the initializer here would
+                        // store the value the pass *started* from, so the next turn
+                        // would replay this one — a wrong answer that looks like a
+                        // working session. A group cell advanced inside a branch is
+                        // the shape that reaches this.
+                        Some(session_group_output_value(workflow, cell, &values).with_context(|| {
+                        format!(
+                            "session state '{cell}' is held by a state service group, but this \
+                             pass bound no value to the group's output port for it, so the lease \
+                             could only be stored as the value the turn started from"
+                        )
+                    })?)
+                    } else {
+                        None
+                    };
                 let value_ref = group_output.as_deref().unwrap_or_else(|| {
                     final_state_refs
                         .get(cell)
@@ -1702,7 +1759,7 @@ impl WorkflowRuntime {
                         let (
                             selected_component,
                             selected_declaration,
-                            selected_inputs,
+                            mut selected_inputs,
                             selected_outputs,
                         ) = resolve_component_invocation(
                             workflow,
@@ -1711,6 +1768,17 @@ impl WorkflowRuntime {
                             inputs,
                             outputs,
                             component_overrides,
+                        )?;
+                        // A session's leased state enters at the port its state
+                        // group aliases, and only on the first read of the pass:
+                        // later reads see what the graph itself advanced the
+                        // state to. Rebinding the port to a private value keeps
+                        // it contained — no other consumer of the SSA name the
+                        // step named observes the lease.
+                        self.bind_session_port_leases(
+                            selected_component,
+                            &mut selected_inputs,
+                            values,
                         )?;
                         // Fixed-capacity groups scatter to positions carried in
                         // data. Bounds-check them here, while an illegal write

@@ -490,3 +490,73 @@ fn a_session_cell_whose_group_does_not_alias_it_is_refused_at_load() -> anyhow::
     );
     Ok(())
 }
+
+/// A group-backed lease enters at the port its alias declares, not by
+/// overwriting the value the cell's initializer names.
+///
+/// The distinction is the difference between working and silently restarting.
+/// The canonical group cell's initializer is a value a *setup step produces*
+/// (`decoder.setup.present.0.key` in this fixture), so writing the lease there
+/// before the pass would be overwritten by that step and dropped with no error —
+/// exactly the regression this change exists to fix. The lease is bound at the
+/// alias's `input` port instead, and the validator refuses an alias no step
+/// reaches so the binding always has a reader.
+#[test]
+fn a_group_lease_is_bound_at_its_port_and_must_have_a_reader() -> anyhow::Result<()> {
+    let metadata = onnx_genai_metadata::load_metadata_from_dir(&decoder_package())?
+        .expect("the fixture ships metadata");
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
+
+    // The alias the lease would enter through, and the step that reads it.
+    let aliases = onnx_genai_metadata::session_group_aliases(workflow, "cache_0");
+    let (component, alias) = aliases.first().expect("the cache cell is aliased");
+    assert_eq!(*component, "model");
+    assert_eq!(alias.input, "past_key_values.0.key");
+    assert_eq!(alias.output.as_deref(), Some("present.0.key"));
+
+    // The cell's initializer is produced by a setup step, which is precisely why
+    // the lease cannot be written there.
+    let initializer = &workflow.state["cache_0"].initializer;
+    assert_eq!(initializer, "decoder.setup.present.0.key");
+
+    // A group whose alias names a port no step binds is refused: the lease would
+    // have no reader.
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("unread_group_port_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let path = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+    let state = document["pipeline"]["workflow"]["state"]
+        .as_mapping_mut()
+        .expect("workflow declares state");
+    state
+        .remove(serde_yaml::Value::String("conversation".into()))
+        .expect("the fixture declares a conversation");
+    // Session-scope the cache and take it out of the loop's carries, so the
+    // group is the only thing that could hold it.
+    let cache = state
+        .get_mut(serde_yaml::Value::String("cache_0".into()))
+        .expect("the fixture declares a cache cell");
+    cache["scope"] = serde_yaml::Value::String("session".into());
+    cache["release_boundary"] = serde_yaml::Value::String("session".into());
+    let carried = document["pipeline"]["workflow"]["steps"][0]["carried"]
+        .as_sequence_mut()
+        .expect("the loop carries state");
+    carried.retain(|carry| carry["cell"].as_str() != Some("cache_0"));
+    // And rename the port the alias reads to one no step binds.
+    document["pipeline"]["workflow"]["serving"]["state_service"]["groups"]["decoder_cache"]["ports"]
+        ["model"]["cache_0"]["input"] = serde_yaml::Value::String("past_key_values.absent".into());
+    std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+    let metadata =
+        onnx_genai_metadata::load_metadata_from_dir(&scratch)?.expect("metadata was written");
+    let reported =
+        onnx_genai_metadata::validate_metadata(&metadata).expect_err("the lease has no reader");
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("the lease would have no reader")),
+        "expected the missing-reader refusal, got {reported:?}"
+    );
+    Ok(())
+}
