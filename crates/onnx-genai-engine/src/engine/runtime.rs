@@ -2903,6 +2903,16 @@ fn literal_token_ids(literal: &onnx_genai_metadata::LiteralValue) -> anyhow::Res
         .collect()
 }
 
+// DELIBERATE DEFECT: falsifier for #2015 / reproduction of #1982.
+// A fixture name containing the banned substring "WorkflowShape". This exact
+// shape shipped to `main` with both required checks green and reddened only
+// the advisory `CLI ORT` lane. Pushed to observe the new *required* step fail.
+#[cfg(test)]
+#[allow(dead_code)]
+enum TestWorkflowShape {
+    Probe,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
