@@ -317,17 +317,22 @@ whichever holder happened to be there at the end:
 | `changed` | the window spans a change of custody; no single holder describes it |
 | `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
 
-Set `HOSTLOCK_OWNER` in the **environment**, not just `--owner` on the command
-line: `run` does not export the flag, so a child that inherits neither cannot
-tell your lock from a co-tenant's and reports `held:` rather than `mine:`.
-`HOSTLOCK_OWNER=leon scripts/hostlock.sh run --reason "..." -- ...` sets both at
-once, since `--owner` defaults to it.
+`run --owner leon -- ...` is enough: since #1929 `run` exports the declared
+owner into the wrapped command, so the obvious invocation is also the one that
+certifies. Before that fix the flag was only a shell variable, the child
+inherited nothing, and every row of an otherwise correctly locked matrix read
+`held:leon` instead of `mine:leon` -- honest, but not certifying. Setting
+`HOSTLOCK_OWNER=leon` in the environment still works and is equivalent, since
+`--owner` defaults to it.
 
-There is deliberately no fallback to `$USER`, even though the script uses one.
-Every agent on this host runs as the same user, so `$USER` cannot distinguish
-one declaration from another -- defaulting to it would report `mine:` for
-somebody else's lock, which is the one direction this field exists to prevent.
-An unset `HOSTLOCK_OWNER` genuinely cannot be attributed, and says so.
+The export is deliberately **not** applied to an owner the script defaulted
+from `$USER`. Every agent on this host runs as the same unix user, so a
+`$USER`-derived owner cannot distinguish one declaration from another --
+exporting it would make every agent's lock read `mine:` to every other agent,
+which is the one direction this field exists to prevent. So the lock file still
+records that defaulted owner (it is the best available answer to "who?"), but
+nothing downstream is told to treat it as *its own*: an undeclared run reports
+`held:` and says so. Declaring an owner is what makes a row attributable.
 
 This is orthogonal to the `foreign_%` / `sib_%` columns beside it and does not
 replace them: those measure what the host *did*, `host_lock` records what

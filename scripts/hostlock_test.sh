@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1984,13 +1984,99 @@ hl_legacy "$CONF" release >/dev/null 2>&1
 rm -rf "$LOCK.legacy" "$LOCK.box" "$CONF"
 cleanup
 
+echo "== run hands its declared identity to the command, and only when declared =="
+# `--owner` was a shell variable, invisible to the child, so the obvious
+# invocation produced an unattributed `host_lock=held:leon` row while the
+# environment form produced `mine:leon`. The reader is right in both cases --
+# `held:` is the honest answer when attribution is impossible -- but the tool
+# was making the weaker label the easy one to reach (#1929).
+rm -f "$LOCK.owner"
+# shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
+env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 -- \
+    sh -c 'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(sed -n "s/^owner=//p" "$2/meta")" >"$1"' \
+    _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
+# Asserted together, because the export is only worth anything if it matches
+# what the lock records: that equality is exactly the comparison the reader
+# makes to decide `mine:` rather than `held:`.
+chk "run --owner reaches the command, as the identity the lock records" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "leon-1929|leon-1929"
+
+rm -f "$LOCK.owner"
+# Precedence, asserted in the child rather than in the lock file, because the
+# vacuous version of this cell is the tempting one. `HOSTLOCK_OWNER=x run --
+# child` proves nothing about this change: the variable is already in the
+# script's environment and the child inherits it whether or not `run` exports
+# anything. Adding `--owner` makes it load-bearing, and it is also the case
+# that actually bites -- the flag wins for the lock file, so without the export
+# the child keeps the STALE inherited name, disagrees with what was recorded,
+# and the reader reports `foreign:` -- a co-tenant's row -- which is worse than
+# the `held:` this issue is about.
+# shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
+HOSTLOCK_OWNER=env-owner "$HL" run --owner flag-owner -- \
+    sh -c 'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(sed -n "s/^owner=//p" "$2/meta")" >"$1"' \
+    _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
+chk "a declared owner overrides an inherited one in the child, not just in the lock" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "flag-owner|flag-owner"
+
+# The load-bearing half. Every agent on this box runs as the same unix user,
+# so exporting a $USER-derived owner would make every agent's lock read as
+# `mine:` to every other agent -- a false certification, on the DEFAULT path,
+# produced by the naive one-line version of this fix.
+rm -f "$LOCK.owner"
+# shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
+env -u HOSTLOCK_OWNER "$HL" run -- \
+    sh -c 'printf %s "${HOSTLOCK_OWNER-<unset>}" >"$1"' _ "$LOCK.owner" >/dev/null 2>&1
+chk "an owner defaulted from the unix user is NOT exported" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "<unset>"
+
+# Anti-vacuity for the cell above: it would also pass if `run` had stopped
+# deriving a default at all. Only the EXPORT is suppressed; the lock still
+# records who took it, because a lock with no owner is a different regression.
+rm -f "$LOCK.owner"
+# shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
+env -u HOSTLOCK_OWNER "$HL" run -- \
+    sh -c 'sed -n "s/^owner=//p" "$2/meta" >"$1"' _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
+chk "but the lock still records that defaulted owner" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "${USER:-unknown}"
+
+# A nested hostlock inheriting the identity is the point, not a side effect:
+# a harness that takes a second lock (a different directory, a sub-run) should
+# do so as the same agent. Asserted so it stays deliberate.
+rm -rf "$LOCK.nested"
+rm -f "$LOCK.owner"
+# shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
+env -u HOSTLOCK_OWNER "$HL" run --owner leon-1929 -- \
+    sh -c 'HOSTLOCK_DIR="$2" scripts/hostlock.sh acquire --ttl 60 >/dev/null 2>&1
+           sed -n "s/^owner=//p" "$2/meta" >"$1"' _ "$LOCK.owner" "$LOCK.nested" >/dev/null 2>&1
+chk "a nested hostlock inherits that identity, deliberately" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "leon-1929"
+
+# `acquire` has no child, so it has nothing to export to -- and asserting that
+# behaviourally is impossible: a subprocess cannot alter its caller's
+# environment, so such a "check" would pass with the export hoisted anywhere
+# at all. Worse, `cmd_run` calls `cmd_acquire` as a FUNCTION, in the same
+# process, so an export moved there would still reach the wrapped command and
+# every behavioural cell above would stay green while `acquire` quietly
+# started setting a variable in a process with nothing to hand it to. This
+# file's idiom for a safety that is positional and invisible is to assert it
+# structurally, so that is what these two do: one place, and that place is the
+# one command that has a child.
+# shellcheck disable=SC2016  # matching the literal source text, not expanding it
+chk "the identity is exported in exactly one place" \
+    "$(grep -c 'export HOSTLOCK_OWNER' "$HL")" "1"
+# shellcheck disable=SC2016  # matching the literal source text, not expanding it
+chk "and that place is cmd_run, which is the only one with a child" \
+    "$(sed -n '/^cmd_run() {/,/^}/p' "$HL" | grep -c 'export HOSTLOCK_OWNER')" "1"
+rm -rf "$LOCK.nested"
+cleanup
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "314"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "321"
 
 echo
 echo "passed=${pass} failed=${fail}"
