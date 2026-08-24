@@ -457,6 +457,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      # The gate's submodule precondition, tested against fixture repository
+      # roots with cargo/rustup shimmed -- about a second, and it is the only
+      # thing that proves the check refuses BEFORE spending a clippy run rather
+      # than after one. One of its cells runs the gate against this checkout,
+      # so a precondition that started rejecting correct trees fails here
+      # instead of on every developer's box. #1816.
+      - name: Cross-compile gate preconditions (self-test)
+        run: |
+          shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
+          bash scripts/check_cross_compile_test.sh
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
