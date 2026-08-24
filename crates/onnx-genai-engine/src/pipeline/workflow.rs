@@ -1355,7 +1355,9 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // package the ability to answer one question.
         let session_state = onnx_genai_metadata::classify_session_state(workflow);
         // Taken before the lease is read and released when the pass ends,
-        // whichever way it ends.
+        // whichever way it ends. Declared session contracts validate as
+        // exclusive, and cells without one use the schema's exclusive default,
+        // so every carried session cell requires this guard.
         let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
             (Some(session_id), true) => {
                 match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
