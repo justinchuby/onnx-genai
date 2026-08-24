@@ -2117,14 +2117,32 @@ time. That figure is now stale; the re-measurement replaces it.
 > paired-imbalance gate passing at 8.3%) and costs ~3x the launches, since each
 > launch runs three independent width-16 processes that each draw the mode. The
 > 22.2-point straggler wait remains the open target; what is closed is the claim
-> that spare tiles collect it. Full records:
+> that spare tiles collect it.
+>
+> **Worker placement is also excluded (2026-08-24).** A probe capturing the
+> pinned-CPU set and the mode from the *same* process found both modes on a
+> byte-identical 15-worker / 15-physical-core / 8-7-L3 set across 16 trusted
+> launches (21 over three runs). A 4.0 ms launch and a 6.0 ms launch are
+> placed identically. The probe's first version carried a **selection bias
+> that admitted only slow launches** — it sampled `/proc` at a fixed 4.0 s,
+> later than a fast launch's entire 1.13 s lifetime, and reported the
+> resulting misses as workload failures. Fixed by polling from t=0; the
+> defect is written up because the failure mode (an instrument that
+> structurally cannot see one arm, while its discards look like noise) is the
+> same class as the harness defects already in this ledger. Remaining live
+> candidates for the 22.2-point straggler wait: **weight-arena placement
+> across the two L3/CCX domains**, and **per-launch clock/boost state**. Since
+> a slow worker is slow for reasons of its own rather than holding more work,
+> a static redistribution cannot collect it — the evidence points at a
+> dynamic, measurement-driven steal. Full records:
 
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md),
 > [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
 > [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
-> [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md).
+> [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md),
+> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
