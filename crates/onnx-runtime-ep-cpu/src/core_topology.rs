@@ -356,6 +356,72 @@ pub fn host() -> Option<&'static CoreTopology> {
     TOPOLOGY.get_or_init(CoreTopology::detect).as_ref()
 }
 
+/// Whether this target has a core-topology backend at all.
+///
+/// Compile-time, and that is the whole point. Every placement assertion in this
+/// crate used to be reached through `host()` returning `Some`, so a detection
+/// regression converted them into no-ops instead of failures -- including the
+/// anti-vacuity guard that exists to report exactly that, which was written
+/// `if allowed_now >= 2 && core_topology::host().is_some()`. A guard predicated
+/// on the runtime success of the thing whose failure it reports cannot fire.
+///
+/// Skipping is legitimate only where there is no backend to succeed, and that
+/// is a property of the *target*, not of a runtime call, so it is answered by
+/// `cfg!` and cannot silently become false on a host that should have answered.
+#[cfg(test)]
+pub(crate) const DETECTION_SUPPORTED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_vendor = "apple"
+));
+
+/// Reason returned when a skip is genuinely justified. Stated rather than
+/// silent, so a skipped placement check is visible in the assertion text.
+#[cfg(test)]
+pub(crate) const NO_BACKEND_REASON: &str = "core-topology detection has no backend on this target, so placement is unanswerable by \
+     construction rather than by failure";
+
+/// The fail-closed policy behind [`require_host_for_placement`], split out so
+/// the mutation test can force a detection failure without mutating global
+/// state that parallel tests share.
+///
+/// `detection_supported` is a parameter rather than a direct read of
+/// [`DETECTION_SUPPORTED`] for the same reason: it lets one test assert the
+/// panic branch and another assert the skip branch, on whichever host CI runs.
+#[cfg(test)]
+pub(crate) fn topology_or_fail_closed(
+    detected: Option<&'static CoreTopology>,
+    detection_supported: bool,
+) -> Result<&'static CoreTopology, &'static str> {
+    match (detected, detection_supported) {
+        (Some(topology), _) => Ok(topology),
+        (None, true) => panic!(
+            "core-topology detection returned None on a target that supports it. Every \
+             placement assertion in this crate is reached through this call, so treating \
+             this as a skip would silently convert them -- and the anti-vacuity guard that \
+             reports that conversion -- into no-ops that still pass. See #1792: a pool \
+             reporting `realized=16 as_requested` while running on half the cores it \
+             claimed is the defect; a checker that reports nothing is indistinguishable \
+             from a checker that passes."
+        ),
+        (None, false) => Err(NO_BACKEND_REASON),
+    }
+}
+
+/// Topology for placement assertions: fails closed wherever detection is
+/// supported, and skips with an explicit reason only where it is not.
+///
+/// Placement *tests* must call this rather than [`host`]. `host` keeps its
+/// `Option` because production callers must not panic on an undiscoverable
+/// topology -- `placement_is_one_worker_per_physical_core` answering `None` is
+/// correct, since claiming `Some(true)` there would be a lie. The difference is
+/// that a test skipping is a defect being missed, whereas production declining
+/// to cap is the documented "never cap on a guess" policy.
+#[cfg(test)]
+pub(crate) fn require_host_for_placement() -> Result<&'static CoreTopology, &'static str> {
+    topology_or_fail_closed(host(), DETECTION_SUPPORTED)
+}
+
 /// The number of physical cores the current process may actually run on.
 ///
 /// Intersects the detected core topology with the process's allowed CPU set
@@ -657,8 +723,16 @@ mod tests {
     fn detected_host_topology_is_self_consistent() {
         // Runs on whatever CI machine this lands on; asserts the invariants
         // rather than a specific layout, so it is not host-fitted.
-        let Some(topology) = host() else {
-            return;
+        //
+        // Fails closed: this used to `return` on `None`, which meant a
+        // detection regression made it pass vacuously. It is one of the three
+        // tests the mutation battery caught doing exactly that.
+        let topology = match require_host_for_placement() {
+            Ok(topology) => topology,
+            Err(reason) => {
+                eprintln!("skipping {}: {reason}", module_path!());
+                return;
+            }
         };
         assert!(topology.core_count() > 0);
         assert!(topology.logical_count() >= topology.core_count());
@@ -762,5 +836,93 @@ mod tests {
             "topology covers {} logical CPUs but the process sees {logical}",
             topology.logical_count()
         );
+    }
+
+    /// The mutation test, made permanent.
+    ///
+    /// #1805's placement checks were all reached through `host()` returning
+    /// `Some`, so forcing detection to `None` made three of them -- including
+    /// `placement_reports_a_shared_core_as_a_defect`, the *negative control* --
+    /// pass vacuously. That was proved once by hand-editing `detect_linux`,
+    /// which is exactly the kind of evidence that decays: the next person to
+    /// reintroduce a silent skip has nothing to trip over.
+    ///
+    /// This forces the failure through the same policy function every placement
+    /// test now routes through, so the proof runs on every CI job. It injects
+    /// `None` as an argument rather than mutating a global, because the test
+    /// binary is multi-threaded and a global toggle would make *other* tests
+    /// observe a missing topology at random.
+    #[test]
+    fn forcing_a_detection_failure_fails_closed_where_detection_is_supported() {
+        let forced = std::panic::catch_unwind(|| topology_or_fail_closed(None, true));
+        assert!(
+            forced.is_err(),
+            "a forced detection failure on a supported target did not panic, so placement \
+             assertions would skip silently instead of failing -- this is the #1805 \
+             fail-open reintroduced"
+        );
+
+        let message = forced
+            .err()
+            .and_then(|payload| {
+                payload
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+            })
+            .unwrap_or_default();
+        assert!(
+            message.contains("placement"),
+            "the fail-closed panic must say what it is about, so a CI log identifies the \
+             defect without a bisect; got {message:?}"
+        );
+    }
+
+    /// The other half: a skip is still allowed where there is genuinely no
+    /// backend, and it has to carry a reason. Without this, "fail closed" would
+    /// be indistinguishable from "panic on every platform we have not ported
+    /// to", and the pressure would be to weaken the panic rather than state the
+    /// exemption.
+    #[test]
+    fn an_unsupported_target_skips_with_an_explicit_stated_reason() {
+        let skipped = topology_or_fail_closed(None, false)
+            .expect_err("an unsupported target must skip, not resolve a topology");
+        assert!(
+            !skipped.trim().is_empty(),
+            "a skip must state why; a bare skip is the silent-return this change removes"
+        );
+        assert_eq!(skipped, NO_BACKEND_REASON);
+    }
+
+    /// A present topology resolves on either setting -- so the two tests above
+    /// are testing the `None` handling specifically, rather than a function
+    /// that panics unconditionally.
+    #[test]
+    fn a_detected_topology_resolves_regardless_of_support_flag() {
+        let Some(detected) = host() else {
+            // Only reachable on a target with no backend, where the two tests
+            // above already pin the behaviour.
+            return;
+        };
+        assert!(topology_or_fail_closed(Some(detected), true).is_ok());
+        assert!(topology_or_fail_closed(Some(detected), false).is_ok());
+    }
+
+    /// This crate's own target must be one that fails closed. Without it,
+    /// porting to a target that quietly lands outside `DETECTION_SUPPORTED`
+    /// would re-open every placement skip with no test noticing.
+    #[test]
+    // The assertion is deliberately constant-valued: it is a *compile-target*
+    // tripwire, not a runtime check. A `const` block would turn a port to an
+    // unported target into a build error, which would break the graceful skip
+    // this change is careful to preserve.
+    #[allow(clippy::assertions_on_constants)]
+    fn the_targets_this_crate_is_tested_on_are_all_fail_closed() {
+        assert!(
+            DETECTION_SUPPORTED,
+            "this target has no core-topology backend, so every placement assertion in \
+             this crate is skipping; if that is intended, say so here explicitly"
+        );
+        assert!(require_host_for_placement().is_ok());
     }
 }
