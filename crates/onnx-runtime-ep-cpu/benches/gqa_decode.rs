@@ -108,6 +108,10 @@ fn bench_sdpa_group_vs_row(c: &mut Criterion) {
                                 scale,
                                 None,
                                 SoftmaxExp::F64Intermediate,
+                                // No head sink: the arm this benchmark has
+                                // always measured, kept identical across
+                                // #1956 so its history stays comparable.
+                                None,
                                 &mut out[g * head_size..(g + 1) * head_size],
                             );
                         }
@@ -131,6 +135,7 @@ fn bench_sdpa_group_vs_row(c: &mut Criterion) {
                             scale,
                             None,
                             SoftmaxExp::F64Intermediate,
+                            None,
                             &mut out,
                             &mut scores,
                         );

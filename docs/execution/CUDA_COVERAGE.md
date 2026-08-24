@@ -267,9 +267,9 @@ are correct as history — they are not a statement about today.
 `com.microsoft`: `FusedAttention`, `MoE`, `PackedMultiHeadAttention`.
 
 Each is either explained as a deliberate non-gap in this file or is open work
-with a tracking entry. `DFT` is the newest and is under investigation — it was
-found by the re-measurement described above, not by a report, which is why the
-test now exists.
+with a tracking entry. `DFT` was the newest addition to this list — it was found
+by the re-measurement described above rather than by a report, which is why the
+test exists — and is now itself a documented non-gap; see the write-up below.
 
 Issue #67 batch (2026-07-30): a data-driven placement audit over the real target
 decode models (Qwen2.5 0.5b/1.5b/7b, Phi-4-mini, Qwen3.6-27B, Qwen3.5-35B-A3B)
@@ -364,14 +364,86 @@ worth stating precisely:
   non-gap is recorded here (and pinned by a unit test in `kernels/mod.rs`) to
   prevent future re-investigation.
 
+`ai.onnx::DFT` (opset 17, discrete Fourier transform) is present in the CPU EP
+(`crates/onnx-runtime-ep-cpu/src/kernels/dft.rs`) but is **not a real CUDA gap**.
+It is the safest class of non-gap in this document — safer than both `MoE` and
+`PackedMultiHeadAttention` — for reasons stated precisely below:
 
-### Library mapping for the remaining CPU gaps
+* **No in-scope CUDA target model emits `DFT` inside its graph.** The CUDA
+  workloads this project targets are decoder-only / hybrid LLMs (Qwen2.5/3.x,
+  Phi-4-mini) and the Whisper encoder-decoder. None of them compute a Fourier
+  transform inside the ONNX graph. Whisper in particular does **not**: its
+  STFT / log-mel feature extraction runs on the **host**, in Rust, via
+  `rustfft` in `crates/onnx-genai-preprocess/src/audio.rs`
+  (`LogMelExtractor`, `WHISPER_N_FFT = 400`), and the model receives a
+  precomputed `[1, n_mels, n_frames]` feature tensor. The graph never sees a
+  `DFT` (or `STFT`) node, so the CUDA EP is never asked to place one. No
+  `*.textproto` fixture in the repo contains a `DFT` or `STFT` producer.
+
+* **The only in-graph `DFT` producer anywhere in the repo is the Perch v2
+  bioacoustics model**, exercised by `crates/onnx-runtime-session/tests/perch_dft.rs`.
+  Perch takes a raw `[1, 160000]` waveform and computes its transform (N=1024)
+  inside the graph. It is a **CPU-EP workload**, not a CUDA decode target: the
+  integration test loads it through the native CPU EP only, and the fast path is
+  a macOS/iOS Accelerate vDSP DFT aimed at edge/laptop deployment. Perch is not
+  in the CUDA target set and there is no Perch-on-CUDA path. *(A measurement
+  exists that `DFT` is ~0.80% of Perch's total model time — PR #368 review — but
+  it says nothing about the cost of a CUDA decline and must not be read that
+  way; see the next bullet.)*
+
+* **What declining actually costs here, stated in this repo's own terms.**
+  It is tempting to reason "the op is a tiny fraction of runtime, so declining
+  it is cheap". That intuition comes from ONNX Runtime, which assigns
+  **per node** and leaves the rest of the graph on the GPU. It holds only on one
+  of this repo's two paths:
+
+  | Path | What a declined node does |
+  |---|---|
+  | **ORT plugin EP** (`onnx-runtime-ep-cuda-plugin`) | ORT assigns per node, so the declined node goes to another ORT provider and the rest of the graph stays put — the familiar cheap case |
+  | **Native session** (`onnx-runtime-session`), default | `*ep = auto_detect_cpu_ep()` — the **whole session** drops to CPU (`executor/build.rs`), with a warning |
+  | **Native session**, `ONNX_GENAI_HETERO=1`, mixed graph | fails closed, `HeterogeneousExecutionUnsupported` (`hetero.rs`) — per-node heterogeneous *execution* is not wired, deferred under #603 |
+  | **Native session**, `ONNX_GENAI_REQUIRE_CUDA=1` | hard error rather than accept the fallback |
+
+  On the native path there is therefore no configuration in which a decline
+  costs a few percent: the cost is all of the GPU acceleration, or a load
+  failure. **This is why the load-bearing argument is the absence of a producer,
+  and nothing else.** An "op X is only N% of runtime" figure is not evidence
+  about a coverage decision, and reasoning from ORT's per-node behaviour alone
+  understates the native path's risk.
+
+* **Given a node did appear, it would still load.** `DFT` has a complete,
+  reviewed CPU kernel in this repo's own CPU EP (`dft.rs`: real and complex
+  input, forward/inverse, full/onesided, opset-17 axis attribute and opset-20
+  axis input), so the whole-session CPU fallback above succeeds. That is the
+  precise sense in which this is a safer non-gap than
+  `PackedMultiHeadAttention`, where no CPU kernel exists anywhere and a fallback
+  could not even load. It is *not* the sense of "a cheap slowdown".
+
+  Weak corroboration only: upstream ORT ships no CUDA `DFT` kernel either
+  (ORT issue #21164), so nothing is lost relative to it. This is deliberately
+  not load-bearing — the conclusion would be unchanged if ORT *did* have one,
+  which is exactly why it cannot be evidence. Note also that "CPU-only upstream"
+  would be imprecise: ORT ships DFT for its DML and WebGPU providers, so a GPU
+  DFT is plainly implementable. The reason it is absent here is the absence of a
+  producer, not anything inherent to the operator.
+
+* **The condition that would flip this decision.** If an in-scope model ever
+  computes its STFT / mel-spectrogram (or any Fourier transform) **inside** the
+  ONNX graph and is placed on CUDA where the per-op host↔device transfer of the
+  CPU fallback becomes a measured bottleneck, implement a CUDA kernel. The
+  natural implementation is a cuFFT-backed complex/real DFT mirroring `dft.rs`'s
+  parameter surface (axis, onesided, inverse, complex input), wired through the
+  five-place registration contract in `crates/onnx-runtime-ep-cuda/src/kernels/mod.rs`.
+  Until then it would be dead code for current targets; this non-gap is recorded
+  here (and pinned by `dft_is_a_documented_non_gap` in `kernels/mod.rs`) to
+  prevent future re-investigation.
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
 | **deferred heavy operators** | `NonMaxSuppression` | Data-dependent selection deserves a dedicated follow-up wave and focused review. |
+| **none (documented non-gap)** | `DFT` | Not emitted in-graph by any in-scope CUDA target; only the CPU-EP Perch model produces it. Were one to appear, this repo's own CPU `dft.rs` lets the whole-session fallback still load. See the DFT non-gap write-up above. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local

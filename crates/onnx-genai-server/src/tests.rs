@@ -2598,7 +2598,10 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let generation = driver.generate(Some(session_id), request).await.unwrap();
+    let generation = driver
+        .generate(Some(session_id), request, None)
+        .await
+        .unwrap();
     let result = timeout(
         Duration::from_secs(5),
         collect_generation_result(generation.events),
@@ -4664,6 +4667,13 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
 fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageCapabilityError;
 
+    let no_state = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+        PackageCapabilityError::NoSessionState,
+    ));
+    let response = crate::routes::generation_failure(no_state);
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert_eq!(response.kind, "conflict_error");
+
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageCapabilityError::ExclusiveLeaseConflict {
             session: "shared".to_string(),
@@ -4685,7 +4695,15 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     let response = crate::routes::generation_failure(over_bound);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert_eq!(response.kind, "invalid_request_error");
-    assert!(response.message.contains('6'));
+    assert_eq!(
+        response.message,
+        PackageCapabilityError::ConversationOverBound {
+            cell: "conversation".to_string(),
+            requested: 12,
+            bound: 6,
+        }
+        .to_string()
+    );
 
     // An ordinary failure is still a server error, so the new kind cannot
     // swallow a real fault.
