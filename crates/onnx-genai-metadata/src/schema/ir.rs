@@ -21,47 +21,61 @@ pub struct TensorContract {
     /// stay runtime-private.
     #[serde(default, skip_serializing_if = "BatchLayout::is_shared")]
     pub batch_layout: BatchLayout,
-    /// Which entries of this tensor are real rather than padding.
+    /// Which dimensions of this tensor may be padded, and where the truth
+    /// about how much of each entry is real is recorded.
     ///
     /// A dense tensor is the only shape a fixed-arity component can consume, so
-    /// a batch whose rows carry different amounts of data has to be padded up to
-    /// a common extent. Nothing in the padded tensor says where the real entries
-    /// stop, and guessing from a sentinel is exactly the hidden heuristic this
-    /// schema refuses: the mask is named, typed, and validated like any other
-    /// value. Absence means every entry is valid.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pad_mask: Option<PadMask>,
+    /// a group whose items carry different amounts of data has to be padded up
+    /// to a common extent. Nothing in the padded tensor says where the real
+    /// entries stop, and guessing from a sentinel is exactly the hidden
+    /// heuristic this schema refuses: validity is named, typed, and validated
+    /// like any other value. An empty list means the value carries no padding,
+    /// and a runtime must not introduce any.
+    ///
+    /// One entry per padded dimension: a clip tensor padded along frames and
+    /// again along patches states both, because a single companion cannot say
+    /// where two independent extents end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub padding: Vec<PaddedDimension>,
 }
 
-/// The mask that says which entries of a padded tensor are real, and the axis
-/// it marks them along.
+/// One padded dimension of a value and the companion that bounds it.
 ///
-/// The axis is stated rather than inferred. A rank-2 mask over a rank-5 clip
-/// tensor could plausibly mark frames, tiles, or patches, and a reader that
-/// guessed from rank alone would silently mark the wrong axis for any tensor
-/// whose padded axis is not the one the reader assumed. Naming it costs one
-/// integer and removes the guess.
+/// The dimension is named by its shape symbol rather than by an axis index. The
+/// same extent sits at different positions in different values — `patches` is
+/// axis 1 of the pixel tensor and axis 0 of a pooled one — and an index would
+/// name whichever the author happened to be looking at.
+///
+/// Padding is always appended: the real entries of a padded dimension form a
+/// prefix. That is what lets one integer per enclosing entry say everything a
+/// full boolean mask would say, and it is a rule rather than a convention
+/// because left padding would shift every position-dependent computation and an
+/// interior hole cannot be expressed by a length at all.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PadMask {
-    /// Workflow value, or sibling port of the same component, whose booleans or
-    /// integers mark the valid entries.
-    pub value: String,
-    /// Axis of the masked tensor whose entries the mask marks.
-    pub axis: usize,
+pub struct PaddedDimension {
+    /// Shape symbol of the padded dimension of the owning value.
+    #[schemars(length(min = 1))]
+    pub dimension: String,
+    /// Value giving how many leading entries of `dimension` are real, one entry
+    /// per position of the axes outer to it.
+    ///
+    /// It resolves in the namespace of the contract's owner: a sibling port for
+    /// a component port, a workflow value for a workflow input, output, or
+    /// state cell.
+    #[schemars(length(min = 1))]
+    pub valid_lengths: String,
 }
 
 /// Structural relationship between a typed value and the runtime batch.
 ///
 /// `shared` values are invariant across requests. `request_aligned` values carry
 /// exactly one entry per in-flight request along `axis`, so compaction permutes
-/// that axis. `token_packed` values are ragged: `offsets` names the
-/// exclusive-prefix offset value and `owner` names the per-item owner mapping,
-/// which together let a runtime split and regroup the packed value without any
-/// serialized request ID. A packing whose items belong to the items of another
-/// packing — frames inside clips inside request rows — names that enclosing
-/// packing in `owner_span`. `runtime_sequence_state` marks a value whose
-/// per-sequence storage the runtime owns outright.
+/// that axis. `token_packed` values are ragged: the items of every request are
+/// concatenated along one physical axis, and the ownership companions say which
+/// request each item came from, which is what lets a runtime split and regroup
+/// the packed value without any serialized request ID. `runtime_sequence_state`
+/// marks a value whose per-sequence storage the runtime owns outright.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BatchLayout {
@@ -78,28 +92,97 @@ pub enum BatchLayout {
         /// Validation requires this to be at least one.
         factor: usize,
     },
+    /// Items belonging to many requests concatenated along one axis.
+    ///
+    /// There is exactly one packed axis. Structure above the item — frames
+    /// inside clips inside request rows — is ownership, not a second axis: the
+    /// tensor stays a flat run of items and `levels` says how to fold that run
+    /// back into requests.
     TokenPacked {
-        /// Value holding the exclusive prefix offset of each owner's items.
-        ///
-        /// Request-aligned for a packing owned by request rows; aligned with the
-        /// enclosing packing's items when `owner_span` names one.
-        offsets: String,
-        /// Item-aligned value mapping each packed item to the index of its owner.
-        owner: String,
         /// Packed axis of this value.
-        axis: usize,
-        /// Packed value whose items this packing's owner indices name.
         ///
-        /// Absent means the owner map indexes request rows, which is where every
-        /// ownership chain ends. Present means one more level sits in between:
-        /// packed frames own into packed clips, and the clips own into rows.
-        /// Composition is bounded — validation rejects a chain deeper than
-        /// items inside spans inside request rows — because a runtime resolves
-        /// ownership by walking it on every compaction.
+        /// Validation requires axis zero. A run of items is only splittable
+        /// into per-request pieces without copying when the items are the
+        /// outermost, contiguous stride of the tensor, and a packed axis
+        /// anywhere else would silently turn every split into a gather.
+        axis: usize,
+        /// Ownership chain of the packed axis, innermost level first.
+        ///
+        /// Level zero owns the physically packed positions; the last level owns
+        /// into request rows. One level is the ordinary flat case — items in
+        /// rows — and two states one grouping in between, as frames in clips in
+        /// rows. Validation rejects a third: a runtime walks the whole chain on
+        /// every split, and each level multiplies the states that have to be
+        /// checked and tested.
+        #[schemars(length(min = 1, max = 2))]
+        levels: Vec<OwnershipLevel>,
+        /// Where the extent of this packed axis comes from, for a value a
+        /// component produces.
+        ///
+        /// Absent is right for a value a component consumes, whose extent the
+        /// caller assembled. An output must state it: a runtime that assumed
+        /// the input's offsets still describe the result would split a
+        /// token-merging encoder's output at the wrong boundaries and report
+        /// nothing.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        owner_span: Option<String>,
+        packed_extent: Option<PackedExtent>,
     },
     RuntimeSequenceState,
+}
+
+/// One level of a packed value's ownership chain.
+///
+/// A level is a pair, never a tensor axis: `offsets` gives the exclusive prefix
+/// offset of each parent's run and `owner` gives the owning position of each
+/// entry at this level. The two together are what a runtime walks to answer
+/// "which request does this item belong to".
+///
+/// Both are `shared`, never `request_aligned`. An exclusive prefix sum is not
+/// permutation-followable — permuting rows does not permute a prefix-offset
+/// vector, it invalidates it — so a runtime that compacts rebuilds the chain
+/// rather than gathering it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipLevel {
+    /// Value holding the exclusive prefix offset of each parent's run at this
+    /// level, with a final entry holding the total. Its extent is the parent
+    /// count plus one.
+    #[schemars(length(min = 1))]
+    pub offsets: String,
+    /// Value mapping each entry at this level to the position of its parent.
+    /// Its extent is this level's own unit count, which at level zero is the
+    /// packed extent.
+    #[schemars(length(min = 1))]
+    pub owner: String,
+}
+
+/// Where the extent of a component output's packed axis comes from.
+///
+/// Neither answer is derivable from the contract: an output of the same rank
+/// and symbols as its input may be a per-item transform or a token merger, and
+/// the two split at completely different boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackedExtent {
+    /// The level's units correspond one-to-one, in order, with an input
+    /// level's, so the output reuses that input's companions unchanged. A
+    /// component may drop inner levels it has consumed; it may not invent a
+    /// correspondence it does not have.
+    Preserved,
+    /// The graph decides the extent, so the level's companions are outputs of
+    /// the same component. An input's offsets describe an extent this value
+    /// does not have.
+    Produced,
+}
+
+impl PackedExtent {
+    /// Serialized spelling, for diagnostics that name what a document declared.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preserved => "preserved",
+            Self::Produced => "produced",
+        }
+    }
 }
 
 impl BatchLayout {
@@ -124,6 +207,11 @@ impl BatchLayout {
     }
 
     /// Axis along which items belonging to many requests are concatenated.
+    ///
+    /// This counts items, never request rows. The two are different numbers as
+    /// soon as one request contributes more than one item, so nothing that
+    /// reasons about rows — row scope, compaction selections, per-row state —
+    /// may read this as a row axis.
     pub fn packed_axis(&self) -> Option<usize> {
         match self {
             Self::TokenPacked { axis, .. } => Some(*axis),
@@ -131,30 +219,41 @@ impl BatchLayout {
         }
     }
 
-    /// Values a packed layout needs to map items back to rows: `(offsets, owner)`.
+    /// Ownership chain of a packed value, innermost level first.
+    pub fn levels(&self) -> &[OwnershipLevel] {
+        match self {
+            Self::TokenPacked { levels, .. } => levels,
+            _ => &[],
+        }
+    }
+
+    /// Where a packed output's extent comes from.
+    pub fn packed_extent(&self) -> Option<PackedExtent> {
+        match self {
+            Self::TokenPacked { packed_extent, .. } => *packed_extent,
+            _ => None,
+        }
+    }
+
+    /// Every companion value this layout names, innermost level first.
+    pub fn companions(&self) -> Vec<(usize, &'static str, &str)> {
+        self.levels()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, level)| {
+                [
+                    (index, "offsets", level.offsets.as_str()),
+                    (index, "owner", level.owner.as_str()),
+                ]
+            })
+            .collect()
+    }
+
+    /// Values the innermost level needs to map items back to owners.
     pub fn packing(&self) -> Option<(&str, &str)> {
-        match self {
-            Self::TokenPacked { offsets, owner, .. } => Some((offsets.as_str(), owner.as_str())),
-            _ => None,
-        }
-    }
-
-    /// Packed value whose items this packing's owner indices name, if this
-    /// packing nests inside another instead of owning into request rows.
-    pub fn owner_span(&self) -> Option<&str> {
-        match self {
-            Self::TokenPacked { owner_span, .. } => owner_span.as_deref(),
-            _ => None,
-        }
-    }
-
-    /// Axis a runtime groups this value along when it fills one invocation.
-    ///
-    /// A request-aligned value groups by row and a packed value groups by item,
-    /// but both stack along exactly one axis, and that axis is what a batching
-    /// capacity is declared against.
-    pub fn batch_axis(&self) -> Option<usize> {
-        self.request_axis().or_else(|| self.packed_axis())
+        self.levels()
+            .first()
+            .map(|level| (level.offsets.as_str(), level.owner.as_str()))
     }
 
     /// Whether the runtime must move this value when it compacts or releases rows.
@@ -815,49 +914,83 @@ pub struct WorkflowComponent {
     /// additional state they read that is not visible as a typed input.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub cache_affects_state: BTreeSet<String>,
-    /// How many request rows one invocation of this component may carry.
+    /// How much one invocation of this component may carry.
     ///
     /// Absence means one request row per invocation: a runtime that wants to
     /// serve two requests calls the component twice. That is the safe reading
     /// for every component whose producer has not thought about batching, so it
     /// is the default. A component that declares a capacity is stating that its
-    /// artifact accepts several rows stacked on one axis, which is the fact a
-    /// scheduler needs before it may coalesce work.
+    /// artifact accepts several contributions stacked on one axis, which is the
+    /// fact a scheduler needs before it may coalesce work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_capacity: Option<ComponentBatchCapacity>,
 }
 
 /// Batching capacity of one invocation of a component.
 ///
-/// This describes the shape of an invocation, never a scheduling policy: how
-/// many request rows may share a call, along which axis they stack, and which
-/// axes must already agree before they can. A runtime decides whether to use
-/// the capacity; the package only says what its artifact can accept.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+/// This describes the shape of an invocation, never a scheduling policy: which
+/// dimensions must already agree before two contributions can share a call, and
+/// how much the assembled call may materialize. A runtime decides whether to
+/// group at all, and may always group fewer; the package only says what its
+/// artifact tolerates.
+///
+/// Everything here is keyed by shape symbol rather than by axis index. Ports of
+/// one component routinely differ in rank — a rank-3 payload, a rank-1
+/// companion, a rank-2 pooled output — so an axis index is only meaningful
+/// relative to one port, while a symbol names the same quantity on every port
+/// that mentions it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentBatchCapacity {
-    /// Axis of this component's request-scoped ports along which rows stack.
-    pub axis: usize,
-    /// Largest number of request rows one invocation may carry.
+    /// Shape symbols whose extents must be equal across every co-batched item.
     ///
-    /// Absent means the component accepts as many rows as the runtime can fit,
-    /// so the bound is memory rather than the artifact. Zero is never a capacity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
-    pub max_rows: Option<usize>,
-    /// Axes whose dimensions must be equal across rows for those rows to share
-    /// one invocation.
-    ///
-    /// A component that accepts several rows may still require them to agree on
-    /// something the batch axis does not cover — an encoder whose artifact is
-    /// built for one spatial extent, say, or one that batches clips only when
-    /// they carry the same number of frames. Spatial and temporal axes are
-    /// listed the same way: an axis is an axis, and the runtime compares the
-    /// dimensions it is told to compare rather than guessing which ones matter.
-    /// Listing them lets a scheduler group compatible rows instead of guessing
-    /// from shapes it cannot compare.
+    /// A component that accepts several items may still require them to agree
+    /// on something no amount of padding or packing reconciles — an encoder
+    /// whose artifact is built for one spatial extent, say, or one that groups
+    /// clips only when they carry the same number of frames. Spatial and
+    /// temporal extents are listed the same way: a symbol is a symbol, and the
+    /// runtime compares the dimensions it is told to compare rather than
+    /// guessing which ones matter. A symbol left off this list is free to vary,
+    /// and must then be reconciled by padding or by packing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub uniform_axes: Vec<usize>,
+    #[schemars(inner(length(min = 1)))]
+    pub uniform_dimensions: Vec<String>,
+    /// Upper bounds on what one assembled invocation materializes, keyed by
+    /// shape symbol.
+    ///
+    /// These are static geometry — a fixed position table, an exported
+    /// constant, a kernel bound — never a measured throughput sweet spot, which
+    /// would be a cost model and belongs to the runtime. Every entry is an
+    /// upper bound and never an obligation: a runtime may group fewer,
+    /// including one. An empty list bounds nothing beyond what the runtime's
+    /// own row budget already bounds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<CapacityBudget>,
+}
+
+/// One materialized-footprint bound of an assembled invocation.
+///
+/// A budget bounds what the invocation materializes, not what is nominally
+/// valid. A packed dimension's footprint is the sum of the items' valid extents,
+/// which is exactly the packed extent because packing stores no padding; a
+/// padded dimension's footprint is the enclosing count times the padded extent,
+/// which is the rectangle the runtime allocates and the kernel reads. Budgeting
+/// the valid sum instead would let one long and fifteen short items pass a bound
+/// the group then blows through.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityBudget {
+    /// Shape symbols whose materialized extents multiply to the bounded
+    /// quantity, in order.
+    ///
+    /// One symbol bounds that dimension directly — items at an ownership level,
+    /// positions on a packed axis. Several bound an activation-shaped quantity,
+    /// such as total padded patch slots, without the package ever naming bytes.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub dimensions: Vec<String>,
+    /// Largest product of those extents one invocation may carry.
+    #[schemars(range(min = 1))]
+    pub max_total: usize,
 }
 
 /// Row scope of a component's runtime-private state.

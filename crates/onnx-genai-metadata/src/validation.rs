@@ -947,7 +947,7 @@ fn require_compatible_tensor_contracts(
             other => other,
         }
     }
-    // batch_layout and pad_mask are part of the contract: a preprocessing output
+    // batch_layout and padding are part of the contract: a preprocessing output
     // that claims a different row correspondence, or a different notion of which
     // entries are real, than the port it feeds would let per-request rows drift
     // out of alignment with the rest of the workflow.
@@ -955,7 +955,7 @@ fn require_compatible_tensor_contracts(
         || source.rank != target.rank
         || source.shape != target.shape
         || source.batch_layout != target.batch_layout
-        || source.pad_mask != target.pad_mask
+        || source.padding != target.padding
     {
         errors.push(format!(
             "{path} has a contract incompatible with its adapter output port"
@@ -2076,7 +2076,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     shape: Some(Vec::new()),
                     optional: false,
                     batch_layout: crate::schema::BatchLayout::Shared,
-                    pad_mask: None,
+                    padding: Vec::new(),
                 },
             );
         }
@@ -2109,6 +2109,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     validate_effect_declarations(workflow, errors);
     validate_row_scoped_components(workflow, errors);
     validate_batch_layout_references(workflow, errors);
+    validate_shared_companions(workflow, errors);
     validate_batch_capacity(workflow, errors);
     validate_state_lifetimes(workflow, errors);
     validate_session_continuity(workflow, errors);
@@ -2345,7 +2346,7 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
 ///
 /// A workflow-level contract may only name workflow values. A component port
 /// contract may additionally name a sibling port of the same component, because
-/// the component's own ABI is what pairs a padded tensor with its mask or a
+/// the component's own ABI is what pairs a padded tensor with its lengths or a
 /// packed tensor with its offsets; which SSA value reaches that port is the
 /// invocation's business, not the port's.
 struct LayoutReferenceScope<'a> {
@@ -2454,16 +2455,17 @@ fn workflow_declared_values(
     (declared, contracts)
 }
 
-/// A packed layout and a pad mask are references, and a reference that resolves
-/// to nothing — or to a value that cannot carry what it is asked to carry — is
-/// a contract no runtime can execute.
+/// A packed layout and a validity companion are references, and a reference
+/// that resolves to nothing — or to a value that cannot carry what it is asked
+/// to carry — is a contract no runtime can execute.
 ///
 /// `token_packed` is the only layout whose meaning lives in other values: the
-/// offsets say how many items each row contributed and the owner map says which
-/// row each item came from. Together they are what lets a runtime split a packed
-/// result back into per-request pieces without any serialized row identity, so
-/// they must be values that exist, are integers, and are shaped the way that
-/// mapping requires. A `pad_mask` is the same kind of fact for a padded batch.
+/// offsets say how many items each owner contributed and the owner map says
+/// which owner each item came from. Together they are what lets a runtime split
+/// a packed result back into per-request pieces without any serialized row
+/// identity, so they must be values that exist, are integers, and are shaped
+/// the way that mapping requires. `padding` is the same kind of fact for a
+/// padded batch.
 fn validate_batch_layout_references(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     let (declared, contracts) = workflow_declared_values(workflow);
     let workflow_scope = LayoutReferenceScope {
@@ -2509,14 +2511,129 @@ fn validate_batch_layout_references(workflow: &WorkflowSpec, errors: &mut Vec<St
             ("output", &component.ports.outputs),
         ] {
             for (port, contract) in ports {
-                validate_contract_references(
-                    &format!("workflow component '{name}' {direction} '{port}'"),
-                    Some(port),
-                    contract,
-                    &scope,
-                    errors,
-                );
+                let path = format!("workflow component '{name}' {direction} '{port}'");
+                validate_contract_references(&path, Some(port), contract, &scope, errors);
+                validate_packed_extent(&path, direction, contract, &component.ports, errors);
             }
+        }
+    }
+}
+
+/// Where a packed component port's extent comes from, and who produces the
+/// companions that state it.
+///
+/// An output of the same rank and symbols as its input may be a per-item
+/// transform or a token merger, and the two split at completely different
+/// boundaries. Nothing in the contract distinguishes them, so the package
+/// declares which — and a runtime that had to guess would slice the payload at
+/// the wrong places and report nothing at all.
+fn validate_packed_extent(
+    path: &str,
+    direction: &str,
+    contract: &crate::schema::TensorContract,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let levels = contract.batch_layout.levels();
+    let Some(level) = levels.first() else {
+        if contract.batch_layout.packed_extent().is_some() {
+            errors.push(format!(
+                "{path} declares packed_extent but declares no packed layout; the field says \
+                 where a packed axis's extent comes from, and there is no packed axis here"
+            ));
+        }
+        return;
+    };
+    let extent = contract.batch_layout.packed_extent();
+    if direction == "input" {
+        if let Some(extent) = extent {
+            errors.push(format!(
+                "{path} declares packed_extent {}; the extent of a value a component consumes is \
+                 the one its caller assembled, so only an output states where its extent came \
+                 from",
+                extent.name()
+            ));
+        }
+        return;
+    }
+    let Some(extent) = extent else {
+        errors.push(format!(
+            "{path} packs items but declares no packed_extent; an output either preserves an \
+             input's units one for one or produces its own, and a runtime that guessed would \
+             split the result at the wrong boundaries"
+        ));
+        return;
+    };
+    // Only level zero is at stake: `packed_extent` is a statement about the
+    // physically packed axis. Coarser levels are ordinary references, and the
+    // mixed chain — an inner level the graph produced over an outer one it left
+    // alone — is the normal case for a token-merging encoder.
+    for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
+        match extent {
+            // Preserving an extent means reusing the companions that already
+            // describe it. A companion the component's own graph emits describes
+            // an extent that did not exist when the call was assembled, so it
+            // cannot be the one being preserved.
+            crate::schema::PackedExtent::Preserved => {
+                if ports.outputs.contains_key(companion) {
+                    errors.push(format!(
+                        "{path} declares packed_extent preserved but its level 0 {role} \
+                         '{companion}' is an output port of the same component; preserving an \
+                         extent means reusing the companions that already described it, and one \
+                         the graph emits describes an extent the caller never assembled"
+                    ));
+                }
+            }
+            // An extent the graph decides is described by companions the graph
+            // emits. Reusing an input's offsets here would describe a length the
+            // output does not have, and the split would land between items.
+            crate::schema::PackedExtent::Produced => {
+                if !ports.outputs.contains_key(companion) {
+                    errors.push(format!(
+                        "{path} declares packed_extent produced but its level 0 {role} \
+                         '{companion}' is not an output port of the same component; an extent the \
+                         graph decides is described by companions the graph emits"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Two packed values that share a level's offsets share its grouping.
+///
+/// An `offsets` vector is a complete description of how many units each parent
+/// owns, so two values naming the same one at the same level are claiming the
+/// same grouping. If they pair it with different owner maps, one of the two is
+/// packed against a grouping that does not describe it, and a runtime would
+/// split whichever it read second at the wrong boundaries.
+fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let mut sites: Vec<(String, &crate::schema::TensorContract)> = Vec::new();
+    for (name, input) in &workflow.inputs {
+        sites.push((format!("workflow input '{name}'"), &input.contract));
+    }
+    for (name, output) in &workflow.outputs {
+        sites.push((format!("workflow output '{name}'"), &output.contract));
+    }
+    for (name, state) in &workflow.state {
+        sites.push((format!("workflow state '{name}'"), &state.contract));
+    }
+    let mut pairings: BTreeMap<(&str, usize), (&str, String)> = BTreeMap::new();
+    for (path, contract) in &sites {
+        for (level, owner) in contract.batch_layout.levels().iter().enumerate() {
+            let key = (owner.offsets.as_str(), level);
+            if let Some((previous, first)) = pairings.get(&key)
+                && *previous != owner.owner.as_str()
+            {
+                errors.push(format!(
+                    "{path} pairs level {level} offsets '{}' with owner map '{}', but {first} \
+                     pairs the same offsets with '{previous}'; one offsets vector describes one \
+                     grouping, so the two cannot both be right",
+                    owner.offsets, owner.owner
+                ));
+                continue;
+            }
+            pairings.insert(key, (owner.owner.as_str(), path.clone()));
         }
     }
 }
@@ -2528,554 +2645,706 @@ fn validate_contract_references(
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
-    if let crate::schema::BatchLayout::TokenPacked {
-        offsets,
-        owner,
-        axis,
-        owner_span,
-    } = &contract.batch_layout
-    {
-        validate_token_packed_layout(
-            PackedLayoutFacts {
-                path,
-                value,
-                contract,
-                axis: *axis,
-                offsets,
-                owner,
-                owner_span: owner_span.as_deref(),
-            },
-            scope,
-            errors,
-        );
+    if let crate::schema::BatchLayout::TokenPacked { axis, levels, .. } = &contract.batch_layout {
+        validate_token_packed_layout(path, value, contract, *axis, levels, scope, errors);
     }
-    if let Some(mask) = &contract.pad_mask {
-        validate_pad_mask(path, value, contract, mask, scope, errors);
-    }
+    validate_padding(path, value, contract, scope, errors);
 }
 
-/// How deep packings may nest before the document is describing a structure no
-/// runtime is expected to unpack.
+/// What a packed value's ownership chain must satisfy for a runtime to be able
+/// to fold the packed run back into per-request pieces.
 ///
-/// Two is what the media actually needs: frames inside clips inside request
-/// rows. Every level costs the runtime another indirection to resolve an item
-/// back to the request that asked for it, and a document that needs more is far
-/// more likely to have looped its ownership than to have found a third real
-/// level of structure.
-const MAX_PACKED_OWNERSHIP_DEPTH: usize = 2;
-
-/// What one `token_packed` declaration says about itself, gathered so the
-/// checks below read as rules rather than as a parameter list.
-struct PackedLayoutFacts<'a> {
-    path: &'a str,
-    value: Option<&'a str>,
-    contract: &'a crate::schema::TensorContract,
-    axis: usize,
-    offsets: &'a str,
-    owner: &'a str,
-    owner_span: Option<&'a str>,
-}
-
+/// Everything here is a statement about the graph: names resolve, dtypes and
+/// ranks can carry what they are asked to carry, and no two declarations
+/// contradict each other. What the companions *contain* — that offsets start at
+/// zero, rise monotonically, and end at the packed extent, and that every owner
+/// position is in range — is a property of the values themselves. Those are
+/// checked where the values live, at invocation time on the device that holds
+/// them; reading them at load time would mean copying device memory back to the
+/// host to answer a question the document cannot answer anyway.
+#[allow(clippy::too_many_arguments)]
 fn validate_token_packed_layout(
-    facts: PackedLayoutFacts<'_>,
-    scope: &LayoutReferenceScope<'_>,
-    errors: &mut Vec<String>,
-) {
-    let PackedLayoutFacts {
-        path,
-        value,
-        contract,
-        axis,
-        offsets,
-        owner,
-        owner_span,
-    } = facts;
-    if axis >= contract.rank {
-        errors.push(format!(
-            "{path} packs items on axis {axis}, outside rank {}",
-            contract.rank
-        ));
-    }
-    if offsets.trim().is_empty() || owner.trim().is_empty() {
-        errors.push(format!(
-            "{path} is token_packed but does not name both an offsets value and an owner map; \
-             without them the runtime cannot map packed items back to request rows"
-        ));
-        return;
-    }
-    // What one offset counts against: a request row for a terminal packing, an
-    // item of the enclosing packing for a nested one.
-    let per = match owner_span {
-        Some(_) => "enclosing span",
-        None => "request row",
-    };
-    if offsets == owner {
-        errors.push(format!(
-            "{path} names '{offsets}' as both its packed offsets and its owner map; offsets hold \
-             one prefix offset per {per} and the owner map holds one owning index per packed \
-             item, so one value cannot be both"
-        ));
-    }
-    if value == Some(offsets) {
-        errors.push(format!(
-            "{path} names itself as its own packed offsets; the offsets are a separate value, one \
-             entry per enclosing span"
-        ));
-    }
-
-    // An enclosing span turns this packing from "items in request rows" into
-    // "items in the spans of another packing", which changes what the offsets
-    // are counted against. Resolve it first so the offsets rule below knows
-    // which of the two it is applying.
-    let enclosing = owner_span
-        .and_then(|span| validate_owner_span(path, value, offsets, owner, span, scope, errors));
-
-    if !scope.is_declared(offsets) {
-        errors.push(format!(
-            "{path} token_packed offsets reference '{offsets}', which this workflow does not \
-             declare as a value or as a port of the same component"
-        ));
-    } else if let Some(offsets_contract) = scope.contract(offsets) {
-        if !is_integer_dtype(&offsets_contract.dtype) {
-            errors.push(format!(
-                "{path} token_packed offsets '{offsets}' must have an integer dtype, not '{}'",
-                offsets_contract.dtype
-            ));
-        }
-        if offsets_contract.rank != 1 {
-            errors.push(format!(
-                "{path} token_packed offsets '{offsets}' must be rank one with one prefix offset \
-                 per {per}, not rank {}",
-                offsets_contract.rank
-            ));
-        }
-        match enclosing {
-            // Nested: one offset per span of the enclosing packing, so the
-            // offsets are themselves packed the way those spans are.
-            Some((span, span_offsets, span_owner)) => {
-                let packed_as_spans = offsets_contract.batch_layout.packing().is_some_and(
-                    |(packed_offsets, packed_owner)| {
-                        packed_offsets == span_offsets && packed_owner == span_owner
-                    },
-                ) && offsets_contract.batch_layout.packed_axis() == Some(0);
-                if !packed_as_spans {
-                    errors.push(format!(
-                        "{path} packs items inside the spans of '{span}', so its offsets \
-                         '{offsets}' must themselves be token_packed on axis 0 against offsets \
-                         '{span_offsets}' and owner map '{span_owner}'; there is one offset per \
-                         span, not one per request row, and the offsets are {} instead",
-                        request_axis_description(&offsets_contract.batch_layout)
-                    ));
-                }
-            }
-            // Terminal: one offset per request row.
-            None => {
-                if offsets_contract.batch_layout.request_axis() != Some(0) {
-                    errors.push(format!(
-                        "{path} token_packed offsets '{offsets}' must declare a request_aligned \
-                         batch_layout on axis 0; the offsets describe the rows they are permuted \
-                         with when the runtime compacts the batch"
-                    ));
-                }
-            }
-        }
-    }
-
-    if !scope.is_declared(owner) {
-        errors.push(format!(
-            "{path} token_packed owner map references '{owner}', which this workflow does not \
-             declare as a value or as a port of the same component"
-        ));
-        return;
-    }
-    let Some(owner_contract) = scope.contract(owner) else {
-        return;
-    };
-    if !is_integer_dtype(&owner_contract.dtype) {
-        errors.push(format!(
-            "{path} token_packed owner map '{owner}' must have an integer dtype, not '{}'",
-            owner_contract.dtype
-        ));
-    }
-    if owner_contract.rank != 1 {
-        errors.push(format!(
-            "{path} token_packed owner map '{owner}' must be rank one with one owning index per \
-             packed item, not rank {}",
-            owner_contract.rank
-        ));
-    }
-    match &owner_contract.batch_layout {
-        crate::schema::BatchLayout::Shared => {}
-        crate::schema::BatchLayout::TokenPacked {
-            offsets: owner_offsets,
-            owner: owner_owner,
-            axis: owner_axis,
-            owner_span: owner_owner_span,
-        } => {
-            if *owner_axis != 0 {
-                errors.push(format!(
-                    "{path} token_packed owner map '{owner}' packs on axis {owner_axis}; a \
-                     rank-one owner map packs on axis 0"
-                ));
-            }
-            if owner_offsets != offsets {
-                errors.push(format!(
-                    "{path} token_packed owner map '{owner}' is packed against offsets \
-                     '{owner_offsets}', not the '{offsets}' this value is packed against; one \
-                     packing has one offsets value"
-                ));
-            }
-            if owner_owner != owner {
-                errors.push(format!(
-                    "{path} token_packed owner map '{owner}' names '{owner_owner}' as its own \
-                     owner map; an owner map describes its own items and must name itself"
-                ));
-            }
-            if owner_owner_span.as_deref() != owner_span {
-                errors.push(format!(
-                    "{path} token_packed owner map '{owner}' {} but the value it owns {}; the map \
-                     and the items it indexes sit at the same level of the packing",
-                    owner_span_description(owner_owner_span.as_deref()),
-                    owner_span_description(owner_span)
-                ));
-            }
-        }
-        other => errors.push(format!(
-            "{path} token_packed owner map '{owner}' declares a {} batch_layout; an owner map has \
-             one entry per packed item, not one per enclosing span, so it is either shared or \
-             packed against the same offsets",
-            other.kind_name()
-        )),
-    }
-}
-
-/// Check the packing this one nests inside, and report its `(offsets, owner)`
-/// when it is usable — the caller needs them to check that this packing's
-/// offsets are counted per span rather than per request row.
-fn validate_owner_span<'a>(
-    path: &str,
-    value: Option<&str>,
-    offsets: &str,
-    owner: &str,
-    span: &'a str,
-    scope: &'a LayoutReferenceScope<'_>,
-    errors: &mut Vec<String>,
-) -> Option<(&'a str, &'a str, &'a str)> {
-    if span.trim().is_empty() {
-        errors.push(format!(
-            "{path} declares an empty owner_span; omit owner_span to declare that its owner \
-             indices name request rows"
-        ));
-        return None;
-    }
-    if value == Some(span) || span == offsets || span == owner {
-        errors.push(format!(
-            "{path} names '{span}' as the packing its items sit inside, but that is this same \
-             packing; an enclosing span is a separate, coarser packing"
-        ));
-        return None;
-    }
-    if !scope.is_declared(span) {
-        errors.push(format!(
-            "{path} owner_span references '{span}', which this workflow does not declare as a \
-             value or as a port of the same component"
-        ));
-        return None;
-    }
-    let span_contract = scope.contract(span)?;
-    let Some((span_offsets, span_owner)) = span_contract.batch_layout.packing() else {
-        errors.push(format!(
-            "{path} owner_span '{span}' declares a {} batch_layout; its owner indices name the \
-             items of '{span}', so '{span}' is itself token_packed",
-            span_contract.batch_layout.kind_name()
-        ));
-        return None;
-    };
-    let mut depth = 1;
-    let mut visited = vec![span];
-    let mut cursor = span_contract.batch_layout.owner_span();
-    while let Some(next) = cursor {
-        if Some(next) == value || visited.contains(&next) {
-            errors.push(format!(
-                "{path} nests inside '{span}', whose enclosing spans loop back to '{next}'; \
-                 ownership walks outwards to request rows and cannot cycle"
-            ));
-            return None;
-        }
-        depth += 1;
-        if depth >= MAX_PACKED_OWNERSHIP_DEPTH {
-            errors.push(format!(
-                "{path} nests {} packings deep through '{span}', past the limit of \
-                 {MAX_PACKED_OWNERSHIP_DEPTH}; ownership composes at most that far before an \
-                 item is resolved against its request row",
-                depth + 1
-            ));
-            return None;
-        }
-        let Some(next_contract) = scope.contract(next) else {
-            break;
-        };
-        visited.push(next);
-        cursor = next_contract.batch_layout.owner_span();
-    }
-    Some((span, span_offsets, span_owner))
-}
-
-/// Where a packing's owner indices point, spelled for an error message.
-fn owner_span_description(owner_span: Option<&str>) -> String {
-    match owner_span {
-        Some(span) => format!("owns into the items of '{span}'"),
-        None => "owns into request rows".to_string(),
-    }
-}
-
-fn validate_pad_mask(
     path: &str,
     value: Option<&str>,
     contract: &crate::schema::TensorContract,
-    mask: &crate::schema::PadMask,
+    axis: usize,
+    levels: &[crate::schema::OwnershipLevel],
     scope: &LayoutReferenceScope<'_>,
     errors: &mut Vec<String>,
 ) {
-    let crate::schema::PadMask {
-        value: mask_value,
-        axis,
-    } = mask;
-    if mask_value.trim().is_empty() {
+    if axis >= contract.rank {
         errors.push(format!(
-            "{path} declares an empty pad_mask value; omit pad_mask to declare that every entry \
-             is valid"
-        ));
-        return;
-    }
-    if value == Some(mask_value.as_str()) {
-        errors.push(format!(
-            "{path} names itself as its own pad_mask; the mask is a separate value marking which \
-             of this value's entries are real"
-        ));
-        return;
-    }
-    if let crate::schema::BatchLayout::TokenPacked { offsets, .. } = &contract.batch_layout {
-        errors.push(format!(
-            "{path} is token_packed and declares pad_mask '{mask_value}'; packed items are \
-             contiguous and carry no padding, so their validity is already given by offsets \
-             '{offsets}'"
-        ));
-        return;
-    }
-    // The masked axis is the one the rows were padded up to a common extent
-    // along — a frame count, a tile count, a token count. It is never the axis
-    // the rows themselves stack on: a compacted batch has no padding rows, and
-    // a mask that claimed otherwise would describe a batch the runtime never
-    // builds.
-    if *axis >= contract.rank {
-        errors.push(format!(
-            "{path} declares pad_mask '{mask_value}' on axis {axis}, outside rank {}",
+            "{path} packs items along axis {axis}, outside its rank {}",
             contract.rank
         ));
         return;
     }
-    if contract.batch_layout.request_axis() == Some(*axis) {
+    // A per-request piece of a packed value is a contiguous element window only
+    // when the items are the outermost stride. An inner packed axis would make
+    // every split a strided gather — a full device-side copy of the payload, per
+    // row, per invocation — which is the cost packing exists to avoid.
+    if axis != 0 {
         errors.push(format!(
-            "{path} declares pad_mask '{mask_value}' on axis {axis}, which is the axis its \
-             request rows stack along; a mask marks padding within a row, and the batch itself \
-             carries no padding rows"
+            "{path} packs items along axis {axis}; a packed axis must be axis 0, because only \
+             then is each request's span a contiguous range that can be aliased rather than \
+             gathered"
         ));
     }
-    if !scope.is_declared(mask_value) {
+    if levels.is_empty() {
         errors.push(format!(
-            "{path} pad_mask references '{mask_value}', which this workflow does not declare as a \
-             value or as a port of the same component"
+            "{path} packs items but declares no ownership levels; a packed run is only \
+             attributable to requests through at least one offsets/owner pair"
         ));
         return;
     }
-    let Some(mask_contract) = scope.contract(mask_value) else {
+    if levels.len() > MAX_OWNERSHIP_LEVELS {
+        errors.push(format!(
+            "{path} declares {} ownership levels, more than the {MAX_OWNERSHIP_LEVELS} a packed \
+             value may carry; parts in items in rows is the deepest chain this schema states, and \
+             a deeper one is a schema change rather than something a package asserts into \
+             existence",
+            levels.len()
+        ));
         return;
-    };
-    if mask_contract.dtype != "bool" && !is_integer_dtype(&mask_contract.dtype) {
-        errors.push(format!(
-            "{path} pad_mask '{mask_value}' must have a bool or integer dtype marking valid \
-             entries, not '{}'",
-            mask_contract.dtype
-        ));
     }
-    if mask_contract.rank == 0 || mask_contract.rank > contract.rank {
-        errors.push(format!(
-            "{path} pad_mask '{mask_value}' has rank {}, which cannot mark the valid entries of a \
-             rank-{} value",
-            mask_contract.rank, contract.rank
-        ));
-    } else if contract.batch_layout.request_axis().is_some() && mask_contract.rank < 2 {
-        errors.push(format!(
-            "{path} pad_mask '{mask_value}' has rank {}, but the value it masks is \
-             request-scoped; the mask spans both the rows it is permuted with and axis {axis} it \
-             marks",
-            mask_contract.rank
-        ));
+    // Every companion is a different vector with a different length, so one
+    // value cannot serve two of these roles. Naming it twice is a contradiction
+    // the runtime would resolve silently by reading the wrong lengths.
+    let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+    for (level, role, companion) in contract.batch_layout.companions() {
+        let role = format!("level {level} {role}");
+        if let Some(previous) = seen.insert(companion, role.clone())
+            && previous != role
+        {
+            errors.push(format!(
+                "{path} names '{companion}' as both its {previous} and its {role}; the two are \
+                 different vectors of different lengths, so one value cannot be both"
+            ));
+        }
     }
-    if mask_contract.batch_layout.request_axis() != contract.batch_layout.request_axis() {
-        errors.push(format!(
-            "{path} pad_mask '{mask_value}' is {} but the value it masks is {}; a mask is \
-             permuted with the rows it describes, so both must declare the same request axis",
-            request_axis_description(&mask_contract.batch_layout),
-            request_axis_description(&contract.batch_layout)
-        ));
+    let packed_symbol = contract
+        .shape
+        .as_ref()
+        .and_then(|shape| shape.get(axis))
+        .and_then(symbol_of);
+    for (index, level) in levels.iter().enumerate() {
+        let owner = validate_ownership_level(path, value, index, level, scope, errors);
+        // Level zero's owner has one entry per packed position, so the two are
+        // the same count and the document has to say so with one symbol. Two
+        // symbols is two numbers for one quantity, and a runtime that trusted
+        // either would split the payload at the wrong boundaries.
+        if index == 0
+            && let (Some(packed), Some(owner)) = (packed_symbol, owner.and_then(extent_symbol))
+            && packed != owner
+        {
+            errors.push(format!(
+                "{path} packs '{packed}' items on axis {axis} but its level 0 owner map '{}' is \
+                 '{owner}' long; the owner map has exactly one entry per packed item, so both \
+                 must name the same extent",
+                level.owner
+            ));
+        }
+        // A level's offsets is one longer than the count of its parents, which
+        // is the count its own owner map indexes into. Reusing the child count
+        // there would be an off-by-one the runtime cannot detect.
+        if let (Some(offsets), Some(owner)) = (
+            scope.contract(&level.offsets).and_then(extent_symbol),
+            scope.contract(&level.owner).and_then(extent_symbol),
+        ) && offsets == owner
+        {
+            errors.push(format!(
+                "{path} declares level {index} offsets '{}' and owner map '{}' with the same \
+                 extent '{offsets}'; offsets carries one entry per parent plus a final total \
+                 while the owner map carries one entry per unit, so the two are never equal",
+                level.offsets, level.owner
+            ));
+        }
     }
 }
 
-/// How a layout relates to the request axis, spelled for an error message.
-fn request_axis_description(layout: &crate::schema::BatchLayout) -> String {
-    match layout.request_axis() {
-        Some(axis) => format!("request-aligned on axis {axis}"),
-        None => format!("{} with no request axis", layout.kind_name()),
+/// Deepest ownership chain a packed value may declare.
+///
+/// Parts in items in rows — frames in clips in requests, tokens in segments in
+/// requests — is what every known workload needs, and each further level
+/// multiplies the chain a runtime walks on every split and the corruption cases
+/// that have to be tested.
+const MAX_OWNERSHIP_LEVELS: usize = 2;
+
+/// Check one level's companions and hand back the owner map's contract.
+///
+/// Both companions are `shared` rather than `request_aligned`, and that is
+/// structural rather than conservative: an exclusive prefix sum is not
+/// permutation-followable. Permuting rows does not permute a prefix-offset
+/// vector, it invalidates it, so a runtime that compacts rebuilds the chain. A
+/// document that labelled either companion request-aligned would be inviting a
+/// gather that silently produces nonsense.
+fn validate_ownership_level<'a>(
+    path: &str,
+    value: Option<&str>,
+    index: usize,
+    level: &crate::schema::OwnershipLevel,
+    scope: &'a LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) -> Option<&'a crate::schema::TensorContract> {
+    let mut owner_contract = None;
+    for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
+        if Some(companion.as_str()) == value {
+            errors.push(format!(
+                "{path} names itself as its own level {index} {role}; a packed value and the \
+                 vector that describes its packing are different values"
+            ));
+            continue;
+        }
+        if !scope.is_declared(companion) {
+            errors.push(format!(
+                "{path} names '{companion}' as its level {index} {role}, which is not a declared \
+                 value or port in that scope"
+            ));
+            continue;
+        }
+        let Some(companion_contract) = scope.contract(companion) else {
+            continue;
+        };
+        if role == "owner map" {
+            owner_contract = Some(companion_contract);
+        }
+        if companion_contract.dtype != "int64" {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' is {} but must be int64; offsets and \
+                 owner positions are indices, and a narrower or floating type cannot address a \
+                 group the runtime has already assembled",
+                companion_contract.dtype
+            ));
+        }
+        if companion_contract.rank != 1 {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' has rank {} but must be rank 1; it \
+                 carries one entry per unit and nothing else",
+                companion_contract.rank
+            ));
+        }
+        if !companion_contract.batch_layout.is_shared() {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' declares {} but must declare shared; \
+                 an exclusive prefix sum is not permutation-followable, so a runtime that \
+                 compacts rebuilds it rather than gathering it",
+                companion_contract.batch_layout.kind_name()
+            ));
+        }
+        if !companion_contract.padding.is_empty() {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' declares padding of its own; a \
+                 companion has exactly one entry per unit, so there is nothing in it to pad"
+            ));
+        }
+    }
+    owner_contract
+}
+
+/// The shape symbol of a dimension, when it has one.
+fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
+    match dimension {
+        crate::schema::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
+        crate::schema::TensorDimension::Fixed(_) => None,
+    }
+}
+
+/// The extent symbol of a rank-1 companion.
+fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
+    contract
+        .shape
+        .as_ref()
+        .filter(|shape| shape.len() == 1)
+        .and_then(|shape| shape.first())
+        .and_then(symbol_of)
+}
+
+/// Position of a shape symbol in a contract's declared shape.
+fn axis_of_symbol(contract: &crate::schema::TensorContract, symbol: &str) -> Option<usize> {
+    contract
+        .shape
+        .as_ref()?
+        .iter()
+        .position(|dimension| symbol_of(dimension) == Some(symbol))
+}
+
+/// What a padded value's validity companions must satisfy.
+///
+/// Padding is appended, so how much of an entry is real is one number per
+/// enclosing position rather than a tensor of booleans. That is what keeps the
+/// truth host-resident and cheap: a runtime reads these numbers to assemble and
+/// to split every group, and a payload-shaped mask would put that read on the
+/// device and turn a free arithmetic check into a hidden transfer.
+fn validate_padding(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    let mut covered: BTreeSet<&str> = BTreeSet::new();
+    for entry in &contract.padding {
+        let crate::schema::PaddedDimension {
+            dimension,
+            valid_lengths,
+        } = entry;
+        if !covered.insert(dimension.as_str()) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}' more than once; one dimension \
+                 has one padded extent, so two companions would be two truths about one fact"
+            ));
+            continue;
+        }
+        let Some(axis) = axis_of_symbol(contract, dimension) else {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is not a shape symbol \
+                 of the value it pads"
+            ));
+            continue;
+        };
+        // Packed items are contiguous by construction, which is the whole point
+        // of packing instead of padding. Padding that same dimension would
+        // leave two contradictory accounts of where a unit's entries end.
+        if contract.batch_layout.packed_axis() == Some(axis) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is the axis it packs \
+                 items along; packed items are contiguous and carry no padding, so their extent \
+                 is already given by the packing's offsets"
+            ));
+            continue;
+        }
+        // A compacted batch has no padding rows: the runtime drops a finished
+        // row rather than blanking it. A companion that claimed otherwise would
+        // describe a batch the runtime never builds.
+        if contract.batch_layout.request_axis() == Some(axis) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is the axis its \
+                 request rows stack along; padding bounds an extent within a row, and the batch \
+                 itself carries no padding rows"
+            ));
+            continue;
+        }
+        if Some(valid_lengths.as_str()) == value {
+            errors.push(format!(
+                "{path} names itself as the valid_lengths of its own dimension '{dimension}'; a \
+                 padded value and the vector that bounds it are different values"
+            ));
+            continue;
+        }
+        if !scope.is_declared(valid_lengths) {
+            errors.push(format!(
+                "{path} names '{valid_lengths}' as the valid_lengths of dimension '{dimension}', \
+                 which is not a declared value or port in that scope"
+            ));
+            continue;
+        }
+        let Some(companion) = scope.contract(valid_lengths) else {
+            continue;
+        };
+        if companion.dtype != "int64" {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' is {} but must be int64; it counts real \
+                 entries of dimension '{dimension}'",
+                companion.dtype
+            ));
+        }
+        if !companion.batch_layout.is_shared() {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' declares {} but must declare shared; it \
+                 has one entry per position of the axes outer to '{dimension}', which is not a \
+                 request row count",
+                companion.batch_layout.kind_name()
+            ));
+        }
+        validate_valid_lengths_shape(
+            path,
+            contract,
+            dimension,
+            axis,
+            valid_lengths,
+            companion,
+            errors,
+        );
+    }
+}
+
+/// A validity companion has exactly one entry per position of the axes outer to
+/// the dimension it bounds.
+///
+/// Axes inner to the padded one are not indexed — a length applies to the whole
+/// slice — so the companion's shape is the value's shape truncated at the padded
+/// axis. Stating that exactly is what lets a runtime index it without knowing
+/// what the value means.
+#[allow(clippy::too_many_arguments)]
+fn validate_valid_lengths_shape(
+    path: &str,
+    contract: &crate::schema::TensorContract,
+    dimension: &str,
+    axis: usize,
+    valid_lengths: &str,
+    companion: &crate::schema::TensorContract,
+    errors: &mut Vec<String>,
+) {
+    if companion.rank != axis {
+        errors.push(format!(
+            "{path} valid_lengths '{valid_lengths}' has rank {} but dimension '{dimension}' is \
+             axis {axis}, so it must have rank {axis}: one entry per position of the axes outer \
+             to '{dimension}'",
+            companion.rank
+        ));
+        return;
+    }
+    let (Some(outer), Some(declared)) = (contract.shape.as_ref(), companion.shape.as_ref()) else {
+        return;
+    };
+    if outer.len() <= axis || declared.len() != axis {
+        return;
+    }
+    for (index, expected) in outer.iter().take(axis).enumerate() {
+        let Some(actual) = declared.get(index) else {
+            continue;
+        };
+        if actual != expected {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' declares {} on axis {index} but the value \
+                 it bounds declares {} there; the companion carries one entry per position of the \
+                 axes outer to '{dimension}'",
+                describe_dimension(actual),
+                describe_dimension(expected)
+            ));
+        }
+    }
+}
+
+fn describe_dimension(dimension: &crate::schema::TensorDimension) -> String {
+    match dimension {
+        crate::schema::TensorDimension::Fixed(fixed) => fixed.to_string(),
+        crate::schema::TensorDimension::Symbol(symbol) => format!("'{symbol}'"),
     }
 }
 
 /// A declared batching capacity is a promise about the artifact's own shape, so
-/// it must agree with the ports that carry the rows.
+/// it must agree with the ports that carry the group.
 ///
 /// Absence of `batch_capacity` already has a meaning — one request row per
-/// invocation — so a declared capacity only ever adds a claim: rows stack on
-/// this axis, at most this many of them, and only when these axes already agree.
-/// A capacity that no port can honour would let a scheduler build an invocation
+/// invocation — so a declared capacity only ever adds claims: these symbols must
+/// already agree, the assembled call materializes no more than this, and every
+/// dimension left free is reconciled by a declared padding or packing. A
+/// capacity that no port can honour would let a scheduler build an invocation
 /// the component cannot execute, which is exactly the kind of contradiction that
 /// has to fail at load time.
+///
+/// Everything is keyed by shape symbol. Ports of one component differ in rank —
+/// a rank-3 payload, a rank-1 companion, a rank-2 pooled output — so an axis
+/// index would name whichever port the author happened to be looking at, while a
+/// symbol names the same quantity on all of them.
 fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     for (name, component) in &workflow.components {
         let Some(capacity) = &component.batch_capacity else {
             continue;
         };
-        if capacity.max_rows == Some(0) {
-            errors.push(format!(
-                "workflow component '{name}' declares batch_capacity max_rows 0; an invocation \
-                 carries at least one request row, and omitting max_rows declares no bound"
-            ));
+        let path = format!("workflow component '{name}' batch_capacity");
+        let ports = &component.ports;
+        let declared = declared_symbols(ports);
+        let budgeted = validate_budgets(&path, capacity, &declared, errors);
+        validate_uniform_dimensions(&path, capacity, &declared, &budgeted, errors);
+        validate_level_budgets(&path, ports, &budgeted, errors);
+        validate_free_dimensions(&path, capacity, ports, errors);
+        if let Some(row_scope) = &component.row_scope {
+            validate_capacity_row_scope(&path, row_scope, ports, errors);
         }
-        let mut seen_uniform = BTreeSet::new();
-        for axis in &capacity.uniform_axes {
-            if !seen_uniform.insert(*axis) {
-                errors.push(format!(
-                    "workflow component '{name}' repeats axis {axis} in \
-                     batch_capacity.uniform_axes"
-                ));
-            }
-            if *axis == capacity.axis {
-                errors.push(format!(
-                    "workflow component '{name}' requires uniformity on batch_capacity axis \
-                     {axis}, which is the axis rows stack along; rows differ there by construction"
-                ));
-            }
-        }
-        if let Some(row_scope) = &component.row_scope
-            && row_scope.axis != capacity.axis
-        {
-            errors.push(format!(
-                "workflow component '{name}' declares batch_capacity axis {} but row_scope axis \
-                 {}; rows must stack along the axis the runtime compacts",
-                capacity.axis, row_scope.axis
-            ));
-        }
+    }
+}
 
-        let batched_ports = [
-            ("input", &component.ports.inputs),
-            ("output", &component.ports.outputs),
-        ]
-        .into_iter()
-        .flat_map(|(direction, ports)| {
-            ports.iter().filter_map(move |(port, contract)| {
-                contract
-                    .batch_layout
-                    .batch_axis()
-                    .map(|axis| (direction, port, contract, axis))
-            })
-        })
-        .collect::<Vec<_>>();
-        for (direction, port, contract, axis) in &batched_ports {
-            if *axis != capacity.axis {
-                // A packed port stacks items rather than rows, but the items of
-                // all the rows in one invocation are concatenated along that
-                // same axis, so it is still the axis the capacity governs.
-                let carries = match contract.batch_layout.packed_axis() {
-                    Some(packed) => format!(
-                        "packs the items of its rows on axis {packed}, which is where an \
-                         invocation's rows land"
-                    ),
-                    None => format!("batches rows on axis {axis}"),
-                };
-                errors.push(format!(
-                    "workflow component '{name}' {direction} port '{port}' {carries}, but the \
-                     component declares batch_capacity axis {}",
-                    capacity.axis
-                ));
-            }
-            if capacity.axis >= contract.rank {
-                errors.push(format!(
-                    "workflow component '{name}' declares batch_capacity axis {} but \
-                     {direction} port '{port}' has rank {}",
-                    capacity.axis, contract.rank
-                ));
-            }
-            // A fixed dimension on the batch axis pins how many rows the
-            // artifact can ever accept. A row bound that disagrees with it
-            // is a promise the graph itself refuses to keep.
-            if let Some(max_rows) = capacity.max_rows
-                && contract.batch_layout.request_axis() == Some(capacity.axis)
-                && let Some(crate::schema::TensorDimension::Fixed(fixed)) = contract
-                    .shape
-                    .as_ref()
-                    .and_then(|shape| shape.get(capacity.axis))
-            {
-                let rows =
-                    max_rows.saturating_mul(contract.batch_layout.request_expansion_factor());
-                if i64::try_from(rows).is_ok_and(|rows| rows != *fixed) {
-                    errors.push(format!(
-                        "workflow component '{name}' declares batch_capacity max_rows \
-                         {max_rows} but {direction} port '{port}' pins axis {} to a fixed \
-                         dimension of {fixed}",
-                        capacity.axis
-                    ));
-                }
+/// Every shape symbol any port of a component declares, with a port that
+/// declares it.
+///
+/// A level's unit count is often named only by its `owner` companion's extent,
+/// and a padded extent only by the payload, so a capacity may legitimately name
+/// a symbol that appears on exactly one port.
+fn declared_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, &str> {
+    let mut symbols = BTreeMap::new();
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        for dimension in shape {
+            if let Some(symbol) = symbol_of(dimension) {
+                symbols.entry(symbol).or_insert(port.as_str());
             }
         }
-        // Uniformity is required of the rows, not of any single port: the ports
-        // of one component legitimately have different ranks, so an axis is in
-        // range when some batched port actually has it. An axis no batched port
-        // has is a grouping key nothing can be compared on.
-        let widest_port = batched_ports
-            .iter()
-            .map(|(_, _, contract, _)| contract.rank)
-            .max();
-        if let Some(widest_port) = widest_port {
-            for axis in &capacity.uniform_axes {
-                if *axis >= widest_port {
-                    errors.push(format!(
-                        "workflow component '{name}' declares batch_capacity uniform axis {axis} \
-                         but its widest request-scoped port has rank {widest_port}"
-                    ));
-                }
-            }
-        }
-        let inferred_ports = component.ports.inputs.is_empty()
-            && component.ports.outputs.is_empty()
-            && matches!(
-                component.implementation,
-                crate::schema::ComponentImplementation::Onnx { .. }
-            );
-        if batched_ports.is_empty() && !inferred_ports {
+    }
+    symbols
+}
+
+/// Check the footprint bounds and hand back the symbols they bind.
+fn validate_budgets<'a>(
+    path: &str,
+    capacity: &'a crate::schema::ComponentBatchCapacity,
+    declared: &BTreeMap<&str, &str>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let mut budgeted: BTreeSet<&str> = BTreeSet::new();
+    let mut bounded: BTreeSet<Vec<&str>> = BTreeSet::new();
+    for budget in &capacity.budgets {
+        let entry = describe_symbols(&budget.dimensions);
+        if budget.dimensions.is_empty() {
             errors.push(format!(
-                "workflow component '{name}' declares batch_capacity but no port declares a \
-                 request-scoped or token_packed batch_layout; there is nothing to batch"
+                "{path} declares a budgets entry naming no dimension; a bound with nothing to \
+                 bind cannot be evaluated against a group"
+            ));
+            continue;
+        }
+        if budget.max_total == 0 {
+            errors.push(format!(
+                "{path} budgets {entry} at 0; every budget is an upper bound on an assembled \
+                 group, and a bound of zero forbids the single-item invocation the component is \
+                 otherwise required to serve"
+            ));
+        }
+        let mut within: BTreeSet<&str> = BTreeSet::new();
+        for dimension in &budget.dimensions {
+            if !within.insert(dimension.as_str()) {
+                errors.push(format!(
+                    "{path} budgets {entry}, which names '{dimension}' twice; a composed budget \
+                     multiplies distinct extents, and squaring one is not a footprint"
+                ));
+                continue;
+            }
+            if !declared.contains_key(dimension.as_str()) {
+                errors.push(format!(
+                    "{path} budgets '{dimension}', which no port of the component declares; \
+                     declared symbols are {}",
+                    describe_declared(declared)
+                ));
+                continue;
+            }
+            budgeted.insert(dimension.as_str());
+        }
+        let key: Vec<&str> = budget.dimensions.iter().map(String::as_str).collect();
+        if !bounded.insert(key) {
+            errors.push(format!(
+                "{path} budgets {entry} more than once; two bounds on one footprint is two \
+                 numbers for one fact, and a runtime honouring either would be honouring neither"
+            ));
+        }
+    }
+    budgeted
+}
+
+/// Symbols pinned across a group are stated once, and are never also budgeted.
+///
+/// A pinned dimension has one extent across the whole group, so its footprint is
+/// already the item count times that extent; budgeting it as well is a second
+/// spelling of a bound the item budget already carries.
+fn validate_uniform_dimensions(
+    path: &str,
+    capacity: &crate::schema::ComponentBatchCapacity,
+    declared: &BTreeMap<&str, &str>,
+    budgeted: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for symbol in &capacity.uniform_dimensions {
+        if !seen.insert(symbol.as_str()) {
+            errors.push(format!(
+                "{path} lists uniform dimension '{symbol}' twice; the list states which extents \
+                 must agree, and stating one twice states nothing further"
+            ));
+            continue;
+        }
+        if !declared.contains_key(symbol.as_str()) {
+            errors.push(format!(
+                "{path} requires uniform dimension '{symbol}', which no port of the component \
+                 declares; declared symbols are {}",
+                describe_declared(declared)
+            ));
+            continue;
+        }
+        if budgeted.contains(symbol.as_str()) {
+            errors.push(format!(
+                "{path} both pins '{symbol}' across the group and budgets it; a pinned dimension \
+                 has one extent for every item, so its footprint is already bounded by the item \
+                 budget and a second bound is a second truth"
             ));
         }
     }
 }
 
-/// State the runtime or an external service owns must say when it may be freed.
+/// Every ownership level a component's inputs pack is bounded.
 ///
-/// An ordinary tensor's lifetime is SSA liveness: the runtime frees it when
-/// nothing can read it again. Runtime-managed and external state has no such
-/// bound — nothing in the dataflow says the last reader has run — so the
-/// document must name the boundary at which it becomes releasable.
+/// The units of a level are exactly what a scheduler chooses when it forms a
+/// group, so a level with no budget leaves the group unbounded in the one
+/// quantity the scheduler controls. Output levels are not budgeted: an extent
+/// the graph decides cannot be a precondition on forming the group, and the
+/// package could not check a bound on it either.
+fn validate_level_budgets(
+    path: &str,
+    ports: &crate::schema::ComponentPorts,
+    budgeted: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    for (port, contract) in &ports.inputs {
+        for (index, level) in contract.batch_layout.levels().iter().enumerate() {
+            let Some(symbol) = ports
+                .inputs
+                .get(&level.owner)
+                .or_else(|| ports.outputs.get(&level.owner))
+                .and_then(extent_symbol)
+            else {
+                continue;
+            };
+            if !budgeted.contains(symbol) {
+                errors.push(format!(
+                    "{path} declares no budget for '{symbol}', the units input '{port}' packs at \
+                     ownership level {index}; a scheduler chooses how many of those to group, so \
+                     an unbudgeted level is unbounded in exactly the quantity it controls"
+                ));
+            }
+        }
+    }
+}
+
+/// A dimension items may differ on is declared free everywhere, and is
+/// reconciled somewhere.
+///
+/// A fixed literal on a dimension the package has said may vary is a
+/// contradiction: the group would have to change a shape the artifact pinned.
+/// And a free dimension with neither a padding entry nor a packed axis to
+/// consume it is a promise a runtime cannot honour — it would have to invent a
+/// reconciliation, which is the silent-wrong-answer class this schema exists to
+/// prevent.
+fn validate_free_dimensions(
+    path: &str,
+    capacity: &crate::schema::ComponentBatchCapacity,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let companions = port_companions(ports);
+    let uniform: BTreeSet<&str> = capacity
+        .uniform_dimensions
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for (port, contract) in &ports.inputs {
+        if companions.contains(port.as_str()) {
+            continue;
+        }
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        let padded: BTreeSet<&str> = contract
+            .padding
+            .iter()
+            .map(|entry| entry.dimension.as_str())
+            .collect();
+        for (axis, dimension) in shape.iter().enumerate() {
+            if contract.batch_layout.request_axis() == Some(axis) {
+                continue;
+            }
+            if contract.batch_layout.packed_axis() == Some(axis) {
+                if symbol_of(dimension).is_none() {
+                    errors.push(format!(
+                        "{path} groups input '{port}', which packs items along axis {axis} but \
+                         fixes that axis at {}; a packed extent is the sum of the group's items \
+                         and cannot be a literal",
+                        describe_dimension(dimension)
+                    ));
+                }
+                continue;
+            }
+            let Some(symbol) = symbol_of(dimension) else {
+                continue;
+            };
+            if uniform.contains(symbol) || padded.contains(symbol) {
+                continue;
+            }
+            errors.push(format!(
+                "{path} leaves '{symbol}' free on input '{port}' axis {axis} but declares neither \
+                 a padding entry on it nor a packed axis that consumes it; a dimension items may \
+                 differ on has to say how the difference is reconciled"
+            ));
+        }
+    }
+}
+
+/// Ports named by another port's layout or padding rather than carrying a
+/// payload of their own.
+fn port_companions(ports: &crate::schema::ComponentPorts) -> BTreeSet<&str> {
+    let mut companions = BTreeSet::new();
+    for contract in ports.inputs.values().chain(ports.outputs.values()) {
+        for (_, _, companion) in contract.batch_layout.companions() {
+            companions.insert(companion);
+        }
+        for entry in &contract.padding {
+            companions.insert(entry.valid_lengths.as_str());
+        }
+    }
+    companions
+}
+
+/// Row scope counts rows, and a packed axis counts items.
+///
+/// One request contributing eight clips makes the two different numbers, so a
+/// runtime that compacted per-request state with an item-indexed selection would
+/// address the wrong entries entirely. The axis therefore has to be a row axis
+/// some port actually declares, and never a packed one.
+fn validate_capacity_row_scope(
+    path: &str,
+    row_scope: &crate::schema::ComponentRowScope,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let mut packed_on: Option<&str> = None;
+    let mut rows_on = false;
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        if contract.batch_layout.request_axis() == Some(row_scope.axis) {
+            rows_on = true;
+        }
+        if contract.batch_layout.packed_axis() == Some(row_scope.axis) && packed_on.is_none() {
+            packed_on = Some(port.as_str());
+        }
+    }
+    if let Some(port) = packed_on
+        && !rows_on
+    {
+        errors.push(format!(
+            "{path} declares row_scope on axis {}, which port '{port}' packs items along; items \
+             are not rows — one request contributes many — so per-row state selected by an item \
+             position would address the wrong entries",
+            row_scope.axis
+        ));
+        return;
+    }
+    if !rows_on {
+        errors.push(format!(
+            "{path} declares row_scope on axis {}, which no port of the component declares as its \
+             request axis; per-row state is selected by row position, so the axis has to be one \
+             the component's rows actually stack along",
+            row_scope.axis
+        ));
+    }
+}
+
+/// A symbol list, spelled for an error message.
+fn describe_symbols(symbols: &[String]) -> String {
+    let listed: Vec<String> = symbols.iter().map(|symbol| format!("'{symbol}'")).collect();
+    format!("[{}]", listed.join(", "))
+}
+
+/// The symbols a component's ports declare, spelled for an error message.
+fn describe_declared(declared: &BTreeMap<&str, &str>) -> String {
+    let listed: Vec<String> = declared
+        .keys()
+        .map(|symbol| format!("'{symbol}'"))
+        .collect();
+    if listed.is_empty() {
+        "none".to_string()
+    } else {
+        listed.join(", ")
+    }
+}
+
 fn validate_state_lifetimes(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     // Runtime-owned state is private: its storage layout, paging and precision
     // are the runtime's business and are not part of any contract. Such a cell
@@ -4049,6 +4318,7 @@ fn validate_compaction_derivability(
                      a declared row axis so the runtime can associate result rows with requests"
                 ));
             }
+            validate_packed_emit_companions(path, value, output, declared, workflow, errors);
             let Some(contract) = value_contracts.get(value) else {
                 return;
             };
@@ -4061,6 +4331,7 @@ fn validate_compaction_derivability(
             if contract.rank > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
+                && !ownership_companions(workflow).contains(output.as_str())
             {
                 errors.push(format!(
                     "{path} emits per-request value '{value}' without a declared batch_layout; a \
@@ -4072,6 +4343,54 @@ fn validate_compaction_derivability(
         WorkflowNode::Invoke { .. }
         | WorkflowNode::Transfer { .. }
         | WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+/// Every value any contract in this workflow names as an ownership companion.
+///
+/// These are `shared` by construction — a prefix-offset vector describes a whole
+/// packing rather than one row — so they are exactly the values the per-request
+/// emission rule above would otherwise reject. Publishing them is what makes a
+/// packed result splittable, so the rule that demands a row correspondence has
+/// to know which values are the mechanism by which that correspondence is
+/// stated.
+fn ownership_companions(workflow: &WorkflowSpec) -> BTreeSet<&str> {
+    workflow
+        .outputs
+        .values()
+        .map(|output| &output.contract)
+        .flat_map(|contract| contract.batch_layout.companions())
+        .map(|(_, _, companion)| companion)
+        .collect()
+}
+
+/// A packed result is only usable by whoever receives it if the companions that
+/// describe the packing come with it.
+///
+/// The caller of a workflow sees its declared outputs and nothing else. A packed
+/// output whose offsets and owner maps are internal SSA values is a flat run of
+/// items with no way to say which request any of them belongs to, which is the
+/// exact failure the packed layout exists to prevent. So every level's
+/// companions are declared outputs too, and the serving rule that would
+/// otherwise reject them as `shared` admits them for exactly that reason.
+fn validate_packed_emit_companions(
+    path: &str,
+    value: &str,
+    output: &str,
+    declared: &crate::schema::WorkflowOutput,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    for (level, role, companion) in declared.contract.batch_layout.companions() {
+        if workflow.outputs.contains_key(companion) {
+            continue;
+        }
+        errors.push(format!(
+            "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
+             {role} '{companion}' is not itself a declared workflow output; a caller can only \
+             split a packed result with the companions that describe it, so a packed emit \
+             publishes every level of them"
+        ));
     }
 }
 

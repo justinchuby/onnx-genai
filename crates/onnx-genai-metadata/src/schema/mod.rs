@@ -47,9 +47,16 @@ pub struct InferenceMetadata {
     /// Schema version of this inference-metadata document, e.g. `"v1"`.
     ///
     /// Absent means the initial `"v1"` contract (readers default to `v1`).
-    /// Bump this only for breaking schema changes; additive fields keep the
-    /// same major version and rely on the forward-compatible "ignore unknown
-    /// fields" rule.
+    /// Bump this only for breaking schema changes.
+    ///
+    /// An additive field keeps the same major version, but note what that does
+    /// and does not buy: the v1 surface is closed — every structure here denies
+    /// unknown fields — so a reader built before a field was added rejects a
+    /// document that uses it rather than ignoring it. Compatibility with older
+    /// readers therefore comes from a new field being *absent by default*, not
+    /// from tolerance of unknown keys. A producer that emits one is declaring
+    /// that the package needs a reader which understands it, and a package that
+    /// does not emit it keeps loading everywhere it loaded before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
@@ -306,17 +313,19 @@ mod schema_vocabulary {
         ///
         /// A program that packs the media of several requests into one batch
         /// emits the values that map packed entries back to request rows,
-        /// alongside the pixels themselves. Packing is layered, so each level
-        /// names its own pair: `item_offsets`/`item_owner` for the patches or
-        /// tokens a vision encoder consumes, `frame_offsets`/`frame_owner` for
-        /// the frames a clip contributes, and `clip_offsets`/`clip_owner` when
-        /// one request carries several clips. A still image uses the item pair
-        /// alone, because it has exactly one frame and no clip structure.
+        /// alongside the pixels themselves. Two roles cover every level:
+        /// `pack_offsets` and `pack_owner`. Which level a value serves is
+        /// stated by the ownership chain that references it, not by its role,
+        /// so a frames-to-clips pair and a clips-to-rows pair carry the same
+        /// two roles and a runtime resolves both the same way whatever the
+        /// medium calls its levels. `valid_lengths` says how much of a padded
+        /// dimension is real, and is shared with the audio vocabulary rather
+        /// than duplicated.
         ///
         /// They are content roles like any other: the runtime reads what a
         /// tensor means from here, never from the name a producer chose. What
         /// each value must structurally satisfy is stated by its tensor
-        /// contract — `batch_layout` and `pad_mask` — which is what the
+        /// contract — `batch_layout` and `padding` — which is what the
         /// validator enforces.
         VisionOutputContent,
         vision_output_content,
@@ -328,12 +337,9 @@ mod schema_vocabulary {
             "original_size",
             "transformed_size",
             "validity_mask",
-            "item_offsets",
-            "item_owner",
-            "frame_offsets",
-            "frame_owner",
-            "clip_offsets",
-            "clip_owner"
+            "valid_lengths",
+            "pack_offsets",
+            "pack_owner"
         ]
     );
 
@@ -389,7 +395,10 @@ mod schema_vocabulary {
             "valid_samples",
             "sample_lengths",
             "frame_lengths",
-            "validity_mask"
+            "valid_lengths",
+            "validity_mask",
+            "pack_offsets",
+            "pack_owner"
         ]
     );
 
