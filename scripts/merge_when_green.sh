@@ -181,7 +181,7 @@ warn_if_bypassed() {
     done
 }
 
-REQUIRED=$(required_contexts)
+REQUIRED=$(required_contexts | grep '[^[:space:]]')
 if [ -z "$REQUIRED" ]; then
     echo "$PROG: could not determine any required status check from $REPO's rulesets." >&2
     echo "$PROG: refusing to merge. An empty required set is indistinguishable from" >&2
@@ -236,32 +236,63 @@ verdict() {
 import json, os, sys
 
 snap = json.load(sys.stdin)
-rollup = {c.get("name") or c.get("context"): c
-          for c in (snap.get("statusCheckRollup") or [])}
+entries = snap.get("statusCheckRollup")
+if entries is None:
+    entries = []
+if not isinstance(entries, list):
+    raise SystemExit("statusCheckRollup is not a list")
 
-for name in os.environ["REQ"].split("\n"):
-    name = name.strip()
+by = {}
+for c in entries:
+    if not isinstance(c, dict):
+        raise SystemExit("statusCheckRollup entry is not an object")
+    name = c.get("name") or c.get("context")
     if not name:
-        continue
-    c = rollup.get(name)
-    if c is None:
-        print("%s\tABSENT\t-" % name)
         continue
     status = c.get("status") or c.get("state") or "-"
     concl = c.get("conclusion") or c.get("state") or "-"
+    by.setdefault(name, []).append((status, concl))
+
+names = [n.strip() for n in os.environ["REQ"].split("\n") if n.strip()]
+if not names:
+    raise SystemExit("no required contexts")
+
+for name in names:
+    seen = by.get(name)
+    if seen is None:
+        print("%s\tABSENT\t-" % name)
+        continue
+    # Pessimistic fold. A re-run creates a fresh check run with the same name,
+    # so a required context can appear more than once, and dict-last-wins
+    # would let the rollup ARRAY ORDER decide whether we merge -- ordering
+    # GitHub does not document as chronological. A name is green only if
+    # every entry carrying it is green.
+    bad = [e for e in seen if e[1] != "SUCCESS"]
+    status, concl = bad[0] if bad else seen[0]
+    if len(seen) > 1:
+        status = "%s[%d/%d]" % (status, len(seen) - len(bad), len(seen))
     print("%s\t%s\t%s" % (name, status, concl))
 '
 }
 
 deadline=$((SECONDS + TIMEOUT))
+misses=0
 while :; do
     SNAP=$(pr_json)
     if [ -z "$SNAP" ]; then
-        echo "$PROG: could not read #$PR; retrying" >&2
+        misses=$((misses + 1))
+        if [ "$misses" -ge 5 ]; then
+            echo "$PROG: could not read #$PR $misses times running -- this is an" >&2
+            echo "$PROG: environment fault (auth, rate limit, network), not a slow" >&2
+            echo "$PROG: check. Reporting it as one would invite a pointless retry." >&2
+            exit 1
+        fi
+        echo "$PROG: could not read #$PR ($misses); retrying" >&2
+        [ "$SECONDS" -lt "$deadline" ] || exit 3
         sleep "$POLL"
-        [ "$SECONDS" -lt "$deadline" ] || { exit 3; }
         continue
     fi
+    misses=0
 
     now_state=$(printf '%s' "$SNAP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
     now_head=$(printf '%s' "$SNAP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["headRefOid"])')
@@ -278,12 +309,19 @@ while :; do
     fi
 
     V=$(verdict "$SNAP")
+    vrc=$?
+    if [ "$vrc" -ne 0 ]; then
+        echo "$PROG: could not read the check rollup for $HEAD (parser exit $vrc)." >&2
+        echo "$PROG: refusing. An unreadable rollup is not an empty one, and an" >&2
+        echo "$PROG: empty one is not a green one." >&2
+        exit 5
+    fi
     echo "-- $(date -u +%H:%M:%S) --"
     printf '%s\n' "$V" | while IFS="$(printf '\t')" read -r n s c; do
         printf '  %-28s %-12s %s\n' "$n" "$s" "$c"
     done
 
-    failed=$(printf '%s\n' "$V" | awk -F'\t' '$3 == "FAILURE" || $3 == "TIMED_OUT" || $3 == "CANCELLED" || $3 == "ACTION_REQUIRED" || $3 == "STARTUP_FAILURE" { print $1 }')
+    failed=$(printf '%s\n' "$V" | awk -F'\t' '$3 == "FAILURE" || $3 == "TIMED_OUT" || $3 == "CANCELLED" || $3 == "ACTION_REQUIRED" || $3 == "STARTUP_FAILURE" || $3 == "ERROR" || $3 == "STALE" { print $1 }')
     if [ -n "$failed" ]; then
         echo "$PROG: required check(s) did not pass:" >&2
         printf '%s\n' "$failed" | sed 's/^/  /' >&2
@@ -291,8 +329,31 @@ while :; do
         exit 2
     fi
 
+    # Counted positively, not inferred from the absence of bad rows. `[ -z
+    # "$notgreen" ]` alone merges on an EMPTY verdict, and an empty verdict is
+    # what a parser fault, a whitespace-only required set, or a silently
+    # dropped row all look like -- the vacuous-guard class, in the gate.
+    #
+    # Stated honestly: this is now the THIRD layer over that, and mutation
+    # testing says so. The parse-fault exit above and the blank-required-set
+    # filter at the top already catch both reachable ways to produce an empty
+    # verdict, so removing this count changes no test outcome. It is kept
+    # because it states the invariant positively -- `green == want` is the
+    # property; `notgreen is empty` is an inference about it -- and because
+    # breaking the inference alone (mutant: `$3 != "SUCCESS"` -> a predicate
+    # that matches nothing) is then caught here with no behaviour change at
+    # all. Redundant, deliberately, and not mistaken for uniquely covered.
+    want=$(printf '%s\n' "$REQUIRED" | grep -c '[^[:space:]]')
+    rows=$(printf '%s\n' "$V" | grep -c '[^[:space:]]')
+    green=$(printf '%s\n' "$V" | awk -F'\t' '$3 == "SUCCESS"' | grep -c '[^[:space:]]')
+    if [ "$rows" != "$want" ]; then
+        echo "$PROG: expected a verdict for $want required context(s), got $rows." >&2
+        echo "$PROG: refusing rather than guessing which one is missing." >&2
+        exit 5
+    fi
+
     notgreen=$(printf '%s\n' "$V" | awk -F'\t' '$3 != "SUCCESS" { print $1 }')
-    if [ -z "$notgreen" ]; then
+    if [ "$green" = "$want" ] && [ -z "$notgreen" ]; then
         echo "$PROG: every required check reported SUCCESS at $HEAD."
         if [ "$DRY_RUN" = 1 ]; then
             echo "$PROG: --dry-run, not merging."

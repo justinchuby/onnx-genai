@@ -55,6 +55,7 @@ case "$args" in
         exit "$(cat "$FIX/merge_rc" 2>/dev/null || echo 0)"
         ;;
     *"pr view"*)
+        if [ -f "$FIX/pr_view.fail" ]; then exit 1; fi
         n=$(cat "$FIX/poll" 2>/dev/null || echo 1)
         echo $((n + 1)) >"$FIX/poll"
         if [ -f "$FIX/pr.$n.json" ]; then cat "$FIX/pr.$n.json"; else cat "$FIX/pr.json"; fi
@@ -193,6 +194,65 @@ touch "$FIX/ruleset_ids.fail"
 chk "an unreadable ruleset API is a refusal too" "$(run_mw)" "5"
 
 echo
+echo "== a rollup that cannot be read is not an empty one =="
+# Both of these merged before review. The decision was `[ -z "$notgreen" ]`,
+# which is satisfied by a verdict with NO ROWS -- and a parser fault, a blank
+# required set and a silently dropped row all look exactly like that. A merge
+# gate that merges on an unhandled exception is #1817 relocated into the gate.
+fixture malformed
+cat >"$FIX/pr.json" <<'EOF'
+{"state":"OPEN","headRefOid":"deadbeef","isDraft":false,
+ "mergeStateStatus":"BLOCKED","statusCheckRollup":[null]}
+EOF
+chk "a rollup entry that is not an object refuses, it does not merge" "$(run_mw)" "5"
+chk "and nothing was merged" "$(merges)" "0"
+
+fixture blankctx
+printf '   \n\t\n' >"$FIX/contexts"
+chk "a required set of nothing but whitespace is not a required set" "$(run_mw)" "5"
+chk "and nothing was merged" "$(merges)" "0"
+
+echo
+echo "== a name that appears twice is folded pessimistically =="
+# A re-run creates a fresh check run with the same name. Keyed naively, the
+# LAST entry in the array wins -- so whether we merge past a failing required
+# check is decided by an array order GitHub does not document as chronological.
+fixture dup_fail_then_pass
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"FAILURE"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}'
+chk "a later SUCCESS does not overwrite an earlier FAILURE of the same name" "$(run_mw)" "2"
+chk "and nothing was merged" "$(merges)" "0"
+
+fixture dup_pass_then_fail
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"FAILURE"}'
+chk "and the verdict does not depend on which order they arrived in" "$(run_mw)" "2"
+
+fixture dup_all_green
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"name":"Fast (Linux x86_64)","status":"COMPLETED","conclusion":"SUCCESS"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}'
+chk "two green runs of the same name still merge" "$(run_mw)" "0"
+
+echo
+echo "== refusals that will never go green stop, rather than wait =="
+fixture errored
+rollup "$FIX/pr.json" OPEN deadbeef \
+    '{"context":"Fast (Linux x86_64)","state":"ERROR"}' \
+    '{"name":"Rust quality","status":"COMPLETED","conclusion":"SUCCESS"}'
+chk "a legacy status of ERROR fails fast instead of timing out" "$(T=30 run_mw)" "2"
+
+fixture unreadable
+touch "$FIX/pr_view.fail"
+chk "a pull request that cannot be read at all is an environment fault" "$(T=60 run_mw)" "1"
+chk "and nothing was merged" "$(merges)" "0"
+
+echo
 echo "== states that are not about checks =="
 fixture closed
 rollup "$FIX/pr.json" CLOSED deadbeef
@@ -257,7 +317,7 @@ echo
 # An assertion that quietly stops running is indistinguishable from one that
 # passes. Both branches of the probe above assert, so this total is invariant
 # across environments.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "27"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "38"
 
 echo
 echo "passed=${pass} failed=${fail}"
