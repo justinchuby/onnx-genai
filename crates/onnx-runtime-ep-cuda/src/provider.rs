@@ -840,7 +840,15 @@ impl CudaExecutionProvider {
     ) -> Result<Self> {
         validate_offload_policy(&offload_policy)?;
         let runtime = Arc::new(CudaRuntime::new(ordinal)?);
-        let csa_metrics = Arc::new(CsaMetrics::default());
+        // B6.2: thread the process governor into the CSA telemetry surface so
+        // every CSA device state-group reservation charges the one accounting
+        // authority (`MemoryGovernor::used(Tier::Device)`) instead of a private
+        // ledger. Without a governor the surface uses an unlimited reference
+        // governor, keeping the disarmed path byte-identical.
+        let csa_metrics = Arc::new(match governor.as_ref() {
+            Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
+            None => CsaMetrics::default(),
+        });
         let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),

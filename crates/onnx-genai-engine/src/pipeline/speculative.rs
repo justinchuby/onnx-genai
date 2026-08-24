@@ -195,7 +195,7 @@ fn borrowed_state_bindings(
 impl WorkflowRuntime {
     /// The package's speculative compatibility contract, when it declares one.
     pub fn speculative_contract(&self) -> Option<&SpeculativeContract> {
-        self.speculative.as_ref()
+        self.plan.speculative.as_ref()
     }
 
     /// Drive a chained speculative proposal through the interpreter's own
@@ -214,10 +214,11 @@ impl WorkflowRuntime {
         options: ChainedProposalOptions,
     ) -> anyhow::Result<ChainedProposal> {
         let contract = self
+            .plan
             .speculative
             .as_ref()
             .context("package declares no speculative contract")?;
-        let plan = ChainedPlan::resolve(contract, &self.workflow)?;
+        let plan = ChainedPlan::resolve(contract, &self.plan.workflow)?;
         anyhow::ensure!(
             options.width >= 1,
             "chained proposal width must be at least 1"
@@ -230,6 +231,7 @@ impl WorkflowRuntime {
         );
 
         let declaration = self
+            .plan
             .workflow
             .components
             .get(plan.proposer)
@@ -638,20 +640,21 @@ impl WorkflowRuntime {
         run: &PipelineTensors,
     ) -> anyhow::Result<PipelineTensors> {
         let contract = self
+            .plan
             .speculative
             .as_ref()
             .context("package declares no speculative contract")?;
         let mut state = PipelineTensors::new();
         for cell in &contract.rollback_state {
-            let port =
-                target_state_output(&self.workflow, &contract.target, cell).with_context(|| {
+            let port = target_state_output(&self.plan.workflow, &contract.target, cell)
+                .with_context(|| {
                     format!(
                         "rollback_state cell '{cell}' names no output port on the speculative \
                          target '{}'",
                         contract.target
                     )
                 })?;
-            let value_name = component_invocation(&self.workflow, &contract.target)
+            let value_name = component_invocation(&self.plan.workflow, &contract.target)
                 .and_then(|(_, outputs)| outputs.get(&port).cloned())
                 .with_context(|| {
                     format!("the workflow binds no value to target output '{port}'")
@@ -677,6 +680,7 @@ impl WorkflowRuntime {
         length: usize,
     ) -> anyhow::Result<()> {
         let contract = self
+            .plan
             .speculative
             .as_ref()
             .context("package declares no speculative contract")?;
@@ -714,8 +718,13 @@ impl WorkflowRuntime {
         let source = super::device_ops::residency_of(value)?;
         if source != ops.residency() && ops.residency() == super::device_ops::Residency::Host {
             let bytes = (value.numel() * value.dtype().size_of()) as u64;
-            self.device_readback_bytes
-                .set(self.device_readback_bytes.get().saturating_add(bytes));
+            self.worker.counters.device_readback_bytes.set(
+                self.worker
+                    .counters
+                    .device_readback_bytes
+                    .get()
+                    .saturating_add(bytes),
+            );
         }
         ops.adopt(value)
     }
@@ -733,15 +742,20 @@ impl WorkflowRuntime {
         let id = *ids.first().context("argmax returned no row")?;
         if ops.residency() != super::device_ops::Residency::Host {
             let bytes = (ids.len() * std::mem::size_of::<u32>()) as u64;
-            self.device_readback_bytes
-                .set(self.device_readback_bytes.get().saturating_add(bytes));
+            self.worker.counters.device_readback_bytes.set(
+                self.worker
+                    .counters
+                    .device_readback_bytes
+                    .get()
+                    .saturating_add(bytes),
+            );
         }
         Ok(id)
     }
 
     /// Sequence axis a state cell rolls back along, from its serving group.
     fn state_sequence_axis(&self, cell: &str) -> Option<usize> {
-        let serving = self.workflow.serving.as_ref()?;
+        let serving = self.plan.workflow.serving.as_ref()?;
         serving
             .state_service
             .groups
@@ -756,7 +770,8 @@ impl WorkflowRuntime {
     }
 
     fn workflow_session_state_value(&self, cell: &str) -> Option<Value> {
-        self.workflow_session_state
+        self.worker
+            .session_state
             .borrow()
             .iter()
             .find(|((_, name), _)| name == cell)
@@ -813,7 +828,7 @@ impl WorkflowRuntime {
             residency.cache_key(),
             source.scale.map(f32::to_bits),
         );
-        if let Some(cached) = self.embedding_tables.borrow().get(&key) {
+        if let Some(cached) = self.worker.embedding_tables.borrow().get(&key) {
             return Ok(std::rc::Rc::clone(cached));
         }
         let loaded = std::rc::Rc::new(self.embedding_table(source)?.into_residency(
@@ -821,7 +836,8 @@ impl WorkflowRuntime {
         ).with_context(|| {
             format!("failed to make embedding table '{table}' of component '{component}' resident on {residency}")
         })?);
-        self.embedding_tables
+        self.worker
+            .embedding_tables
             .borrow_mut()
             .insert(key, std::rc::Rc::clone(&loaded));
         Ok(loaded)
@@ -834,7 +850,7 @@ impl WorkflowRuntime {
     /// and unusably slow, which is the class of regression a throughput number
     /// does not attribute. This is what a test holds to one read per table.
     pub fn embedding_table_loads(&self) -> u64 {
-        self.embedding_table_loads.get()
+        self.worker.counters.embedding_table_loads.get()
     }
 
     pub fn embedding_table(
@@ -843,6 +859,7 @@ impl WorkflowRuntime {
     ) -> anyhow::Result<EmbeddingTable> {
         let (component, table) = (source.component.as_str(), source.table.as_str());
         let path = self
+            .backend
             .models
             .directory
             .model_paths
@@ -907,8 +924,13 @@ impl WorkflowRuntime {
                 )
             })?,
         };
-        self.embedding_table_loads
-            .set(self.embedding_table_loads.get().saturating_add(1));
+        self.worker.counters.embedding_table_loads.set(
+            self.worker
+                .counters
+                .embedding_table_loads
+                .get()
+                .saturating_add(1),
+        );
         Ok(EmbeddingTable {
             vocab,
             hidden,
