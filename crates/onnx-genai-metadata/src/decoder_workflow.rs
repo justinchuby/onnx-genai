@@ -383,6 +383,7 @@ pub fn decoder_workflow(
         effects: Vec::new(),
         row_scope: None,
         cache_affects_state: BTreeSet::new(),
+        batch_capacity: None,
     };
 
     for (cell, port, contract, default) in [
@@ -429,6 +430,7 @@ pub fn decoder_workflow(
         effects: Vec::new(),
         row_scope: None,
         cache_affects_state: BTreeSet::new(),
+        batch_capacity: None,
     };
 
     let mut body = vec![
@@ -682,6 +684,7 @@ pub fn iteration_variant(
             },
         ),
         cache_affects_state: decoder.cache_affects_state.clone(),
+        batch_capacity: None,
     };
 
     let component = policy.component().to_string();
@@ -977,6 +980,7 @@ impl Builder {
                     )]),
                     optional: false,
                     batch_layout: BatchLayout::Shared,
+                    pad_mask: None,
                 },
                 role: SemanticInputRole::Runtime {
                     version: CONTRACT_VERSION.to_string(),
@@ -1401,6 +1405,7 @@ fn token_contract() -> TensorContract {
         shape: dims(&["batch", "sequence"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1411,6 +1416,7 @@ fn mask_contract() -> TensorContract {
         shape: dims(&["batch", "kv_sequence"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1421,6 +1427,7 @@ fn logits_contract() -> TensorContract {
         shape: dims(&["batch", "sequence", "vocabulary"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1431,6 +1438,7 @@ fn hidden_contract() -> TensorContract {
         shape: dims(&["batch", "sequence", "hidden"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1441,6 +1449,7 @@ fn state_contract() -> TensorContract {
         shape: dims(&["batch", "kv_heads", "kv_sequence", "head_dim"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1451,6 +1460,7 @@ fn lengths_contract() -> TensorContract {
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1461,6 +1471,7 @@ fn flag_contract() -> TensorContract {
         shape: dims(&["batch"]),
         optional: false,
         batch_layout: request_aligned(),
+        pad_mask: None,
     }
 }
 
@@ -1471,6 +1482,7 @@ fn scalar_contract() -> TensorContract {
         shape: Some(vec![crate::schema::TensorDimension::Fixed(1)]),
         optional: false,
         batch_layout: BatchLayout::Shared,
+        pad_mask: None,
     }
 }
 

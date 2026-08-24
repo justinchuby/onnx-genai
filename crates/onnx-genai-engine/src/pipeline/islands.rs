@@ -1157,6 +1157,7 @@ fn session_tensor_contract(
         shape: Some(shape),
         optional: false,
         batch_layout: onnx_genai_metadata::BatchLayout::Shared,
+        pad_mask: None,
     }
 }
 
@@ -2369,6 +2370,7 @@ mod tests {
             effects: Vec::new(),
             row_scope: None,
             cache_affects_state: Default::default(),
+            batch_capacity: None,
         }
     }
 
@@ -2386,6 +2388,7 @@ mod tests {
             ),
             optional: false,
             batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+            pad_mask: None,
         }
     }
 
@@ -2396,6 +2399,7 @@ mod tests {
             shape: Some(vec![onnx_genai_metadata::TensorDimension::Fixed(1)]),
             optional: false,
             batch_layout: onnx_genai_metadata::BatchLayout::Shared,
+            pad_mask: None,
         }
     }
 

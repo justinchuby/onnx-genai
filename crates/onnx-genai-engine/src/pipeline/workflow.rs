@@ -5706,6 +5706,7 @@ mod workflow_sampling_binding_tests {
             shape: None,
             optional: false,
             batch_layout: BatchLayout::default(),
+            pad_mask: None,
         };
 
         let value = workflow_request_value(&RuntimeInputRole::PromptTokens, &request, &contract)
@@ -5728,6 +5729,7 @@ mod workflow_sampling_binding_tests {
             shape: None,
             optional: false,
             batch_layout: BatchLayout::default(),
+            pad_mask: None,
         };
 
         let error =
@@ -5750,6 +5752,7 @@ mod workflow_sampling_binding_tests {
             shape: Some(vec![TensorDimension::Fixed(1)]),
             optional: false,
             batch_layout: BatchLayout::default(),
+            pad_mask: None,
         };
 
         let top_k = workflow_request_value(&RuntimeInputRole::SamplingTopK, &request, &contract)

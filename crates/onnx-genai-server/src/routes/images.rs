@@ -1160,6 +1160,7 @@ mod tests {
                     shape: None,
                     optional: false,
                     batch_layout: Default::default(),
+                    pad_mask: None,
                 }, &mut BTreeMap::new())
                 .unwrap(),
             ImageInputValue::Raw {
@@ -1186,6 +1187,7 @@ mod tests {
                     shape: None,
                     optional: false,
                     batch_layout: Default::default(),
+                    pad_mask: None,
                 },
                 &mut BTreeMap::new(),
             )
@@ -1206,6 +1208,7 @@ mod tests {
             ]),
             optional: false,
             batch_layout: Default::default(),
+            pad_mask: None,
         };
         let tensor = ApplicationTensor {
             dtype: "float32".to_string(),
