@@ -358,7 +358,7 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
         } => {
             assert_eq!(cell, "conversation");
             assert_eq!(bound, 6);
-            assert!(requested > bound);
+            assert_eq!(requested, 10);
         }
         other => panic!("unexpected capability refusal: {other:?}"),
     }
@@ -706,6 +706,10 @@ fn copy_on_write_session_mutation_is_refused_at_load() -> anyhow::Result<()> {
         Ok(_) => panic!("an unsupported mutation policy must not load"),
         Err(error) => format!("{error:#}"),
     };
+    assert!(
+        refused.contains("workflow state 'conversation'"),
+        "{refused}"
+    );
     assert!(refused.contains("copy-on-write"), "{refused}");
     Ok(())
 }

@@ -509,8 +509,20 @@ impl ApiError {
 /// operational one.
 pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     match onnx_genai_engine::package_capability_error(&error) {
-        Some(capability) => ApiError::conflict(capability.to_string()),
+        Some(capability) => package_capability_failure(capability),
         None => ApiError::internal(format!("session create failed: {error}")),
+    }
+}
+
+fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
+    match capability {
+        PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+        PackageCapabilityError::ConversationOverBound { .. } => {
+            ApiError::invalid_request(capability.to_string())
+        }
+        PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
+            ApiError::conflict(capability.to_string())
+        }
     }
 }
 
@@ -528,15 +540,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // and the caller can shorten; a busy session is a conflict that the same
         // request succeeds at once the turn in flight finishes. Both are read
         // off the engine's own type, so neither status depends on wording.
-        DriverFailureKind::PackageCapability(capability) => match capability {
-            PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
-            PackageCapabilityError::ConversationOverBound { .. } => {
-                ApiError::invalid_request(capability.to_string())
-            }
-            PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
-                ApiError::conflict(capability.to_string())
-            }
-        },
+        DriverFailureKind::PackageCapability(capability) => package_capability_failure(capability),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
