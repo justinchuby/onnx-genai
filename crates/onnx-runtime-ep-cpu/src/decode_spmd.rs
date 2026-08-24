@@ -175,6 +175,22 @@ const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 /// unbounded spin that holds a machine at full occupancy indefinitely.
 const POOL_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The part of an SPMD decode worker's thread name that survives `/proc`.
+///
+/// Linux caps `comm` at 15 bytes *plus* its NUL, so the full name a worker is
+/// spawned with -- `onnx-genai-spmd-n0-12` and longer -- is truncated to
+/// exactly this before anything can read it back. Shared with the spawn site so
+/// the two cannot drift: a `/proc` scan filtered on a name is a *filter*, and a
+/// filter that matches nothing reports "no threads" rather than failing, so a
+/// rename here would silently empty every survivor count that reads it.
+/// `the_worker_name_survives_proc_truncation` is the tripwire on that.
+const SPMD_THREAD_NAME_PREFIX: &str = "onnx-genai-spmd";
+
+/// Linux's `comm` field width, excluding the terminating NUL (`TASK_COMM_LEN -
+/// 1`). Not configurable and not queryable at runtime; see `man 5 proc`.
+#[cfg(test)]
+const COMM_MAX_BYTES: usize = 15;
+
 // Both knobs below are scoped to the thread that builds the pool, not global. A
 // global knob is read by *every* concurrently-building pool in the same test
 // binary, so injecting a fault reaches pools belonging to unrelated tests --
@@ -1658,7 +1674,9 @@ impl SpmdDecodePools {
             let shared = Arc::clone(&shared);
             let placements = Arc::clone(&placements);
             let handle = thread::Builder::new()
-                .name(format!("onnx-genai-spmd-n{node_position}-{global_index}"))
+                .name(format!(
+                    "{SPMD_THREAD_NAME_PREFIX}-n{node_position}-{global_index}"
+                ))
                 .spawn(move || {
                     let attempt = match cpu {
                         None => PinAttempt::NotRequested,
@@ -4990,22 +5008,271 @@ mod tests {
     #[cfg(target_os = "linux")]
     const READY_LEAK_CHILD_ENV: &str = "ONNX_GENAI_TEST_READY_LEAK_CHILD";
 
+    /// What one `/proc/self/task/<tid>/comm` read told the scan.
+    ///
+    /// Split out from the scan so the three cases can be asserted directly. The
+    /// distinction that matters is between the last two: a task that exited
+    /// mid-scan is *not* a surviving worker and must not stop the count, while
+    /// a name that could not be read for any other reason means the scan cannot
+    /// see and its count is not evidence of anything.
+    #[cfg(target_os = "linux")]
+    #[derive(Debug, PartialEq, Eq)]
+    enum CommRead {
+        /// The name was read; `true` if it marks an SPMD decode worker.
+        Named(bool),
+        /// The task exited between the directory listing and the read.
+        Vanished,
+        /// The name is unreadable, so this scan is blind.
+        Blind(String),
+    }
+
+    /// Classify one `comm` read. See [`CommRead`].
+    #[cfg(target_os = "linux")]
+    fn classify_worker_comm(read: std::io::Result<String>) -> CommRead {
+        match read {
+            Ok(comm) => CommRead::Named(comm.trim_end().starts_with(SPMD_THREAD_NAME_PREFIX)),
+            // Threads come and go under a scan that is not a snapshot, and the
+            // one case this races with -- a worker leaving -- is the outcome the
+            // callers are hoping for. Not blindness.
+            //
+            // Two errnos, because `read_to_string` is `open` then `read` and a
+            // task can vanish between them. Gone before the `open` is `ENOENT`;
+            // gone before the first `read` makes `comm_show` fail its
+            // `get_proc_task` and return `ESRCH` (`man 5 proc`: an exited
+            // thread's files give "ESRCH or ENOENT"). `ESRCH` has to be matched
+            // on the raw errno: Rust's `decode_error_kind` has no mapping for
+            // it, so it arrives as `ErrorKind::Uncategorized`, which is *also*
+            // what `EIO` arrives as -- and `EIO` is real blindness. Matching the
+            // kind rather than the errno would either panic on a correct
+            // teardown or excuse a broken one.
+            //
+            // This is not a theoretical window. `shutdown_join_child` counts
+            // immediately after `shutdown_pools` joins, and this file already
+            // documents that regime: "the futex that unblocks `join` is
+            // signalled before the kernel unhashes the task". That is the peak
+            // `ESRCH` window, entered on the *success* path.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::NotFound
+                    || err.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                CommRead::Vanished
+            }
+            Err(err) => CommRead::Blind(err.to_string()),
+        }
+    }
+
     /// Threads in this process whose name marks them as SPMD decode workers.
     ///
     /// The 15-byte `comm` truncation is why this is a prefix test and why it is
     /// only sound in a single-pool process.
+    ///
+    /// Panics rather than returning a count it cannot stand behind. This reads
+    /// harsh for a helper, but `0` is the *passing* value for
+    /// [`a_failed_build_leaves_no_workers_running`], so the previous
+    /// `else { return 0 }` on an unlistable `/proc` made the test report success
+    /// exactly when it had gone blind -- a scan that can see nothing agrees that
+    /// nothing survived. The other caller was already guarded, by
+    /// `spmd_threads_before > 0` in `realized_width_child`'s parent; this puts
+    /// the guarantee in the instrument instead of in one of its two users.
     #[cfg(target_os = "linux")]
     fn live_spmd_worker_threads() -> usize {
-        let Ok(entries) = std::fs::read_dir("/proc/self/task") else {
-            return 0;
-        };
-        entries
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                std::fs::read_to_string(entry.path().join("comm"))
-                    .is_ok_and(|comm| comm.trim_end().starts_with("onnx-genai-spmd"))
-            })
-            .count()
+        match try_live_spmd_worker_threads() {
+            Ok(workers) => workers,
+            Err(reason) => panic!(
+                "the surviving-worker scan went blind, so its count is not \
+                 evidence either way: {reason}"
+            ),
+        }
+    }
+
+    /// [`live_spmd_worker_threads`] with the blindness reported rather than
+    /// raised, so the fail-closed policy is testable.
+    #[cfg(target_os = "linux")]
+    fn try_live_spmd_worker_threads() -> Result<usize, String> {
+        let entries = std::fs::read_dir("/proc/self/task")
+            .map_err(|err| format!("/proc/self/task could not be listed: {err}"))?;
+        tally_worker_comms(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| std::fs::read_to_string(entry.path().join("comm"))),
+        )
+    }
+
+    /// Count the SPMD workers among a sequence of `comm` reads, or report why
+    /// the sequence cannot be counted.
+    ///
+    /// Takes the reads as an argument rather than performing them, so the
+    /// blind cases below have deterministic negative controls: `/proc` cannot
+    /// be made to fail on demand, and a policy that is only ever exercised by
+    /// the happy path is a policy nobody has tested.
+    #[cfg(target_os = "linux")]
+    fn tally_worker_comms(
+        reads: impl IntoIterator<Item = std::io::Result<String>>,
+    ) -> Result<usize, String> {
+        let mut named = 0usize;
+        let mut workers = 0usize;
+        for read in reads {
+            match classify_worker_comm(read) {
+                CommRead::Named(is_worker) => {
+                    named += 1;
+                    workers += usize::from(is_worker);
+                }
+                CommRead::Vanished => {}
+                CommRead::Blind(reason) => {
+                    return Err(format!("a task's comm is unreadable: {reason}"));
+                }
+            }
+        }
+        // A listable directory does not imply readable entries, and it is the
+        // entries the filter depends on: a `/proc` that enumerates tasks but
+        // refuses every `comm` yields the same `0` an empty process would.
+        // The calling thread is always in there and cannot exit under itself,
+        // so reading no name at all is impossible unless the scan is blind.
+        if named == 0 {
+            return Err(
+                "no task's comm could be read at all, not even the calling thread's".to_string(),
+            );
+        }
+        Ok(workers)
+    }
+
+    /// The name workers are spawned with must still be recognisable after
+    /// Linux truncates it.
+    ///
+    /// Not arch-gated: the identity being checked is string arithmetic, and the
+    /// drift it guards against -- someone renaming the spawn site -- happens on
+    /// whatever platform the rename is written on, not on the one that reads
+    /// `/proc`. A filter that matches nothing does not fail; it returns "no
+    /// threads", which is the passing answer for every caller of the scan.
+    #[test]
+    fn the_worker_name_survives_proc_truncation() {
+        assert!(
+            SPMD_THREAD_NAME_PREFIX.len() <= COMM_MAX_BYTES,
+            "the prefix the scan filters on is itself truncated by comm, so it \
+             can never match: {SPMD_THREAD_NAME_PREFIX:?}"
+        );
+        // Built exactly as the spawn site builds it, with a node/index pair a
+        // stock 2-core runner reaches.
+        let spawned = format!("{SPMD_THREAD_NAME_PREFIX}-n0-1");
+        assert!(
+            spawned.len() > COMM_MAX_BYTES,
+            "the name is no longer truncated, so this test has stopped \
+             describing what /proc holds: {spawned:?}"
+        );
+        assert_eq!(
+            &spawned[..COMM_MAX_BYTES],
+            SPMD_THREAD_NAME_PREFIX,
+            "what /proc keeps of a worker's name is not what the scan looks for"
+        );
+    }
+
+    /// A `comm` that cannot be read is blindness, never "no worker here".
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_unreadable_comm_makes_the_scan_blind() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            classify_worker_comm(Err(denied)),
+            CommRead::Blind(_)
+        ));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let blind = tally_worker_comms([Ok(SPMD_THREAD_NAME_PREFIX.to_string()), Err(denied)]);
+        assert!(
+            blind.is_err(),
+            "a scan that could not read one of its tasks reported a count \
+             anyway: {blind:?}"
+        );
+    }
+
+    /// A task that exits mid-scan is the outcome the callers want, not a fault.
+    ///
+    /// Both errnos, because `read_to_string` is `open` then `read` and the task
+    /// can vanish between them. `ESRCH` is the one that bites: it is not in
+    /// Rust's errno mapping, so it arrives as `Uncategorized` and any
+    /// kind-based test for "vanished" misses it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_task_that_exits_mid_scan_is_not_blindness() {
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(classify_worker_comm(Err(gone)), CommRead::Vanished);
+
+        let raced = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert_ne!(
+            raced.kind(),
+            std::io::ErrorKind::NotFound,
+            "ESRCH now maps to NotFound, so the raw-errno arm below is dead \
+             code -- re-derive it rather than deleting either half"
+        );
+        assert_eq!(classify_worker_comm(Err(raced)), CommRead::Vanished);
+
+        let gone = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let raced = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert_eq!(
+            tally_worker_comms([
+                Ok(format!("{SPMD_THREAD_NAME_PREFIX}\n")),
+                Err(gone),
+                Err(raced),
+                Ok("main\n".to_string()),
+            ]),
+            Ok(1),
+            "a worker leaving under the scan must not stop it counting"
+        );
+    }
+
+    /// Blindness is decided by errno, not by `ErrorKind`.
+    ///
+    /// `ESRCH` and `EIO` are indistinguishable as kinds -- both arrive as
+    /// `Uncategorized` -- and they are opposite verdicts: the first is a
+    /// correct teardown, the second is an instrument that cannot see. A
+    /// kind-based rule has to be wrong about one of them.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn an_uncategorized_error_is_not_by_itself_a_vanished_task() {
+        let unreadable = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(
+            unreadable.kind(),
+            std::io::Error::from_raw_os_error(libc::ESRCH).kind(),
+            "this test only means something while EIO and ESRCH share a kind"
+        );
+        assert!(matches!(
+            classify_worker_comm(Err(unreadable)),
+            CommRead::Blind(_)
+        ));
+    }
+
+    /// The empty tally is blindness, not "every worker left".
+    ///
+    /// This is the case that made the old scan a false oracle: `0` is the
+    /// passing value for [`a_failed_build_leaves_no_workers_running`], so a
+    /// scan that could see nothing agreed that nothing survived.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_scan_that_read_nothing_is_never_reported_as_no_survivors() {
+        let empty: [std::io::Result<String>; 0] = [];
+        assert!(
+            tally_worker_comms(empty).is_err(),
+            "a scan that read no task at all reported zero survivors, which is \
+             the same answer a clean teardown gives"
+        );
+        let all_denied = (0..4)
+            .map(|_| Err::<String, _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(tally_worker_comms(all_denied).is_err());
+    }
+
+    /// The real scan must be able to see this process, on any host CI uses.
+    ///
+    /// Fails closed: if `/proc/self/task` ever stops being readable here, that
+    /// is reported rather than quietly turning two teardown tests vacuous.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri has no /proc")]
+    fn the_live_scan_can_see_this_process() {
+        let seen = try_live_spmd_worker_threads();
+        assert!(
+            seen.is_ok(),
+            "the surviving-worker scan cannot read this process's own threads, \
+             so every count it feeds is vacuous: {seen:?}"
+        );
     }
 
     #[test]

@@ -75,7 +75,15 @@ def l3_of(cpu):
 
 
 def worker_cpus(pid):
-    """Pinned CPU of every live `onnx-genai-spmd` thread, or None if unpinned."""
+    """Pinned CPU of every live `onnx-genai-spmd` thread, or None if unpinned.
+
+    The name is Linux's 15-byte ``comm`` truncation of what the pool spawns
+    (``onnx-genai-spmd-n0-1``), duplicated here because Python cannot read the
+    Rust const. Keep it equal to ``SPMD_THREAD_NAME_PREFIX`` in
+    ``crates/onnx-runtime-ep-cpu/src/decode_spmd.rs``: this is a *filter*, so a
+    rename there empties the census silently rather than failing it. The caller
+    reports an empty result as a defect rather than as a placement.
+    """
     out = []
     taskdir = f"/proc/{pid}/task"
     try:

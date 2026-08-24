@@ -50,6 +50,12 @@ L3_1=$(cat /sys/devices/system/cpu/cpu16/cache/index3/shared_cpu_list 2>/dev/nul
 SIB0=$(cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list 2>/dev/null)
 
 # Every spmd thread's pinned CPU set, one per line.
+#
+# The name is Linux's 15-byte `comm` truncation of what the pool actually
+# spawns ("onnx-genai-spmd-n0-1"), and it is duplicated here because a shell
+# script cannot read the Rust const. Keep it equal to SPMD_THREAD_NAME_PREFIX
+# in crates/onnx-runtime-ep-cpu/src/decode_spmd.rs: this is a *filter*, so a
+# rename there empties the census silently rather than failing it.
 worker_cpus() {
   local pid=$1
   for t in /proc/"$pid"/task/*; do
@@ -83,7 +89,15 @@ run() {
   kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
 
   echo "== $label"
-  echo "   spawned spmd threads : $n"
+  if [ "$n" -eq 0 ]; then
+    echo "   spawned spmd threads : 0  <-- NOTHING MATCHED. Either the pool"
+    echo "                              spawned no workers, or the thread name"
+    echo "                              no longer starts with onnx-genai-spmd."
+    echo "                              An empty census is not evidence of a"
+    echo "                              placement; do not read the rows below."
+  else
+    echo "   spawned spmd threads : $n"
+  fi
   echo "   pinned cpus          : $cpus"
   echo "   l3 spread            : $doms"
   grep -m1 'confined the process to' "$out" | sed 's/^/   confinement          : /'

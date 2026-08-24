@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -122,6 +122,16 @@ impl ModelHandle {
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    /// Stop this model's engine worker and wait for it to exit.
+    ///
+    /// **Blocking.** The engine is thread-affine: its ORT sessions, KV pages,
+    /// and device allocations are destroyed on the worker thread that created
+    /// them, and this is the call that makes that destruction ordered with
+    /// respect to the caller instead of merely eventual.
+    fn shutdown(&self) {
+        self.engine.shutdown();
     }
 
     /// Run one deterministic generation matching the loaded model's output
@@ -557,10 +567,17 @@ impl ModelRegistry {
         let handle = Arc::new(handle);
 
         // Insert + evict under the write lock (no await held).
-        {
+        let evicted = {
             let mut inner = self.write()?;
             inner.insert_loaded(Arc::clone(&handle));
-            inner.enforce_eviction(self.config.max_loaded_models, id);
+            inner.enforce_eviction(self.config.max_loaded_models, id)
+        };
+        // Stopping an evicted engine waits for its worker, so it happens off the
+        // async executor and outside the registry lock.
+        if !evicted.is_empty() {
+            tokio::task::spawn_blocking(move || release_handles(evicted))
+                .await
+                .context("model eviction task panicked")?;
         }
         if spec.warmup {
             let registry = self.clone();
@@ -588,14 +605,25 @@ impl ModelRegistry {
     /// `available` so it can be lazily reloaded.  In-flight requests that already
     /// hold an `Arc<ModelHandle>` keep the engine alive until they finish.
     ///
+    /// When this call holds the last reference, it waits for the engine worker
+    /// to stop, so the ORT sessions and device memory are gone before it
+    /// returns rather than at some unobservable later moment.
+    ///
+    /// **Blocking**, for that reason: an async caller must go through
+    /// `spawn_blocking`.
+    ///
     /// Returns an error if the id is not currently loaded (mapped to 404).
     pub(crate) fn unload(&self, id: &str) -> anyhow::Result<()> {
-        let mut inner = self.write()?;
-        if inner.remove_loaded(id) {
-            tracing::info!(id = %id, "unloaded model");
-            Ok(())
-        } else {
-            anyhow::bail!("model '{id}' is not loaded")
+        // The write lock is released before the join: waiting for a generation
+        // to finish while holding it would stall every other model's requests.
+        let unloaded = self.write()?.remove_loaded(id);
+        match unloaded {
+            Some(handle) => {
+                release_handle(handle);
+                tracing::info!(id = %id, "unloaded model");
+                Ok(())
+            }
+            None => anyhow::bail!("model '{id}' is not loaded"),
         }
     }
 
@@ -626,6 +654,27 @@ impl ModelRegistry {
     }
 }
 
+impl Drop for ModelRegistry {
+    /// Tear the node down the way an unload does, one model at a time.
+    ///
+    /// The last registry clone owns every loaded model, so this is where a
+    /// server shutdown destroys them: each engine is stopped and joined, and
+    /// its device memory released on the worker thread that allocated it,
+    /// before the process moves on. Runs only for the final clone — a route
+    /// handler dropping its `AppState` clone unloads nothing.
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.inner) != 1 {
+            return;
+        }
+        let handles = {
+            let mut inner = self.inner.write().unwrap_or_else(PoisonError::into_inner);
+            inner.order.clear();
+            inner.models.drain().map(|(_, handle)| handle).collect()
+        };
+        release_handles(handles);
+    }
+}
+
 impl RegistryInner {
     /// Insert a loaded handle, appending to `order` if the id is new.  Never
     /// changes `default_id` (that is fixed at construction).
@@ -637,15 +686,13 @@ impl RegistryInner {
         self.models.insert(id, handle);
     }
 
-    /// Remove a loaded handle from `models` and `order`.  Returns `true` if it
-    /// was present.  The spec stays in `available` for later reloads.
-    fn remove_loaded(&mut self, id: &str) -> bool {
-        if self.models.remove(id).is_some() {
-            self.order.retain(|existing| existing != id);
-            true
-        } else {
-            false
-        }
+    /// Remove a loaded handle from `models` and `order`, returning it so the
+    /// caller can stop its worker outside the lock.  The spec stays in
+    /// `available` for later reloads.
+    fn remove_loaded(&mut self, id: &str) -> Option<Arc<ModelHandle>> {
+        let removed = self.models.remove(id)?;
+        self.order.retain(|existing| existing != id);
+        Some(removed)
     }
 
     /// Evict least-recently-used models until `models.len() <= max`.
@@ -654,17 +701,26 @@ impl RegistryInner {
     /// default model is only evicted as a last resort.  Because eviction only
     /// runs when `len > max` and `max >= 1`, the registry never drops below one
     /// loaded model.
-    fn enforce_eviction(&mut self, max_loaded: Option<usize>, loading_id: &str) {
+    ///
+    /// Returns the evicted handles so the caller can stop their workers once the
+    /// registry lock is released.
+    fn enforce_eviction(
+        &mut self,
+        max_loaded: Option<usize>,
+        loading_id: &str,
+    ) -> Vec<Arc<ModelHandle>> {
+        let mut evicted = Vec::new();
         let Some(max) = max_loaded else {
-            return;
+            return evicted;
         };
         while self.models.len() > max {
             let Some(victim) = self.pick_lru_victim(loading_id) else {
                 break;
             };
             tracing::info!(id = %victim, "evicting model (LRU)");
-            self.remove_loaded(&victim);
+            evicted.extend(self.remove_loaded(&victim));
         }
+        evicted
     }
 
     /// Choose the LRU victim, excluding `loading_id` and preferring non-default
@@ -687,6 +743,36 @@ impl RegistryInner {
             .filter(|(id, _)| id.as_str() != loading_id)
             .min_by_key(|(_, h)| h.last_request_at.load(Ordering::Relaxed))
             .map(|(id, _)| id.clone())
+    }
+}
+
+/// Stop the engine behind a handle the registry has just dropped, if nobody
+/// else still holds it.
+///
+/// A request that is mid-generation holds its own `Arc<ModelHandle>`; stopping
+/// that engine now would abort a caller's live response. In that case the
+/// handle is simply released: the worker still shuts itself down and destroys
+/// the engine on its own thread when the last in-flight request finishes — what
+/// is lost is only the ordering guarantee, which no caller is waiting on.
+///
+/// **Blocking** in the common case, where this is the last owner.
+fn release_handle(handle: Arc<ModelHandle>) {
+    let id = handle.id.clone();
+    match Arc::into_inner(handle) {
+        Some(handle) => {
+            handle.shutdown();
+            tracing::debug!(id = %id, "engine worker stopped and joined");
+        }
+        None => tracing::debug!(
+            id = %id,
+            "engine still serving in-flight requests; it will stop when they finish",
+        ),
+    }
+}
+
+fn release_handles(handles: Vec<Arc<ModelHandle>>) {
+    for handle in handles {
+        release_handle(handle);
     }
 }
 
@@ -738,8 +824,11 @@ impl ModelRegistry {
 
     /// Enforce eviction directly (used by eviction unit tests).
     pub(crate) fn enforce_eviction_for_test(&self, max_loaded: Option<usize>, loading_id: &str) {
-        let mut inner = self.inner.write().unwrap();
-        inner.enforce_eviction(max_loaded, loading_id);
+        let evicted = {
+            let mut inner = self.inner.write().unwrap();
+            inner.enforce_eviction(max_loaded, loading_id)
+        };
+        release_handles(evicted);
     }
 
     /// Replace the default model's `fim_config` in place (test-only helper).
@@ -872,7 +961,12 @@ mod tests {
                 graph_components: 0,
                 declares_generation_loop: false,
             },
-            commands: tx,
+            // A pool of one detached worker: a command channel with no engine
+            // thread behind it, so shutting it down joins nothing.
+            workers: crate::worker::WorkerPool::single(crate::worker::WorkerHandle::detached(
+                crate::worker::WorkerId::PRIMARY,
+                tx,
+            )),
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,
             // A test double drives no engine, so there is no pool to
@@ -1186,6 +1280,65 @@ mod tests {
         assert_eq!(registry.ids().unwrap(), vec!["a"]);
         // Unloading an id that is not loaded is an error (mapped to 404).
         assert!(registry.unload("b").is_err());
+    }
+
+    /// Unloading a real model stops its engine worker and waits for it, so the
+    /// engine is destroyed on its owner thread before the call returns.
+    #[tokio::test]
+    async fn unload_stops_and_joins_the_engine_worker() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let specs = vec![ModelSpec {
+            id: "tiny".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        // Keep the worker addressable without keeping the *handle* alive: the
+        // registry must be the last owner for the unload to be able to join.
+        let worker = {
+            let handle = registry.resolve("tiny").unwrap().unwrap();
+            Arc::clone(handle.engine.workers.primary())
+        };
+        assert!(worker.is_running());
+
+        registry.unload("tiny").expect("unload loaded model");
+
+        assert!(
+            worker.is_joined(),
+            "unload must join the engine worker before returning",
+        );
+        assert!(!worker.is_running());
+        assert_eq!(registry.ids().unwrap(), Vec::<String>::new());
+        // The spec stays available, so the model can be lazily reloaded.
+        assert!(registry.contains_available("tiny").unwrap());
+    }
+
+    /// An unload racing an in-flight request does not tear the engine out from
+    /// under it: the worker keeps running for whoever still holds the handle.
+    #[tokio::test]
+    async fn unload_leaves_an_in_flight_engine_running() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let specs = vec![ModelSpec {
+            id: "tiny".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let in_flight = registry.resolve("tiny").unwrap().unwrap();
+
+        registry.unload("tiny").expect("unload loaded model");
+
+        let worker = in_flight.engine.workers.primary();
+        assert!(!worker.is_joined());
+        assert!(
+            worker.is_running(),
+            "an engine still serving a request must keep answering it",
+        );
+        assert!(in_flight.engine.create_session().await.is_ok());
     }
 
     #[test]

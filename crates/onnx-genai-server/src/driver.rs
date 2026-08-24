@@ -19,6 +19,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use crate::image_generation::{ImageExecutionRequest, ProducedImage};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
+use crate::worker::{SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerUnavailable};
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
 const MICROBATCH_MIN_WAIT: Duration = Duration::from_millis(2);
@@ -28,7 +29,9 @@ const MICROBATCH_POLL_WAIT: Duration = Duration::from_micros(250);
 
 #[derive(Clone)]
 pub(crate) struct EngineDriver {
-    pub(crate) commands: mpsc::Sender<DriverCommand>,
+    /// The worker threads that own the engine. Exactly one today; every command
+    /// names the worker it must reach rather than assuming there is only one.
+    pub(crate) workers: WorkerPool,
     pub(crate) generation_capacity: Arc<Semaphore>,
     pub(crate) generation_capacity_size: u32,
     /// Lock-free mirror of the KV page pool, readable during a generation.
@@ -317,9 +320,15 @@ impl EngineDriver {
         };
         let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
         let driver_snapshot = Arc::clone(&resource_snapshot);
-        thread::Builder::new()
-            .name("onnx-genai-batch-driver".to_string())
-            .spawn(move || {
+        // One worker owns the engine for the whole life of this driver. The
+        // pool exists so a command names the worker it is going to, not so the
+        // engine can move between them: it cannot.
+        let worker_id = WorkerId::PRIMARY;
+        let worker = WorkerHandle::spawn(
+            worker_id,
+            format!("onnx-genai-batch-driver-{worker_id}"),
+            commands,
+            move || {
                 run_engine_driver(
                     owner,
                     rx,
@@ -328,10 +337,15 @@ impl EngineDriver {
                     driver_capacity,
                     driver_snapshot,
                 )
-            })
-            .expect("failed to spawn onnx-genai engine driver");
+            },
+        );
+        let workers = WorkerPool::single(worker);
+        tracing::info!(
+            workers = workers.len(),
+            "engine worker pool started (one worker owns the engine)",
+        );
         Self {
-            commands,
+            workers,
             generation_capacity,
             generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
             kv_telemetry,
@@ -341,6 +355,31 @@ impl EngineDriver {
             batching,
             workflow_facts,
         }
+    }
+
+    /// Stop every worker and wait for the engine to be destroyed.
+    ///
+    /// Idempotent. **Blocking**: callers on an async task must go through
+    /// `spawn_blocking`, because this waits for the worker to finish whatever
+    /// it is running. When it returns, the engine's ORT sessions, KV pages, and
+    /// device allocations have been released on the thread that created them,
+    /// and every later command fails with the usual "engine driver stopped".
+    pub(crate) fn shutdown(&self) {
+        self.workers.shutdown();
+    }
+
+    /// The sender for a session-bound command, addressed to the worker that
+    /// owns the session's state.
+    fn session_commands(
+        &self,
+        session: SessionPlacement,
+    ) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
+        self.workers.sender_for(session.worker)
+    }
+
+    /// The sender for a command bound to no session.
+    fn commands(&self) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
+        self.workers.primary_sender()
     }
 
     /// What the loaded package's serialized workflow declares.
@@ -363,21 +402,31 @@ impl EngineDriver {
         &self.batching
     }
 
-    pub(crate) async fn create_session(&self) -> anyhow::Result<SessionId> {
+    /// Open an engine session and report where it lives.
+    ///
+    /// The placement, not the bare id, is what a caller stores: an engine
+    /// session id means nothing away from the worker that issued it.
+    pub(crate) async fn create_session(&self) -> anyhow::Result<SessionPlacement> {
+        let worker = self.workers.placement_worker();
         let (response, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.workers
+            .sender_for(worker)
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::CreateSession(response))
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        let engine_session_id = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        Ok(SessionPlacement::new(worker, engine_session_id))
     }
 
-    pub(crate) async fn close_session(&self, session_id: SessionId) -> anyhow::Result<()> {
+    pub(crate) async fn close_session(&self, session: SessionPlacement) -> anyhow::Result<()> {
         let (response, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.session_commands(session)
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::CloseSession {
-                session_id,
+                session_id: session.engine_session_id,
                 response,
             })
             .await
@@ -389,12 +438,13 @@ impl EngineDriver {
     /// Tokens attended ahead of the prompt and the subset re-prefilled.
     pub(crate) async fn session_prefill_carry(
         &self,
-        session_id: SessionId,
+        session: SessionPlacement,
     ) -> anyhow::Result<onnx_genai_engine::SessionPrefillCarry> {
         let (response, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.session_commands(session)
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::SessionPrefillCarry {
-                session_id,
+                session_id: session.engine_session_id,
                 response,
             })
             .await
@@ -403,11 +453,15 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
     }
 
-    pub(crate) async fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
+    pub(crate) async fn session_token_count(
+        &self,
+        session: SessionPlacement,
+    ) -> anyhow::Result<usize> {
         let (response, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.session_commands(session)
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::SessionTokenCount {
-                session_id,
+                session_id: session.engine_session_id,
                 response,
             })
             .await
@@ -425,31 +479,37 @@ impl EngineDriver {
     /// takes its prompt from the request).
     pub(crate) async fn submit_generation(
         &self,
-        session_id: Option<SessionId>,
+        session: Option<SessionPlacement>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
-        self.generate(session_id, request, input).await
+        self.generate(session, request, input).await
     }
 
     pub(crate) async fn generate(
         &self,
-        session_id: Option<SessionId>,
+        session: Option<SessionPlacement>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
+        // A session-bound generation goes to the worker holding its KV state;
+        // a stateless one goes to the worker that serves unbound work.
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let commands = match session {
+            Some(session) => self.session_commands(session),
+            None => self.commands(),
+        }
+        .map_err(|_| GenerateSubmitError::DriverStopped)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
-        if self
-            .commands
+        if commands
             .send(DriverCommand::Generate {
-                session_id,
+                session_id: session.map(|session| session.engine_session_id),
                 request: Box::new(request),
                 input,
                 admission,
@@ -486,7 +546,8 @@ impl EngineDriver {
             events,
             permit,
         };
-        self.commands
+        self.commands()
+            .map_err(anyhow::Error::new)?
             .blocking_send(command)
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
         while let Some(event) = receiver.blocking_recv() {
@@ -509,10 +570,12 @@ impl EngineDriver {
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let Ok(commands) = self.commands() else {
+            return Err(GenerateSubmitError::DriverStopped);
+        };
         let (reply, response) = oneshot::channel();
         crate::metrics::generation_queued();
-        if self
-            .commands
+        if commands
             .send(DriverCommand::SynthesizeSpeech {
                 request: Box::new(request),
                 audio_output,
@@ -540,10 +603,12 @@ impl EngineDriver {
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let Ok(commands) = self.commands() else {
+            return Err(GenerateSubmitError::DriverStopped);
+        };
         let (reply, receiver) = oneshot::channel();
         crate::metrics::generation_queued();
-        if self
-            .commands
+        if commands
             .send(DriverCommand::GenerateImage {
                 request: Box::new(request),
                 reply,
@@ -568,7 +633,8 @@ impl EngineDriver {
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
         let (reply, receiver) = oneshot::channel();
-        self.commands
+        self.commands()
+            .map_err(anyhow::Error::new)?
             .blocking_send(DriverCommand::GenerateImage {
                 request: Box::new(request),
                 reply,
@@ -594,11 +660,13 @@ impl EngineDriver {
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let Ok(commands) = self.commands() else {
+            return Err(GenerateSubmitError::DriverStopped);
+        };
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
-        if self
-            .commands
+        if commands
             .send(DriverCommand::GenerateFim {
                 prefix,
                 suffix,
@@ -630,7 +698,8 @@ impl EngineDriver {
             .await
             .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?;
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.commands()
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::Embed {
                 input_ids,
                 options,
@@ -678,7 +747,8 @@ impl EngineDriver {
         limit: ResourceLimit,
     ) -> anyhow::Result<Result<GovernorSnapshot, EngineGovernorError>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.commands
+        self.commands()
+            .map_err(anyhow::Error::new)?
             .send(DriverCommand::SetVramLimit { limit, reply })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
@@ -1901,7 +1971,7 @@ mod admission_tests {
                 graph_components: 0,
                 declares_generation_loop: false,
             },
-            commands,
+            workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2018,6 +2088,94 @@ mod admission_tests {
                  sending headers, and the bound arm's `Some(&mut admitted)` is its only \
                  resolver on success"
             );
+        }
+    }
+
+    /// Shutting a driver down destroys the engine on the thread that owns it,
+    /// before the call returns — and says so the same way twice.
+    #[tokio::test]
+    async fn shutdown_joins_the_engine_worker_and_is_idempotent() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let engine = Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())
+            .expect("load tiny fixture");
+        let driver = EngineDriver::start(engine, 1, 2);
+        assert_eq!(driver.workers.len(), 1, "phase one runs a pool of one");
+        let worker = Arc::clone(driver.workers.primary());
+        assert!(worker.is_running());
+
+        // A session is opened on, and named by, the pool's only worker.
+        let session = driver.create_session().await.expect("open session");
+        assert_eq!(session.worker, WorkerId::PRIMARY);
+        driver.close_session(session).await.expect("close session");
+
+        driver.shutdown();
+        assert!(worker.is_joined(), "shutdown must join the worker thread");
+        assert!(!worker.is_running());
+
+        // Idempotent: a second shutdown neither panics nor waits on anything.
+        driver.shutdown();
+        assert!(worker.is_joined());
+
+        // And every command now fails the way a stopped driver always has.
+        let error = driver
+            .create_session()
+            .await
+            .expect_err("a stopped driver opens no sessions");
+        assert_eq!(error.to_string(), "engine driver stopped");
+        assert!(matches!(
+            driver.generate(None, warmup_request(), None).await,
+            Err(GenerateSubmitError::DriverStopped)
+        ));
+        assert!(matches!(
+            driver.session_token_count(session).await,
+            Err(error) if error.to_string() == "engine driver stopped"
+        ));
+    }
+
+    /// A session-bound command addressed to a worker the pool does not have is
+    /// refused by name, not routed to whichever worker happens to exist.
+    #[tokio::test]
+    async fn a_session_on_an_unknown_worker_is_refused() {
+        let (commands, _rx) = mpsc::channel(1);
+        let driver = EngineDriver {
+            workflow_facts: WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
+            workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            generation_capacity: Arc::new(Semaphore::new(1)),
+            generation_capacity_size: 1,
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+            resource_snapshot: Arc::new(Mutex::new(None)),
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                0,
+                None,
+                "driver test stub",
+            )),
+            device_authority: None,
+            batching: Arc::new(BatchingReport::single_sequence_stub()),
+        };
+        let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
+
+        let error = driver
+            .close_session(elsewhere)
+            .await
+            .expect_err("worker 4 is not in a pool of one");
+        assert_eq!(
+            error.to_string(),
+            "engine worker 4 is not in this pool (1 worker(s) loaded)"
+        );
+    }
+
+    fn warmup_request() -> GenerateRequest {
+        GenerateRequest {
+            prompt: onnx_genai::GeneratePrompt::TokenIds(vec![0]),
+            options: GenerateOptions {
+                max_new_tokens: 1,
+                ..GenerateOptions::default()
+            },
         }
     }
 
