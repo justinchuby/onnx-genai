@@ -1,4 +1,4 @@
-# The width-16 A/A null is bimodal, and it is not page backing
+# The width-16 A/A null is bimodal; it is not page backing and it is not foreign load
 
 **Date:** 2026-08-24
 **Tree:** `2c3968afb` (main)
@@ -19,6 +19,20 @@ split into a slow cluster of five agreeing to **1.05%** and a fast cluster of
 seven, with a mode ratio of **1.687x**. A slow arm whose members agree to one
 percent is a discrete alternative configuration selected per process launch, not
 noise.
+
+**REJECT: foreign load on the pinned CPUs does not explain it either.** A
+direct `/proc/stat` measurement of non-ours CPU time on exactly the sixteen
+pinned CPUs bounds it at **0.59 CPU-seconds against ~34**, a ceiling of 1.7% in
+every launch. Costing 3.7 of 16 lanes needs 23%. Spearman rho **+0.0210**, and
+the *fastest* launch in the run carries 1.6x more foreign time than the slow
+one.
+
+**The finding that relocates the target:** the slow mode does the **same work**.
+User CPU per token spans **11% across both modes** while wall time spans
+**1.69x**; the slow launch's `sys` per token is **+170%** and its user per token
+is **+4.6%**. The lanes are lost to **waiting in the yield loop**, not to work
+going missing — the signature of a persistent straggler inside the process, with
+placement, page backing and foreign load all now excluded.
 
 ## Why hugepages were the hypothesis
 
@@ -167,34 +181,149 @@ lanes were actually busy:
 | 14 | 14.958 | 0.07438 | 4.97 | tail |
 
 Mode A: 15.30–16.10. Mode B: 9.76–12.16. **No overlap, and the gap is 3.1
-lanes.** The slow mode is not burning more CPU — launch 4 uses *less* CPU per
-token than launch 8 and takes 1.55x the wall time. **It is running on about
-ten of the sixteen lanes.**
+lanes.** **It is running on about ten of the sixteen lanes.**
+
+An earlier draft of this paragraph read "the slow mode is not burning more CPU —
+launch 4 uses *less* CPU per token than launch 8". That is true of those two
+launches and false of the modes: mode B's median CPU per token (0.0631) is
+above mode A's (0.0592), and the later user/sys split below shows the excess is
+**entirely `sys`** while user CPU per token is nearly mode-invariant. Picking
+the one B launch that undercuts the one A launch is the small-n manufacture
+trap in miniature, inside a document about that trap. Corrected rather than
+deleted, because the corrected version is the interesting one.
 
 That reframes the target. The question is no longer "why is this launch slow",
 it is **"why does a launch that builds 15 workers on 15 verified distinct
 physical cores run at two-thirds of its width, for its entire life, decided
 before the first token".**
 
-**The leading hypothesis is foreign load on a subset of the pinned CPUs, and it
-is unproven.** It fits every property — a competitor stable over a ~4 s launch
-makes those workers permanent stragglers, the barrier waits on them, and
-effective width drops in discrete steps with the number of contended cores; it
-is decided before the run and constant within it; and it is a property of a
-shared host, which is why the same levels recur. It also predicts the tail:
-launches 12–14 are consecutive and sit at 5 lanes, which is what more foreign
-load looks like, and `sys_frac` there is 0.40–0.45 against 0.15–0.32 elsewhere.
-The **falsifier is direct**: sample per-CPU busy time from `/proc/stat` for the
-sixteen pinned CPUs across a launch and subtract our own workers' CPU time; if
-mode B launches show foreign time on ~5 pinned cores and mode A shows none,
-the null is contention the hostlock gate does not catch, and the acc0 width-16
-numbers need to be taken with that measured per launch rather than gated once
-at acquire. **That has not been run and nothing here asserts it.**
+**The leading hypothesis was foreign load on a subset of the pinned CPUs. It
+has now been tested directly and is REJECTED.** See the next section.
 
-Note what this does *not* rescue: if the mechanism is external, the +23%
-steal-tiles candidate is still blocked, but the block becomes a solvable
-measurement problem (reject or stratify launches by measured foreign time)
-rather than an open question about the pool.
+## Foreign load on the pinned CPUs: REJECTED
+
+`benches/acc0_w16_foreign_load.py`, 12 trusted launches on a gated host. For
+each launch, per-CPU busy jiffies are read from `/proc/stat` for exactly the
+pinned set before and after the child, and the child's own total CPU time
+(`getrusage(RUSAGE_CHILDREN)` deltas, whole process, not just the steady phase)
+is subtracted. The child is pinned to the same sixteen CPUs, so all of its CPU
+time lands inside the sum, and the remainder is CPU time on our cores that is
+not ours.
+
+| # | ms/tok | lanes | pinned busy | child cpu | **foreign** | sys frac |
+|---|---|---|---|---|---|---|
+| 1 | 3.534 | 15.93 | 33.80 s | 33.21 s | **0.59 s** | 0.147 |
+| **2** | **5.910** | **12.43** | 40.36 s | 40.00 s | **0.36 s** | **0.315** |
+| 3 | 3.473 | 16.05 | 34.52 s | 34.09 s | 0.43 s | 0.154 |
+| 4 | 3.406 | 16.19 | 33.38 s | 33.41 s | 0.00 s | 0.162 |
+| 5 | 3.749 | 15.06 | 34.09 s | 34.09 s | 0.00 s | 0.200 |
+| 6 | 3.646 | 15.73 | 35.89 s | 35.87 s | 0.02 s | 0.195 |
+| 7 | 3.556 | 15.48 | 34.40 s | 34.23 s | 0.17 s | 0.154 |
+| 8 | 3.496 | 15.39 | 33.44 s | 33.26 s | 0.18 s | 0.150 |
+| 9 | 3.796 | 14.57 | 34.91 s | 34.86 s | 0.05 s | 0.155 |
+| 10 | 3.580 | 15.81 | 33.08 s | 32.98 s | 0.10 s | 0.167 |
+| 11 | 3.560 | 15.71 | 34.23 s | 34.10 s | 0.13 s | 0.140 |
+| 12 | 3.664 | 15.76 | 33.85 s | 33.79 s | 0.06 s | 0.161 |
+
+Spearman rho between foreign time and effective lanes is **+0.0210** against a
+required -0.70 — no relationship, and the sign is wrong. The slow launch is not
+the one with the most foreign time; launch 1, at 15.93 lanes, has **1.6x more
+foreign time than the slow launch does**.
+
+**The magnitude argument is stronger than the correlation and does not depend
+on n at all.** Foreign time never exceeds **0.59 CPU-seconds against ~34
+CPU-seconds** of pinned busy time — a ceiling of **1.7%** in every launch,
+including the slow one. Losing 3.7 lanes out of 16 requires **23%** of the
+pinned CPU time to go to someone else. The measured ceiling is **thirteen times
+too small**. Even a run that had sampled only fast launches would license this
+rejection, because it bounds the cause rather than correlating it with the
+effect.
+
+One condition did pass in isolation and is worth naming as a trap: the slow
+launch's foreign time is 3.43x the fast-mode median, clearing the pre-registered
+2x bar. That "3.4x" is 0.36 s versus 0.10 s — a ratio of two quantities that are
+both noise against a 34-second denominator, from a single slow sample. A rule
+that fired on the multiple alone would have manufactured an ACCEPT here. It
+survived only because the rule required the correlation *and* checked the
+absolute spread first.
+
+### The rule had an ordering defect, fixed before the first launch
+
+As first written, the range guard was tested before the both-modes-present
+check, which would have printed `REJECT` on a run that sampled only one mode.
+A narrow range in the *cause* is only evidence against a hypothesis once the
+*effect* has been observed to vary; on a single-mode run it means nothing.
+Note this is the opposite reading of a narrow range from the page-backing
+probe above, where a narrow range invalidated an ACCEPT. A narrow range can
+never support an ACCEPT, and can only support a REJECT after the effect is
+known to have moved. The order is now (1) n, (2) both modes, (3) range,
+(4) correlation, and the docstring says why.
+
+## What the slow mode actually spends, and why that relocates the target
+
+The falsifier's `sys_frac` column carries the sharper finding. Splitting each
+launch's CPU per token into user and system:
+
+| | fast mode (11 launches) | slow launch |
+|---|---|---|
+| wall ms/token | 3.406 – 3.796 | **5.910** (1.69x) |
+| cpu s/token | 0.0538 – 0.0578 | 0.0735 (+31%) |
+| **user s/token** | **0.0452 – 0.0485** | **0.0503** (+4.6% on median) |
+| **sys s/token** | **0.0081 – 0.0113** | **0.0232** (+170%) |
+| sys frac | 0.140 – 0.200 | 0.315 |
+
+**The useful work is the same. Across both modes, user CPU per token spans 11%
+end to end while wall time spans 1.69x** — the metric is roughly fifteen times
+tighter than the one the null is measured on. Essentially all of the slow
+mode's extra CPU is `sys`.
+
+That is the signature of **stragglers, not of less parallelism per se**: the
+same user work is performed, one or a few workers arrive late, and the rest
+spend the difference in `worker_wait`'s yield loop, which is exactly the `sys`
+consumer Sebastian isolated with his blocktime sweep (sys rises 12x with the
+window while parks move the *opposite* way, so it is the yield remainder and
+not futex traffic). The earlier framing in this document — "it is running on
+about ten of the sixteen lanes" — is right arithmetically but reads as though
+work went missing. It did not. The lanes are lost to **waiting**, and the
+question is now:
+
+> what makes one worker in a 15-worker pool persistently late, for the entire
+> life of a process, when placement is verified one-per-physical-core and there
+> is no foreign load on its CPU?
+
+That is an internal question. Foreign load is out; so is page backing; so is
+placement (categorical census, `2c3968afb`). The remaining candidates are the
+memory placement of the weight arena across the two L3/CCX domains, and
+per-launch clock or boost state — both of which are per-process, decided at
+startup, and constant for the life of the process, which the mechanism must be.
+
+### The unblock this licenses, stated precisely
+
+Two usable consequences for A/B work at width 16, both of which need no fix to
+the pool:
+
+1. **Stratify on an in-launch statistic that cannot see the arm.** Effective
+   lanes and `sys_frac` each separate the modes with no overlap on a clean run
+   (lanes 12.43 vs 14.57–16.19; `sys_frac` 0.315 vs 0.140–0.200), and both are
+   computed from the launch's own counters without reference to which arm it
+   is. Rejecting slow-mode launches by a pre-registered threshold is therefore
+   not arm-selective. **Caveat: one slow launch.** The lane classifier is
+   backed by three runs; the `sys_frac` separation is backed by this one and
+   should be treated as a hypothesis until a run samples several slow launches.
+2. **Score work-reducing candidates on user CPU per token, where the null is
+   15x smaller.** This is null-immune but *narrow*: it measures work, not
+   speed. A candidate whose whole mechanism is better load balance — which
+   is what the +23% steal-tiles candidate is — moves wall time and `sys` while
+   leaving user CPU per token flat, so this metric is the wrong score for it
+   and the right *control* for it. It is how you check that a load-balance
+   change did not quietly add work.
+
+**Neither of these is a claim that the +23% candidate is real.** It remains
+blocked on a mode-stratified re-test against its own unmodified rule.
+
+Note what this does *not* rescue: the mechanism being internal means the block
+on the steal-tiles candidate is a measurement problem to be solved by
+stratification, not a pool defect to be fixed.
 
 ## Reproducing
 
@@ -211,3 +340,24 @@ silently discarded all three launches of its first run — it was resolving the
 model fixtures relative to the wrong working directory, and a harness that
 reports a workload failure and a parse failure identically cannot tell you
 which one it hit.
+
+The foreign-load falsifier:
+
+```bash
+HOSTLOCK_OWNER=roy scripts/hostlock.sh run --gate 4 --wait \
+  --reason "acc0 w16 null: foreign-load falsifier" -- \
+  python3 crates/onnx-runtime-ep-cpu/benches/acc0_w16_foreign_load.py \
+    --binary target/release/deps/int4_decode_loop_ab-<hash> \
+    --launches 12 --json bb/w16_foreign.json
+```
+
+It reads `/proc/stat` per-CPU rows for exactly `acc0_gap_matrix.PIN` rather than
+the aggregate `cpu` row, so an idle-elsewhere host cannot mask a competitor
+sitting on one of our sixteen; and it subtracts `getrusage(RUSAGE_CHILDREN)`
+deltas rather than the bench's own steady-phase counters, so startup and
+teardown CPU are attributed to us and not to a phantom competitor.
+
+**Mode incidence is not stable across runs and should not be quoted as a rate.**
+The three clean runs to date produced 5/12, 6/14 and 1/12 slow launches. Any
+protocol that depends on sampling the slow mode must check that it did, rather
+than assume a hit rate.

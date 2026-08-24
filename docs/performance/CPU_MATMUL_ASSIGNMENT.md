@@ -2074,13 +2074,36 @@ time. That figure is now stale; the re-measurement replaces it.
 > `cpu_s_per_token / ms_token` — does not. **Mode A runs on 15.30-16.10 of the
 > sixteen lanes; mode B on 9.76-12.16, with no overlap and a 3.1-lane gap.** The
 > slow mode is not burning more CPU; it uses *less* per token and takes 1.55x
-> the wall time. So the question is now "why does a launch that builds 15
+> the wall time (**this sentence is wrong and is corrected below** — it
+> generalises from one B launch undercutting one A launch; mode B's *median*
+> CPU per token is above mode A's). So the question is now "why does a launch
+> that builds 15
 > workers on 15 verified distinct physical cores run at two-thirds of its width
-> for its entire life". The leading hypothesis is **foreign load on a subset of
-> the pinned CPUs** — unproven, with a direct falsifier (per-CPU `/proc/stat`
-> busy time on the pinned set minus our own workers' CPU time, per launch). If
-> that is it, the block on the +23% candidate becomes a measurement problem to
-> stratify rather than a question about the pool. Full records:
+> for its entire life". **The foreign-load hypothesis has now been tested and
+> is REJECTED.** A per-launch `/proc/stat` read of the sixteen pinned CPUs minus
+> our own `getrusage` child CPU bounds non-ours time at **0.59 CPU-seconds
+> against ~34, a 1.7% ceiling in every launch**, where costing 3.7 of 16 lanes
+> needs 23%; Spearman rho is **+0.0210** and the *fastest* launch carries 1.6x
+> more foreign time than the slow one. That magnitude bound does not depend on
+> sampling the slow mode, which matters because that run drew only 1 slow launch
+> in 12 (incidence across three clean runs: 5/12, 6/14, 1/12 — **not a stable
+> rate, do not quote it**). **The same run relocates the target:** splitting CPU
+> per token into user and system, **user CPU per token spans 11% across both
+> modes while wall spans 1.69x**, and the slow launch is **+4.6% user, +170%
+> sys**. The work is identical; the lanes are lost to **waiting in
+> `worker_wait`'s yield loop** — a persistent straggler *inside* the process,
+> with placement, page backing and foreign load all now excluded. Remaining
+> candidates: weight-arena memory placement across the two L3/CCX domains, and
+> per-launch clock/boost state. Two unblocks this licenses for A/B work, neither
+> needing a pool fix: **stratify on an in-launch statistic that cannot see the
+> arm** (effective lanes, backed by three runs; `sys_frac` separates 0.315 vs
+> 0.140-0.200 but on one slow sample, so treat as hypothesis), and **score
+> work-reducing candidates on user CPU per token**, where the null is 15x
+> smaller — null-immune but narrow, since a pure load-balance change like the
+> +23% steal-tiles candidate moves wall and `sys` while leaving user CPU flat,
+> making it that candidate's *control* rather than its score. **The +23%
+> candidate remains blocked** on a mode-stratified re-test against its own
+> unmodified rule. Full records:
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md),
