@@ -20035,7 +20035,13 @@ mod tests {
         fully_pinned: bool,
         /// Whether every worker could read the affinity actually in force for
         /// it.
-        proc_readable: bool,
+        ///
+        /// Named for the mechanism it now uses. It was `proc_readable` when the
+        /// cross-check scanned `/proc/self/task`; it is a per-thread
+        /// `sched_getaffinity` / `GetThreadGroupAffinity` now, and keeping the
+        /// old name would have left the parent's escape hatch below checking a
+        /// host fact that no longer has anything to do with it.
+        worker_masks_readable: bool,
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
         /// number is the only in-band trace of them (#1745).
@@ -20049,6 +20055,18 @@ mod tests {
         /// to diagnose them.
         #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         attempts: u32,
+    }
+
+    /// Can this process query its own thread affinity at all?
+    ///
+    /// The parent's independent probe of the *same* capability the child's
+    /// cross-check depends on. Deliberately not a `/proc` read: the child asks
+    /// the kernel directly now, and excusing it on the strength of an unrelated
+    /// host fact would make the escape hatch a place for real failures to hide.
+    fn parent_cannot_query_its_own_affinity() -> bool {
+        crate::decode_affinity::observe_current_thread_cpus()
+            .cpus()
+            .is_none()
     }
 
     /// Encode a realized placement for the child's single marker line.
@@ -20459,7 +20477,7 @@ mod tests {
             realized: text("realized").to_string(),
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
-            proc_readable: field("proc") == 1,
+            worker_masks_readable: field("proc") == 1,
             attempts: attempts_used,
         };
 
@@ -20547,9 +20565,9 @@ mod tests {
         // reported independently of the verdict, so a suppressed verdict here
         // is still a failure.
         assert!(
-            honest.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
-            "this process can read `/proc/self/task` but the control child could not, so \
-             the cross-check is not running at all ({honest:?})"
+            honest.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+            "this process can read its own thread affinity but the control child could \
+             not, so the cross-check is not running at all ({honest:?})"
         );
         if !honest.fully_pinned {
             return;
@@ -20662,7 +20680,7 @@ mod tests {
             // that stops being produced turns the check above into decoration
             // that still passes.
             //
-            // The condition is `fully_pinned && proc_readable`, reported by the
+            // The condition is `fully_pinned && worker_masks_readable`, reported by the
             // child, and deliberately *not* `distinct_cores.is_some()`. An
             // earlier version used the latter and was wrong:
             // `planned_placement_is_one_worker_per_physical_core` answers `Some(false)`
@@ -20689,32 +20707,33 @@ mod tests {
             // it for all five. The per-width form catches what neither did:
             // verdicts disappearing for widths 4/8/16 while width 2 keeps
             // working.
-            // Asserting `/proc` readability rather than skipping on it is what
+            // Asserting mask readability rather than skipping on it is what
             // keeps "the cross-check was disabled outright" a failure instead
             // of a silent skip -- an earlier version tolerated it and the
             // mutation battery immediately showed P4 escaping through it.
             //
-            // The escape hatch is the *parent's own* read, not a tolerated
-            // `false`: `hidepid` restricts other processes' entries and never
-            // your own, so the one host that legitimately cannot answer is one
-            // with no `/proc` mounted at all (minimal container, chroot,
-            // initramfs) -- and there this process cannot read it either.
-            // Checking it here rather than trusting the child's flag is the
-            // point: the parent's read is independent of whatever the child's
-            // cross-check does, so a broken cross-check on a normal host still
-            // fails.
-            #[cfg(target_os = "linux")]
+            // The escape hatch is the *parent's own* probe of the *same
+            // mechanism*, not a tolerated `false`. It used to be a
+            // `read_dir("/proc/self/task")`, which was the right cross-signal
+            // while the child scanned `/proc` -- and became the wrong one the
+            // moment the child switched to `sched_getaffinity`. A container
+            // with `/proc` mounted normally and a seccomp policy denying
+            // `sched_getaffinity` would then have failed here for a legitimate
+            // host limitation. Probing the query the child actually uses keeps
+            // the escape hatch tied to the capability it is excusing, and it is
+            // still independent of whatever the child's cross-check does, so a
+            // broken cross-check on a healthy host still fails.
             assert!(
-                report.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
-                "width {requested}: this process can read `/proc/self/task` but the child \
-                 could not, so the failure is in the cross-check rather than the host -- \
-                 the placement cross-check is not running ({report:?})"
+                report.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+                "width {requested}: this process can read its own thread affinity but the \
+                 child could not, so the failure is in the cross-check rather than the host \
+                 -- the placement cross-check is not running ({report:?})"
             );
 
-            #[cfg(target_os = "linux")]
             assert!(
-                !(report.fully_pinned && report.proc_readable) || report.placement_honest.is_some(),
-                "width {requested}: every worker is pinned and `/proc` is readable, so the \
+                !(report.fully_pinned && report.worker_masks_readable)
+                    || report.placement_honest.is_some(),
+                "width {requested}: every worker is pinned and every mask was readable, so the \
                  cross-check was answerable, yet no honesty verdict came back -- \
                  `worker_cpus()` went unverified at this width and the #1792 class is \
                  unguarded here ({report:?})"
@@ -20725,13 +20744,14 @@ mod tests {
             // producible from a fully pinned pool, so one that exists while
             // `pinned=0` means the two disagree and one of them is lying.
             assert!(
-                report.placement_honest.is_none() || (report.fully_pinned && report.proc_readable),
+                report.placement_honest.is_none()
+                    || (report.fully_pinned && report.worker_masks_readable),
                 "width {requested}: a placement verdict was produced while the child \
                  reports it could not have produced one (pinned={}, proc={}), so the \
                  honesty check and the host facts its guard keys off disagree about the \
                  same pool ({report:?})",
                 report.fully_pinned,
-                report.proc_readable
+                report.worker_masks_readable
             );
 
             // (2) POLICY-DEPENDENT, and deliberately labelled as such: one
