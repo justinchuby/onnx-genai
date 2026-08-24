@@ -9446,6 +9446,20 @@ mod dispatch_claim_tests {
     /// to discriminate at all. A deadline that has already expired when the
     /// yield phase starts exits on yield 1 in both worlds.
     #[test]
+    // Miri makes this test's premise false rather than its assertion wrong,
+    // exactly as it does for the `task_runtime::pool` sibling this one is
+    // modelled on. The test needs the spin phase short against the deadline --
+    // 4096 `spin_loop`s measure 130us natively against `BLOCKTIME` of 200ms --
+    // but under the interpreter those iterations outlast the deadline, so the
+    // yield phase is entered already expired and the strided and every-yield
+    // forms both exit on yield 1. Verified, not assumed: run under the lane's
+    // own flags it fails on its own non-vacuity assertion, "left the yield
+    // phase after 1 yield(s) ... it is not a pass". It is green today only
+    // because `miri.yml` selects `decode_spmd::tests::a_panic_in_the_dispatcher`
+    // and not `decode_spmd::dispatch_claim_tests::`, i.e. it escapes by filter
+    // rather than by design -- so widening that filter would red the lane with
+    // a message that reads like a defect in the code under test.
+    #[cfg_attr(miri, ignore = "spin-vs-deadline ratio is wall-clock, not emulated")]
     fn the_blocktime_deadline_is_evaluated_on_every_yield_not_on_a_stride() {
         /// Cost of one injected yield: the contended regime, where a yield
         /// costs microseconds to milliseconds rather than ~1.2us.
