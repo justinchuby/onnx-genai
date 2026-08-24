@@ -482,13 +482,21 @@ Every `TensorContract` carries a `batch_layout`:
 ```yaml
 batch_layout: { kind: shared }                                  # invariant across requests
 batch_layout: { kind: request_aligned, axis: 0 }                # one row per request
-batch_layout: { kind: token_packed, offsets: cu_seqlens,
-                owner: token_owner, axis: 0 }                   # packed tokens + owner map
+batch_layout: { kind: token_packed, axis: 0,                    # packed items
+                levels: [ { offsets: cu_seqlens,                 # + ownership
+                            owner: token_owner } ] }
 batch_layout: { kind: runtime_sequence_state }                  # opaque runtime state handle
 ```
 
 That is the whole vocabulary. It states **where the request axis is**, never
 **which request occupies which position**.
+
+`token_packed` carries an ordered `levels` chain rather than a single
+`offsets`/`owner` pair. The one-level form above is exactly what the earlier flat
+spelling `{ offsets, owner, axis }` meant; the flat spelling is **replaced**, not
+retained alongside it, and that replacement is the one deliberate compatibility
+break in the v1.1 surface
+([`ENCODER_BATCHING.md` §6.1](ENCODER_BATCHING.md#61-schema-evolution-what-actually-happens-to-an-old-runtime)).
 
 ### 8.3 No row identity
 
@@ -622,12 +630,19 @@ image_features:
     rank: 2
     batch_layout:
       kind: token_packed
-      offsets: image_offsets     # cu_seqlens-style prefix offsets
-      owner: image_owner         # per-item owning row
       axis: 0
+      levels:
+        - offsets: image_offsets   # cu_seqlens-style prefix offsets
+          owner: image_owner       # per-item owning row
 ```
 
-`offsets` and `owner` are the only facts needed to map packed items back to rows.
+An `offsets`/`owner` pair is the only fact needed to map packed items back to
+rows, and one level is the whole chain when items sit directly in rows. A second
+level expresses items that nest — the frames of a video clip
+([§10.5](#105-generic-component-batching--proposed)). This replaced the earlier
+flat `{ offsets, owner, axis }` spelling of the same fact; see
+[`ENCODER_BATCHING.md` §6.1](ENCODER_BATCHING.md#61-schema-evolution-what-actually-happens-to-an-old-runtime)
+for why the flat form was migrated rather than kept.
 
 ### 10.2 Externally suppliable results
 
