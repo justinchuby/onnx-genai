@@ -2002,11 +2002,21 @@ chk "run --owner reaches the command, as the identity the lock records" \
     "$(cat "$LOCK.owner" 2>/dev/null)" "leon-1929|leon-1929"
 
 rm -f "$LOCK.owner"
+# Precedence, asserted in the child rather than in the lock file, because the
+# vacuous version of this cell is the tempting one. `HOSTLOCK_OWNER=x run --
+# child` proves nothing about this change: the variable is already in the
+# script's environment and the child inherits it whether or not `run` exports
+# anything. Adding `--owner` makes it load-bearing, and it is also the case
+# that actually bites -- the flag wins for the lock file, so without the export
+# the child keeps the STALE inherited name, disagrees with what was recorded,
+# and the reader reports `foreign:` -- a co-tenant's row -- which is worse than
+# the `held:` this issue is about.
 # shellcheck disable=SC2016  # the CHILD sh must expand these, not this shell
-HOSTLOCK_OWNER=env-owner "$HL" run -- \
-    sh -c 'printf %s "${HOSTLOCK_OWNER-<unset>}" >"$1"' _ "$LOCK.owner" >/dev/null 2>&1
-chk "an inherited HOSTLOCK_OWNER still reaches it" \
-    "$(cat "$LOCK.owner" 2>/dev/null)" "env-owner"
+HOSTLOCK_OWNER=env-owner "$HL" run --owner flag-owner -- \
+    sh -c 'printf "%s|%s" "${HOSTLOCK_OWNER-<unset>}" "$(sed -n "s/^owner=//p" "$2/meta")" >"$1"' \
+    _ "$LOCK.owner" "$LOCK" >/dev/null 2>&1
+chk "a declared owner overrides an inherited one in the child, not just in the lock" \
+    "$(cat "$LOCK.owner" 2>/dev/null)" "flag-owner|flag-owner"
 
 # The load-bearing half. Every agent on this box runs as the same unix user,
 # so exporting a $USER-derived owner would make every agent's lock read as
