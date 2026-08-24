@@ -185,6 +185,80 @@ pub fn lazy_weight_candidates(graph: &Graph) -> Vec<LazyWeightCandidate> {
     candidates
 }
 
+/// A logical MoE expert-weight group: every initializer `ValueId` consumed
+/// as a weight/scale/zero-point/bias input by the *same* fused-routing
+/// (`QMoE`/`BlockQuantizedMoE`) node.
+///
+/// Derived purely from graph structure (which initializers feed which node's
+/// input slots) — **never** from tensor names. A single QMoE node's
+/// `fc1_experts_weights`/`fc1_scales`/`fc2_experts_weights`/`fc2_scales`/
+/// `fc3_experts_weights`/`fc3_scales`/bias/zero-point inputs together
+/// describe *one* logical expert bank; any residency policy or boundary
+/// application that would tier some of these `ValueId`s but not others is
+/// silently splitting one logical expert across two residency states, which
+/// this type exists to make structurally visible and preventable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertWeightGroup {
+    /// The node whose inputs define this group (the `QMoE`/`BlockQuantizedMoE`
+    /// call site).
+    pub node: NodeId,
+    /// The offload boundary this node binds at.
+    pub boundary: LazyWeightBoundary,
+    /// Every initializer `ValueId` consumed as an input to `node`, in input
+    /// order, deduplicated. All members must transition atomically: either
+    /// every member's residency decision is honored, or the whole group
+    /// falls back to whole-bank-resident before any physical mutation.
+    pub members: Vec<ValueId>,
+}
+
+impl ExpertWeightGroup {
+    /// Whether `value` is a member of this group.
+    pub fn contains(&self, value: ValueId) -> bool {
+        self.members.contains(&value)
+    }
+}
+
+/// Derive every [`ExpertWeightGroup`] in `graph`: one group per node whose
+/// `op_type`/`domain` binds a fused-routing [`LazyWeightBoundary`]
+/// (`QMoe`/`BlockQuantizedMoe`) and which consumes at least one initializer
+/// input.
+///
+/// Dense boundaries (`MatMul`/`MatMulNBits`) are intentionally excluded: they
+/// have no multi-tensor "logical expert" concept to group — each such
+/// initializer is already its own atomic unit. Only fused-routing boundaries,
+/// whose kernel call reads several distinct initializers (weights, scales,
+/// optional zero-points/bias) for what is semantically one expert bank, need
+/// grouping.
+///
+/// This is graph-structural, not name-based: membership is exactly "which
+/// initializer `ValueId`s are input operands of this node", read directly
+/// from [`Node::inputs`](onnx_runtime_ir::Node::inputs).
+pub fn expert_weight_groups(graph: &Graph) -> Vec<ExpertWeightGroup> {
+    let mut groups = Vec::new();
+    for (node_id, node) in graph.nodes.iter() {
+        let boundary = match LazyWeightBoundary::for_op(&node.domain, &node.op_type) {
+            Some(LazyWeightBoundary::QMoe) => LazyWeightBoundary::QMoe,
+            Some(LazyWeightBoundary::BlockQuantizedMoe) => LazyWeightBoundary::BlockQuantizedMoe,
+            _ => continue,
+        };
+        let mut members = Vec::new();
+        for input in &node.inputs {
+            let Some(value) = input else { continue };
+            if graph.initializers.contains_key(value) && !members.contains(value) {
+                members.push(*value);
+            }
+        }
+        if !members.is_empty() {
+            groups.push(ExpertWeightGroup {
+                node: node_id,
+                boundary,
+                members,
+            });
+        }
+    }
+    groups
+}
+
 pub trait ResidentWeightMaterializer: Send + Sync {
     fn materialize(&self) -> Result<ResidentWeight, WeightHandleError>;
 }
@@ -580,6 +654,11 @@ impl ResidencyPlan {
 /// [`onnx_runtime_loader::WeightRegionCatalog`] (byte layout/pageability), and
 /// the caller-supplied budget/capability context.
 pub struct ResidencyPolicyInput<'a> {
+    /// The [`ValueId`] of the weight initializer this decision covers. Used
+    /// by profile-based policies (e.g. [`StaticProfileResidencyPolicy`]) to
+    /// look up the per-value hot-expert set. Policies that don't need it
+    /// (like [`WholeBankResidentPolicy`]) simply ignore it.
+    pub value_id: ValueId,
     pub boundary: LazyWeightBoundary,
     pub catalog: &'a onnx_runtime_loader::WeightRegionCatalog,
     /// Advisory device byte budget available for expert-bank residency, if
@@ -675,6 +754,72 @@ impl ResidencyPolicy for WholeBankResidentPolicy {
             }
         };
         ResidencyDecision::WholeBankResident { reason }
+    }
+}
+
+/// A [`ResidencyPolicy`] that consults a static offline profile: a
+/// `HashMap<ValueId, Vec<usize>>` mapping each value to its "hot" expert
+/// indices (the set to keep Device-resident). Values absent from the profile
+/// fall back to [`WholeBankResidentPolicy`] behavior — byte-for-byte
+/// unchanged from today's default.
+///
+/// The profile is pure data: no model-name inspection, no env-var allowlist,
+/// no runtime trace. All entries are validated at `decide()` time by the
+/// existing `plan_residency` validation layer; out-of-range or duplicate
+/// indices degrade to `WholeBankResident` there, never here.
+///
+/// This is the sole new production policy in Slice 5 of #1810.
+#[derive(Clone, Debug, Default)]
+pub struct StaticProfileResidencyPolicy {
+    /// Hot expert indices per value. An entry with an empty `Vec` is
+    /// treated identically to a missing entry
+    /// (→ `WholeBankResident`).
+    profile: std::collections::HashMap<ValueId, Vec<usize>>,
+}
+
+impl StaticProfileResidencyPolicy {
+    /// Build from an explicit profile map. Entries with empty expert lists
+    /// are silently dropped (equivalent to a missing entry).
+    pub fn new(profile: std::collections::HashMap<ValueId, Vec<usize>>) -> Self {
+        let profile = profile
+            .into_iter()
+            .filter(|(_, experts)| !experts.is_empty())
+            .collect();
+        Self { profile }
+    }
+
+    /// Add or replace the hot-expert set for one value. An empty list
+    /// removes any existing entry.
+    pub fn with_entry(mut self, value: ValueId, experts: Vec<usize>) -> Self {
+        if experts.is_empty() {
+            self.profile.remove(&value);
+        } else {
+            self.profile.insert(value, experts);
+        }
+        self
+    }
+
+    /// How many values have an explicit hot-expert profile.
+    pub fn profile_len(&self) -> usize {
+        self.profile.len()
+    }
+}
+
+impl ResidencyPolicy for StaticProfileResidencyPolicy {
+    fn name(&self) -> &'static str {
+        "static_profile"
+    }
+
+    fn decide(&self, input: &ResidencyPolicyInput<'_>) -> ResidencyDecision {
+        match self.profile.get(&input.value_id) {
+            Some(experts) if !experts.is_empty() => {
+                let mut sorted = experts.clone();
+                sorted.sort_unstable();
+                sorted.dedup();
+                ResidencyDecision::PerExpertCandidate { experts: sorted }
+            }
+            _ => WholeBankResidentPolicy.decide(input),
+        }
     }
 }
 
@@ -1045,6 +1190,7 @@ pub fn plan_residency<'a>(
     let mut decisions = std::collections::HashMap::new();
     for (value, boundary, catalog) in candidates {
         let input = ResidencyPolicyInput {
+            value_id: value,
             boundary,
             catalog,
             budget_bytes,
@@ -1197,6 +1343,103 @@ mod tests {
             None
         );
         assert!(!LazyWeightBoundary::matches_any("ai.onnx", "MatMul"));
+    }
+
+    fn shape1(n: usize) -> onnx_runtime_ir::Shape {
+        onnx_runtime_ir::static_shape([n])
+    }
+
+    fn inline_initializer(graph: &mut Graph, name: &str) -> ValueId {
+        let value = graph.create_named_value(name, DataType::Uint8, shape1(4));
+        graph.set_initializer(
+            value,
+            onnx_runtime_ir::WeightRef::Inline(onnx_runtime_ir::TensorData::from_raw(
+                DataType::Uint8,
+                vec![4],
+                vec![0u8; 4],
+            )),
+        );
+        value
+    }
+
+    #[test]
+    fn expert_weight_groups_groups_every_qmoe_input_initializer() {
+        let mut graph = Graph::new();
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let router = graph.create_named_value("router_probs", DataType::Float32, shape1(4));
+        let fc1_w = inline_initializer(&mut graph, "fc1_experts_weights");
+        let fc1_s = inline_initializer(&mut graph, "fc1_scales");
+        let fc1_b = inline_initializer(&mut graph, "fc1_experts_bias");
+        let fc2_w = inline_initializer(&mut graph, "fc2_experts_weights");
+        let fc2_s = inline_initializer(&mut graph, "fc2_scales");
+        let fc3_w = inline_initializer(&mut graph, "fc3_experts_weights");
+        let fc3_s = inline_initializer(&mut graph, "fc3_scales");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "QMoE",
+            vec![
+                Some(input),
+                Some(router),
+                Some(fc1_w),
+                Some(fc1_s),
+                Some(fc1_b),
+                Some(fc2_w),
+                Some(fc2_s),
+                None,
+                Some(fc3_w),
+                Some(fc3_s),
+            ],
+            vec![output],
+        );
+        node.domain = "com.microsoft".to_string();
+        let node_id = graph.insert_node(node);
+
+        let groups = expert_weight_groups(&graph);
+        assert_eq!(groups.len(), 1, "exactly one QMoE node -> one group");
+        let group = &groups[0];
+        assert_eq!(group.node, node_id);
+        assert_eq!(group.boundary, LazyWeightBoundary::QMoe);
+        // Only initializer-backed inputs are members: `input`/`router_probs`
+        // are graph values, not initializers, and must not be included.
+        assert_eq!(
+            group.members,
+            vec![fc1_w, fc1_s, fc1_b, fc2_w, fc2_s, fc3_w, fc3_s]
+        );
+        assert!(group.contains(fc1_w));
+        assert!(group.contains(fc3_s));
+        assert!(!group.contains(input));
+        assert!(!group.contains(router));
+    }
+
+    #[test]
+    fn expert_weight_groups_ignores_dense_matmul_and_empty_moe() {
+        let mut graph = Graph::new();
+        // A dense MatMul boundary: not grouped (each initializer is already
+        // its own atomic unit; MatMul has no multi-tensor logical-expert
+        // concept).
+        let dense_w = inline_initializer(&mut graph, "dense_weight");
+        let dense_in = graph.create_named_value("x", DataType::Float32, shape1(4));
+        let dense_out = graph.create_named_value("y", DataType::Float32, shape1(4));
+        graph.insert_node(onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(dense_in), Some(dense_w)],
+            vec![dense_out],
+        ));
+
+        // A QMoE node with zero initializer inputs (e.g. all inputs are
+        // graph values, not weights) yields no group.
+        let a = graph.create_named_value("a", DataType::Float32, shape1(4));
+        let b = graph.create_named_value("b", DataType::Float32, shape1(4));
+        let out2 = graph.create_named_value("out2", DataType::Float32, shape1(4));
+        let mut empty_qmoe =
+            onnx_runtime_ir::Node::new(NodeId(0), "QMoE", vec![Some(a), Some(b)], vec![out2]);
+        empty_qmoe.domain = "com.microsoft".to_string();
+        graph.insert_node(empty_qmoe);
+
+        assert!(expert_weight_groups(&graph).is_empty());
     }
 
     #[test]
@@ -1674,5 +1917,85 @@ mod tests {
             ..Default::default()
         };
         assert!(point.is_safe());
+    }
+
+    // -- StaticProfileResidencyPolicy tests -------------------------------
+
+    #[test]
+    fn static_profile_policy_emits_per_expert_candidate_for_profiled_value() {
+        let catalog = pageable_catalog();
+        let mut profile = std::collections::HashMap::new();
+        profile.insert(value(7), vec![2, 0]);
+        let policy = StaticProfileResidencyPolicy::new(profile);
+        assert_eq!(policy.profile_len(), 1);
+        let plan = plan_residency(
+            [(value(7), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert_eq!(plan.policy_name(), "static_profile");
+        assert_eq!(
+            plan.decision(value(7)),
+            Some(&ResidencyDecision::PerExpertCandidate {
+                experts: vec![0, 2]
+            })
+        );
+    }
+
+    #[test]
+    fn static_profile_policy_missing_value_falls_back_to_whole_bank() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::new(std::collections::HashMap::new());
+        let plan = plan_residency(
+            [(value(1), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert_eq!(
+            plan.decision(value(1)),
+            Some(&ResidencyDecision::WholeBankResident { reason: None })
+        );
+    }
+
+    #[test]
+    fn static_profile_policy_empty_entry_is_treated_as_missing() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::default()
+            .with_entry(value(3), vec![])
+            .with_entry(value(4), vec![1]);
+        assert_eq!(policy.profile_len(), 1);
+        let plan = plan_residency(
+            [
+                (value(3), LazyWeightBoundary::QMoe, &catalog),
+                (value(4), LazyWeightBoundary::QMoe, &catalog),
+            ],
+            &policy,
+            None,
+        );
+        assert!(matches!(
+            plan.decision(value(3)),
+            Some(&ResidencyDecision::WholeBankResident { .. })
+        ));
+        assert!(matches!(
+            plan.decision(value(4)),
+            Some(&ResidencyDecision::PerExpertCandidate { .. })
+        ));
+    }
+
+    #[test]
+    fn static_profile_policy_out_of_range_expert_degrades_via_validation() {
+        let catalog = pageable_catalog();
+        let policy = StaticProfileResidencyPolicy::default().with_entry(value(9), vec![9999]);
+        let plan = plan_residency(
+            [(value(9), LazyWeightBoundary::QMoe, &catalog)],
+            &policy,
+            None,
+        );
+        assert!(matches!(
+            plan.decision(value(9)),
+            Some(&ResidencyDecision::WholeBankResident {
+                reason: Some(ResidencyDegradationReason::RejectedByValidation(_))
+            })
+        ));
     }
 }

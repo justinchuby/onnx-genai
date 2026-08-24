@@ -655,7 +655,10 @@ impl PagedKvCache {
     /// store transactionally, so [`restore_sequence`](Self::restore_sequence)
     /// brings back byte-identical KV and a preempted-then-restored sequence
     /// decodes the same tokens as if it had never been preempted. Both stores
-    /// remain host-backed emulation until Stage 3. Returns pages demoted.
+    /// are host-backed: "hot" and "cold" are declared residencies, not devices,
+    /// and they stay that way -- #721 stage 3 is superseded, so no in-crate CUDA
+    /// store is coming to make the hot tier device-resident. Returns pages
+    /// demoted.
     pub fn preempt_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
         // Validate the sequence exists so a bogus id surfaces as an error
         // rather than a silent no-op.

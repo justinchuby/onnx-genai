@@ -166,7 +166,7 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
     if extra:
         env.update(extra)
     r = sh(f"taskset -c {PIN} {binary}", env)
-    steady, width_line, cpu = None, None, None
+    steady, width_line, cpu, dispatcher = None, None, None, None
     for line in r.stdout.splitlines() + r.stderr.splitlines():
         if line.strip().startswith("steady"):
             f = line.split()
@@ -174,6 +174,12 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
                       "tps": float(f[3]), "spread": float(f[4])}
         if line.strip().startswith("decode_width"):
             width_line = line.strip()
+        # Optional, same contract as the `cpu` row: only binaries built after
+        # the dispatcher-placement change emit it. Carries the last token, the
+        # verdict, so a caller can reject an intervention arm whose pin did not
+        # take instead of scoring it as a control.
+        if line.strip().startswith("dispatcher reserved_cpu="):
+            dispatcher = line.split()[-1]
         # Optional: only binaries built after the CPU-accounting change emit
         # it, so its absence is not an error -- older harnesses and older
         # binaries keep working and simply carry no `cpu_*` keys.
@@ -208,6 +214,8 @@ def native(binary, model, block, acc, threads, sessions, tokens, reps, extra=Non
             raise RuntimeError(f"native width vacuous: {width_line}")
     if cpu:
         steady["cpu"] = cpu
+    if dispatcher:
+        steady["dispatcher"] = dispatcher
     return steady
 
 
