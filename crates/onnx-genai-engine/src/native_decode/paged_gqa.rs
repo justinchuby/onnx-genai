@@ -180,6 +180,12 @@ pub fn paged_gqa_decode_step(
                 cfg.scale,
                 cfg.softcap,
                 SoftmaxExp::F64Intermediate,
+                // No head sink: this reference path models plain GQA, and
+                // `PagedGqaConfig` carries no sink term to forward. Keeping it
+                // `None` is what the call did before `head_sink` was threaded
+                // through, so the paged and fresh-present oracles stay in
+                // agreement.
+                None,
                 out_row,
             );
         }
@@ -254,6 +260,9 @@ pub fn flat_gqa_decode_step(
                 cfg.scale,
                 cfg.softcap,
                 SoftmaxExp::F64Intermediate,
+                // No head sink: this reference path models plain GQA, and
+                // `PagedGqaConfig` carries no sink term to forward.
+                None,
                 out_row,
             );
         }

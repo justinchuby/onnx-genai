@@ -2598,7 +2598,10 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let generation = driver.generate(Some(session_id), request).await.unwrap();
+    let generation = driver
+        .generate(Some(session_id), request, None)
+        .await
+        .unwrap();
     let result = timeout(
         Duration::from_secs(5),
         collect_generation_result(generation.events),
