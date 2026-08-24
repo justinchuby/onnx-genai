@@ -55,9 +55,17 @@ case "$args" in
         exit "$(cat "$FIX/merge_rc" 2>/dev/null || echo 0)"
         ;;
     *"pr view"*)
-        if [ -f "$FIX/pr_view.fail" ]; then exit 1; fi
         n=$(cat "$FIX/poll" 2>/dev/null || echo 1)
         echo $((n + 1)) >"$FIX/poll"
+        if [ -f "$FIX/pr_view.fail" ]; then exit 1; fi
+        # Fail a WINDOW of reads rather than all of them, so a cell can let the
+        # opening snapshot succeed and break the connection afterwards -- which
+        # is the only way to reach the in-loop retry counter.
+        from=$(cat "$FIX/fail_from" 2>/dev/null || echo 0)
+        to=$(cat "$FIX/fail_to" 2>/dev/null || echo 0)
+        if [ "$from" -gt 0 ] && [ "$n" -ge "$from" ] && { [ "$to" = 0 ] || [ "$n" -le "$to" ]; }; then
+            exit 1
+        fi
         if [ -f "$FIX/pr.$n.json" ]; then cat "$FIX/pr.$n.json"; else cat "$FIX/pr.json"; fi
         exit 0
         ;;
@@ -249,8 +257,25 @@ chk "a legacy status of ERROR fails fast instead of timing out" "$(T=30 run_mw)"
 
 fixture unreadable
 touch "$FIX/pr_view.fail"
-chk "a pull request that cannot be read at all is an environment fault" "$(T=60 run_mw)" "1"
+chk "a pull request that cannot be read at all fails before it polls" "$(T=60 run_mw)" "1"
 chk "and nothing was merged" "$(merges)" "0"
+
+# The case the retry counter actually exists for, and which the cell above
+# does NOT reach: the opening read succeeds, then the token is revoked. Every
+# later poll comes back empty, and reporting that as "timed out" invites the
+# caller to retry an environment fault as if it were a slow queue.
+fixture revoked
+printf '2\n' >"$FIX/fail_from"
+chk "a read that breaks mid-wait is an environment fault, not a slow check" "$(T=600 run_mw)" "1"
+chk "and nothing was merged" "$(merges)" "0"
+
+# ... but a few dropped reads are a flaky API, not a revoked token. Four
+# misses then a recovery must still merge, or the counter has just turned
+# every transient 502 into a refusal.
+fixture flaky
+printf '2\n' >"$FIX/fail_from"
+printf '5\n' >"$FIX/fail_to"
+chk "four dropped reads then a recovery still merges" "$(T=600 run_mw)" "0"
 
 echo
 echo "== states that are not about checks =="
@@ -317,7 +342,7 @@ echo
 # An assertion that quietly stops running is indistinguishable from one that
 # passes. Both branches of the probe above assert, so this total is invariant
 # across environments.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "38"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "41"
 
 echo
 echo "passed=${pass} failed=${fail}"
