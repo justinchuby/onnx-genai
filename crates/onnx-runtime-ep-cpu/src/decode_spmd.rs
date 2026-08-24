@@ -7325,7 +7325,10 @@ mod tests {
         // an arm that silently ran the default would look like a valid arm.
         assert_eq!(default_label, "identity", "unset must report `identity`");
         assert_eq!(identity_label, "identity");
-        assert_eq!(rotated_label, "rotate:3", "the pool must report the rotation it built with");
+        assert_eq!(
+            rotated_label, "rotate:3",
+            "the pool must report the rotation it built with"
+        );
         assert_eq!(seeded_label, "seed:7");
 
         // Default is the identity, and `identity` spells the default.
