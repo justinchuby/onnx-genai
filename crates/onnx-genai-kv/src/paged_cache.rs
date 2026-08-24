@@ -202,6 +202,19 @@ impl PagedKvCache {
         id
     }
 
+    /// Emit the token-major PagedAttention index tensors for `requests`.
+    ///
+    /// A read-only view over this cache's page authority; it never allocates,
+    /// frees, or mutates pages. See [`crate::PagedIndexPlan::build`] for the
+    /// exact contract and typed rejections. The caller must have appended the
+    /// query tokens (allocating their pages) before emitting their slots.
+    pub fn emit_paged_index_plan(
+        &self,
+        requests: &[crate::PagedRequest],
+    ) -> Result<crate::PagedIndexPlan, KvError> {
+        crate::PagedIndexPlan::build(&self.page_table, requests)
+    }
+
     /// Append one token of per-layer K/V tensors at the sequence tail.
     pub fn append_token_kv(
         &mut self,
