@@ -370,3 +370,52 @@ pub fn report_decode_width() {
         width.path,
     );
 }
+
+/// Report the dispatcher's reserved CPU against the CPU it is actually on.
+///
+/// The non-vacuity check for `ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN`, and the
+/// measurement that motivated it. Two independent facts, never inferred from
+/// each other: which CPU the headroom reserve kept clear, and which CPU the
+/// dispatching thread is running on now.
+///
+/// Both come from the pool, which samples the dispatcher from *inside* the
+/// dispatch path. Neither can be obtained here. The first version of this read
+/// `sched_getcpu()` on the reporting thread and was exactly inverted: the
+/// reporter is idle while the pool works, so with the dispatcher unpinned the
+/// scheduler parks the reporter on the one free core, and pinning the
+/// dispatcher *evicts* it -- so "unpinned" read as on-the-reserved-CPU and
+/// "pinned" read as off it. Reading the wrong thread does not merely add noise,
+/// it can invert the sign. The second version read the dispatcher's own
+/// `/proc/self/task/<tid>/stat`, which parses correctly but almost always
+/// returns nothing: the dispatcher is a transient thread and has usually exited
+/// by the time a bench reports.
+///
+/// `PIN-TOOK` only when the knob was asked for and the two agree; `PIN-MISSED`
+/// when it was asked for and they do not, which is a failed intervention and
+/// must not be scored as a control. With the knob off this is pure
+/// observation -- `observed` is where the scheduler left the dispatcher, which
+/// is the quantity the experiment is about.
+pub fn report_dispatcher_cpu() {
+    let pools = onnx_runtime_ep_cpu::decode_spmd::pools();
+    let reserved = pools.and_then(|p| p.dispatcher_cpu());
+    let observed = pools.and_then(|p| p.dispatcher_observed_cpu());
+    let tid = pools.and_then(|p| p.dispatcher_thread_id());
+    let moves = pools.map(|p| p.dispatcher_cpu_changes());
+    let requested = onnx_runtime_ep_cpu::decode_spmd::dispatcher_pin_requested();
+    let verdict = match (requested, reserved, observed) {
+        (false, _, _) => "PIN-OFF",
+        (true, None, _) => "PIN-UNRESERVED",
+        (true, Some(_), None) => "PIN-UNOBSERVABLE",
+        (true, Some(r), Some(o)) if r == o => "PIN-TOOK",
+        (true, Some(_), Some(_)) => "PIN-MISSED",
+    };
+    let show = |v: Option<usize>| v.map_or("none".to_string(), |v| v.to_string());
+    println!(
+        "dispatcher reserved_cpu={} requested={} tid={} observed_cpu={} moves={} {verdict}",
+        show(reserved),
+        u8::from(requested),
+        tid.map_or("none".to_string(), |v| v.to_string()),
+        show(observed),
+        moves.map_or("none".to_string(), |v| v.to_string()),
+    );
+}
