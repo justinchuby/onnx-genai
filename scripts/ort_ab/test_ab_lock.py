@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from ab import (  # noqa: E402
     ancestry,
     lock_verdict,
+    lock_columns,
     parse_provenance,
     read_provenance,
     window_label,
@@ -123,6 +124,17 @@ class Window(unittest.TestCase):
         before = prov("HELD", "17", "leon")
         self.assertEqual(window_label("mine:leon", before, dict(before)), "mine:leon")
 
+    def test_a_failed_second_reading_is_not_a_handoff(self):
+        """`changed` asserts custody moved. An unreadable end says nothing.
+
+        Stamping `changed` for a lock that could not be re-read blames a
+        completed, genuinely protected matrix for a handoff that never
+        happened -- and, worse, makes a real handoff indistinguishable from a
+        60-second timeout on the final read.
+        """
+        before = prov("HELD", "17", "leon")
+        self.assertEqual(window_label("mine:leon", before, {}), "unverified-end")
+
     def test_a_lock_that_changed_hands_is_not_reported_as_held_throughout(self):
         before = prov("HELD", "17", "leon")
         for after in (
@@ -135,6 +147,48 @@ class Window(unittest.TestCase):
                 "changed",
                 after,
             )
+
+
+class Columns(unittest.TestCase):
+    """The provenance-key to column-name mapping, as a table.
+
+    Every value below is distinct on purpose: two columns reading each
+    other's provenance key, or one reading a plausible neighbour, produces a
+    row whose numbers sit under names that do not describe them. A cell that
+    only checked the keys were present could not tell.
+    """
+
+    def test_each_column_carries_the_field_it_is_named_after(self):
+        fields = {
+            "held_by": "leon",
+            "held_pid": "4242",
+            "runnable": "7",
+            "held_secs": "99",
+            "contended": "no",
+            "hostlock_state": "HELD",
+        }
+        self.assertEqual(
+            lock_columns("mine:leon", fields),
+            {
+                "host_lock": "mine:leon",
+                "lock_owner": "leon",
+                "lock_anchor_pid": "4242",
+                "runnable_at_start": "7",
+            },
+        )
+
+    def test_a_missing_reading_stamps_placeholders_rather_than_blanks(self):
+        # An empty cell in a CSV reads as "not applicable". These rows always
+        # have an answer, even when the answer is that there was none.
+        self.assertEqual(
+            lock_columns("unknown", {}),
+            {
+                "host_lock": "unknown",
+                "lock_owner": "none",
+                "lock_anchor_pid": "none",
+                "runnable_at_start": "unknown",
+            },
+        )
 
 
 class Ancestry(unittest.TestCase):
@@ -264,7 +318,49 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(row["host_lock"], "mine:leon-selftest", row)
             self.assertEqual(row["lock_owner"], "leon-selftest", row)
             self.assertNotEqual(row["lock_anchor_pid"], "none", row)
-            self.assertIn("contended", row)
+            self.assertTrue(row["runnable_at_start"].isdigit(), row)
+
+    def test_unlocked_does_not_override_a_peers_declaration(self):
+        """The escape hatch protects our labels, not their run.
+
+        `--unlocked` exists so an unprotected run cannot be quoted later as a
+        protected one. That reasoning is entirely about our own rows, and it
+        does not extend to a box somebody else has declared: the damage there
+        lands on their measurement, where no label of ours can reach it.
+        """
+        anchor = subprocess.Popen(["sleep", "120"])
+        try:
+            taken = subprocess.run(
+                [
+                    "bash",
+                    str(HOSTLOCK),
+                    "acquire",
+                    "--owner",
+                    "someone-else",
+                    "--reason",
+                    "peer-declaration",
+                    "--pid",
+                    str(anchor.pid),
+                ],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=300,
+            )
+            self.assertEqual(taken.returncode, 0, taken.stdout + taken.stderr)
+            out = subprocess.run(
+                [*self.ab_args(), "--unlocked"],
+                capture_output=True,
+                text=True,
+                env=self.env,
+                timeout=300,
+            )
+            self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+            self.assertIn("someone-else", out.stderr)
+            self.assertFalse(self.csv.exists())
+        finally:
+            anchor.kill()
+            anchor.wait()
 
     def test_unlocked_by_request_runs_but_marks_the_rows(self):
         out = subprocess.run(

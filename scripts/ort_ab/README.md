@@ -255,13 +255,20 @@ scripts/hostlock.sh run --owner leon --reason "moe mt panel 6-cell" -- \
     python3 scripts/ort_ab/ab.py --arms base=./a mine=./b --null-control ...
 ```
 
-Every CSV row then carries `host_lock`, `lock_owner`, `lock_anchor_pid`,
-`runnable_at_start` and `contended`, and the label covers the **whole window**:
-the lock is read again at the end, and a run that changed hands halfway through
-is stamped `changed` rather than named after whoever happened to hold it last.
+Every CSV row then carries `host_lock`, `lock_owner`, `lock_anchor_pid` and
+`runnable_at_start`, and the label covers the **whole window**: the lock is
+read again at the end, and a run that changed hands halfway through is stamped
+`changed` rather than named after whoever happened to hold it last. If that
+second reading fails the row says `unverified-end`, because an unreadable lock
+is not evidence of a handoff and is not evidence against one either.
+`runnable_at_start` is a single sample taken before the first arm — a note
+about the conditions at the start, not a property of the interval; see the
+`--gate` paragraph above for why no threshold on it is honest here.
 `--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
-tests, never for anything publishable. `scripts/ort_ab/test_ab_lock.py` covers
-the admission table and runs in the `Host lock` workflow.
+tests, never for anything publishable — but it will **not** run over a lock
+somebody else declared, because that damage lands on their measurement, where
+no label of ours can reach it. `scripts/ort_ab/test_ab_lock.py` covers the
+admission table and runs in the `Host lock` workflow.
 
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**

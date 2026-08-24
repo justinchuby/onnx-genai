@@ -154,6 +154,15 @@ def lock_verdict(prov: dict[str, str], chain: set[int]) -> tuple[str, str | None
     invocation -- is released between arms, so it certifies each arm and
     protects none of the comparison. A lock held by a *peer* is a reason to
     stop rather than to start.
+
+    Only the pid *number* is compared, and that is safe **only** because it
+    sits behind `state == "HELD"`: `hostlock.sh` reports HELD only for an
+    anchor whose pid **and** `/proc` start time both still match, so a
+    recycled pid reaches here as STALE and is refused. This box cycles ~1.5M
+    pids in four days, so admitting on `held_pid in chain` without the state
+    check -- or accepting a state the script does not start-time verify --
+    would be a genuine false admit. The invariant is recorded because it is
+    invisible in the expression that depends on it.
     """
     state = prov.get("hostlock_state", "")
     owner = prov.get("held_by", "none")
@@ -206,11 +215,43 @@ def window_label(label: str, before: dict[str, str], after: dict[str, str]) -> s
     gap in which the box was free, and on a host cycling ~1.5M pids in four
     days the pid alone can repeat.
     """
+    if not after:
+        # The second read failed. That is not evidence of a handoff, and
+        # saying `changed` would assert a specific false fact -- custody
+        # moved -- about data that may be perfectly good. It is equally not
+        # evidence the declaration held, so the row says which it is.
+        return "unverified-end"
     moved = (after.get("held_by"), after.get("held_pid")) != (
         before.get("held_by"),
         before.get("held_pid"),
     )
     return "changed" if moved else label
+
+
+def lock_columns(label: str, prov: dict[str, str]) -> dict[str, str]:
+    """The lock fields stamped onto every row.
+
+    A dict built in one place, so the mapping from provenance key to column
+    is testable. Built inline it was not: two of these columns could be
+    swapped, or read from the wrong provenance key, with every cell still
+    green -- the row would carry a number under a name that did not describe
+    it, which is worse than carrying nothing.
+
+    `contended` is deliberately absent. `hostlock.sh` only computes it when
+    given `--expect-runnable`, and there is no honest threshold to pass here:
+    this host is shared by design (#1802), so "more runnable than expected"
+    has no fixed value. A column that reads `unknown` on every real run is an
+    invitation to treat its absence as reassurance.
+    """
+    return {
+        "host_lock": label,
+        "lock_owner": prov.get("held_by", "none"),
+        "lock_anchor_pid": prov.get("held_pid", "none"),
+        # An instantaneous sample, named so it cannot be read as a property of
+        # the window. It is the runnable count at the moment the matrix
+        # started and says nothing about what happened afterwards.
+        "runnable_at_start": prov.get("runnable", "unknown"),
+    }
 
 
 def run_one(
@@ -305,7 +346,12 @@ def main() -> None:
     prov = read_provenance()
     lock_label, refusal = lock_verdict(prov, ancestry(os.getpid()))
     if refusal:
-        if not args.unlocked:
+        # `--unlocked` never overrides a live declaration by somebody else.
+        # The escape hatch exists so an unprotected run cannot be mistaken for
+        # a protected one later -- it is about the honesty of OUR rows. A peer
+        # holding the box is a different harm entirely: the damage lands on
+        # THEIR measurement, and no label on ours repairs it.
+        if not args.unlocked or lock_label.startswith("foreign:"):
             sys.stderr.write(f"ab.py: refusing to measure: {refusal}.\n{_REMEDY}\n")
             raise SystemExit(3)
         lock_label = f"unlocked:{lock_label}"
@@ -373,12 +419,9 @@ def main() -> None:
     # Read the lock again at the end, so the label covers the whole window
     # rather than its first instant.
     lock_label = window_label(lock_label, prov, read_provenance())
+    columns = lock_columns(lock_label, prov)
     for r in rows:
-        r["host_lock"] = lock_label
-        r["lock_owner"] = prov.get("held_by", "none")
-        r["lock_anchor_pid"] = prov.get("held_pid", "none")
-        r["runnable_at_start"] = prov.get("runnable", "unknown")
-        r["contended"] = prov.get("contended", "unknown")
+        r.update(columns)
 
     args.csv.parent.mkdir(parents=True, exist_ok=True)
     with args.csv.open("w", newline="") as fh:
