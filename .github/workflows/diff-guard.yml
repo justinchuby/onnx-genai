@@ -102,8 +102,31 @@ jobs:
           fi
 
           # Tracked files at the repository root: no directory separator in the path.
-          actual=$(git ls-files | { grep -v '/' || true; } | LC_ALL=C sort)
-          allowed=$(grep -vE '^[[:space:]]*(#|$)' "$allow" | LC_ALL=C sort)
+          #
+          # core.quotePath=false because git's default renders a non-ASCII name in an
+          # octal-escaped, quoted form ("caf\303\251.txt"). Under the default a
+          # contributor who adds the real name to the allowlist -- the documented way
+          # to add a root file -- is told both that their file is unlisted and that
+          # their entry is stale. The escape hatch has to work for the names people
+          # actually use, not just for ASCII.
+          actual=$(git -c core.quotePath=false ls-files | { grep -v '/' || true; } | LC_ALL=C sort)
+
+          # Strip CR (a CRLF checkout would otherwise mismatch every entry), then
+          # surrounding whitespace, then comments and blanks. Trailing whitespace on
+          # an entry is invisible in review and would silently never match.
+          allowed=$(sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$allow" \
+                    | { grep -vE '^(#|$)' || true; } | LC_ALL=C sort)
+
+          # Explicit, rather than letting `set -e` abort on the empty grep above: an
+          # empty list cannot express "the root is correct", and failing silently
+          # gives a red X with no diagnostic. It must also never reach `comm`, where
+          # two empty inputs would compare equal and pass vacuously.
+          if [ -z "$allowed" ]; then
+            echo "::error::$allow has no entries. Every root file would be reported as"
+            echo "::error::unlisted, and an empty list cannot express 'the root is"
+            echo "::error::correct', so this fails rather than guessing which was meant."
+            exit 1
+          fi
 
           unlisted=$(LC_ALL=C comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$allowed"))
           stale=$(LC_ALL=C comm -13 <(printf '%s\n' "$actual") <(printf '%s\n' "$allowed"))
