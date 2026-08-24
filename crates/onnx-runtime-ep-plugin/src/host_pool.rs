@@ -212,6 +212,8 @@ unsafe extern "C" fn run_index(usr_data: *mut c_void, index: usize) {
             // worker which is going to help has time to claim another. Paid
             // only on probe dispatches, and only until one of them answers.
             if !task.stalled.swap(true, Ordering::Relaxed) {
+                #[cfg(test)]
+                probe_stall_counter::record();
                 stall_until(PROBE_STALL, &task.saw_another_thread);
             }
         } else {
@@ -220,6 +222,39 @@ unsafe extern "C" fn run_index(usr_data: *mut c_void, index: usize) {
     }
     if std::panic::catch_unwind(AssertUnwindSafe(|| (task.body)(index))).is_err() {
         task.panicked.store(true, Ordering::Relaxed);
+    }
+}
+
+/// How many probe stalls this thread has actually paid.
+///
+/// Test-only, and thread-local rather than global: the stall runs exclusively
+/// on the thread that called `KernelContext_ParallelFor` (that is what the
+/// `caller` comparison above establishes), so a thread-local is exact and
+/// immune to a concurrently-running test in the same binary bumping it.
+///
+/// This exists because the two tests below used to assert "the stall ran once,
+/// not once per index" through a **wall clock**, and that instrument does not
+/// survive a loaded, coverage-instrumented CI runner: the upper bound was
+/// `PROBE_STALL * 4` = 1.6 ms and `Rust coverage (Windows x86_64)` measured
+/// 2.0171 ms on correct code (run 32729806697, `main` @ `332077afb`). The
+/// property being asserted differs by 64x -- one stall is 400 us, one per index
+/// would be 25.6 ms -- so it was never a close call that needed measuring; it
+/// was a count, asserted with a stopwatch. Count it. See #2018.
+#[cfg(test)]
+mod probe_stall_counter {
+    use std::cell::Cell;
+
+    thread_local! {
+        static STALLS: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(super) fn record() {
+        STALLS.with(|stalls| stalls.set(stalls.get() + 1));
+    }
+
+    /// Stalls paid on this thread so far.
+    pub(super) fn count() -> u32 {
+        STALLS.with(Cell::get)
     }
 }
 
@@ -752,45 +787,61 @@ mod tests {
     /// The stall must not run once a session has latched: it is a probe cost,
     /// not a per-dispatch one.
     ///
-    /// Wall-clock, so not a property Miri can represent: the interpreter is
-    /// three orders of magnitude slower than native and eight dispatches take
-    /// far longer than [`PROBE_STALL`] there whatever the code does. Ignored
-    /// under Miri rather than weakened, because the native run is the one that
-    /// makes the claim.
-    #[cfg_attr(miri, ignore = "asserts on wall clock, which Miri does not model")]
+    /// Asserted as a **count**, not as elapsed time. The previous version bounded
+    /// eight dispatches by a single `PROBE_STALL` (400 us) -- which is a claim
+    /// about the machine as much as about the code, and one that an instrumented
+    /// or contended runner falsifies while the code is correct. A latched session
+    /// pays *zero* stalls; that is the property, and it is exactly countable.
+    ///
+    /// This also makes the test meaningful under Miri, which the wall-clock
+    /// version had to be `#[ignore]`d under: an interpreter three orders of
+    /// magnitude slower than native cannot be timed, but it can count.
     #[test]
     fn a_latched_session_pays_no_stall() {
         let probe = AtomicU32::new(HOST_HELPED);
         let mut pool = pool(inline_parallel_for, &probe);
-        let started = std::time::Instant::now();
+        let before = probe_stall_counter::count();
         for _ in 0..8 {
             unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 4, &|_| {}) };
         }
-        assert!(
-            started.elapsed() < PROBE_STALL,
-            "eight latched dispatches took longer than a single probe stall"
+        assert_eq!(
+            probe_stall_counter::count() - before,
+            0,
+            "a latched session paid a probe stall"
         );
     }
 
     /// And it must run at most once per probe, however many indices there are.
     ///
-    /// Wall-clock, so ignored under Miri for the reason given on
-    /// [`a_latched_session_pays_no_stall`].
-    #[cfg_attr(miri, ignore = "asserts on wall clock, which Miri does not model")]
+    /// Counted rather than timed, for the reason on
+    /// [`a_latched_session_pays_no_stall`] -- and this is the test that actually
+    /// went red on correct code: `PROBE_STALL * 4` = 1.6 ms against 2.0171 ms
+    /// measured on `Rust coverage (Windows x86_64)`. The property is 64 stalls
+    /// versus one, a 64x separation, so nothing about it needed a stopwatch.
+    ///
+    /// The lower bound is *not* replaced by the count, because it asserts a
+    /// different thing -- that a probe actually gives workers a window rather
+    /// than returning immediately -- and it is one-sided: load can only make
+    /// elapsed time larger, never smaller, so it cannot flake the way the upper
+    /// bound did. It stays native-only, since a virtual clock under an
+    /// interpreter is not the thing it is checking.
     #[test]
     fn a_probe_stalls_once_not_once_per_index() {
         let probe = AtomicU32::new(0);
         let mut pool = pool(inline_parallel_for, &probe);
+        let before = probe_stall_counter::count();
+        #[cfg(not(miri))]
         let started = std::time::Instant::now();
         unsafe { ort_parallel_for((&raw mut pool).cast::<c_void>(), 64, &|_| {}) };
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed >= PROBE_STALL,
-            "a probe has to give workers a chance"
+        assert_eq!(
+            probe_stall_counter::count() - before,
+            1,
+            "the stall is per dispatch, not per index"
         );
+        #[cfg(not(miri))]
         assert!(
-            elapsed < PROBE_STALL * 4,
-            "the stall is per dispatch, not per index: {elapsed:?}"
+            started.elapsed() >= PROBE_STALL,
+            "a probe has to give workers a chance"
         );
     }
 
