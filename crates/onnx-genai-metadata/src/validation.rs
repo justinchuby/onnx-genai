@@ -883,6 +883,23 @@ impl<'a> PreprocessingOutputView<'a> {
 /// ownership roles for every level and every modality — `pack_offsets` and
 /// `pack_owner` — so a program that emitted an owner map under the role `pixels`
 /// would be handing its caller a tensor it could only guess at.
+///
+/// This reaches only declarations that have a role to check, which is what makes
+/// it enforceable rather than merely desirable. A preprocessing program declares
+/// what each of its outputs *is*, so a program that wires some other plausible
+/// int64 rank-1 vector into a level is caught here instead of at the first
+/// split. A companion a component's graph produces has no such declaration — it
+/// is an ONNX output port, and a port contract has nowhere to carry a content
+/// role — so a level whose extent is `produced` is not asked for something its
+/// half of the schema does not have.
+///
+/// Padding deliberately does not get the same treatment, and the difference is
+/// not an inconsistency. A length vector already has established modality
+/// spellings that programs legitimately emit, so no single role could be
+/// demanded without breaking a program that predates the generic name. The two
+/// ownership roles are new, with no legacy to accommodate, so requiring them
+/// rejects nothing that exists. Both rules resolve the *reference* by name; this
+/// one additionally constrains what the referenced declaration may claim to be.
 fn validate_program_companion_roles(
     kind: &str,
     outputs: &[PreprocessingOutputView<'_>],
@@ -3016,7 +3033,11 @@ fn validate_token_packed_layout(
     // A per-request piece of a packed value is a contiguous element window only
     // when the items are the outermost stride. An inner packed axis would make
     // every split a strided gather — a full device-side copy of the payload, per
-    // row, per invocation — which is the cost packing exists to avoid.
+    // row, per invocation — which is the cost packing exists to avoid. This holds
+    // wherever `token_packed` appears, not only where a component declares a
+    // capacity: an emit rebases offsets and derives per-request owners with no
+    // capacity in sight and wants the same contiguity, so a component that
+    // declared none has simply not said it could pay for a gather.
     if axis != 0 {
         errors.push(format!(
             "{path} packs items along axis {axis}; a packed axis must be axis 0, because only \

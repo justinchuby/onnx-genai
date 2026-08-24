@@ -2390,6 +2390,47 @@ fn an_ownership_companion_carries_a_role_that_says_which_half_it_is() {
 }
 
 #[test]
+fn the_role_requirement_reaches_only_declarations_that_have_a_role() {
+    // A preprocessing program declares what each of its outputs *is*, so a
+    // companion there can be asked to say so — and a program that wires some
+    // other plausible int64 rank-1 vector into a `levels` entry is caught at
+    // load rather than at the first split. A companion the graph produces has no
+    // such declaration: it is an ONNX output port, and a port contract has
+    // nowhere to carry a content role. The requirement is scoped to the values
+    // that can answer it, so a `produced` level is not rejected for failing to
+    // declare something its half of the schema does not have.
+    assert!(
+        !NESTED_VIDEO_ENCODER.contains("content:"),
+        "this fixture's companions are graph output ports, which carry no content role"
+    );
+    validate_metadata(&parse(NESTED_VIDEO_ENCODER))
+        .expect("a produced level described by graph outputs is well-formed");
+}
+
+#[test]
+fn a_packed_axis_is_axis_zero_whether_or_not_a_capacity_was_declared() {
+    // The reason is the split, not the capacity: a per-request piece of a packed
+    // value is a contiguous element window only when the items are the outermost
+    // stride. An emit rebases offsets and derives per-request owners with no
+    // capacity in sight and wants exactly the same contiguity, so a component
+    // that declares no `batch_capacity` earns no exemption — it has simply not
+    // declared that it could pay for a strided gather.
+    let document = PACKED_EMIT_WORKFLOW.replace(
+        "        contract:\n          dtype: float32\n          rank: 2\n          shape: [items, hidden]\n          batch_layout:\n            kind: token_packed\n            axis: 0\n",
+        "        contract:\n          dtype: float32\n          rank: 2\n          shape: [hidden, items]\n          batch_layout:\n            kind: token_packed\n            axis: 1\n",
+    );
+    assert!(
+        !document.contains("batch_capacity"),
+        "no component in this workflow declares a capacity"
+    );
+    assert_reports(
+        &document,
+        "packs items along axis 1; a packed axis must be axis 0, because only then is each \
+         request's span a contiguous range that can be aliased rather than gathered",
+    );
+}
+
+#[test]
 fn an_owner_map_is_runtime_internal_and_cannot_be_supplied() {
     // An owner map indexes into a batch the application never assembled. The
     // per-request view of a packed value comes from rebasing that request's
