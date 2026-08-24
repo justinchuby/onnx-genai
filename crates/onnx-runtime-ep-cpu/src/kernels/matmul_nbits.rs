@@ -20017,6 +20017,14 @@ mod tests {
         /// `Some(true)` on a build whose pinning reports success and does
         /// nothing. `realized` is the one that asks the kernel.
         planned_distinct_cores: Option<bool>,
+        /// Which placement policy the child selected, as
+        /// [`crate::decode_affinity::CorePlacement::as_str`].
+        ///
+        /// Reported so the sweep can say what it is measuring instead of
+        /// assuming it. An assertion about *where* workers run is an assertion
+        /// about this value, and one that does not name it is asserting a
+        /// policy it never selected.
+        placement_policy: String,
         /// What the pool's workers *observed* about their own placement, as the
         /// wire code of [`crate::decode_spmd::RealizedPlacement`]. The blind-spot
         /// codes are distinct from `one-per-core`, so an unanswerable child can
@@ -20345,22 +20353,33 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized}",
+             pinned={} proc={} realized={realized} policy={}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
             u8::from(fully_pinned),
-            u8::from(observed_ok)
+            u8::from(observed_ok),
+            crate::decode_affinity::CorePlacement::from_env().as_str()
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
-        realized_width_report_with(requested, false)
+        realized_width_report_with(requested, false, None)
     }
 
-    fn realized_width_report_with(requested: usize, dishonest: bool) -> RealizedWidth {
+    /// The sweep's child, with the placement policy named rather than inherited.
+    ///
+    /// `placement: None` removes [`crate::decode_affinity::DECODE_PLACEMENT_ENV`]
+    /// entirely, which is what "the default" means here -- the point of the
+    /// default arm is to measure whatever policy ships, not a policy the test
+    /// pinned down for its own convenience.
+    fn realized_width_report_with(
+        requested: usize,
+        dishonest: bool,
+        placement: Option<crate::decode_affinity::CorePlacement>,
+    ) -> RealizedWidth {
         let width = requested.to_string();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -20383,6 +20402,17 @@ mod tests {
             // same way this spawn refuses to inherit an affinity override.
             .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
             .env_remove(SPMD_PARITY_CHILD_ENV);
+        match placement {
+            Some(policy) => {
+                command.env(
+                    crate::decode_affinity::DECODE_PLACEMENT_ENV,
+                    policy.as_str(),
+                );
+            }
+            None => {
+                command.env_remove(crate::decode_affinity::DECODE_PLACEMENT_ENV);
+            }
+        }
         // Never inherited: the sweep's honesty assertion would be meaningless
         // if an ambient value could switch the injection on, and unfalsifiable
         // if one could switch it off.
@@ -20475,6 +20505,7 @@ mod tests {
             cores: field("cores"),
             planned_distinct_cores: tri("placement"),
             realized: text("realized").to_string(),
+            placement_policy: text("policy").to_string(),
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             worker_masks_readable: field("proc") == 1,
@@ -20568,8 +20599,8 @@ mod tests {
         if allowed < 2 {
             return;
         }
-        let honest = realized_width_report_with(2, false);
-        let lying = realized_width_report_with(2, true);
+        let honest = realized_width_report_with(2, false, None);
+        let lying = realized_width_report_with(2, true, None);
 
         // A pool that did not fully pin cannot be cross-checked at all, so the
         // experiment below has no signal to read either way. Skip on the *host
@@ -20769,75 +20800,70 @@ mod tests {
                 report.worker_masks_readable
             );
 
-            // (2) POLICY-DEPENDENT, and deliberately labelled as such: one
-            // worker per physical core is #1729's *spread* policy, not a law.
-            // It is measured better on a quiet host and measured ~26% worse
-            // with a single ~90% co-tenant, because a compact pool leaves half
-            // the box for the co-tenant to land on. The standing user direction
+            // (2) The pool must report *which* placement policy it applied,
+            // and that report must be one the child could actually have
+            // produced. This replaces an unconditional one-worker-per-physical
+            // -core assertion that used to live here.
+            //
+            // Why it had to go: one worker per physical core is #1729's
+            // *spread* policy, not a law. It measures better on a quiet host
+            // and ~26% worse with a single ~90% co-tenant, because a compact
+            // pool leaves half the box for the co-tenant to land on. The
+            // standing user direction
             // (`.squad/decisions/inbox/copilot-cpu-shared-host-default-2026-08-23.md`,
             // via #1729) is that a policy which wins only under exclusive
-            // quiet-host conditions is not a valid default, so this assertion
-            // may legitimately have to change.
+            // quiet-host conditions is not a valid default -- so the default
+            // sweep asserting that policy makes #1802's shared default
+            // unlandable, and the path of least resistance for whoever hits it
+            // is to weaken the assertion rather than fix its shape.
             //
-            // If it does, change it *deliberately* -- it is an assertion about
-            // the policy that is currently shipped, not about correctness. Do
-            // not "fix" it by loosening it to match whatever the pool did,
-            // which would delete the check; and do not read a failure here as a
-            // regression without first deciding which policy is intended. Part
-            // (1) above is the part that must survive that decision intact.
-            //
-            // Only assert where one-per-core is achievable: past the core
-            // budget the workers must double up, and demanding otherwise would
-            // fail the host, not the code.
-            if report.workers <= report.cores && report.planned_distinct_cores.is_some() {
-                assert_eq!(
-                    report.planned_distinct_cores,
-                    Some(true),
-                    "requested width {requested} realized {} workers that share physical \
-                     cores on a host with {} cores available, so a decode row labelled \
-                     t={requested} ran on fewer front ends than its label implies. This is \
-                     an assertion about the currently shipped spread policy ({report:?})",
-                    report.workers,
-                    report.cores
-                );
-            }
-            saw_placement_check |=
-                report.workers <= report.cores && report.planned_distinct_cores.is_some();
+            // The honest, policy-neutral claim -- "the pool places workers
+            // where it says it places them" -- is part (1) above, and it holds
+            // under every policy. Where the *spread* policy is what is being
+            // asked for, it is asserted explicitly, by
+            // `an_explicit_spread_policy_places_one_worker_per_physical_core`,
+            // which selects it rather than assuming it.
+            assert!(
+                matches!(report.placement_policy.as_str(), "spread" | "compact"),
+                "width {requested}: the child reported placement policy \
+                 `{}`, which is not a policy this build can select -- the \
+                 sweep cannot say what it is measuring ({report:?})",
+                report.placement_policy
+            );
 
-            // (3) The same policy claim, asked of the kernel instead of the
-            // planner. (2) reads `worker_cpus()`, which is the assignment plus
-            // whatever the pin call *returned*, so it survives a build whose
-            // pinning does nothing and reports success. This one reads the mask
-            // each worker read for itself.
-            //
-            // Blind spots are named, and none of them is `one-per-core`: a
-            // child that could not answer fails the guard below rather than
-            // passing this one. Conditioned on the affinity query existing --
-            // `fully_pinned` reports the *pinning* capability, and a target
-            // that can pin without being able to read a mask back would fail
-            // this for a host limitation rather than a defect. The guard
-            // immediately after is what stops that condition from becoming an
-            // escape: where the query does exist, a child claiming it does not
-            // is a defect in the apparatus.
-            if crate::decode_affinity::affinity_observation_supported()
-                && report.fully_pinned
-                && report.workers <= report.cores
-            {
-                assert_eq!(
-                    report.realized, "one-per-core",
-                    "requested width {requested}: every worker reports an applied pin and the                      host has room, but the placement the workers actually observed for                      themselves is `{}` -- so the label t={requested} describes a placement                      the kernel did not enforce ({report:?})",
-                    report.realized
-                );
-            }
+            // The realized placement must be a code the apparatus can act on.
+            // `no-affinity-query` on a target that *has* the query means the
+            // observation was switched off, which is the exact shape of a check
+            // that cannot fail. Note this asserts nothing about *where* the
+            // workers went.
             assert!(
                 !crate::decode_affinity::affinity_observation_supported()
                     || report.realized != "no-affinity-query",
-                "width {requested}: this target has a per-thread affinity query, yet the                  child reported it had none -- the realized-placement observation is                  switched off, which is the exact shape of a check that cannot fail                  ({report:?})"
+                "width {requested}: this target has a per-thread affinity query, yet the \
+                 child reported it had none -- the realized-placement observation is \
+                 switched off, which is the exact shape of a check that cannot fail \
+                 ({report:?})"
             );
+            assert!(
+                report.realized != "affinity-query-failed",
+                "width {requested}: at least one worker could not read the affinity in \
+                 force for it, so its placement is unknown rather than correct -- an \
+                 unreadable mask must never be scored as a placed worker ({report:?})"
+            );
+
+            // Anti-vacuity for the honesty half, per width. `saw_placement_check`
+            // used to count widths at which the *planner's* one-per-core policy
+            // was asserted; there is no such assertion here any more, so it
+            // counts widths at which a policy-neutral verdict was actually
+            // produced. A counter that outlives the check it counted is worse
+            // than no counter, because it keeps reporting coverage that stopped
+            // existing.
+            saw_placement_check |= report.placement_honest.is_some();
             saw_realized_placement_check |=
                 crate::decode_affinity::affinity_observation_supported()
                     && report.fully_pinned
-                    && report.workers <= report.cores;
+                    && report.workers <= report.cores
+                    && report.placement_honest == Some(true);
 
             assert_eq!(
                 report.workers, effective,
@@ -20883,16 +20909,21 @@ mod tests {
         }
         if allowed_now >= 2 && crate::core_topology::DETECTION_SUPPORTED {
             assert!(
-                saw_placement_check,
-                "no swept width produced a checkable *planned* placement on a \
-                 {allowed_now}-CPU cpuset, so the planner's core layout went unasserted \
-                 and only the worker count was verified"
+                saw_placement_check
+                    || !crate::decode_affinity::pinning_supported()
+                    || !crate::decode_affinity::affinity_observation_supported(),
+                "no swept width produced a placement-honesty verdict on a \
+                 {allowed_now}-CPU cpuset that supports pinning and can read affinity \
+                 back, so `worker_cpus()` went unverified at every width and the sweep \
+                 checked the worker count only"
             );
             // Separate counter from `saw_placement_check`, because the two can
-            // diverge in exactly the direction that matters: the planned check
-            // needs only a topology, while the realized one needs pins that
-            // actually took. A single flag would let the planner's assertions
-            // vouch for a realized check that never ran.
+            // diverge in exactly the direction that matters: a verdict of
+            // `Some(false)` still counts as "the check ran", while this one
+            // counts only widths where the check ran *and* the pool passed it
+            // with room to spare. A single flag would let a sweep in which
+            // every verdict was negative report the same coverage as one in
+            // which every verdict was positive.
             assert!(
                 saw_realized_placement_check
                     || !crate::decode_affinity::pinning_supported()
@@ -20903,6 +20934,191 @@ mod tests {
                  skipped and the sweep verified only what the planner intended"
             );
         }
+    }
+
+    /// The widest swept width that can still be one-per-core on this host, or
+    /// `None` when the host cannot answer the question at all.
+    ///
+    /// Returning `None` for an unsupported platform is a *skip with a reason*;
+    /// it is never conflated with a passing answer, and every caller says out
+    /// loud which of the two it got.
+    fn placement_probe_width() -> Option<(usize, usize)> {
+        if !crate::core_topology::DETECTION_SUPPORTED
+            || !crate::decode_affinity::pinning_supported()
+            || !crate::decode_affinity::affinity_observation_supported()
+        {
+            return None;
+        }
+        let allowed = crate::decode_affinity::allowed_cpus()?;
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        let cores = topology.physical_cores_within(&allowed);
+        // Leave the dispatcher its reserved CPU, so the requested width is one
+        // the pool can actually realize one-per-core.
+        let width = cores.saturating_sub(1).min(8);
+        (width >= 2).then_some((width, cores))
+    }
+
+    /// With the spread policy **selected**, the workers must land one per
+    /// physical core.
+    ///
+    /// This is the assertion the default sweep used to make unconditionally.
+    /// It is correct here and wrong there for one reason: here the policy is
+    /// named, so the test asserts a claim it actually asked for. #1802 may
+    /// change what the default is; it cannot change what `spread` means.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn an_explicit_spread_policy_places_one_worker_per_physical_core() {
+        let Some((width, cores)) = placement_probe_width() else {
+            eprintln!(
+                "skipping explicit-spread placement check: this target cannot pin, cannot \
+                 read a mask back, or has fewer than 3 allowed physical cores"
+            );
+            return;
+        };
+        let report = realized_width_report_with(
+            width,
+            false,
+            Some(crate::decode_affinity::CorePlacement::Spread),
+        );
+        assert_eq!(
+            report.placement_policy, "spread",
+            "the child did not receive the policy this test selected, so it is measuring \
+             something else ({report:?})"
+        );
+        assert!(
+            report.pool_built && report.workers >= 2 && report.workers <= cores,
+            "the probe width did not produce a pool inside the core budget, so the \
+             assertion below would be about the host rather than the policy ({report:?})"
+        );
+        assert_eq!(
+            report.realized, "one-per-core",
+            "`spread` was selected explicitly and the host has room for it, yet the \
+             workers observed `{}` for themselves -- the selector is inert ({report:?})",
+            report.realized
+        );
+        assert_eq!(
+            report.planned_distinct_cores,
+            Some(true),
+            "the planner did not even intend one worker per physical core under an \
+             explicit `spread` ({report:?})"
+        );
+        // Honest under the policy too: a spread that is reported but not
+        // applied is the #1792 defect wearing a policy name.
+        assert_ne!(
+            report.placement_honest,
+            Some(false),
+            "the pool reports CPUs the kernel did not enforce ({report:?})"
+        );
+    }
+
+    /// With the compact policy selected, workers share cores -- and the sweep's
+    /// policy-neutral assertions must still all pass.
+    ///
+    /// Two claims in one child, deliberately. The first is that the selector
+    /// does something (a knob that parses and changes nothing is #1792 again).
+    /// The second is the mutation #1802 needs: everything the default sweep
+    /// asserts has to hold when the placement is compact, or the sweep is still
+    /// encoding the spread policy somewhere.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn a_compact_policy_shares_cores_and_still_passes_every_policy_neutral_check() {
+        let Some((width, _cores)) = placement_probe_width() else {
+            eprintln!(
+                "skipping compact placement check: this target cannot pin, cannot read a \
+                 mask back, or has fewer than 3 allowed physical cores"
+            );
+            return;
+        };
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        let report = realized_width_report_with(
+            width,
+            false,
+            Some(crate::decode_affinity::CorePlacement::Compact),
+        );
+        assert_eq!(
+            report.placement_policy, "compact",
+            "the child did not receive the policy this test selected ({report:?})"
+        );
+
+        // Every policy-neutral claim the default sweep makes, restated here
+        // against a compact pool. If any of these fail, the sweep has not been
+        // made policy-neutral and #1802 is still blocked.
+        assert_ne!(
+            report.placement_honest,
+            Some(false),
+            "a compact pool reports CPUs the kernel did not enforce ({report:?})"
+        );
+        assert_ne!(
+            report.realized, "affinity-query-failed",
+            "a worker could not read its own mask ({report:?})"
+        );
+        assert!(
+            !crate::decode_affinity::affinity_observation_supported()
+                || report.realized != "no-affinity-query",
+            "the realized-placement observation is switched off ({report:?})"
+        );
+        assert!(
+            report.fully_pinned,
+            "a compact pool left workers unpinned, so `compact` is being read as \
+             `off` rather than as a layout ({report:?})"
+        );
+
+        // ...and the claim that makes the selector worth having. Only on an SMT
+        // host: without siblings, compact and spread are the same layout and
+        // demanding a shared core would be demanding a host feature.
+        if topology.has_smt() && report.workers >= 2 {
+            assert_eq!(
+                report.realized, "shared-core",
+                "`compact` was selected on an SMT host with {} workers, yet the workers \
+                 observed `{}` -- the selector parses and changes nothing, which is the \
+                 #1792 shape ({report:?})",
+                report.workers, report.realized
+            );
+        } else {
+            eprintln!(
+                "compact/spread are the same layout on a host without SMT; the \
+                 shared-core half of this test did not run"
+            );
+        }
+    }
+
+    /// The mutation for the explicit-spread arm: a compact placement must
+    /// *fail* the spread assertion.
+    ///
+    /// Without this, `an_explicit_spread_policy_places_one_worker_per_physical_core`
+    /// could be passing because `realized` is hardcoded to `one-per-core`
+    /// somewhere, and nobody would know. It re-runs the same child under the
+    /// other policy and checks the same predicate answers differently -- so the
+    /// predicate is shown to discriminate, on this host, today.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn the_spread_assertion_rejects_a_compact_placement() {
+        let Some((width, _cores)) = placement_probe_width() else {
+            eprintln!("skipping spread-assertion mutation: unsupported target");
+            return;
+        };
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        if !topology.has_smt() {
+            eprintln!(
+                "skipping spread-assertion mutation: without SMT siblings the two \
+                 policies are the same layout, so no mutation exists to apply"
+            );
+            return;
+        }
+        let compact = realized_width_report_with(
+            width,
+            false,
+            Some(crate::decode_affinity::CorePlacement::Compact),
+        );
+        assert_ne!(
+            compact.realized, "one-per-core",
+            "a compact placement satisfied the one-per-core predicate, so that \
+             predicate cannot fail and the explicit-spread test proves nothing \
+             ({compact:?})"
+        );
     }
 
     #[test]
