@@ -282,6 +282,67 @@ benchmark harnesses (`scripts/ort_ab/gen_moe.py`) and CPU-EP-only e2e test
 fixtures. Registering a CUDA `MoE` kernel would be dead code for current targets;
 this non-gap is explicitly recorded here to prevent future re-investigation.
 
+`com.microsoft::PackedMultiHeadAttention` is present in the CPU EP
+(`packed_multi_head_attention.rs`) but is **not a real CUDA gap** — for the same
+"no real producer" reason as `MoE`, though the failure surface is different and
+worth stating precisely:
+
+* **No target model emits it.** Upstream ONNX Runtime produces
+  `PackedMultiHeadAttention` only from its **opt-in packing-mode conversion
+  tool** (`python/tools/transformers/convert_to_packing_mode.py`, class
+  `PackingMultiHeadAttention`), which removes padding from variable-length
+  batched encoder sequences for throughput. This is a separate transformation a
+  user runs deliberately — **not** part of default graph optimization — so it
+  cannot arrive through an ordinary PyTorch/TF export. It never appears on the
+  decoder-only autoregressive LLM path this project targets, which uses
+  `Attention` / `MultiHeadAttention` / `GroupQueryAttention` with a KV cache. The
+  real Qwen3.5-0.8B hybrid decode graph (1289 nodes) places on CUDA with **zero
+  declines** (`tests/qwen35_0_8b_placement_lock.rs`, which panics rather than
+  passing if the GPU or model is absent), so it contains no such node.
+  Encoder-decoder models in scope are unaffected for the same reason: Whisper's
+  encoder consumes fixed-length 1500-frame mel features, so there is no padding
+  to pack out, and its exports carry `MultiHeadAttention`. Across every
+  `*.textproto` fixture in the repo the attention ops are `Attention`,
+  `GroupQueryAttention` and `MultiHeadAttention` — never the packed variant.
+  This project's own packed variable-length attention is the runtime-invented
+  `pkg.nxrt::PackedVarlenAttention` (already CUDA-covered,
+  `packed_varlen_attention.rs`) — the exact analogue of `MoE`→`QMoE` /
+  `BlockQuantizedMoE`. The only producer of `com.microsoft::PackedMultiHeadAttention`
+  in the repo is one synthetic CPU-EP e2e fixture
+  (`crates/onnx-runtime-ep-cpu-plugin/tests/fixtures/packed_mha_assignment_f32/`).
+
+* **Why the CPU EP still implements it, and why CUDA need not.** ORT has **no CPU
+  kernel** for this op (verified upstream and recorded in
+  `packed_multi_head_attention.rs` and the `plugin_ort_e2e.rs` assignment table),
+  so a CPU-EP decline of a node that *did* appear would be a hard *session-load*
+  failure rather than a slow fallback — hence the CPU EP carries it defensively.
+  ORT **does** ship a native CUDA kernel
+  (`contrib_ops/cuda/bert/packed_multihead_attention.cc`), so when a session that
+  contains this op also has ORT's native CUDA EP available, a CUDA-plugin decline
+  is harmless (ORT runs its own CUDA kernel). Because no target model contains the
+  node at all, the harder `[plugin-CUDA-EP, ORT-CPU-EP-only]` failure mode is
+  unreachable for current workloads.
+
+* **This is a riskier non-gap than `MoE`, so state the trigger plainly.** For
+  `MoE`, ORT *does* have a CPU kernel, so calling it a non-gap wrongly would cost
+  only a slow fallback. Here there is no CPU kernel anywhere, so a wrong call
+  costs a hard session-load failure. Exactly one condition flips this decision:
+  **a model that was pre-converted with ORT's packing-mode tool, loaded on a
+  session that does not have ORT's native CUDA EP in its fallback chain.** If
+  that combination ever ships, implement the adapter below. Note that the
+  "declining is harmless" argument rests on that fallback chain, which has not
+  been verified end to end in production configurations — the load-bearing
+  evidence for this decision is the absence of any producer, not the fallback.
+
+* **If it ever became real, it is a small adapter, not new kernels.** The CUDA
+  `PackedVarlenAttention` kernel already runs cumulative-seqlen packed SDPA over
+  the shared attention core, so a `PackedMultiHeadAttention` kernel would be an
+  input-reshaping adapter onto that core (separate Q/K/V `[total_tokens, hidden]`
+  + `cumulative_sequence_length`, non-causal), mirroring the CPU adapter. It is
+  left unimplemented because it would be dead code for current targets; this
+  non-gap is recorded here (and pinned by a unit test in `kernels/mod.rs`) to
+  prevent future re-investigation.
+
 
 ### Library mapping for the remaining CPU gaps
 
