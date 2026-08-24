@@ -4,12 +4,30 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Iterable
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+# The status checks the `main` branch ruleset marks required. A job outside this
+# set can go red without blocking a merge, so a package tested only there is,
+# for merge purposes, untested: #1982 left `shape_dispatch_gate` failing on
+# `main` with both required checks green, because the only lane that ran it was
+# advisory. See #2015.
+#
+# This mirrors a repository setting that a workflow file cannot read, so it is
+# maintained by hand. `verify_required_tier` asserts every name here still
+# matches a job in the workflow, which catches the rename direction. A ruleset
+# edit that *drops* a required check is not observable from inside the repo and
+# is the one drift this gate cannot see.
+REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
 
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
@@ -128,6 +146,221 @@ def verify(simulate_missing: str | None = None) -> int:
     return 0
 
 
+# A `cargo test`/`cargo llvm-cov` invocation is the only thing that counts as
+# executing a package's tests. `cargo build` and `cargo clippy --all-targets`
+# compile the same test targets but never run an assertion, so they must not
+# satisfy this gate.
+_RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
+_LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
+_PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
+
+
+# `ubuntu-latest` does not ship PyYAML in the interpreter `python` resolves to,
+# and PEP 668 blocks installing it globally, so this gate parses the workflow
+# itself. Only the two block styles the file uses are handled, and anything
+# unrecognised is reported rather than assumed: an under-read here makes the
+# gate stricter (packages look unenforced and it fails loudly), so the direction
+# that must be guarded is over-reading, which is what job-slice attribution and
+# comment stripping are for.
+_JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+_JOB_NAME = re.compile(r"^    name:\s*(.+?)\s*$")
+_RUN_KEY = re.compile(r"^(\s*)(- )?run:\s*(.*)$")
+_FOLDED = {">", ">-", ">+"}
+_LITERAL = {"|", "|-", "|+"}
+
+
+def workflow_jobs() -> dict[str, str]:
+    """Map each job's display name to its YAML body with comments removed."""
+    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        raise SystemExit(f"{WORKFLOW}: no top-level `jobs:` block to check")
+
+    jobs: dict[str, str] = {}
+    key: str | None = None
+    body: list[str] = []
+
+    def flush() -> None:
+        nonlocal key, body
+        if key is None:
+            return
+        name = key
+        for line in body:
+            if match := _JOB_NAME.match(line):
+                name = match.group(1)
+                break
+        if name in jobs:
+            raise SystemExit(f"{WORKFLOW}: two jobs are both named {name!r}")
+        jobs[name] = "\n".join(
+            line for line in body if not line.lstrip().startswith("#")
+        )
+        key, body = None, []
+
+    for line in lines[start + 1 :]:
+        if line.strip() and not line.startswith(" ") and not line.startswith("#"):
+            break
+        if match := _JOB_KEY.match(line):
+            flush()
+            key = match.group(1)
+            continue
+        if key is not None:
+            body.append(line)
+    flush()
+    if not jobs:
+        raise SystemExit(f"{WORKFLOW}: parsed no jobs; the gate would check nothing")
+    return jobs
+
+
+def run_blocks(job_body: str) -> list[str]:
+    """Every `run:` scalar in a job, folded or literal, as shell text."""
+    lines = job_body.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = _RUN_KEY.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        indent = len(match.group(1)) + (2 if match.group(2) else 0)
+        header = match.group(3).strip()
+        index += 1
+        if header and header not in _FOLDED and header not in _LITERAL:
+            blocks.append(header)
+            continue
+        # A folded scalar is one shell command wrapped across lines; a literal
+        # one is a script whose newlines separate commands. Collapsing the two
+        # would either lose a command boundary or invent one.
+        joiner = " " if header in _FOLDED else "\n"
+        collected: list[str] = []
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                break
+            collected.append(line.strip())
+            index += 1
+        blocks.append(joiner.join(part for part in collected if part))
+    return blocks
+
+
+def packages_tested_by(commands: Iterable[str]) -> set[str]:
+    """Packages whose tests the given shell commands actually execute."""
+    tested: set[str] = set()
+    for command in commands:
+        for fragment in re.split(r"&&|\|\||;|\n", command):
+            if not _RUNS_TESTS.search(fragment):
+                continue
+            for lane in _LANE_CALL.findall(fragment):
+                tested.update(lane_packages(lane))
+            tested.update(_PACKAGE_FLAG.findall(fragment))
+    return tested
+
+
+def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set[str]]:
+    jobs = workflow_jobs()
+    commands: list[str] = []
+    for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
+        for block in run_blocks(jobs[name]):
+            if skip_lane and re.search(rf"cargo-args\s+{re.escape(skip_lane)}\b", block):
+                continue
+            commands.append(block)
+    return commands, set(jobs)
+
+
+def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
+    commands, job_names = required_lane_commands(simulate_dropped_lane)
+
+    if missing_jobs := sorted(REQUIRED_JOB_NAMES - job_names):
+        print(
+            "Required-lane coverage check failed.\n"
+            f"REQUIRED_JOB_NAMES names job(s) that no longer exist in {WORKFLOW.name}: "
+            f"{missing_jobs}\n"
+            "Renaming a required job also breaks the branch ruleset; update both.",
+            file=sys.stderr,
+        )
+        return 1
+
+    packages = workspace_packages()
+    required_tested = packages_tested_by(commands) & packages
+    unenforced = sorted(packages - required_tested - set(DENYLIST))
+    if unenforced:
+        print("Required-lane coverage check failed.", file=sys.stderr)
+        print(
+            "Workspace member(s) whose tests no required status check executes:",
+            file=sys.stderr,
+        )
+        for package in unenforced:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "Their tests can go red on `main` while every required check is green.\n"
+            f"Run them from one of {sorted(REQUIRED_JOB_NAMES)}, or add a DENYLIST "
+            "entry with a reason.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"required-lane coverage ok: {len(required_tested)} package(s) tested by "
+        f"{sorted(REQUIRED_JOB_NAMES)}, {len(DENYLIST)} denied"
+    )
+    return 0
+
+
+def self_test() -> int:
+    """Prove both gates still refuse, on content and not merely on exit code.
+
+    An exit status is not enough to tell a refusal from a crash: `python` not
+    being on PATH exits 127, and every `SystemExit` in this file exits 1, so a
+    workflow-parse failure is indistinguishable from a real verdict. Each arm
+    below therefore states the packages it expects to be named and fails if the
+    guard reports anything else -- including reporting nothing.
+    """
+    arms: list[tuple[str, object, dict, int, list[str]]] = [
+        ("verify (control)", verify, {}, 0, []),
+        (
+            "verify --simulate-missing onnx-genai-engine",
+            verify,
+            {"simulate_missing": "onnx-genai-engine"},
+            1,
+            ["onnx-genai-engine"],
+        ),
+        ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
+        (
+            "verify-required-tier --simulate-dropped-lane ort-backed",
+            verify_required_tier,
+            {"simulate_dropped_lane": "ort-backed"},
+            1,
+            sorted(ORT_BACKED),
+        ),
+    ]
+    failures = 0
+    for label, function, kwargs, want_code, want_named in arms:
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = function(**kwargs)
+        except SystemExit as exit_error:  # a crash must not read as a verdict
+            print(f"  FAIL  {label}\n        raised SystemExit: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        text = out.getvalue() + err.getvalue()
+        missing = [package for package in want_named if package not in text]
+        if code != want_code or missing:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        exit want={want_code} got={code}", file=sys.stderr)
+            if missing:
+                print(f"        expected the report to name: {missing}", file=sys.stderr)
+            print("        ---\n" + "\n".join(f"        {line}" for line in text.splitlines()), file=sys.stderr)
+        else:
+            named = f", naming {want_named}" if want_named else ""
+            print(f"  ok    {label} -> exit {code}{named}")
+    if failures:
+        print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
+        return 1
+    print(f"workspace test package self-test: {len(arms)}/{len(arms)} arms behaved as stated")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -141,10 +374,20 @@ def main() -> int:
         "--simulate-missing",
         help="drop one package from the derived tested set to prove the guard fails",
     )
+    subparsers.add_parser("self-test")
+    required_parser = subparsers.add_parser("verify-required-tier")
+    required_parser.add_argument(
+        "--simulate-dropped-lane",
+        help="ignore required-job steps that run this lane, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
         return verify(args.simulate_missing)
+    if args.command == "self-test":
+        return self_test()
+    if args.command == "verify-required-tier":
+        return verify_required_tier(args.simulate_dropped_lane)
     print(package_args(lane_packages(args.lane)))
     return 0
 
