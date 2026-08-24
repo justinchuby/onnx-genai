@@ -281,6 +281,12 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // line. A document from a version this build does not support is refused for
     // being from that version, and this crate does not tell its author what a
     // spelling it has never read is supposed to mean.
+    //
+    // It also cannot become part of the gate, which is the tempting
+    // simplification to reach for later. A stale document here is well-formed
+    // and declares a version this reader supports; both spellings belong to the
+    // same line, so no comparison of version numbers can tell them apart. A
+    // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
 }
 
