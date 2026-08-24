@@ -4847,24 +4847,45 @@ fn validate_compaction_derivability(
                 && !is_shape_companion
             {
                 // A value that is named as a companion but does not have a
-                // companion's shape gets the reason it was not admitted. The
-                // generic message would tell its author to declare a row axis,
-                // which is precisely what a companion must not do.
-                if let Some(roles) = claimed {
+                // companion's shape, or is named only by a declaration nothing
+                // writes, gets the reason it was not admitted. The generic
+                // message would tell its author to declare a row axis, which is
+                // precisely what a companion must not do.
+                let unwritten = claimed.map(|roles| {
+                    roles
+                        .iter()
+                        .filter(|role| !role.claimant_emitted)
+                        .map(|role| role.claimed_by)
+                        .collect::<BTreeSet<_>>()
+                });
+                if let Some(roles) = claimed
+                    && roles.iter().any(|role| role.claimant_emitted)
+                {
                     let expected = roles
                         .iter()
+                        .filter(|role| role.claimant_emitted)
                         .map(|role| match role.rank {
                             Some(rank) => format!("{} at rank {rank}", role.role.describe()),
                             None => role.role.describe().to_string(),
                         })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
                         .collect::<Vec<_>>()
                         .join(", ");
                     errors.push(format!(
-                        "{path} emits '{value}' into output '{output}', which another declared \
+                        "{path} emits '{value}' into output '{output}', which another emitted \
                          output names as {expected}, but it is {} at rank {}; a companion is \
                          admitted into a serving workflow only at the shape the declaration \
                          naming it requires",
                         contract.dtype, contract.rank
+                    ));
+                } else if let Some(unwritten) = unwritten.filter(|names| !names.is_empty()) {
+                    errors.push(format!(
+                        "{path} emits '{value}' into output '{output}', which only output '{}' \
+                         names as a shape companion, and that output is never emitted; a \
+                         companion describes a result the caller receives, so it is admitted into \
+                         a serving workflow only alongside the value it describes",
+                        unwritten.iter().copied().collect::<Vec<_>>().join("', '")
                     ));
                 } else {
                     errors.push(format!(
@@ -4893,7 +4914,7 @@ fn validate_compaction_derivability(
 /// is what lets the carve-out admit each of them at its own shape instead of at
 /// whichever shape happened to be written down first.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct CompanionExpectation {
+struct CompanionExpectation<'a> {
     role: CompanionRole,
     /// Rank the naming declaration requires, when the declaration determines it.
     ///
@@ -4902,6 +4923,15 @@ struct CompanionExpectation {
     /// padding declaration; the carve-out must not add a second, misleading
     /// complaint about a rank nothing was able to compute.
     rank: Option<usize>,
+    /// Output whose contract names this companion.
+    claimed_by: &'a str,
+    /// Whether some step actually emits that output.
+    ///
+    /// A declaration that is never written describes a result the caller never
+    /// receives, so it cannot be the reason another value is admitted. Demanding
+    /// that a companion be emitted while letting an unemitted payload confer the
+    /// carve-out on it would be two answers to one question.
+    claimant_emitted: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -4921,9 +4951,9 @@ impl CompanionRole {
     }
 }
 
-impl CompanionExpectation {
+impl CompanionExpectation<'_> {
     fn admits(self, rank: usize) -> bool {
-        self.rank.is_none_or(|expected| expected == rank)
+        self.claimant_emitted && self.rank.is_none_or(|expected| expected == rank)
     }
 }
 
@@ -4943,10 +4973,22 @@ impl CompanionExpectation {
 /// one of them. Two declarations that demand different ranks of one value are a
 /// contradiction, but it is `validate_padding`'s to report against the
 /// declaration that is wrong, not this rule's to report as a missing row axis.
-fn output_companions(workflow: &WorkflowSpec) -> BTreeMap<&str, BTreeSet<CompanionExpectation>> {
-    let mut companions: BTreeMap<&str, BTreeSet<CompanionExpectation>> = BTreeMap::new();
-    for output in workflow.outputs.values() {
+///
+/// The claiming output must itself be emitted. A declared output no step writes
+/// describes a result the caller never receives, so it cannot be the reason
+/// another value is admitted — and the companion obligations demand that a
+/// companion be emitted, so letting an unemitted payload confer the carve-out
+/// would be two answers to one question. The claimant is carried so a value
+/// admitted by nothing but an unwritten declaration can be told that, rather
+/// than told to declare a row axis.
+fn output_companions<'a>(
+    workflow: &'a WorkflowSpec,
+) -> BTreeMap<&'a str, BTreeSet<CompanionExpectation<'a>>> {
+    let emitted = emitted_outputs(workflow);
+    let mut companions: BTreeMap<&str, BTreeSet<CompanionExpectation<'_>>> = BTreeMap::new();
+    for (name, output) in &workflow.outputs {
         let contract = &output.contract;
+        let claimant_emitted = emitted.contains(name.as_str());
         for (_, role, companion) in contract.batch_layout.companions() {
             let role = if role == "offsets" {
                 CompanionRole::Offsets
@@ -4959,6 +5001,8 @@ fn output_companions(workflow: &WorkflowSpec) -> BTreeMap<&str, BTreeSet<Compani
                 .insert(CompanionExpectation {
                     role,
                     rank: Some(1),
+                    claimed_by: name.as_str(),
+                    claimant_emitted,
                 });
         }
         for entry in &contract.padding {
@@ -4968,6 +5012,8 @@ fn output_companions(workflow: &WorkflowSpec) -> BTreeMap<&str, BTreeSet<Compani
                 .insert(CompanionExpectation {
                     role: CompanionRole::ValidLengths,
                     rank: axis_of_symbol(contract, &entry.dimension),
+                    claimed_by: name.as_str(),
+                    claimant_emitted,
                 });
         }
     }
