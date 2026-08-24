@@ -1065,6 +1065,7 @@ impl WorkflowRuntime {
     /// loudly instead of writing an entry nothing will ever read -- which would
     /// leave a test asserting a carry against a silently absent one.
     #[cfg(test)]
+    #[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
     pub(crate) fn seed_session_conversation(
         &self,
         session_id: &str,
