@@ -293,6 +293,41 @@ trace,并通过 [[contracts/Formal Verification with TLA+]] 中描述的独立�
 某条通道的失败应归因于确切失败的那个契约。如果 CUDA 编译已通过、而随后的
 测试清单审计失败,那么"CUDA CI 失败"的说法就过于笼统了。
 
+### 通道分两层:能拦住合并的,和不能的
+
+`main` 的 ruleset 只要求两个上下文:**`Fast (Linux x86_64)`** 与
+**`Rust quality`**。其余通道全部是 advisory——它们红了,合并照样可以进行。
+所以"这个包有测试、并且 CI 会跑"并不等于"它的失败拦得住任何东西"。
+
+这不是理论问题。#1982 把一个失败的 `shape_dispatch_gate` 合进了 `main`,两个
+required 检查全绿;唯一变红的是 advisory 的 `CLI ORT`。当时
+`onnx-genai`、`-capi`、`-cli`、`-engine`、`-ort`、`-server` 这六个 crate 的测试
+不被任何 required 通道执行:`Fast` 的包集合按定义是**整个 workspace 减去**这
+六个(它们会触发 `onnx-genai-ort-sys` 的 ORT 下载),而 `Rust quality` 原有的
+三个 `cargo test` 步骤全是 `-p onnx-runtime-ep-cpu`。见 #2015。
+
+上一节那句话在这里的推论是:**一条不能拦住合并的检查,和一条没人及时读的
+检查,失效方式相同**——只是前者更隐蔽,因为它的输出确实存在,只是没有约束力。
+
+因此有两个门:
+
+- `workspace_test_packages.py verify`——每个 workspace 成员要么属于某条测试
+  通道,要么在 `DENYLIST` 里写明理由。它回答的是"有没有人跑"。
+- `workspace_test_packages.py verify-required-tier`——每个成员必须由
+  `REQUIRED_JOB_NAMES` 中的某个 job 真正执行。它回答的是"跑它的那条通道能不能
+  拦住合并"。该门直接解析 `ci.yml` 推导包集合,不依赖手抄清单;并且只认
+  `cargo test`/`cargo llvm-cov`,不认 `cargo build` 与 `cargo clippy --all-targets`
+  ——后两者会编译同一批测试目标却不执行任何断言。
+
+两个门都属于"看不见东西就通过"的那一类,所以
+`workspace_test_packages.py self-test` 会要求它们按需失败,并且**核对它们点名
+的包,而不是只看退出码**:`python` 不存在时退出 127,而该脚本里每个
+`SystemExit` 都退出 1,单看状态码无法把"判定"和"崩溃"区分开。
+
+`REQUIRED_JOB_NAMES` 是仓库设置在代码里的镜像。job 改名会被 self-test 抓到;
+ruleset 里**去掉**一个 required 检查则从仓库内部看不见——这是该门唯一看不到的
+漂移方向,已写在源码注释里。
+
 ## 当本地证据与托管证据不一致时
 
 先对差异分类:
