@@ -1814,6 +1814,47 @@ mod tests {
         );
     }
 
+    /// `ai.onnx::DFT` (opset 17) is a *documented non-gap*, not an oversight —
+    /// this test pins that decision so nobody re-opens it.
+    ///
+    /// No in-scope CUDA target model computes a Fourier transform inside its
+    /// graph. Whisper does its STFT / log-mel feature extraction on the **host**
+    /// (`crates/onnx-genai-preprocess/src/audio.rs`, `rustfft`) and feeds the
+    /// model a precomputed `[1, n_mels, n_frames]` tensor, so no `DFT`/`STFT`
+    /// node ever reaches the EP. The only in-graph `DFT` producer in the repo is
+    /// the CPU-EP Perch bioacoustics model (`tests/perch_dft.rs`), which is not a
+    /// CUDA decode target. `DFT` also has a complete CPU kernel in both this repo
+    /// (`onnx-runtime-ep-cpu/src/kernels/dft.rs`) and upstream ORT (which ships
+    /// **no** CUDA DFT kernel — ORT issue #21164), so a CUDA decline degrades to
+    /// an always-present CPU DFT rather than failing. See the non-gap write-up in
+    /// `docs/execution/CUDA_COVERAGE.md`, which records the exact condition that
+    /// would flip this decision.
+    ///
+    /// This checks both halves of the registration state, because half-wiring is
+    /// the failure this file is prone to: an op present in one of the five
+    /// registration places and absent from the others is silently declined at
+    /// runtime rather than reported.
+    ///
+    /// If an in-scope model ever emits `DFT` in-graph on a CUDA-placed workload,
+    /// implement a cuFFT-backed kernel mirroring `dft.rs`'s parameter surface,
+    /// wire it through the five-place registration contract, and delete this test.
+    #[test]
+    fn dft_is_a_documented_non_gap() {
+        assert!(
+            !CUDA_COVERED_OPS.contains(&"DFT"),
+            "DFT was added to CUDA_COVERED_OPS: if this is a real implementation, \
+             remove this non-gap test and update docs/execution/CUDA_COVERAGE.md; \
+             if it is accidental, revert it"
+        );
+        assert_eq!(
+            cuda_supported_dtypes_for_op("DFT", ""),
+            CUDA_FLOAT_DTYPES,
+            "DFT gained a dedicated dtype arm without a kernel: that is the \
+             registration contract half-wired, and it makes an unregistered op \
+             look registered"
+        );
+    }
+
     #[test]
     fn indexing_and_scan_ops_are_listed_in_coverage() {
         for op in [
