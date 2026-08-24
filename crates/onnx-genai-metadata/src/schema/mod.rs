@@ -88,11 +88,12 @@ pub struct InferenceMetadata {
 
     /// Declared, architecture-neutral input preprocessing programs.
     ///
-    /// Carries the typed multimodal preprocessing contract (currently the image
-    /// transform program and its named tensor outputs). Every operation and
-    /// output is generic, parameterized data — never a model family, vendor
-    /// string, or baked-in shape. Absent means the model declares no native
-    /// preprocessing program and a runtime must obtain it elsewhere or fail.
+    /// Carries the typed multimodal preprocessing contracts: the still-image,
+    /// video, and audio transform programs and their named tensor outputs.
+    /// Every operation and output is generic, parameterized data — never a
+    /// model family, vendor string, or baked-in shape. Absent means the model
+    /// declares no native preprocessing program and a runtime must obtain it
+    /// elsewhere or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessing: Option<PreprocessingSpec>,
 
@@ -270,14 +271,20 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic image transform-operation vocabulary.
-        ImageTransformOp,
-        image_transform_op,
-        IMAGE_TRANSFORM_OP,
+        /// Generic pixel transform-operation vocabulary.
+        ///
+        /// One vocabulary spans stills and clips. A still-image program never
+        /// selects frames; a clip program samples and pads them and then does
+        /// the same spatial work. `sample_frames` and `pad_frames` are the two
+        /// operations a temporal axis adds, not a second program dialect.
+        VisionTransformOp,
+        vision_transform_op,
+        VISION_TRANSFORM_OP,
         [
             "decode",
             "decode_rgb",
             "convert_rgb",
+            "sample_frames",
             "resize",
             "rescale",
             "normalize",
@@ -285,6 +292,7 @@ mod schema_vocabulary {
             "flatten",
             "patchify",
             "pad",
+            "pad_frames",
             "emit_original_size",
             "emit_transformed_size",
             "emit_validity_mask",
@@ -294,16 +302,25 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic image-output content-role vocabulary.
+        /// Generic pixel-output content-role vocabulary.
         ///
-        /// A program that packs the images of several requests into one batch
-        /// emits the two values that map packed items back to request rows —
-        /// `item_offsets` and `item_owner` — alongside the pixels themselves.
+        /// A program that packs the media of several requests into one batch
+        /// emits the values that map packed entries back to request rows,
+        /// alongside the pixels themselves. Packing is layered, so each level
+        /// names its own pair: `item_offsets`/`item_owner` for the patches or
+        /// tokens a vision encoder consumes, `frame_offsets`/`frame_owner` for
+        /// the frames a clip contributes, and `clip_offsets`/`clip_owner` when
+        /// one request carries several clips. A still image uses the item pair
+        /// alone, because it has exactly one frame and no clip structure.
+        ///
         /// They are content roles like any other: the runtime reads what a
-        /// tensor means from here, never from the name a producer chose.
-        ImageOutputContent,
-        image_output_content,
-        IMAGE_OUTPUT_CONTENT,
+        /// tensor means from here, never from the name a producer chose. What
+        /// each value must structurally satisfy is stated by its tensor
+        /// contract — `batch_layout` and `pad_mask` — which is what the
+        /// validator enforces.
+        VisionOutputContent,
+        vision_output_content,
+        VISION_OUTPUT_CONTENT,
         [
             "pixels",
             "patch_coordinates",
@@ -312,7 +329,11 @@ mod schema_vocabulary {
             "transformed_size",
             "validity_mask",
             "item_offsets",
-            "item_owner"
+            "item_owner",
+            "frame_offsets",
+            "frame_owner",
+            "clip_offsets",
+            "clip_owner"
         ]
     );
 
@@ -529,12 +550,12 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
     }
 
-    pub(super) fn image_transform_op(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TRANSFORM_OP);
+    pub(super) fn vision_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_TRANSFORM_OP);
     }
 
-    pub(super) fn image_output_content(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
+    pub(super) fn vision_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_OUTPUT_CONTENT);
     }
 
     pub(super) fn audio_transform_op(schema: &mut Schema) {
