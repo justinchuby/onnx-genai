@@ -919,3 +919,105 @@ fn the_sysfs_reader_finds_siblings_that_agree_the_relationship_is_mutual() {
         "a set containing every thread of a core has no sibling outside it"
     );
 }
+
+/// The classification that decides whether a failed status read poisons the
+/// scan, asserted directly.
+///
+/// This is the decision that a `None` from [`threads_off_mask`] hangs on, and
+/// until it was lifted out of the directory walk it was the one thing in the
+/// path that no test could see. `ENOENT` and `ESRCH` are the kernel's two ways
+/// of saying the task is gone; only the first has an `ErrorKind`, so a
+/// classification written in terms of `ErrorKind` alone reads the second as a
+/// live thread and returns "nothing is known" about a thread that is known to
+/// have exited.
+#[cfg(target_os = "linux")]
+#[test]
+fn both_ways_a_thread_can_be_gone_are_read_as_gone() {
+    let vanished = |errno| {
+        matches!(
+            host_contention::classify_status_error(&std::io::Error::from_raw_os_error(errno)),
+            ThreadStatus::Vanished
+        )
+    };
+
+    assert!(vanished(libc::ENOENT), "ENOENT: the task dir entry is gone");
+    assert!(
+        vanished(libc::ESRCH),
+        "ESRCH is what /proc returns when the task is reaped after lookup and \
+         before the read -- the same fact as ENOENT, and it has no ErrorKind"
+    );
+
+    // Everything else is a live thread of unknown affinity and must still
+    // poison the scan. A classifier that widened to "any error means gone"
+    // would pass the two assertions above and silently under-report a real
+    // off-mask thread, which is the failure this crate exists to prevent.
+    for errno in [libc::EACCES, libc::EPERM, libc::EIO, libc::ENOMEM] {
+        assert!(
+            matches!(
+                host_contention::classify_status_error(&std::io::Error::from_raw_os_error(errno)),
+                ThreadStatus::Unreadable
+            ),
+            "errno {errno} is not a vanished thread"
+        );
+    }
+}
+
+/// The scan must survive its own subject changing underneath it.
+///
+/// A whole-process thread walk is inherently racy: threads exit between the
+/// `readdir` and the read, and in a `cargo test` process -- where this crate's
+/// own tests spawn threads in parallel -- that happens constantly. The
+/// regression this guards is a required CI job going red on
+/// `left: None, right: Some(0)` with nothing wrong on the host: the walk
+/// classified a reaped thread as unreadable and gave up on the whole process.
+///
+/// Deliberately probabilistic in one direction only. On a quiet machine the
+/// race may not be provoked and the test passes without having proven
+/// anything; it can only *fail* if the scan actually gives up. Before the fix
+/// the same loop reported roughly one scan in twelve returning `None`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_scan_is_not_defeated_by_threads_exiting_underneath_it() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let allowed = AllowedCpus::current().expect("a mask is readable on Linux");
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let churn: Vec<_> = (0..4)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let batch: Vec<_> = (0..8)
+                        .map(|_| std::thread::spawn(|| std::hint::black_box(0u64)))
+                        .collect();
+                    for h in batch {
+                        let _ = h.join();
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut scans = 0usize;
+    let mut gave_up = 0usize;
+    while std::time::Instant::now() < deadline {
+        scans += 1;
+        if threads_off_mask(&allowed.cpus).is_none() {
+            gave_up += 1;
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    for h in churn {
+        let _ = h.join();
+    }
+
+    assert_eq!(
+        gave_up, 0,
+        "{gave_up} of {scans} scans returned None while threads were exiting; \
+         a thread that has been reaped is not a thread of unknown affinity"
+    );
+}

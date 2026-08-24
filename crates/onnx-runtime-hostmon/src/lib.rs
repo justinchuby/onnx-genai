@@ -348,10 +348,37 @@ pub enum ThreadStatus<'a> {
     /// The file was read.
     Read(&'a str),
     /// The file was gone -- the thread exited between the directory listing and
-    /// the read.
+    /// the read. The kernel reports this as `ENOENT` or, when the race lands
+    /// after the task lookup, as `ESRCH`; see [`classify_status_error`].
     Vanished,
     /// The file existed but could not be read.
     Unreadable,
+}
+
+/// Decides whether a failed `/proc/<tid>/status` read means the thread went
+/// away or that a live thread's mask is unknown.
+///
+/// Split out of the directory walk for the same reason
+/// [`off_mask_from_statuses`] is: the walk cannot be pointed at a synthetic
+/// `/proc`, so a classification left inline in it is a decision that is never
+/// asserted. It was wrong, and silently: the kernel reports a task that
+/// disappeared between the `readdir` and the `open` as `ENOENT` almost always
+/// but as `ESRCH` when the race lands after lookup, and `ESRCH` has no
+/// [`std::io::ErrorKind`] of its own, so it arrived here as `Uncategorized` and
+/// was read as a live thread of unknown affinity. Measured under thread churn,
+/// that turned 8.4% of whole-process scans into `None` -- the value that means
+/// "nothing is known", produced by a thread that was known to be gone.
+///
+/// Both errnos say the same thing, so both are [`ThreadStatus::Vanished`]. No
+/// other failure is: a live thread whose mask cannot be established must still
+/// poison the scan.
+#[cfg(target_os = "linux")]
+pub fn classify_status_error(e: &std::io::Error) -> ThreadStatus<'static> {
+    if e.kind() == std::io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ESRCH) {
+        ThreadStatus::Vanished
+    } else {
+        ThreadStatus::Unreadable
+    }
 }
 
 /// Decides the off-mask count from a set of thread status blobs.
@@ -395,8 +422,7 @@ pub fn threads_off_mask(allowed: &[usize]) -> Option<usize> {
         };
         statuses.push(match std::fs::read_to_string(entry.path().join("status")) {
             Ok(text) => Ok(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ThreadStatus::Vanished),
-            Err(_) => Err(ThreadStatus::Unreadable),
+            Err(e) => Err(classify_status_error(&e)),
         });
     }
     let borrowed: Vec<ThreadStatus<'_>> = statuses
