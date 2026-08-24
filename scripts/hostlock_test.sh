@@ -1547,6 +1547,7 @@ cleanup
 # (a) needs no bound at all: which name is printed is a function of whether a
 # denominator was given, not of the value or of how the work was placed. So
 # assert the naming unguarded, and spend the taskset-dependent budget on (b).
+# shellcheck disable=SC2016  # the body must expand in the child shell, not here
 spin2='for i in 1 2; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
 out=$($HL run --owner leon --reason "unit naming, undenominated" -- bash -c "$spin2" 2>&1)
 chk "without --expect-cores the field is named in cores" \
@@ -1600,6 +1601,7 @@ else
     # exceeds roughly 6*ncpu/1.05 -- a load average in the hundreds. It is
     # stated that way rather than as "the host was quiet", which is a claim
     # nobody here can make: an unannounceable co-tenant is always possible.
+    # shellcheck disable=SC2016  # likewise: the spinner bodies expand in the children
     inside='taskset -c '"$bind_cpu"' bash -c '"'"'for i in 1 2; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'"'"' & for i in 1 2 3 4; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
     out=$($HL run --owner leon --reason "bound inside" -- bash -c "$inside" 2>&1)
     inner=$(echo "$out" | sed -n 's/.*efficiency_cores=\([0-9.]*\).*/\1/p' | head -1)
@@ -1724,14 +1726,14 @@ chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_tea
 # rows, and six weeks later those rows are indistinguishable from clean ones.
 echo
 echo "TTL: run refuses a finite TTL"
-out=$($HL run --ttl 60 -- true 2>&1)
+out=$($HL run --ttl 60 --reason "ttl refusal probe" -- true 2>&1)
 rc=$?
 chk "run --ttl is refused" "$rc" "1"
 # Asserting the lock is FREE afterwards proves nothing -- a `run` that took
 # the lock and released it also ends FREE, so that form passes against the
 # refusal removed and is decoration. Prove the command never STARTED instead.
 rm -f "$LOCK.ttlmarker"
-$HL run --ttl 60 -- touch "$LOCK.ttlmarker" >/dev/null 2>&1
+$HL run --ttl 60 --reason "ttl refusal probe" -- touch "$LOCK.ttlmarker" >/dev/null 2>&1
 chk "and it refuses before running the command" \
     "$([ -e "$LOCK.ttlmarker" ] && echo ran || echo refused)" "refused"
 chk "and the refusal names the process-tree remedy, so it is actionable" \
@@ -1740,7 +1742,7 @@ chk "and the refusal names the process-tree remedy, so it is actionable" \
 # Controls. Without these, a change that rejected --ttl everywhere -- or one
 # that broke `run` outright -- passes all three assertions above. The refusal
 # has to be scoped to exactly `run`, and `run` itself has to still work.
-ttl_seen=$($HL run -- $HL status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
+ttl_seen=$($HL run --reason "ttl default probe" -- $HL status --porcelain 2>/dev/null | sed -n 's/^ttl=//p')
 chk "run without --ttl still runs, and records ttl=0" "$ttl_seen" "0"
 $HL acquire --owner pris --ttl 600 >/dev/null 2>&1
 chk "acquire --ttl is still accepted" "$(st ttl)" "600"
@@ -1752,7 +1754,7 @@ $HL release >/dev/null 2>&1
 # it here keeps the documented rule ("refused when finite") honest: a guard
 # widened to `-ge 0` fails this, and a guard narrowed away fails the three
 # assertions above.
-out=$($HL run --ttl 0 -- true 2>&1)
+out=$($HL run --ttl 0 --reason "ttl zero probe" -- true 2>&1)
 rc=$?
 chk "run --ttl 0 is accepted, because 0 arms no takeover" "$rc" "0"
 case $out in

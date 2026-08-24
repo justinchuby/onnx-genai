@@ -1,13 +1,14 @@
 name: Host lock
 
 # `scripts/hostlock.sh` is the advisory benchmark-host lock (#1803, #1806) and
-# `scripts/hostlock_test.sh` is its conformance suite: 252 assertions (249
-# before #1910) covering mutual exclusion, atomic publish, stale-holder
-# reaping, fail-closed admission and the CPU-efficiency verdict. Until this
-# workflow existed, **nothing ran it.** It was run by hand, by me, on the box
-# it locks -- which is the same "assigned, never executed" shape the suite
-# itself exists to prevent, one level up. A suite nobody runs is a suite that
-# is green because it is stale.
+# `scripts/hostlock_test.sh` is its conformance suite: 278 assertions (249
+# before #1910, 252 before #1869, 265 before the unit/reason work) covering
+# mutual exclusion, atomic publish, stale-holder reaping, fail-closed
+# admission, the CPU-efficiency verdict and the unit it is reported in.
+# Until this workflow existed, **nothing ran it.** It was run by hand, by me,
+# on the box it locks -- which is the same "assigned, never executed" shape
+# the suite itself exists to prevent, one level up. A suite nobody runs is a
+# suite that is green because it is stale.
 #
 # It has already earned its place more than once. Three of the defects it
 # caught were introduced by the fix for the previous one:
@@ -37,8 +38,10 @@ name: Host lock
 # Timing, measured rather than assumed. The suite contains fixed sleeps and
 # several bounded waits, so its wall time is dominated by waiting, not by
 # work. Under `taskset -c 30,31` on the development host -- two cores, the
-# shape of a GitHub-hosted runner -- it passes 252/252 in 210s while consuming
-# 53% of a single core averaged over that window, i.e. it is mostly waiting.
+# shape of a GitHub-hosted runner -- it passes 278/278 in 208s while consuming
+# 57% of a single core averaged over that window, i.e. it is mostly waiting.
+# Both figures are re-measured, not carried forward: 118.7s cpu over 208.3s
+# wall, taken the same way after the assertion count changed.
 # The 20-minute timeout is ~5x the measured wall time, which leaves room for a
 # slower runner without letting a genuinely hung wait sit for the six-hour
 # default.

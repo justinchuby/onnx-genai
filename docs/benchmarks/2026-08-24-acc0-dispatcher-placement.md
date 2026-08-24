@@ -260,7 +260,7 @@ launches.
 ```bash
 cargo build --release -p onnx-runtime-ep-cpu --benches
 BIN=$(ls target/release/deps/int4_decode_loop_ab-* | grep -v '\.d$' | head -1)
-./scripts/hostlock.sh run --wait --gate 8 -- \
+./scripts/hostlock.sh run --wait --gate 8 --reason "acc0 dispatcher pin ab" -- \
   python3 crates/onnx-runtime-ep-cpu/benches/acc0_w16_blocktime_ab.py \
     --binary "$BIN" --env-name ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN \
     --control 0 --test 1 --launches 16 --out pin_ab.json
