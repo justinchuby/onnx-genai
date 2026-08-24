@@ -238,6 +238,40 @@ leave that requires a human with `rm -rf`. If you want to see it before
 trusting it: `hostlock.sh status` distinguishes FREE / HELD / STALE /
 EXPIRED, and `provenance` prints who holds it and since when.
 
+### Where the lock lives
+
+`/tmp/onnx-genai-hostlock`, and **everyone on the box must resolve the same
+path** or the lock coordinates nothing. If your host cannot use `/tmp` (it is
+unwritable, `noexec`, or per-service under systemd `PrivateTmp=`), move it with
+a machine-local config, which every invocation by every agent reads:
+
+```sh
+mkdir -p ~/.config/onnx-genai
+echo 'lock_dir=/var/lib/onnx-genai/hostlock' > ~/.config/onnx-genai/hostlock.conf
+```
+
+`$HOSTLOCK_DIR` also moves the path and is **not** the same thing: it is set per
+process, so it does not move your peers with you. It is a **private** lock. It
+acquires instantly every time, collides with nobody, and — before this was
+fixed — reported `FREE` in bytes identical to a genuinely free shared host
+while a peer held the real one. Every invocation now says so on stderr unless
+`HOSTLOCK_PRIVATE_OK=1` acknowledges it, and `status --porcelain` and
+`provenance` carry `lock_dir=` / `lock_scope=` / `lock_dir_source=` into the
+row, so a recorded measurement says which lock its `declared=yes` is a claim
+about. Use it for tests, not for measurements you intend to publish.
+
+While a config is in effect, `acquire` and `run` also consult the old `/tmp`
+path **read-only** and refuse (exit 2) while a live holder is there: a peer who
+has not re-read the config cannot see the new lock, and taking it would put two
+benchmarks on the box. That consult never reaps or writes the old path — it is
+liveness-checked by pid **and** start time, so a crashed holder or a recycled
+pid does not block the migration.
+
+The Rust reader (`onnx_runtime_hostmon::hostlock`) resolves the path by the
+same rule, and `tests/agrees_with_hostlock_sh.rs` holds both sides to it. A
+reader that looked somewhere else would report `free` on a declared host,
+convincingly, forever.
+
 The lock and the gate decide whether to **start**. They cannot tell you
 afterwards whether the numbers are any good, because they sample instants: a
 gate sampled either side of a 2 s arm reported "runnable 2-4, clean" for runs
