@@ -182,13 +182,9 @@ impl Engine {
                 _ => self.generate_with_callbacks(request.request, on_admitted, callback),
             };
         }
-        if !prompt_only {
-            if let Some(on_admitted) = on_admitted.as_mut() {
-                on_admitted();
-            }
-            return self.run_declared_workflow_generation(request, callback);
-        }
-        // A no-decode-core prompt still shares this runtime's scheduler, and —
+        // Everything that reaches here runs the declared workflow: a
+        // no-decode-core prompt, and any request carrying tensors or component
+        // overrides. All of it still shares this runtime's scheduler, and —
         // when the process configured one — its KV byte budget: components own
         // their own caches, but the byte accounting a shared budget protects is
         // shared regardless of which executor a step names. Admitting here,
@@ -198,6 +194,15 @@ impl Engine {
         // decode-core branch above already has instead of letting the request
         // fail deep inside node execution once a value the loop needed never
         // arrives.
+        //
+        // Binding a tensor used to skip all of it: the `!prompt_only` case
+        // returned above this block, so the budget was enforced for
+        // `generate("hello")` and not for the same prompt plus an image, and
+        // `on_admitted()` fired on a path that had made no admission decision
+        // to report. That callback is a promise to whoever holds the other end
+        // — in the server driver it is a oneshot telling a waiting client it is
+        // in — so it must be sent by a request that was admitted, not by one
+        // that was never asked about.
         let scheduler_session_id = match request
             .session_id
             .as_deref()
