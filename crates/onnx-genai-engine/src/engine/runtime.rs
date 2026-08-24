@@ -2981,7 +2981,7 @@ mod tests {
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
         interpreted_engine_inner(
             budget_bytes,
-            crate::pipeline::generation::TestWorkflowShape::Stateless,
+            crate::pipeline::generation::TestSessionShape::Stateless,
         )
     }
 
@@ -2996,7 +2996,7 @@ mod tests {
     fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
         interpreted_engine_inner(
             budget_bytes,
-            crate::pipeline::generation::TestWorkflowShape::LoopCarriedSession,
+            crate::pipeline::generation::TestSessionShape::LoopCarriedSession,
         )
     }
 
@@ -3008,14 +3008,14 @@ mod tests {
     ) -> anyhow::Result<Engine> {
         interpreted_engine_inner(
             budget_bytes,
-            crate::pipeline::generation::TestWorkflowShape::PromptPrefixConversation,
+            crate::pipeline::generation::TestSessionShape::PromptPrefixConversation,
         )
     }
 
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_inner(
         budget_bytes: u64,
-        shape: crate::pipeline::generation::TestWorkflowShape,
+        shape: crate::pipeline::generation::TestSessionShape,
     ) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
@@ -3034,13 +3034,13 @@ mod tests {
         )?;
         Ok(Engine {
             workflow: Box::new(match shape {
-                crate::pipeline::generation::TestWorkflowShape::Stateless => {
+                crate::pipeline::generation::TestSessionShape::Stateless => {
                     crate::pipeline::generation::test_decoder_runtime()?
                 }
-                crate::pipeline::generation::TestWorkflowShape::LoopCarriedSession => {
+                crate::pipeline::generation::TestSessionShape::LoopCarriedSession => {
                     crate::pipeline::generation::test_session_decoder_runtime()?
                 }
-                crate::pipeline::generation::TestWorkflowShape::PromptPrefixConversation => {
+                crate::pipeline::generation::TestSessionShape::PromptPrefixConversation => {
                     crate::pipeline::generation::test_conversation_decoder_runtime()?
                 }
             }),
