@@ -3380,6 +3380,10 @@ impl KvCapacityAppendTestEp {
 }
 
 impl ExecutionProvider for KvCapacityAppendTestEp {
+    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "kv_capacity_append_test_ep"
     }
@@ -4283,6 +4287,10 @@ impl WeightDeliveryEp {
 }
 
 impl ExecutionProvider for WeightDeliveryEp {
+    fn consume_route_residency_at_boundary(&self) -> onnx_runtime_ep_api::Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         if self.lazy {
             "nxrt_test_ep"

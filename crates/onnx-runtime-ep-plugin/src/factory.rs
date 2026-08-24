@@ -1184,6 +1184,10 @@ mod tests {
     }
 
     impl ExecutionProvider for CountingEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "counting_ep"
         }

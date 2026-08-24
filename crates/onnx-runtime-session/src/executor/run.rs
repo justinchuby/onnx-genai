@@ -134,8 +134,9 @@ impl Executor {
                 // captured replay have completed (the sync above), the stream is
                 // no longer capturing, and the device validation latch is clean.
                 // Consume any completed route-telemetry window here and nowhere
-                // else (issue #1810 Slice 7C). The default EP path is a no-op, so
-                // this is byte-identical unless a provider opts in.
+                // else (issue #1810 Slice 7C). Every EP declares this explicitly;
+                // non-residency EPs return Ok(()) and the CUDA EP is gated off by
+                // default, so this is byte-identical unless a provider opts in.
                 self.ep.consume_route_residency_at_boundary()?;
                 Ok(())
             }

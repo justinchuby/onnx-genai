@@ -1,4 +1,4 @@
-# Decision: route-telemetry CONSUMER wires into the real request lifecycle at the single coarse safe boundary — one default-no-op EP method, no second boundary mechanism
+# Decision: route-telemetry CONSUMER wires into the real request lifecycle at the single coarse safe boundary — one required EP lifecycle method (no compatibility shim), no second boundary mechanism
 
 - **Slice:** 7C (issue #1810), draft PR (base `main`, includes #1971 `98731d31`)
 - **Date:** 2026-08-24
@@ -29,11 +29,16 @@ called there and **nowhere else**. No second boundary mechanism, no model
 allowlist.
 
 **EP-agnostic call, EP-owned operation.** The executor cannot name CUDA types,
-so the boundary is a new default-no-op trait method
-`ExecutionProvider::consume_route_residency_at_boundary(&self) -> Result<()>`
-(`Ok(())` default). The success arm of `finish_device_validation` calls it
-after the latch is confirmed clean. Stock EPs and the CUDA EP with the profile
-disabled are byte-identical to the method not existing.
+so the boundary is a **required** trait method
+`ExecutionProvider::consume_route_residency_at_boundary(&self) -> Result<()>`.
+Per the "no backward-compatibility during development" directive there is **no
+compatibility default/shim**: every in-repo `ExecutionProvider` implements it
+explicitly (non-residency EPs and mocks return `Ok(())`; forwarding EPs delegate
+to their inner EP; the planning-only capability gate is `unreachable!`), so each
+provider states its boundary behaviour rather than silently inheriting a no-op.
+The success arm of `finish_device_validation` calls it after the latch is
+confirmed clean. Non-residency EPs and the CUDA EP with the profile disabled do
+nothing here and are byte-identical at runtime.
 
 **CUDA override, reused authorities only.** The CUDA EP override:
 1. reads the existing default-off gate
@@ -102,3 +107,9 @@ test still pass (no regression).
 - Avoided PagedAttention / HCA/CSA / Mobius / BQMoE-fusion files. The only
   session caller file touched is `executor/run.rs` (one success-arm line) — no
   concurrent-edit conflict observed.
+- **Revision (no backward-compat during development):** the boundary method was
+  made a required part of the EP lifecycle contract (the earlier `Ok(())`
+  default was a compatibility shim and was removed). All in-repo
+  `ExecutionProvider` implementations, mocks, and integration-test doubles were
+  updated atomically in the same change; safety, default-off, and the typed
+  diagnostics outcome surface are unchanged.

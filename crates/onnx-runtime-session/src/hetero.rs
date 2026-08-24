@@ -131,6 +131,10 @@ struct AssignedOracle<'a> {
 }
 
 impl ExecutionProvider for AssignedOracle<'_> {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        unreachable!("AssignedOracle is a planning-only capability gate")
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

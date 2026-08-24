@@ -338,6 +338,10 @@ mod tests {
     }
 
     impl ExecutionProvider for RecordingEp {
+        fn consume_route_residency_at_boundary(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "recording_ep"
         }

@@ -123,6 +123,10 @@ impl HostDownloadCountingEp {
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "host_download_counting_ep"
     }
