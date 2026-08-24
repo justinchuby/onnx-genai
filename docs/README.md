@@ -91,8 +91,9 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`INFERENCE_METADATA_DECISIONS.md`](genai/INFERENCE_METADATA_DECISIONS.md)
 (normative metadata specification and complete built-in capability catalogue),
 [`ENCODER_BATCHING.md`](genai/ENCODER_BATCHING.md)
-(proposed generic component batching: `batch_capacity`, `pad_mask`, packed
-item ownership, phasing and acceptance matrix),
+(proposed generic component batching for image, video, audio, and text encoders:
+`batch_capacity`, `pad_mask`, nested item/frame ownership, phasing and
+acceptance matrix),
 [`WORKFLOW_POLICY_COMPONENTS.md`](WORKFLOW_POLICY_COMPONENTS.md)
 (policy components from first principles and the producer contract),
 [`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),
