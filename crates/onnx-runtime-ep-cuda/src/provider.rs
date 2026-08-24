@@ -4789,11 +4789,29 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         );
     }
 
+    // `is_available` must answer from the runtime, not report a compile-time
+    // constant. The discriminating input is a device ordinal that cannot exist:
+    // an implementation that reports availability without probing accepts every
+    // ordinal, while a real probe fails to select the device. Verified by
+    // falsification — replacing the body with `true` fails this test; the
+    // opposite error (always reporting unavailable) is already caught by the
+    // several hundred tests in this crate that construct a real provider.
+    //
+    // This deliberately replaces an assertion that `is_available(0)` equalled
+    // `initialized(0).is_ok()`. `is_available` is *defined* as that expression,
+    // so the assertion was true of every possible implementation and pinned
+    // nothing. Its only observable effect was building two complete providers
+    // (VMM arena plus cuBLASLt handle) back to back; each reserves a 64 GiB
+    // virtual address range, so on a small card the first provider's deferred
+    // release had not always finished before the second reserved, and a test
+    // that proved nothing still failed intermittently.
     #[test]
-    fn runtime_availability_matches_constructability() {
-        let available = CudaExecutionProvider::is_available(0);
-        let constructible = CudaExecutionProvider::initialized(0).is_ok();
-        assert_eq!(available, constructible);
+    fn availability_is_probed_at_runtime_not_compiled_in() {
+        const IMPOSSIBLE_ORDINAL: u32 = u32::MAX;
+        assert!(
+            !CudaExecutionProvider::is_available(IMPOSSIBLE_ORDINAL),
+            "is_available must probe the device; it reported CUDA:{IMPOSSIBLE_ORDINAL} usable"
+        );
     }
 
     // Phase-4 overlap through the public `ExecutionProvider` surface: a host→
