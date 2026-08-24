@@ -694,13 +694,122 @@ pub fn allowed_cpus() -> Option<Vec<usize>> {
     }
 }
 
-/// Read the current process's CPU affinity mask via `sched_getaffinity` and
+/// What asking the **calling thread** which CPUs it may run on returned.
+///
+/// Three states, not two, and deliberately not `Option<Vec<usize>>`: a caller
+/// that cannot tell "this target has no affinity query" from "the query ran and
+/// failed" from "here is the mask" will eventually collapse the first two into
+/// the third's success path. That collapse is exactly how a pool comes to report
+/// a placement nothing observed -- the defect behind #1792 -- so the type makes
+/// it unrepresentable rather than merely discouraged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedAffinity {
+    /// The kernel reported this thread's effective CPU set.
+    Cpus(Vec<usize>),
+    /// The query is implemented for this target but failed at runtime (a
+    /// seccomp filter, an emulator without the syscall, a hardened container).
+    QueryFailed(String),
+    /// This target has no per-thread affinity query at all, so no amount of
+    /// retrying would answer. macOS is the live example: `thread_policy_set`
+    /// is an advisory hint and there is nothing to read back.
+    Unsupported,
+}
+
+impl ObservedAffinity {
+    /// The observed CPU set, or `None` when the mask was never obtained.
+    ///
+    /// Callers that only want the happy path use this; callers that must *fail
+    /// closed* match on the variants, because `None` here is two very different
+    /// facts glued together.
+    pub fn cpus(&self) -> Option<&[usize]> {
+        match self {
+            Self::Cpus(cpus) => Some(cpus),
+            Self::QueryFailed(_) | Self::Unsupported => None,
+        }
+    }
+
+    /// `Some(cpu)` when the thread is confined to exactly one CPU.
+    ///
+    /// A mask with more than one bit is not a pin, however it was requested:
+    /// the scheduler is free to use any of those CPUs, so a multi-bit mask
+    /// cannot support a one-worker-per-core claim.
+    pub fn pinned_cpu(&self) -> Option<usize> {
+        match self.cpus()? {
+            [cpu] => Some(*cpu),
+            _ => None,
+        }
+    }
+}
+
+/// Whether this target can report a thread's *effective* affinity mask.
+///
+/// A `cfg!` constant, and that is the point: it is a property of the target,
+/// so it cannot be falsified by the very failure a fail-closed check exists to
+/// catch. Keying a guard on `observe_current_thread_cpus().cpus().is_some()`
+/// would switch the guard off in precisely the case it is there to report.
+pub const fn affinity_observation_supported() -> bool {
+    // `not(miri)` because [`observe_current_thread_cpus`] answers `Unsupported`
+    // there -- Miri has no scheduler affinity and calling the shim would abort.
+    // The two must agree: a constant claiming the query exists while the query
+    // reports it does not would fire every fail-closed guard keyed on it, in a
+    // run that is testing something else entirely.
+    cfg!(all(
+        any(target_os = "linux", target_os = "windows"),
+        not(miri)
+    ))
+}
+
+/// Ask the **calling thread** which CPUs it is currently permitted to run on.
+///
+/// This is the read-back half of [`pin_current_thread_to_cpu`], and it is the
+/// only evidence that a pin actually happened. A pin call's return value says
+/// the request was accepted; it does not say the kernel enforced anything, and
+/// a build where the syscall is stubbed, filtered, or emulated away returns
+/// `Ok(())` while every thread stays free to roam. Ask the kernel instead.
+///
+/// Per-thread on every supported target: Linux `sched_getaffinity(0, ..)` and
+/// Windows `GetThreadGroupAffinity(GetCurrentThread(), ..)` both scope to the
+/// caller, so this must be called *on* the thread being asked about.
+pub fn observe_current_thread_cpus() -> ObservedAffinity {
+    #[cfg(all(target_os = "linux", not(miri)))]
+    {
+        match linux_thread_cpus() {
+            Ok(cpus) => ObservedAffinity::Cpus(cpus),
+            Err(message) => ObservedAffinity::QueryFailed(message),
+        }
+    }
+    #[cfg(all(target_os = "linux", miri))]
+    {
+        // Miri has no scheduler affinity to report and would abort on the
+        // syscall shim. Unsupported is the honest answer, and it fails closed.
+        ObservedAffinity::Unsupported
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_imp::allowed_cpus().map_or_else(
+            || {
+                ObservedAffinity::QueryFailed(
+                    "GetThreadGroupAffinity did not report a mask".to_string(),
+                )
+            },
+            ObservedAffinity::Cpus,
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        ObservedAffinity::Unsupported
+    }
+}
+
+/// Read the calling thread's CPU affinity mask via `sched_getaffinity` and
 /// return the set CPU indices. The mask buffer is grown on `EINVAL` (the kernel
 /// signalling it is too small for the host's CPU count), so hosts with more than
-/// 1024 CPUs are handled without a fixed `cpu_set_t`. Returns `None` on any
-/// error so the caller treats the allowed set as unknown (unrestricted).
+/// 1024 CPUs are handled without a fixed `cpu_set_t`.
+///
+/// `pid == 0` means the *calling thread* on Linux, not the process: threads have
+/// independent masks, which is what makes per-worker pinning observable at all.
 #[cfg(target_os = "linux")]
-fn linux_allowed_cpus() -> Option<Vec<usize>> {
+fn linux_thread_cpus() -> std::result::Result<Vec<usize>, String> {
     let bits_per_word = 8 * std::mem::size_of::<libc::c_ulong>();
     // Start comfortably above a typical core count and grow on EINVAL.
     let mut words = 128 / bits_per_word.max(1);
@@ -710,7 +819,7 @@ fn linux_allowed_cpus() -> Option<Vec<usize>> {
         let byte_len = words * std::mem::size_of::<libc::c_ulong>();
         // SAFETY: `mask` is a live `byte_len`-sized buffer of `unsigned long`
         // words in the `cpu_set_t` layout the syscall fills; we pass its true
-        // byte length and query the current process (`pid == 0`). The buffer
+        // byte length and query the calling thread (`pid == 0`). The buffer
         // outlives the call and is only written by the kernel up to `byte_len`.
         let result = unsafe {
             libc::sched_getaffinity(0, byte_len, mask.as_mut_ptr() as *mut libc::cpu_set_t)
@@ -724,20 +833,36 @@ fn linux_allowed_cpus() -> Option<Vec<usize>> {
                     }
                 }
             }
-            return (!cpus.is_empty()).then_some(cpus);
+            if cpus.is_empty() {
+                // A runnable thread always has at least one allowed CPU, so an
+                // empty mask means the read did not describe reality.
+                return Err("sched_getaffinity returned an empty mask".to_string());
+            }
+            return Ok(cpus);
         }
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EINVAL) {
             // Buffer too small for the host's CPU count: double and retry, with a
             // sane ceiling so a persistent EINVAL cannot loop forever.
-            words = words.checked_mul(2)?;
+            words = words
+                .checked_mul(2)
+                .ok_or_else(|| "cpu mask size overflowed while growing".to_string())?;
             if words * bits_per_word > 1 << 20 {
-                return None;
+                return Err("sched_getaffinity kept rejecting the mask size".to_string());
             }
             continue;
         }
-        return None;
+        return Err(format!("sched_getaffinity failed: {err}"));
     }
+}
+
+/// The CPUs the current thread is permitted to run on, or `None` when the mask
+/// could not be read at all. The `Option`-shaped view of [`linux_thread_cpus`]
+/// for the cpuset/taskset safety input, which genuinely wants "do not restrict"
+/// on any failure and does not need to distinguish the reasons.
+#[cfg(target_os = "linux")]
+fn linux_allowed_cpus() -> Option<Vec<usize>> {
+    linux_thread_cpus().ok()
 }
 
 /// A resolved decode-affinity plan: the CPUs to pin the pool's workers to (round

@@ -413,7 +413,7 @@ pub(crate) fn topology_or_fail_closed(
 ///
 /// Placement *tests* must call this rather than [`host`]. `host` keeps its
 /// `Option` because production callers must not panic on an undiscoverable
-/// topology -- `placement_is_one_worker_per_physical_core` answering `None` is
+/// topology -- `planned_placement_is_one_worker_per_physical_core` answering `None` is
 /// correct, since claiming `Some(true)` there would be a lie. The difference is
 /// that a test skipping is a defect being missed, whereas production declining
 /// to cap is the documented "never cap on a guess" policy.
@@ -793,7 +793,7 @@ mod tests {
     /// actually exercised in CI.
     ///
     /// Every placement assertion this crate added in #1805 reaches its subject
-    /// through `host()` returning `Some`: `placement_is_one_worker_per_physical_core`
+    /// through `host()` returning `Some`: `planned_placement_is_one_worker_per_physical_core`
     /// opens with `host()?`, so it answers `None` when the topology is
     /// undiscoverable, and each caller then skips. That includes the
     /// `saw_placement_check` anti-vacuity guard in the width sweep, which is
@@ -842,7 +842,7 @@ mod tests {
     ///
     /// #1805's placement checks were all reached through `host()` returning
     /// `Some`, so forcing detection to `None` made three of them -- including
-    /// `placement_reports_a_shared_core_as_a_defect`, the *negative control* --
+    /// `the_planner_reports_a_shared_core_as_a_defect`, the *negative control* --
     /// pass vacuously. That was proved once by hand-editing `detect_linux`,
     /// which is exactly the kind of evidence that decays: the next person to
     /// reintroduce a silent skip has nothing to trip over.

@@ -1053,6 +1053,35 @@ impl WorkflowRuntime {
     /// Answered from the typed classification rather than from "does this
     /// session hold a conversation", because those are different questions and
     /// only this one is a length a caller's request will be charged for.
+    /// Put a conversation into a session's continuation cell.
+    ///
+    /// Production fills this cell by completing a turn. The interpreted test
+    /// fixtures cannot complete one -- their decoder wants a KV value no
+    /// component produces -- so a test about what a *second* turn costs has no
+    /// way to reach that state by running a first turn.
+    ///
+    /// It seeds through the cell the workflow declares rather than a name
+    /// spelled in the test, so a fixture that declares no continuation fails
+    /// loudly instead of writing an entry nothing will ever read -- which would
+    /// leave a test asserting a carry against a silently absent one.
+    #[cfg(all(test, feature = "native-backend"))]
+    pub(crate) fn seed_session_conversation(
+        &self,
+        session_id: &str,
+        tokens: &[i64],
+    ) -> anyhow::Result<()> {
+        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
+        let cell = facts.prompt_continuation().context(
+            "this workflow declares no prompt continuation, so it has no conversation to seed",
+        )?;
+        let rows = i64::try_from(tokens.len())?;
+        self.workflow_session_state.borrow_mut().insert(
+            (session_id.to_string(), cell.to_string()),
+            Value::from_slice_i64(tokens, &[1, rows])?,
+        );
+        Ok(())
+    }
+
     pub(crate) fn session_prepended_prompt_len(&self, session_id: &str) -> usize {
         let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
         let Some(cell) = facts.prompt_continuation() else {
