@@ -497,6 +497,29 @@ jobs:
           --features onnx-genai-engine/native-backend,onnx-genai-server/native-backend
           -- -D warnings
 
+      # The mirror image of the step above, and the other half of the same hole.
+      # That one turns the feature *on*, and it is the only `-D warnings` gate in
+      # this file that names these crates -- `Run clippy on all offline crates`
+      # cannot list them because they pull in `ort-sys`, and `CLI ORT`'s clippy
+      # steps name `onnx-genai-cli`, so `-D warnings` does not reach a dependency
+      # and dependencies do not build test targets anyway.
+      #
+      # So the *default* configuration of both crates was compiled by
+      # `Test ORT-backed workspace crates` and linted by nothing. Measured, not
+      # assumed: #1964 merged with `warning: function `test_session_decoder_runtime`
+      # is never used` in a green `CLI ORT` log. That warning was harmless; a real
+      # unused-code defect at default features has exactly the same signature and
+      # the same fate, in a log only read once something else has already failed.
+      #
+      # Most of this is cache-warm from the step above, which shares the whole
+      # dependency graph minus the feature. Both configurations are checked
+      # separately rather than as a union, because default is what ships.
+      - name: Check the default features compile clean
+        run: >-
+          cargo clippy --locked --all-targets
+          -p onnx-genai-engine -p onnx-genai-server
+          -- -D warnings
+
       # No shipped artifact links MLAS: the wheel builds it only when someone
       # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
       # python/nxrt-ep-cpu/setup.py: MLAS_TARGETS, and release automation never

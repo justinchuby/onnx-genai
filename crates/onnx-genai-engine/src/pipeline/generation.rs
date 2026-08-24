@@ -943,7 +943,7 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
 /// the next. Nothing else about the workflow changes, so a session test and a
 /// stateless test still differ in one declared property rather than in two
 /// unrelated fixtures.
-#[cfg(test)]
+#[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
     test_decoder_runtime_inner(true)
 }
