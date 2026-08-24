@@ -39,9 +39,9 @@ moving it transfers exclusive ownership and that mutation still requires
 `&mut Engine` (`crates/onnx-genai-engine/src/engine/model.rs:221-229`). It
 carries no `Sync` impl, and could not honestly carry one: the workflow
 interpreter it owns holds
-`workflow_session_leases: RefCell<std::collections::HashSet<String>>`
-(`crates/onnx-genai-engine/src/pipeline/mod.rs:191`), and `RefCell` is `!Sync`
-by construction.
+`session_leases: RefCell<HashSet<String>>` in its worker state
+(`crates/onnx-genai-engine/src/pipeline/runtime_state.rs:279`), and `RefCell` is
+`!Sync` by construction.
 
 That is the important fact, and it is easy to miss because the `unsafe impl
 Send` looks like the concurrency story. It is not. The concurrency story is that
@@ -148,16 +148,16 @@ request sequence can produce it. A `RefCell<HashSet<String>>` on a
 single-worker driver cannot observe two turns in flight.
 
 **Second — and this is the part the citation trail does not advertise — the
-lease does not cover most sessions.** `workflow_session_leases` is read at
+lease does not cover most sessions.** The worker's lease set is read at
 exactly one place, and only under two conditions:
 
 ```rust
 let session_state = onnx_genai_metadata::classify_session_state(workflow);
 let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
     (Some(session_id), true) => {
-        match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
+        match SessionLeaseGuard::acquire(&engine.worker.session_leases, session_id) {
 ```
-— `crates/onnx-genai-engine/src/pipeline/workflow.rs:1356-1363`
+— `crates/onnx-genai-engine/src/pipeline/workflow.rs:1390-1397`
 
 The guard is taken only when the *interpreted workflow* declares session-scoped
 cells that carry. That path is reached only when the engine does **not** hold a
@@ -173,12 +173,13 @@ if !self.holds_decode_core() {
 A decode-core package — the ordinary LLM case — takes the other branch, keeps
 its conversation in `Engine::sessions: HashMap<SessionId, EngineSession>`
 (`engine/model.rs:55-56`), and **acquires no lease of any kind**. There is no
-`SessionLeaseGuard` on that path; `workflow_session_leases` has exactly four
-references in the entire workspace, all of them in the interpreter
-(`pipeline/mod.rs:191`, `:445`, `:799`, `workflow.rs:1363`).
+`SessionLeaseGuard` on that path; the interpreter's lease set has exactly four
+non-test references in the entire workspace, all of them in the interpreter
+(`pipeline/runtime_state.rs:279`, `:320`, `workflow.rs:1397`, and the guard
+itself at `workflow.rs:631-660`).
 
 The two even use different identifier types. The interpreter's lease set is
-keyed by `String` (`pipeline/mod.rs:191`, and `session_id: Option<String>` at
+keyed by `String` (`pipeline/runtime_state.rs:279`, and `session_id: Option<String>` at
 `workflow.rs:258`); the decode core is keyed by
 `SessionId = SequenceId = u64` (`config.rs:389`, `onnx-genai-kv/src/lib.rs:61`).
 The interpreter is handed a stringified copy of the numeric id at the boundary
@@ -361,7 +362,7 @@ The `Drop` impl now says exactly that:
 > allocator whose memory it holds, so ORT still requires every value to be
 > released before that allocator. Nothing in the type system says so, which is
 > exactly why it is done here explicitly instead of left to the field list.
-> — `crates/onnx-genai-engine/src/pipeline/mod.rs:270-287`
+> — `crates/onnx-genai-engine/src/pipeline/mod.rs:189-208`
 
 That is the correct scope for the remaining manual code: it no longer papers over
 a session/binding ordering problem that the types now solve, and it survives only
@@ -389,8 +390,9 @@ reason.
 
 - **Session maps.** `Engine` holds `sessions: HashMap<SessionId, EngineSession>`
   for decode-core packages and `workflow_sessions: HashMap<SessionId, usize>`
-  for interpreted ones, plus a monotonic `workflow_session_counter`
-  (`engine/model.rs:55-67`). The native backend holds a third map,
+  for interpreted ones, plus `workflow_session_ids: SharedSessionIds` — the
+  atomic allocator those ids are minted from, because they leave the engine
+  (`engine/model.rs:55-72`, `engine/ids.rs`). The native backend holds a third map,
   `native_sessions: HashMap<SessionId, NativeSessionState>`, with LRU eviction
   bounded by `native_max_sessions` (`engine/model.rs:78-100`,
   `engine/runtime.rs:621-640`).
@@ -498,11 +500,12 @@ are `Sync` because they are frozen, not because a lock guards them. Loading once
 and sharing is also the only way a bounded worker pool is affordable — cloning a
 package per worker would multiply host memory by the worker count.
 
-The plan/interpreter split is what makes this possible. Today
-`WorkflowRuntime` mixes the compiled plan with per-pass mutable state (its lease
-set lives there: `pipeline/mod.rs:191`). The plan must be extracted into an
-`Arc`-shared, genuinely immutable value, leaving the interpreter as a
-per-execution object constructed against it.
+The plan/interpreter split is what makes this possible, and its first half has
+landed: `WorkflowRuntime` now holds the compiled plan as an `Arc<WorkflowPlan>`
+separate from the worker state its lease set lives in
+(`pipeline/runtime_state.rs:100-279`). What remains is making the interpreter a
+per-execution object constructed against that plan rather than a long-lived one
+that opens a pass on it.
 
 ### 3.2 Per-worker: backend handles
 
@@ -589,7 +592,7 @@ edge in exactly the shape this rule asks for:
 does not hold a back-reference to the `Allocator` it was allocated from, so a
 device `Value` can still outlive its allocator by field order. The `Drop for
 WorkflowRuntime` doc comment states this as the reason its manual clears remain
-(`crates/onnx-genai-engine/src/pipeline/mod.rs:270-277`), and the ORT test helper
+(`crates/onnx-genai-engine/src/pipeline/mod.rs:189-200`), and the ORT test helper
 spells out the order a caller must keep: *"`Value` (frees memory through the
 allocator), then the `Allocator`, then …"* (`value.rs:2443-2448`). §4.3 therefore
 carries "release values before their allocator" as an explicit worker obligation
@@ -641,7 +644,7 @@ decides"* (`pipeline/islands.rs:75-83`).
 as licence to delete them, and that is wrong: they were never only about
 bindings. The binding and allocator half is now structural, but the value half
 is not, because `Value` has no back-reference to its allocator
-(`pipeline/mod.rs:270-277`). §13 Phase 1 explicitly retains this `Drop`. A
+(`pipeline/mod.rs:189-200`). §13 Phase 1 explicitly retains this `Drop`. A
 compensating teardown may only be deleted once the structural edge that replaces
 it exists for every resource it covers — §3.5 states that sequencing rule in
 general, and this is its first live application.
@@ -672,7 +675,7 @@ gap is real.** `WorkflowRuntime` holds `_ort_environment: Option<Arc<Environment
 as its **last** field, documented as *"Kept last so the ORT environment, its
 registered allocator bridge, and their plugin/provider teardown outlive every
 component and execution-island session that may still call back into them"*
-(`pipeline/mod.rs:264-267`). That is a
+(`pipeline/mod.rs:183-186`). That is a
 per-owner, field-order-dependent workaround for a missing structural edge — the
 exact pattern Rule A removed one level down. It is a useful partial precedent
 (the environment *is* already an `Arc` that an owner can co-own) and it is not a
@@ -704,8 +707,8 @@ Until one is chosen, two things follow, and both are normative:
    It does not yet claim anything about `Environment`, providers or plugins.
 2. **No compensating teardown may be deleted before the structural lifetime that
    replaces it exists.** This applies to `WorkflowRuntime::drop`
-   (`pipeline/mod.rs:270-287`), to `WorkflowRuntime`'s last-field environment
-   (`pipeline/mod.rs:264-267`), and to `Environment::drop`'s ordering discipline
+   (`pipeline/mod.rs:189-208`), to `WorkflowRuntime`'s last-field environment
+   (`pipeline/mod.rs:183-186`), and to `Environment::drop`'s ordering discipline
    (`env.rs:308-324`) alike. Deleting a manual teardown is the *last* step of a
    conversion, never the first, and §13 Phase 1 sequences it that way.
 
@@ -1112,12 +1115,12 @@ drop it. §7 makes this a shutdown ordering rule.
 is a separate obligation from Rule A, because Rule A's ownership edge stops one
 level short. A `Value` is a bare `OrtValue` handle with no back-reference to the
 allocator whose memory it holds, so nothing in the type system prevents an
-allocator from being released first (`pipeline/mod.rs:270-277`). The required
+allocator from being released first (`pipeline/mod.rs:189-200`). The required
 order is written down in the ORT crate — *"the device `Value` (frees memory
 through the allocator), then the `Allocator`, then the `Session`, and finally the
 `Environment`"* (`value.rs:2443-2448`) — and it is why
 `WorkflowRuntime::drop` still clears bindings, outputs and allocators by hand
-(`pipeline/mod.rs:278-287`). A worker's teardown path carries the same duty: it
+(`pipeline/mod.rs:201-208 via pipeline/runtime_state.rs:351-365`). A worker's teardown path carries the same duty: it
 drops its bound `Value`s, then its `Allocator`s, then releases its `Arc<Session>`.
 This is normative for §7's shutdown sequence and for the worker-failure path.
 
@@ -1578,7 +1581,7 @@ producing it intermittently.
 `ExecutionIsland` and `PipelineModels` no longer depend on field order for the
 session edge. What remains inside the scope of the rule is the `Value` →
 `Allocator` edge, which has no ownership link and is still discharged by a `Drop`
-one level up (`pipeline/mod.rs:270-287`) — the rule's own exception, kept
+one level up (`pipeline/mod.rs:189-208`) — the rule's own exception, kept
 visible rather than quietly satisfied.
 
 The scoping is not a hedge; it is §3.5. The `Session → Environment` edge has the
@@ -1657,7 +1660,7 @@ sufficient.
    `RwLock<Engine>` does **not** work, and not merely because it is a bad idea.
    `RwLock<T>: Sync` requires `T: Send + Sync`, and `Engine` is structurally
    `!Sync`: the interpreter holds `RefCell<HashSet<String>>`
-   (`pipeline/mod.rs:191`). So `Arc<RwLock<Engine>>` is not `Sync` and cannot be
+   (`pipeline/runtime_state.rs:279`). So `Arc<RwLock<Engine>>` is not `Sync` and cannot be
    shared across threads at all. Even if that were fixed, a read lock would buy
    nothing: almost every session operation takes `&mut self` —
    `create_session` (`engine/runtime.rs:1501`), `reset_session` (`:1662`),
@@ -1989,18 +1992,18 @@ left implying coverage it does not have.
 **What this phase must not do is delete a compensating teardown before the
 structural replacement exists.** Two are explicitly retained:
 
-- **`WorkflowRuntime::drop`'s manual clears stay** (`pipeline/mod.rs:278-287`).
+- **`WorkflowRuntime::drop`'s manual clears stay** (`pipeline/mod.rs:201-208 via pipeline/runtime_state.rs:351-365`).
   `Arc<Session>` does *not* license removing them. Its own doc comment says why:
   bindings and session-derived allocators are now structural, but *"A `Value`
   cannot: it is a bare `OrtValue` handle with no back-reference to the allocator
   whose memory it holds, so ORT still requires every value to be released before
   that allocator. Nothing in the type system says so, which is exactly why it is
   done here explicitly instead of left to the field list"*
-  (`pipeline/mod.rs:270-277`). Removing it becomes possible only if a later phase
+  (`pipeline/mod.rs:189-200`). Removing it becomes possible only if a later phase
   gives `Value` an ownership edge to its `Allocator`; until then §4.3 carries the
   ordering as a worker obligation.
 - **`Drop for Environment`'s ordering discipline stays** (`env.rs:308-324`), as
-  does `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:264-267`).
+  does `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:183-186`).
   §3.5 shows nothing structurally keeps the environment alive behind a session,
   so these are the only things enforcing an ORT lifetime requirement. They are
   removed only in whichever later phase adopts §3.5's structural option, and only
@@ -2017,6 +2020,31 @@ otherwise — where at `W = 1` every check passes trivially and therefore
 establishes the baseline rather than chasing a regression. Still one thread,
 still one worker. This is the largest refactor and the one that carries no
 concurrency risk, which is why it is isolated.
+
+✅ **Done, for the interpreter: the state split proper**
+(`pipeline/runtime_state.rs`, `engine/ids.rs`). `WorkflowRuntime`'s flat field
+list is now three named owners plus the environment it already kept last:
+`Arc<WorkflowPlan>` is §3.1's immutable plan, asserted `Send + Sync` because
+nothing in it is a cell; `WorkerBackend` holds the ORT and native handles and
+`WorkerRuntimeState` holds everything one worker mutates (§3.2 storage under
+§3.3 access), both structurally `!Send`/`!Sync` through a `PhantomData`
+marker rather than a new `unsafe impl` or a blanket lock; and `WorkflowPass` is
+§3.3's per-execution state, created when a pass opens and dropped when it ends.
+`workflow_session_leases` moved into `WorkerRuntimeState::session_leases`, where
+it remains the inner-layer invariant §4.2 describes. The id namespaces are typed
+and separated with it: `PassId` (was `workflow_execution_generation`) and
+`GraphCaptureId` mint from worker-local allocators, because they are only ever
+compared against state the same worker owns, while session ids — the only ones
+that leave the engine, and the ones a routing layer would key on — mint from
+`engine::ids::SharedSessionIds`, an atomic allocator, so two workers cannot hand
+one id to two conversations. Externally observed ids are unchanged. Both `Drop`
+retentions above are kept verbatim; the clears moved into
+`WorkerRuntimeState::release_ort_state`, called from the same `Drop`.
+
+⚠️ **The rest of Phase 1 is untouched by that change:** the `Box<Session>`
+holders above, and extending the shipped `thread_affinity` vocabulary to the
+native handles §4.3 lists. The state split is a structural prerequisite at
+`W = 1` — it moves ownership into types; it does not make anything concurrent.
 
 **Phase 2 — the routing lease, on the worker pool of one that already exists.**
 PR #2012 (merged as `1bf87c86`) already built the worker thread, the
@@ -2121,5 +2149,5 @@ rows in flight.
    scope rule is left to implementation, because the answer depends on how much
    of the EP plugin registry moves with it. What is *not* open is the ordering:
    the compensating `Drop for Environment` (`env.rs:308-324`) and
-   `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:264-267`)
+   `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:183-186`)
    are not removed before whichever option is chosen actually lands.

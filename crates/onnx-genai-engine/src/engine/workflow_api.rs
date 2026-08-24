@@ -209,10 +209,7 @@ impl Engine {
             .and_then(|id| id.parse::<crate::config::SessionId>().ok())
         {
             Some(session_id) if self.workflow_sessions.contains_key(&session_id) => session_id,
-            _ => {
-                self.workflow_session_counter += 1;
-                self.workflow_session_counter
-            }
+            _ => self.workflow_session_ids.mint(),
         };
         let (budget_cap, max_new_tokens) = self.admit_interpreted_generate_request(
             scheduler_session_id,

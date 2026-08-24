@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use super::runtime_state::{GraphCaptureId, PassId};
 use super::*;
 use crate::decode::clone_value;
 use onnx_genai_metadata::{StateAliasing, StatePortAccess};
@@ -174,8 +175,13 @@ pub(crate) struct StableComponentBinding {
     outputs: Vec<(String, Arc<Value>)>,
     shared_outputs: Vec<(String, usize)>,
     output_order: Vec<String>,
-    service_generation: u64,
-    graph_id: i32,
+    /// The pass this binding's shared service inputs were last written for.
+    /// Compared against the pass now running to decide whether a service-held
+    /// input has to be re-seeded.
+    service_generation: PassId,
+    /// The capture id this binding replays under, inside its session's
+    /// namespace.
+    graph_id: GraphCaptureId,
     captured: bool,
     /// Kept alive because the stable input/output values were allocated from it
     /// and ORT frees them through it. Like `binding`, it co-owns the session.
@@ -296,6 +302,20 @@ pub(crate) struct WorkflowRunTelemetry {
 }
 
 impl WorkflowRunTelemetry {
+    /// Telemetry for a pass that starts now.
+    ///
+    /// The clock starts here rather than at the caller's convenience: `started`
+    /// is what the elapsed and time-to-first-token numbers are measured from,
+    /// and three call sites setting it by hand is three chances for one of them
+    /// to measure something else.
+    pub(crate) fn started(max_iterations_only: bool) -> Self {
+        Self {
+            started: Some(std::time::Instant::now()),
+            max_iterations_only,
+            ..Self::default()
+        }
+    }
+
     fn record_stage(&mut self, name: impl Into<String>, elapsed_ns: u128) {
         let name = name.into();
         *self.stage_runs.entry(name.clone()).or_default() += 1;
@@ -608,13 +628,13 @@ fn continuation_tokens(value: &Value) -> anyhow::Result<Vec<i64>> {
 /// and generation nowhere, and nothing would report that they were lost. The
 /// guard is released on drop, so a pass that fails or panics does not strand the
 /// session.
-struct SessionLeaseGuard<'a> {
+pub(super) struct SessionLeaseGuard<'a> {
     leases: &'a RefCell<std::collections::HashSet<String>>,
     session: String,
 }
 
 impl<'a> SessionLeaseGuard<'a> {
-    fn acquire(
+    pub(super) fn acquire(
         leases: &'a RefCell<std::collections::HashSet<String>>,
         session: &str,
     ) -> anyhow::Result<Self> {
@@ -807,10 +827,16 @@ impl WorkflowRuntime {
         // Every device→host copy this runtime performs goes through here, which
         // is why the count lives here and not at the call sites: a new caller
         // is counted without having to remember to count itself.
-        self.host_staging_count
-            .set(self.host_staging_count.get().saturating_add(1));
+        self.worker.counters.host_staging_count.set(
+            self.worker
+                .counters
+                .host_staging_count
+                .get()
+                .saturating_add(1),
+        );
         let device_id = value.device_id()?;
         if let Some(island) = self
+            .backend
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
@@ -839,6 +865,7 @@ impl WorkflowRuntime {
         }
         let device_id = value.device_id()?;
         let host = if let Some(island) = self
+            .backend
             .execution_islands
             .iter()
             .find(|island| island.cuda_device_id() == Some(device_id))
@@ -860,7 +887,7 @@ impl WorkflowRuntime {
         row_outputs: BTreeMap<String, Vec<String>>,
     ) -> anyhow::Result<PipelineOutputs> {
         let mut outputs = PipelineTensors::new();
-        for output in self.workflow.outputs.keys() {
+        for output in self.plan.workflow.outputs.keys() {
             let row_prefix = format!("{output}.row.");
             let event_prefix = format!("{output}.");
             let names = values
@@ -897,13 +924,15 @@ impl WorkflowRuntime {
     /// Read by the generate path so a composite workflow reports the reason it
     /// actually finished for.
     pub(crate) fn last_generation_ended_by_predicate(&self) -> bool {
-        self.workflow_performance
+        self.worker
+            .counters
+            .workflow_performance
             .borrow()
             .last_loop_ended_by_predicate
     }
 
     pub fn workflow_performance_diagnostic(&self) -> WorkflowPerformanceDiagnostic {
-        let counters = self.workflow_performance.borrow();
+        let counters = self.worker.counters.workflow_performance.borrow();
         let elapsed_seconds = counters.last_elapsed_ns as f64 / 1_000_000_000.0;
         WorkflowPerformanceDiagnostic {
             runs: counters.runs,
@@ -963,7 +992,7 @@ impl WorkflowRuntime {
         // left where the backend produced them, so a native-CUDA proposal chain
         // keeps its carry and borrowed KV device-resident instead of paying a
         // host round-trip to be observed.
-        for output in self.workflow.outputs.keys() {
+        for output in self.plan.workflow.outputs.keys() {
             let row_prefix = format!("{output}.row.");
             let event_prefix = format!("{output}.");
             let names = values
@@ -999,14 +1028,15 @@ impl WorkflowRuntime {
         request: GenerateRequest,
         session_id: Option<&str>,
     ) -> anyhow::Result<(GenerateRequest, Option<Vec<i64>>)> {
-        let Some((cell, _, _, _)) = workflow_prompt_continuation(&self.workflow) else {
+        let Some((cell, _, _, _)) = workflow_prompt_continuation(&self.plan.workflow) else {
             return Ok((request, None));
         };
         let Some(session_id) = session_id else {
             return Ok((request, None));
         };
         let history = match self
-            .workflow_session_state
+            .worker
+            .session_state
             .borrow()
             .get(&(session_id.to_string(), cell.to_string()))
         {
@@ -1076,7 +1106,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             session_id,
             component_overrides,
         } = request;
-        let workflow = &engine.workflow;
+        let workflow = &engine.plan.workflow;
         validate_component_overrides(workflow, &component_overrides)?;
         // A conversation the package declares as a prompt prefix rejoins here,
         // before anything is bound: every input derived from the prompt — the
@@ -1228,6 +1258,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             .with_context(|| format!("workflow execution plan has no input '{name}'"))?;
         let input = self
             .engine
+            .plan
             .workflow
             .inputs
             .get(package_name)
@@ -1281,22 +1312,17 @@ impl<'a> WorkflowExecutionPlan<'a> {
         &mut self,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<(PipelineTensors, BTreeMap<String, Vec<String>>)> {
-        let started = std::time::Instant::now();
-        let mut telemetry = WorkflowRunTelemetry {
-            started: Some(started),
-            max_iterations_only: self.max_iterations_only,
-            ..WorkflowRunTelemetry::default()
-        };
         let engine = self.engine;
-        let generation = engine.workflow_execution_generation.get().wrapping_add(1);
-        engine.workflow_execution_generation.set(generation);
-        for island in &engine.execution_islands {
-            island.begin_execution(generation);
+        // One named owner for everything this pass alone holds (§3.3): its id
+        // and the telemetry it accumulates. Both end with the pass.
+        let mut pass = engine.begin_pass(self.max_iterations_only);
+        for island in &engine.backend.execution_islands {
+            island.begin_execution(pass.id);
         }
-        let workflow = &engine.workflow;
+        let workflow = &engine.plan.workflow;
         let mut values = std::mem::take(&mut self.values);
         let prepare_adapters = (|| -> anyhow::Result<()> {
-            if let Some(service) = &engine.adapter_service {
+            if let Some(service) = &engine.plan.adapter_service {
                 if !service.portable_fallback {
                     anyhow::bail!(
                         "adapter capability '{}' is unavailable in the portable workflow runtime and portable_fallback is disabled",
@@ -1329,19 +1355,20 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 };
                 let selection =
                     super::adapters::selection_from_inputs(service, &values, batch_rows)?;
-                let context = engine.adapter_cache.borrow_mut().prepare(
-                    &engine.package_root,
+                let context = engine.worker.adapter_cache.borrow_mut().prepare(
+                    &engine.plan.package_root,
                     service,
                     &selection,
                     &active_rows,
                 )?;
-                *engine.active_adapter_context.borrow_mut() = Some(context);
+                *engine.worker.active_adapter_context.borrow_mut() = Some(context);
                 // A runtime-minted row selection expands or compacts the batch
                 // (beam search, speculative row cloning). It carries source
                 // positions within the current batch, never scheduler IDs, so
                 // every row-scoped component follows through the same ABI.
                 if let Some(selection) = workflow_row_selection(workflow, &values)?
-                    && let Some(context) = engine.active_adapter_context.borrow_mut().as_mut()
+                    && let Some(context) =
+                        engine.worker.active_adapter_context.borrow_mut().as_mut()
                 {
                     context.compact(&selection)?;
                 }
@@ -1352,7 +1379,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
             self.retain_inputs(&mut values);
             return Err(error);
         }
-        let _adapter_context_guard = ActiveAdapterContextGuard(&engine.active_adapter_context);
+        let _adapter_context_guard =
+            ActiveAdapterContextGuard(&engine.worker.active_adapter_context);
         // A package may declare session state and still be asked for a single
         // stateless generation — that is the first turn of every conversation,
         // and it is also what `Engine::generate` is. Without a session there is
@@ -1366,7 +1394,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // so every carried session cell requires this guard.
         let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
             (Some(session_id), true) => {
-                match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
+                match SessionLeaseGuard::acquire(&engine.worker.session_leases, session_id) {
                     Ok(guard) => Some(guard),
                     Err(error) => {
                         self.retain_inputs(&mut values);
@@ -1379,7 +1407,8 @@ impl<'a> WorkflowExecutionPlan<'a> {
         if let Some(session_id) = self.session_id.as_ref() {
             for (cell, carrier) in session_state.carried() {
                 let Some(value) = engine
-                    .workflow_session_state
+                    .worker
+                    .session_state
                     .borrow()
                     .get(&(session_id.to_string(), cell.to_string()))
                     .map(clone_value)
@@ -1428,7 +1457,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
         let result = engine.run_workflow_node(
-            &engine.compiled_workflow.graph,
+            &engine.plan.compiled_workflow.graph,
             workflow,
             &mut values,
             &mut symbols,
@@ -1436,14 +1465,14 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut emit_counts,
             &mut final_state_refs,
             &self.component_overrides,
-            &mut telemetry,
+            &mut pass.telemetry,
             host,
         );
         if let Err(error) = result {
             self.retain_inputs(&mut values);
             return Err(error);
         }
-        for output in workflow_emitted_outputs(&engine.compiled_workflow.graph) {
+        for output in workflow_emitted_outputs(&engine.plan.compiled_workflow.graph) {
             let Some(value) = values.get(&output) else {
                 continue;
             };
@@ -1482,7 +1511,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     let mut conversation = prompt.to_vec();
                     conversation.extend(published_conversation_tokens(
                         &values,
-                        &telemetry.row_outputs,
+                        &pass.telemetry.row_outputs,
                         tokens_output,
                     )?);
                     let length = conversation.len() as i64;
@@ -1553,13 +1582,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 })?;
                 updates.push(((session_id.clone(), cell.to_string()), clone_value(value)?));
             }
-            let mut session_state = engine.workflow_session_state.borrow_mut();
+            let mut session_state = engine.worker.session_state.borrow_mut();
             for (key, value) in updates {
                 session_state.insert(key, value);
             }
         }
-        let row_outputs = std::mem::take(&mut telemetry.row_outputs);
-        engine.publish_workflow_telemetry(telemetry);
+        let row_outputs = std::mem::take(&mut pass.telemetry.row_outputs);
+        engine.publish_workflow_telemetry(pass.telemetry);
         let inputs = self.take_inputs(&mut values);
         self.values = inputs;
         Ok((values, row_outputs))
@@ -1588,7 +1617,7 @@ impl WorkflowRuntime {
         let elapsed_ns = telemetry
             .started
             .map_or(0, |started| started.elapsed().as_nanos());
-        let mut counters = self.workflow_performance.borrow_mut();
+        let mut counters = self.worker.counters.workflow_performance.borrow_mut();
         counters.runs += 1;
         counters.total_elapsed_ns += elapsed_ns;
         counters.last_elapsed_ns = elapsed_ns;
@@ -2127,7 +2156,7 @@ impl WorkflowRuntime {
                     let source = values
                         .get(value)
                         .with_context(|| format!("workflow emit value '{value}' is unavailable"))?;
-                    if source.is_host_resident()? && self.movable_emit_values.contains(value) {
+                    if source.is_host_resident()? && self.plan.movable_emit_values.contains(value) {
                         values.remove(value).with_context(|| {
                             format!("workflow emit value '{value}' is unavailable")
                         })?
@@ -2151,7 +2180,7 @@ impl WorkflowRuntime {
                 // emit into it is ragged, and the declared request axis says
                 // which axis the rows lie on. A dense request-aligned output
                 // with no ragged emit is still emitted as one tensor.
-                if self.row_wise_outputs.contains(output)
+                if self.plan.row_wise_outputs.contains(output)
                     && output_contract
                         .contract
                         .batch_layout
@@ -2253,7 +2282,7 @@ impl WorkflowRuntime {
             }
             WorkflowNode::ExecutionIsland { id } => {
                 let stage_started = std::time::Instant::now();
-                let island = self.execution_islands.get(*id).with_context(|| {
+                let island = self.backend.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
                 if island.uses_override(component_overrides) {
@@ -2278,7 +2307,7 @@ impl WorkflowRuntime {
                 for (component, inputs) in invoke_bindings(&fused) {
                     self.enforce_fixed_capacity_writes(workflow, component, inputs, values)?;
                 }
-                let island = self.execution_islands.get(*id).with_context(|| {
+                let island = self.backend.execution_islands.get(*id).with_context(|| {
                     format!("workflow references unknown execution island {id}")
                 })?;
                 telemetry.component_invocations += island.component_count() as u64;
@@ -2472,7 +2501,7 @@ impl WorkflowRuntime {
         outputs: &std::collections::BTreeMap<String, String>,
         symbol_hints: &HashMap<String, i64>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
-        let workflow = &self.workflow;
+        let workflow = &self.plan.workflow;
         let declaration = workflow
             .components
             .get(component)
@@ -2549,12 +2578,12 @@ impl WorkflowRuntime {
         selected_outputs: &std::collections::BTreeMap<String, String>,
         output_shapes: &std::collections::BTreeMap<String, Vec<usize>>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
-        match self.decode_backend {
+        match self.plan.decode_backend {
             EngineDecodeBackend::Native => {
                 #[cfg(feature = "native-backend")]
                 {
                     let _ = (workflow, component, selected_declaration, component_symbols);
-                    let set = self.native_components.as_ref().with_context(|| {
+                    let set = self.backend.native_components.as_ref().with_context(|| {
                         format!(
                             "native workflow backend selected but ONNX component \
                              '{selected_component}' has no native session"
@@ -2587,14 +2616,17 @@ impl WorkflowRuntime {
             }
             EngineDecodeBackend::Ort | EngineDecodeBackend::Auto => {
                 let _ = output_shapes;
-                let session = self.models.sessions.get(selected_component).with_context(|| {
+                let session = self.backend.models.sessions.get(selected_component).with_context(|| {
                     format!(
                         "workflow ONNX component '{selected_component}' selected for '{component}' \
                          was not loaded"
                     )
                 })?;
                 let stable_eligible = session.cuda_device_id().is_some()
-                    && self.device_bridge_components.contains(selected_component);
+                    && self
+                        .plan
+                        .device_bridge_components
+                        .contains(selected_component);
                 if stable_eligible {
                     self.run_stable_component(
                         workflow,
@@ -2693,8 +2725,8 @@ impl WorkflowRuntime {
                     .collect::<HashMap<_, _>>()
             })
             .unwrap_or_default();
-        let generation = self.workflow_execution_generation.get();
-        let mut bindings = self.component_bindings.borrow_mut();
+        let generation = self.worker.current_pass();
+        let mut bindings = self.worker.component_bindings.borrow_mut();
         if let Some(stable) = bindings.get_mut(&key) {
             let reset_services = stable.service_generation != generation;
             for (name, source) in resolved {
@@ -2730,7 +2762,7 @@ impl WorkflowRuntime {
                 if !stable.captured {
                     session.synchronize_device()?;
                 }
-                session.run_with_binding_graph(&stable.binding, stable.graph_id)?;
+                session.run_with_binding_graph(&stable.binding, stable.graph_id.get())?;
                 stable.captured = true;
             } else {
                 session.run_with_binding(&stable.binding)?;
@@ -2738,19 +2770,25 @@ impl WorkflowRuntime {
             return stable_component_outputs(stable);
         }
 
-        let allocator =
-            if let Some(allocator) = self.component_allocators.borrow().get(component).cloned() {
-                allocator
-            } else {
-                let allocator = Arc::new(
-                    Session::shared_device_allocator(session)?
-                        .context("stable component execution requires a CUDA allocator")?,
-                );
-                self.component_allocators
-                    .borrow_mut()
-                    .insert(component.to_string(), Arc::clone(&allocator));
-                allocator
-            };
+        let allocator = if let Some(allocator) = self
+            .worker
+            .component_allocators
+            .borrow()
+            .get(component)
+            .cloned()
+        {
+            allocator
+        } else {
+            let allocator = Arc::new(
+                Session::shared_device_allocator(session)?
+                    .context("stable component execution requires a CUDA allocator")?,
+            );
+            self.worker
+                .component_allocators
+                .borrow_mut()
+                .insert(component.to_string(), Arc::clone(&allocator));
+            allocator
+        };
         let discovered = if selected_outputs.keys().any(|output| {
             declaration
                 .ports
@@ -2877,13 +2915,18 @@ impl WorkflowRuntime {
                     shape.clone(),
                     format!("{:?}", metadata.dtype),
                 );
-                let stable = if let Some(value) =
-                    self.component_outputs.borrow().get(&output_key).cloned()
+                let stable = if let Some(value) = self
+                    .worker
+                    .component_outputs
+                    .borrow()
+                    .get(&output_key)
+                    .cloned()
                 {
                     value
                 } else {
                     let value = Arc::new(Value::empty_in(&shape, metadata.dtype, &allocator)?);
-                    self.component_outputs
+                    self.worker
+                        .component_outputs
                         .borrow_mut()
                         .insert(output_key, Arc::clone(&value));
                     value
@@ -2895,12 +2938,14 @@ impl WorkflowRuntime {
         if session.graph_capture() {
             // Warm the final fixed-address binding without capturing. The next
             // equal-shape invocation owns the non-negative graph id.
-            session.run_with_binding_graph(&binding, -1)?;
+            session.run_with_binding_graph(&binding, GraphCaptureId::UNCAPTURED.get())?;
         } else {
             session.run_with_binding(&binding)?;
         }
-        let graph_id =
-            i32::try_from(bindings.len()).context("stable component CUDA graph id exceeds i32")?;
+        // One id per binding, from the worker's own allocator. It used to be
+        // the length of this map, which is the same number only for as long as
+        // nothing is ever removed from it.
+        let graph_id = self.worker.next_graph_capture_id()?;
         let stable = StableComponentBinding {
             binding,
             inputs,
@@ -2986,7 +3031,7 @@ impl WorkflowRuntime {
         let source = input
             .to_vec_f32()
             .context("portable parameter overlay requires host float32 input")?;
-        let context = self.active_adapter_context.borrow();
+        let context = self.worker.active_adapter_context.borrow();
         let context = context
             .as_ref()
             .context("parameter overlay executed without a request adapter context")?;
@@ -2998,7 +3043,7 @@ impl WorkflowRuntime {
             "adapter context holds {} rows but the overlay input has batch {batch}",
             context.rows()
         );
-        let cache = self.adapter_cache.borrow();
+        let cache = self.worker.adapter_cache.borrow();
         let (result, output_features) = super::adapters::apply_parameter_overlay(
             &cache,
             context,
@@ -3033,6 +3078,7 @@ impl WorkflowRuntime {
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
         let program = self
+            .plan
             .preprocessing
             .as_ref()
             .and_then(|spec| spec.image.as_ref())
@@ -3139,6 +3185,7 @@ impl WorkflowRuntime {
         component_symbols: &mut HashMap<String, i64>,
     ) -> anyhow::Result<()> {
         let program = self
+            .plan
             .preprocessing
             .as_ref()
             .and_then(|spec| spec.audio.as_ref())
@@ -6187,17 +6234,18 @@ impl WorkflowGenerationCursor {
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            runtime.adapter_service.is_none(),
+            runtime.plan.adapter_service.is_none(),
             "the per-token drive cannot advance a package that selects adapters per request; \
              adapter selection is prepared once for a whole pass"
         );
         anyhow::ensure!(
-            runtime.execution_islands.is_empty(),
+            runtime.backend.execution_islands.is_empty(),
             "the per-token drive cannot advance a package with fused execution islands, whose \
              bindings are established for a whole pass"
         );
         anyhow::ensure!(
             !runtime
+                .plan
                 .workflow
                 .state
                 .values()
@@ -6205,7 +6253,7 @@ impl WorkflowGenerationCursor {
             "the per-token drive cannot advance a package with session-scoped workflow state, \
              which is published when a pass completes"
         );
-        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
         anyhow::ensure!(
             matches!(
                 loop_plan(loop_node)?.setup,
@@ -6215,11 +6263,7 @@ impl WorkflowGenerationCursor {
              pass, and a drive that hands out one iteration at a time has no pass to run it in"
         );
         let mut plan = WorkflowExecutionPlan::new_hosted(runtime, request, hosted)?;
-        let mut telemetry = WorkflowRunTelemetry {
-            started: Some(std::time::Instant::now()),
-            max_iterations_only: plan.max_iterations_only,
-            ..WorkflowRunTelemetry::default()
-        };
+        let mut telemetry = WorkflowRunTelemetry::started(plan.max_iterations_only);
         let mut values = std::mem::take(&mut plan.values);
         let mut symbols = plan.initial_symbols.clone();
         let dynamic_symbols = plan.dynamic_symbols.clone();
@@ -6229,7 +6273,7 @@ impl WorkflowGenerationCursor {
         let plan_parts = loop_plan(loop_node)?;
         let limit = runtime.begin_workflow_loop(
             &plan_parts,
-            &runtime.workflow,
+            &runtime.plan.workflow,
             &mut values,
             &mut symbols,
             &dynamic_symbols,
@@ -6261,11 +6305,11 @@ impl WorkflowGenerationCursor {
         if self.index >= self.limit {
             return Ok(false);
         }
-        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
         let plan_parts = loop_plan(loop_node)?;
         let ran = runtime.advance_workflow_loop(
             &plan_parts,
-            &runtime.workflow,
+            &runtime.plan.workflow,
             self.index,
             &mut self.values,
             &mut self.symbols,
@@ -6289,7 +6333,7 @@ impl WorkflowGenerationCursor {
         mut self,
         runtime: &WorkflowRuntime,
     ) -> anyhow::Result<(PipelineTensors, bool)> {
-        let loop_node = sole_generation_loop(&runtime.compiled_workflow.graph)?;
+        let loop_node = sole_generation_loop(&runtime.plan.compiled_workflow.graph)?;
         end_workflow_loop(&loop_plan(loop_node)?, &mut self.values);
         runtime.publish_workflow_telemetry(self.telemetry);
         let ended_by_predicate = runtime.last_generation_ended_by_predicate();
@@ -6303,6 +6347,7 @@ impl WorkflowGenerationCursor {
     /// bare name would find nothing and call that "emitted nothing".
     pub(crate) fn emitted_tokens(&self, runtime: &WorkflowRuntime) -> anyhow::Result<Vec<i64>> {
         let Some(output) = runtime
+            .plan
             .workflow
             .outputs
             .iter()
@@ -6336,6 +6381,7 @@ impl WorkflowGenerationCursor {
         runtime: &WorkflowRuntime,
     ) -> anyhow::Result<Vec<Vec<i64>>> {
         let Some(output) = runtime
+            .plan
             .workflow
             .outputs
             .iter()

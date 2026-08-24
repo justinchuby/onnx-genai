@@ -465,7 +465,7 @@ impl Engine {
             governor,
             sessions: HashMap::new(),
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             _environment: Some(environment),
             session: Some(Box::new(session)),
             #[cfg(feature = "native-backend")]
@@ -478,7 +478,7 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_active_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             #[cfg(feature = "native-backend")]
             native_access_counter: 0,
             #[cfg(feature = "native-backend")]
@@ -1179,14 +1179,14 @@ impl Engine {
             governor,
             sessions: HashMap::new(),
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             session: None,
             native_session: Some(native_session),
             weight_placement,
             memory_strategy_plan,
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: config.native_max_sessions,
