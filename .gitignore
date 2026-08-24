@@ -127,7 +127,9 @@ roy_validate.log
 .body.md
 .resp*.md
 .prbody*.md
-.merge.log
-.mutate*
-.suite.log
-.selftest.log
+# Root-anchored: these four are ordinary nouns, and a nested crate or fixture
+# could reasonably want one. The scratch only ever lands in a worktree root.
+/.merge.log
+/.mutate*
+/.suite.log
+/.selftest.log
