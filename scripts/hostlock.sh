@@ -62,7 +62,13 @@
 #
 # Options for acquire/run:
 #   --reason TEXT     what you are running (shown to whoever is blocked)
-#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER
+#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER.
+#                     `run` exports a DECLARED owner (--owner, or an inherited
+#                     $HOSTLOCK_OWNER) to the wrapped command, so a harness
+#                     that reads the lock can recognise its own. A $USER
+#                     default is never exported: every agent on a shared box
+#                     runs as the same unix user, so that would make every
+#                     lock read as ours. See #1929.
 #   --wait            block until free instead of failing immediately
 #   --timeout S       give up after S seconds (default 3600 with --wait)
 #   --gate N          after taking the lock, also wait until the instantaneous
@@ -1359,6 +1365,19 @@ cmd_run() {
     DO_WAIT=1
     cmd_acquire || return $?
 
+    # Hand the declared identity to the wrapped command, so a harness that
+    # reads the lock into its rows can tell its own parent's declaration from
+    # a co-tenant's. Without this, `--owner leon` is only a shell variable and
+    # the child reports `host_lock=held:leon` -- honest, but unattributed and
+    # deliberately not treated as certifying -- while the environment form
+    # reports `mine:leon`. The obvious invocation was the one that silently
+    # measured weaker (#1929).
+    #
+    # Only when the owner was actually declared: see OWNER_DECLARED.
+    if [ "$OWNER_DECLARED" = 1 ]; then
+        export HOSTLOCK_OWNER="$OWNER"
+    fi
+
     # Run the command in the BACKGROUND and wait for it, rather than inline.
     #
     # Bash does not run a trap until the current foreground command finishes.
@@ -1406,6 +1425,20 @@ cmd_run() {
     return $rc
 }
 
+# Whether the owner was DECLARED, or merely defaulted from the unix user.
+#
+# `run` exports a declared owner to its child (#1929) so a harness reading the
+# lock can tell its own parent's declaration from a co-tenant's, instead of
+# reporting an unattributed `held:`. That export must not manufacture an
+# attribution nobody made: every agent on this box runs as the same unix user,
+# so a $USER-derived owner handed to the child would make EVERY agent's lock
+# read as `mine:` to every other agent. That is the flattering error, and the
+# naive one-line export puts it on the DEFAULT path -- which is why the
+# default is recorded here as undeclared and never exported.
+OWNER_DECLARED=0
+if [ -n "${HOSTLOCK_OWNER:-}" ]; then
+    OWNER_DECLARED=1
+fi
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
 REASON=""
 DO_WAIT=0
@@ -1509,6 +1542,7 @@ while [ "$#" -gt 0 ]; do
         --owner)
             OWNER=${2:-}
             require_name "$1" "$OWNER"
+            OWNER_DECLARED=1
             shift 2
             ;;
         --wait)
