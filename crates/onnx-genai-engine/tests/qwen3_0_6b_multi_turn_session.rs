@@ -62,7 +62,9 @@ fn package() -> PathBuf {
     assert_eq!(
         digest,
         PINNED_METADATA_SHA256,
-        "{} is not the metadata published at {PINNED_REVISION}",
+        "{} is not the metadata published at {PINNED_REVISION}. Fetch it with: \
+         huggingface-cli download justinchuby/qwen3-0.6b-onnx-genai --revision \
+         {PINNED_REVISION} --local-dir /path/to/pkg",
         metadata.display()
     );
     assert!(
