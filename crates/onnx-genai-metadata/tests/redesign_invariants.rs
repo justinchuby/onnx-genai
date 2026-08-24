@@ -155,12 +155,12 @@ pipeline:
           dtype: float32
           rank: 2
           shape: [items, hidden]
-          batch_layout: { kind: token_packed, offsets: image_offsets, owner: image_owner, axis: 0 }
+          batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: image_owner }] }
         role: { kind: opaque }
         source: { kind: application, name: image_features }
         externally_suppliable: true
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:
@@ -1116,19 +1116,15 @@ fn every_row_scoped_carrier_survives_batch_compaction() {
         "packed encoder values must still be attributable to a row"
     );
     match &vision.batch_layout {
-        onnx_genai_metadata::BatchLayout::TokenPacked {
-            offsets,
-            owner,
-            axis,
-            owner_span,
-        } => {
-            assert_eq!(offsets, "image_offsets");
-            assert_eq!(owner, "image_owner");
+        onnx_genai_metadata::BatchLayout::TokenPacked { axis, levels, .. } => {
             assert_eq!(*axis, 0);
             assert_eq!(
-                owner_span, &None,
-                "a packing with no enclosing span owns straight into request rows"
+                levels.len(),
+                1,
+                "a packing with no coarser grouping owns straight into request rows"
             );
+            assert_eq!(levels[0].offsets, "image_offsets");
+            assert_eq!(levels[0].owner, "image_owner");
         }
         other => panic!("packed encoder value must declare its owner mapping: {other:?}"),
     }

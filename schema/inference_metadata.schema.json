@@ -538,7 +538,10 @@
             "valid_samples",
             "sample_lengths",
             "frame_lengths",
-            "validity_mask"
+            "valid_lengths",
+            "validity_mask",
+            "pack_offsets",
+            "pack_owner"
           ],
           "title": "Known standard value"
         },
@@ -552,7 +555,10 @@
               "valid_samples",
               "sample_lengths",
               "frame_lengths",
-              "validity_mask"
+              "valid_lengths",
+              "validity_mask",
+              "pack_offsets",
+              "pack_owner"
             ]
           },
           "title": "Forward-compatible extension value",
@@ -808,7 +814,7 @@
       "type": "string"
     },
     "BatchLayout": {
-      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: `offsets` names the\nexclusive-prefix offset value and `owner` names the per-item owner mapping,\nwhich together let a runtime split and regroup the packed value without any\nserialized request ID. A packing whose items belong to the items of another\npacking — frames inside clips inside request rows — names that enclosing\npacking in `owner_span`. `runtime_sequence_state` marks a value whose\nper-sequence storage the runtime owns outright.",
+      "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: the items of every request are\nconcatenated along one physical axis, and the ownership companions say which\nrequest each item came from, which is what lets a runtime split and regroup\nthe packed value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -871,9 +877,10 @@
         },
         {
           "additionalProperties": false,
+          "description": "Items belonging to many requests concatenated along one axis.\n\nThere is exactly one packed axis. Structure above the item — frames\ninside clips inside request rows — is ownership, not a second axis: the\ntensor stays a flat run of items and `levels` says how to fold that run\nback into requests.",
           "properties": {
             "axis": {
-              "description": "Packed axis of this value.",
+              "description": "Packed axis of this value.\n\nValidation requires axis zero. A run of items is only splittable\ninto per-request pieces without copying when the items are the\noutermost, contiguous stride of the tensor, and a packed axis\nanywhere else would silently turn every split into a gather.",
               "format": "uint",
               "minimum": 0,
               "type": "integer"
@@ -882,27 +889,31 @@
               "const": "token_packed",
               "type": "string"
             },
-            "offsets": {
-              "description": "Value holding the exclusive prefix offset of each owner's items.\n\nRequest-aligned for a packing owned by request rows; aligned with the\nenclosing packing's items when `owner_span` names one.",
-              "type": "string"
+            "levels": {
+              "description": "Ownership chain of the packed axis, innermost level first.\n\nLevel zero owns the physically packed positions; the last level owns\ninto request rows. One level is the ordinary flat case — items in\nrows — and two states one grouping in between, as frames in clips in\nrows. Validation rejects a third: a runtime walks the whole chain on\nevery split, and each level multiplies the states that have to be\nchecked and tested.",
+              "items": {
+                "$ref": "#/$defs/OwnershipLevel"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array"
             },
-            "owner": {
-              "description": "Item-aligned value mapping each packed item to the index of its owner.",
-              "type": "string"
-            },
-            "owner_span": {
-              "description": "Packed value whose items this packing's owner indices name.\n\nAbsent means the owner map indexes request rows, which is where every\nownership chain ends. Present means one more level sits in between:\npacked frames own into packed clips, and the clips own into rows.\nComposition is bounded — validation rejects a chain deeper than\nitems inside spans inside request rows — because a runtime resolves\nownership by walking it on every compaction.",
-              "type": [
-                "string",
-                "null"
-              ]
+            "packed_extent": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PackedExtent"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where the extent of this packed axis comes from, for a value a\ncomponent produces.\n\nAbsent is right for a value a component consumes, whose extent the\ncaller assembled. An output must state it: a runtime that assumed\nthe input's offsets still describe the result would split a\ntoken-merging encoder's output at the wrong boundaries and report\nnothing."
             }
           },
           "required": [
             "kind",
-            "offsets",
-            "owner",
-            "axis"
+            "axis",
+            "levels"
           ],
           "type": "object"
         },
@@ -921,6 +932,32 @@
         }
       ]
     },
+    "CapacityBudget": {
+      "additionalProperties": false,
+      "description": "One materialized-footprint bound of an assembled invocation.\n\nA budget bounds what the invocation materializes, not what is nominally\nvalid. A packed dimension's footprint is the sum of the items' valid extents,\nwhich is exactly the packed extent because packing stores no padding; a\npadded dimension's footprint is the enclosing count times the padded extent,\nwhich is the rectangle the runtime allocates and the kernel reads. Budgeting\nthe valid sum instead would let one long and fifteen short items pass a bound\nthe group then blows through.",
+      "properties": {
+        "dimensions": {
+          "description": "Shape symbols whose materialized extents multiply to the bounded\nquantity, in order.\n\nOne symbol bounds that dimension directly — items at an ownership level,\npositions on a packed axis. Several bound an activation-shaped quantity,\nsuch as total padded patch slots, without the package ever naming bytes.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "max_total": {
+          "description": "Largest product of those extents one invocation may carry.",
+          "format": "uint",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dimensions",
+        "max_total"
+      ],
+      "type": "object"
+    },
     "ChunkedPrefillConfig": {
       "description": "Runtime chunked-prefill preference.",
       "properties": {
@@ -938,36 +975,24 @@
     },
     "ComponentBatchCapacity": {
       "additionalProperties": false,
-      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: how\nmany request rows may share a call, along which axis they stack, and which\naxes must already agree before they can. A runtime decides whether to use\nthe capacity; the package only says what its artifact can accept.",
+      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: which\ndimensions must already agree before two contributions can share a call, and\nhow much the assembled call may materialize. A runtime decides whether to\ngroup at all, and may always group fewer; the package only says what its\nartifact tolerates.\n\nEverything here is keyed by shape symbol rather than by axis index. Ports of\none component routinely differ in rank — a rank-3 payload, a rank-1\ncompanion, a rank-2 pooled output — so an axis index is only meaningful\nrelative to one port, while a symbol names the same quantity on every port\nthat mentions it.",
       "properties": {
-        "axis": {
-          "description": "Axis of this component's request-scoped ports along which rows stack.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "max_rows": {
-          "description": "Largest number of request rows one invocation may carry.\n\nAbsent means the component accepts as many rows as the runtime can fit,\nso the bound is memory rather than the artifact. Zero is never a capacity.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "uniform_axes": {
-          "description": "Axes whose dimensions must be equal across rows for those rows to share\none invocation.\n\nA component that accepts several rows may still require them to agree on\nsomething the batch axis does not cover — an encoder whose artifact is\nbuilt for one spatial extent, say, or one that batches clips only when\nthey carry the same number of frames. Spatial and temporal axes are\nlisted the same way: an axis is an axis, and the runtime compares the\ndimensions it is told to compare rather than guessing which ones matter.\nListing them lets a scheduler group compatible rows instead of guessing\nfrom shapes it cannot compare.",
+        "budgets": {
+          "description": "Upper bounds on what one assembled invocation materializes, keyed by\nshape symbol.\n\nThese are static geometry — a fixed position table, an exported\nconstant, a kernel bound — never a measured throughput sweet spot, which\nwould be a cost model and belongs to the runtime. Every entry is an\nupper bound and never an obligation: a runtime may group fewer,\nincluding one. An empty list bounds nothing beyond what the runtime's\nown row budget already bounds.",
           "items": {
-            "format": "uint",
-            "minimum": 0,
-            "type": "integer"
+            "$ref": "#/$defs/CapacityBudget"
+          },
+          "type": "array"
+        },
+        "uniform_dimensions": {
+          "description": "Shape symbols whose extents must be equal across every co-batched item.\n\nA component that accepts several items may still require them to agree\non something no amount of padding or packing reconciles — an encoder\nwhose artifact is built for one spatial extent, say, or one that groups\nclips only when they carry the same number of frames. Spatial and\ntemporal extents are listed the same way: a symbol is a symbol, and the\nruntime compares the dimensions it is told to compare rather than\nguessing which ones matter. A symbol left off this list is free to vary,\nand must then be reconciled by padding or by packing.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
           },
           "type": "array"
         }
       },
-      "required": [
-        "axis"
-      ],
       "type": "object"
     },
     "ComponentContract": {
@@ -2192,6 +2217,27 @@
       ],
       "type": "string"
     },
+    "OwnershipLevel": {
+      "additionalProperties": false,
+      "description": "One level of a packed value's ownership chain.\n\nA level is a pair, never a tensor axis: `offsets` gives the exclusive prefix\noffset of each parent's run and `owner` gives the owning position of each\nentry at this level. The two together are what a runtime walks to answer\n\"which request does this item belong to\".\n\nBoth are `shared`, never `request_aligned`. An exclusive prefix sum is not\npermutation-followable — permuting rows does not permute a prefix-offset\nvector, it invalidates it — so a runtime that compacts rebuilds the chain\nrather than gathering it.",
+      "properties": {
+        "offsets": {
+          "description": "Value holding the exclusive prefix offset of each parent's run at this\nlevel, with a final entry holding the total. Its extent is the parent\ncount plus one.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "owner": {
+          "description": "Value mapping each entry at this level to the position of its parent.\nIts extent is this level's own unit count, which at level zero is the\npacked extent.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "offsets",
+        "owner"
+      ],
+      "type": "object"
+    },
     "PackageFacts": {
       "additionalProperties": false,
       "description": "Exact package facts required to interpret request data correctly.",
@@ -2217,24 +2263,39 @@
       },
       "type": "object"
     },
-    "PadMask": {
-      "additionalProperties": false,
-      "description": "The mask that says which entries of a padded tensor are real, and the axis\nit marks them along.\n\nThe axis is stated rather than inferred. A rank-2 mask over a rank-5 clip\ntensor could plausibly mark frames, tiles, or patches, and a reader that\nguessed from rank alone would silently mark the wrong axis for any tensor\nwhose padded axis is not the one the reader assumed. Naming it costs one\ninteger and removes the guess.",
-      "properties": {
-        "axis": {
-          "description": "Axis of the masked tensor whose entries the mask marks.",
-          "format": "uint",
-          "minimum": 0,
-          "type": "integer"
+    "PackedExtent": {
+      "description": "Where the extent of a component output's packed axis comes from.\n\nNeither answer is derivable from the contract: an output of the same rank\nand symbols as its input may be a per-item transform or a token merger, and\nthe two split at completely different boundaries.",
+      "oneOf": [
+        {
+          "const": "preserved",
+          "description": "The level's units correspond one-to-one, in order, with an input\nlevel's, so the output reuses that input's companions unchanged. A\ncomponent may drop inner levels it has consumed; it may not invent a\ncorrespondence it does not have.",
+          "type": "string"
         },
-        "value": {
-          "description": "Workflow value, or sibling port of the same component, whose booleans or\nintegers mark the valid entries.",
+        {
+          "const": "produced",
+          "description": "The graph decides the extent, so the level's companions are outputs of\nthe same component. An input's offsets describe an extent this value\ndoes not have.",
+          "type": "string"
+        }
+      ]
+    },
+    "PaddedDimension": {
+      "additionalProperties": false,
+      "description": "One padded dimension of a value and the companion that bounds it.\n\nThe dimension is named by its shape symbol rather than by an axis index. The\nsame extent sits at different positions in different values — `patches` is\naxis 1 of the pixel tensor and axis 0 of a pooled one — and an index would\nname whichever the author happened to be looking at.\n\nPadding is always appended: the real entries of a padded dimension form a\nprefix. That is what lets one integer per enclosing entry say everything a\nfull boolean mask would say, and it is a rule rather than a convention\nbecause left padding would shift every position-dependent computation and an\ninterior hole cannot be expressed by a length at all.",
+      "properties": {
+        "dimension": {
+          "description": "Shape symbol of the padded dimension of the owning value.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "valid_lengths": {
+          "description": "Value giving how many leading entries of `dimension` are real, one entry\nper position of the axes outer to it.\n\nIt resolves in the namespace of the contract's owner: a sibling port for\na component port, a workflow value for a workflow input, output, or\nstate cell.",
+          "minLength": 1,
           "type": "string"
         }
       },
       "required": [
-        "value",
-        "axis"
+        "dimension",
+        "valid_lengths"
       ],
       "type": "object"
     },
@@ -3798,16 +3859,12 @@
           "default": false,
           "type": "boolean"
         },
-        "pad_mask": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PadMask"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Which entries of this tensor are real rather than padding.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na batch whose rows carry different amounts of data has to be padded up to\na common extent. Nothing in the padded tensor says where the real entries\nstop, and guessing from a sentinel is exactly the hidden heuristic this\nschema refuses: the mask is named, typed, and validated like any other\nvalue. Absence means every entry is valid."
+        "padding": {
+          "description": "Which dimensions of this tensor may be padded, and where the truth\nabout how much of each entry is real is recorded.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na group whose items carry different amounts of data has to be padded up\nto a common extent. Nothing in the padded tensor says where the real\nentries stop, and guessing from a sentinel is exactly the hidden\nheuristic this schema refuses: validity is named, typed, and validated\nlike any other value. An empty list means the value carries no padding,\nand a runtime must not introduce any.\n\nOne entry per padded dimension: a clip tensor padded along frames and\nagain along patches states both, because a single companion cannot say\nwhere two independent extents end.",
+          "items": {
+            "$ref": "#/$defs/PaddedDimension"
+          },
+          "type": "array"
         },
         "rank": {
           "format": "uint",
@@ -4095,7 +4152,7 @@
       "type": "object"
     },
     "VisionOutputContent": {
-      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Packing is layered, so each level\nnames its own pair: `item_offsets`/`item_owner` for the patches or\ntokens a vision encoder consumes, `frame_offsets`/`frame_owner` for\nthe frames a clip contributes, and `clip_offsets`/`clip_owner` when\none request carries several clips. A still image uses the item pair\nalone, because it has exactly one frame and no clip structure.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract — `batch_layout` and `pad_mask` — which is what the\nvalidator enforces.",
+      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Two roles cover every level:\n`pack_offsets` and `pack_owner`. Which level a value serves is\nstated by the ownership chain that references it, not by its role,\nso a frames-to-clips pair and a clips-to-rows pair carry the same\ntwo roles and a runtime resolves both the same way whatever the\nmedium calls its levels. `valid_lengths` says how much of a padded\ndimension is real, and is shared with the audio vocabulary rather\nthan duplicated.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract — `batch_layout` and `padding` — which is what the\nvalidator enforces.",
       "oneOf": [
         {
           "enum": [
@@ -4105,12 +4162,9 @@
             "original_size",
             "transformed_size",
             "validity_mask",
-            "item_offsets",
-            "item_owner",
-            "frame_offsets",
-            "frame_owner",
-            "clip_offsets",
-            "clip_owner"
+            "valid_lengths",
+            "pack_offsets",
+            "pack_owner"
           ],
           "title": "Known standard value"
         },
@@ -4123,12 +4177,9 @@
               "original_size",
               "transformed_size",
               "validity_mask",
-              "item_offsets",
-              "item_owner",
-              "frame_offsets",
-              "frame_owner",
-              "clip_offsets",
-              "clip_owner"
+              "valid_lengths",
+              "pack_offsets",
+              "pack_owner"
             ]
           },
           "title": "Forward-compatible extension value",
@@ -4616,7 +4667,7 @@
               "type": "null"
             }
           ],
-          "description": "How many request rows one invocation of this component may carry.\n\nAbsence means one request row per invocation: a runtime that wants to\nserve two requests calls the component twice. That is the safe reading\nfor every component whose producer has not thought about batching, so it\nis the default. A component that declares a capacity is stating that its\nartifact accepts several rows stacked on one axis, which is the fact a\nscheduler needs before it may coalesce work."
+          "description": "How much one invocation of this component may carry.\n\nAbsence means one request row per invocation: a runtime that wants to\nserve two requests calls the component twice. That is the safe reading\nfor every component whose producer has not thought about batching, so it\nis the default. A component that declares a capacity is stating that its\nartifact accepts several contributions stacked on one axis, which is the\nfact a scheduler needs before it may coalesce work."
         },
         "cache_affects_state": {
           "description": "Non-dataflow facts that change this component's observable state.\n\nCache correctness dependencies of ONNX components are derived from the\nworkflow SSA graph. Native and external components must declare any\nadditional state they read that is not visible as a typed input.",
@@ -5365,7 +5416,7 @@
       "type": "array"
     },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes; additive fields keep the\nsame major version and rely on the forward-compatible \"ignore unknown\nfields\" rule.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.",
       "type": [
         "string",
         "null"

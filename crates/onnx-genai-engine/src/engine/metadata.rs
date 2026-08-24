@@ -672,7 +672,7 @@ pub fn graph_port_contracts(
                 shape: None,
                 optional: false,
                 batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
-                pad_mask: None,
+                padding: Vec::new(),
             },
         );
     }
