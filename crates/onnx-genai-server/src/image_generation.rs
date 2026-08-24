@@ -2,8 +2,8 @@ use anyhow::Context;
 use onnx_genai::{GenerateOptions, GeneratePrompt, GenerateRequest};
 use onnx_genai_engine::PipelineGenerateRequest;
 use onnx_genai_metadata::{
-    ImageOutputValueRange, LiteralValue, PipelineSpec, RuntimeInputRole, ScalarValue,
-    SemanticInputRole, TensorContract, WorkflowInputSource, WorkflowOutputRole,
+    LiteralValue, PipelineSpec, PixelValueRange, RuntimeInputRole, ScalarValue, SemanticInputRole,
+    TensorContract, WorkflowInputSource, WorkflowOutputRole,
 };
 use onnx_genai_ort::{DataType, Tokenizer, Value};
 
@@ -17,7 +17,7 @@ pub(crate) struct ImageInputBinding {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImagePipelineSpec {
-    pub(crate) output_value_range: ImageOutputValueRange,
+    pub(crate) output_value_range: PixelValueRange,
     pub(crate) prompt_tokens: Option<ImageInputBinding>,
     pub(crate) negative_prompt_tokens: Option<ImageInputBinding>,
     pub(crate) seed: Option<ImageInputBinding>,

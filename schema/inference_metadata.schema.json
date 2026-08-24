@@ -562,7 +562,7 @@
       "type": "string"
     },
     "AudioPreprocessingProgram": {
-      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `ImagePreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
+      "description": "Generic audio preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata, mirroring `VisionPreprocessingProgram`. Transform operations are\ngeneric (decode, resample, downmix, rescale, normalize, pad, frame,\nspectrogram, log_mel). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `input_values`,\n`input_features`, `attention_mask`, or anything else without introducing\nruntime model-family dispatch.\n\nOne program type covers every audio family. A CTC acoustic model declares\nresample/downmix/zero_mean_unit_variance over raw samples; an\nencoder-decoder speech model declares resample/pad/log_mel over a fixed\nwindow. The runtime reads the same fields either way.",
       "properties": {
         "outputs": {
           "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
@@ -1599,498 +1599,6 @@
       },
       "type": "object"
     },
-    "ImageOutputBinding": {
-      "description": "One named tensor output produced by an image preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
-      "properties": {
-        "content": {
-          "$ref": "#/$defs/ImageOutputContent",
-          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed\nbatch) — never a model-family label."
-        },
-        "contract": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TensorContract"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
-        },
-        "dtype": {
-          "$ref": "#/$defs/TensorDType",
-          "description": "Declared output dtype. Always explicit; never inferred from the model."
-        },
-        "name": {
-          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
-          "examples": [
-            "image.pixel_values"
-          ],
-          "minLength": 1,
-          "type": "string"
-        },
-        "optional": {
-          "description": "Whether the runtime may omit this output when a model does not need it.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "pad_value": {
-          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "source": {
-          "description": "Named processor-local value produced by a transform.",
-          "minLength": 1,
-          "type": "string"
-        }
-      },
-      "required": [
-        "source",
-        "name",
-        "content",
-        "dtype"
-      ],
-      "type": "object"
-    },
-    "ImageOutputContent": {
-      "description": "Generic image-output content-role vocabulary.\n\nA program that packs the images of several requests into one batch\nemits the two values that map packed items back to request rows —\n`item_offsets` and `item_owner` — alongside the pixels themselves.\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose.",
-      "oneOf": [
-        {
-          "enum": [
-            "pixels",
-            "patch_coordinates",
-            "grid_dimensions",
-            "original_size",
-            "transformed_size",
-            "validity_mask",
-            "item_offsets",
-            "item_owner"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "pixels",
-              "patch_coordinates",
-              "grid_dimensions",
-              "original_size",
-              "transformed_size",
-              "validity_mask",
-              "item_offsets",
-              "item_owner"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
-    "ImageOutputValueRange": {
-      "description": "Numeric interpretation of pixels emitted by an image workflow output.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
-      "enum": [
-        "zero_to_one",
-        "negative_one_to_one",
-        "zero_to_255"
-      ],
-      "type": "string"
-    },
-    "ImagePreprocessingProgram": {
-      "description": "Generic image preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad). In workflow metadata, outputs are materialized by a\nmanifest-pinned preprocessing adapter invocation and bind processor-local\nvalues to typed SSA names. A package may name an output `pixel_position_ids`,\n`image_grid_thw`, or anything else without introducing runtime model-family\ndispatch.",
-      "properties": {
-        "outputs": {
-          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
-          "items": {
-            "$ref": "#/$defs/ImageOutputBinding"
-          },
-          "minItems": 1,
-          "type": "array"
-        },
-        "transforms": {
-          "description": "Ordered list of generic transform operations applied to decoded pixels.",
-          "items": {
-            "$ref": "#/$defs/ImageTransform"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "outputs"
-      ],
-      "type": "object"
-    },
-    "ImageSizeSpec": {
-      "anyOf": [
-        {
-          "description": "A single edge length applied to both dimensions.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
-        },
-        {
-          "description": "Explicit width and height.",
-          "properties": {
-            "height": {
-              "description": "Target height in pixels.",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "width": {
-              "description": "Target width in pixels.",
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            }
-          },
-          "required": [
-            "width",
-            "height"
-          ],
-          "type": "object"
-        }
-      ],
-      "description": "A square size or an explicit width/height for an image transform."
-    },
-    "ImageTransform": {
-      "description": "One generic image transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
-      "properties": {
-        "canvas_pad_value": {
-          "description": "RGB canvas fill value applied before dynamic tiling.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "channel_order": {
-          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "coordinate_order": {
-          "description": "Patch-coordinate component order (`yx` or `xy`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "flatten": {
-          "description": "Whether `patchify` flattens each patch into a single feature vector.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "include_thumbnail": {
-          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "inputs": {
-          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "interpolation": {
-          "description": "Interpolation filter for a `resize` operation — generic string data.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "mask_patch_size": {
-          "description": "Pixel edge represented by one validity-mask cell.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_patches": {
-          "description": "Maximum number of spatial patches for a patch-budget resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_pixels": {
-          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "max_tiles": {
-          "description": "Maximum number of local tiles for a `tile` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "mean": {
-          "description": "Per-channel mean for a `normalize` operation (length is model data).",
-          "items": {
-            "format": "float",
-            "type": "number"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "merge_size": {
-          "description": "Spatial patch-group edge controlling packed patch traversal order.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "min_pixels": {
-          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "mode": {
-          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "op": {
-          "$ref": "#/$defs/ImageTransformOp",
-          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
-        },
-        "outputs": {
-          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `ImageOutputBinding::source`.",
-          "items": {
-            "minLength": 1,
-            "type": "string"
-          },
-          "minItems": 1,
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "pad_value": {
-          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "patch_order": {
-          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one image token.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "patch_size": {
-          "description": "Edge length of a square patch for a `patchify` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "pooling_kernel_size": {
-          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "scale": {
-          "description": "Scalar multiplier for a `rescale` operation.",
-          "format": "double",
-          "type": [
-            "number",
-            "null"
-          ]
-        },
-        "size": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ImageSizeSpec"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Target size for a `resize` operation."
-        },
-        "size_multiple": {
-          "description": "Required divisibility of both resized dimensions.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "std": {
-          "description": "Per-channel standard deviation for a `normalize` operation.",
-          "items": {
-            "format": "float",
-            "type": "number"
-          },
-          "type": [
-            "array",
-            "null"
-          ]
-        },
-        "target_length": {
-          "description": "Exact first-axis length produced by a `pad` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "temporal_order": {
-          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "temporal_patch_size": {
-          "description": "Number of identical temporal frames packed into each spatial patch.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
-        "thumbnail_interpolation": {
-          "description": "Interpolation filter used specifically for a global thumbnail.",
-          "minLength": 1,
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "thumbnail_order": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/ThumbnailOrder"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Ordering of a global thumbnail relative to local tiles."
-        },
-        "tile_size": {
-          "description": "Edge length of a square tile for a `tile` operation.",
-          "format": "uint",
-          "minimum": 1,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "op"
-      ],
-      "type": "object"
-    },
-    "ImageTransformOp": {
-      "description": "Generic image transform-operation vocabulary.",
-      "oneOf": [
-        {
-          "enum": [
-            "decode",
-            "decode_rgb",
-            "convert_rgb",
-            "resize",
-            "rescale",
-            "normalize",
-            "tile",
-            "flatten",
-            "patchify",
-            "pad",
-            "emit_original_size",
-            "emit_transformed_size",
-            "emit_validity_mask",
-            "emit_patch_coordinates",
-            "emit_grid_coordinates"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "decode",
-              "decode_rgb",
-              "convert_rgb",
-              "resize",
-              "rescale",
-              "normalize",
-              "tile",
-              "flatten",
-              "patchify",
-              "pad",
-              "emit_original_size",
-              "emit_transformed_size",
-              "emit_validity_mask",
-              "emit_patch_coordinates",
-              "emit_grid_coordinates"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "KeySequenceLengthsSpec": {
       "description": "Explicit compatibility rules for attention key-sequence-length metadata.",
       "properties": {
@@ -2749,6 +2257,15 @@
       ],
       "type": "object"
     },
+    "PixelValueRange": {
+      "description": "Numeric interpretation of pixels emitted by an image or video workflow\noutput.\n\nA frame carries the same pixels a still image does, so both output roles\nread their normalization from one contract rather than from two vocabularies\nthat could disagree.\n\nThis is an output contract, not a model-family hint: consumers must never\ninfer normalization from observed pixel values.",
+      "enum": [
+        "zero_to_one",
+        "negative_one_to_one",
+        "zero_to_255"
+      ],
+      "type": "string"
+    },
     "PoolingKind": {
       "description": "Pooling reduction kind.",
       "enum": [
@@ -2887,13 +2404,24 @@
         "image": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ImagePreprocessingProgram"
+              "$ref": "#/$defs/VisionPreprocessingProgram"
             },
             {
               "type": "null"
             }
           ],
-          "description": "Typed image preprocessing transform program and its named tensor outputs."
+          "description": "Typed still-image preprocessing program and its named tensor outputs."
+        },
+        "video": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VisionPreprocessingProgram"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Typed video preprocessing program and its named tensor outputs.\n\nA video is a still image plus a temporal axis, so it declares the same\nprogram type: the spatial transforms and their parameters are identical,\nand the temporal ones (`sample_frames`, `pad_frames`) are further\noperations in the same generic vocabulary. Splitting the two would\nduplicate every spatial parameter for no gain, while keeping them one\nkey would hide that a package preprocesses stills and clips differently."
         }
       },
       "type": "object"
@@ -4475,6 +4003,527 @@
       ],
       "type": "object"
     },
+    "VisionOutputBinding": {
+      "description": "One named tensor output produced by a pixel preprocessing program.\n\nThe output binds a processor-local value to a typed workflow SSA name.\nNeither the name nor the content role is inferred from a model identity.",
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/VisionOutputContent",
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed batch\nat item, frame, or clip granularity) — never a model-family label."
+        },
+        "contract": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TensorContract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Full workflow tensor contract. Required when `pipeline.workflow` is present."
+        },
+        "dtype": {
+          "$ref": "#/$defs/TensorDType",
+          "description": "Declared output dtype. Always explicit; never inferred from the model."
+        },
+        "name": {
+          "description": "Workflow SSA value produced by the preprocessing adapter invocation.",
+          "examples": [
+            "image.pixel_values"
+          ],
+          "minLength": 1,
+          "type": "string"
+        },
+        "optional": {
+          "description": "Whether the runtime may omit this output when a model does not need it.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Optional sentinel/pad value for padded entries (e.g. `-1` coordinates).",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "source": {
+          "description": "Named processor-local value produced by a transform.",
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "source",
+        "name",
+        "content",
+        "dtype"
+      ],
+      "type": "object"
+    },
+    "VisionOutputContent": {
+      "description": "Generic pixel-output content-role vocabulary.\n\nA program that packs the media of several requests into one batch\nemits the values that map packed entries back to request rows,\nalongside the pixels themselves. Packing is layered, so each level\nnames its own pair: `item_offsets`/`item_owner` for the patches or\ntokens a vision encoder consumes, `frame_offsets`/`frame_owner` for\nthe frames a clip contributes, and `clip_offsets`/`clip_owner` when\none request carries several clips. A still image uses the item pair\nalone, because it has exactly one frame and no clip structure.\n\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose. What\neach value must structurally satisfy is stated by its tensor\ncontract — `batch_layout` and `pad_mask` — which is what the\nvalidator enforces.",
+      "oneOf": [
+        {
+          "enum": [
+            "pixels",
+            "patch_coordinates",
+            "grid_dimensions",
+            "original_size",
+            "transformed_size",
+            "validity_mask",
+            "item_offsets",
+            "item_owner",
+            "frame_offsets",
+            "frame_owner",
+            "clip_offsets",
+            "clip_owner"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "pixels",
+              "patch_coordinates",
+              "grid_dimensions",
+              "original_size",
+              "transformed_size",
+              "validity_mask",
+              "item_offsets",
+              "item_owner",
+              "frame_offsets",
+              "frame_owner",
+              "clip_offsets",
+              "clip_owner"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
+    "VisionPreprocessingProgram": {
+      "description": "Generic pixel preprocessing program: an ordered transform pipeline plus the\nnamed workflow SSA tensor outputs it emits.\n\nThe program is expressed entirely as parameterized, architecture-neutral\ndata. Transform operations are generic (decode, resize, rescale, normalize,\ntile, patchify, pad, and for clips sample_frames and pad_frames). In workflow\nmetadata, outputs are materialized by a manifest-pinned preprocessing adapter\ninvocation and bind processor-local values to typed SSA names. A package may\nname an output `pixel_position_ids`, `image_grid_thw`, `video_grid_thw`, or\nanything else without introducing runtime model-family dispatch.\n\nOne program type covers stills and clips, the way one audio program covers\nevery audio family: a frame is an image, so a video program declares the\nsame spatial work plus the temporal operations that select and pad frames.",
+      "properties": {
+        "outputs": {
+          "description": "Named tensor outputs the program emits, each bound to a workflow SSA value.",
+          "items": {
+            "$ref": "#/$defs/VisionOutputBinding"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "transforms": {
+          "description": "Ordered list of generic transform operations applied to decoded pixels.",
+          "items": {
+            "$ref": "#/$defs/VisionTransform"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "outputs"
+      ],
+      "type": "object"
+    },
+    "VisionSizeSpec": {
+      "anyOf": [
+        {
+          "description": "A single edge length applied to both dimensions.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "description": "Explicit width and height.",
+          "properties": {
+            "height": {
+              "description": "Target height in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "description": "Target width in pixels.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "A square size or an explicit width/height for a pixel transform."
+    },
+    "VisionTransform": {
+      "description": "One generic pixel transform operation.\n\n`op` selects the operation from a generic vocabulary; the remaining fields\nare the parameters that operation reads (only the relevant ones are set).\nEvery parameter is model DATA — concrete sizes, patch sizes, means, and so on\nlive in a model's fixture, never as constants baked into this schema.",
+      "properties": {
+        "canvas_pad_value": {
+          "description": "RGB canvas fill value applied before dynamic tiling.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "channel_order": {
+          "description": "Flattened patch feature order (`channels_first` or `channels_last`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "coordinate_order": {
+          "description": "Patch-coordinate component order (`yx` or `xy`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flatten": {
+          "description": "Whether `patchify` flattens each patch into a single feature vector.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "fps": {
+          "description": "Frame rate a `sample_frames` operation resamples a clip to.\n\nTemporal parameters, like every other parameter here, are model DATA: a\npackage that preprocesses clips states its own sampling rate and frame\nbudget instead of a runtime inferring them from a model family.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "frame_stride": {
+          "description": "Stride, in decoded frames, between the frames `sample_frames` selects.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "include_thumbnail": {
+          "description": "Whether a `tile` operation also emits a global thumbnail tile.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "inputs": {
+          "description": "Named values consumed by this transform.\n\nAbsent means the operation consumes the immediately preceding value.\nExplicit names allow branching programs without tensor-name heuristics.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "interpolation": {
+          "description": "Interpolation filter for a `resize` operation — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mask_patch_size": {
+          "description": "Pixel edge represented by one validity-mask cell.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_patches": {
+          "description": "Maximum number of spatial patches for a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_pixels": {
+          "description": "Maximum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tiles": {
+          "description": "Maximum number of local tiles for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mean": {
+          "description": "Per-channel mean for a `normalize` operation (length is model data).",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "merge_size": {
+          "description": "Spatial patch-group edge controlling packed patch traversal order.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_pixels": {
+          "description": "Minimum pixel area for an aspect-preserving `pixel_area` resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "num_frames": {
+          "description": "Exact number of frames a `sample_frames` operation selects from a clip.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "op": {
+          "$ref": "#/$defs/VisionTransformOp",
+          "description": "Generic operation selector (e.g. `resize`, `normalize`, `patchify`)."
+        },
+        "outputs": {
+          "description": "Named values produced by this transform.\n\nThese names are processor-local data. Final graph bindings select them\nthrough `VisionOutputBinding::source`.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "pad_value": {
+          "description": "Fill value for a `pad` operation, or sentinel for padded coordinates.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "patch_order": {
+          "description": "Order patches are emitted in (`merge_groups`, the default, or `raster`).\nIndependent of `merge_size`, which only sets how many patches collapse\ninto one vision token.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "patch_size": {
+          "description": "Edge length of a square patch for a `patchify` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pooling_kernel_size": {
+          "description": "Spatial pooling edge used when resolving a patch-budget resize.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scale": {
+          "description": "Scalar multiplier for a `rescale` operation.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VisionSizeSpec"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Target size for a `resize` operation."
+        },
+        "size_multiple": {
+          "description": "Required divisibility of both resized dimensions.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "std": {
+          "description": "Per-channel standard deviation for a `normalize` operation.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "target_length": {
+          "description": "Exact first-axis length produced by a `pad` operation, or the exact frame\ncount produced by a `pad_frames` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "temporal_order": {
+          "description": "Relative nesting of the temporal and channel axes inside a flattened\n`channels_first` patch (`channel_major` or `temporal_major`).",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "temporal_patch_size": {
+          "description": "Number of identical temporal frames packed into each spatial patch.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "thumbnail_interpolation": {
+          "description": "Interpolation filter used specifically for a global thumbnail.",
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thumbnail_order": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThumbnailOrder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Ordering of a global thumbnail relative to local tiles."
+        },
+        "tile_size": {
+          "description": "Edge length of a square tile for a `tile` operation.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "op"
+      ],
+      "type": "object"
+    },
+    "VisionTransformOp": {
+      "description": "Generic pixel transform-operation vocabulary.\n\nOne vocabulary spans stills and clips. A still-image program never\nselects frames; a clip program samples and pads them and then does\nthe same spatial work. `sample_frames` and `pad_frames` are the two\noperations a temporal axis adds, not a second program dialect.",
+      "oneOf": [
+        {
+          "enum": [
+            "decode",
+            "decode_rgb",
+            "convert_rgb",
+            "sample_frames",
+            "resize",
+            "rescale",
+            "normalize",
+            "tile",
+            "flatten",
+            "patchify",
+            "pad",
+            "pad_frames",
+            "emit_original_size",
+            "emit_transformed_size",
+            "emit_validity_mask",
+            "emit_patch_coordinates",
+            "emit_grid_coordinates"
+          ],
+          "title": "Known standard value"
+        },
+        {
+          "not": {
+            "enum": [
+              "decode",
+              "decode_rgb",
+              "convert_rgb",
+              "sample_frames",
+              "resize",
+              "rescale",
+              "normalize",
+              "tile",
+              "flatten",
+              "patchify",
+              "pad",
+              "pad_frames",
+              "emit_original_size",
+              "emit_transformed_size",
+              "emit_validity_mask",
+              "emit_patch_coordinates",
+              "emit_grid_coordinates"
+            ]
+          },
+          "title": "Forward-compatible extension value",
+          "type": "string"
+        }
+      ],
+      "type": "string"
+    },
     "WorkflowBranchOutput": {
       "additionalProperties": false,
       "properties": {
@@ -4778,7 +4827,7 @@
         "value_range": {
           "anyOf": [
             {
-              "$ref": "#/$defs/ImageOutputValueRange"
+              "$ref": "#/$defs/PixelValueRange"
             },
             {
               "type": "null"
@@ -5248,7 +5297,7 @@
           "type": "null"
         }
       ],
-      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contract (currently the image\ntransform program and its named tensor outputs). Every operation and\noutput is generic, parameterized data — never a model family, vendor\nstring, or baked-in shape. Absent means the model declares no native\npreprocessing program and a runtime must obtain it elsewhere or fail."
+      "description": "Declared, architecture-neutral input preprocessing programs.\n\nCarries the typed multimodal preprocessing contracts: the still-image,\nvideo, and audio transform programs and their named tensor outputs.\nEvery operation and output is generic, parameterized data — never a\nmodel family, vendor string, or baked-in shape. Absent means the model\ndeclares no native preprocessing program and a runtime must obtain it\nelsewhere or fail."
     },
     "profiles": {
       "additionalProperties": {

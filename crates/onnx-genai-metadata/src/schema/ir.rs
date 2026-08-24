@@ -654,7 +654,7 @@ pub struct WorkflowOutput {
     pub contract: TensorContract,
     pub role: WorkflowOutputRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_range: Option<ImageOutputValueRange>,
+    pub value_range: Option<PixelValueRange>,
     pub stage: OutputStage,
     /// Concrete media delivery contract for a post-processing output.
     ///
@@ -666,13 +666,18 @@ pub struct WorkflowOutput {
     pub media: Option<MediaOutputContract>,
 }
 
-/// Numeric interpretation of pixels emitted by an image workflow output.
+/// Numeric interpretation of pixels emitted by an image or video workflow
+/// output.
+///
+/// A frame carries the same pixels a still image does, so both output roles
+/// read their normalization from one contract rather than from two vocabularies
+/// that could disagree.
 ///
 /// This is an output contract, not a model-family hint: consumers must never
 /// infer normalization from observed pixel values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ImageOutputValueRange {
+pub enum PixelValueRange {
     ZeroToOne,
     NegativeOneToOne,
     #[serde(rename = "zero_to_255")]

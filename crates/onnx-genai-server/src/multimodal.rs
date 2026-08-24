@@ -21,7 +21,7 @@ pub struct VisionInputSpec {
     /// binding an image is refused rather than silently ignored.
     placeholder_token_id: Option<u32>,
     /// The package's own image program, used to size each placeholder run.
-    program: Option<Box<onnx_genai_metadata::ImagePreprocessingProgram>>,
+    program: Option<Box<onnx_genai_metadata::VisionPreprocessingProgram>>,
 }
 
 impl VisionInputSpec {

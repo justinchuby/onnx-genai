@@ -713,14 +713,42 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
 
 /// One preprocessing output binding, viewed independently of its modality.
 ///
-/// Image and audio programs bind processor-local values to typed SSA names
-/// under identical rules, so the workflow checks below are written once against
-/// this view rather than duplicated per modality.
+/// Image, video, and audio programs bind processor-local values to typed SSA
+/// names under identical rules, so the workflow checks below are written once
+/// against this view rather than duplicated per modality.
 struct PreprocessingOutputView<'a> {
     name: &'a str,
     dtype: &'a str,
     contract: Option<&'a crate::schema::TensorContract>,
     optional: bool,
+}
+
+impl<'a> PreprocessingOutputView<'a> {
+    fn pixels(program: &'a crate::schema::VisionPreprocessingProgram) -> Vec<Self> {
+        program
+            .outputs
+            .iter()
+            .map(|output| PreprocessingOutputView {
+                name: &output.name,
+                dtype: &output.dtype,
+                contract: output.contract.as_ref(),
+                optional: output.optional.unwrap_or(false),
+            })
+            .collect()
+    }
+
+    fn audio(program: &'a crate::schema::AudioPreprocessingProgram) -> Vec<Self> {
+        program
+            .outputs
+            .iter()
+            .map(|output| PreprocessingOutputView {
+                name: &output.name,
+                dtype: &output.dtype,
+                contract: output.contract.as_ref(),
+                optional: output.optional.unwrap_or(false),
+            })
+            .collect()
+    }
 }
 
 fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
@@ -732,46 +760,32 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
         return;
     };
     let preprocessing = metadata.preprocessing.as_ref();
-    validate_preprocessing_program(
-        workflow,
-        "image",
-        "onnx-genai.image-preprocess",
-        preprocessing
-            .and_then(|spec| spec.image.as_ref())
-            .map(|program| {
-                program
-                    .outputs
-                    .iter()
-                    .map(|output| PreprocessingOutputView {
-                        name: &output.name,
-                        dtype: &output.dtype,
-                        contract: output.contract.as_ref(),
-                        optional: output.optional.unwrap_or(false),
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        errors,
-    );
-    validate_preprocessing_program(
-        workflow,
-        "audio",
-        "onnx-genai.audio-preprocess",
-        preprocessing
-            .and_then(|spec| spec.audio.as_ref())
-            .map(|program| {
-                program
-                    .outputs
-                    .iter()
-                    .map(|output| PreprocessingOutputView {
-                        name: &output.name,
-                        dtype: &output.dtype,
-                        contract: output.contract.as_ref(),
-                        optional: output.optional.unwrap_or(false),
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        errors,
-    );
+    let programs = [
+        (
+            "image",
+            "onnx-genai.image-preprocess",
+            preprocessing
+                .and_then(|spec| spec.image.as_ref())
+                .map(PreprocessingOutputView::pixels),
+        ),
+        (
+            "video",
+            "onnx-genai.video-preprocess",
+            preprocessing
+                .and_then(|spec| spec.video.as_ref())
+                .map(PreprocessingOutputView::pixels),
+        ),
+        (
+            "audio",
+            "onnx-genai.audio-preprocess",
+            preprocessing
+                .and_then(|spec| spec.audio.as_ref())
+                .map(PreprocessingOutputView::audio),
+        ),
+    ];
+    for (kind, abi, program_outputs) in programs {
+        validate_preprocessing_program(workflow, kind, abi, program_outputs, errors);
+    }
 }
 
 fn validate_preprocessing_program(
