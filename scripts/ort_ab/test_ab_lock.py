@@ -33,6 +33,7 @@ from ab import (  # noqa: E402
 )
 
 AB = Path(__file__).resolve().parent / "ab.py"
+SWEEP = Path(__file__).resolve().parent / "sweep_decode.py"
 HOSTLOCK = Path(__file__).resolve().parents[1] / "hostlock.sh"
 
 # A stub arm: prints the line `ab.py` parses and exits. Using a real benchmark
@@ -380,6 +381,135 @@ class EndToEnd(unittest.TestCase):
                 "unlocked:free",
                 "the escape hatch must leave the rows self-identifying",
             )
+
+
+STUB_BENCH = """#!/bin/sh
+# Emits one line in `bench_generic`'s paired format. The numbers are fixed:
+# nothing here measures anything, it only has to parse.
+echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 \\
+native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800"
+"""
+
+
+class SweepDecodeGate(unittest.TestCase):
+    """The thread sweep is the most saturating thing we run.
+
+    It is therefore the one driver where "somebody forgot the wrapper" costs
+    the most, both to the run and to whoever else is on the box.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir=str(SWEEP.parent))
+        self.bench = Path(self.tmp) / "bench.sh"
+        self.bench.write_text(STUB_BENCH)
+        self.bench.chmod(0o755)
+        self.env = dict(
+            os.environ, HOSTLOCK_DIR=f"{self.tmp}/hl", HOSTLOCK_PRIVATE_OK="1"
+        )
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def args(self):
+        return [
+            sys.executable,
+            str(SWEEP),
+            "--binary",
+            str(self.bench),
+            "--models",
+            "m.onnx",
+            "--threads",
+            "1",
+            "--trials",
+            "1",
+            "--runs",
+            "1",
+            "--warmups",
+            "0",
+        ]
+
+    def test_a_sweep_whose_lock_changed_hands_reports_it_and_fails(self):
+        """The rows are already printed, so the only honest move is to fail.
+
+        A sweep whose custody moved is not half-good data: the thread counts
+        above and below the change were compared across it. The fixture
+        rewrites `owner=` in the scratch lock while the stub bench runs, which
+        is what a real takeover looks like to the end-of-window read.
+        """
+        handoff = Path(self.tmp) / "handoff.sh"
+        handoff.write_text(
+            "#!/bin/sh\n"
+            'sed -i "s/^owner=.*/owner=someone-else/" "$HOSTLOCK_DIR/meta"\n'
+            + STUB_BENCH.split("\n", 1)[1]
+        )
+        handoff.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(handoff)
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "handoff fixture",
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertIn("host_lock=changed", out.stderr)
+        self.assertIn("discard", out.stderr)
+        self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_an_unlocked_sweep_refuses_before_it_starts_any_child(self):
+        out = subprocess.run(
+            self.args(), capture_output=True, text=True, env=self.env, timeout=300
+        )
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        self.assertIn("refusing to measure", out.stderr)
+        self.assertIn("sweep_decode.py", out.stderr)
+        # The remedy has to name the driver, not ab.py -- a wrapper someone
+        # pastes for the wrong script is a wrapper that does not span the arms.
+        self.assertNotIn("ab.py", out.stderr)
+        self.assertEqual(out.stdout, "")
+
+    def test_a_locked_sweep_runs_and_every_row_carries_the_label(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "sweep gate test",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        # `hostlock.sh run` prints its own outcome first, so the driver's
+        # output is found by content rather than by position.
+        lines = [l for l in out.stdout.splitlines() if l.strip()]
+        banner = next(l for l in lines if l.startswith("host_lock="))
+        self.assertIn("host_lock=mine:leon", banner)
+        self.assertIn("lock_owner=leon", banner)
+        header = next(l for l in lines if "ratio_min" in l).split()
+        self.assertEqual(header[-1], "host_lock")
+        # The label is on the DATA row, not only in a banner: a banner is lost
+        # the moment somebody pastes one interesting row into a doc.
+        row = next(l for l in lines if l.split()[0] == "m")
+        self.assertEqual(row.split()[-1], "mine:leon")
+        self.assertEqual(len(row.split()), len(header))
 
 
 if __name__ == "__main__":
