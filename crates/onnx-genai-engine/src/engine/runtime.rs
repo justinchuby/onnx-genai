@@ -1748,70 +1748,54 @@ impl Engine {
         session_state::token_count(&OrtSessionsRef(self), session_id)
     }
 
+    /// Whether the loaded package continues a conversation by putting it in
+    /// front of the next turn's prompt.
+    ///
+    /// This is the gate on charging a request for a session: only a package
+    /// whose carrier is `SessionStateCarrier::PromptContinuation` prepends the
+    /// conversation, so only for that one is the session's retained length part
+    /// of what the turn is prefilled with.
+    ///
+    /// It is **false** for everything else, and each for its own reason:
+    ///
+    /// * a **decode core** keeps its conversation in KV, which the request does
+    ///   not carry and the prefill does not repeat;
+    /// * a **loop-carried** or **group-held** lease is handed back inside the
+    ///   graph, so the tokens it stands for live in a cache the package bounds
+    ///   itself rather than in front of a prompt;
+    /// * a package with no session state has no conversation at all.
+    ///
+    /// Adding a session's retained count for any of those charges a turn twice
+    /// — inflating `usage`, halving the usable context, and refusing requests at
+    /// roughly half the model's limit.
+    ///
+    /// Answered from the shared classifier, never from "does this session hold
+    /// state": those are different questions with the same shape.
+    pub fn prepends_session_conversation(&self) -> bool {
+        if self.holds_decode_core() {
+            return false;
+        }
+        self.workflow.prepends_session_conversation()
+    }
+
     /// Tokens this session already holds in front of the next turn's prompt.
     ///
-    /// This is what a front end has to add to a request's own prompt length
-    /// before it enforces a context limit, admits a budget, or reports
-    /// `usage.prompt_tokens`: the model's window has to fit both, and a cap that
-    /// sees only the request lets a conversation grow past it and then produce
-    /// nothing.
-    ///
-    /// What counts as "in front of" differs by how the session is carried, and
-    /// that is the whole of the answer:
-    ///
-    /// * a **decode core** appends each turn's prompt to the sequence it
-    ///   retains, so everything it already holds is ahead of this turn. (Its
-    ///   prefix cache is consulted only for a session that starts empty, so a
-    ///   continuing turn never elides what came before.)
-    /// * a **`prompt_prefix` continuation** puts the conversation it holds in
-    ///   front of the prompt, so its length counts for the same reason.
-    /// * a **loop-carried or group-held** lease is handed back inside the graph:
-    ///   the tokens it stands for live in a cache the package bounds itself, not
-    ///   in front of a prompt, and counting them would charge a request for
-    ///   context it does not occupy. Zero.
-    ///
-    /// Read from the typed carrier classification rather than from whether a
-    /// session happens to hold state — those are different questions, and only
-    /// this one is a length a request will be charged for.
-    pub fn session_prefill_carry(
-        &self,
-        session_id: SessionId,
-    ) -> anyhow::Result<SessionPrefillCarry> {
-        if self.holds_decode_core() {
-            let retained = self.session_token_count(session_id)?;
-            #[cfg(feature = "native-backend")]
-            if self.decode_backend == EngineDecodeBackend::Native {
-                // The native session is a prefix-reuse cache, not a sequence
-                // this turn is appended to: it truncates its history to the
-                // common prefix with the incoming prompt and replaces it. The
-                // decoder is fed the prompt and nothing else, so nothing the
-                // session retains is in front of it.
-                return Ok(SessionPrefillCarry::default());
-            }
-            // The ORT session appends: its prefix cache is consulted only for a
-            // session that starts empty, so a continuing turn sits behind
-            // everything the session already holds. None of it is computed
-            // again — that is what its KV is for.
-            return Ok(SessionPrefillCarry {
-                attended: retained,
-                reprefilled: 0,
-            });
+    /// Zero unless [`Self::prepends_session_conversation`] — the carrier gate —
+    /// is true. See it for why every other carrier contributes nothing.
+    pub fn session_prefill_carry(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        if !self.prepends_session_conversation() {
+            // Resolved through the same accessor a caller would use, so an
+            // unknown id is reported as one rather than answered with a zero.
+            self.session_token_count(session_id)?;
+            return Ok(0);
         }
         anyhow::ensure!(
             self.workflow_sessions.contains_key(&session_id),
             "session {session_id} not found"
         );
-        // A prompt prefix is put in front of the prompt *and* prefilled with it,
-        // every turn: it is carried as tokens because the package's own cache
-        // does not survive the invocation. Everything else the interpreter
-        // carries lives in a cache the package bounds itself.
-        let prepended = self
+        Ok(self
             .workflow
-            .session_prepended_prompt_len(&session_id.to_string());
-        Ok(SessionPrefillCarry {
-            attended: prepended,
-            reprefilled: prepended,
-        })
+            .session_prepended_prompt_len(&session_id.to_string()))
     }
 
     /// The tokens a session's conversation holds, oldest first.

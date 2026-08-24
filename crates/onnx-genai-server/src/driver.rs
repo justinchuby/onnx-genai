@@ -106,8 +106,7 @@ pub(crate) enum DriverCommand {
     /// Tokens this session will put in front of the next turn's prompt.
     SessionPrefillCarry {
         session_id: SessionId,
-        response:
-            tokio::sync::oneshot::Sender<anyhow::Result<onnx_genai_engine::SessionPrefillCarry>>,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
     },
     /// Generate, from whatever the request carried.
     ///
@@ -394,7 +393,7 @@ impl EngineDriver {
     pub(crate) async fn session_prefill_carry(
         &self,
         session_id: SessionId,
-    ) -> anyhow::Result<onnx_genai_engine::SessionPrefillCarry> {
+    ) -> anyhow::Result<usize> {
         let (response, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::SessionPrefillCarry {

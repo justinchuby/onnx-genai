@@ -413,11 +413,15 @@ pub(crate) enum CompletionGeneration {
         options: GenerateOptions,
     },
 }
-/// `error.type` for a request the loaded package cannot serve as asked.
+/// `error.type` for a request that conflicts with the state or the capability of
+/// what is loaded.
 ///
-/// A distinct kind so a client can tell "this package will never do that" from
-/// "the server broke", which a shared `server_error` hid.
-pub(crate) const PACKAGE_CAPABILITY_ERROR_KIND: &str = "package_capability_error";
+/// A 409 is never a fault: nothing broke, and the caller can act on it. Reporting
+/// one as `server_error` told a client to retry a crash.
+pub(crate) const CONFLICT_ERROR_KIND: &str = "conflict_error";
+
+/// `error.type` for a request the loaded package cannot serve as asked.
+pub(crate) const INVALID_REQUEST_ERROR_KIND: &str = "invalid_request_error";
 
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
@@ -430,11 +434,11 @@ impl ApiError {
     }
 
     /// A request the loaded package cannot serve, and no retry will change.
-    fn capability_bad_request(message: impl Into<String>) -> Self {
+    fn invalid_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
-            kind: PACKAGE_CAPABILITY_ERROR_KIND,
+            kind: INVALID_REQUEST_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -466,26 +470,13 @@ impl ApiError {
         }
     }
 
+    /// The request conflicts with the state or the capability of what is
+    /// loaded.
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
-            kind: "server_error",
-            retry_after_secs: None,
-        }
-    }
-
-    /// The caller and the loaded package disagree, and the same request may
-    /// succeed later.
-    ///
-    /// Distinct from [`Self::conflict`], whose other caller is a resource
-    /// override with nothing to do with a package: giving both the capability
-    /// kind would have made the discrimination it exists for unreliable.
-    fn capability_conflict(message: impl Into<String>) -> Self {
-        Self {
-            status: StatusCode::CONFLICT,
-            message: message.into(),
-            kind: PACKAGE_CAPABILITY_ERROR_KIND,
+            kind: CONFLICT_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -518,7 +509,7 @@ impl ApiError {
 /// operational one.
 pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     match onnx_genai_engine::package_capability_error(&error) {
-        Some(capability) => ApiError::capability_conflict(capability.to_string()),
+        Some(capability) => ApiError::conflict(capability.to_string()),
         None => ApiError::internal(format!("session create failed: {error}")),
     }
 }
@@ -539,9 +530,13 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // off the engine's own type, so neither status depends on wording.
         DriverFailureKind::PackageCapability(capability) => {
             if capability.is_retryable() {
-                ApiError::capability_conflict(capability.to_string())
+                // An exclusive lease already held: the same request succeeds
+                // once the turn in flight finishes.
+                ApiError::conflict(capability.to_string())
             } else {
-                ApiError::capability_bad_request(capability.to_string())
+                // A conversation past the bound its package declares: the
+                // caller shortens the turn or starts a new session.
+                ApiError::invalid_request(capability.to_string())
             }
         }
         DriverFailureKind::Internal => {

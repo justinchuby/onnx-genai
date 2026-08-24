@@ -2103,11 +2103,10 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
             .unwrap()
             .contains("cannot satisfy lowered resource limit")
     );
-    // A resource override has nothing to do with what the package can do, so it
-    // must not carry the kind a client reads to mean exactly that.
+    // A 409 is never a fault: nothing broke and the caller can act on it.
     assert_eq!(
         impossible["error"]["type"].as_str(),
-        Some("server_error"),
+        Some("conflict_error"),
         "{impossible}"
     );
 
@@ -3939,6 +3938,41 @@ fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf
     destination
 }
 
+async fn completion_turn(
+    router: axum::Router,
+    model: &str,
+    session: Option<&str>,
+    prompt: &str,
+) -> (StatusCode, Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(session) = session {
+        builder = builder.header("x-session-id", session);
+    }
+    let response = router
+        .oneshot(
+            builder
+                .body(Body::from(
+                    json!({
+                        "model": model,
+                        "prompt": prompt,
+                        "max_tokens": 2,
+                        "temperature": 0.0
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    (status, body)
+}
+
 async fn chat_turn(
     router: axum::Router,
     session: Option<&str>,
@@ -4401,90 +4435,108 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
     assert_eq!(plain.status(), StatusCode::OK);
 }
 
-/// A decode-core session is charged for what the model will actually hold.
+/// A decode-core session is charged the prompt it received, and nothing else.
 ///
-/// Its clients send only the new turn — `build_session_prompt` renders the last
-/// message — and the engine *appends* that to the sequence the session retains;
-/// the prefix cache is consulted only for a session that starts empty. So the
-/// tokens ahead of this turn are everything the session already holds, and a cap
-/// that saw only the request would let the conversation grow past the model's
-/// window and then produce nothing.
+/// `Engine::prepends_session_conversation` is false for it: its conversation
+/// lives in KV, which the request does not carry and which the prefill does not
+/// repeat. Adding the session's retained count would charge each turn twice —
+/// inflating `usage`, halving the usable context and refusing at roughly half
+/// the model's limit.
+///
+/// The client resends the conversation, which is what a decode-core client does
+/// on `/v1/completions`, where the prompt it sends is the prompt verbatim.
 #[tokio::test]
-async fn a_decode_core_turn_is_charged_for_the_conversation_the_engine_retains() {
+async fn a_decode_core_session_is_charged_only_its_request_prompt() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let handle = state
+        .registry
+        .resolve("")
+        .expect("registry")
+        .expect("a model is loaded");
+    let tokenizer = handle.tokenizer.clone();
+    drop(handle);
     let router = app(state);
     let session = "sess-decode-core";
 
-    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), "hello").await;
+    let turn_one = "hello";
+    let resent = "hello world the";
+    let expected = |text: &str| tokenizer.encode(text).expect("encode").len() as u64;
+
+    let (status, first) =
+        completion_turn(router.clone(), "tiny-llm", Some(session), turn_one).await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let first_prompt = first["usage"]["prompt_tokens"]
-        .as_u64()
-        .expect("prompt tokens");
-    let retained = session_tokens(&first);
     assert_eq!(
-        retained,
-        first_prompt
-            + first["usage"]["completion_tokens"]
-                .as_u64()
-                .expect("generated"),
-        "the session retains this turn's prompt and generation: {first}"
+        first["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        expected(turn_one),
+        "the first turn is charged its own prompt: {first}"
     );
 
-    // The same message again. It renders identically, so any growth in what the
-    // turn is charged is the conversation now ahead of it.
-    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), "hello").await;
+    // Turn two resends the conversation. It is charged exactly what it sent —
+    // not that plus what the session retains.
+    let (status, second) = completion_turn(router.clone(), "tiny-llm", Some(session), resent).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(
         second["usage"]["prompt_tokens"]
             .as_u64()
             .expect("prompt tokens"),
-        first_prompt + retained,
-        "a continuing turn is charged the sequence the engine appends it to: {second}"
+        expected(resent),
+        "a decode-core turn is charged its request prompt, not its prompt plus the session's: \
+         {second}"
+    );
+
+    // The same request with no session at all is charged the same, which is what
+    // "the session did not change the accounting" means.
+    let (status, stateless) = completion_turn(router, "tiny-llm", None, resent).await;
+    assert_eq!(status, StatusCode::OK, "{stateless}");
+    assert_eq!(
+        stateless["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        second["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
     );
 }
 
-/// A conversation that outgrows the model's window is refused, not silently
-/// answered with nothing.
+/// And its context and budget are not halved by the session either.
 ///
-/// The engine stops before taking a step once the sequence reaches the context
-/// limit and reports `length` with zero tokens. A 200 whose completion is empty
-/// tells a caller nothing it can act on; the context cap has to see the retained
-/// conversation so the refusal is the actionable 400 instead.
+/// Two turns each a bit under half the model's window: together they exceed it,
+/// which is exactly what the double count would have added up before refusing
+/// the second.
 #[tokio::test]
-async fn a_decode_core_conversation_past_the_window_is_refused_not_answered_empty() {
+async fn a_decode_core_session_does_not_halve_the_context_or_the_budget() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
+    let handle = state
+        .registry
+        .resolve("")
+        .expect("registry")
+        .expect("a model is loaded");
+    let context = handle
+        .model_max_context
+        .expect("the fixture declares a context limit");
+    drop(handle);
     let router = app(state);
-    let session = "sess-decode-core-window";
+    let session = "sess-decode-core-budget";
 
-    // The fixture's window is 16 tokens, so a ten-token turn fits once and the
-    // conversation it leaves does not leave room for a second.
-    let message = "the quick brown fox jumps over the lazy dog";
-    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), message).await;
-    assert_eq!(status, StatusCode::OK, "{first}");
-    assert!(
-        first["usage"]["completion_tokens"]
-            .as_u64()
-            .expect("generated")
-            > 0,
-        "the first turn generates: {first}"
-    );
-
-    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), message).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a conversation past the model's window is the caller's to shorten, not a 200 with an \
-         empty completion: {second}"
-    );
-    assert!(
-        second["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("context limit"),
-        "the refusal names the limit it hit: {second}"
-    );
+    let prompt = "hello world ".repeat(context / 4);
+    for turn in 0..2 {
+        let (status, body) =
+            completion_turn(router.clone(), "tiny-llm", Some(session), prompt.trim()).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "turn {} must be admitted on its own length: {body}",
+            turn + 1
+        );
+        assert!(
+            body["choices"][0]["text"].is_string(),
+            "and the budget it was admitted with is its own: {body}"
+        );
+    }
 }
 
 /// A lease the graph carries is not in front of the prompt, so it is not
@@ -4608,8 +4660,8 @@ async fn a_capability_refusal_body_names_the_disagreement_not_a_fault() {
         serde_json::from_slice(&to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(
         body["error"]["type"].as_str(),
-        Some("package_capability_error"),
-        "a capability refusal is its own kind, not a server fault: {body}"
+        Some("conflict_error"),
+        "a capability refusal is a conflict, not a server fault: {body}"
     );
     assert!(
         body["error"]["message"]
@@ -4664,7 +4716,7 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
     );
     assert_eq!(
         second["error"]["type"].as_str(),
-        Some("package_capability_error"),
+        Some("invalid_request_error"),
         "{second}"
     );
     assert!(
@@ -4687,26 +4739,27 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     use onnx_genai_engine::PackageCapabilityError;
 
     let busy = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-        PackageCapabilityError::SessionBusy {
+        PackageCapabilityError::ExclusiveLeaseConflict {
             session: "shared".to_string(),
         },
     ));
     let response = crate::routes::generation_failure(busy);
     assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(response.kind, "package_capability_error");
-    assert!(response.message.contains("already has a turn in flight"));
+    assert_eq!(response.kind, "conflict_error");
+    // The structured field, not the sentence: nothing may depend on wording.
+    assert!(response.message.contains("shared"));
 
     let over_bound = crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
         PackageCapabilityError::ConversationOverBound {
             cell: "conversation".to_string(),
-            reached: 12,
+            requested: 12,
             bound: 6,
         },
     ));
     let response = crate::routes::generation_failure(over_bound);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
-    assert_eq!(response.kind, "package_capability_error");
-    assert!(response.message.contains("declares a bound of 6"));
+    assert_eq!(response.kind, "invalid_request_error");
+    assert!(response.message.contains('6'));
 
     // An ordinary failure is still a server error, so the new kind cannot
     // swallow a real fault.
@@ -4715,4 +4768,157 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     let response = crate::routes::generation_failure(internal);
     assert_eq!(response.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert_eq!(response.kind, "server_error");
+}
+
+/// All three session refusals, on both paths that can raise them, asserted on
+/// status *and* on the body a client branches on.
+///
+/// One test, because the three are only meaningful against each other: a client
+/// has to tell "this package will never do that" (409, and it is `NoSessionState`
+/// on `/v1/sessions` or on an `X-Session-Id` request) from "shorten this turn"
+/// (400) from "try again in a moment" (409). Statuses come from the typed
+/// variant, never from a message.
+#[tokio::test]
+async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_on() {
+    // 1. NoSessionState — the package declares no conversation at all.
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_package_without_conversation(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    for (path, response) in [
+        (
+            "/v1/sessions",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/sessions")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+        (
+            "x-session-id chat",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/chat/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-session-id", "sess-no-state")
+                        .body(Body::from(
+                            json!({
+                                "model": "workflow-multi-turn",
+                                "messages": [{"role": "user", "content": "hello world"}],
+                                "max_tokens": 2
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+        (
+            "x-session-id completions",
+            router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/completions")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-session-id", "sess-no-state")
+                        .body(Body::from(
+                            json!({
+                                "model": "workflow-multi-turn",
+                                "prompt": "hello world",
+                                "max_tokens": 2
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+        ),
+    ] {
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{path}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("conflict_error"),
+            "{path}: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("scope: session"),
+            "{path}: {body}"
+        );
+    }
+
+    // 2. ConversationOverBound — a turn the package's own bound refuses.
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": false,
+        "default": 6
+    });
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        Value::String("package.conversation_limit".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+
+    let (status, first) = chat_turn(router.clone(), Some("sess-bound"), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let (status, second) = chat_turn(router, Some("sess-bound"), "hello").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{second}");
+    assert_eq!(
+        second["error"]["type"].as_str(),
+        Some("invalid_request_error"),
+        "{second}"
+    );
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("declares a bound of 6"),
+        "{second}"
+    );
+
+    // 3. ExclusiveLeaseConflict — the driver serializes passes, so this is
+    //    raised where it is decided and mapped where it is answered.
+    let conflict = crate::routes::generation_failure(
+        crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
+            onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                session: "sess-busy".to_string(),
+            },
+        )),
+    );
+    assert_eq!(conflict.status, StatusCode::CONFLICT);
+    assert_eq!(conflict.kind, "conflict_error");
+    assert!(conflict.message.contains("sess-busy"));
 }

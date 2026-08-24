@@ -613,10 +613,12 @@ impl<'a> SessionLeaseGuard<'a> {
         session: &str,
     ) -> anyhow::Result<Self> {
         if !leases.borrow_mut().insert(session.to_string()) {
-            return Err(crate::engine::PackageCapabilityError::SessionBusy {
-                session: session.to_string(),
-            }
-            .into());
+            return Err(
+                crate::engine::PackageCapabilityError::ExclusiveLeaseConflict {
+                    session: session.to_string(),
+                }
+                .into(),
+            );
         }
         Ok(Self {
             leases,
@@ -1170,12 +1172,12 @@ impl<'a> WorkflowExecutionPlan<'a> {
         {
             let bound = continuation_bound(cell, state, &values)?;
             let budget = request.options.max_new_tokens;
-            let reached = conversation.len().saturating_add(budget);
-            if reached > bound {
+            let requested = conversation.len().saturating_add(budget);
+            if requested > bound {
                 return Err(
                     crate::engine::PackageCapabilityError::ConversationOverBound {
                         cell: cell.to_string(),
-                        reached,
+                        requested,
                         bound,
                     }
                     .into(),
@@ -1488,7 +1490,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                         return Err(
                             crate::engine::PackageCapabilityError::ConversationOverBound {
                                 cell: cell.to_string(),
-                                reached: conversation.len(),
+                                requested: conversation.len(),
                                 bound,
                             }
                             .into(),

@@ -1068,7 +1068,8 @@ computing it twice is how they came to disagree.
   so never reaches the carry path's recurrence check, and this is the only place
   it is honoured. Separately, the conversation's *current* length is what a front
   end adds to a request's own before enforcing a context limit, because a
-  prompt-prefix conversation really is prefilled again on every turn. A turn whose conversation would exceed it is refused before it
+  prompt-prefix conversation really is prefilled again on every turn — and it is
+  the only carrier for which that is true. A turn whose conversation would exceed it is refused before it
   runs, and a turn whose own generation would exceed it is refused rather than
   stored — a session left in a state its own declaration forbids has no way
   back. Neither refusal changes what the session already held; `reset_session`
@@ -1578,17 +1579,15 @@ Runtime behaviour changed alongside it, for packages rather than documents:
   server answers 409 rather than 500. Stateless generation is untouched;
 * a package that publishes no token stream is unaffected and keeps its session
   handle;
-* `session_token_count` means the same thing on every backend (§12.5a). What a
-  turn is *charged* for is a different question, and `Engine::session_prefill_carry`
-  answers it in two parts, because a context cap and a "prompt tokens processed"
-  metric are not asking the same thing:
-
-  | carrier | attended (context cap, `usage`) | re-prefilled (metric) |
-  | --- | --- | --- |
-  | ORT decode core | everything the session retains — each turn is appended to it | none; the rest is served from its KV |
-  | native decode core | none — the session truncates to the common prefix with this prompt and replaces it | none |
-  | `prompt_prefix` continuation | the conversation, which is put in front of the prompt | the same, because it really is computed again |
-  | loop carry / state service group | none — the lease lives in a cache the package bounds itself | none |
+* `session_token_count` means the same thing on every backend (§12.5a). Whether
+  a request is *charged* for it is a different question, gated on one query —
+  `Engine::prepends_session_conversation`, read from the shared classifier. It is
+  true for `SessionStateCarrier::PromptContinuation` and nothing else, because
+  that is the one carrier whose mechanism is the prompt binding. A decode core
+  keeps its conversation in KV, and a loop-carried or group-held lease lives in a
+  cache the package bounds itself; charging either would count each turn twice,
+  inflating `usage`, halving the usable context and refusing requests at roughly
+  half the model's limit.
 
 ## 19. Invariants
 

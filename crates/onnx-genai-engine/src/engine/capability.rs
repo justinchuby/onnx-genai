@@ -28,15 +28,15 @@ pub enum PackageCapabilityError {
     /// declares for it. The caller can shorten the turn, ask for fewer tokens,
     /// or start a new session.
     #[error(
-        "this turn would leave a conversation of {reached} tokens and '{cell}' declares a bound \
+        "this turn would leave a conversation of {requested} tokens and '{cell}' declares a bound \
          of {bound}; reset or close the session to start a new one, or ask for fewer tokens"
     )]
     ConversationOverBound {
         /// The state cell whose declared bound would be exceeded.
         cell: String,
-        /// Tokens the conversation would hold.
-        reached: usize,
-        /// The bound the package declares.
+        /// Tokens the conversation would hold if this turn ran.
+        requested: usize,
+        /// The bound the package declares for that cell.
         bound: usize,
     },
     /// A turn is already in flight for this session, whose lease is declared
@@ -47,8 +47,8 @@ pub enum PackageCapabilityError {
          conversation an exclusive lease; run the turns one after another so neither reads a \
          conversation the other is about to replace"
     )]
-    SessionBusy {
-        /// The session with a turn already running.
+    ExclusiveLeaseConflict {
+        /// The session whose exclusive lease is already held.
         session: String,
     },
 }
@@ -57,7 +57,7 @@ impl PackageCapabilityError {
     /// Whether this is a transient conflict the same request can succeed at
     /// later, as opposed to a package that will never serve it.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::SessionBusy { .. })
+        matches!(self, Self::ExclusiveLeaseConflict { .. })
     }
 }
 
@@ -70,26 +70,4 @@ pub fn package_capability_error(error: &anyhow::Error) -> Option<PackageCapabili
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<PackageCapabilityError>().cloned())
-}
-
-/// What a session already holds in front of the next turn's prompt.
-///
-/// Two numbers, because two different questions are asked of the same session
-/// and they have different answers:
-///
-/// * `attended` is what the model's window has to fit *besides* this request —
-///   what a context cap, an output budget and `usage.prompt_tokens` are about;
-/// * `reprefilled` is how much of that this turn will compute again — what a
-///   "prompt tokens processed" metric is about.
-///
-/// They coincide only for a package that carries its conversation by prepending
-/// it. A decode core that appends each turn to a retained sequence attends to
-/// everything it holds and re-prefills none of it, because the rest is served
-/// from its KV.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SessionPrefillCarry {
-    /// Tokens the model holds in front of this turn's prompt.
-    pub attended: usize,
-    /// Of those, the tokens this turn will prefill again.
-    pub reprefilled: usize,
 }

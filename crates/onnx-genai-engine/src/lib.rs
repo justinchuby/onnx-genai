@@ -53,8 +53,8 @@ pub use engine::{
     MirostatConfig, MirostatVersion, MtpCacheScope, MtpConfig, MtpHiddenLayout, MtpWeightSource,
     PackageCapabilityError, PrioritizedGenerateRequest, PrioritizedGenerateResult,
     RewindTokenCount, SamplingOverrides, ScheduledGenerateArrival, SessionCheckpoint,
-    SessionForkCapability, SessionId, SessionPosition, SessionPrefillCarry, SpeculativeMode,
-    TokenLogprob, WeightAccessPattern, WeightPlacementReport, XtcConfig, package_capability_error,
+    SessionForkCapability, SessionId, SessionPosition, SpeculativeMode, TokenLogprob,
+    WeightAccessPattern, WeightPlacementReport, XtcConfig, package_capability_error,
     parse_device_policy, parse_resource_limit, resolve_device_vram_limit_bytes,
 };
 pub use fim::{FimConfig, FimFormat};

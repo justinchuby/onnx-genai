@@ -1027,6 +1027,19 @@ impl WorkflowRuntime {
             .map(|conversation| conversation.len())
     }
 
+    /// Whether this package continues a conversation by putting it in front of
+    /// the next turn's prompt.
+    ///
+    /// True only for `SessionStateCarrier::PromptContinuation`, read from the
+    /// shared classifier. Every other carrier hands its lease back inside the
+    /// graph or inside a decode core's own state, so nothing is prepended and a
+    /// request must not be charged for it.
+    pub(crate) fn prepends_session_conversation(&self) -> bool {
+        onnx_genai_metadata::classify_session_state(self.workflow_spec())
+            .prompt_continuation()
+            .is_some()
+    }
+
     /// Tokens this runtime will put in front of the next turn's prompt.
     ///
     /// Only a `prompt_prefix` continuation prepends anything: it is the one
