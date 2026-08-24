@@ -245,6 +245,78 @@ def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
     return jobs
 
 
+# A step's `if:` decides whether it runs at all, and this gate cannot evaluate
+# GitHub's expression language. Crediting a guarded step would let `if: false`
+# -- or a copy-pasted `if: runner.os == 'Windows'` on a Linux-only job -- remove
+# a package's only required executor while the gate still reported it covered.
+# So only steps that are guaranteed to have run in a *successful* job are
+# counted: no `if:` (which defaults to `success()`), or an expression on this
+# list. Anything else is not credited, which can only make the gate stricter and
+# it names the step when it refuses.
+_STEP_ITEM = re.compile(r"^\s*- ")
+_STEP_IF = re.compile(r"^\s*if:\s*(.+?)\s*$")
+_RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+
+
+def job_steps(job_body: str) -> list[tuple[str | None, str]]:
+    """Each step of a job as (its `if:` expression or None, its YAML text)."""
+    steps: list[tuple[str | None, str]] = []
+    current: list[str] = []
+    for line in job_body.splitlines():
+        if _STEP_ITEM.match(line):
+            if current:
+                steps.append(_step_entry(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        steps.append(_step_entry(current))
+    return steps
+
+
+def _step_entry(lines: list[str]) -> tuple[str | None, str]:
+    first = lines[0]
+    item_indent = len(first) - len(first.lstrip())
+    body_indent = item_indent + 2
+    condition: str | None = None
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if index == 0:
+            # `- if: cond` puts the key straight after the list marker.
+            stripped = first.lstrip()
+            text = stripped[2:] if stripped.startswith("- ") else ""
+        elif len(line) - len(line.lstrip()) == body_indent:
+            # A key at the step's own depth. Anything deeper is shell text
+            # inside a run block and must not be read as a step condition.
+            text = line.lstrip()
+        else:
+            continue
+        if match := _STEP_IF.match(text):
+            condition = match.group(1)
+            break
+    return condition, "\n".join(lines)
+
+
+def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
+    """Run blocks that a successful job is guaranteed to have executed.
+
+    Returns those blocks and the `if:` expressions that were refused, so a
+    caller can say *why* a package looks unexecuted rather than only that it is.
+    """
+    kept: list[str] = []
+    refused: list[str] = []
+    for condition, text in job_steps(job_body):
+        blocks = run_blocks(text)
+        if not blocks:
+            continue
+        if condition is None or condition in _RUNS_IN_A_PASSING_JOB:
+            kept.extend(blocks)
+        else:
+            refused.append(condition)
+    return kept, refused
+
+
 def run_blocks(job_body: str) -> list[str]:
     """Every `run:` scalar in a job, folded or literal, as shell text."""
     lines = job_body.splitlines()
@@ -293,7 +365,14 @@ def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set
     jobs = workflow_jobs()
     commands: list[str] = []
     for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
-        for block in run_blocks(jobs[name]):
+        blocks, refused = unconditional_run_blocks(jobs[name])
+        for condition in refused:
+            print(
+                f"note: {name!r} has a conditional step this gate will not credit: "
+                f"if: {condition}",
+                file=sys.stderr,
+            )
+        for block in blocks:
             if skip_lane and re.search(rf"cargo-args\s+{re.escape(skip_lane)}\b", block):
                 continue
             commands.append(block)
@@ -356,6 +435,63 @@ _PARSER_FIXTURE = """jobs:
     steps:
       - run: cargo test -p pkg-beta
 """
+
+
+_CONDITIONAL_ARMS: tuple[tuple[str, str, list[str], list[str]], ...] = (
+    # label, step YAML, packages that must be credited, `if:`s that must be refused
+    (
+        "unconditional step is credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "if: always() is credited",
+        "      - name: x\n        if: always()\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "if: false is not credited",
+        "      - name: x\n        if: false\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["false"],
+    ),
+    (
+        "a platform guard is not credited",
+        "      - name: x\n        if: runner.os == 'Windows'\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["runner.os == 'Windows'"],
+    ),
+    (
+        "if: on the list-item line is still a step condition",
+        "      - if: false\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["false"],
+    ),
+    (
+        "`if:` inside shell text is not a step condition",
+        "      - name: x\n        run: |\n          if: not-a-condition\n          cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+)
+
+
+def _conditional_arms() -> int:
+    """A step the job may skip must not count as having run its tests."""
+    failures = 0
+    for label, step, want_credited, want_refused in _CONDITIONAL_ARMS:
+        kept, refused = unconditional_run_blocks("    steps:\n" + step)
+        credited = sorted(packages_tested_by(kept))
+        if credited != want_credited or refused != want_refused:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        credited want={want_credited} got={credited}", file=sys.stderr)
+            print(f"        refused  want={want_refused} got={refused}", file=sys.stderr)
+        else:
+            print(f"  ok    {label} -> credited {credited}, refused {refused}")
+    return failures
 
 
 _PARSER_ARM_COUNT = 5
@@ -449,9 +585,9 @@ def self_test() -> int:
         else:
             named = f", naming {want_named}" if want_named else ""
             print(f"  ok    {label} -> exit {code}{named}")
-    parser_failures = _parser_arms()
-    failures += parser_failures
-    total = len(arms) + _PARSER_ARM_COUNT
+    failures += _parser_arms()
+    failures += _conditional_arms()
+    total = len(arms) + _PARSER_ARM_COUNT + len(_CONDITIONAL_ARMS)
     if failures:
         print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
         return 1
