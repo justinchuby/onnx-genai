@@ -197,8 +197,35 @@ pub enum ShapeInference {
     /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
     /// has to be read off input 1.
     CausalConvWithState,
-    /// Op with no modelled shape rule — Compute will error with op details.
-    Declined { op_type: String, domain: String },
+    /// Op the shape table cannot resolve. `reason` separates the two cases,
+    /// which look identical at the decline site and are not the same defect.
+    Declined {
+        op_type: String,
+        domain: String,
+        reason: DeclineReason,
+    },
+}
+
+/// Why [`ShapeInference::for_node`] could not produce a rule.
+///
+/// `GetCapability` drops any claim containing a declined node either way, so
+/// the distinction changes no routing. It changes what the situation *means*:
+/// [`Self::NodeNotShapeable`] is the table working as designed, while
+/// [`Self::Unmodelled`] on an operator that has a registered kernel is wiring
+/// nobody finished — the kernel exists and is never dispatched to, and the only
+/// symptom is that the op quietly runs somewhere else.
+///
+/// `registered_ops_are_claimable` in `onnx-runtime-ep-cpu-plugin` turns that
+/// second case into a test failure instead of a silent slowdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// No arm in the table names this operator. If a kernel is registered for
+    /// it, the registration is incomplete.
+    Unmodelled,
+    /// An arm exists, but this node cannot be shaped from what it carries —
+    /// a missing attribute, or an extent that only an input's *values* fix.
+    /// Declining is the correct outcome and the claim is dropped on purpose.
+    NodeNotShapeable(&'static str),
 }
 
 impl ShapeInference {
@@ -351,6 +378,7 @@ impl ShapeInference {
                 _ => Self::Declined {
                     op_type: op.to_string(),
                     domain: domain.to_string(),
+                    reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
 
@@ -414,6 +442,7 @@ impl ShapeInference {
                     Self::Declined {
                         op_type: op.to_string(),
                         domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable("Unsqueeze opset-13 takes axes from input[1]"),
                     }
                 }
             }
@@ -454,6 +483,7 @@ impl ShapeInference {
                     Self::Declined {
                         op_type: op.to_string(),
                         domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable("Conv attributes/input shapes do not determine the output"),
                     }
                 }
             }
@@ -514,6 +544,7 @@ impl ShapeInference {
             _ => Self::Declined {
                 op_type: op.to_string(),
                 domain: domain.to_string(),
+                reason: DeclineReason::Unmodelled,
             },
         }
     }
@@ -4267,11 +4298,24 @@ fn infer_shapes(
             Ok(outputs)
         }
 
-        ShapeInference::Declined { op_type, domain } => Err(format!(
-            "Op '{op_type}' (domain '{domain}') has no shape-inference rule. \
-             If the op is not yet modelled, add a variant to ShapeInference, \
-             resolve it in ShapeInference::for_node, and handle it in infer_shapes."
-        )),
+        ShapeInference::Declined {
+            op_type,
+            domain,
+            reason,
+        } => Err(match reason {
+            DeclineReason::Unmodelled => format!(
+                "Op '{op_type}' (domain '{domain}') has no shape-inference rule at all. \
+                 If a kernel is registered for it, that registration is incomplete and the \
+                 kernel is never dispatched to. Add a variant to ShapeInference, resolve it \
+                 in ShapeInference::for_node, and handle it in infer_shapes. A data-dependent \
+                 extent is expressed as `None` for that dimension."
+            ),
+            DeclineReason::NodeNotShapeable(why) => format!(
+                "Op '{op_type}' (domain '{domain}') is modelled, but this node cannot be \
+                 shaped: {why}. The claim was dropped deliberately; this is the shape table \
+                 working as intended, not a missing rule."
+            ),
+        }),
     }
 }
 
@@ -4760,6 +4804,7 @@ fn after() {}
         let s = ShapeInference::Declined {
             op_type: "FooBar".into(),
             domain: "some.domain".into(),
+            reason: DeclineReason::Unmodelled,
         };
         let err = infer(&s, &[]).unwrap_err();
         assert!(err.contains("FooBar"), "error should mention op: {err}");
