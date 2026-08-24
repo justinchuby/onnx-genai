@@ -2972,6 +2972,23 @@ mod tests {
     /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(budget_bytes, false)
+    }
+
+    /// The same fixture over a package that declares session-scoped state.
+    ///
+    /// `create_session` refuses a package that publishes tokens and declares no
+    /// conversation, so a test that opens a session needs one that does. Kept
+    /// as a separate constructor rather than a flag on every call site: the
+    /// stateless fixture is the right one everywhere a session is not opened,
+    /// and the two differ in exactly one declared property.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(budget_bytes, true)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn interpreted_engine_inner(budget_bytes: u64, session_scoped: bool) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2988,7 +3005,11 @@ mod tests {
             0,
         )?;
         Ok(Engine {
-            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow: Box::new(if session_scoped {
+                crate::pipeline::generation::test_session_decoder_runtime()?
+            } else {
+                crate::pipeline::generation::test_decoder_runtime()?
+            }),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
@@ -3056,6 +3077,36 @@ mod tests {
         Ok(())
     }
 
+    /// The reject direction for the fixture the test below accepts.
+    ///
+    /// That test needs a package declaring `scope: session` state, so it uses a
+    /// fixture built to have some. A fixture that grants what it is meant to
+    /// test is worth exactly nothing unless the ungranted case is shown to be
+    /// refused, and both fixtures come from one builder differing in one flag —
+    /// so this pins that the flag is what the refusal turns on.
+    ///
+    /// It is also the only unit test of the refusal itself. #1892 added the
+    /// gate; how it was discovered to be load-bearing is that it silently broke
+    /// a test written for something else, which is a slower way to find out.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn create_session_refuses_a_package_that_declares_no_conversation() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        assert!(!engine.holds_decode_core());
+
+        let error = engine
+            .create_session()
+            .expect_err("a package publishing tokens with no session state cannot hold a session");
+
+        assert_eq!(
+            crate::engine::package_capability_error(&error),
+            Some(PackageCapabilityError::NoSessionState),
+            "the refusal must be the typed one a front end reads for its status code, \
+             not prose that happens to say something similar: {error}"
+        );
+        Ok(())
+    }
+
     /// The cold-call test above exercises `generate_interpreted`; a
     /// continuing workflow session reaches the exact same no-decode-core
     /// branch through [`Engine::generate_in_workflow_session`] instead (the
@@ -3065,7 +3116,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
-        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        let mut engine = interpreted_session_engine_with_byte_budget(10)?;
 
         // No decode core: this engine's sessions are workflow sessions,
         // opened through the same public `create_session` a real caller
@@ -3158,6 +3209,71 @@ mod tests {
             engine.scheduler.running_count(),
             0,
             "no sequence may still be running once every request has finished"
+        );
+        Ok(())
+    }
+
+    /// The accept-direction control for the tensor-binding branch, which had
+    /// neither direction under test.
+    ///
+    /// `on_admitted` carries two different contracts at that call site, and
+    /// this is where they came apart. To the engine it means "the scheduler
+    /// admitted this" -- which is false there, because the branch takes no
+    /// reservation and calls no `complete()`. To the server it means "you may
+    /// begin streaming": `run_generation`'s success arm never touches the
+    /// admission sender (only its error arm does), so this callback is the
+    /// *only* thing that ever resolves that oneshot with `Ok` on a request
+    /// that succeeds. Drop the call and every successful tensor-bound request
+    /// becomes a 500 at the awaiting end while the generation itself completes
+    /// perfectly.
+    ///
+    /// That asymmetry is why the obvious falsifier is the wrong one. Asserting
+    /// `!admitted` here encodes the engine contract, passes under the change
+    /// that deletes the call, and therefore goes green exactly when serving
+    /// breaks. This asserts the contract a mutation can actually violate.
+    ///
+    /// Limitation, stated rather than implied: this fixture's interpreted
+    /// decoder cannot complete a generation, so what is pinned is that the
+    /// branch signals admission, not that it does so on a run returning `Ok`.
+    /// The signal is unconditional and precedes the work, so it is the same
+    /// line either way -- but an end-to-end version needs a package the
+    /// interpreter can finish, and that fixture does not exist yet.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_tensor_bound_request_signals_admission_even_though_it_takes_no_reservation()
+    -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(vec![1]),
+        ));
+        request.request.options.max_new_tokens = 1;
+        request.request.options.stop_on_eos = false;
+        let request = request.with_input(
+            "pixel_values",
+            onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?,
+        );
+
+        // Assert the precondition rather than trusting the test's name: a
+        // request that lost its inputs takes the prompt path instead, where a
+        // different call site signals admission, and this test would then pass
+        // for a reason that has nothing to do with binding tensors.
+        assert!(
+            !request.inputs.is_empty(),
+            "this test is only about the branch a tensor-carrying request takes"
+        );
+
+        let mut admissions = 0usize;
+        {
+            let mut on_admitted = || admissions += 1;
+            let _ = engine.generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None);
+        }
+
+        assert_eq!(
+            admissions, 1,
+            "a tensor-bound request must signal admission exactly once: the server's \
+             admission oneshot has no other resolver on a successful generation"
         );
         Ok(())
     }

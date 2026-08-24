@@ -167,6 +167,22 @@ The temptation here is to re-run until the null happens to come in narrow. That
 is choosing the sample that licenses the conclusion, and it is not done: the
 rule needs a tighter instrument, not more attempts at the same one.
 
+> **SUPERSEDED, 2026-08-24 — there is no +23% effect.** The instrument was
+> tightened as this section demanded, and the candidate was re-run 24 launches
+> deep: **ratio 0.9889 against an A/A half-width of 0.0323**, an instrument 4.6x
+> sharper than this one, able to resolve anything above +9.7%. The +23% here is
+> **accounted for by a mode imbalance**: the control arm drew the slow mode in
+> 4 of 8 launches and the test arm in 1 of 8, and at the 1.687x mode ratio that
+> alone manufactures up to **+0.2576** of ratio — more than the +0.2327 observed.
+> The `sys_frac` fall reported above as the mechanism moving in the predicted
+> direction inverts too (+0.0111 at 46% sign at n=24): the slow mode *is* the
+> high-`sys` mode, so the mechanism agreed with the effect because both were the
+> same artifact. **The paragraph above is right that the instrument was the
+> binding constraint, and wrong to read the point estimate as a candidate.**
+> The 22.2-point straggler wait measured in this document stands; what is
+> disposed of is the claim that spare tiles collect it. Full record:
+> [`2026-08-24-acc0-steal-tiles-retest.md`](2026-08-24-acc0-steal-tiles-retest.md).
+
 
 ## Method
 

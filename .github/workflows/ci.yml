@@ -363,10 +363,17 @@ jobs:
       # CUDA toolchain, so every pull request gets the signal. It supplements
       # the inventory check and does not replace it -- it cannot see
       # macro-expanded tests, nor inventory parity between feature configs.
+      #
+      # The scan covers both halves of the class. The half above is loud: the
+      # test runs and the lane reds. The other half is silent -- a `cfg` on
+      # `gpu-tests` (on the test, on its `mod`, on the whole target, or as
+      # manifest `required-features`) deletes the test from the base-config
+      # inventory, so the lane is green because the tests are not there. #1927
+      # lost thirteen that way and nothing reported it.
       - name: Check CUDA test source scan can still detect (self-test)
         run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
 
-      - name: Check every CUDA test carries an ignore
+      - name: Check CUDA tests are ignored, not deleted by a cfg
         run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
@@ -457,6 +464,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      # The gate's submodule precondition, tested against fixture repository
+      # roots with cargo/rustup shimmed -- about a second, and it is the only
+      # thing that proves the check refuses BEFORE spending a clippy run rather
+      # than after one. One of its cells runs the gate against this checkout,
+      # so a precondition that started rejecting correct trees fails here
+      # instead of on every developer's box. #1816.
+      - name: Cross-compile gate preconditions (self-test)
+        run: |
+          shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
+          bash scripts/check_cross_compile_test.sh
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 

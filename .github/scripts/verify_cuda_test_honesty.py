@@ -8,7 +8,10 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
+from collections.abc import Iterator, Sequence
+from functools import lru_cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -142,6 +145,26 @@ FN_DECLARATION = re.compile(r"\bfn\s+[A-Za-z0-9_]+\s*[(<]")
 # `#[test]`, `#[ test ]`, and the same-line `#[test] fn a() {}` all produce a
 # running test. Matching only the canonical spelling left two of them uninspected.
 TEST_ATTR = re.compile(r"#\[\s*test\s*\]")
+# Only `gpu-tests` distinguishes the two configurations this script builds
+# (`cuda` and `cuda,gpu-tests`), and it is a leaf feature -- ep-cuda forwards it
+# to cuda-memory, where it is `[]`. So a `cfg` on any *other* feature is held
+# constant across both builds, produces no inventory drift, and `compare_inventories`
+# passes it. Flagging those would red the fast lane on code the authoritative
+# check accepts, which is worse than missing one: `#![cfg(feature = "cuda")]`
+# already exists in this tree, on an unpoliced target.
+GPU_TESTS_FEATURE = "gpu-tests"
+# A `cfg` naming a feature *deletes* code from one configuration rather than
+# ignoring it, so the two inventories stop matching. `cfg_attr` is a different
+# attribute and is the sanctioned spelling -- `cfg\s*\(` cannot match
+# `cfg_attr(` because `_` is not `(`, so the two are distinguished by shape.
+FEATURE_CFG = re.compile(r"cfg\s*\(")
+FEATURE_MENTION = re.compile(r"\bfeature\s*=")
+# Only the feature name is quoted, so it survives in raw text where masking
+# blanks it; detection runs on masked text, quoting on raw, as everywhere else.
+FEATURE_NAME = re.compile(r"""feature\s*=\s*["']([A-Za-z0-9_-]+)["']""")
+# A `mod` gated on `gpu-tests` removes every test inside it from one inventory,
+# which is the same drift one level up from a test's own attributes.
+MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z0-9_]+\s*\{")
 
 
 def mask_source(source: str) -> list[tuple[str, bool]]:
@@ -237,7 +260,7 @@ def mask_source(source: str) -> list[tuple[str, bool]]:
     return masked
 
 
-def head_line_indices(masked: list[tuple[str, bool]], index: int, downward: bool = True) -> list[int]:
+def head_line_indices(masked: Sequence[tuple[str, bool]], index: int, downward: bool = True) -> list[int]:
     """Line indices of the attribute head of the `#[test]` item at `index`."""
     above: list[int] = []
     pending = 0
@@ -281,12 +304,18 @@ def head_line_indices(masked: list[tuple[str, bool]], index: int, downward: bool
     return head
 
 
-def attribute_spans(text: str) -> list[tuple[int, int]]:
-    """Half-open spans of each `#[..]` attribute in bracket-masked `text`."""
+def attribute_spans(text: str, opener: str = "#[") -> list[tuple[int, int]]:
+    """Half-open spans of each `#[..]` attribute in bracket-masked `text`.
+
+    `opener` selects outer (`#[`) or inner (`#![`) attributes. The bracket walk
+    is identical for both -- it skips forward to the first bracket either way --
+    so the two share one definition rather than one being reimplemented later
+    and drifting from the masking rules the other depends on.
+    """
     spans: list[tuple[int, int]] = []
     cursor = 0
     while True:
-        start = text.find("#[", cursor)
+        start = text.find(opener, cursor)
         if start == -1:
             return spans
         depth = 0
@@ -365,11 +394,33 @@ def test_name_at(lines: list[str], index: int) -> str:
     return "<unknown fn>"
 
 
-def un_ignored_tests(source: str) -> list[tuple[int, str]]:
-    """Every `#[test]` in `source` not ignored when `gpu-tests` is off, 1-based."""
+@dataclass(frozen=True)
+class TestItem:
+    """A `#[test]` item's head: its attributes, in both masked and raw form."""
+
+    line: int
+    name: str
+    masked_head: str
+    raw_head: str
+    aligned: bool
+
+
+@lru_cache(maxsize=None)
+def masked_lines(source: str) -> tuple[tuple[str, bool], ...]:
+    """`mask_source` memoised: both source scans mask the same files."""
+    return tuple(mask_source(source))
+
+
+def test_items(source: str) -> list[TestItem]:
+    """Every `#[test]` item in `source`, with its full attribute head.
+
+    The upward/downward walk is subtle enough that having two copies of it
+    would guarantee they eventually disagree, so both source scans read the
+    item head from here.
+    """
     lines = source.splitlines()
-    masked = mask_source(source)
-    found: list[tuple[int, str]] = []
+    masked = masked_lines(source)
+    items: list[TestItem] = []
     for index, (code, _) in enumerate(masked):
         spans = attribute_spans(code)
         if not any(TEST_ATTR.fullmatch(code[start:end].strip()) for start, end in spans):
@@ -385,15 +436,32 @@ def un_ignored_tests(source: str) -> list[tuple[int, str]]:
         # trailing comment leaves spaces that strip() then removes.
         masked_head = "\n".join([masked[cursor][0] for cursor in head] + [code])
         raw_head = "\n".join([lines[cursor] for cursor in head] + [lines[index]])
-        if len(masked_head) != len(raw_head):
-            # Masking is column-exact, so this cannot happen; if it ever does,
-            # report rather than trust a span mapping that has drifted.
-            found.append((index + 1, test_name_at(lines, index)))
-            continue
-        if has_effective_ignore(masked_head, raw_head):
-            continue
         name = same_line_fn.group(0) if same_line_fn else None
-        found.append((index + 1, name[3:].strip("(<").strip() if name else test_name_at(lines, index)))
+        items.append(
+            TestItem(
+                line=index + 1,
+                name=name[3:].strip("(<").strip() if name else test_name_at(lines, index),
+                masked_head=masked_head,
+                raw_head=raw_head,
+                # Masking is column-exact, so the two blobs cannot differ in
+                # length; if they ever do, the span mapping has drifted and
+                # every offset read out of it is untrustworthy.
+                aligned=len(masked_head) == len(raw_head),
+            )
+        )
+    return items
+
+
+def un_ignored_tests(source: str) -> list[tuple[int, str]]:
+    """Every `#[test]` in `source` not ignored when `gpu-tests` is off, 1-based."""
+    found: list[tuple[int, str]] = []
+    for item in test_items(source):
+        if not item.aligned:
+            found.append((item.line, item.name))
+            continue
+        if has_effective_ignore(item.masked_head, item.raw_head):
+            continue
+        found.append((item.line, item.name))
     return found
 
 
@@ -426,6 +494,188 @@ def scan_source_for_missing_ignores() -> list[str]:
                     "when gpu-tests is off, or it runs on a machine with no device: add "
                     '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]'
                 )
+    return errors
+
+
+def gates_on_gpu_tests(masked: str, raw: str, start: int, end: int) -> bool:
+    """Whether the attribute at `start:end` is a `cfg` on `gpu-tests`.
+
+    Detection reads masked text so a `cfg` written in a doc comment or a string
+    cannot trigger it; the feature names are quoted out of raw text at the same
+    offsets, because masking blanks the string literals that hold them.
+
+    Only `gpu-tests` counts. A `cfg` on `cuda` or `tracing` resolves the same
+    way in both builds, so it cannot move a test between the two inventories,
+    and flagging it would fail a lane the authoritative check passes.
+    """
+    attribute = masked[start:end]
+    if not FEATURE_CFG.search(attribute) or not FEATURE_MENTION.search(attribute):
+        return False
+    return GPU_TESTS_FEATURE in FEATURE_NAME.findall(raw[start:end])
+
+
+def feature_gated_attribute(masked: str, raw: str, opener: str = "#[") -> bool:
+    """Whether any `cfg` attribute in `masked` gates on `gpu-tests`."""
+    return any(gates_on_gpu_tests(masked, raw, start, end) for start, end in attribute_spans(masked, opener))
+
+
+def source_blobs(source: str) -> tuple[str, str] | None:
+    """The whole file as masked and raw blobs, or None if they ever disagree."""
+    lines = source.splitlines()
+    masked_blob = "\n".join(code for code, _ in masked_lines(source))
+    raw_blob = "\n".join(lines)
+    return None if len(masked_blob) != len(raw_blob) else (masked_blob, raw_blob)
+
+
+def target_level_feature_gate(source: str) -> int | None:
+    """The 1-based line of a `#![cfg(feature = "gpu-tests")]` on the target."""
+    blobs = source_blobs(source)
+    if blobs is None:
+        return None
+    masked_blob, raw_blob = blobs
+    for start, end in attribute_spans(masked_blob, "#!["):
+        if gates_on_gpu_tests(masked_blob, raw_blob, start, end):
+            return masked_blob.count("\n", 0, start) + 1
+    return None
+
+
+def gpu_tests_gated_modules(source: str) -> list[int]:
+    """1-based lines of `mod` items gated on `gpu-tests` that contain tests.
+
+    A test's own attributes are not the only way to delete it from the base
+    inventory -- a `#[cfg(feature = "gpu-tests")]` on the module around it does
+    the same thing, and the head walk deliberately stops at the `mod` boundary,
+    so it is invisible from inside. Only modules that actually contain a test
+    are reported: gating a helper module is the sanctioned two-arm shim.
+    """
+    blobs = source_blobs(source)
+    if blobs is None:
+        return []
+    masked_blob, raw_blob = blobs
+    masked = masked_lines(source)
+    found: list[int] = []
+    offsets, cursor = [], 0
+    for code, _ in masked:
+        offsets.append(cursor)
+        cursor += len(code) + 1
+    for index, (code, _) in enumerate(masked):
+        if not MOD_DECLARATION.match(code):
+            continue
+        head = head_line_indices(masked, index, downward=False)
+        if not head:
+            continue
+        head_start, head_end = offsets[head[0]], offsets[index]
+        gate = next(
+            (
+                head_start + start
+                for start, end in attribute_spans(masked_blob[head_start:head_end])
+                if gates_on_gpu_tests(masked_blob[head_start:head_end], raw_blob[head_start:head_end], start, end)
+            ),
+            None,
+        )
+        if gate is None:
+            continue
+        body_start = offsets[index] + code.index("{")
+        depth, cursor = 0, body_start
+        while cursor < len(masked_blob):
+            if masked_blob[cursor] == "{":
+                depth += 1
+            elif masked_blob[cursor] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            cursor += 1
+        if TEST_ATTR.search(masked_blob[body_start:cursor]):
+            found.append(masked_blob.count("\n", 0, gate) + 1)
+    return found
+
+
+def manifest_required_features(manifest: str) -> Iterator[str]:
+    """Policed CUDA targets a manifest gives `required-features`.
+
+    Parsed rather than pattern-matched. A regex over `[[test]]` sections was
+    wrong in both directions: it absorbed a following `[[bench]]` table into
+    the preceding test's span, and it did not recognise a header with a
+    trailing comment. Neither shape is exotic, and both are free to get right.
+    """
+    for section in tomllib.loads(manifest).get("test", []):
+        name = section.get("name")
+        if isinstance(name, str) and is_cuda_test_target(name) and section.get("required-features"):
+            yield name
+
+
+def targets_with_required_features() -> list[tuple[Path, str]]:
+    found: list[tuple[Path, str]] = []
+    for crate in CUDA_CRATES:
+        manifest_path = crate / "Cargo.toml"
+        if not manifest_path.is_file():
+            continue
+        found.extend(
+            (manifest_path, name)
+            for name in manifest_required_features(manifest_path.read_text(encoding="utf-8"))
+        )
+    return found
+
+
+def scan_source_for_inventory_drift() -> list[str]:
+    """No policed CUDA target may hold fewer tests with `gpu-tests` off than on.
+
+    A missing ignore makes a test *run* where there is no device. This is the
+    other half of the same class: a `cfg` on a feature makes a test, or a whole
+    target, *cease to exist* in the configuration CI builds. Both break the
+    lane, but this half is the quieter one -- the target compiles, the suite is
+    green, and it is green because the tests are not there. `#1854` shipped a
+    target-level gate that took a 13-test file to 0 with `gpu-tests` off.
+
+    `compare_inventories` is authoritative for this and needs both CUDA builds
+    to say so. These three spellings are the ones that have actually occurred,
+    and all three are visible in the source.
+    """
+    errors: list[str] = []
+    for test_dir in TEST_DIRS:
+        for path in sorted(test_dir.glob("*.rs")):
+            if not is_cuda_test_target(path.stem):
+                continue
+            relative = path.relative_to(ROOT)
+            source = path.read_text(encoding="utf-8")
+            gate = target_level_feature_gate(source)
+            if gate is not None:
+                errors.append(
+                    f'{relative}:{gate}: the whole target is gated on feature "{GPU_TESTS_FEATURE}". '
+                    "With the feature off the target holds no tests at all, so it cannot disagree "
+                    "with the device suite and cannot go red. Gate the item that needs the feature "
+                    "-- a two-arm shim over the gated helper keeps every test in both inventories."
+                )
+            for line_number in gpu_tests_gated_modules(source):
+                errors.append(
+                    f'{relative}:{line_number}: this module is gated on feature "{GPU_TESTS_FEATURE}" '
+                    "and contains tests, so those tests are absent from the inventory when the "
+                    "feature is off. Gate the helper the module exists for, not the tests."
+                )
+            for item in test_items(source):
+                if not item.aligned:
+                    # Masking is column-exact, so this cannot happen; if it
+                    # ever does, report rather than trust a span mapping that
+                    # has drifted -- the same disposition as `un_ignored_tests`.
+                    errors.append(
+                        f"{relative}:{item.line}: {item.name} could not be parsed reliably "
+                        "(masked and raw text disagree in length); refusing to clear it."
+                    )
+                    continue
+                if not feature_gated_attribute(item.masked_head, item.raw_head):
+                    continue
+                errors.append(
+                    f'{relative}:{item.line}: {item.name} is gated on feature "{GPU_TESTS_FEATURE}", '
+                    "so it is absent from the inventory when the feature is off. Use "
+                    '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")] '
+                    "to keep the test present and skipped rather than deleted."
+                )
+    for manifest_path, target in targets_with_required_features():
+        errors.append(
+            f"{manifest_path.relative_to(ROOT)}: test target {target} sets required-features, "
+            "so it is not built at all in the base configuration and its tests are missing from "
+            "that inventory. Build the target unconditionally and ignore its tests instead."
+        )
     return errors
 
 
@@ -867,6 +1117,119 @@ def self_test() -> None:
     if head_line_indices(corrupted, 4) != [3]:
         raise AssertionError("the upward walk must stop at an item boundary even when brackets do not balance")
 
+    # Inventory-drift fixtures. The rule these encode is that a policed target
+    # must offer the *same* tests with `gpu-tests` off as on -- ignored, but
+    # present. Each spelling that has actually reached main gets a positive
+    # control, and each is paired with the sanctioned spelling as a negative
+    # control, because a drift check that flagged `cfg_attr` too would condemn
+    # every correctly written test in the tree.
+    target_gated = '#![cfg(feature = "gpu-tests")]\n\n#[test]\nfn a() {}\n'
+    if target_level_feature_gate(target_gated) != 1:
+        raise AssertionError("a target-level gpu-tests gate must be reported with its line")
+    # Only `gpu-tests` separates the two configurations, so a cfg on any other
+    # feature resolves identically in both and causes no drift. Flagging one
+    # would fail the fast lane on code the authoritative check accepts, and
+    # `#![cfg(feature = "cuda")]` already exists in this tree.
+    for benign in (
+        "#![allow(clippy::too_many_lines)]\n",
+        '#![cfg(target_os = "linux")]\n',
+        '#![cfg(feature = "cuda")]\n',
+        '#![cfg(feature = "cuda-13000")]\n',
+    ):
+        if target_level_feature_gate(benign) is not None:
+            raise AssertionError(f"inner attribute {benign!r} causes no inventory drift and must not be flagged")
+    # The gate is an inner attribute; the outer `#[cfg_attr]` spelling on a test
+    # must not be mistaken for one, or the fix for this class reports itself.
+    correct = '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]\n#[test]\nfn a() {}\n'
+    if target_level_feature_gate(correct) is not None:
+        raise AssertionError("an outer cfg_attr on a test is not a target-level gate")
+    # Prose and string literals must not be able to fabricate a gate, which is
+    # the failure the whole masking layer exists to prevent.
+    quoted = '//! Formerly #![cfg(feature = "gpu-tests")], now a shim.\nlet s = "#![cfg(feature = \\"gpu-tests\\")]";\n'
+    if target_level_feature_gate(quoted) is not None:
+        raise AssertionError("a gate named in a comment or a literal is not a gate")
+    # Spans must be found in masked text, not merely *read* from it. An
+    # unbalanced `#![cfg(` inside a literal makes the bracket walk run to the
+    # end of the file without closing, and `attribute_spans` then abandons the
+    # rest of the file -- so a real gate below it is never examined at all.
+    # Masking blanks the literal, so the walk never starts there.
+    shadowed = 'const S: &str = "#![cfg(";\n#![cfg(feature = "gpu-tests")]\n'
+    if target_level_feature_gate(shadowed) != 2:
+        raise AssertionError("an unbalanced bracket inside a literal must not hide the gate below it")
+
+    per_test_gated = '#[cfg(feature = "gpu-tests")]\n#[test]\nfn a() {}\n'
+    gated_items = test_items(per_test_gated)
+    if len(gated_items) != 1:
+        raise AssertionError("the feature-gated test fixture must yield exactly one item")
+    if not feature_gated_attribute(gated_items[0].masked_head, gated_items[0].raw_head):
+        raise AssertionError("a cfg on gpu-tests deletes the test from one inventory and must be flagged")
+    # A cfg that removes the test from the *other* configuration is drift too.
+    inverted = test_items('#[cfg(not(feature = "gpu-tests"))]\n#[test]\nfn a() {}\n')
+    if not feature_gated_attribute(inverted[0].masked_head, inverted[0].raw_head):
+        raise AssertionError("a negated gpu-tests cfg drifts the other way and must be flagged")
+    # `cfg_attr` is the sanctioned spelling and shares the `cfg` prefix; a
+    # substring test for "cfg(" would flag it and make the check unusable.
+    correct_items = test_items(correct)
+    if feature_gated_attribute(correct_items[0].masked_head, correct_items[0].raw_head):
+        raise AssertionError("cfg_attr keeps the test in both inventories and must not be flagged")
+    # Neither a platform cfg nor a cfg on a feature held constant across both
+    # builds moves a test between inventories.
+    for harmless in ('#[cfg(target_os = "linux")]', '#[cfg(feature = "cuda")]', '#[cfg(feature = "tracing")]'):
+        items = test_items(f"{harmless}\n#[test]\nfn a() {{}}\n")
+        if feature_gated_attribute(items[0].masked_head, items[0].raw_head):
+            raise AssertionError(f"{harmless} causes no feature-inventory drift and must not be flagged")
+
+    # The feature name is read from raw text, where masking has not blanked it,
+    # so the *presence* of a feature key must be established on masked text.
+    # Otherwise a feature named inside a string literal is read as a real one.
+    literal_feature = test_items('#[cfg(all(unix, target_env = r#"feature = "gpu-tests""#))]\n#[test]\nfn a() {}\n')
+    if feature_gated_attribute(literal_feature[0].masked_head, literal_feature[0].raw_head):
+        raise AssertionError("a feature named inside a string literal is not a gate")
+
+    # A gate on the module around a test deletes it just as surely, and the
+    # head walk stops at the `mod` boundary so it is invisible from inside.
+    gated_mod = '#[cfg(feature = "gpu-tests")]\nmod inner {\n    #[test]\n    fn a() {}\n}\n'
+    if gpu_tests_gated_modules(gated_mod) != [1]:
+        raise AssertionError("a gpu-tests-gated module containing tests must be flagged")
+    # Gating a module of *helpers* is the sanctioned two-arm shim, and the
+    # two-arm shim is the fix this check recommends -- flagging it would make
+    # the advice self-defeating.
+    helper_mod = '#[cfg(feature = "gpu-tests")]\nmod shim {\n    pub fn helper() {}\n}\n'
+    if gpu_tests_gated_modules(helper_mod):
+        raise AssertionError("a gated helper module holds no tests and must not be flagged")
+    # The brace walk must end at the module it started in, or the next
+    # module's tests are attributed to this one.
+    neighbour = '#[cfg(feature = "gpu-tests")]\nmod shim {\n    pub fn helper() {}\n}\n\nmod real {\n    #[test]\n    fn a() {}\n}\n'
+    if gpu_tests_gated_modules(neighbour):
+        raise AssertionError("a later module's tests must not be attributed to an earlier gated one")
+    if gpu_tests_gated_modules('mod inner {\n    #[test]\n    fn a() {}\n}\n'):
+        raise AssertionError("an ungated module is not drift")
+    # The brace walk must start at the gated module's own body. Starting
+    # anywhere earlier lets an unrelated module's tests be counted as this
+    # one's, which flags a correct gated helper and reds a green lane.
+    preceded = (
+        'mod first {\n    #[test]\n    fn a() {}\n}\n\n'
+        '#[cfg(feature = "gpu-tests")]\nmod second {\n    pub fn helper() {}\n}\n'
+    )
+    if gpu_tests_gated_modules(preceded):
+        raise AssertionError("an earlier module's tests must not be counted as the gated module's")
+
+    # `required-features` keeps the target from being built at all. Parsed with
+    # tomllib because the two shapes below are exactly what a hand-rolled
+    # section split gets wrong: a following table absorbed into the preceding
+    # test's span, and a header carrying a legal trailing comment.
+    if list(manifest_required_features('[[test]]\nname = "foo_gpu"\nrequired-features = ["gpu-tests"]\n')) != ["foo_gpu"]:
+        raise AssertionError("required-features on a policed target must be reported")
+    if list(manifest_required_features('[[test]] # a comment\nname = "foo_gpu"\nrequired-features = ["gpu-tests"]\n')) != ["foo_gpu"]:
+        raise AssertionError("a trailing comment on the table header must not hide required-features")
+    absorbed = '[[test]]\nname = "foo_gpu"\n\n[[bench]]\nname = "b"\nrequired-features = ["x"]\n'
+    if list(manifest_required_features(absorbed)):
+        raise AssertionError("a following bench table must not be read as part of the test target")
+    if list(manifest_required_features('[[test]]\nname = "plain_cpu"\nrequired-features = ["gpu-tests"]\n')):
+        raise AssertionError("an unpoliced target is not this check's business")
+    if list(manifest_required_features('[[test]]\nname = "foo_gpu"\n')):
+        raise AssertionError("a policed target without required-features is correct")
+
     good_active = ActiveResult("fixture_active", inventory=2, passed=0, failed=2, ignored=0)
     silent_with_feature = ActiveResult("fixture_active_silent", inventory=1, passed=1, failed=0, ignored=0)
     if validate_active_no_cuda_result(good_active):
@@ -891,16 +1254,19 @@ def main() -> int:
         return 0
 
     if args.source_scan:
-        source_errors = scan_source_for_missing_ignores()
+        source_errors = scan_source_for_missing_ignores() + scan_source_for_inventory_drift()
         if source_errors:
             print("CUDA test source scan failed:", file=sys.stderr)
             for error in source_errors:
                 print(f"  - {error}", file=sys.stderr)
             return 1
-        print("CUDA test source scan passed: every test in a CUDA target carries an ignore")
+        print(
+            "CUDA test source scan passed: every test in a CUDA target carries an ignore "
+            "and is present with gpu-tests off"
+        )
         return 0
 
-    errors: list[str] = scan_source_for_missing_ignores()
+    errors: list[str] = scan_source_for_missing_ignores() + scan_source_for_inventory_drift()
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
         if not declares_gpu_tests_feature(manifest):
