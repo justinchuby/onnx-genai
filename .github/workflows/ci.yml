@@ -494,6 +494,18 @@ jobs:
           shellcheck scripts/merge_when_green.sh scripts/merge_when_green_test.sh
           bash scripts/merge_when_green_test.sh
 
+      # The Miri lane selects most of its tests by name, and libtest exits 0 on
+      # a filter that matches nothing -- so a renamed test turns its step into a
+      # no-op that reports `ok`. `run_miri` refuses that, and this suite is what
+      # proves it still refuses, including a negative control that reproduces
+      # the pre-guard behaviour. Hermetic (no cargo, no Miri), well under a
+      # second. Runs here rather than in miri.yml so it is covered by a required
+      # lane instead of by the lane it guards.
+      - name: Miri step wrapper still refuses an empty filter (self-test)
+        run: |
+          shellcheck scripts/miri_step.sh scripts/miri_step_test.sh
+          bash scripts/miri_step_test.sh
+
       # onnx-genai-engine's native decode path only compiles when this feature
       # is on. Without this step a refactor can leave it uncompilable while
       # every other job still passes -- which is exactly what happened when
