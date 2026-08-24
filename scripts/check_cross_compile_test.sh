@@ -19,6 +19,16 @@
 # pass while the gate rejected every correct checkout.
 #
 # Linux/macOS shell; no /proc, no GNU-only tools.
+#
+# `uname` is shimmed too, and that is not cosmetic. The gate chooses its crate
+# scope from the HOST os, and on a non-Linux host it drops to the FFI-free
+# subset, which deliberately excludes onnx-runtime-cpuinfo -- so the
+# precondition correctly does not run there at all. Fixtures cannot override
+# that, because scope comes from the real `uname -s` and not from the fixture
+# root. Without the shim, eight of the cells below would fail on a macOS
+# developer's box while nothing was actually wrong. Pinning the host makes
+# every cell mean the same thing everywhere, and the scope-gating behaviour
+# gets its own explicit cells instead of silently deciding the others.
 
 set -uo pipefail
 
@@ -55,7 +65,9 @@ check() {
 # ─── Shims ────────────────────────────────────────────────────────────────
 # `cargo` and `rustup` are replaced so no cell compiles anything.  Both append
 # to $WORK/calls, which is how the ordering cell distinguishes "refused before
-# doing any work" from "refused after a full clippy pass".
+# doing any work" from "refused after a full clippy pass".  `uname` is replaced
+# so the host this suite runs on cannot change which crates the gate puts in
+# scope; see the header.
 
 make_shims() {
     mkdir -p "$WORK/bin"
@@ -74,7 +86,15 @@ EOF
 echo "cargo $*" >> "$SHIM_CALLS"
 exit 0
 EOF
-    chmod +x "$WORK/bin/rustup" "$WORK/bin/cargo"
+    cat > "$WORK/bin/uname" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-s" ]; then
+    echo "$SHIM_UNAME"
+    exit 0
+fi
+exec /usr/bin/uname "$@"
+EOF
+    chmod +x "$WORK/bin/rustup" "$WORK/bin/cargo" "$WORK/bin/uname"
 }
 
 # fixture_root <name> <file>... — a fake repo root holding a copy of the real
@@ -95,10 +115,18 @@ fixture_root() {
 
 # run_gate <root> — run the script inside <root> with the shims on PATH.
 # Sets OUT (merged stdout+stderr), STATUS and CALLS.
+#
+# $SHIM_UNAME pins the host the gate believes it is on (default Linux, where
+# onnx-runtime-cpuinfo is in scope).  GITHUB_ACTIONS is cleared so the result
+# does not depend on whether this suite happens to run before or after the
+# workflow step that installs the aarch64 cross toolchain -- the gate
+# hard-fails on a missing toolchain only under that variable, and this suite is
+# not the place that behaviour is decided.
 run_gate() {
     local root="$1"
     : > "$WORK/calls"
-    OUT="$(cd "$root" && PATH="$WORK/bin:$PATH" SHIM_CALLS="$WORK/calls" \
+    OUT="$(cd "$root" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" \
+        SHIM_CALLS="$WORK/calls" SHIM_UNAME="${SHIM_UNAME:-Linux}" \
         bash "$root/scripts/check_cross_compile.sh" 2>&1)"
     STATUS=$?
     CALLS="$(cat "$WORK/calls")"
@@ -183,6 +211,30 @@ case "$OUT" in *"not populated"*) R=1 ;; *) R=0 ;; esac
 check "this checkout is not reported as unpopulated" "$R" "$OUT"
 
 echo ""
+echo "== the precondition is scoped to the passes that actually build the crate =="
+
+# On a non-Linux host the gate drops to the FFI-free subset, which excludes
+# onnx-runtime-cpuinfo: nothing in that run touches the vendored tree, so
+# refusing on it would be a false alarm. This is the behaviour that would
+# otherwise silently decide the cells above, so it is asserted rather than
+# assumed.
+ROOT="$(fixture_root darwin)"
+SHIM_UNAME=Darwin run_gate "$ROOT"
+
+check "an unpopulated tree is not refused when the crate is out of scope" \
+    "$([ "$STATUS" = "0" ] && echo 0 || echo 1)" "got $STATUS: $OUT"
+
+case "$OUT" in *"not populated"*) R=1 ;; *) R=0 ;; esac
+check "and says nothing about submodules there" "$R" "$OUT"
+
+# Anti-vacuity for the two cells above: if the uname shim were not taking
+# effect they would be running the Linux path against a populated-looking tree
+# and passing for the wrong reason.
+case "$OUT" in *"Running on Darwin"*) R=0 ;; *) R=1 ;; esac
+check "the host shim reached the gate (so those cells are not vacuous)" \
+    "$R" "$OUT"
+
+echo ""
 echo "== the precondition follows the script, not the caller's directory =="
 
 # The gate resolves its own repository root from BASH_SOURCE, so running it
@@ -191,7 +243,8 @@ echo "== the precondition follows the script, not the caller's directory =="
 ROOT="$(fixture_root fromelsewhere CMakeLists.txt include/cpuinfo.h)"
 mkdir -p "$WORK/elsewhere"
 : > "$WORK/calls"
-OUT="$(cd "$WORK/elsewhere" && PATH="$WORK/bin:$PATH" SHIM_CALLS="$WORK/calls" \
+OUT="$(cd "$WORK/elsewhere" && env -u GITHUB_ACTIONS PATH="$WORK/bin:$PATH" \
+    SHIM_CALLS="$WORK/calls" SHIM_UNAME=Linux \
     bash "$ROOT/scripts/check_cross_compile.sh" 2>&1)"
 STATUS=$?
 
@@ -199,7 +252,7 @@ check "exit status is 0 when run from another directory" \
     "$([ "$STATUS" = "0" ] && echo 0 || echo 1)" "got $STATUS: $OUT"
 
 echo ""
-EXPECTED=15
+EXPECTED=18
 TOTAL=$((PASS + FAIL))
 if [ "$TOTAL" -ne "$EXPECTED" ]; then
     echo "✗ $TOTAL assertions ran, expected $EXPECTED — a cell was added or lost" >&2
