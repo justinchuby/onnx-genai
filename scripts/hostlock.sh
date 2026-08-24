@@ -62,7 +62,10 @@
 #
 # Options for acquire/run:
 #   --reason TEXT     what you are running (shown to whoever is blocked)
-#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER
+#   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER. `run` exports it
+#                     to the wrapped command (but never the $USER default, which
+#                     every agent on a shared box would answer to), so a harness
+#                     reading the lock can report `mine:` rather than `held:`
 #   --wait            block until free instead of failing immediately
 #   --timeout S       give up after S seconds (default 3600 with --wait)
 #   --gate N          after taking the lock, also wait until the instantaneous
@@ -1354,6 +1357,20 @@ run_teardown() {
     exit "$code"
 }
 
+# Was the owner stated, or merely defaulted from $USER?
+#
+# `OWNER` cannot answer this: by the time anything reads it, the `$USER`
+# default is indistinguishable from an explicit `--owner "$USER"`. The two
+# sources are therefore checked at their origin -- the environment here, and
+# `--owner` through OWNER_DECLARED in the parse loop. OWNER_DECLARED may be
+# unset (this script runs under `set -u`), so it is read with a default
+# rather than initialised next to OWNER, which keeps this self-contained.
+run_owner_is_declared() {
+    [ -n "${HOSTLOCK_OWNER:-}" ] && return 0
+    [ "${OWNER_DECLARED:-0}" = 1 ] && return 0
+    return 1
+}
+
 cmd_run() {
     [ "$#" -gt 0 ] || die "run needs a command after --"
     DO_WAIT=1
@@ -1369,7 +1386,23 @@ cmd_run() {
     # the wrapped command, which the inline form left running.
     local child rc wall0 wall1 cpu0 cpu1
     wall0=$(wall_now)
-    "$@" &
+
+    # Export the owner so the wrapped command can recognise the lock it is
+    # running under as its own. Without this, a harness that reads the lock
+    # sees a holder it cannot attribute and reports the run UNPROTECTED --
+    # `run --owner leon` yields `held:leon`, never `mine:leon`, so the one
+    # state the field exists to certify is unreachable by the one invocation
+    # that earns it.
+    #
+    # Only an owner that was DECLARED is exported. `$USER` is shared by every
+    # agent on this box, so defaulting the export to it would make every
+    # child claim every co-tenant's lock as its own. A false `mine:` is worse
+    # than a missing one: it reads as protected.
+    if run_owner_is_declared; then
+        HOSTLOCK_OWNER="$OWNER" "$@" &
+    else
+        "$@" &
+    fi
     child=$!
 
     # Traps first. Reading the child's start time forks, and a signal arriving
@@ -1508,6 +1541,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --owner)
             OWNER=${2:-}
+            OWNER_DECLARED=1
             require_name "$1" "$OWNER"
             shift 2
             ;;

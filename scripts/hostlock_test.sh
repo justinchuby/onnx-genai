@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".childowner "$LOCK".nested 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -373,6 +373,84 @@ sleep 1
 chk "SIGKILL leaves the lock behind" "$(st state)" "STALE"
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 chk "next acquirer reaps the killed holder" "$(st owner)" "roy"
+cleanup
+
+echo "== run: the wrapped command can recognise its own lock =="
+# #1929. `run` acquired the lock with OWNER and then never told the command
+# about it, so a harness that reads the lock saw a holder it could not
+# attribute and labelled its own protected run UNPROTECTED (`held:leon`, not
+# `mine:leon`). Every invocation below controls HOSTLOCK_OWNER explicitly --
+# the agents that run this suite export it, so an ambient value would decide
+# these cells instead of the code under test.
+CHILDOWNER="$LOCK".childowner
+child_saw() { cat "$CHILDOWNER" 2>/dev/null; }
+# $0 is the report file; ${HOSTLOCK_OWNER:-<unset>} distinguishes "exported
+# empty" from "not exported at all", which is the whole question here.
+# The child must expand these, not this shell: SC2016 is the point, not a bug.
+# shellcheck disable=SC2016
+SAY_OWNER='printf "%s" "${HOSTLOCK_OWNER:-<unset>}" > "$0"'
+
+rm -f "$CHILDOWNER"
+env -u HOSTLOCK_OWNER $HL run --owner leon -- bash -c "$SAY_OWNER" "$CHILDOWNER" >/dev/null 2>&1
+chk "--owner reaches the wrapped command" "$(child_saw)" "leon"
+cleanup
+
+rm -f "$CHILDOWNER"
+# This cell is NOT killed by the original defect: with the variable already in
+# the environment the child inherits it whether `run` exports it or not. It
+# holds down the other direction -- that `run` neither scrubs nor rewrites an
+# owner the caller declared -- and is killed by a `run` that sanitises the
+# child's environment. Recorded because an assertion whose defect nobody
+# identified is indistinguishable from one that cannot fail.
+HOSTLOCK_OWNER=roy $HL run -- bash -c "$SAY_OWNER" "$CHILDOWNER" >/dev/null 2>&1
+chk "an owner from the environment reaches it unchanged" "$(child_saw)" "roy"
+cleanup
+
+rm -f "$CHILDOWNER"
+HOSTLOCK_OWNER=roy $HL run --owner leon -- bash -c "$SAY_OWNER" "$CHILDOWNER" >/dev/null 2>&1
+chk "--owner wins over the environment for the command too" "$(child_saw)" "leon"
+cleanup
+
+# The load-bearing cell: the reader labels a row `mine:` by comparing the
+# exported name against the name IN the lock. Asserting only that the variable
+# exists would pass even if the two disagreed, which is the failure this is
+# meant to exclude -- so the child reports both and they are compared.
+rm -f "$CHILDOWNER"
+# shellcheck disable=SC2016  # the child expands these, which is the point
+env -u HOSTLOCK_OWNER $HL run --owner leon -- bash -c \
+    'printf "%s %s" "${HOSTLOCK_OWNER:-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
+    "$CHILDOWNER" >/dev/null 2>&1
+chk "the exported name is the name in the lock, so the reader can say mine:" \
+    "$(child_saw)" "leon leon"
+cleanup
+
+# The $USER default must NOT be exported: every agent on this box is the same
+# unix user, so a child told to answer to it would claim a co-tenant's lock as
+# its own. A false `mine:` is worse than a missing one -- it reads as
+# protected. The lock itself still records the default, which this cell holds
+# down at the same time so the fix cannot be mistaken for a change to acquire.
+rm -f "$CHILDOWNER"
+# shellcheck disable=SC2016  # the child expands these, which is the point
+env -u HOSTLOCK_OWNER $HL run -- bash -c \
+    'printf "%s|%s" "${HOSTLOCK_OWNER:-<unset>}" "$(scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p")" > "$0"' \
+    "$CHILDOWNER" >/dev/null 2>&1
+chk "an owner defaulted from \$USER is written to the lock but not exported" \
+    "$(child_saw)" "<unset>|${USER:-unknown}"
+cleanup
+
+# Inheriting into a nested acquire is deliberate, not incidental: a wrapped
+# script that takes a second lock should take it as the same agent. A separate
+# directory, because a nested acquire on the SAME lock is contention, not
+# inheritance, and would test the wrong thing.
+rm -f "$CHILDOWNER"
+# shellcheck disable=SC2016  # the child expands these, which is the point
+env -u HOSTLOCK_OWNER $HL run --owner leon -- bash -c \
+    'HOSTLOCK_DIR="$1" scripts/hostlock.sh acquire --ttl 60 >/dev/null 2>&1
+     HOSTLOCK_DIR="$1" scripts/hostlock.sh status --porcelain | sed -n "s/^owner=//p" > "$2"' \
+    _ "$LOCK".nested "$CHILDOWNER" >/dev/null 2>&1
+chk "a nested acquire inherits the declared owner rather than \$USER" \
+    "$(child_saw)" "leon"
+rm -rf "$LOCK".nested
 cleanup
 
 echo "== run does not clobber a successor's lock =="
@@ -1990,7 +2068,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "314"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "320"
 
 echo
 echo "passed=${pass} failed=${fail}"

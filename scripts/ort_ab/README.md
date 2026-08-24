@@ -317,11 +317,13 @@ whichever holder happened to be there at the end:
 | `changed` | the window spans a change of custody; no single holder describes it |
 | `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
 
-Set `HOSTLOCK_OWNER` in the **environment**, not just `--owner` on the command
-line: `run` does not export the flag, so a child that inherits neither cannot
-tell your lock from a co-tenant's and reports `held:` rather than `mine:`.
-`HOSTLOCK_OWNER=leon scripts/hostlock.sh run --reason "..." -- ...` sets both at
-once, since `--owner` defaults to it.
+Declare an owner one way or the other: `run` exports `HOSTLOCK_OWNER` to the
+wrapped command, so `scripts/hostlock.sh run --owner leon --reason "..." -- ...`
+and `HOSTLOCK_OWNER=leon scripts/hostlock.sh run --reason "..." -- ...` both
+produce `mine:leon`. What it will **not** do is export an owner it defaulted
+from `$USER`: with neither the flag nor the variable set, the lock still records
+`$USER` but the child is told nothing, and the row reads `held:` rather than
+`mine:`.
 
 There is deliberately no fallback to `$USER`, even though the script uses one.
 Every agent on this host runs as the same user, so `$USER` cannot distinguish
