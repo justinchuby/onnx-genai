@@ -2238,6 +2238,17 @@ time. That figure is now stale; the re-measurement replaces it.
 > measured. Full record:
 > [`docs/benchmarks/2026-08-24-acc0-straggler-identity.md`](../benchmarks/2026-08-24-acc0-straggler-identity.md).
 >
+> **Post-hoc lead from the same data, recorded as a lead and not a verdict:**
+> across 73 launches in three independent experiments the last-arriving lane is
+> also the highest-`work_ns` lane in **0.667 / 0.667 / 0.684** of launches
+> against a chance share of 0.067 -- so the victim usually computes longer
+> rather than merely starting late. That constrains the selector to something
+> that makes identical work, on a fixed core, at fixed virtual addresses, take
+> longer. **Physical page assignment** is the family that fits and is the next
+> hypothesis to test: `setarch -R` fixes virtual addresses while the kernel
+> still hands out different physical frames each exec, and the large caches
+> here are physically indexed. Not yet tested, and not to be cited as a cause.
+>
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
 > (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not

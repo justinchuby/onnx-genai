@@ -149,10 +149,44 @@ the straggler lead and the 0.565-share figure in the ledger, and meant two
 probes were built to find the mechanism of an artefact. It was written into the
 rule for that reason and it is worth stating that it did not fire.
 
+## 4. Post-hoc: the victim computes longer, it does not merely start late
+
+This is an analysis of data already collected, not a pre-registered test, and
+is recorded as a lead rather than a verdict. It costs nothing — every launch
+above already reports both `straggler_idx` (most `last_arrivals`) and
+`slowest_idx` (most `work_ns`), and the question is simply how often they are
+the same lane.
+
+| run | launches | `straggler_idx == slowest_idx` | chance |
+|---|---|---|---|
+| identity (24 launches) | 24 | 16/24 = **0.667** | 0.067 |
+| ASLR A/B (both arms) | 30 | 20/30 = **0.667** | 0.067 |
+| window scaling (both arms) | 19 | 13/19 = **0.684** | 0.067 |
+
+Three independent experiments, 73 launches, agreement 10× above chance and
+stable to within 0.017. In about two thirds of launches the lane that arrives
+last is also the lane that spent the most time *computing* — so the victim is
+usually genuinely slower at the work, not merely late to be woken. (In the
+remaining third it arrives last without holding the most `work_ns`, which is
+what a dispatch- or wake-ordering effect looks like; both are probably present.)
+
+That matters for what to test next, because it constrains the selector to
+something that makes *identical work on a fixed core at fixed virtual
+addresses* take longer. One family fits without contradicting anything above:
+**physical** page assignment. `setarch -R` fixes virtual addresses, but the
+kernel still hands out different physical frames on every exec, and the large
+caches on this part are physically indexed — so cache set and DRAM bank
+conflicts vary per process while virtual layout does not. That is per-process,
+durable, invisible to the layout arm, and able to slow equal work.
+
+It is written here as the next hypothesis to test, explicitly **not** as a
+finding. The way to test it is to vary physical backing — for example by
+forcing or forbidding huge pages for the weight arena, which changes colouring
+granularity — and to pre-register the rule before looking, exactly as above.
+
 ## Where this leaves the straggler
 
 Established by measurement, not argument:
-
 * **Real.** One lane is last on ~72% of ops over a 3840-op window, and the
   concentration strengthens with window length (R = 1.69).
 * **Costly.** Straggler wait is ~0.31 of the width-16 window; every other lane
@@ -162,14 +196,19 @@ Established by measurement, not argument:
 * **Not address layout.** `setarch -R` gives the same concentration as ASLR.
 * **Per-process and durable.** Persistent within a launch, different between
   launches.
+* **Usually genuinely slower at computing** (post-hoc, 73 launches across three
+  experiments): the last-arriving lane is also the highest-`work_ns` lane in
+  0.667 / 0.667 / 0.684 of launches against a chance share of 0.067.
 
 What has *not* been established, and is the next question: what picks the
 victim at startup. The remaining shape is something that varies between
-processes but is not the address layout and not the CPU assignment — a startup
-ordering effect is the obvious family (which lane registers first, what a lane
-touches before steady state), but naming a specific mechanism here would repeat
-the error of carrying "weight-arena placement across the two L3/CCX domains"
-for two records on a single-NUMA host. It is left unnamed until it is measured.
+processes but is not the address layout and not the CPU assignment. Section 4
+narrows it further — the victim usually computes longer, so the selector has to
+make identical work on a fixed core at fixed virtual addresses take longer, and
+**physical** page assignment is the family that fits. That is recorded as the
+next hypothesis rather than a conclusion; naming a mechanism as established here
+would repeat the error of carrying "weight-arena placement across the two
+L3/CCX domains" for two records on a single-NUMA host.
 
 ## Method notes
 
