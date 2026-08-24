@@ -263,6 +263,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Clip",
     "Softsign",
     "Selu",
+    "Celu",
     "Gather",
     "Shape",
     "Constant",
@@ -1228,6 +1229,13 @@ pub fn build_cuda_registry_with_metrics(
         }),
     );
     reg.register(
+        OpKey::new("Celu", "", 12),
+        Box::new(ActivationFactory {
+            name: "Celu",
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
         OpKey::new("Swish", "", 24),
         Box::new(ActivationFactory {
             name: "Swish",
@@ -1780,6 +1788,7 @@ mod tests {
             "Clip",
             "Softsign",
             "Selu",
+            "Celu",
         ] {
             assert!(
                 CUDA_COVERED_OPS.contains(&op),

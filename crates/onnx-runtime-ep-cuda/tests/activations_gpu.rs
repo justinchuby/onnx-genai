@@ -17,7 +17,7 @@
 use onnx_runtime_ep_api::{DevicePtr, DevicePtrMut, ExecutionProvider, TensorMut, TensorView};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::runtime::cuptr;
-use onnx_runtime_ir::{DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
+use onnx_runtime_ir::{Attribute, DataType, DeviceId, Node, NodeId, compute_contiguous_strides};
 
 fn f32_bytes(values: &[f32]) -> &[u8] {
     // SAFETY: f32 is plain data and the byte slice retains the source lifetime.
@@ -272,6 +272,10 @@ fn clip_optional_bounds_match_cpu_reference() {
 /// returns NaN, where the correct answer converges to x. The CPU kernel uses the
 /// overflow-stable form and the CUDA one must agree — a test that only probed
 /// small inputs would pass against the broken spelling.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn mish_matches_cpu_including_the_saturating_tail() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
@@ -311,6 +315,85 @@ fn mish_matches_cpu_including_the_saturating_tail() {
         assert!(
             (output - input).abs() < 1e-3,
             "Mish({input}) = {output}; expected it to converge to the input"
+        );
+    }
+}
+
+/// `Celu(x) = max(0,x) + min(0, alpha*(exp(x/alpha)−1))`, opset 12.
+///
+/// Two critical properties are verified:
+///
+/// 1. **NaN propagation**: the CPU scalar uses an explicit `is_nan` guard
+///    because Rust's `f32::max`/`f32::min` (IEEE maxNum) return the non-NaN
+///    operand, so both terms would collapse to zero; CUDA's `fmaxf`/`fminf`
+///    have the same behaviour, so the kernel must guard too. A naive
+///    implementation without the guard would return 0 for NaN input.
+///
+/// 2. **Non-default `alpha`**: a test using only `alpha = 1.0` would pass
+///    against a kernel that ignored the attribute entirely (because Celu(x,1)
+///    and Elu(x,1) are numerically close for small |x|). We therefore run
+///    `alpha = 2.0` and `alpha = 0.5` as well.
+#[test]
+fn celu_matches_cpu_including_nan_and_alpha_variants() {
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => {
+            eprintln!("skip: no CUDA GPU/runtime available ({error})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+        Err(_) => {
+            eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+
+    // Inputs: negative, zero, positive, large positive (exp(x/alpha) overflows
+    // → result is max(0,x)+0 = x), NaN.  The large-positive case specifically
+    // distinguishes a correct kernel from one that computes
+    // min(0, alpha*(Inf-1)) = -Inf and adds it to x (giving -Inf where the
+    // correct answer is x itself).
+    let x = [
+        f32::NEG_INFINITY,
+        -3.0f32,
+        -1.0,
+        -0.5,
+        -0.0,
+        0.0,
+        0.5,
+        1.0,
+        2.0,
+        100.0,
+        f32::NAN,
+    ];
+
+    fn cpu_celu(v: f32, alpha: f32) -> f32 {
+        if v.is_nan() {
+            return v;
+        }
+        v.max(0.0) + (alpha * ((v / alpha).exp() - 1.0)).min(0.0)
+    }
+
+    for alpha in [1.0f32, 2.0, 0.5] {
+        let mut celu_node = Node::new(NodeId(0), "Celu", vec![], vec![]);
+        celu_node
+            .attributes
+            .insert("alpha".into(), Attribute::Float(alpha));
+
+        let got = run(&ep, &celu_node, &x, None);
+        let expected: Vec<f32> = x.iter().map(|&v| cpu_celu(v, alpha)).collect();
+        assert_close(&got, &expected);
+
+        // Large-positive sanity check: exp(100/alpha) overflows to Inf, so
+        // min(0, alpha*(Inf-1)) = min(0, Inf) = 0, and Celu(100) = 100+0 = 100.
+        // A broken kernel returning -Inf here fails this assertion.
+        let large_idx = x.iter().position(|&v| v == 100.0).unwrap();
+        assert_eq!(
+            got[large_idx], 100.0,
+            "Celu(100, alpha={alpha}) must be 100 (not -Inf)"
         );
     }
 }
