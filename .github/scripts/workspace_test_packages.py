@@ -162,8 +162,29 @@ _PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
 # gate stricter (packages look unenforced and it fails loudly), so the direction
 # that must be guarded is over-reading, which is what job-slice attribution and
 # comment stripping are for.
-_JOB_KEY = re.compile(r"^  ([A-Za-z0-9_-]+):\s*$")
+# A job key may be quoted and may carry a trailing comment; both are valid YAML.
+# Missing one silently folds that job's steps into the *previous* job, and since
+# `rust-coverage` follows required `rust-quality`, that direction manufactures a
+# false green. Anything at job-key depth that does not parse here is therefore a
+# hard error rather than body text -- see `_at_job_depth`.
+_JOB_KEY = re.compile(
+    r"""^\ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:\s*(?:\#.*)?$"""
+)
 _JOB_NAME = re.compile(r"^    name:\s*(.+?)\s*$")
+_TRAILING_COMMENT = re.compile(r"\s+\#.*$")
+
+
+def _at_job_depth(line: str) -> bool:
+    """True for a line indented exactly two spaces, i.e. a direct child of `jobs:`."""
+    return len(line) > 2 and line.startswith("  ") and not line[2].isspace()
+
+
+def _scalar(value: str) -> str:
+    """A YAML scalar as written in this workflow: optional quotes, optional comment."""
+    value = _TRAILING_COMMENT.sub("", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value
 _RUN_KEY = re.compile(r"^(\s*)(- )?run:\s*(.*)$")
 _FOLDED = {">", ">-", ">+"}
 _LITERAL = {"|", "|-", "|+"}
@@ -171,11 +192,16 @@ _LITERAL = {"|", "|-", "|+"}
 
 def workflow_jobs() -> dict[str, str]:
     """Map each job's display name to its YAML body with comments removed."""
-    lines = WORKFLOW.read_text(encoding="utf-8").splitlines()
+    return parse_jobs(WORKFLOW.read_text(encoding="utf-8"), source=str(WORKFLOW))
+
+
+def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
+    """`workflow_jobs` over arbitrary text, so the parser itself is testable."""
+    lines = text.splitlines()
     try:
         start = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
     except StopIteration:
-        raise SystemExit(f"{WORKFLOW}: no top-level `jobs:` block to check")
+        raise SystemExit(f"{source}: no top-level `jobs:` block to check")
 
     jobs: dict[str, str] = {}
     key: str | None = None
@@ -188,10 +214,10 @@ def workflow_jobs() -> dict[str, str]:
         name = key
         for line in body:
             if match := _JOB_NAME.match(line):
-                name = match.group(1)
+                name = _scalar(match.group(1))
                 break
         if name in jobs:
-            raise SystemExit(f"{WORKFLOW}: two jobs are both named {name!r}")
+            raise SystemExit(f"{source}: two jobs are both named {name!r}")
         jobs[name] = "\n".join(
             line for line in body if not line.lstrip().startswith("#")
         )
@@ -200,15 +226,22 @@ def workflow_jobs() -> dict[str, str]:
     for line in lines[start + 1 :]:
         if line.strip() and not line.startswith(" ") and not line.startswith("#"):
             break
-        if match := _JOB_KEY.match(line):
+        if _at_job_depth(line) and not line.lstrip().startswith("#"):
+            match = _JOB_KEY.match(line)
+            if match is None:
+                raise SystemExit(
+                    f"{source}: line at job-key depth is not a job key this gate "
+                    f"can parse: {line!r}. Refusing to guess -- absorbing it into the "
+                    f"previous job would credit its steps to that job."
+                )
             flush()
-            key = match.group(1)
+            key = match.group("dq") or match.group("sq") or match.group("plain")
             continue
         if key is not None:
             body.append(line)
     flush()
     if not jobs:
-        raise SystemExit(f"{WORKFLOW}: parsed no jobs; the gate would check nothing")
+        raise SystemExit(f"{source}: parsed no jobs; the gate would check nothing")
     return jobs
 
 
@@ -305,6 +338,68 @@ def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
     return 0
 
 
+# Job bodies whose keys are written in the ways YAML allows. A key form this
+# parser fails to recognise does not degrade to "unknown job": the body is
+# appended to whatever job came last, so an advisory job's steps are credited to
+# the required job above it. `rust-coverage` sits directly below `rust-quality`,
+# so that is a concrete route to a false green, and it is the reason
+# `_at_job_depth` raises instead of guessing. Measured before the fix: trailing
+# comment and quoted forms both produced a passing gate on a workflow whose
+# required job ran none of the tests.
+_PARSER_FIXTURE = """jobs:
+  alpha:
+    name: Required Job
+    steps:
+      - run: cargo test -p pkg-alpha
+{key}
+    name: Advisory Job
+    steps:
+      - run: cargo test -p pkg-beta
+"""
+
+
+_PARSER_ARM_COUNT = 5
+
+
+def _parser_arms() -> int:
+    """Prove a job boundary is never absorbed into the job above it."""
+    failures = 0
+    for label, key in (
+        ("plain job key (control)", "  beta:"),
+        ("job key with a trailing comment", "  beta:  # advisory lane"),
+        ('job key in double quotes', '  "beta":'),
+        ("job key in single quotes", "  'beta':"),
+    ):
+        text = _PARSER_FIXTURE.format(key=key)
+        try:
+            jobs = parse_jobs(text)
+        except SystemExit as exit_error:
+            print(f"  FAIL  {label}: parser refused a valid workflow: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        required_body = jobs.get("Required Job", "")
+        leaked = "pkg-beta" in required_body
+        if sorted(jobs) != ["Advisory Job", "Required Job"] or leaked:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        jobs parsed: {sorted(jobs)}", file=sys.stderr)
+            if leaked:
+                print("        the advisory job's step was credited to the required job", file=sys.stderr)
+        else:
+            print(f"  ok    {label} -> two jobs, no step credited across the boundary")
+
+    # An unrecognised line at job-key depth must stop the gate, not extend a job.
+    label = "unparseable line at job-key depth is fatal"
+    try:
+        parse_jobs(_PARSER_FIXTURE.format(key="  beta: not-a-job-body"))
+    except SystemExit:
+        print(f"  ok    {label} -> refused")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: parsed without complaint", file=sys.stderr)
+    return failures
+
+
 def self_test() -> int:
     """Prove both gates still refuse, on content and not merely on exit code.
 
@@ -354,10 +449,13 @@ def self_test() -> int:
         else:
             named = f", naming {want_named}" if want_named else ""
             print(f"  ok    {label} -> exit {code}{named}")
+    parser_failures = _parser_arms()
+    failures += parser_failures
+    total = len(arms) + _PARSER_ARM_COUNT
     if failures:
         print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
         return 1
-    print(f"workspace test package self-test: {len(arms)}/{len(arms)} arms behaved as stated")
+    print(f"workspace test package self-test: {total}/{total} arms behaved as stated")
     return 0
 
 
