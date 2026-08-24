@@ -197,6 +197,19 @@ pub enum ShapeInference {
     /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
     /// has to be read off input 1.
     CausalConvWithState,
+    /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
+    ///
+    /// Output shape is the input's, with the last dimension forced to 2 (the
+    /// complex component pair, even for real input) and the signal axis set to
+    /// `dft_length` — halved to `n / 2 + 1` when `onesided`.
+    ///
+    /// Both `dft_length` (input 1) and, from opset 20, `axis` (input 2) arrive
+    /// as *inputs*, so like [`Self::Compress`] this resolves at Compute time by
+    /// reading values. `axis_attr` carries the pre-opset-20 spelling.
+    Dft {
+        onesided: bool,
+        axis_attr: Option<i64>,
+    },
     /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
     /// when absent) using a 1-D Bool `condition`.
     ///
@@ -549,6 +562,15 @@ impl ShapeInference {
                     num_outputs,
                 }
             }
+
+            // ── DFT ───────────────────────────────────────────────────────
+            // Pre-opset-20 the axis is an attribute defaulting to -2; from
+            // opset 20 it is input 2. Both are modelled, so neither reaches
+            // `Unmodelled`.
+            "DFT" => Self::Dft {
+                onesided: int_attr("onesided").unwrap_or(0) != 0,
+                axis_attr: int_attr("axis"),
+            },
 
             // ── Compress ──────────────────────────────────────────────────
             // `axis` is optional: absent means the input is flattened first.
@@ -3573,6 +3595,44 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
 // Shape inference implementations
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read a scalar `i64` (or `i32`) out of a host-accessible view.
+///
+/// Same device restriction, and for the same reason, as [`count_true`]: this
+/// runs on the host, so a device-resident value is refused with an explanation
+/// rather than dereferenced.
+fn read_scalar_i64(t: &TensorView<'_>, what: &str) -> Result<i64, String> {
+    if !t.device.is_host_accessible() {
+        return Err(format!(
+            "{what} is on {:?}, which the host cannot read during shape \
+             inference. An EP with device-resident inputs must copy it to the \
+             host before Compute.",
+            t.device
+        ));
+    }
+    let base = t.data.as_ptr() as *const u8;
+    if base.is_null() {
+        return Err(format!("{what} has a null data pointer"));
+    }
+    // SAFETY: host-accessible view of at least one element of the stated dtype;
+    // `byte_offset` is inside it by the view's contract.
+    let p = unsafe { base.add(t.byte_offset) };
+    match t.dtype {
+        DataType::Int64 => Ok(unsafe { p.cast::<i64>().read_unaligned() }),
+        DataType::Int32 => Ok(i64::from(unsafe { p.cast::<i32>().read_unaligned() })),
+        other => Err(format!("{what} must be Int32 or Int64, got {other:?}")),
+    }
+}
+
+/// Resolve a possibly-negative axis against `rank`.
+fn normalize_axis(axis: i64, rank: usize, what: &str) -> Result<usize, String> {
+    let r = rank as i64;
+    let a = if axis < 0 { axis + r } else { axis };
+    if a < 0 || a >= r {
+        return Err(format!("{what} {axis} out of range for rank {rank}"));
+    }
+    Ok(a as usize)
+}
+
 /// Indices of the true entries in a 1-D Bool `condition`.
 ///
 /// This is the only place the shape table reads a tensor's *values*, so the two
@@ -4367,6 +4427,63 @@ fn infer_shapes(
             Ok(outputs)
         }
 
+        ShapeInference::Dft {
+            onesided,
+            axis_attr,
+        } => {
+            if inputs.is_empty() {
+                return Err("DFT: expected at least 1 input".into());
+            }
+            let input = &inputs[0];
+            let rank = input.shape.len();
+            if rank < 2 {
+                return Err(format!(
+                    "DFT: input must have rank >= 2 (signal axis plus complex \
+                     component dim), got {rank}"
+                ));
+            }
+            let last = rank - 1;
+            let complex_dim = input.shape[last];
+            if complex_dim != 1 && complex_dim != 2 {
+                return Err(format!(
+                    "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
+                ));
+            }
+
+            // opset 20 moves `axis` into input 2; before that it is an
+            // attribute defaulting to -2.
+            let axis_raw = match inputs.get(2) {
+                Some(t) if !t.shape.is_empty() => read_scalar_i64(t, "DFT axis")?,
+                _ => axis_attr.unwrap_or(-2),
+            };
+            let axis = normalize_axis(axis_raw, rank, "DFT axis")?;
+            if axis == last {
+                return Err(
+                    "DFT: the signal axis cannot be the complex component dimension".into(),
+                );
+            }
+
+            // `dft_length` (input 1) overrides the signal extent when present.
+            let signal_len = match inputs.get(1) {
+                Some(t) if t.shape.iter().product::<usize>() > 0 => {
+                    let n = read_scalar_i64(t, "DFT dft_length")?;
+                    usize::try_from(n)
+                        .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
+                }
+                _ => input.shape[axis],
+            };
+
+            let mut shape = input.shape.to_vec();
+            shape[axis] = if *onesided {
+                signal_len / 2 + 1
+            } else {
+                signal_len
+            };
+            // Always complex out, even for real input.
+            shape[last] = 2;
+            Ok(vec![shape])
+        }
+
         ShapeInference::Compress { axis } => {
             // The only rule here that reads input *values* rather than shapes.
             // `Compress` selects the entries where `condition` is true, so the
@@ -4809,6 +4926,120 @@ fn after() {}
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
+    }
+
+    // ── DFT ──────────────────────────────────────────────────────────────────
+
+    fn i64_scalar<'a>(v: &'a [i64], shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(v.as_ptr() as *mut std::ffi::c_void),
+            DataType::Int64,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn dft_real_input_produces_a_complex_last_dim() {
+        // [batch=2, signal=8, real=1] -> [2, 8, 2]. The last dim must become 2
+        // even though the input is real; a rule that copied it through would
+        // answer 1 and the kernel would reject the buffer.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: false,
+                    axis_attr: Some(1)
+                },
+                &[x]
+            )
+            .unwrap(),
+            vec![vec![2, 8, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_onesided_halves_the_signal_axis() {
+        // n=8 -> 8/2+1 = 5. This is the whole point of `onesided`, and a rule
+        // that ignored the attribute would answer 8.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: true,
+                    axis_attr: Some(1)
+                },
+                &[x]
+            )
+            .unwrap(),
+            vec![vec![2, 5, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_length_input_overrides_the_signal_extent() {
+        // dft_length=4 against a signal of 8: the output follows the request,
+        // not the input extent.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        let n = [4i64];
+        let len = i64_scalar(&n, &[1], &[1]);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: false,
+                    axis_attr: Some(1)
+                },
+                &[x, len]
+            )
+            .unwrap(),
+            vec![vec![2, 4, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_opset20_reads_the_axis_from_input_two() {
+        // The axis input must win over the attribute. Attribute says 1, input
+        // says 0 — a rule that ignored the input would resize the wrong axis.
+        let buf = vec![0.0f32; 24];
+        let x = f32_data(&[3, 4, 2], &[8, 2, 1], &buf);
+        let empty: [i64; 0] = [];
+        let no_len = i64_scalar(&empty, &[0], &[1]);
+        let a = [0i64];
+        let axis_in = i64_scalar(&a, &[1], &[1]);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: true,
+                    axis_attr: Some(1)
+                },
+                &[x, no_len, axis_in]
+            )
+            .unwrap(),
+            // axis 0 of extent 3, onesided -> 3/2+1 = 2
+            vec![vec![2, 4, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_refuses_the_complex_dim_as_the_signal_axis() {
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        let err = infer(
+            &ShapeInference::Dft {
+                onesided: false,
+                axis_attr: Some(-1),
+            },
+            &[x],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("complex component"),
+            "error should name the reason: {err}"
+        );
     }
 
     // ── Compress ─────────────────────────────────────────────────────────────

@@ -76,7 +76,6 @@ const NOT_CLAIMABLE: &[(&str, &str)] = &[
     ("ConvTranspose", ""),
     ("CumProd", ""),
     ("CumSum", ""),
-    ("DFT", ""),
     ("DequantizeLinear", ""),
     ("DynamicQuantizeLinear", ""),
     ("Expand", ""),
