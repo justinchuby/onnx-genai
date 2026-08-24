@@ -55,8 +55,17 @@ const MAX_OWNER_LEN: usize = 32;
 /// Who claims the host, as recorded in the lock's metadata file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockHolder {
-    /// Sanitised; see [`sanitise_owner`].
+    /// Sanitised for printing; see [`sanitise_owner`].
     pub owner: String,
+    /// The owner exactly as written, minus surrounding whitespace.
+    ///
+    /// Attribution compares this and never [`owner`](Self::owner), because
+    /// sanitising is lossy in the one direction that matters: it maps
+    /// `sebastian!` and any 33-character name sharing a 32-character prefix
+    /// onto an existing name, and a collision there turns `foreign` into
+    /// `mine` and marks a contaminated row protected. Display may be lossy;
+    /// the protection decision may not.
+    pub owner_raw: String,
     /// The PID whose liveness decides whether the lock is stale. `None` when the
     /// metadata did not carry one, which is itself a reason to distrust it.
     pub anchor_pid: Option<u32>,
@@ -212,6 +221,7 @@ pub fn parse_meta(meta: &str) -> Option<LockHolder> {
     let owner = meta_get(meta, "owner")?;
     Some(LockHolder {
         owner: sanitise_owner(owner),
+        owner_raw: owner.trim().to_string(),
         // A non-numeric or absent anchor is `None` rather than a default. There
         // is no safe default: 0 or 1 would both name a live process and label a
         // dead holder's lock as current.
@@ -394,8 +404,8 @@ pub fn field(before: &LockState, after: &LockState, self_owner: Option<&str>) ->
         LockState::Free => LockField::Free,
         LockState::Stale(holder) => LockField::Stale(holder.owner.clone()),
         LockState::Unverified(holder) => LockField::Unverified(holder.owner.clone()),
-        LockState::Held(holder) => match self_owner.map(sanitise_owner) {
-            Some(mine) if mine == holder.owner => LockField::Mine(holder.owner.clone()),
+        LockState::Held(holder) => match self_owner.map(str::trim) {
+            Some(mine) if mine == holder.owner_raw => LockField::Mine(holder.owner.clone()),
             Some(_) => LockField::Foreign(holder.owner.clone()),
             None => LockField::Held(holder.owner.clone()),
         },
@@ -434,6 +444,7 @@ mod tests {
     fn held(owner: &str) -> LockState {
         LockState::Held(LockHolder {
             owner: owner.to_string(),
+            owner_raw: owner.to_string(),
             anchor_pid: Some(1),
             start_time: Some(900),
             reason: "acc0".to_string(),
@@ -648,6 +659,7 @@ mod tests {
             state,
             LockState::Unverified(LockHolder {
                 owner: "roy".into(),
+                owner_raw: "roy".into(),
                 anchor_pid: Some(7),
                 start_time: None,
                 reason: "acc0".into(),
@@ -664,6 +676,36 @@ mod tests {
             classify(Some("owner=roy\n"), |_| running(900)),
             LockState::Unverified(_)
         ));
+    }
+
+    /// Sanitising is lossy, so it must not be what decides whether a lock is
+    /// ours. Both collisions below would otherwise promote another agent's
+    /// declaration to `mine` and mark a contaminated row protected -- the one
+    /// direction this module exists to prevent.
+    #[test]
+    fn a_name_that_merely_sanitises_to_ours_is_not_ours() {
+        let punctuated = parse_meta(&meta("sebastian!", "1")).expect("present");
+        assert_eq!(
+            punctuated.owner, "sebastian",
+            "the display form is expected to collide; that is what makes this a hazard"
+        );
+        let state = LockState::Held(punctuated);
+        assert_eq!(
+            field(&state, &state, Some("sebastian")),
+            LockField::Foreign("sebastian".into()),
+            "a different raw owner must stay foreign however it prints"
+        );
+        assert!(!field(&state, &state, Some("sebastian")).is_protected());
+
+        // Two names that differ only past the display truncation.
+        let long = format!("{}a", "s".repeat(MAX_OWNER_LEN));
+        let other = format!("{}b", "s".repeat(MAX_OWNER_LEN));
+        let state = LockState::Held(parse_meta(&meta(&long, "1")).expect("present"));
+        assert!(
+            !field(&state, &state, Some(&other)).is_protected(),
+            "truncation must not make two distinct owners the same owner"
+        );
+        assert!(field(&state, &state, Some(&long)).is_protected());
     }
 
     /// A non-numeric anchor must not fall back to a PID that happens to exist.

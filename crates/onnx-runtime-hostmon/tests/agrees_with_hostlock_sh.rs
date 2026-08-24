@@ -63,6 +63,55 @@ fn hostlock(dir: &Path, args: &[&str]) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// Kills and reaps its child on unwind.
+///
+/// Without this, a panic between spawning the anchor and killing it leaves a
+/// `sleep 300` reparented to init for five minutes. It burns no CPU, so it
+/// would not corrupt anyone's measurement -- but complaining about other
+/// agents' leaked processes while leaking one on every failed assertion is not
+/// a position worth defending, and the failing run is exactly when someone will
+/// be looking at the process table.
+struct Anchor(std::process::Child);
+
+impl Anchor {
+    fn spawn() -> Self {
+        Anchor(
+            Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .expect("spawn anchor"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Ends the anchor and waits for it, so the PID names nothing afterwards
+    /// rather than a zombie.
+    fn retire(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for Anchor {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+/// Removes a scratch lock directory on unwind. Never the real one: it is
+/// constructed only by [`lock_dir`], which roots everything under
+/// `CARGO_TARGET_TMPDIR`.
+struct ScratchLock(PathBuf);
+
+impl Drop for ScratchLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn read_at(dir: &Path) -> onnx_runtime_hostmon::hostlock::LockState {
     // Deliberately not `hostlock::read()`: that reads `HOSTLOCK_DIR` from the
     // process environment, and a test that mutated it would leak the override
@@ -82,10 +131,11 @@ fn read_at(dir: &Path) -> onnx_runtime_hostmon::hostlock::LockState {
 fn the_reader_sees_the_lock_the_script_just_took() {
     use onnx_runtime_hostmon::hostlock::{LockField, LockState, field};
 
-    let dir = lock_dir("hostlock-agreement");
+    let dir = ScratchLock(lock_dir("hostlock-agreement"));
+    let dir = &dir.0;
 
     assert_eq!(
-        read_at(&dir),
+        read_at(dir),
         LockState::Free,
         "an absent lock directory must read as free, not as unknown"
     );
@@ -94,14 +144,11 @@ fn the_reader_sees_the_lock_the_script_just_took() {
     // script's own shell would make the lock stale the instant it returned, so
     // the test would assert the staleness path while claiming to assert the
     // held one.
-    let mut anchor = Command::new("sleep")
-        .arg("300")
-        .spawn()
-        .expect("spawn anchor");
-    let anchor_pid = anchor.id();
+    let mut anchor = Anchor::spawn();
+    let anchor_pid = anchor.pid();
 
     let (ok, out) = hostlock(
-        &dir,
+        dir,
         &[
             "acquire",
             "--owner",
@@ -114,7 +161,7 @@ fn the_reader_sees_the_lock_the_script_just_took() {
     );
     assert!(ok, "acquire failed: {out}");
 
-    let held = read_at(&dir);
+    let held = read_at(dir);
     let LockState::Held(ref holder) = held else {
         panic!("the reader must see the lock the script just wrote, got {held:?}");
     };
@@ -149,28 +196,27 @@ fn the_reader_sees_the_lock_the_script_just_took() {
     // The script refuses to release a lock whose anchor is still running. That
     // refusal is the property that makes the lock worth reading at all, so it is
     // asserted rather than stepped around with HOSTLOCK_FORCE.
-    let (ok, out) = hostlock(&dir, &["release", "--owner", "sebastian"]);
+    let (ok, out) = hostlock(dir, &["release", "--owner", "sebastian"]);
     assert!(
         !ok,
         "a lock with a live anchor must not be releasable by a bystander: {out}"
     );
     assert!(
-        matches!(read_at(&dir), LockState::Held(_)),
+        matches!(read_at(dir), LockState::Held(_)),
         "a refused release must leave the lock exactly as it was"
     );
 
-    anchor.kill().expect("kill anchor");
-    anchor.wait().expect("reap anchor");
+    anchor.retire();
 
     assert!(
-        matches!(read_at(&dir), LockState::Stale(_)),
+        matches!(read_at(dir), LockState::Stale(_)),
         "once the anchor is gone and reaped, the lock is stale"
     );
 
-    let (ok, out) = hostlock(&dir, &["release", "--owner", "sebastian"]);
+    let (ok, out) = hostlock(dir, &["release", "--owner", "sebastian"]);
     assert!(ok, "release of a dead-anchor lock failed: {out}");
     assert_eq!(
-        read_at(&dir),
+        read_at(dir),
         LockState::Free,
         "release must return the lock to free"
     );
@@ -178,11 +224,9 @@ fn the_reader_sees_the_lock_the_script_just_took() {
     // A run spanning the release is the case a single end-of-window reading
     // would have reported as a clean `mine:sebastian`.
     assert_eq!(
-        field(&held, &read_at(&dir), Some("sebastian")),
+        field(&held, &read_at(dir), Some("sebastian")),
         LockField::Changed
     );
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A zombie anchor: `/proc/<pid>` still exists and its start time still
@@ -198,7 +242,8 @@ fn the_reader_sees_the_lock_the_script_just_took() {
 fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
     use onnx_runtime_hostmon::hostlock::{LockField, LockState, field};
 
-    let dir = lock_dir("hostlock-zombie");
+    let dir = ScratchLock(lock_dir("hostlock-zombie"));
+    let dir = &dir.0;
 
     let mut corpse = Command::new("true").spawn().expect("spawn");
     let pid = corpse.id();
@@ -225,12 +270,12 @@ fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
     );
 
     let (ok, out) = hostlock(
-        &dir,
+        dir,
         &["acquire", "--owner", "roy", "--pid", &pid.to_string()],
     );
     assert!(ok, "acquire failed: {out}");
 
-    let state = read_at(&dir);
+    let state = read_at(dir);
     let LockState::Stale(ref holder) = state else {
         panic!("a zombie anchor must not hold the box forever, got {state:?}");
     };
@@ -245,12 +290,11 @@ fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
 
     // The script must reach the same verdict, otherwise a reaper and a
     // published row would tell an operator two different stories about one lock.
-    let (_, status) = hostlock(&dir, &["status", "--porcelain"]);
+    let (_, status) = hostlock(dir, &["status", "--porcelain"]);
     assert!(
         status.to_lowercase().contains("stale"),
         "the script must call this lock stale too, said: {status}"
     );
 
     corpse.wait().expect("reap");
-    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1035,9 +1035,14 @@ fn main() {
     // covers the whole window but proves nothing about load. An unlocked run on
     // a genuinely idle box is fine; a locked run beside somebody's unannounced
     // `cargo test` is not.
-    let lock =
-        host_contention::hostlock::field_from_env(&lock_before, &host_contention::hostlock::read());
-    match host_contention::hostlock::reason(&lock_before, &host_contention::hostlock::read()) {
+    // One reading, used for both fields. Reading twice here would let the
+    // printed reason describe a different lock than the printed verdict --
+    // `host_lock=changed lock_reason=acc0` names a holder for a window the
+    // field itself says had none, which invites a reader to dismiss the
+    // `changed`.
+    let lock_after = host_contention::hostlock::read();
+    let lock = host_contention::hostlock::field_from_env(&lock_before, &lock_after);
+    match host_contention::hostlock::reason(&lock_before, &lock_after) {
         Some(reason) => println!("host_lock={lock} lock_reason={reason}"),
         None => println!("host_lock={lock}"),
     }
