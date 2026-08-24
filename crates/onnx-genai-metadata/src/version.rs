@@ -9,8 +9,8 @@
 //! first field it did not recognize: `unknown field 'batch_capacity'`, which
 //! sends a reader looking for a typo in a document that is perfectly correct and
 //! merely newer. Reading the version *before* handing the bytes to `serde` turns
-//! that into the true statement — this document is 1.2 and this runtime reads up
-//! to 1.1 — which is the difference between an upgrade and a bug hunt.
+//! that into the true statement — this document is v1.2 and this runtime reads
+//! up to v1.1 — which is the difference between an upgrade and a bug hunt.
 
 use std::fmt;
 
@@ -28,8 +28,10 @@ impl SchemaVersion {
 }
 
 impl fmt::Display for SchemaVersion {
+    /// The canonical spelling: `v<major>.<minor>`, which is what a document that
+    /// needs a version this build knows about should write.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{}", self.major, self.minor)
+        write!(formatter, "v{}.{}", self.major, self.minor)
     }
 }
 
@@ -56,8 +58,8 @@ pub fn normalize(spelling: Option<&str>) -> Result<SchemaVersion, String> {
     let unreadable = || {
         format!(
             "schema_version '{raw}' is not a version this reader can compare. Write it as \
-             '<major>.<minor>' — '{SUPPORTED_SCHEMA_VERSION}' is the newest this build reads — or \
-             leave it out to mean '{INITIAL_SCHEMA_VERSION}'"
+             'v<major>.<minor>' — '{SUPPORTED_SCHEMA_VERSION}' is the newest this build reads — \
+             or leave it out to mean '{INITIAL_SCHEMA_VERSION}'"
         )
     };
     if digits.is_empty() {
@@ -135,8 +137,8 @@ mod tests {
 
     #[test]
     fn a_canonical_version_prints_the_way_a_document_should_write_it() {
-        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "1.1");
-        assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "1.0");
+        assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.1");
+        assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
     }
 
     #[test]
@@ -151,9 +153,10 @@ mod tests {
     fn a_spelling_no_one_can_compare_says_how_to_write_one() {
         let error = normalize(Some("latest")).expect_err("'latest' is not a version");
         assert!(
-            error.contains("'<major>.<minor>'") && error.contains("1.1"),
+            error.contains("'v<major>.<minor>'") && error.contains("v1.1"),
             "{error}"
         );
+        assert!(normalize(Some("v1.2.3")).is_err());
         assert!(normalize(Some("1.x")).is_err());
         assert!(normalize(Some("v")).is_err());
         assert!(normalize(Some("")).is_err());
@@ -174,10 +177,10 @@ mod tests {
     fn a_newer_minor_is_refused_by_number_rather_than_by_field_name() {
         let error = gate(Some("1.2")).expect_err("1.2 is newer than this build");
         assert!(
-            error.contains("declares inference-metadata schema version 1.2"),
+            error.contains("declares inference-metadata schema version v1.2"),
             "{error}"
         );
-        assert!(error.contains("reads up to 1.1"), "{error}");
+        assert!(error.contains("reads up to v1.1"), "{error}");
         assert!(error.contains("refuses fields it does not know"), "{error}");
     }
 

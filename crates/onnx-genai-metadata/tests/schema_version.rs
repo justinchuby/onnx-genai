@@ -86,12 +86,17 @@ fn every_spelling_the_first_version_was_ever_written_in_still_loads() {
 }
 
 #[test]
-fn the_constant_an_emitter_stamps_is_the_canonical_spelling_of_that_version() {
-    assert_eq!(SCHEMA_VERSION, "1.0");
+fn the_constant_an_emitter_stamps_is_the_one_it_already_stamped() {
+    // Changing this would rewrite the version string of every document a writer
+    // touches, and with it the semantic identity, to say something no reader
+    // distinguishes from what it said before.
+    assert_eq!(SCHEMA_VERSION, "v1");
     assert_eq!(
         version::normalize(Some(SCHEMA_VERSION)).expect("the emitted constant is a version"),
         INITIAL_SCHEMA_VERSION
     );
+    assert_eq!(INITIAL_SCHEMA_VERSION.to_string(), "v1.0");
+    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.1");
 }
 
 #[test]
@@ -104,7 +109,7 @@ fn a_newer_document_is_refused_by_version_rather_than_by_the_first_field_it_uses
     let error = parse_metadata(&document, Some("yaml")).expect_err("1.2 is newer than this build");
     let error = error.to_string();
     assert!(
-        error.contains("schema version 1.2") && error.contains("reads up to 1.1"),
+        error.contains("schema version v1.2") && error.contains("reads up to v1.1"),
         "{error}"
     );
     assert!(
@@ -125,8 +130,11 @@ fn a_version_no_one_can_compare_says_how_to_write_one() {
     let error = parse_metadata(&with_version(PLAIN, Some("latest")), Some("yaml"))
         .expect_err("'latest' is not a version");
     let error = error.to_string();
-    assert!(error.contains("'<major>.<minor>'"), "{error}");
-    assert!(error.contains("1.1"), "{error}");
+    assert!(error.contains("'v<major>.<minor>'"), "{error}");
+    assert!(error.contains("v1.1"), "{error}");
+
+    // Three components is not this grammar either, however plausible it looks.
+    assert!(parse_metadata(&with_version(PLAIN, Some("v1.2.3")), Some("yaml")).is_err());
 }
 
 #[test]
@@ -138,7 +146,7 @@ fn the_gate_is_on_the_path_a_file_takes() {
     std::fs::write(&path, with_version(PLAIN, Some("1.2"))).expect("write the document");
     let error =
         onnx_genai_metadata::load_metadata(&path).expect_err("1.2 is newer than this build");
-    assert!(error.to_string().contains("reads up to 1.1"), "{error}");
+    assert!(error.to_string().contains("reads up to v1.1"), "{error}");
 
     std::fs::write(&path, with_version(PLAIN, Some("v1"))).expect("write the document");
     onnx_genai_metadata::load_metadata(&path).expect("an old spelling still loads from a file");
@@ -151,7 +159,7 @@ fn the_gate_is_on_the_path_a_document_built_in_memory_takes() {
     let mut document = serde_json::json!({ "model": { "vocab_size": 32000 } });
     document["schema_version"] = serde_json::json!("1.2");
     let error = parse_metadata_json(&document).expect_err("1.2 is newer than this build");
-    assert!(error.to_string().contains("reads up to 1.1"), "{error}");
+    assert!(error.to_string().contains("reads up to v1.1"), "{error}");
 
     document["schema_version"] = serde_json::json!(SCHEMA_VERSION);
     parse_metadata_json(&document).expect("the canonical base version parses");
@@ -169,7 +177,7 @@ fn a_document_that_uses_a_batching_field_declares_the_version_that_introduced_it
             "{spelling:?}: {reported}"
         );
         assert!(
-            reported.contains("which schema version 1.1 introduced"),
+            reported.contains("which schema version v1.1 introduced"),
             "{spelling:?}: {reported}"
         );
     }
@@ -177,13 +185,19 @@ fn a_document_that_uses_a_batching_field_declares_the_version_that_introduced_it
 
 #[test]
 fn declaring_the_version_the_fields_belong_to_is_all_it_takes() {
-    let metadata = parse_metadata(&with_version(PADDED, Some("1.1")), Some("yaml"))
-        .expect("the document parses");
-    validate_metadata(&metadata).expect("a truthfully versioned document is valid");
-    assert_eq!(
-        version::normalize(metadata.schema_version.as_deref()).expect("a version"),
-        SUPPORTED_SCHEMA_VERSION
-    );
+    // `v1.1` is the canonical spelling a new batching document emits, and `1.1`
+    // is an accepted synonym on read for the same reason the four spellings of
+    // the first version are.
+    for spelling in ["v1.1", "1.1"] {
+        let metadata = parse_metadata(&with_version(PADDED, Some(spelling)), Some("yaml"))
+            .expect("the document parses");
+        validate_metadata(&metadata)
+            .unwrap_or_else(|errors| panic!("'{spelling}' is truthful: {errors:#?}"));
+        assert_eq!(
+            version::normalize(metadata.schema_version.as_deref()).expect("a version"),
+            SUPPORTED_SCHEMA_VERSION
+        );
+    }
 }
 
 #[test]
