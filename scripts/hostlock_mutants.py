@@ -138,8 +138,8 @@ MUTANTS = [
 
     # --- the window: a claim about a span, not an instant ---
     (WINDOW, "window-one-ended",
-     "            field: hostlock::field_from_env(&self.before, &after),",
-     "            field: hostlock::field_from_env(&after, &after),"),
+     "            field: hostlock::field(&self.before, &after, self_owner),",
+     "            field: hostlock::field(&after, &after, self_owner),"),
     (WINDOW, "window-reason-from-second-read",
      "            reason: hostlock::reason(&self.before, &after),",
      "            reason: hostlock::reason(&after, &after),"),
@@ -155,6 +155,41 @@ MUTANTS = [
     (WINDOW, "window-drops-the-reason",
      "            Some(reason) => write!(f, \"host_lock={} lock_reason={reason}\", self.field),",
      "            Some(_) => write!(f, \"host_lock={}\", self.field),"),
+    (WINDOW, "window-reason-accessor-blind",
+     "        self.reason.as_deref()",
+     "        None"),
+
+    # --- the verdict cannot be fabricated ---
+    # Killed by the `compile_fail` doctests on `Report`, which are the only
+    # thing that can assert an API shape. Here for the same reason the doctests
+    # carry a positive control: rustdoc does not enforce the error code, so
+    # `compile_fail` alone would also pass if the block stopped compiling for a
+    # reason nobody intended. If `Report`'s fields are ever renamed this anchor
+    # stops applying, and an un-applied anchor is reported as a survivor rather
+    # than skipped.
+    (WINDOW, "window-report-fields-public",
+     "pub struct Report {\n    field: LockField,\n    reason: Option<String>,",
+     "pub struct Report {\n    pub field: LockField,\n    pub reason: Option<String>,"),
+
+    # --- the two functions every benchmark actually calls ---
+    # Nothing in-process can reach these: they read `HOSTLOCK_DIR` and
+    # `HOSTLOCK_OWNER` from the environment. They are killed by the child-process
+    # probe in `agrees_with_hostlock_sh.rs`, and before that probe existed all
+    # three of these survived while the suite reported 31/31 -- the coverage was
+    # of `close_as`, which no benchmark calls.
+    (WINDOW, "window-open-does-not-read",
+     "            before: hostlock::read(),",
+     "            before: LockState::Unknown,"),
+    (WINDOW, "window-close-does-not-read",
+     "        self.close_as(owner.as_deref(), hostlock::read)",
+     "        self.close_as(owner.as_deref(), || LockState::Unknown)"),
+    (WINDOW, "window-close-forgets-the-owner",
+     '        let owner = std::env::var("HOSTLOCK_OWNER").ok();',
+     "        let owner: Option<String> = None;"),
+    (WINDOW, "window-warning-forgets-the-owner",
+     '            self.self_owner.as_deref().unwrap_or("unset")',
+     '            "unset"'),
+
 ]
 
 
@@ -171,6 +206,12 @@ def run_tests():
     counts = [int(m) for m in re.findall(r"running (\d+) tests", text)]
     if out.returncode != 0:
         names = re.findall(r"^    ([\w:]+)$", text, re.M)
+        # Doctest failures are named by path and line rather than by an
+        # identifier, so the identifier pattern above misses them entirely and
+        # the kill reads as `unnamed`. `window-report-fields-public` is killed
+        # only by a doctest, and a kill nobody can attribute is halfway back to
+        # not knowing whether the test ran.
+        names += re.findall(r"^    (\S+\.rs - \S+ \(line \d+\))$", text, re.M)
         return "killed", (counts, ", ".join(sorted(set(names))) or "unnamed")
     return "survived", (counts, text)
 

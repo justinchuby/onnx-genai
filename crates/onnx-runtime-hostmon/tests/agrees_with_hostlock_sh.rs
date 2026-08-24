@@ -576,10 +576,11 @@ fn a_window_the_script_claimed_midway_is_reported_as_changed() {
     assert!(ok, "acquire failed: {out}");
 
     let after = read_at(&dir);
-    let report = onnx_runtime_hostmon::window::Window::opened_at(before).closed_at(after.clone());
+    let report =
+        onnx_runtime_hostmon::window::Window::opened_at(before).close_as(None, || after.clone());
     assert_eq!(
-        report.field,
-        onnx_runtime_hostmon::hostlock::LockField::Changed
+        report.field(),
+        &onnx_runtime_hostmon::hostlock::LockField::Changed
     );
     assert_eq!(
         report.to_string(),
@@ -597,8 +598,8 @@ fn a_window_the_script_claimed_midway_is_reported_as_changed() {
 
     // The steady case, from the same real lock: both ends agree, so the
     // holder's own reason survives into the row.
-    let steady =
-        onnx_runtime_hostmon::window::Window::opened_at(after.clone()).closed_at(after.clone());
+    let steady = onnx_runtime_hostmon::window::Window::opened_at(after.clone())
+        .close_as(None, || after.clone());
     // The reason was written with a space in it and comes back with an
     // underscore: the row is a `key=value` list, so a reason that kept its
     // spaces would add fields to it. Asserted against a reason the *script*
@@ -616,6 +617,197 @@ fn a_window_the_script_claimed_midway_is_reported_as_changed() {
         "a holder's reason must not be able to add fields to a result row"
     );
     assert!(!steady.is_protected());
+
+    anchor.retire();
+}
+
+/// Set on a child of this test binary to tell it which probe to run.
+const PROBE_MODE: &str = "HOSTMON_WINDOW_PROBE";
+
+/// Runs one probe in a child process and returns everything it printed.
+///
+/// A child rather than an in-process call because [`Window::open`] and
+/// [`Window::close`] read `HOSTLOCK_DIR` and `HOSTLOCK_OWNER` from the process
+/// environment, and there is no way to point them at a scratch lock from inside
+/// this binary without a process-wide override that leaks into every later test
+/// on any failing assertion -- the defect #1591 spent a PR removing. A child
+/// gets its own environment, so the override dies with it.
+///
+/// `HOSTLOCK_OWNER` is *removed* rather than merely not set: this binary is run
+/// by agents who export it, and inheriting it would make the assertions below
+/// depend on whose shell started the run.
+fn run_probe(mode: &str, dir: &Path, owner: Option<&str>) -> String {
+    let exe = std::env::current_exe().expect("a test binary knows its own path");
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "window_probe_child",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(PROBE_MODE, mode)
+    .env("HOSTLOCK_DIR", dir);
+    match owner {
+        Some(owner) => cmd.env("HOSTLOCK_OWNER", owner),
+        None => cmd.env_remove("HOSTLOCK_OWNER"),
+    };
+    let out = cmd.output().expect("spawn the probe child");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "probe child failed:\n{text}");
+    // The filter has to have matched something. A renamed test would leave the
+    // child passing with zero tests run, and the parent would then assert
+    // against output that no probe produced -- a green run that measured
+    // nothing, which is the failure this whole file exists to make impossible.
+    assert!(
+        text.contains("1 passed"),
+        "the probe child ran no test, so its silence proves nothing:\n{text}"
+    );
+    text
+}
+
+/// Reads the one `PROBE ` line out of a child's output.
+fn probe_row(text: &str) -> &str {
+    // Not `strip_prefix`: libtest writes `test <name> ... ` before the first
+    // line the test itself prints, so the marker lands mid-line.
+    let rows: Vec<&str> = text
+        .lines()
+        .filter_map(|line| line.split_once("PROBE ").map(|(_, row)| row.trim_end()))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "expected exactly one probe row, got {}:\n{text}",
+        rows.len()
+    );
+    rows[0]
+}
+
+/// The body of the child. Does nothing unless [`PROBE_MODE`] says which arm to
+/// run, which is only ever set by [`run_probe`].
+///
+/// It is not itself an assertion -- the parent tests make those. It is here
+/// rather than in a separate binary because an integration test binary is the
+/// only thing in this crate that is already built and already linked against
+/// the library.
+#[test]
+fn window_probe_child() {
+    let Ok(mode) = std::env::var(PROBE_MODE) else {
+        return;
+    };
+    let dir = PathBuf::from(
+        std::env::var("HOSTLOCK_DIR").expect("the parent points the child at a scratch lock"),
+    );
+    let report = match mode.as_str() {
+        // The lock is already held, by the owner the parent exported. Both
+        // readings come from `hostlock::read` via the environment.
+        "held" => onnx_runtime_hostmon::window::Window::open().close(),
+        // Free at the open, claimed by somebody else before the close.
+        "changed" => {
+            let window = onnx_runtime_hostmon::window::Window::open();
+            let mut anchor = Anchor::spawn();
+            let (ok, out) = hostlock(
+                &dir,
+                &[
+                    "acquire",
+                    "--owner",
+                    "a-co-tenant",
+                    "--reason",
+                    "arrived midway",
+                    "--pid",
+                    &anchor.pid().to_string(),
+                ],
+            );
+            assert!(ok, "acquire failed in the child: {out}");
+            let report = window.close();
+            anchor.retire();
+            report
+        }
+        other => panic!("unknown probe mode {other:?}"),
+    };
+    println!(
+        "PROBE {report} protected={} warned={}",
+        report.is_protected(),
+        report.warning().is_some()
+    );
+}
+
+/// `Window::open` and `Window::close` against the real script, the real
+/// `HOSTLOCK_DIR` and the real `HOSTLOCK_OWNER`.
+///
+/// Every other test of `Window` hands it states built in-process and an owner
+/// passed as an argument, which is deliberate -- but it leaves the two
+/// functions every benchmark actually calls covered by nothing. `open` reading
+/// the wrong directory, or `close` reusing the first reading, or the owner
+/// never reaching `field`, would pass the whole unit suite and put
+/// `host_lock=free` on every row of a locked host.
+///
+/// So this drives them end to end, in a child, and asserts the exact row text a
+/// benchmark would print.
+#[test]
+fn open_and_close_read_the_real_lock_and_the_real_owner() {
+    let dir = lock_dir("window-probe");
+    let _cleanup = ScratchLock(dir.clone());
+    let mut anchor = Anchor::spawn();
+
+    // A window this process held end to end: the one case that is protected and
+    // the one case that must not warn.
+    let (ok, out) = hostlock(
+        &dir,
+        &[
+            "acquire",
+            "--owner",
+            "probe-owner",
+            "--reason",
+            "window probe",
+            "--pid",
+            &anchor.pid().to_string(),
+        ],
+    );
+    assert!(ok, "acquire failed: {out}");
+
+    let text = run_probe("held", &dir, Some("probe-owner"));
+    assert_eq!(
+        probe_row(&text),
+        "host_lock=mine:probe-owner lock_reason=window_probe protected=true warned=false",
+        "a lock this process declared, held across the whole window, is the only protected row"
+    );
+
+    // Same lock, same window, a different declared owner: the row must name it
+    // as somebody else's rather than certify the run.
+    let text = run_probe("held", &dir, Some("someone-else"));
+    assert_eq!(
+        probe_row(&text),
+        "host_lock=foreign:probe-owner lock_reason=window_probe protected=false warned=true",
+        "a co-tenant's lock must never certify a row"
+    );
+
+    // And with nothing declared, the honest answer is an unattributed holder.
+    let text = run_probe("held", &dir, None);
+    assert_eq!(
+        probe_row(&text),
+        "host_lock=held:probe-owner lock_reason=window_probe protected=false warned=true"
+    );
+
+    // The window that changed hands, from the real script, through the real
+    // `close`. The reason the late holder wrote must not appear.
+    //
+    // A second scratch directory rather than releasing the first: the script
+    // refuses to release a lock whose anchor is still alive, and the override
+    // for that is `HOSTLOCK_FORCE=1` -- a test that reaches for a safety
+    // bypass to arrange its own fixture is training the habit that loses
+    // somebody a run.
+    let changed_dir = lock_dir("window-probe-changed");
+    let _changed_cleanup = ScratchLock(changed_dir.clone());
+    let text = run_probe("changed", &changed_dir, Some("probe-owner"));
+    assert_eq!(
+        probe_row(&text),
+        "host_lock=changed protected=false warned=true",
+        "a window that changed hands names no holder, whichever end held one"
+    );
 
     anchor.retire();
 }
