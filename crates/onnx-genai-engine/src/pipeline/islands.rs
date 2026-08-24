@@ -12,6 +12,8 @@ use onnx_genai_metadata::{
     WorkflowSpec,
 };
 use onnx_genai_ort::{Allocator, IoBinding, Session, Value};
+
+use super::runtime_state::{GraphCaptureId, GraphCaptureIdAllocator, PassId};
 use onnx_runtime_loader::proto::onnx::{
     GraphProto, ModelProto, TensorProto, TensorShapeProto, TypeProto, ValueInfoProto, tensor_proto,
     tensor_shape_proto, type_proto,
@@ -89,7 +91,9 @@ pub(crate) struct ExecutionIsland {
     linked_node_count: usize,
     external_initializer_bytes: u64,
     initializer_bytes: u64,
-    next_graph_id: Cell<i32>,
+    /// Capture ids for this island's own session, minted on the thread that
+    /// owns it.
+    graph_capture_ids: GraphCaptureIdAllocator,
     runs: Cell<u64>,
     session_runs: Cell<u64>,
     eager_runs: Cell<u64>,
@@ -111,7 +115,8 @@ pub(crate) struct ExecutionIsland {
     device_memory_min_free_bytes: Cell<Option<u64>>,
     total_run_ns: Cell<u128>,
     fallback_reason: RefCell<Option<String>>,
-    execution_generation: Cell<u64>,
+    /// The interpreter pass this island is executing, set when the pass opens.
+    execution_generation: Cell<PassId>,
 }
 
 struct StableIslandBinding {
@@ -120,8 +125,9 @@ struct StableIslandBinding {
     inputs: Vec<(String, Value)>,
     outputs: Vec<(String, Value)>,
     captured: bool,
-    graph_id: i32,
-    service_generation: u64,
+    graph_id: GraphCaptureId,
+    /// The pass this binding's shared service inputs were last written for.
+    service_generation: PassId,
     source_ptrs: Vec<usize>,
     /// Stable inputs whose buffer a shared service output is actually bound to.
     ///
@@ -134,8 +140,8 @@ struct StableIslandBinding {
 }
 
 impl ExecutionIsland {
-    pub(crate) fn begin_execution(&self, generation: u64) {
-        self.execution_generation.set(generation);
+    pub(crate) fn begin_execution(&self, pass: PassId) {
+        self.execution_generation.set(pass);
     }
 
     pub(crate) fn clear_bindings(&mut self) {
@@ -393,7 +399,7 @@ impl ExecutionIsland {
                 }
                 self.session_runs.set(self.session_runs.get() + 1);
                 self.session
-                    .run_with_binding_graph(&stable.binding, stable.graph_id)
+                    .run_with_binding_graph(&stable.binding, stable.graph_id.get())
             } else {
                 self.session_runs.set(self.session_runs.get() + 1);
                 self.session.run_with_binding(&stable.binding)
@@ -504,7 +510,8 @@ impl ExecutionIsland {
                 // Populate ORT's non-arena constants and discover output extents
                 // without consuming a graph id. The stable binding is captured
                 // only on its next run, after every OrtValue address is fixed.
-                self.session.run_with_binding_graph(&binding, -1)?;
+                self.session
+                    .run_with_binding_graph(&binding, GraphCaptureId::UNCAPTURED.get())?;
             } else {
                 self.session.run_with_binding(&binding)?;
             }
@@ -565,12 +572,12 @@ impl ExecutionIsland {
             // address, so discovery output is not a semantic substitute.
             self.session_runs.set(self.session_runs.get() + 1);
             if self.session.graph_capture() {
-                self.session.run_with_binding_graph(&binding, -1)?;
+                self.session
+                    .run_with_binding_graph(&binding, GraphCaptureId::UNCAPTURED.get())?;
             } else {
                 self.session.run_with_binding(&binding)?;
             }
-            let graph_id = self.next_graph_id.get();
-            self.next_graph_id.set(graph_id + 1);
+            let graph_id = self.graph_capture_ids.mint()?;
             let mut pending_copies = false;
             for (port, output) in &stable_outputs {
                 let value_ref = &self.outputs[port];
@@ -622,8 +629,7 @@ impl ExecutionIsland {
             binding.bind_output(name, &stable)?;
             stable_outputs.push((name.clone(), stable));
         }
-        let graph_id = self.next_graph_id.get();
-        self.next_graph_id.set(graph_id + 1);
+        let graph_id = self.graph_capture_ids.mint()?;
         self.record_stable_binding_bytes(&stable_inputs, &stable_outputs);
         bindings.insert(
             signature,
@@ -765,7 +771,8 @@ impl Drop for ExecutionIsland {
 
 impl WorkflowRuntime {
     pub fn execution_island_diagnostics(&self) -> Vec<ExecutionIslandDiagnostic> {
-        self.execution_islands
+        self.backend
+            .execution_islands
             .iter()
             .map(ExecutionIsland::diagnostic)
             .collect()
@@ -1571,7 +1578,7 @@ fn build_execution_island(
         linked_node_count: linked.node_count,
         external_initializer_bytes,
         initializer_bytes: linked.initializer_bytes,
-        next_graph_id: Cell::new((id as i32).saturating_mul(1000)),
+        graph_capture_ids: GraphCaptureIdAllocator::for_island(id),
         runs: Cell::new(0),
         session_runs: Cell::new(0),
         eager_runs: Cell::new(0),
@@ -1605,7 +1612,7 @@ fn build_execution_island(
         } else {
             None
         }),
-        execution_generation: Cell::new(0),
+        execution_generation: Cell::new(PassId::NONE),
     })
 }
 

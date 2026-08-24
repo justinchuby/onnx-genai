@@ -70,6 +70,7 @@ pub(crate) use crate::speculative::MtpProposer;
 mod capability;
 mod decode_backend;
 mod governor;
+mod ids;
 mod load;
 pub(crate) mod memory_plan;
 mod memory_strategy;
@@ -88,6 +89,7 @@ pub use metadata::graph_port_contracts;
 pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
+pub(crate) use ids::SharedSessionIds;
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
@@ -208,7 +210,7 @@ mod tests {
             governor,
             sessions,
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,
@@ -220,7 +222,7 @@ mod tests {
             #[cfg(feature = "native-backend")]
             native_active_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             #[cfg(feature = "native-backend")]
             native_access_counter: 0,
             #[cfg(feature = "native-backend")]
