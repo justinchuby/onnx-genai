@@ -5090,14 +5090,26 @@ mod tests {
     /// single-CPU probe reports "pinning works" and the test then fails on the
     /// sandbox's virtual topology instead of on the pool.
     fn environment_can_pin(cpus: &[usize]) -> bool {
-        !cpus.is_empty()
+        let can = !cpus.is_empty()
             && cpus.iter().all(|&cpu| {
                 std::thread::spawn(move || {
                     crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
                 })
                 .join()
                 .unwrap_or(false)
-            })
+            });
+        // Every caller treats `false` as a skip, so on a lane that declared
+        // placement checks mandatory this one helper is the switch that turns
+        // seven of them off at once. Refusing to pin is a real property of a
+        // sandbox and a legitimate skip elsewhere; it is not a pass.
+        assert!(
+            can || !crate::core_topology::placement_tests_required(),
+            "{}=1 but this environment refuses to pin a thread to {cpus:?}, which turns every \
+             observed-placement check in this crate into a no-op that still reports success. \
+             Either the lane must not require placement tests or the confinement must be lifted.",
+            crate::core_topology::REQUIRE_PLACEMENT_ENV
+        );
+        can
     }
 
     /// Selects child mode for [`ready_leak_child`].
@@ -5874,8 +5886,12 @@ mod tests {
         };
         // A single-core budget cannot express "one worker per core" as a
         // distinguishable claim. That is a host fact and a legitimate skip;
-        // an unanswerable topology is not, and panics above.
-        if cores.core_count() < 2 {
+        // an unanswerable topology is not, and panics above. Stated rather than
+        // silent, and fatal in a lane that requires these checks.
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "the_planner_lays_out_one_worker_per_physical_core",
+        ) {
             return;
         }
         // Two full physical cores' worth of CPUs, spread the way the placement
@@ -5970,7 +5986,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pinned_pool_is_observed_one_worker_per_physical_core",
+        ) {
             return; // one core cannot express "one per core" distinguishably
         }
         // Stated, not implied. Today no target can pin without also being able
@@ -6180,7 +6199,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pin_that_reports_success_without_the_syscall_fails_the_realized_check",
+        ) {
             return;
         }
         let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
@@ -6695,7 +6717,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_partially_pinned_pool_is_not_scored_on_its_pinned_half",
+        ) {
             return;
         }
         let spread = crate::decode_affinity::order_pin_targets(
