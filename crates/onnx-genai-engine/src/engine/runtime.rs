@@ -1748,30 +1748,34 @@ impl Engine {
         session_state::token_count(&OrtSessionsRef(self), session_id)
     }
 
-    /// Tokens this session will put in front of the next turn's prompt.
+    /// Tokens this session already holds in front of the next turn's prompt.
     ///
     /// This is what a front end has to add to a request's own prompt length
     /// before it enforces a context limit, admits a budget, or reports
-    /// `usage.prompt_tokens` — and it is **zero** for every session that does
-    /// not prepend anything, which is most of them:
+    /// `usage.prompt_tokens`: the model's window has to fit both, and a cap that
+    /// sees only the request lets a conversation grow past it and then produce
+    /// nothing.
     ///
-    /// * a decode core reuses its KV against the conversation the client
-    ///   resends, so the request already carries every token that will be
-    ///   prefilled and adding the session's retained count would charge each
-    ///   turn twice;
-    /// * a loop-carried or group-held lease is handed back inside the graph, so
-    ///   the tokens it stands for live in a cache rather than in front of the
-    ///   prompt.
+    /// What counts as "in front of" differs by how the session is carried, and
+    /// that is the whole of the answer:
     ///
-    /// Only a package declaring a `prompt_prefix` continuation prepends, and
-    /// that is read from the typed carrier classification rather than from
-    /// whether a session happens to hold state.
+    /// * a **decode core** appends each turn's prompt to the sequence it
+    ///   retains, so everything it already holds is ahead of this turn. (Its
+    ///   prefix cache is consulted only for a session that starts empty, so a
+    ///   continuing turn never elides what came before.)
+    /// * a **`prompt_prefix` continuation** puts the conversation it holds in
+    ///   front of the prompt, so its length counts for the same reason.
+    /// * a **loop-carried or group-held** lease is handed back inside the graph:
+    ///   the tokens it stands for live in a cache the package bounds itself, not
+    ///   in front of a prompt, and counting them would charge a request for
+    ///   context it does not occupy. Zero.
+    ///
+    /// Read from the typed carrier classification rather than from whether a
+    /// session happens to hold state — those are different questions, and only
+    /// this one is a length a request will be charged for.
     pub fn session_prefill_carry(&self, session_id: SessionId) -> anyhow::Result<usize> {
         if self.holds_decode_core() {
-            // Resolved through the same accessor a caller would use, so an
-            // unknown id is reported as one rather than answered with a zero.
-            self.session_token_count(session_id)?;
-            return Ok(0);
+            return self.session_token_count(session_id);
         }
         anyhow::ensure!(
             self.workflow_sessions.contains_key(&session_id),

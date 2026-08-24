@@ -2103,6 +2103,13 @@ async fn resources_get_and_admin_vram_override_report_governor_state() {
             .unwrap()
             .contains("cannot satisfy lowered resource limit")
     );
+    // A resource override has nothing to do with what the package can do, so it
+    // must not carry the kind a client reads to mean exactly that.
+    assert_eq!(
+        impossible["error"]["type"].as_str(),
+        Some("server_error"),
+        "{impossible}"
+    );
 
     let valid = router
         .oneshot(
@@ -4394,22 +4401,16 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
     assert_eq!(plain.status(), StatusCode::OK);
 }
 
-/// A decode-core session is charged for the request it received, and nothing
-/// else.
+/// A decode-core session is charged for what the model will actually hold.
 ///
-/// Its clients resend the conversation and the KV prefix cache reuses what it
-/// already holds, so the request already carries every token that will be
-/// prefilled. Adding the session's retained token count on top charged each turn
-/// twice — inflating `usage`, halving the usable context and refusing requests
-/// at half the model's limit. `session_prefill_carry` is zero for such a session
-/// because nothing is prepended, and that is read from the carrier
-/// classification rather than from whether the session holds any state.
-///
-/// Two turns sending the *same* message are compared, because a sessioned
-/// request renders only the new turn: identical messages therefore have
-/// identical prompt lengths, and any growth between them is the double count.
+/// Its clients send only the new turn — `build_session_prompt` renders the last
+/// message — and the engine *appends* that to the sequence the session retains;
+/// the prefix cache is consulted only for a session that starts empty. So the
+/// tokens ahead of this turn are everything the session already holds, and a cap
+/// that saw only the request would let the conversation grow past the model's
+/// window and then produce nothing.
 #[tokio::test]
-async fn a_decode_core_session_is_not_charged_for_tokens_the_client_resent() {
+async fn a_decode_core_turn_is_charged_for_the_conversation_the_engine_retains() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
     let router = app(state);
@@ -4420,64 +4421,121 @@ async fn a_decode_core_session_is_not_charged_for_tokens_the_client_resent() {
     let first_prompt = first["usage"]["prompt_tokens"]
         .as_u64()
         .expect("prompt tokens");
-
-    let (status, second) = chat_turn_for(router.clone(), "tiny-llm", Some(session), "hello").await;
-    assert_eq!(status, StatusCode::OK, "{second}");
-    let second_prompt = second["usage"]["prompt_tokens"]
-        .as_u64()
-        .expect("prompt tokens");
-
+    let retained = session_tokens(&first);
     assert_eq!(
-        second_prompt, first_prompt,
-        "a decode-core turn is charged its own prompt; the conversation it retains is reused \
-         from KV, not prepended"
+        retained,
+        first_prompt
+            + first["usage"]["completion_tokens"]
+                .as_u64()
+                .expect("generated"),
+        "the session retains this turn's prompt and generation: {first}"
     );
-    assert!(
-        session_tokens(&second) > second_prompt,
-        "the session does retain more than this turn sent, which is what would have been \
-         double-counted"
-    );
-    assert!(
-        session_tokens(&second) > session_tokens(&first),
-        "and the conversation really is growing, so the assertion above is not vacuous"
+
+    // The same message again. It renders identically, so any growth in what the
+    // turn is charged is the conversation now ahead of it.
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        first_prompt + retained,
+        "a continuing turn is charged the sequence the engine appends it to: {second}"
     );
 }
 
-/// The context cap and the output budget are not inflated for a decode-core
-/// session either.
+/// A conversation that outgrows the model's window is refused, not silently
+/// answered with nothing.
 ///
-/// A request that fits the model's context must still be admitted on turn two.
-/// Charging the retained conversation would refuse it at roughly half the limit.
+/// The engine stops before taking a step once the sequence reaches the context
+/// limit and reports `length` with zero tokens. A 200 whose completion is empty
+/// tells a caller nothing it can act on; the context cap has to see the retained
+/// conversation so the refusal is the actionable 400 instead.
 #[tokio::test]
-async fn a_decode_core_session_does_not_shrink_the_context_it_admits() {
+async fn a_decode_core_conversation_past_the_window_is_refused_not_answered_empty() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    let handle = state
-        .registry
-        .resolve("")
-        .expect("registry")
-        .expect("a model is loaded");
-    let context = handle
-        .model_max_context
-        .expect("the fixture declares a context limit");
-    drop(handle);
     let router = app(state);
-    let session = "sess-decode-core-cap";
+    let session = "sess-decode-core-window";
 
-    // A prompt of a bit under half the context, twice. Neither is near the
-    // limit on its own; together they exceed it, which is precisely what the
-    // double count would have added up.
-    let prompt = "hello world ".repeat(context / 4);
-    for turn in 0..2 {
-        let (status, body) =
-            chat_turn_for(router.clone(), "tiny-llm", Some(session), prompt.trim()).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "turn {} must be admitted on its own length: {body}",
-            turn + 1
-        );
-    }
+    // The fixture's window is 16 tokens, so a ten-token turn fits once and the
+    // conversation it leaves does not leave room for a second.
+    let message = "the quick brown fox jumps over the lazy dog";
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), message).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert!(
+        first["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated")
+            > 0,
+        "the first turn generates: {first}"
+    );
+
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), message).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a conversation past the model's window is the caller's to shorten, not a 200 with an \
+         empty completion: {second}"
+    );
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("context limit"),
+        "the refusal names the limit it hit: {second}"
+    );
+}
+
+/// A lease the graph carries is not in front of the prompt, so it is not
+/// charged.
+///
+/// This is the half of the accounting that is genuinely zero: a loop-carried or
+/// group-held lease lives in a cache the package bounds itself. Charging a
+/// request for it would refuse turns for context they do not occupy.
+#[tokio::test]
+async fn a_graph_carried_lease_is_not_charged_against_the_prompt() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    // Drop the prompt continuation and session-scope a loop-carried cache cell,
+    // so the session is carried inside the graph instead.
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    let state_cells = document["pipeline"]["workflow"]["state"]
+        .as_object_mut()
+        .expect("workflow declares state");
+    state_cells.remove("conversation").expect("a conversation");
+    let cache = state_cells.get_mut("cache_0").expect("a cache cell");
+    cache["scope"] = Value::String("session".into());
+    cache["release_boundary"] = Value::String("session".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state);
+    let session = "sess-graph-carried";
+
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_prompt = first["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+
+    let (status, second) = chat_turn(router, Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["usage"]["prompt_tokens"]
+            .as_u64()
+            .expect("prompt tokens"),
+        first_prompt,
+        "a lease carried inside the graph is not in front of the prompt: {second}"
+    );
 }
 
 /// A prompt-continuation package *is* charged for the conversation, because it

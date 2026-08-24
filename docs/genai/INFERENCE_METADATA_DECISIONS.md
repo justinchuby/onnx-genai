@@ -1066,7 +1066,9 @@ computing it twice is how they came to disagree.
 
   The `recurrence` bound is load-bearing: a continuation is not loop-carried and
   so never reaches the carry path's recurrence check, and this is the only place
-  it is honoured. A turn whose conversation would exceed it is refused before it
+  it is honoured. It is also what a front end adds to a request's own length
+  before enforcing a context limit, because the conversation really is prefilled
+  again on every turn. A turn whose conversation would exceed it is refused before it
   runs, and a turn whose own generation would exceed it is refused rather than
   stored — a session left in a state its own declaration forbids has no way
   back. Neither refusal changes what the session already held; `reset_session`
@@ -1576,10 +1578,14 @@ Runtime behaviour changed alongside it, for packages rather than documents:
   server answers 409 rather than 500. Stateless generation is untouched;
 * a package that publishes no token stream is unaffected and keeps its session
   handle;
-* `session_token_count` means the same thing on every backend (§12.5a), and only
-  a `prompt_prefix` continuation contributes to what a turn is *prefilled* with —
-  a decode core reuses its KV against the conversation the client resends, and a
-  loop or group lease lives in a cache rather than in front of the prompt.
+* `session_token_count` means the same thing on every backend (§12.5a). What a
+  turn is *charged* for — its context cap, its budget, its reported
+  `usage.prompt_tokens` — is its own prompt plus whatever the runtime holds in
+  front of it, and that differs by carrier: a decode core appends each prompt to
+  the sequence it retains, so all of it is ahead of the turn; a `prompt_prefix`
+  continuation puts its conversation in front of the prompt, so its length counts
+  too; a loop-carried or group-held lease lives in a cache the package bounds
+  itself and is not in front of any prompt, so it counts for nothing.
 
 ## 19. Invariants
 

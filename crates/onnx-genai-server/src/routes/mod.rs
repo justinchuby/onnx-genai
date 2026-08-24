@@ -466,12 +466,22 @@ impl ApiError {
         }
     }
 
-    /// The caller and the loaded package disagree about what was asked for.
-    ///
-    /// Not `server_error`: nothing failed, and a client that retries the same
-    /// request against the same package gets the same answer. The kind is what
-    /// a client branches on, so it names the disagreement rather than a fault.
     fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            message: message.into(),
+            kind: "server_error",
+            retry_after_secs: None,
+        }
+    }
+
+    /// The caller and the loaded package disagree, and the same request may
+    /// succeed later.
+    ///
+    /// Distinct from [`Self::conflict`], whose other caller is a resource
+    /// override with nothing to do with a package: giving both the capability
+    /// kind would have made the discrimination it exists for unreliable.
+    fn capability_conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
@@ -508,7 +518,7 @@ impl ApiError {
 /// operational one.
 pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     match onnx_genai_engine::package_capability_error(&error) {
-        Some(capability) => ApiError::conflict(capability.to_string()),
+        Some(capability) => ApiError::capability_conflict(capability.to_string()),
         None => ApiError::internal(format!("session create failed: {error}")),
     }
 }
@@ -529,7 +539,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // off the engine's own type, so neither status depends on wording.
         DriverFailureKind::PackageCapability(capability) => {
             if capability.is_retryable() {
-                ApiError::conflict(capability.to_string())
+                ApiError::capability_conflict(capability.to_string())
             } else {
                 ApiError::capability_bad_request(capability.to_string())
             }

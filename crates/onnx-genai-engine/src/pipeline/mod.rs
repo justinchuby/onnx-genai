@@ -1033,8 +1033,9 @@ impl WorkflowRuntime {
     /// carrier whose mechanism *is* the prompt binding, so the tokens it holds
     /// are prefilled again on every turn and are part of what the next request
     /// costs. A loop carry or a state service group hands its lease back inside
-    /// the graph — the tokens it represents are already in a cache, not in front
-    /// of the prompt — so nothing is prepended and this is zero.
+    /// the graph — the tokens it represents live in a cache the package bounds
+    /// itself, not in front of a prompt — so nothing is prepended and this is
+    /// zero.
     ///
     /// Answered from the typed classification rather than from "does this
     /// session hold a conversation", because those are different questions and
