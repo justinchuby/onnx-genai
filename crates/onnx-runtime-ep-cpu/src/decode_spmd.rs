@@ -4731,10 +4731,19 @@ mod tests {
              arm above proves nothing"
         );
 
-        // Say what was actually checked. Every other exit from this test is an
-        // explicit skip line, so a log with neither this nor a skip means the
-        // test did not run at all -- which is the state this whole change
-        // exists to make impossible to reach silently.
+        // Say what was actually checked. Under `--nocapture` -- or in the
+        // captured output libtest replays for a *failing* test -- every exit
+        // from this test is either this line or an explicit skip line, so a run
+        // with neither did not execute.
+        //
+        // Under CI's default capture a passing test prints nothing either way,
+        // so this does **not** distinguish "ran" from "skipped" in a green CI
+        // log. Nothing can: the only capture-proof anti-vacuity signal is a
+        // failure, which is why the *topology* branch panics instead of
+        // printing. The two skips left here are genuinely environmental -- no
+        // SMT sibling inside the allowed set, or a sandbox that refuses
+        // `sched_setaffinity` -- and are stated rather than silent so they are
+        // recoverable from a local `--nocapture` run.
         eprintln!(
             "actual-mask control ran: shared-core arm on {shared:?}, distinct-core arm on \
              {distinct:?}"
