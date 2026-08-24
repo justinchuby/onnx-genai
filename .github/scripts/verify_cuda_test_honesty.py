@@ -116,46 +116,199 @@ def is_cuda_test_target(target: str) -> bool:
 
 # `ignore` as an attribute token, not as English. The first version of this
 # scan searched the item's head for the substring "ignore", and so passed on a
-# test whose doc comment happened to contain the words "a kernel that ignored
-# the attribute" -- the exact defect it was written to catch. Anchor on the
-# punctuation an attribute must have around it, and never look at doc text.
+# test whose doc comment read "a kernel that ignored the attribute" -- the exact
+# defect it was written to catch. Anchor on the punctuation an attribute must
+# have around it, and read only masked attribute text, never prose or literals.
 IGNORE_ATTR = re.compile(r"(?:^|[\[(,\s])ignore\s*(?:=|\]|,|\)|$)")
+# An ignore inside a `cfg_attr` only ignores the test when its predicate holds.
+# `#[cfg_attr(not(feature = "some-other-thing"), ignore = "...")]` still runs
+# the test with `gpu-tests` off, which is the defect, so the predicate has to be
+# read rather than assumed from the presence of an `ignore` token.
+GPU_TESTS_PREDICATE = re.compile(r"""not\s*\(\s*feature\s*=\s*["']gpu-tests["']\s*\)""")
+RAW_STRING_START = re.compile(r"r(#*)\"")
+CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
+# Walking upward out of one item and into the one above it would let a test
+# inherit its neighbour's ignore -- a false negative in a check that must fail
+# closed. These anchor the top of an item's head regardless of bracket counting.
+ITEM_BOUNDARY = re.compile(
+    r"^(?:\}|\{|fn\s|pub\s|async\s|unsafe\s|extern\s|mod\s|use\s|let\s|impl\s"
+    r"|struct\s|enum\s|trait\s|const\s|static\s|type\s|macro_rules)"
+)
 
 
-def attribute_lines_of_item(lines: list[str], index: int) -> list[str]:
-    """The attribute lines belonging to the `#[test]` item at `lines[index]`.
+def mask_source(source: str) -> list[tuple[str, bool]]:
+    """Per line: (code with literals and comments masked, is-comment-only).
 
-    Collects the contiguous attribute block above the marker and any attributes
-    between it and the `fn`, since attribute order is not significant in Rust.
-    Doc comments are excluded: they are prose, and reading them as though they
-    were attributes is what made the first version of this check vacuous.
+    Length-preserving and column-exact, so a span found in the masked text can
+    be read back out of the original. Bracket counting and token matching both
+    run on the masked text: a `)` inside `expected = "boom )"` is not structure,
+    and `ignore` inside a string or a doc comment is not an attribute. Counting
+    them was a fail-open -- one unbalanced bracket in a string literal let the
+    walk escape upward and adopt the previous test's ignore.
     """
-    attributes: list[str] = []
+    masked: list[tuple[str, bool]] = []
+    block_depth = 0
+    raw_hashes: int | None = None
+    in_string = False
+    for line in source.splitlines():
+        code: list[str] = []
+        index, length = 0, len(line)
+        while index < length:
+            if block_depth:
+                if line.startswith("*/", index):
+                    block_depth -= 1
+                    code.append("  ")
+                    index += 2
+                elif line.startswith("/*", index):
+                    block_depth += 1
+                    code.append("  ")
+                    index += 2
+                else:
+                    code.append(" ")
+                    index += 1
+                continue
+            if raw_hashes is not None:
+                terminator = '"' + "#" * raw_hashes
+                at = line.find(terminator, index)
+                if at == -1:
+                    code.append("_" * (length - index))
+                    index = length
+                else:
+                    code.append("_" * (at - index))
+                    code.append('"' + " " * raw_hashes)
+                    index = at + len(terminator)
+                    raw_hashes = None
+                continue
+            if in_string:
+                cursor = index
+                while cursor < length:
+                    if line[cursor] == "\\":
+                        cursor += 2
+                        continue
+                    if line[cursor] == '"':
+                        break
+                    cursor += 1
+                if cursor >= length:
+                    code.append("_" * (length - index))
+                    index = length
+                else:
+                    code.append("_" * (cursor - index))
+                    code.append('"')
+                    index = cursor + 1
+                    in_string = False
+                continue
+            if line.startswith("//", index):
+                code.append(" " * (length - index))
+                index = length
+                continue
+            if line.startswith("/*", index):
+                block_depth = 1
+                code.append("  ")
+                index += 2
+                continue
+            raw = RAW_STRING_START.match(line, index)
+            if raw:
+                raw_hashes = len(raw.group(1))
+                code.append(" " * (raw.end() - index - 1) + '"')
+                index = raw.end()
+                continue
+            char = CHAR_LITERAL.match(line, index)
+            if char:
+                code.append("'" + "_" * (char.end() - index - 2) + "'")
+                index = char.end()
+                continue
+            if line[index] == '"':
+                in_string = True
+                code.append('"')
+                index += 1
+                continue
+            code.append(line[index])
+            index += 1
+        rendered = "".join(code)
+        masked.append((rendered, bool(line.strip()) and not rendered.strip()))
+    return masked
+
+
+def head_line_indices(masked: list[tuple[str, bool]], index: int) -> list[int]:
+    """Line indices of the attribute head of the `#[test]` item at `index`."""
+    above: list[int] = []
     pending = 0
-    for line in reversed(lines[:index]):
-        stripped = line.strip()
-        if not stripped:
+    for cursor in range(index - 1, -1, -1):
+        code, comment_only = masked[cursor]
+        stripped = code.strip()
+        if not stripped and not comment_only:
             break
-        if pending == 0 and stripped.startswith("//"):
+        # Checked regardless of bracket depth, on purpose: this is the backstop
+        # that makes the walk degrade closed if bracket accounting is ever
+        # wrong. After masking, a continuation line cannot look like the start
+        # of an item, because anything that could is inside a literal.
+        if stripped == "#[test]" or ITEM_BOUNDARY.match(stripped):
+            break
+        if pending == 0 and comment_only:
             continue
         delta = stripped.count("]") + stripped.count(")") - stripped.count("[") - stripped.count("(")
         # A multi-line attribute is met tail-first walking upward, so a line
-        # that closes more brackets than it opens starts a continuation.
+        # closing more brackets than it opens starts a continuation.
         if pending == 0 and delta <= 0 and not stripped.startswith("#["):
             break
-        attributes.append(stripped)
+        above.append(cursor)
         pending = max(0, pending + delta)
+    head = list(reversed(above))
     pending = 0
-    for line in lines[index + 1 :]:
-        stripped = line.strip()
+    for cursor in range(index + 1, len(masked)):
+        code, comment_only = masked[cursor]
+        stripped = code.strip()
         if pending == 0:
-            if stripped.startswith("//"):
+            if comment_only:
                 continue
             if not stripped.startswith("#["):
                 break
-        attributes.append(stripped)
+        head.append(cursor)
         pending = max(0, pending + stripped.count("[") + stripped.count("(") - stripped.count("]") - stripped.count(")"))
-    return attributes
+    return head
+
+
+def attribute_spans(text: str) -> list[tuple[int, int]]:
+    """Half-open spans of each `#[..]` attribute in bracket-masked `text`."""
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    while True:
+        start = text.find("#[", cursor)
+        if start == -1:
+            return spans
+        depth = 0
+        end = start + 1
+        while end < len(text):
+            char = text[end]
+            if char in "[(":
+                depth += 1
+            elif char in "])":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if depth != 0:
+            return spans
+        spans.append((start, end + 1))
+        cursor = end + 1
+
+
+def has_effective_ignore(masked_head: str, raw_head: str) -> bool:
+    """Whether the head ignores the test when `gpu-tests` is off.
+
+    The ignore token is looked for in masked text so literals and prose cannot
+    supply it; the `cfg_attr` predicate is read from the original text at the
+    same offsets, because masking blanks the feature name it needs to check.
+    """
+    for start, end in attribute_spans(masked_head):
+        attribute = masked_head[start:end]
+        if not IGNORE_ATTR.search(attribute):
+            continue
+        if "cfg_attr" not in attribute:
+            return True
+        if GPU_TESTS_PREDICATE.search(raw_head[start:end]):
+            return True
+    return False
 
 
 def test_name_at(lines: list[str], index: int) -> str:
@@ -167,14 +320,26 @@ def test_name_at(lines: list[str], index: int) -> str:
 
 
 def un_ignored_tests(source: str) -> list[tuple[int, str]]:
-    """Every `#[test]` in `source` that carries no ignore attribute, 1-based."""
+    """Every `#[test]` in `source` not ignored when `gpu-tests` is off, 1-based."""
     lines = source.splitlines()
+    masked = mask_source(source)
     found: list[tuple[int, str]] = []
-    for index, line in enumerate(lines):
-        if line.strip() != "#[test]":
+    for index, (code, _) in enumerate(masked):
+        if code.strip() != "#[test]":
             continue
-        attributes = attribute_lines_of_item(lines, index)
-        if any(IGNORE_ATTR.search(entry) for entry in attributes):
+        head = head_line_indices(masked, index)
+        # Joined unstripped: masking is length-preserving per line, so the two
+        # blobs agree column for column and a span found in one can be read out
+        # of the other. Stripping would break exactly that, because masking a
+        # trailing comment leaves spaces that strip() then removes.
+        masked_head = "\n".join(masked[cursor][0] for cursor in head)
+        raw_head = "\n".join(lines[cursor] for cursor in head)
+        if len(masked_head) != len(raw_head):
+            # Masking is column-exact, so this cannot happen; if it ever does,
+            # report rather than trust a span mapping that has drifted.
+            found.append((index + 1, test_name_at(lines, index)))
+            continue
+        if has_effective_ignore(masked_head, raw_head):
             continue
         found.append((index + 1, test_name_at(lines, index)))
     return found
@@ -555,35 +720,76 @@ def self_test() -> None:
     if not any("executed without gpu-tests" in error for error in validate_ignored_result(silent_without_feature)):
         raise AssertionError("without-gpu-tests silent pass should fail")
 
-    # The first version of this scan searched the item head for the substring
-    # "ignore" and so accepted a test whose doc comment said "a kernel that
-    # ignored the attribute". That is the defect it exists to catch, and it is
-    # the second fixture below. Both controls are here on purpose: the ones
-    # that must be flagged, and the ones that must not.
+    # These fixtures are the review history of this scan, kept as tests. The
+    # first version searched the item head for the substring "ignore" and so
+    # accepted a test whose doc comment said "a kernel that ignored the
+    # attribute" -- the defect it exists to catch. The second version counted
+    # brackets in string literals, so one stray `)` inside a `should_panic`
+    # message let the upward walk escape into the item above and adopt *its*
+    # ignore: a fail-open in a check that must fail closed. Both controls are
+    # here on purpose -- the cases that must be flagged, and the ones that must
+    # not, because only the second kind catches a scan that flags everything.
     for source, expected in (
         ("#[test]\nfn a() {}\n", ["a"]),
-        ("/// a kernel that ignored the attribute entirely\n#[test]\nfn a() {}\n", ["a"]),
-        ("/// close for small |x|). We run\n#[test]\nfn a() {}\n", ["a"]),
-        ("#[cfg(feature = \"gpu-tests\")]\n#[test]\nfn a() {}\n", ["a"]),
         ("#[ignore]\n#[test]\nfn a() {}\n", []),
-        ("#[test]\n#[ignore = \"needs a device\"]\nfn a() {}\n", []),
-        ("#[cfg_attr(not(feature = \"gpu-tests\"), ignore = \"x\")]\n#[test]\nfn a() {}\n", []),
-        ('''#[cfg_attr(\n    not(feature = "gpu-tests"),\n    ignore = "requires CUDA device"\n)]\n#[test]\nfn a() {}\n''', []),
-        ("/// doc\n#[cfg_attr(not(feature = \"gpu-tests\"), ignore = \"x\")]\n#[test]\nfn a() {}\n", []),
-        ("#[test]\nfn a() {}\n\n#[ignore]\n#[test]\nfn b() {}\n", ["a"]),
-        ("macro_rules! m {\n    () => {\n        #[ignore]\n        #[test]\n        fn a() {}\n    };\n}\n", []),
-        ("// let ignore = 1;\n#[test]\nfn a() {}\n", ["a"]),
-        # These two exist to make the two defences falsifiable rather than
-        # merely present. The first fails if IGNORE_ATTR is relaxed to a bare
-        # substring: "ignore" appears, but inside a string literal, not as an
-        # attribute. The second fails if doc comments are read as attributes:
-        # the prose ends "ignore," which is attribute-shaped punctuation.
-        ("#[should_panic(expected = \"ignore me\")]\n#[test]\nfn a() {}\n", ["a"]),
+        ('#[test]\n#[ignore = "needs a device"]\nfn a() {}\n', []),
+        ('#[cfg_attr(not(feature = "gpu-tests"), ignore = "x")]\n#[test]\nfn a() {}\n', []),
+        ('#[cfg_attr(not(feature = "gpu-tests"), ignore)]\n#[test]\nfn a() {}\n', []),
+        ('#[cfg_attr(\n    not(feature = "gpu-tests"),\n    ignore = "x"\n)]\n#[test]\nfn a() {}\n', []),
+        ('#[cfg(feature = "gpu-tests")]\n#[test]\nfn a() {}\n', ["a"]),
+        # An ignore conditioned on some other feature does not ignore the test
+        # when gpu-tests is off, which is the whole defect.
+        ('#[cfg_attr(not(feature = "something-else"), ignore = "x")]\n#[test]\nfn a() {}\n', ["a"]),
+        # Prose is not an attribute: both of these say "ignore" and neither is one.
+        ("/// a kernel that ignored the attribute entirely\n#[test]\nfn a() {}\n", ["a"]),
         ("/// we do not ignore, ever\n#[test]\nfn a() {}\n", ["a"]),
+        ("// let ignore = 1;\n#[test]\nfn a() {}\n", ["a"]),
+        # Nor is a string literal, however attribute-shaped its contents.
+        ('#[should_panic(expected = "ignore me")]\n#[test]\nfn a() {}\n', ["a"]),
+        ("#[allow(clippy::ignored_unit_patterns)]\n#[test]\nfn a() {}\n", ["a"]),
+        # A bracket inside a literal is not structure. Without masking, the
+        # stray `)` below makes the walk climb into `a` and inherit its ignore.
+        (
+            '#[cfg_attr(not(feature = "gpu-tests"), ignore = "x")]\n#[test]\nfn a() {}\n'
+            '#[should_panic(expected = "boom )")]\n#[test]\nfn b() {}\n',
+            ["b"],
+        ),
+        ('/// we do not ignore, ever\n#[should_panic(expected = "boom )")]\n#[test]\nfn a() {}\n', ["a"]),
+        ('#[cfg_attr(not(feature = "gpu-tests"), ignore = r#"a ) ] b"#)]\n#[test]\nfn a() {}\n', []),
+        # Comments inside a head must not truncate it, including nested blocks.
+        ('#[cfg_attr(not(feature = "gpu-tests"), ignore = "x")]\n/* why */\n#[test]\nfn a() {}\n', []),
+        ('#[cfg_attr(not(feature = "gpu-tests"), ignore = "x")]\n/* a /* b */ c */\n#[test]\nfn a() {}\n', []),
+        ('/// doc\n#[cfg_attr(not(feature = "gpu-tests"), ignore = "x")]\n#[test]\nfn a() {}\n', []),
+        # An adjacent item's ignore is not this item's, blank line or not.
+        ("#[test]\nfn a() {}\n\n#[ignore]\n#[test]\nfn b() {}\n", ["a"]),
+        ("#[ignore]\n#[test]\nfn a() {}\n#[test]\nfn b() {}\n", ["b"]),
+        ("macro_rules! m {\n    () => {\n        #[ignore]\n        #[test]\n        fn a() {}\n    };\n}\n", []),
+        # An attribute below `#[test]` with a trailing comment. Masking that
+        # comment leaves trailing spaces, so joining the stripped lines made the
+        # masked and raw blobs different lengths and the span mapping drifted.
+        (
+            '#[cfg_attr(\n    not(feature = "gpu-tests"),\n    ignore = "x"\n)]\n#[test]\n'
+            "#[allow(clippy::identity_op)] // mirrors the shape above\n"
+            "fn a() {}\n",
+            [],
+        ),
     ):
         names = [name for _, name in un_ignored_tests(source)]
         if names != expected:
             raise AssertionError(f"source scan fixture returned {names!r}, expected {expected!r}: {source!r}")
+
+    if mask_source('let s = "a // b"; // c\n')[0][0].rstrip() != 'let s = "______";':
+        raise AssertionError("masking must blank literals and comments while preserving columns")
+
+    # The item boundary is a backstop for bracket accounting, so it has to be
+    # exercised against accounting that is already wrong -- the stray `)` here
+    # stands in for a masking failure. Without the boundary the walk climbs out
+    # of `a` and adopts its `#[ignore]`, which is the fail-open this must not
+    # have. Driven through `head_line_indices` because no valid Rust reaches
+    # this state once masking is correct.
+    corrupted = [("#[ignore]", False), ("#[test]", False), ("fn a() {}", False), (")", False), ("#[test]", False)]
+    if head_line_indices(corrupted, 4) != [3]:
+        raise AssertionError("the upward walk must stop at an item boundary even when brackets do not balance")
 
     good_active = ActiveResult("fixture_active", inventory=2, passed=0, failed=2, ignored=0)
     silent_with_feature = ActiveResult("fixture_active_silent", inventory=1, passed=1, failed=0, ignored=0)
