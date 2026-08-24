@@ -205,25 +205,77 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
-    reject_retired_model_io(&content)?;
+    parse_metadata(&content, path.extension().and_then(|e| e.to_str()))
+}
 
-    let metadata: InferenceMetadata = match path.extension().and_then(|e| e.to_str()) {
-        Some("yaml" | "yml") => serde_yaml::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
-        Some("json") => serde_json::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
+/// The one way a document becomes an [`InferenceMetadata`].
+///
+/// Every loader goes through here rather than calling `serde` itself, because
+/// two things have to happen before a typed reader sees the bytes. The retired
+/// `model.io` block has to be recognized so a package that still declares one
+/// gets told how to convert it instead of failing later with a puzzled "declares
+/// no workflow". And the schema version has to be compared, because every
+/// structure in this schema denies unknown fields: a document from a newer
+/// runtime is not malformed, and reporting the first field this build happens
+/// not to know would send a reader hunting for a typo that is not there.
+///
+/// `extension` is a hint, not a requirement — `None` tries YAML and then JSON,
+/// which is what a document with no filename gets.
+pub fn parse_metadata(
+    content: &str,
+    extension: Option<&str>,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    preparse(content)?;
+    match extension {
+        Some("yaml" | "yml") => {
+            serde_yaml::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
+        Some("json") => {
+            serde_json::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
         _ => {
-            // Try YAML first, then JSON
-            if let Ok(m) = serde_yaml::from_str::<InferenceMetadata>(&content) {
-                m
+            // YAML is a superset of JSON, but its error for a JSON document that
+            // is wrong in a JSON way is worse, so fall back rather than insist.
+            if let Ok(metadata) = serde_yaml::from_str::<InferenceMetadata>(content) {
+                Ok(metadata)
             } else {
-                serde_json::from_str::<InferenceMetadata>(&content)
-                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))?
+                serde_json::from_str::<InferenceMetadata>(content)
+                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))
             }
         }
-    };
+    }
+}
 
-    Ok(metadata)
+/// Like [`parse_metadata`], for a document a caller already holds as JSON.
+///
+/// A lowering that builds a document in memory gets the same two checks a file
+/// gets. It would otherwise be the one path on which a package could declare a
+/// version nothing verified.
+pub fn parse_metadata_json(
+    document: &serde_json::Value,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    let value = serde_yaml::to_value(document)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    gate_document(&value)?;
+    serde_json::from_value(document.clone())
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))
+}
+
+/// Checks that read a document as a tree, before anything reads it as a type.
+fn preparse(content: &str) -> Result<(), crate::MetadataError> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        // Not parseable as a tree at all; the typed reader reports why.
+        return Ok(());
+    };
+    gate_document(&document)
+}
+
+fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    reject_retired_model_io(document)?;
+    let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
+    crate::version::gate(declared)
+        .map(|_| ())
+        .map_err(crate::MetadataError::Parse)
 }
 
 /// Refuse a document that still declares the retired `model.io` block.
@@ -233,11 +285,7 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
 /// the retired shape here — and *only* to explain it — turns that into an
 /// actionable error naming the conversion. This is the one place the old spelling
 /// appears, and it never produces a value: it produces a refusal.
-fn reject_retired_model_io(content: &str) -> Result<(), crate::MetadataError> {
-    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
-        // Not parseable as YAML at all; the real parser reports why.
-        return Ok(());
-    };
+fn reject_retired_model_io(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
     let declares_retired_io = document
         .get("model")
         .and_then(|model| model.get("io"))

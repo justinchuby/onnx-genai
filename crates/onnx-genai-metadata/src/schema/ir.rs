@@ -116,16 +116,6 @@ pub enum BatchLayout {
         /// checked and tested.
         #[schemars(length(min = 1, max = 2))]
         levels: Vec<OwnershipLevel>,
-        /// Where the extent of this packed axis comes from, for a value a
-        /// component produces.
-        ///
-        /// Absent is right for a value a component consumes, whose extent the
-        /// caller assembled. An output must state it: a runtime that assumed
-        /// the input's offsets still describe the result would split a
-        /// token-merging encoder's output at the wrong boundaries and report
-        /// nothing.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        packed_extent: Option<PackedExtent>,
     },
     RuntimeSequenceState,
 }
@@ -154,9 +144,20 @@ pub struct OwnershipLevel {
     /// packed extent.
     #[schemars(length(min = 1))]
     pub owner: String,
+    /// Where this level's unit count comes from, for a value a component
+    /// produces.
+    ///
+    /// Absent is right for a value a component consumes, whose every count the
+    /// caller assembled. An output states it per level, because the levels of
+    /// one chain do not answer together: a token-merging encoder decides how
+    /// many tokens each clip becomes while leaving which clip belongs to which
+    /// request exactly as it found it. A single answer for the whole chain
+    /// could only be wrong at one end or the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<PackedExtent>,
 }
 
-/// Where the extent of a component output's packed axis comes from.
+/// Where the unit count of one ownership level comes from.
 ///
 /// Neither answer is derivable from the contract: an output of the same rank
 /// and symbols as its input may be a per-item transform or a token merger, and
@@ -224,14 +225,6 @@ impl BatchLayout {
         match self {
             Self::TokenPacked { levels, .. } => levels,
             _ => &[],
-        }
-    }
-
-    /// Where a packed output's extent comes from.
-    pub fn packed_extent(&self) -> Option<PackedExtent> {
-        match self {
-            Self::TokenPacked { packed_extent, .. } => *packed_extent,
-            _ => None,
         }
     }
 
@@ -942,18 +935,21 @@ pub struct WorkflowComponent {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ComponentBatchCapacity {
-    /// Shape symbols whose extents must be equal across every co-batched item.
+    /// Shape symbols whose extents every item in a group must agree on.
     ///
-    /// A component that accepts several items may still require them to agree
-    /// on something no amount of padding or packing reconciles — an encoder
-    /// whose artifact is built for one spatial extent, say, or one that groups
-    /// clips only when they carry the same number of frames. Spatial and
-    /// temporal extents are listed the same way: a symbol is a symbol, and the
-    /// runtime compares the dimensions it is told to compare rather than
-    /// guessing which ones matter. A symbol left off this list is free to vary,
-    /// and must then be reconciled by padding or by packing.
+    /// A symbol here names a property of one item — a patch width, a mel bin, a
+    /// frame count of a fixed-length clip — that the artifact cannot vary
+    /// within a single call. Items that disagree on it cannot share an
+    /// invocation, so a scheduler splits them into separate groups.
+    ///
+    /// It may not name a count: not the extent of a packed axis, and not the
+    /// unit or run count of an ownership level. Those are the numbers a packed
+    /// layout exists to let vary per request, and pinning one would describe a
+    /// fixed-shape batch the package did not declare. A video whose frame count
+    /// really is fixed is expressed by pinning the frame dimension of an
+    /// ordinary request-aligned tensor and declaring no frame ownership level
+    /// at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(inner(length(min = 1)))]
     pub uniform_dimensions: Vec<String>,
     /// Upper bounds on what one assembled invocation materializes, keyed by
     /// shape symbol.

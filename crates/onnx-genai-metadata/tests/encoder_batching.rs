@@ -9,8 +9,8 @@
 //! clip granularity through the same contracts a still image uses.
 
 use onnx_genai_metadata::{
-    BatchLayout, ComponentBatchCapacity, InferenceMetadata, PackedExtent, TensorContract,
-    VisionOutputBinding, inference_metadata_schema_json, validate_metadata,
+    BatchLayout, ComponentBatchCapacity, InferenceMetadata, LENGTH_CONTENT_ROLES, PackedExtent,
+    TensorContract, VisionOutputBinding, inference_metadata_schema_json, validate_metadata,
 };
 
 fn parse(document: &str) -> InferenceMetadata {
@@ -35,7 +35,7 @@ fn assert_reports(document: &str, expected: &str) {
 /// extents its artifact was built for, and bounds what one call materializes on
 /// the dimension the rows differ in.
 const PADDED_VISION_ENCODER: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 pipeline:
   workflow:
     manifest:
@@ -108,7 +108,7 @@ pipeline:
 /// concatenated onto one item axis and one ownership level maps each item back
 /// to the row that asked for it.
 const PACKED_VISION_ENCODER: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 pipeline:
   workflow:
     manifest:
@@ -172,8 +172,7 @@ pipeline:
                 kind: token_packed
                 axis: 0
                 levels:
-                  - { offsets: offsets, owner: owner }
-                packed_extent: preserved
+                  - { offsets: offsets, owner: owner, extent: preserved }
       splice:
         implementation: { kind: onnx, artifact: splice.onnx }
         ports:
@@ -255,18 +254,14 @@ fn a_packed_encoder_result_maps_items_back_to_rows() {
     let workflow = &metadata.pipeline.expect("pipeline").workflow;
     let layout = &workflow.inputs["image_pixels"].contract.batch_layout;
     match layout {
-        BatchLayout::TokenPacked {
-            axis,
-            levels,
-            packed_extent,
-        } => {
+        BatchLayout::TokenPacked { axis, levels } => {
             assert_eq!(*axis, 0);
             assert_eq!(levels.len(), 1, "one level owns items straight into rows");
             assert_eq!(levels[0].offsets, "image_offsets");
             assert_eq!(levels[0].owner, "image_owner");
             assert_eq!(
-                *packed_extent, None,
-                "a value a component consumes carries the extent its caller assembled"
+                levels[0].extent, None,
+                "a value a component consumes carries the counts its caller assembled"
             );
         }
         other => panic!("fixture declares a packed layout: {other:?}"),
@@ -274,7 +269,8 @@ fn a_packed_encoder_result_maps_items_back_to_rows() {
     assert_eq!(
         workflow.components["vision"].ports.outputs["features"]
             .batch_layout
-            .packed_extent(),
+            .levels()[0]
+            .extent,
         Some(PackedExtent::Preserved)
     );
 }
@@ -442,14 +438,15 @@ fn a_packed_axis_carries_no_padding() {
 #[test]
 fn two_values_that_share_offsets_share_the_grouping() {
     // One offsets vector is a complete account of how many units each parent
-    // owns, so two values naming it at the same level are claiming one grouping.
+    // owns, so two values naming it are claiming one grouping — wherever in
+    // their chains they name it, since a level is the pair and not the position.
     let document = PACKED_VISION_ENCODER.replace(
         "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tokens",
         "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [items, generated], batch_layout: { kind: token_packed, axis: 0, levels: [{ offsets: image_offsets, owner: prompt }] } }\n        role: tokens",
     );
     assert_reports(
         &document,
-        "pairs level 0 offsets 'image_offsets' with owner map 'prompt', but workflow input \
+        "pairs offsets 'image_offsets' with owner map 'prompt', but workflow input \
          'image_pixels' pairs the same offsets with 'image_owner'",
     );
 }
@@ -573,56 +570,85 @@ fn a_padded_value_is_not_its_own_length_vector() {
 }
 
 #[test]
-fn a_packed_output_says_where_its_extent_came_from() {
+fn a_packed_output_says_where_every_level_came_from() {
     // An output of the same rank and symbols as its input may be a per-item
     // transform or a token merger, and the two split at different boundaries.
-    let document = PACKED_VISION_ENCODER.replace("                packed_extent: preserved\n", "");
-    assert_reports(
-        &document,
-        "packs items but declares no packed_extent; an output either preserves an input's units \
-         one for one or produces its own",
-    );
-}
-
-#[test]
-fn a_produced_extent_is_described_by_the_components_own_outputs() {
-    // Reusing an input's offsets for an extent the graph decided would describe
-    // a length the output does not have, and the split would land between items.
-    let document = NESTED_VIDEO_ENCODER.replace(
-        "                  - { offsets: clip_offsets, owner: clip_owner }\n                packed_extent: preserved",
-        "                  - { offsets: clip_offsets, owner: clip_owner }\n                packed_extent: produced",
-    );
-    assert_reports(
-        &document,
-        "declares packed_extent produced but its level 0 offsets 'clip_offsets' is not an output \
-         port of the same component; an extent the graph decides is described by companions the \
-         graph emits",
-    );
-}
-
-#[test]
-fn a_preserved_extent_reuses_the_companions_that_already_described_it() {
-    let document = NESTED_VIDEO_ENCODER.replace(
-        "                  - { offsets: media_token_offsets, owner: media_token_owner }\n                  - { offsets: clip_offsets, owner: clip_owner }\n                packed_extent: produced",
-        "                  - { offsets: media_token_offsets, owner: media_token_owner }\n                  - { offsets: clip_offsets, owner: clip_owner }\n                packed_extent: preserved",
-    );
-    assert_reports(
-        &document,
-        "declares packed_extent preserved but its level 0 offsets 'media_token_offsets' is an \
-         output port of the same component; preserving an extent means reusing the companions \
-         that already described it",
-    );
-}
-
-#[test]
-fn a_consumed_value_does_not_state_where_its_extent_came_from() {
     let document = PACKED_VISION_ENCODER.replace(
-        "                levels:\n                  - { offsets: offsets, owner: owner }\n            offsets:",
-        "                levels:\n                  - { offsets: offsets, owner: owner }\n                packed_extent: preserved\n            offsets:",
+        "                  - { offsets: offsets, owner: owner, extent: preserved }",
+        "                  - { offsets: offsets, owner: owner }",
     );
     assert_reports(
         &document,
-        "declares packed_extent preserved; the extent of a value a component consumes is the one \
+        "packs items but declares no extent for level 0; a level either preserves an input \
+         level's units one for one or produces its own",
+    );
+}
+
+#[test]
+fn an_outer_level_states_its_own_extent() {
+    // The chain does not answer as a unit: dropping the outer answer leaves the
+    // clip-to-row mapping unstated even though the inner one is produced.
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "                  - { offsets: clip_offsets, owner: clip_owner, extent: preserved }\n            media_tokens:",
+        "                  - { offsets: clip_offsets, owner: clip_owner }\n            media_tokens:",
+    );
+    assert_reports(&document, "declares no extent for level 0");
+}
+
+#[test]
+fn a_produced_level_is_described_by_the_components_own_outputs() {
+    // Reusing an input's offsets for a count the graph decided would describe a
+    // length the output does not have, and the split would land between items.
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "                  - { offsets: clip_offsets, owner: clip_owner, extent: preserved }\n            media_tokens:",
+        "                  - { offsets: clip_offsets, owner: clip_owner, extent: produced }\n            media_tokens:",
+    );
+    assert_reports(
+        &document,
+        "declares level 0 extent produced but its offsets 'clip_offsets' is not an output port of \
+         the same component; a level the graph decides is described by companions the graph emits",
+    );
+}
+
+#[test]
+fn a_preserved_level_reuses_the_companions_that_already_described_it() {
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "                  - { offsets: media_token_offsets, owner: media_token_owner, extent: produced }",
+        "                  - { offsets: media_token_offsets, owner: media_token_owner, extent: preserved }",
+    );
+    assert_reports(
+        &document,
+        "declares level 0 extent preserved but its offsets 'media_token_offsets' is an output \
+         port of the same component; preserving a level means reusing the companions that already \
+         described it",
+    );
+}
+
+#[test]
+fn a_preserved_level_corresponds_to_an_input_level_by_its_pair() {
+    // Nothing in the component consumed a clip-to-row mapping spelled this way,
+    // so the output cannot be preserving one.
+    let document = PACKED_EMIT_WORKFLOW.replace(
+        "                  - { offsets: image_offsets, owner: image_owner, extent: preserved }",
+        "                  - { offsets: image_owner, owner: image_offsets, extent: preserved }",
+    );
+    assert_reports(
+        &document,
+        "no input port of the component declares an ownership level pairing offsets 'image_owner' \
+         with owner map 'image_offsets'; a level is preserved by reusing the very pair that \
+         described it",
+    );
+}
+
+#[test]
+fn a_consumed_value_does_not_state_where_its_levels_came_from() {
+    let document = PACKED_VISION_ENCODER.replace(
+        "                  - { offsets: offsets, owner: owner }\n            offsets:",
+        "                  - { offsets: offsets, owner: owner, extent: preserved }\n            offsets:",
+    );
+    assert_reports(
+        &document,
+        "declares level 0 extent preserved; every count of a value a component consumes is one \
          its caller assembled",
     );
 }
@@ -650,15 +676,55 @@ fn uniform_dimensions_are_distinct_declared_symbols() {
 }
 
 #[test]
-fn a_symbol_is_pinned_or_budgeted_but_never_both() {
+fn a_pinned_symbol_is_never_budgeted_on_its_own() {
     let document = PACKED_VISION_ENCODER.replace(
         "            - { dimensions: [items], max_total: 32 }",
         "            - { dimensions: [items], max_total: 32 }\n            - { dimensions: [channels], max_total: 3 }",
     );
     assert_reports(
         &document,
-        "both pins 'channels' across the group and budgets it; a pinned dimension has one extent \
-         for every item",
+        "both pins 'channels' across the group and budgets it on its own; a pinned dimension has \
+         one extent for every item",
+    );
+}
+
+#[test]
+fn a_composed_budget_may_multiply_a_pinned_extent_by_a_count() {
+    // Bounding channels alone restates a number the artifact already fixed;
+    // bounding items times channels bounds what one call materializes, which is
+    // the whole point of a footprint.
+    let document = PACKED_VISION_ENCODER.replace(
+        "            - { dimensions: [items], max_total: 32 }",
+        "            - { dimensions: [items], max_total: 32 }\n            - { dimensions: [items, channels], max_total: 96 }",
+    );
+    validate_metadata(&parse(&document))
+        .expect("a pinned extent may appear in a composed footprint");
+}
+
+#[test]
+fn a_pinned_dimension_is_a_property_of_an_item_and_never_a_count_of_them() {
+    // Pinning the packed extent would say every group holds the same number of
+    // items, which is the raggedness the packed layout exists to express.
+    let packed = PACKED_VISION_ENCODER.replace(
+        "uniform_dimensions: [channels, height, width]",
+        "uniform_dimensions: [channels, height, width, items]",
+    );
+    assert_reports(
+        &packed,
+        "requires uniform dimension 'items', which is the packed extent of port 'pixels' rather \
+         than a property of one item",
+    );
+
+    // And pinning a level's unit count would say every request contributes the
+    // same number of clips, which is what the level is there to let vary.
+    let nested = NESTED_VIDEO_ENCODER.replace(
+        "          uniform_dimensions: [features]",
+        "          uniform_dimensions: [features, clips]",
+    );
+    assert_reports(
+        &nested,
+        "requires uniform dimension 'clips', which is the units of ownership level 1 of port \
+         'pixel_values' rather than a property of one item",
     );
 }
 
@@ -906,6 +972,127 @@ fn pixel_programs_can_emit_the_offsets_and_owner_of_a_packed_batch() {
     }
 }
 
+/// An image preprocessor that packs: it concatenates every request's images onto
+/// one item axis and emits, alongside the pixels, the two companions that fold
+/// that run back into rows. Both companions are its own outputs, so the level
+/// they describe is one the preprocessor produced.
+const PACKED_PIXEL_PROGRAM: &str = r#"
+schema_version: "1.1"
+preprocessing:
+  image:
+    transforms:
+      - op: decode
+        outputs: [image.decoded]
+      - op: resize
+        size: 224
+        inputs: [image.decoded]
+        outputs: [image.resized]
+      - op: normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+        inputs: [image.resized]
+        outputs: [image.normalized]
+    outputs:
+      - name: image.pixel_values
+        source: image.normalized
+        content: pixels
+        dtype: float32
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [items, channels, height, width]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:
+              - { offsets: image.offsets, owner: image.owner, extent: produced }
+      - name: image.offsets
+        source: image.pack_offsets
+        content: pack_offsets
+        dtype: int64
+        contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+      - name: image.owner
+        source: image.pack_owner
+        content: pack_owner
+        dtype: int64
+        contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: { onnx-genai.image-preprocess: "1" }
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      request.image:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: runtime, version: "1.0", role: media }
+        source: { kind: request }
+      prompt:
+        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: prompt }
+    outputs:
+      tokens:
+        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tokens
+        stage: pre_adapter
+    components:
+      image_preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.image-preprocess, version: "1" }
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+          outputs:
+            image.pixel_values:
+              dtype: float32
+              rank: 4
+              shape: [items, channels, height, width]
+              batch_layout:
+                kind: token_packed
+                axis: 0
+                levels:
+                  - { offsets: image.offsets, owner: image.owner, extent: produced }
+            image.offsets: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+            image.owner: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+      splice:
+        implementation: { kind: onnx, artifact: splice.onnx }
+        ports:
+          inputs:
+            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            pixels:
+              dtype: float32
+              rank: 4
+              shape: [items, channels, height, width]
+              batch_layout:
+                kind: token_packed
+                axis: 0
+                levels:
+                  - { offsets: image.offsets, owner: image.owner }
+          outputs:
+            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+    steps:
+      - kind: invoke
+        component: image_preprocess
+        inputs: { encoded: request.image }
+        outputs:
+          image.pixel_values: image.pixel_values
+          image.offsets: image.offsets
+          image.owner: image.owner
+      - kind: invoke
+        component: splice
+        inputs: { prompt: prompt, pixels: image.pixel_values }
+        outputs: { token: raw }
+      - kind: emit
+        value: raw
+        output: tokens
+        mode: replace
+"#;
+
+#[test]
+fn a_packing_preprocessor_produces_the_companions_it_describes() {
+    validate_metadata(&parse(PACKED_PIXEL_PROGRAM))
+        .expect("a packing image program is describable");
+}
+
 /// A clip encoder that pads in time: every request contributes one row of at
 /// most `frames` frames, and `video.frame_lengths` says how many of them are
 /// real rather than sampled-out or padded. The declaration is the one a
@@ -913,7 +1100,7 @@ fn pixel_programs_can_emit_the_offsets_and_owner_of_a_packed_batch() {
 /// capacity pins the spatial extents in the same list that would pin a temporal
 /// one.
 const PADDED_VIDEO_ENCODER: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 preprocessing:
   video:
     transforms:
@@ -1111,7 +1298,8 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
         );
     let metadata = parse(&document);
     validate_metadata(&metadata).expect("pinning the temporal extent is valid");
-    let capacity = metadata.pipeline.expect("pipeline").workflow.components["video_encoder"]
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
+    let capacity = workflow.components["video_encoder"]
         .batch_capacity
         .clone()
         .expect("fixture declares a capacity");
@@ -1123,6 +1311,51 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
         capacity.budgets.is_empty(),
         "a pinned encoder with nothing free needs no footprint bound"
     );
+
+    // And a fixed-frame video is exactly this: an ordinary request-aligned
+    // tensor with the temporal extent pinned, and no ownership level at all.
+    // There is nothing ragged to fold back, so there is nothing to declare.
+    let contracts = workflow
+        .components
+        .values()
+        .flat_map(|component| {
+            component
+                .ports
+                .inputs
+                .values()
+                .chain(component.ports.outputs.values())
+        })
+        .chain(workflow.inputs.values().map(|input| &input.contract))
+        .chain(workflow.outputs.values().map(|output| &output.contract));
+    for contract in contracts {
+        assert!(
+            contract.batch_layout.levels().is_empty(),
+            "a fixed-frame video needs no ownership level: {contract:?}"
+        );
+    }
+    let encoder = &workflow.components["video_encoder"].ports;
+    for contract in encoder.inputs.values().chain(encoder.outputs.values()) {
+        assert!(
+            contract.padding.is_empty(),
+            "the encoder's pinned temporal extent has nothing to pad: {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn a_pinned_temporal_extent_is_not_also_an_ownership_level() {
+    // Pinning the frame count while packing frames is two answers to one
+    // question: the level says a request may contribute any number of frames
+    // and the pin says every group contributes the same number.
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "          uniform_dimensions: [features]",
+        "          uniform_dimensions: [features, frames]",
+    );
+    assert_reports(
+        &document,
+        "requires uniform dimension 'frames', which is the packed extent of port 'pixel_values' \
+         rather than a property of one item",
+    );
 }
 
 /// The design's worked case, and the deepest chain the schema states: frames are
@@ -1132,7 +1365,7 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
 ///
 /// Three kinds of raggedness, three dimensions of one contract, no two competing.
 const NESTED_VIDEO_ENCODER: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 pipeline:
   workflow:
     manifest:
@@ -1182,8 +1415,7 @@ pipeline:
             kind: token_packed
             axis: 0
             levels:
-              - { offsets: clip_offsets, owner: clip_owner }
-            packed_extent: preserved
+              - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
         role: tensor
         stage: pre_adapter
       clip_offsets:
@@ -1230,8 +1462,7 @@ pipeline:
                 kind: token_packed
                 axis: 0
                 levels:
-                  - { offsets: clip_offsets, owner: clip_owner }
-                packed_extent: preserved
+                  - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
             media_tokens:
               dtype: float32
               rank: 2
@@ -1240,9 +1471,8 @@ pipeline:
                 kind: token_packed
                 axis: 0
                 levels:
-                  - { offsets: media_token_offsets, owner: media_token_owner }
-                  - { offsets: clip_offsets, owner: clip_owner }
-                packed_extent: produced
+                  - { offsets: media_token_offsets, owner: media_token_owner, extent: produced }
+                  - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
             media_token_offsets: { dtype: int64, rank: 1, shape: [media_token_offsets_len], batch_layout: { kind: shared } }
             media_token_owner: { dtype: int64, rank: 1, shape: [media_tokens_total], batch_layout: { kind: shared } }
     steps:
@@ -1348,15 +1578,37 @@ fn a_mixed_chain_produces_one_level_and_preserves_the_other() {
     let metadata = parse(NESTED_VIDEO_ENCODER);
     let workflow = metadata.pipeline.expect("pipeline").workflow;
     let tokens = &workflow.components["clip_encoder"].ports.outputs["media_tokens"];
-    assert_eq!(
-        tokens.batch_layout.packed_extent(),
-        Some(PackedExtent::Produced)
-    );
     let levels = tokens.batch_layout.levels();
+    assert_eq!(levels.len(), 2, "the chain the encoder returns is two deep");
     assert_eq!(levels[0].offsets, "media_token_offsets");
+    assert_eq!(
+        levels[0].extent,
+        Some(PackedExtent::Produced),
+        "the encoder decides how many tokens each clip becomes"
+    );
     assert_eq!(
         levels[1].offsets, "clip_offsets",
         "the outer level reuses the input pair the graph did not change"
+    );
+    assert_eq!(
+        levels[1].extent,
+        Some(PackedExtent::Preserved),
+        "which clip belongs to which request is exactly as the encoder found it"
+    );
+
+    // The same chain on the shorter output: one surviving level, and it
+    // corresponds to the input's *second* level. Nothing here matches by index.
+    let clips = &workflow.components["clip_encoder"].ports.outputs["clip_embeddings"];
+    assert_eq!(clips.batch_layout.levels().len(), 1);
+    assert_eq!(
+        clips.batch_layout.levels()[0].extent,
+        Some(PackedExtent::Preserved)
+    );
+    let consumed = &workflow.components["clip_encoder"].ports.inputs["pixel_values"];
+    assert_eq!(
+        consumed.batch_layout.levels()[1].offsets,
+        clips.batch_layout.levels()[0].offsets,
+        "an output that consumed its inner level carries the survivor at index zero"
     );
 }
 
@@ -1436,7 +1688,7 @@ fn every_nested_level_is_budgeted() {
 /// A serving workflow that hands a packed result back to its caller, together
 /// with the companions that make it splittable.
 const PACKED_EMIT_WORKFLOW: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 pipeline:
   workflow:
     manifest:
@@ -1526,8 +1778,7 @@ pipeline:
             kind: token_packed
             axis: 0
             levels:
-              - { offsets: image_offsets, owner: image_owner }
-            packed_extent: preserved
+              - { offsets: image_offsets, owner: image_owner, extent: preserved }
         role: tensor
         stage: pre_adapter
       image_offsets:
@@ -1561,8 +1812,7 @@ pipeline:
                 kind: token_packed
                 axis: 0
                 levels:
-                  - { offsets: image_offsets, owner: image_owner }
-                packed_extent: preserved
+                  - { offsets: image_offsets, owner: image_owner, extent: preserved }
     steps:
       - kind: invoke
         component: vision
@@ -1655,4 +1905,80 @@ fn an_emit_axis_must_be_an_axis_the_value_has() {
         "        value: image_owner\n        output: image_owner\n        mode: append\n        axis: 3",
     );
     assert_reports(&document, "axis is 3, outside the rank 1 of value it emits");
+}
+
+#[test]
+fn a_length_companion_carries_a_role_that_says_it_is_a_length() {
+    // The reference says *that* a value describes a padded tensor; the content
+    // role says what a caller may do with it. A program that emitted a length
+    // under the role `pixels` would hand its caller a tensor it could only guess
+    // at, so the two statements have to agree.
+    let document =
+        PADDED_VIDEO_ENCODER.replace("        content: valid_lengths", "        content: pixels");
+    assert_reports(
+        &document,
+        "output 'video.pixel_values' names 'video.frame_lengths' as its valid lengths, but that \
+         output carries content role 'pixels'",
+    );
+}
+
+#[test]
+fn the_audio_length_roles_say_the_same_thing_as_the_generic_one() {
+    // Audio named lengths before there was a generic word for them. Those names
+    // stay, and stay usable, wherever a length is what is meant — otherwise the
+    // generic role would quietly deprecate correct programs.
+    for role in LENGTH_CONTENT_ROLES {
+        let document = PADDED_VIDEO_ENCODER.replace(
+            "        content: valid_lengths",
+            &format!("        content: {role}"),
+        );
+        validate_metadata(&parse(&document))
+            .unwrap_or_else(|errors| panic!("'{role}' is a length role: {errors:#?}"));
+    }
+    assert!(LENGTH_CONTENT_ROLES.contains(&"valid_lengths"));
+    assert!(LENGTH_CONTENT_ROLES.contains(&"frame_lengths"));
+    assert!(LENGTH_CONTENT_ROLES.contains(&"sample_lengths"));
+}
+
+#[test]
+fn an_ownership_companion_carries_a_role_that_says_which_half_it_is() {
+    let document = PACKED_PIXEL_PROGRAM.replace(
+        "        content: pack_owner",
+        "        content: validity_mask",
+    );
+    assert_reports(
+        &document,
+        "names 'image.owner' as its ownership owner map, but that output carries content role \
+         'validity_mask'; a companion says what it is by its role, and the roles that say this \
+         are 'pack_owner'",
+    );
+}
+
+#[test]
+fn an_owner_map_is_runtime_internal_and_cannot_be_supplied() {
+    // An owner map indexes into a batch the application never assembled. The
+    // per-request view of a packed value comes from rebasing that request's
+    // offsets to zero, so there is nothing for a caller to hand in.
+    let document = PACKED_VISION_ENCODER.replace(
+        "        source: { kind: application, name: image_owner }",
+        "        source: { kind: application, name: image_owner }\n        externally_suppliable: true",
+    );
+    assert_reports(
+        &document,
+        "workflow input 'image_owner' is externally_suppliable but workflow input 'image_pixels' \
+         names it as an ownership owner map; an owner map indexes into a batch the application \
+         never sees",
+    );
+}
+
+#[test]
+fn offsets_stay_suppliable_because_a_request_can_state_its_own() {
+    // Offsets are per-request meaningful — a caller that says "these four items
+    // are mine" has stated its own offsets, and the runtime rebases them into
+    // the group. Only the owner map is derived.
+    let document = PACKED_VISION_ENCODER.replace(
+        "        source: { kind: application, name: image_offsets }",
+        "        source: { kind: application, name: image_offsets }\n        externally_suppliable: true",
+    );
+    validate_metadata(&parse(&document)).expect("offsets may be supplied");
 }

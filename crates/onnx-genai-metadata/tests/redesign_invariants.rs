@@ -84,7 +84,7 @@ fn workflow_manifest_rejects_facts_owned_by_schema_and_onnx_artifacts() {
 /// result, a native grammar component, and a generation-affecting profile.
 /// Every one of those is a cache correctness dependency.
 const MULTIMODAL_ADAPTER_WORKFLOW: &str = r#"
-schema_version: v1
+schema_version: "1.1"
 adapters:
   target_manifest:
     targets:
