@@ -479,6 +479,19 @@ pub struct SpmdCounters {
     /// concurrent-session signal: the pool serves one dispatcher at a time, so
     /// the surplus degrades to serial rather than racing.
     pub inline_dispatches: u64,
+    /// Dispatches that arrived after [`SpmdDecodePools::shutdown`] had already
+    /// joined the workers, and so ran every shard inline rather than publishing
+    /// an op that nobody was left to acknowledge.
+    ///
+    /// Deliberately **not** folded into `inline_dispatches`: both degrade to
+    /// serial, but one means "another dispatcher held the slot" (expected under
+    /// nested dispatch or concurrent sessions) and the other means "this pool is
+    /// dead and every decode from here on is single-threaded". Counting them
+    /// together would hide a permanent cliff inside a transient one -- the same
+    /// unverified-label failure as reporting a requested width as a realized
+    /// one. Non-zero here is always a lifecycle bug in the embedder, not a
+    /// tuning signal.
+    pub post_shutdown_dispatches: u64,
     /// Times a worker's blocktime window caught the next op before it parked.
     ///
     /// Includes the case where the window expired but the op landed before the
@@ -612,6 +625,7 @@ pub struct SpmdWorkerProfile {
 struct DispatchCounters {
     dispatches: AtomicU64,
     inline_dispatches: AtomicU64,
+    post_shutdown_dispatches: AtomicU64,
     dispatcher_yields: AtomicU64,
 }
 
@@ -1071,6 +1085,7 @@ impl SharedState {
         let mut counters = SpmdCounters {
             dispatches: dispatch.dispatches.load(Ordering::Relaxed),
             inline_dispatches: dispatch.inline_dispatches.load(Ordering::Relaxed),
+            post_shutdown_dispatches: dispatch.post_shutdown_dispatches.load(Ordering::Relaxed),
             dispatcher_yields: dispatch.dispatcher_yields.load(Ordering::Relaxed),
             ..SpmdCounters::default()
         };
@@ -2159,7 +2174,16 @@ impl SpmdDecodePools {
     /// a `&'static` by [`pools`]); the join handles live behind a `Mutex` so this
     /// can consume them without owning the pool. This is a teardown-only call and
     /// must not race a live decode dispatch -- after it returns the workers are
-    /// gone and the pool must not be dispatched to again.
+    /// gone.
+    ///
+    /// A dispatch that arrives afterwards no longer hangs: `dispatch` observes
+    /// the stop flag and runs every shard inline on the calling thread, counting
+    /// it in [`SpmdCounters::post_shutdown_dispatches`]. That is a correctness
+    /// backstop, not a supported mode. This receiver is any `SpmdDecodePools`,
+    /// so nothing here says the pool cannot be replaced -- but the only pool
+    /// production has is the one [`pools`] holds in a `OnceLock`, and *that* one
+    /// cannot be rebuilt, so in a real process decode stays serial for the rest
+    /// of its life. See [`shutdown_pools`].
     pub fn shutdown(&self) {
         if self.shared.is_none() {
             return;
@@ -2361,6 +2385,35 @@ impl SpmdDecodePools {
             self.dispatch_inline(job);
             return;
         };
+        // A pool that has been shut down has no workers left to acknowledge a
+        // published op, and `wait` has neither a timeout nor a shutdown check:
+        // publishing here would leave this thread parked on `completion_sense`
+        // forever, burning no CPU and printing nothing. Run the shards inline
+        // instead -- the same closures in the same global-worker order, only
+        // serial, which is already the established equivalent for a contended
+        // slot.
+        //
+        // Checked *after* the claim, not before, and that ordering is the whole
+        // argument: `begin_shutdown` waits for the claim to be free before it
+        // stores the flag, so a dispatch that got the claim first is one the
+        // teardown waits out rather than races. What this closes is the
+        // sequential case -- a dispatch that starts after `shutdown` has already
+        // returned -- which is deterministic, not a race. The concurrent window
+        // `await_quiescent_dispatch` was built for is unchanged; see its doc.
+        if shared.shutdown.load(Ordering::SeqCst) {
+            // Released before running the shards: holding it would make the pool
+            // look busy to a concurrent teardown for the whole inline run, and
+            // nothing here touches the job slot or the barrier.
+            drop(claim);
+            shared
+                .dispatch_counters
+                .0
+                .post_shutdown_dispatches
+                .fetch_add(1, Ordering::Relaxed);
+            report_dispatch_after_shutdown();
+            self.dispatch_inline(job);
+            return;
+        }
         let job_ptr = Job {
             data: std::ptr::from_ref(job).cast(),
             call: call::<F>,
@@ -3267,6 +3320,15 @@ pub fn pools() -> Option<&'static SpmdDecodePools> {
 ///
 /// This is a teardown-only operation: it takes no locks on the decode hot path
 /// and must not be called between decode ops (it stops the workers).
+///
+/// **One-way.** `POOLS` is a `OnceLock`, so there is no rebuild: a decode op
+/// issued after this returns finds the stopped pool and runs serially on the
+/// calling thread (see [`SpmdDecodePools::shutdown`]). It is safe -- it neither
+/// hangs nor races -- but it is a permanent single-threaded decode for the rest
+/// of the process, reported once at `warn` and counted in
+/// [`SpmdCounters::post_shutdown_dispatches`]. Do not call this from a
+/// per-session or per-factory teardown in a host that may create another
+/// session.
 pub fn shutdown_pools() {
     if let Some(Some(pool)) = POOLS.get() {
         pool.shutdown();
@@ -3931,7 +3993,41 @@ fn report_dispatcher_pin(message: &str) {
     }
 }
 
-/// Log the first persistent-pool fallback/pinning problem once so a restricted/// or unsupported host surfaces the reason without spamming every worker.
+/// Report, once per process, that a dispatch arrived on a pool whose workers are
+/// already gone.
+///
+/// `warn` and ungated, unlike the placement/pin reports: this is not a
+/// host-capability nuance that only a debugging session cares about. It means
+/// every decode from this point on runs serially on the calling thread, which
+/// presents as "the CPU EP got slow" and nothing else -- a permanent
+/// order-of-magnitude cliff with no other symptom. Per #1812, a diagnostic that
+/// only fires under `NXRT_CALIB_DEBUG` is a diagnostic nobody reads, and this
+/// one has to reach whoever is looking at the slowdown.
+///
+/// Its own static, for the same reason the others have theirs: sharing one would
+/// let whichever fired first silence this permanently.
+fn report_dispatch_after_shutdown() {
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    if REPORTED.set(()).is_ok() {
+        #[cfg(feature = "tracing")]
+        tracing_crate::warn!(
+            "cpu decode pool received a dispatch after shutdown joined its workers; every \
+             decode op from here runs serially on the calling thread. This is a lifecycle \
+             bug in the embedder: shutdown_pools() is teardown-only and the pool cannot be \
+             rebuilt in the same process"
+        );
+        #[cfg(not(feature = "tracing"))]
+        eprintln!(
+            "onnx-genai: persistent SPMD decode pool: received a dispatch after shutdown \
+             joined its workers; every decode op from here runs serially on the calling \
+             thread. This is a lifecycle bug in the embedder: shutdown_pools() is \
+             teardown-only and the pool cannot be rebuilt in the same process"
+        );
+    }
+}
+
+/// Log the first persistent-pool fallback/pinning problem once so a restricted
+/// or unsupported host surfaces the reason without spamming every worker.
 /// Emitted as `tracing::debug!` when the `tracing` feature is enabled, or
 /// gated behind `NXRT_CALIB_DEBUG` otherwise.
 fn report_spmd_fallback(message: &str) {
@@ -8000,6 +8096,140 @@ mod tests {
             reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             "row-sharded dispatch must be bit-identical to the serial reference"
         );
+    }
+
+    /// A decode op issued after [`SpmdDecodePools::shutdown`] must not hang.
+    ///
+    /// What this falsifies is silent and permanent rather than loud: `wait` has
+    /// no timeout and no shutdown check, so publishing an op to a worker set
+    /// that has already been joined leaves the dispatcher parked on
+    /// `completion_sense` forever -- at zero CPU, with an empty stack in every
+    /// sampling profiler, and no diagnostic anywhere. It is exactly the shape
+    /// that reads as "the process wedged" and never as "the pool was torn down".
+    ///
+    /// Two structural choices, both load-bearing:
+    ///
+    /// * the dispatch runs on its **own thread** behind a `recv_timeout`,
+    ///   because under the defect a direct call would hang the entire test
+    ///   binary instead of failing it -- the timeout *is* the assertion;
+    /// * the pool is built **inside** that thread, so if it never returns
+    ///   nothing it borrows outlives this frame.
+    ///
+    /// The live dispatch before the shutdown is a positive control: without it a
+    /// pool that never dispatched at all would pass.
+    ///
+    /// Mutation-checked: deleting the `shared.shutdown` check in
+    /// [`SpmdDecodePools::dispatch`] makes this time out, and no other test in
+    /// this module fails. Note precisely what that kill does and does not show
+    /// -- the panic aborts the loop at the *first* width, so the mutation
+    /// demonstrates the hang at width 2 only. Widths 3 and 4 are exercised by
+    /// the passing run, not by the kill. The three are structurally identical
+    /// (`single_group_pool` builds no dispatcher shard, so
+    /// `node_thread_counts == [width]` in every arm), so this is a limit on the
+    /// evidence rather than a suspected difference between them.
+    ///
+    /// The one-shot warning `report_dispatch_after_shutdown` emits is expected
+    /// output of this test and escapes libtest's capture, because it is printed
+    /// from the spawned thread rather than the test's own. A single such line
+    /// per binary run is the fix working, not a leak.
+    #[test]
+    fn a_dispatch_after_shutdown_runs_inline_instead_of_hanging() {
+        for width in [2usize, 3, 4] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let pool = single_group_pool(width);
+                let n = 4096usize;
+                let compute = |output_start: usize, outputs: &mut [f32]| {
+                    for (offset, out) in outputs.iter_mut().enumerate() {
+                        *out = (output_start + offset) as f32 * 0.5 - 1.0;
+                    }
+                };
+                let mut live = vec![0.0f32; n];
+                pool.dispatch_rows_across_workers(&mut live, &compute);
+                let before = pool.counters();
+                pool.shutdown();
+                let mut after = vec![0.0f32; n];
+                pool.dispatch_rows_across_workers(&mut after, &compute);
+                let _ = tx.send((live, after, before, pool.counters()));
+            });
+            let (live, after, before, counters) = rx
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "width {width}: a dispatch issued after shutdown never returned; the \
+                         pool published an op to workers that had already been joined"
+                    )
+                });
+            let mut reference = vec![0.0f32; live.len()];
+            for (row, out) in reference.iter_mut().enumerate() {
+                *out = row as f32 * 0.5 - 1.0;
+            }
+            assert_eq!(
+                live, reference,
+                "width {width}: the live control dispatch did not compute the shards"
+            );
+            assert_eq!(
+                after, reference,
+                "width {width}: the post-shutdown inline dispatch must compute exactly what \
+                 the worker set would have"
+            );
+            assert_eq!(
+                before.dispatches, 1,
+                "width {width}: the control must have gone through the barrier, not inline"
+            );
+            assert_eq!(
+                before.post_shutdown_dispatches, 0,
+                "width {width}: nothing was shut down yet"
+            );
+            assert_eq!(
+                counters.dispatches, 1,
+                "width {width}: the post-shutdown op must not have been published"
+            );
+            assert_eq!(
+                counters.post_shutdown_dispatches, 1,
+                "width {width}: the post-shutdown op must be counted apart from a contended \
+                 inline dispatch"
+            );
+            assert_eq!(
+                counters.inline_dispatches, before.inline_dispatches,
+                "width {width}: a dead pool is not a contended slot and must not be counted \
+                 as one"
+            );
+        }
+    }
+
+    /// `shutdown` is idempotent, and a dispatch after the *second* call behaves
+    /// the same as after the first.
+    ///
+    /// The second `shutdown` returns early on the drained join handles, before
+    /// it ever reaches `begin_shutdown` -- so this checks that the stop flag the
+    /// dispatch reads was left set by the first call rather than re-established
+    /// by the second. A `Drop` impl calling `shutdown` after an explicit
+    /// [`shutdown_pools`] takes exactly this path.
+    #[test]
+    fn a_second_shutdown_leaves_the_dispatch_backstop_in_place() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let pool = single_group_pool(3);
+            let mut warm = vec![0.0f32; 256];
+            let compute = |output_start: usize, outputs: &mut [f32]| {
+                for (offset, out) in outputs.iter_mut().enumerate() {
+                    *out = (output_start + offset) as f32;
+                }
+            };
+            pool.dispatch_rows_across_workers(&mut warm, &compute);
+            pool.shutdown();
+            pool.shutdown();
+            let mut after = vec![0.0f32; 256];
+            pool.dispatch_rows_across_workers(&mut after, &compute);
+            let _ = tx.send((after, pool.counters()));
+        });
+        let (after, counters) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a dispatch after a repeated shutdown never returned");
+        let reference: Vec<f32> = (0..256).map(|row| row as f32).collect();
+        assert_eq!(after, reference);
+        assert_eq!(counters.post_shutdown_dispatches, 1);
     }
 
     #[test]
