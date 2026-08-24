@@ -195,8 +195,8 @@ Video *encoding* has none of that:
   sequence cannot be handed to it at all.
 - **No temporal validity vocabulary on the image side.** The audio vocabulary
   has `valid_frames`, `frame_lengths`, and `validity_mask`
-  (`crates/onnx-genai-metadata/src/schema/mod.rs:349-364`); the image vocabulary
-  has a single spatial `validity_mask` (`mod.rs:293-303`) and nothing temporal.
+  (`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`); the image vocabulary
+  has a single spatial `validity_mask` (`mod.rs:296-309`) and nothing temporal.
 - **No nesting.** `BatchLayout::TokenPacked` gives exactly one `offsets`/`owner`
   pair for the whole value (`crates/onnx-genai-metadata/src/schema/ir.rs:51-58`),
   and nothing composes two levels, so "frames belong to clips belong to rows" has
@@ -215,7 +215,7 @@ and `schema/ir.rs` carries 45 more, including every struct this design would
 extend. An older runtime therefore **rejects the whole document** — with a serde
 error naming an unknown field — rather than ignoring a field it does not know.
 The `schema_version` doc comment claims the opposite ("rely on the
-forward-compatible 'ignore unknown fields' rule", `schema/mod.rs:47-53`), and
+forward-compatible 'ignore unknown fields' rule", `schema/mod.rs:47-52`), and
 nothing validates `schema_version` at all: `crates/onnx-genai-metadata/src/validation.rs`
 never mentions it. So the *mechanism* for shipping a new metadata surface is
 itself missing, and [§6.1](#61-schema-evolution-what-actually-happens-to-an-old-runtime)
@@ -311,7 +311,12 @@ Semantics:
   every listed symbol. A symbol not listed is free to vary, and a free symbol
   **MUST** be reconciled either by padding
   ([§3.2](#32-tensorcontractpadding)) or by packing
-  ([§4](#4-strict-token_packed-validation)).
+  ([§4](#4-strict-token_packed-validation)). What may be listed is bounded:
+  these are **ordinary per-item dimensions**, never the symbol a layout packs and
+  never an ownership level's unit count (rule 2). A frame-count-pinned encoder is
+  therefore one with **no** frames→clips level at all — its frames are an
+  ordinary dimension of the per-clip payload
+  ([§3.4](#34-worked-cases-images-video-audio-text)).
 - **`budgets`** bound the **materialized footprint** of the assembled group,
   keyed by shape symbol. Each entry names one symbol, or an ordered list of
   symbols whose materialized extents multiply, and a `max_total` the group
@@ -344,12 +349,46 @@ symbol, and the two facts that disagree, per Rule 1):
    named only by its `owner` companion's extent. An unknown symbol is a load
    error naming the symbol and the component; it is otherwise a typo that
    silently binds nothing.
-2. **A symbol is pinned or budgeted, never both.** `uniform_dimensions` and
-   `budgets` **MUST NOT** name the same symbol. A pinned dimension has one extent
-   across the group, so its footprint is already bounded by the item budget times
-   that extent; budgeting it too is duplicated state (Rule 10). Entries within
-   each list **MUST** be distinct.
-3. **Every input-side ownership level is budgeted.** For each level declared by
+2. **`uniform_dimensions` names ordinary per-item dimensions only.** A symbol
+   listed there **MUST NOT** be the flattened packed symbol of any participating
+   port's layout, and **MUST NOT** be the unit-count symbol of any declared
+   ownership level. Both are rejected at load, naming the symbol, the port, and
+   the layout that already consumes it. The reason is that pinning is a statement
+   about *an item* — "every item that co-batches here agrees on this extent" —
+   while those two symbols count the **group**: how many packed positions and how
+   many units the scheduler chose to put together. Requiring items to agree on a
+   quantity the scheduler picks is either vacuous or unsatisfiable, and it
+   contradicts the layout, which already says that dimension is ragged. In the
+   video example, `frames` (packed) and `clips` (a level's unit count) are
+   budgeted; `features` is pinned; nothing is both.
+3. **A dimension is padded or pinned, never both, and one value states its
+   extent.** For a given port dimension, the component **MUST NOT** declare both
+   a `padding` entry ([§3.2](#32-tensorcontractpadding)) and membership in
+   `uniform_dimensions`. Pinning says every item agrees, which leaves nothing to
+   pad; padding says they differ, which contradicts the pin. For the same reason
+   at most one `padding` entry per port may name a given dimension: two length
+   companions for one extent are two sources of truth, and the runtime would have
+   to pick (Rule 10). Which *role* the length value declares is not part of this
+   rule — `valid_lengths`, `frame_lengths`, and `sample_lengths` are all
+   acceptable spellings ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)).
+4. **Budgets are group-rooted; a pinned symbol composes but never stands
+   alone.** Every `budgets` entry's `dimensions` list is a **nesting path read
+   outermost-first**, and its first symbol **MUST** be group-rooted — the
+   flattened packed symbol or an ownership level's unit-count symbol. Inner
+   per-item symbols, pinned or padded, appear only in later positions. A
+   singleton entry naming a per-item symbol is therefore rejected: `patches`
+   alone counts patches *per frame*, which is a property of one item and bounds
+   nothing about the invocation the scheduler is assembling
+   ([§3.5](#35-budgets-bind-materialized-footprint)). A pinned symbol **MAY** —
+   and where it contributes to a materialized footprint, **MUST** — appear inside
+   a composed entry such as `{ dimensions: [frames, patches], max_total: 65536 }`.
+   An earlier revision said "pinned or budgeted, never both" and was wrong on
+   both halves: pinned means *equal within a group*, not *fixed across groups*.
+   The symbol is still a `TensorDimension::Symbol` (`decoder_abi.rs:266-273`),
+   one group may pin `patches` at 64 and the next at 1024, and a footprint bound
+   that omitted the pinned symbol would bound nothing at all. Entries within each
+   list **MUST** be distinct, and no two `budgets` entries may name the same path.
+5. **Every input-side ownership level is budgeted.** For each level declared by
    a participating packed **input** port, the symbol that counts that level's
    units — the extent of its `owner` companion — **MUST** carry a budget.
    Otherwise the group is unbounded in exactly the quantity the scheduler is
@@ -357,21 +396,21 @@ symbol, and the two facts that disagree, per Rule 1):
    ([§4](#4-strict-token_packed-validation) rule 5) cannot be a precondition on
    forming the group, and bounding it would be a claim about the artifact's
    output the package cannot check either.
-4. **Every free symbol is symbolic everywhere.** A symbol that is neither pinned
+6. **Every free symbol is symbolic everywhere.** A symbol that is neither pinned
    by `uniform_dimensions` nor fixed by the artifact **MUST** be declared as a
    `TensorDimension::Symbol`, not a literal, in every participating port that has
    that dimension. A fixed literal on a free dimension is a contradiction: the
    package has claimed items may differ there while pinning the shape that would
    have to change.
-5. **Raggedness is expressible.** For every free dimension of every participating
+7. **Raggedness is expressible.** For every free dimension of every participating
    port, the component **MUST** declare either a `padding` entry on that
    dimension or a packed layout that consumes it. Declaring batchability without
    declaring how raggedness is expressed is a promise a runtime cannot honor, so
    it is rejected at load rather than discovered at run.
-6. **Budgets are large enough to serve one item.** Each `max_total` **MUST** be
+8. **Budgets are large enough to serve one item.** Each `max_total` **MUST** be
    at least the largest single item's footprint on that dimension, or the budget
    forbids an invocation the component is otherwise required to serve.
-7. **Row scope is about rows.** If both `row_scope` and `batch_capacity` are
+9. **Row scope is about rows.** If both `row_scope` and `batch_capacity` are
    declared, `row_scope.axis` (`ir.rs:729-737`) **MUST** be the axis of the
    component's **request rows** in its row-scoped ports, and it **MUST NOT** be
    the packed item axis of any port. A packed axis counts items, and items are
@@ -476,19 +515,16 @@ item's embedding.
 preprocessing program can produce offsets or owners today — the
 `ImageOutputContent` vocabulary is `pixels`, `patch_coordinates`,
 `grid_dimensions`, `original_size`, `transformed_size`, `validity_mask`
-(`crates/onnx-genai-metadata/src/schema/mod.rs:293-303`) — so a package that
+(`crates/onnx-genai-metadata/src/schema/mod.rs:296-309`) — so a package that
 declares a packed encoder value must obtain its packing metadata out of band,
 which is the model-family guessing this schema refuses everywhere else.
 
 **One packed axis, an ordered chain of ownership levels.** The proposed shape of
 `TokenPacked` is one `axis`, which **MUST** be `0`, plus `levels`: an ordered
-list of one or two `{ offsets, owner }` pairs, **innermost first**. Level 0 maps
-physically packed positions to their immediate parent unit; the last level maps
-the outermost unit to request rows. There is exactly one packed axis no matter
-how many levels there are. A packed **output** additionally declares
-`packed_extent` — `preserved` when its levels correspond one-to-one with an
-input's, `produced` when the graph decides the extent and the companions are the
-component's own outputs ([§4](#4-strict-token_packed-validation) rule 5).
+list of one or two entries, **innermost first**. Level 0 maps physically packed
+positions to their immediate parent unit; the last level maps the outermost unit
+to request rows. There is exactly one packed axis no matter how many levels there
+are.
 
 ```yaml
 batch_layout:
@@ -498,6 +534,28 @@ batch_layout:
     - { offsets: frame_offsets, owner: frame_owner }   # frames -> clips
     - { offsets: clip_offsets,  owner: clip_owner }    # clips  -> rows
 ```
+
+**On an output, each level carries its own `extent`.** Raggedness is produced
+level by level, so the producer question is answered level by level too:
+
+```yaml
+levels:
+  - { offsets: media_token_offsets, owner: media_token_owner, extent: produced }
+  - { offsets: clip_offsets,        owner: clip_owner,        extent: preserved }
+```
+
+- `extent: preserved` — this level's units correspond one-to-one, in order, with
+  an input level's units, so the input's companions describe the output too and
+  are referenced unchanged.
+- `extent: produced` — the graph decides this level's unit count, so this level's
+  `offsets` and `owner` **MUST** be declared outputs of the same component.
+
+A value-wide `packed_extent` field would be a category error: a token-merging
+encoder *produces* its token→clip level while *preserving* the clip→row level it
+never touched, and one flag for the whole value can state only one of those two
+facts. Input levels carry no `extent` — the runtime built those companions, so
+there is no producer question to answer
+([§4](#4-strict-token_packed-validation) rule 5).
 
 Let `P` be the packed extent (the axis-0 extent), `U` the number of units at the
 outer level (clips), and `R` the number of request rows in the invocation. Then:
@@ -597,10 +655,9 @@ components:
           batch_layout:
             kind: token_packed
             axis: 0
-            levels:
-              - { offsets: frame_offsets, owner: frame_owner }
-              - { offsets: clip_offsets,  owner: clip_owner }
-          packed_extent: preserved                      # see rule 5 in §4
+            levels:                                     # both levels unchanged by the graph
+              - { offsets: frame_offsets, owner: frame_owner, extent: preserved }
+              - { offsets: clip_offsets,  owner: clip_owner,  extent: preserved }
         clip_embeddings:                                # [3, 512] here
           dtype: float32
           rank: 2
@@ -608,9 +665,8 @@ components:
           batch_layout:
             kind: token_packed
             axis: 0
-            levels:
-              - { offsets: clip_offsets, owner: clip_owner }
-          packed_extent: preserved
+            levels:                                     # frames pooled away; clip->row kept
+              - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
         media_tokens:                                   # [T, 512], T decided by the graph
           dtype: float32
           rank: 2
@@ -618,10 +674,9 @@ components:
           batch_layout:
             kind: token_packed
             axis: 0
-            levels:
-              - { offsets: media_token_offsets, owner: media_token_owner }
-              - { offsets: clip_offsets,        owner: clip_owner }
-          packed_extent: produced                       # companions are outputs
+            levels:                                     # inner produced, outer preserved
+              - { offsets: media_token_offsets, owner: media_token_owner, extent: produced }
+              - { offsets: clip_offsets,        owner: clip_owner,        extent: preserved }
         media_token_offsets:                            # [4] = clips + 1
           dtype: int64
           rank: 1
@@ -652,14 +707,19 @@ Row 1's frames are `[ frame_offsets[clip_offsets[1]], frame_offsets[clip_offsets
 one contiguous span of two frames, aliased, not copied. Row 1's clips are
 `[2, 3)` of `clip_embeddings`, likewise contiguous.
 
-The three outputs show the three cases rule 5 of
-[§4](#4-strict-token_packed-validation) distinguishes: `frame_features` preserves
-the input's packed extent, so it reuses the input companions unchanged;
-`clip_embeddings` preserves the *outer* level's extent and therefore reuses only
-that level's pair, dropping the inner level it has consumed; `media_tokens` has
-an extent the graph decides, so its inner level's companions are the component's
-**own outputs** while its outer level, whose clip→row mapping the component did
-not change, reuses the input pair.
+The three outputs show what per-level `extent` buys, and why a value-wide flag
+could not express it:
+
+| Output | Level 0 | Level 1 | Reads as |
+| --- | --- | --- | --- |
+| `frame_features` | frames→clips, `preserved` | clips→rows, `preserved` | One output row per input frame; both input pairs describe it unchanged. |
+| `clip_embeddings` | clips→rows, `preserved` | — | The frame level is consumed by pooling and dropped; the surviving level reuses the clip pair. Note this pair sits at level **1** in `pixel_values` and level **0** here — level index is per port, the pair's meaning is not ([§4](#4-strict-token_packed-validation) rule 6). |
+| `media_tokens` | tokens→clips, **`produced`** | clips→rows, `preserved` | The graph decides how many tokens each clip yields, so that level's companions are the component's **own outputs**; the clip→row mapping it never touched reuses the input pair. |
+
+`media_tokens` is the case that settles the grammar: one flag on the value would
+have to call the whole thing `produced` — losing the fact that the outer mapping
+is still the input's and forcing the package to re-emit a `clip_offsets` it did
+not compute — or `preserved`, which is simply false about its token count.
 
 ```yaml
 preprocessing:
@@ -676,9 +736,33 @@ preprocessing:
 
 Two content roles, not four: `pack_offsets` and `pack_owner` are level-agnostic,
 and which level a value serves is stated by the `levels` list that references it,
-not by its role. A third role, `valid_lengths`, already exists on the audio side
-(`crates/onnx-genai-metadata/src/schema/mod.rs:349-364`) and is generalized rather
-than duplicated.
+not by its role.
+
+**`valid_lengths` is a third, and it is new.** The audio vocabulary today is
+`waveform`, `features`, `audio_features`, `valid_frames`, `valid_samples`,
+`sample_lengths`, `frame_lengths`, `validity_mask`
+(`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`); the image vocabulary is
+`pixels`, `patch_coordinates`, `grid_dimensions`, `original_size`,
+`transformed_size`, `validity_mask` (`mod.rs:296-309`). Neither contains
+`valid_lengths`. An earlier revision of this document claimed the role already
+existed and was merely being generalized. It does not, and the claim is
+withdrawn: `valid_lengths` is a **new generic role**, added once, modality-free,
+meaning *the per-item valid extent of the dimension a `padding` entry names*.
+
+Adding it does not deprecate anything, because the existing names are not
+competitors:
+
+| Existing role | What it says | Relationship to `valid_lengths` |
+| --- | --- | --- |
+| `frame_lengths`, `sample_lengths` | Per-item valid extent, named for the audio dimension it measures | Same *shape* of fact, modality-specific spelling. A `padding` entry **MAY** reference a value declared with either role when its contract matches [§3.2](#32-tensorcontractpadding) — the reference is by **value name**, and the role is descriptive metadata for consumers, not the thing the runtime dispatches on. |
+| `valid_frames`, `valid_samples` | Counts a downstream graph consumes as ordinary inputs | Unrelated to grouping. They may coincide numerically with a length vector; nothing in this design requires it. |
+| `validity_mask` | A materialized boolean/additive mask the graph consumes | The alternative encoding considered and rejected for the contract in [§3.2](#32-tensorcontractpadding). A program may still emit one as an ordinary input; the runtime does not interpret it. |
+
+So a video or audio program with an established spelling keeps it and points its
+`padding` entry at that value; a program in a modality with no established
+spelling — text segments, arbitrary encoders — uses `valid_lengths` and does not
+have to invent one. What is forbidden is two values claiming to state the same
+extent for the same dimension ([§3.1](#31-workflowcomponentbatch_capacity) rule 3).
 
 `pack_owner` values carry a **position, never a request identity**
 ([§8.3](INFERENCE_METADATA_DECISIONS.md#83-no-row-identity)). They are exactly as
@@ -703,12 +787,29 @@ out to be.
 Every row below is the *same* component declaration with levels added or removed
 and symbols renamed. Nothing in the runtime path distinguishes them.
 
-| Encoder | Packed position | Levels (innermost → outermost) | Free dimensions and how they are reconciled | Typical `uniform_dimensions` |
+| Encoder | Packed position | Levels (innermost → outermost) | Free dimensions and how they are reconciled | `uniform_dimensions` |
 | --- | --- | --- | --- | --- |
-| Image | one image | images → rows | patches vary per image → pad `patches` with per-image lengths | `features` |
-| Video | one frame | frames → clips, clips → rows | frame count varies per clip → the frame level; patches vary per frame → pad `patches` with per-frame lengths | `features`, plus `patches` when the encoder is resolution-pinned |
+| Image, resolution-agnostic | one image | images → rows | patches vary per image → pad `patches` with per-image lengths | `features` |
+| Image, resolution-pinned | one image | images → rows | patches identical by construction → pin, no padding | `features`, `patches` |
+| Video, variable frames + agnostic resolution | one frame | frames → clips, clips → rows | frames vary per clip → the frame level; patches vary per frame → pad `patches` with per-frame lengths | `features` |
+| Video, variable frames + pinned resolution | one frame | frames → clips, clips → rows | frames vary per clip → the frame level; patches identical → pin | `features`, `patches` |
+| Video, fixed frames per clip | one **clip** | clips → rows *(no frame level)* | frames are an ordinary per-clip dimension of shape `[clips, frames, patches, features]`, equal across co-batched items → pin | `frames`, `features`, and `patches` when pinned |
 | Audio | one spectrogram frame | frames → windows, windows → rows | frames vary per window → the frame level; bins are fixed | `bins` |
 | Text | one token | tokens → segments, segments → rows | tokens vary per segment → the token level | none |
+
+Two facts the table encodes deliberately. First, **padding and pinning are
+alternatives on the same dimension, never a pair**: `patches` is either padded
+with declared lengths (agnostic) or listed in `uniform_dimensions` (pinned), and
+declaring both on one dimension is rejected
+([§3.1](#31-workflowcomponentbatch_capacity) rule 3). Second, **a fixed frame count is not an ownership level.** An ownership
+level exists to describe a count that *varies per parent*; if every clip has 16
+frames, there is nothing ragged to describe, and the frames→clips level is
+**dropped**, not declared-and-pinned. Frames then live where equal-extent
+dimensions live — as an ordinary dimension of the payload, named in
+`uniform_dimensions`, packed nowhere. Groups form from clips whose frame counts
+agree, which is exactly the pinning predicate. Keeping a degenerate level around
+would mean maintaining an offsets vector that is always an arithmetic sequence
+and a validation path that can never fail interestingly.
 
 **Variable clips, frames, and resolutions.** Three separate questions, answered
 separately:
@@ -719,9 +820,10 @@ separately:
   ([§4](#4-strict-token_packed-validation) rule 9).
 - *Two clips have different frame counts.* Item-nesting raggedness, handled by
   the frames→clips level — no padding at all, since frames are packed. If the
-  artifact genuinely requires a fixed frame count, the package instead pins the
-  frame count per clip through `uniform_dimensions` and only equal-length clips
-  co-batch. A runtime **MUST NOT** reconcile the difference by trimming or
+  artifact instead requires a fixed frame count, the package declares the
+  fixed-frame variant above: **no frames→clips level**, `frames` an ordinary
+  per-clip dimension listed in `uniform_dimensions`, and only clips that agree on
+  it co-batch. A runtime **MUST NOT** reconcile the difference by trimming or
   resampling frames — dropping or interpolating a frame to fit a group changes
   what the caller asked for, and silently, which
   [§6](#6-fail-closed-behavior-compatibility-and-defaults) forbids.
@@ -750,7 +852,7 @@ them is metadata:
 | Quantity | What it counts | Bound by | Owner |
 | --- | --- | --- | --- |
 | **Request rows** | Concurrent requests in a decode batch | decode-side `BatchingCapability` and scheduler config | Engine, unchanged by this design |
-| **Items** | Units at an ownership level — images, clips, windows, segments | a `budgets` entry on that level's symbol | Metadata declares the bound; scheduler picks a size at or below it |
+| **Items** | Units at an ownership level — images, clips, windows, segments | a `budgets` entry on that level's unit-count symbol | Metadata declares the bound; scheduler picks a size at or below it |
 | **Packed positions** | Entries on the physically packed axis — frames, tokens | a `budgets` entry on the packed symbol | Same |
 | **Memory** | Bytes the group will occupy on the device | runtime measurement and allocator state | Runtime only; **never** metadata |
 
@@ -776,10 +878,27 @@ a great deal:
   binds `384`. Budgeting the valid sum would let a group of one long and fifteen
   short items pass a budget it then blows through by an order of magnitude, which
   is the exact failure padding causes and the reason the two are distinguished.
-- **A composed entry multiplies the footprints of its symbols, in order.**
-  `{ dimensions: [frames, patches], max_total: 65536 }` binds
-  `6 × 64 = 384` here. This is how a package bounds an activation-shaped
-  quantity — total padded patch slots — without naming bytes.
+- **An entry is a nesting path, read outermost-first, and its value is the
+  product along that path.** `{ dimensions: [frames, patches] }` is "for each of
+  the group's packed frames, its materialized patch slots" — `6 × 64 = 384`
+  here — which is how a package bounds an activation-shaped quantity without
+  naming bytes. The first symbol is what roots the entry in the group: `frames`
+  is the packed total, `clips` is a level's unit count. A singleton entry is the
+  same rule with a path of length one, which is why `{ dimensions: [patches] }`
+  is not a budget at all — `patches` is per frame, so the path never reaches the
+  group and the number bounds one item's shape rather than the invocation
+  ([§3.1](#31-workflowcomponentbatch_capacity) rule 4).
+- **A pinned symbol belongs in composed entries.** If the encoder were
+  resolution-pinned, `patches` would move from `padding` into
+  `uniform_dimensions`, and the composed entry above would still be required. A
+  pin makes the extent equal *within* one group; it does not make it known. Two
+  groups may pin `1024` and `64`, a `frames`-only budget of 64 admits both, and
+  the first materializes sixteen times the second. This is why
+  [§3.1](#31-workflowcomponentbatch_capacity) rule 4 forbids only the *singleton*
+  budget on a pinned symbol — which would say nothing the item budget does not
+  already say — and not its participation in a composed one. The fixed-frame
+  video variant is the same shape one level up: `frames` is pinned per clip and
+  the footprint entry is `{ dimensions: [clips, frames, patches], ... }`.
 - **`request_expanded` contributes `rows × factor`** on its axis, by the same
   rule: a fixed factor is a padded extent that never varies.
 
@@ -846,30 +965,49 @@ profile and are listed separately for that reason.
    [§2.6](#26-validation-of-packed-values-is-close-to-absent) in favor of the
    fixture and of [§10.1](INFERENCE_METADATA_DECISIONS.md#101-independent-encoder-batching);
    the `ir.rs` doc comment is corrected when the rule lands.
-5. **Output-side raggedness has a declared producer.** A packed **output** may
-   reuse an input's companions at a level only when the mapping at that level is
-   **extent-preserving** — one output unit per input unit, in the same order. The
-   package says which by declaring `packed_extent` on the output's layout:
-   - `preserved` — the level's units correspond one-to-one with the input level's
-     units. The validator checks that the referenced companions belong to an input
-     port of the same component and that the two declare the same extent symbol at
-     that level. A component may *drop* inner levels it has consumed (pooling
-     frames into clips) and keep the outer ones; it may not invent correspondence.
-   - `produced` — the graph decides the extent, so the level's `offsets` and
-     `owner` **MUST** themselves be declared **outputs** of the same component.
-     Reusing an input companion here is rejected at load, naming both values and
-     the level, because the input's offsets describe an extent the output does not
-     have. This is the case for token-merging encoders, variable-length poolers,
-     and any graph whose output length is data-dependent.
-   Mixed chains are normal and are declared per level: `media_tokens` in
-   [§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)
-   produces its inner level and preserves its outer one. An output that declares
-   neither is rejected: the runtime would have to guess whether the input's
-   offsets still describe the result, and guessing wrong splits the payload at
-   the wrong boundaries with no error at all.
-6. **Shared companions agree.** Two packed values naming the same `offsets` at the
-   same level **MUST** declare the same extent symbols; otherwise one of them is
-   packed against a grouping that does not describe it.
+5. **Every output level declares its producer.** Each entry in a packed
+   **output**'s `levels` **MUST** carry `extent: preserved | produced`. The field
+   is per level, not per value, because a single output routinely does both
+   ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)):
+   - `extent: preserved` — this level's units correspond one-to-one, in order,
+     with an input level's units. The validator checks that the referenced
+     `{ offsets, owner }` pair belongs to an **input** port of the same component
+     and that both declarations agree on the pair's extent symbols (rule 6). A
+     component may *drop* inner levels it has consumed — pooling frames into
+     clips — and preserve the outer ones; it may not invent a correspondence.
+   - `extent: produced` — the graph decides this level's unit count, so this
+     level's `offsets` and `owner` **MUST** themselves be declared **outputs** of
+     the same component. Naming an input companion on a `produced` level is
+     rejected at load, naming both values and the level, because the input's
+     offsets describe an extent the output does not have. This is the case for
+     token-merging encoders, variable-length poolers, and any graph whose output
+     length is data-dependent.
+   Validation runs per level, so a mixed chain is checked as a mixed chain:
+   `media_tokens` is accepted with a `produced` inner level whose companions are
+   its own outputs and a `preserved` outer level that reuses `clip_offsets` /
+   `clip_owner`. The same value with one *value-wide* flag could not be validated
+   at all — `produced` would demand a re-emitted `clip_offsets` the component
+   never computes, and `preserved` would assert a token count taken from an input
+   that does not have one. An output level that omits `extent` is rejected: the
+   runtime would have to guess whether the input's offsets still describe the
+   result, and guessing wrong splits the payload at the wrong boundaries with no
+   error at all. Input levels **MUST NOT** declare `extent`; the runtime built
+   those companions, so there is no producer to name.
+6. **Companion pairs are consistent wherever they appear, and identity is the
+   pair, not the level index.** A `{ offsets, owner }` pair *is* a mapping from
+   child units to parent units. Every port that names that pair — at any level
+   index, on any port, input or output — **MUST** agree on both of its extent
+   symbols: `owner`'s extent is the child count, `offsets`'s extent is the parent
+   count plus one. Consistency is keyed on **pair identity**, never on position
+   in a `levels` list, because the same pair legitimately occupies different
+   indices on different ports: in
+   [§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce),
+   `{ clip_offsets, clip_owner }` is level 1 of `pixel_values` and level 0 of
+   `clip_embeddings`, since that output has pooled the frame level away. A rule
+   keyed on level index would reject that correct package and accept a package
+   that reuses one pair for two different mappings, which is the error worth
+   catching: the payload would be split at boundaries that describe something
+   else. A pair **MUST NOT** appear twice in one `levels` list.
 7. **No double spelling on one dimension.** A packed value **MUST NOT** declare a
    `padding` entry on the dimension its layout packs
    ([§3.2](#32-tensorcontractpadding)). A `padding` entry on a *different*
@@ -895,10 +1033,18 @@ profile and are listed separately for that reason.
    are delivered per request, the runtime hands each request its own payload span
    plus **rebased** offsets for that span — level offsets recomputed relative to
    the request's own start, so a single-request consumer sees a well-formed chain
-   beginning at zero — and it **MUST NOT** deliver invocation-global `owner`
-   values, which are positions within a grouping the caller cannot see
-   ([§8.3](INFERENCE_METADATA_DECISIONS.md#83-no-row-identity)). Per-request owner
-   values, where a consumer wants them, are derived from the rebased offsets.
+   beginning at zero.
+   **A declared `owner` output is internal.** It must be declared, because the
+   workflow is otherwise not well-formed and the runtime cannot check the level
+   (rule 9); it is **not delivered**. Its values are positions within a grouping
+   the caller cannot see, and handing them out would leak exactly the cross-request
+   identity [§8.3](INFERENCE_METADATA_DECISIONS.md#83-no-row-identity) forbids —
+   two requests in one group would receive owner vectors whose numbering only
+   makes sense together. Where a consumer wants owners, the runtime **derives**
+   them per request from the rebased offsets, which is a one-line expansion
+   (`owner[i] = j` for `i in [offsets[j], offsets[j+1])`) over data the request is
+   already entitled to see. Declaration is a validation obligation; delivery is a
+   separate decision, and this design makes it once, for every level.
 9. **Invocation-time preconditions.** Load-time rules cannot check values, only
    contracts, so the following are checked per invocation, before the payload is
    consumed, and each failure is an error naming the value, the level, the index,
@@ -929,7 +1075,7 @@ profile and are listed separately for that reason.
      receives its empty span directly.
    **These checks never cause a host transfer.** Companions the runtime itself
    constructed are host-resident by construction, so the arithmetic above is free.
-   Companions a component *produced* (`packed_extent: produced`) may be
+   Companions a component *produced* (a level with `extent: produced`) may be
    device-resident, and the runtime **MUST NOT** copy them to the host merely to
    validate them; for those it checks dtype, rank, and resolved extents — facts
    available without reading data — and performs the value-level arithmetic only
@@ -1011,9 +1157,9 @@ Three rules follow:
   (`alias_with_offset`, `crates/onnx-genai-ort/src/value.rs:1538-1546`), not a
   per-row copy.
 - **Any copy that does happen is attributable.** Where an alias is impossible —
-  and for `packed_extent: produced` companions, which must reach the host to be
+  and for companions on `extent: produced` levels, which must reach the host to be
   read at all — the copy is permitted but **MUST** be counted and reported
-  alongside the throughput numbers ([§9](#9-e2e-acceptance-matrix) row 19). An
+  alongside the throughput numbers ([§9](#9-e2e-acceptance-matrix) row 20). An
   unmeasured host-device transfer inside the grouping path is how a batching
   change ships as a regression while its own benchmark says it helped.
 
@@ -1062,7 +1208,7 @@ through the chain, outermost level inward:
    gather along axis 0.
 
 Two consequences are contractual. **`row_scope.axis` is never the packed item
-axis** ([§3.1](#31-workflowcomponentbatch_capacity) rule 7): a component's
+axis** ([§3.1](#31-workflowcomponentbatch_capacity) rule 9): a component's
 row-scoped state is compacted with the row selection, exactly as it is today,
 while its packed payload is compacted with the lifted permutation, and conflating
 them would index one with the other's positions. And **a repeated source row
@@ -1095,14 +1241,14 @@ the parts it fully supports.
 
 The doc comment on `schema_version` currently says the opposite: that additive
 fields "keep the same major version and rely on the forward-compatible 'ignore
-unknown fields' rule" (`crates/onnx-genai-metadata/src/schema/mod.rs:47-53`).
+unknown fields' rule" (`crates/onnx-genai-metadata/src/schema/mod.rs:47-52`).
 Given `deny_unknown_fields` on the same struct three lines above, that rule does
 not exist in this codebase. The comment is wrong today, independently of this
 design, and correcting it is part of P1.
 
 Nor is the version field a gate today. `SCHEMA_VERSION` is `"v1"`
 (`crates/onnx-genai-metadata/src/lib.rs:8`), `schema_version` is
-`Option<String>` defaulting to v1 (`schema/mod.rs:54-56`), writers stamp it
+`Option<String>` defaulting to v1 (`schema/mod.rs:53-54`), writers stamp it
 (`crates/onnx-genai-genai-config/src/compatibility.rs:243`,
 `crates/onnx-genai-comfyui-config/src/lower.rs:101`) — and **nothing validates
 it**: there is no reference to `schema_version` anywhere in
@@ -1113,26 +1259,71 @@ actionable order in which to discover the problem.
 The migration mechanism this design requires, therefore, is not a compatibility
 claim; it is a mechanism, and it lands in P1 **before** any new field is emitted:
 
-- **A version gate that runs before struct deserialization.** Parse the document
-  generically, read `schema_version`, and reject a document whose version this
-  runtime does not support with one actionable error — the document's version,
-  the highest supported version, and the fact that an upgrade is required — in
-  place of a field-level serde error that names an internal struct field. The
-  precedent is in this repository: `onnx-model-package` parses
-  `<major>.<minor>`, rejects a major it does not know with exactly that shape of
-  message, and only then reads the rest
-  (`crates/onnx-model-package/src/lib.rs:563-579`).
-- **A minor bump for this surface.** `batch_capacity`, `padding`, `levels`, and
-  the ownership content roles are additive to a v1 document, so they raise the
-  **minor** version. A runtime supporting `v1.0` refuses a `v1.1` document with
-  the gate's message rather than a serde message; a runtime supporting `v1.1`
-  reads both. This is a real minimum-runtime requirement, stated once, and it is
-  the reason the gate must precede the parse rather than accompany it.
-- **Conditional emission.** A writer **MUST NOT** stamp `v1.1` or emit any of
-  these fields for a package that does not use grouping. Packages that do not
-  declare `batch_capacity` continue to serialize as v1.0 documents and continue
-  to load on every existing runtime, byte for byte. The new minimum applies to
-  the packages that actually need the new surface, and to no others.
+- **A version grammar, stated exactly, that normalizes what is already in the
+  wild.** The ecosystem does not speak one spelling today. Of the 39 files named
+  `inference_metadata.yaml` in this repository, **14 omit the field entirely**
+  (it is `Option<String>` and defaults to v1, `schema/mod.rs:53-54`), **19 say
+  `v1`** — `SCHEMA_VERSION` is the string `"v1"`
+  (`crates/onnx-genai-metadata/src/lib.rs:8`), and both writers stamp exactly
+  that (`crates/onnx-genai-genai-config/src/compatibility.rs:243`,
+  `crates/onnx-genai-comfyui-config/src/lower.rs:101`) — and **6 say `1.0`**. All
+  three spellings are already in the tree, so the gate begins by normalizing, not
+  by comparing strings:
+
+  ```text
+  version   := [ "v" ] major [ "." minor ]      ; minor defaults to 0
+  major     := digits
+  minor     := digits
+  absent    => v1.0        "v1" => v1.0         "1.0" => v1.0
+  "v1.1"    => v1.1        "1.1" => v1.1        "2.0" => v2.0
+  ```
+
+  Anything that does not match — `"latest"`, `"v1.2.3"`, an empty string, a JSON
+  number — is rejected by the gate as malformed, naming the value read. The three
+  legacy spellings collapse onto the *same* normalized version, so no existing
+  document changes meaning and none needs rewriting.
+- **A gate that runs before struct deserialization.** Parse the document
+  generically, read and normalize `schema_version`, and compare against the
+  runtime's supported version, which is a compile-time constant pair. Reject when
+  `document.major != supported.major`, **and reject when
+  `document.minor > supported.minor`** — with one actionable error carrying the
+  document's version as written, its normalized form, the highest version this
+  runtime supports, and the fact that an upgrade is required. Only then
+  deserialize into the typed structs. This replaces a field-level serde error
+  that names an internal struct field with a statement a package author can act
+  on.
+- **This is deliberately stricter than the in-repo precedent.**
+  `onnx-model-package` parses `<major>.<minor>` and then **ignores the minor
+  entirely**: it rejects `major != 1` and accepts every minor, known or not
+  (`crates/onnx-model-package/src/lib.rs:563-579`). That is the right rule for a
+  container whose unknown parts are inert. It is the wrong rule here, because
+  `deny_unknown_fields` means an unknown minor's fields are not inert — they are
+  a hard parse failure — and because the fields this design adds are not
+  cosmetic: a runtime that skipped `batch_capacity` and ran the component anyway
+  would still be correct, but a runtime that skipped a `padding` entry or a
+  `levels` chain while grouping would produce wrong numbers. Ignoring the minor
+  and then failing on an unknown field is the worst of both: a late, unactionable
+  error. The divergence is intentional and is called out here so that a future
+  reader does not "fix" the inconsistency by copying the looser rule.
+- **A minor bump for this surface, and a canonical emission version.**
+  `batch_capacity`, `padding`, `levels`, `extent`, and the new content roles are
+  additive, so they raise the **minor**: documents that use them are **v1.1**,
+  and `v1.1` is the canonical version string new batching documents emit. A
+  runtime supporting v1.0 refuses a v1.1 document with the gate's message; a
+  runtime supporting v1.1 reads both. That is a real minimum-runtime
+  requirement — stated once, at the top of the document, in the field built for
+  it.
+- **Conditional emission, and no rewriting of what exists.** A writer **MUST**
+  stamp `v1.1` when the document contains any of the new batching fields, and
+  **MUST NOT** stamp it otherwise. Packages that do not declare `batch_capacity`
+  keep their current bytes exactly — an absent `schema_version` stays absent, a
+  `"v1"` stays `"v1"`, a `'1.0'` stays `'1.0'` — and keep loading on every
+  existing runtime. No migration pass rewrites existing packages, since all three
+  spellings already normalize to v1.0 and rewriting them would change the
+  documents' semantic identity
+  ([§4.4](INFERENCE_METADATA_DECISIONS.md#44-semantic-identity)) for no gain.
+  The new minimum applies to the packages that actually need the new surface, and
+  to no others.
 - **No capability identifier, and not for the reason an earlier revision gave.**
   This design adds nothing to `required_capabilities`
   ([§4.3a](INFERENCE_METADATA_DECISIONS.md#43a-capability-admission-and-complete-built-in-catalogue)).
@@ -1164,7 +1355,7 @@ asymmetry matters:
   reconcile a free dimension, and packing is the only sanctioned way to avoid
   padding.
 - A package that *declares* batchability it has not made expressible is rejected
-  at load ([§3.1](#31-workflowcomponentbatch_capacity) rule 5), not at the first
+  at load ([§3.1](#31-workflowcomponentbatch_capacity) rule 7), not at the first
   unlucky group.
 - A runtime **MUST NOT** exceed any `budgets` entry, and **MUST NOT** treat a
   decode-side row bound as an item bound
@@ -1230,8 +1421,8 @@ provider) combination:
 **Fixtures are synthetic, tiny, and checked in.** Every acceptance row runs on a
 generated fixture in `tests/fixtures/onnx_genai_workflows/`, built by a
 `scripts/build_tiny_*.py` generator like every other fixture in the repository
-(there are already ~40, including `build_tiny_vlm.py` and the `video` generation
-workflow). Video grouping needs a new one: a **synthetic video-encoder fixture**
+(26 such generators today, including `build_tiny_vlm.py`, feeding 19 workflow
+fixture directories, one of which is `video`). Video grouping needs a new one: a **synthetic video-encoder fixture**
 with a handful of frames at a small resolution, deterministic outputs so that
 solo-versus-group equality is exact rather than approximate, and enough shape
 variety to cover the matrix — clips of differing frame counts, requests carrying
@@ -1353,10 +1544,12 @@ P2 validation                    │                          │
 - **P0 — design of record (this change).** Docs only. No code, no schema.
 - **P1 — schema surface and the version gate.** The gate lands *first within the
   phase*: read `schema_version` from a generic parse and reject an unsupported
-  version with one actionable message before any struct is deserialized, matching
-  `onnx-model-package`'s precedent
-  (`crates/onnx-model-package/src/lib.rs:563-579`), and correct the false
-  forward-compatibility comment at `schema/mod.rs:47-53`
+  version with one actionable message before any struct is deserialized —
+  normalizing absent / `v1` / `1.0` to v1.0, rejecting on major mismatch **and**
+  on a minor greater than this runtime's, which is deliberately stricter than
+  `onnx-model-package`'s minor-ignoring precedent
+  (`crates/onnx-model-package/src/lib.rs:563-579`) — and correct the false
+  forward-compatibility comment at `schema/mod.rs:47-52`
   ([§6.1](#61-schema-evolution-what-actually-happens-to-an-old-runtime)). Then add
   `WorkflowComponent.batch_capacity`, `TensorContract.padding`,
   `BatchLayout::TokenPacked.levels`, and the `pack_offsets` / `pack_owner` /
@@ -1366,14 +1559,17 @@ P2 validation                    │                          │
   `schema/inference_metadata.schema.json` with `gen_schema`. Positive fixtures
   only; nothing reads the fields yet. Guards: `cargo test -p onnx-genai-metadata`
   including the committed-schema comparison, plus a test that a `v1.1` document
-  is refused by the gate's message and that every existing fixture still
-  serializes as `v1.0`.
+  is refused by a `v1.0` runtime with the gate's message, that all three legacy
+  spellings normalize to the same version, and that every existing fixture's
+  bytes and version string are unchanged by a round trip.
 - **P2 — validation.** Implement [§3.1](#31-workflowcomponentbatch_capacity)
-  rules 1–7 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
+  rules 1–9 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
   negative fixture asserting the exact message — including a three-level packing
-  declaration, an inner packed axis, a `produced` output that reuses an input
-  companion, and a `shared` rank-1 emit that is *not* a referenced companion and
-  therefore stays rejected. Depends on P1.
+  declaration, an inner packed axis, an output level that omits `extent`, an
+  `extent: produced` level that reuses an input companion, `uniform_dimensions`
+  naming a packed or unit-count symbol, a singleton budget on a pinned symbol,
+  and a `shared` rank-1 emit that is *not* a referenced companion and therefore
+  stays rejected. Depends on P1.
 - **P3 — preprocessor.** Two independent pieces, in this order.
   **P3a (one level):** let the image adapter accept N encoded items and emit one
   level's `pack_offsets` / `pack_owner` plus per-item `valid_lengths`; unit tests
@@ -1389,7 +1585,8 @@ P2 validation                    │                          │
   `scripts/build_tiny_*.py` script and checked in under
   `tests/fixtures/onnx_genai_workflows/`, with tiny frames, deterministic
   outputs, variable frame counts, variable clip counts, both a resolution-pinned
-  and a resolution-agnostic variant, and one `packed_extent: produced` output
+  and a resolution-agnostic variant, and one output with an `extent: produced`
+  level
   ([§6.2](#62-an-unproven-backend-is-a-backend-that-does-not-group)). It gates
   P4's video tests and every video row of the matrix. It does **not** replace
   `crates/onnx-runtime-session/tests/batch_vision_crash.rs`, whose real
@@ -1449,7 +1646,7 @@ and are run against both an image encoder and a video encoder; rows 10–15 pin 
 modality-specific geometry that motivated the design; rows 16–26 cover the
 structural bounds, the memory path, compatibility, and backend readiness. Every
 row runs on checked-in fixtures — the synthetic ones from P3c for grouping
-behavior, plus the retained real-CNN guard for row 20's operator classes — with
+behavior, plus the retained real-CNN guard for row 21's operator classes — with
 no downloaded weights, no sample media, and no network in the test path.
 
 | # | Scenario | What it must prove | Gate |
@@ -1464,25 +1661,26 @@ no downloaded weights, no sample media, and no network in the test path.
 | 8 | **Concurrency and compaction.** Arrival, cancellation, and `compact(selection)` while a group is in flight, including a selection that repeats a source row and one that drops rows. | The selection is lifted through the ownership chain into an item permutation; companions are recomputed, never gathered; a repeated row duplicates its items; a cancelled request's items never reach another row. | P6 |
 | 9 | **Incompatible group refused.** Items disagreeing on a `uniform_dimensions` extent — for a resolution-pinned encoder, two different resolutions — offered to the same group. | The scheduler forms two groups (or executes solo) and never reconciles by resizing; results equal solo. | P6 |
 | 10 | **Variable frames per clip.** Clips of differing frame counts, flattened onto one packed axis with a frames→clips level. | Each clip's output equals its solo output; no frame is trimmed or resampled to fit; no temporal padding is materialized at all. | P4 |
-| 11 | **Variable clips per request.** Requests carrying 0, 1, and several clips, clips themselves carrying differing frame counts. | Both levels round-trip over one flattened axis: composing `frame_offsets` through `clip_offsets` yields each row's contiguous frame span; per-row equality against solo. | P4 |
-| 12 | **Mixed spatial and temporal raggedness.** One group where items differ in frame count *and* in per-frame patch count. | The frame level and the per-frame `valid_lengths` compose; the one-truth-per-dimension rule holds; each row equals solo. | P4 |
-| 13 | **Nested ownership corruption.** The inner level's `offsets` and `owner` corrupted in turn: an owner outside its clip, a non-monotonic inner offset, an inner total disagreeing with the outer level's unit count. | Each case is a loud error naming value, level, index, and the two disagreeing facts — never a clamp or a partial split. | P4 |
-| 14 | **Mixed-modality serving.** Image items and video clips in flight for the same engine. | Grouping is per component, not per request; an image group and a video group are formed by the same code with no modality branch; per-row equality against solo. | P6 |
-| 15 | **A third modality reuses the path.** An audio (or text-segment) encoder declaring `batch_capacity` plus windows-in-rows ownership. | It batches with no new interpreter or scheduler code — the acceptance is that the diff is a fixture and a vocabulary, not a branch. | P6 |
-| 16 | **Structural bounds at load.** A three-level `levels` chain; a packed value on an inner axis; a `batch_capacity` naming an unknown symbol; a symbol both pinned and budgeted; a free dimension with neither padding nor packing. | Each rejected at load with its own message naming the component, the value, and the symbol or level at fault; the valid two-level, axis-0 path is unaffected. | P2 |
-| 17 | **Right-padding enforced.** A `valid_lengths` entry exceeding the padded extent, and a producer that left-pads. | Both rejected before the invocation, naming the item, the dimension, and the offending value; length arithmetic is done on host-resident companions with no device read. | P4 |
-| 18 | **Budgets bind materialized footprint.** Groups that hit the item budget with few frames; groups that hit the packed budget with few items (one long clip); and a group whose *valid* padded extents would fit but whose materialized rectangle does not. | Each bound is enforced separately, none inferred from another; the padded dimension is charged `count × padded_extent`, not the sum of valid lengths; a composed entry multiplies its symbols; a decode-side row bound is never used as an item bound. | P6 |
-| 19 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
-| 20 | **Unproven backend declines, per triple, and says so.** Native reports grouped execution unsupported for the CNN encoder while ORT groups the same workload; a second component with a different operator class is evaluated independently. | Outputs are identical between the two paths; native never receives a group for an unproven triple; one triple passing never flips another; the decline is counted and attributable, not silent; no attempted grouped invocation on the unproven path. The real-model guard in `batch_vision_crash.rs` runs and fails the job if its model is missing. | P5 |
-| 21 | **Version gate, not a serde error.** A `v1.1` document offered to a runtime that supports only `v1.0`, and a `v1.0` document offered to a `v1.1` runtime. | The first is refused before struct deserialization with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error. The second loads and executes unchanged. | P1 |
-| 22 | **Conditional emission.** Every existing fixture round-tripped through the writer. | No `batch_capacity`, `padding`, or `levels` field is emitted, the document still declares `v1.0`, and the bytes are unchanged, so no existing runtime's minimum moves. | P1 |
-| 23 | **Output companions have a declared producer.** A `packed_extent: produced` output whose companions are component outputs; a token-merging graph whose output length differs from its input's; and a negative case declaring `preserved` while reusing an input companion of a different extent. | The first two split at the graph's own boundaries; the third is rejected at load naming both values and the level; no path ever splits a produced output with input offsets. | P2, P4 |
-| 24 | **Serving admits companions, and only companions.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; and one emitting an unrelated `shared` rank-1 value. | The first validates and each request receives its own span with rebased, zero-based offsets and no invocation-global owner values; the second is still rejected with the existing message. | P2, P6 |
-| 25 | **Companion validation causes no hidden transfer.** A group whose companions the runtime built, and a group whose companions a component produced on device. | Runtime-built companions are validated on the host at no transfer cost; produced companions are checked for dtype, rank, and extent without a device read, and the single companion-only transfer needed to split is counted and attributed — the payload never moves. | P4, P7 |
-| 26 | **`request_expanded` participates.** A component with a `request_expanded` port at factor > 1 grouped alongside packed ports. | Ownership is arithmetic — entry `i` belongs to row `i / factor` — no companions are declared or required, footprint is charged as `rows × factor`, and a declaration that is both request-expanded and packed on one axis is rejected at load. | P2, P4 |
-| 27 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed and the padding overhead paid (padded elements as a fraction of real ones). Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |
+| 11 | **Fixed-frame video has no frame level.** A fixed-frame encoder declaring clips→rows only, with `frames` an ordinary per-clip dimension in `uniform_dimensions`, next to the variable-frame encoder of row 10 in the same engine. | Clips whose frame counts agree co-batch; one whose count differs forms its own group; the package declares no frames→clips companions at all and a package that declares a frames→clips level *and* pins `frames` is rejected by [§3.1](#31-workflowcomponentbatch_capacity) rule 2; per-row equality against solo for both encoders. | P4, P6 |
+| 12 | **Variable clips per request.** Requests carrying 0, 1, and several clips, clips themselves carrying differing frame counts. | Both levels round-trip over one flattened axis: composing `frame_offsets` through `clip_offsets` yields each row's contiguous frame span; per-row equality against solo. | P4 |
+| 13 | **Mixed spatial and temporal raggedness.** One group where items differ in frame count *and* in per-frame patch count. | The frame level and the per-frame `valid_lengths` compose; the one-truth-per-dimension rule holds; each row equals solo. | P4 |
+| 14 | **Nested ownership corruption.** The inner level's `offsets` and `owner` corrupted in turn: an owner outside its clip, a non-monotonic inner offset, an inner total disagreeing with the outer level's unit count. | Each case is a loud error naming value, level, index, and the two disagreeing facts — never a clamp or a partial split. | P4 |
+| 15 | **Mixed-modality serving.** Image items and video clips in flight for the same engine. | Grouping is per component, not per request; an image group and a video group are formed by the same code with no modality branch; per-row equality against solo. | P6 |
+| 16 | **A third modality reuses the path.** An audio (or text-segment) encoder declaring `batch_capacity` plus windows-in-rows ownership. | It batches with no new interpreter or scheduler code — the acceptance is that the diff is a fixture and a vocabulary, not a branch. | P6 |
+| 17 | **Structural bounds at load.** A three-level `levels` chain; a packed value on an inner axis; a `batch_capacity` naming an unknown symbol; `uniform_dimensions` naming a packed symbol or a level's unit-count symbol; a singleton budget whose only symbol is per-item rather than group-rooted; a dimension both padded and pinned; a free dimension with neither padding nor packing. | Each rejected at load with its own message naming the component, the value, and the symbol or level at fault; the valid two-level, axis-0 path is unaffected. | P2 |
+| 18 | **Right-padding enforced.** A `valid_lengths` entry exceeding the padded extent, and a producer that left-pads. | Both rejected before the invocation, naming the item, the dimension, and the offending value; length arithmetic is done on host-resident companions with no device read. | P4 |
+| 19 | **Budgets bind materialized footprint.** Groups that hit the item budget with few frames; groups that hit the packed budget with few items (one long clip); a group whose *valid* padded extents would fit but whose materialized rectangle does not; and two groups of a resolution-**pinned** encoder that pin different `patches` values, only one of which fits the composed entry. | Each bound is enforced separately, none inferred from another; the padded dimension is charged `count × padded_extent`, not the sum of valid lengths; a composed path multiplies outermost-first, including pinned symbols — the larger-resolution group is refused while the smaller is admitted, which a budget on the item symbol could not have distinguished; a decode-side row bound is never used as an item bound. | P6 |
+| 20 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
+| 21 | **Unproven backend declines, per triple, and says so.** Native reports grouped execution unsupported for the CNN encoder while ORT groups the same workload; a second component with a different operator class is evaluated independently. | Outputs are identical between the two paths; native never receives a group for an unproven triple; one triple passing never flips another; the decline is counted and attributable, not silent; no attempted grouped invocation on the unproven path. The real-model guard in `batch_vision_crash.rs` runs and fails the job if its model is missing. | P5 |
+| 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged. | P1 |
+| 23 | **Conditional emission, and no rewriting of what exists.** Every existing in-tree document round-tripped through the writer, and a new document that declares `batch_capacity`. | For the existing documents the **bytes and the version strings are unchanged** — `v1` stays `v1`, `1.0` stays `1.0`, absent stays absent, and no field of this design is emitted — so no existing runtime's minimum moves and no semantic identity changes. The new document **MUST** stamp `v1.1`. | P1 |
+| 24 | **Every output level declares its producer.** A mixed-chain output (inner level `extent: produced` with component-output companions, outer level `extent: preserved` reusing the input's clip pair) exercised end to end; a token-merging graph whose output length differs from its input's; and three negative cases — a level omitting `extent`, a `produced` level naming an input companion, and a `preserved` level naming a companion of a different extent. | The mixed chain validates per level and splits at the graph's own inner boundaries while reusing the outer mapping; the negatives are rejected at load naming the value, the level, and both facts; no path ever splits a produced level with input offsets. | P2, P4 |
+| 25 | **Serving admits companions, and only companions.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; and one emitting an unrelated `shared` rank-1 value. | The first validates and each request receives its own span with rebased, zero-based offsets and no invocation-global owner values; the second is still rejected with the existing message. | P2, P6 |
+| 26 | **Companion validation causes no hidden transfer.** A group whose companions the runtime built, and a group whose companions a component produced on device. | Runtime-built companions are validated on the host at no transfer cost; produced companions are checked for dtype, rank, and extent without a device read, and the single companion-only transfer needed to split is counted and attributed — the payload never moves. | P4, P7 |
+| 27 | **`request_expanded` participates.** A component with a `request_expanded` port at factor > 1 grouped alongside packed ports. | Ownership is arithmetic — entry `i` belongs to row `i / factor` — no companions are declared or required, footprint is charged as `rows × factor`, and a declaration that is both request-expanded and packed on one axis is rejected at load. | P2, P4 |
+| 28 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed and the padding overhead paid (padded elements as a fraction of real ones). Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |
 
-Row 27 follows the measurement protocol already used for batched decode
+Row 28 follows the measurement protocol already used for batched decode
 ([`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md` §6](NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md)):
 report the mechanism-level counters and the achieved group sizes, never a bare
 wall-clock headline, and verify the device is idle before each run. Video is
@@ -1498,7 +1696,7 @@ answer.
 
 1. **Group-size choice.** The scheduler needs a policy for trading first-item
    latency against group occupancy. That is runtime policy and stays out of
-   metadata, but P6 should expose the chosen size so row 27 can attribute a
+   metadata, but P6 should expose the chosen size so row 28 can attribute a
    result. Video sharpens it: one long clip can exceed the useful work of a whole
    image group, which is why `budgets` bound packed positions as well as items
    ([§3.5](#35-budgets-bind-materialized-footprint)) —
@@ -1513,10 +1711,14 @@ answer.
 3. **Which modalities need packing versus padding.**
    [§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)
    makes the ownership roles available to any vocabulary. Whether a given
-   modality's first package needs packing, or whether padding plus a
-   `valid_lengths` companion suffices — plausible for fixed-window speech
-   encoders and fixed-frame video encoders, implausible for native-resolution
-   image encoders — is decided per package, from its geometry, not decided here.
+   modality's first package needs a *nested* level, or whether a single
+   items→rows level plus pinning or padding suffices — the latter is what a
+   fixed-window speech encoder and a fixed-frame video encoder get
+   ([§3.4](#34-worked-cases-images-video-audio-text)), while a native-resolution
+   image encoder with per-item geometry does not — is decided per package, from
+   its geometry, not decided here. Note the items→rows level itself is never
+   optional for a grouped component: requests always own a varying number of
+   items.
 4. **The depth cap, and what a third level would take.** `levels` is an ordered
    list, so a third level is a data change rather than a new field name, but it is
    capped at two ([§4 rule 3](#4-strict-token_packed-validation)) because the

@@ -667,7 +667,7 @@ invocation, and today nothing else does either:
   preprocessor underneath accepts many;
 - no declared preprocessing program can produce the `offsets`/`owner` pair that
   `token_packed` names, because the content-role vocabulary has no entry for
-  either (`crates/onnx-genai-metadata/src/schema/mod.rs:293-303`);
+  either (`crates/onnx-genai-metadata/src/schema/mod.rs:296-309`);
 - validation checks nothing about `offsets`/`owner` beyond the serving-emit rule
   in `validation.rs`, which accepts `request_aligned` or `token_packed` without
   distinguishing them;
@@ -691,7 +691,7 @@ structs are closed — `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
 45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
 `WorkflowComponent` — so an older runtime meeting a new field **rejects the whole
 document** rather than ignoring it, contrary to the "ignore unknown fields" claim
-in the `schema_version` doc comment (`schema/mod.rs:47-53`). And nothing
+in the `schema_version` doc comment (`schema/mod.rs:47-52`). And nothing
 validates `schema_version`: `crates/onnx-genai-metadata/src/validation.rs` never
 mentions it, so a document declaring a future version is accepted and then
 rejected field by field, which is the least actionable order in which to learn
@@ -767,11 +767,29 @@ declared on its own dimension and they never compete for one.
   runtime measurement, never metadata ([§1.2](#12-non-goals)).
 - **`uniform_dimensions`** are the symbols two items must agree on before they
   may share an invocation — spatial and temporal alike — which makes batch
-  compatibility a derived predicate rather than a policy. Every free dimension
+  compatibility a derived predicate rather than a policy. They name **ordinary
+  per-item dimensions only**: a symbol listed there **MUST NOT** be a port's
+  flattened packed symbol and **MUST NOT** be an ownership level's unit-count
+  symbol, since both count the *group* the scheduler assembled rather than a
+  property of an item. A fixed frame count is therefore not a pinned level but
+  the absence of one — the frames→clips level is dropped and `frames` becomes an
+  ordinary per-clip dimension that items must agree on. Every free dimension
   **MUST** be reconciled either by a `padding` entry or by the packed axis; a
   component that declares batchability without declaring how raggedness is
-  expressed is rejected at load. A symbol **MUST NOT** be both pinned and
-  budgeted.
+  expressed is rejected at load. A dimension **MUST NOT** be both padded and
+  pinned.
+- **Pinned is not the same as known, and budgets are group-rooted.** A
+  `budgets` entry is a nesting path read outermost-first whose first symbol
+  **MUST** be group-rooted — the flattened packed symbol or a level's unit-count
+  symbol — so a *singleton* entry naming a per-item symbol such as `patches` is
+  rejected: it bounds one item's shape, not the invocation. A pinned symbol
+  **MAY**, and where it contributes to a materialized footprint **MUST**, appear
+  in a *composed* entry such as
+  `{ dimensions: [frames, patches], max_total: 65536 }`. Pinning means equal
+  *within* a group, not fixed *across* groups: one group may pin `patches` at 64
+  and the next at 1024, and a footprint bound that omitted the pinned symbol
+  would bound nothing. An earlier revision's "pinned or budgeted, never both" is
+  withdrawn.
 - **`padding`** is a list of entries, each linking a padded dimension to an
   `int64` `valid_lengths` companion giving how much of each item is real, so a
   runtime never fabricates padding it cannot describe. The companion is `shared`
@@ -795,8 +813,15 @@ declared on its own dimension and they never compete for one.
   is no second physical packed axis: frames are flattened across clips and across
   requests, and the frame→clip and clip→row maps are bookkeeping over that one
   axis. Two content roles, `pack_offsets` and `pack_owner`, join the preprocessing
-  vocabularies so a declared program can produce them at any level; a third,
-  `valid_lengths`, generalizes the existing audio role. Owner values carry a
+  vocabularies so a declared program can produce them at any level. A third role,
+  `valid_lengths`, is **new**: no such role exists today — the audio vocabulary
+  offers `valid_frames`, `valid_samples`, `sample_lengths`, `frame_lengths`, and
+  `validity_mask` (`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`) — and
+  an earlier revision's claim that it generalized an existing role is withdrawn.
+  It coexists with those names rather than replacing them: a `padding` entry
+  references a value **by name**, so an audio program may point at a
+  `frame_lengths` value it already emits, while a modality with no established
+  spelling uses the generic role instead of inventing one. Owner values carry a
   **position**, never a request identity ([§8.3](#83-no-row-identity)). Depth
   stops at two levels, so a third is a deliberate schema change rather than
   something a package asserts into existence.
@@ -842,16 +867,31 @@ is a metadata field — residency and execution capability are runtime-owned
 and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
 document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
 ignore them, and the forward-compatibility claim in the `schema_version` doc
-comment (`schema/mod.rs:47-53`) does not describe this codebase. Nothing
+comment (`schema/mod.rs:47-52`) does not describe this codebase. Nothing
 validates `schema_version` today either
 ([§10.4](#104-what-101-does-not-yet-have)). The mechanism this surface requires is
-therefore: a gate that reads `schema_version` from a generic parse and rejects an
+therefore a gate that reads `schema_version` from a generic parse and rejects an
 unsupported version with one actionable message **before** struct
-deserialization, on the precedent of
-`crates/onnx-model-package/src/lib.rs:563-579`; a **minor** bump for this
-additive surface; and conditional emission, so a package that does not declare
-`batch_capacity` still serializes as a v1.0 document and its minimum runtime does
-not move.
+deserialization, with an exactly stated grammar:
+
+- **Normalization.** `[v]major[.minor]`, minor defaulting to 0. All three
+  spellings already in the tree — absent (14 of the 39 `inference_metadata.yaml`
+  files), `v1` (19), and `1.0` (6) — normalize to **v1.0**, so no existing
+  document changes meaning or bytes. Anything unparseable is rejected as
+  malformed.
+- **Direction.** Reject when the document's major differs from the runtime's,
+  **and** when the document's minor exceeds the runtime's supported minor.
+- **Deliberately stricter than the in-repo precedent.**
+  `onnx-model-package` parses `<major>.<minor>` and then ignores the minor
+  entirely, gating only on major (`crates/onnx-model-package/src/lib.rs:563-579`).
+  That is right for a container whose unknown parts are inert; it is wrong here,
+  because `deny_unknown_fields` makes unknown fields a hard parse failure and
+  because a runtime that silently skipped a `padding` entry while grouping would
+  produce wrong numbers.
+- **Canonical emission.** This additive surface is **v1.1**. A writer **MUST**
+  stamp `v1.1` when the document carries any of these fields and **MUST NOT**
+  otherwise, so packages that do not declare `batch_capacity` keep their current
+  bytes and version strings exactly and their minimum runtime does not move.
 
 Grouping still introduces **no new capability identifier** — but not because an
 old runtime would otherwise refuse a package it can execute, which
@@ -873,26 +913,32 @@ level's `offsets` and `owner` **MUST** resolve to declared values; each is
 `shared`, `int64`, rank 1, with level `k`'s `owner` carrying that level's unit
 count and its `offsets` carrying the parent count plus one; `axis` **MUST** be
 `0` for a component that declares `batch_capacity`; `levels` holds one or two
-entries, innermost first; two packed values sharing one `offsets` agree on their
-extent symbols; a packed value declares no `padding` entry **on the dimension it
-packs**, and no port is both `request_expanded` and packed on one axis.
+entries, innermost first; every port naming a given `{ offsets, owner }` pair
+agrees on that pair's extent symbols — consistency is keyed on **pair identity,
+not on level index**, because a pair legitimately sits at level 1 of an input and
+level 0 of an output that pooled the inner level away; a packed value declares no
+`padding` entry **on the dimension it packs**, and no port is both
+`request_expanded` and packed on one axis.
 
 **Packing depth is capped at two levels.** Parts in items and items in rows
 covers every known workload — frame → clip → request, frame → window → request,
 token → segment → request — and each further level multiplies the validation
 surface, the split implementation, and the corruption cases that must be tested.
 
-**A packed output declares who produces its raggedness.** An output may reuse an
-input's companions at a level only when that level's mapping is
-**extent-preserving** (`packed_extent: preserved`) — one output unit per input
-unit, in order — which the validator checks by comparing the referenced
-companions' extent symbols against the input port's. Where the graph decides the
-extent (`packed_extent: produced`), that level's `offsets` and `owner` **MUST**
-be declared outputs of the same component, and reusing an input companion is
-rejected. Chains may mix: a token-merging encoder produces its inner level and
-preserves the clip→row level it did not change. An output declaring neither is
-rejected, because the runtime would otherwise guess whether the input's offsets
-still describe the result and split at the wrong boundaries in silence.
+**Every output level declares who produces its raggedness.** The declaration is
+per **level**, not per value: each entry of a packed output's `levels` carries
+`extent: preserved | produced`. `preserved` means this level's units correspond
+one-to-one and in order with an input level's, which the validator checks by
+comparing the referenced pair's extent symbols against the input port's;
+`produced` means the graph decides the count, so that level's `offsets` and
+`owner` **MUST** be declared outputs of the same component and naming an input
+companion there is rejected. Input levels carry no `extent`. A value-wide flag
+was considered and rejected as a category error: a token-merging encoder
+*produces* its token→clip level while *preserving* the clip→row level it never
+touched, and one flag can state only one of those. An output level omitting
+`extent` is rejected, because the runtime would otherwise guess whether the
+input's offsets still describe the result and split at the wrong boundaries in
+silence.
 
 **Serving admits companions, and only companions.** A serving workflow rejects an
 emitted value of rank > 0 that declares `shared`
@@ -903,8 +949,11 @@ is admitted **iff** it is `int64`, rank 1, and named as an `offsets` or `owner`
 of another emitted value's layout in the same workflow; anything else keeps the
 existing rejection. A companion is never compacted and never split like a
 payload — each request receives its own span plus **rebased**, zero-based offsets
-for that span, and never invocation-global `owner` values, which are positions
-within a grouping the caller cannot see ([§8.3](#83-no-row-identity)).
+for that span. A declared `owner` output is **internal**: it must be declared so
+the workflow validates and the runtime can check the level, and it is never
+delivered, because its values are positions within a grouping the caller cannot
+see ([§8.3](#83-no-row-identity)). Per-request owners, where a consumer wants
+them, are **derived** by the runtime from the rebased offsets.
 
 `offsets` is `shared` rather than `request_aligned` for a structural reason: an
 exclusive prefix sum is not permutation-followable. Permuting rows does not
@@ -926,6 +975,7 @@ the runtime built are host-resident already, and companions a component produced
 are checked for dtype, rank, and resolved extent without reading data, with
 value-level arithmetic done on the companion-only transfer the split already
 requires.
+
 ---
 
 ## 11. Cache correctness dependencies
@@ -1607,7 +1657,12 @@ so the `offsets`/`owner` pair that `token_packed` names
 state how an item nests — the frames of a video clip, the windows of an
 utterance — or how much of a padded item is real. Two level-agnostic proposed
 roles, `pack_offsets` and `pack_owner`, close the first two gaps at any nesting
-level, and generalizing the existing audio `valid_lengths` role closes the third
+level, and a third proposed role, `valid_lengths`, closes the third. That role is
+**new**, not a generalization of an existing one: the audio vocabulary offers
+`valid_frames`, `valid_samples`, `sample_lengths`, and `frame_lengths`
+(`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`) but no `valid_lengths`,
+and since a padding contract references its length value by name, those
+modality-specific spellings keep working alongside the generic one
 — see [§10.5](#105-generic-component-batching--proposed) and
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
