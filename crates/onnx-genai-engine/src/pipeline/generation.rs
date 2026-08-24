@@ -925,7 +925,7 @@ fn loop_carried_cell_names(
 
 #[cfg(test)]
 pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(TestWorkflowShape::Stateless)
+    test_decoder_runtime_inner(TestSessionShape::Stateless)
 }
 
 /// The same canonical decoder, declaring the conversation it carries.
@@ -945,7 +945,7 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
 /// unrelated fixtures.
 #[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(TestWorkflowShape::LoopCarriedSession)
+    test_decoder_runtime_inner(TestSessionShape::LoopCarriedSession)
 }
 
 /// A package whose session carries the conversation as a **prompt prefix**.
@@ -967,13 +967,13 @@ pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> 
 /// binding carries has no reader inside the workflow.
 #[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_conversation_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(TestWorkflowShape::PromptPrefixConversation)
+    test_decoder_runtime_inner(TestSessionShape::PromptPrefixConversation)
 }
 
 /// Which of the three declarable session shapes a test fixture should build.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TestWorkflowShape {
+pub(crate) enum TestSessionShape {
     /// All state invocation-scoped: every turn restarts.
     Stateless,
     /// The cells the loop threads are session-scoped, so turns continue.
@@ -984,7 +984,7 @@ pub(crate) enum TestWorkflowShape {
 }
 
 #[cfg(test)]
-fn test_decoder_runtime_inner(shape: TestWorkflowShape) -> anyhow::Result<WorkflowRuntime> {
+fn test_decoder_runtime_inner(shape: TestSessionShape) -> anyhow::Result<WorkflowRuntime> {
     let abi = onnx_genai_metadata::DecoderAbi {
         token_input: Some("input_ids".to_string()),
         logits_output: Some("logits".to_string()),
@@ -1000,7 +1000,7 @@ fn test_decoder_runtime_inner(shape: TestWorkflowShape) -> anyhow::Result<Workfl
     .map_err(|error| {
         anyhow::anyhow!("a minimal decoder is expressible as a workflow: {error:?}")
     })?;
-    if shape == TestWorkflowShape::PromptPrefixConversation {
+    if shape == TestSessionShape::PromptPrefixConversation {
         // Every constraint below is one the validator enforces on a
         // continuation, asserted here by construction rather than discovered as
         // a validation failure with no explanation attached. `conversation` is
@@ -1081,7 +1081,7 @@ fn test_decoder_runtime_inner(shape: TestWorkflowShape) -> anyhow::Result<Workfl
              fixture pins a carry the scheduler never charges for"
         );
     }
-    if shape == TestWorkflowShape::LoopCarriedSession {
+    if shape == TestSessionShape::LoopCarriedSession {
         let carried = loop_carried_cell_names(&workflow.steps);
         anyhow::ensure!(
             !carried.is_empty(),
