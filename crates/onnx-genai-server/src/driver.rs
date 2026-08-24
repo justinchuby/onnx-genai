@@ -1917,6 +1917,110 @@ mod admission_tests {
         assert_eq!(driver.resource_snapshot().await.unwrap(), snapshot);
     }
 
+    /// The driver must hand the admission callback to the *tensor-bound* arm.
+    ///
+    /// `run_generation`'s success arm never touches the admission sender: only
+    /// its error arm does. So on a request that succeeds, the `Some(&mut
+    /// admitted)` argument at the `(Some(bound), session)` call site is the only
+    /// thing that resolves this oneshot with `Ok`, and the server is holding the
+    /// other end waiting to send its response headers. Pass `None` there and
+    /// every successful tensor-bound request 500s at the awaiting end while the
+    /// generation itself completes perfectly -- the loudest possible failure in
+    /// the quietest possible place.
+    ///
+    /// #1995: the engine's own guards (`a_tensor_bound_request_signals_
+    /// admission_exactly_once` and its refuse-direction sibling) assert that the
+    /// *engine* invokes the callback it is given. Neither can see this defect,
+    /// because this is the *driver* not giving it one. Measured rather than
+    /// argued: replacing `Some(&mut admitted)` with `None` on that arm alone
+    /// left all 296 tests across all four server targets passing, byte-identical
+    /// to baseline, while nulling the whole closure fails four -- all of them on
+    /// the `(None, None)` prompt arm. The gap is this arm specifically.
+    ///
+    /// The generation is *not* required to succeed for this to discriminate,
+    /// which is what makes the test writable at all -- the engine-side test
+    /// records the opposite conclusion, that an end-to-end version needs a
+    /// package the interpreter can finish. It does not, because the admission
+    /// signal precedes the work and the error arm's `take()` is what separates
+    /// the two cases:
+    ///
+    /// - given the callback: it fires at admission, `take()`s the sender, and
+    ///   the error arm finds `None` -- the receiver already holds `Ok(())`;
+    /// - denied the callback: the sender survives to the error arm, which sends
+    ///   `Err(failure)`.
+    ///
+    /// So the received *value* is the observable, and asserting `Ok(())` rather
+    /// than "resolved" is load-bearing: a test that only checked the receiver
+    /// completed would pass under the mutation, since a denied callback still
+    /// resolves it -- with the wrong answer.
+    #[tokio::test]
+    async fn a_tensor_bound_request_is_told_it_was_admitted() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let mut engine = Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())
+            .expect("load tiny fixture");
+
+        // `encoded: true` is the branch that hands the package its bytes
+        // untouched, so this needs no feature extractor and no mel-shaped
+        // fixture -- it is the shortest route to a genuinely bound tensor.
+        let spec = crate::audio_input::AudioInputSpec {
+            endpoint: "audio_bytes".to_string(),
+            n_mels: 80,
+            n_frames: 100,
+            max_tokens: None,
+            encoded: true,
+        };
+        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
+            .expect("an encoded-audio spec binds the samples it is handed");
+
+        // Assert the precondition rather than trusting the test's name: a
+        // request whose inputs went missing is prompt-only, takes the
+        // `(None, None)` arm, and would then pass for a reason that has nothing
+        // to do with binding tensors -- the exact vacuity the four existing
+        // streaming tests already sit in.
+        let probe = input
+            .bind(PipelineGenerateRequest::new(GenerateRequest::new(
+                onnx_genai::GeneratePrompt::TokenIds(vec![1]),
+            )))
+            .expect("binding an encoded tensor cannot fail");
+        assert!(
+            !probe.inputs.is_empty(),
+            "this test is only about the branch a tensor-carrying request takes"
+        );
+        let input = MultimodalInput::from_samples(&spec, &[0.0f32; 16], 16_000)
+            .expect("an encoded-audio spec binds the samples it is handed");
+
+        let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 1;
+        request.options.stop_on_eos = false;
+
+        let (admission, admission_rx) = oneshot::channel();
+        let (events, _events_rx) = mpsc::channel(64);
+        let permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+
+        run_generation(
+            &mut engine,
+            None,
+            request,
+            Some(input),
+            admission,
+            events,
+            permit,
+        );
+
+        let admitted = admission_rx
+            .await
+            .expect("the admission sender must be resolved, not dropped");
+        if let Err(failure) = admitted {
+            panic!(
+                "a tensor-bound request that the scheduler admitted must be told so, \
+                 got Err({failure:?}): this oneshot is what the server waits on before \
+                 sending headers, and the bound arm's `Some(&mut admitted)` is its only \
+                 resolver on success"
+            );
+        }
+    }
+
     /// A lone request with nothing else outstanding must be admitted at once.
     ///
     /// This is the regression that made the "solo fast path" not fast: the loop

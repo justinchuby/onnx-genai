@@ -43,9 +43,22 @@ use onnx_genai_ort_sys as ort;
 
 /// Serialises all tests that load our EP plugin.
 ///
-/// ORT's per-process EP device state is corrupted after ≥6 register+Run+unregister
-/// cycles (factory.rs bug — Nabil).  The lock ensures tests run one at a time so
-/// the cycle count stays below the failure threshold for the default test suite.
+/// ORT's EP registry is process-global: registering a library, enumerating
+/// `OrtEpDevice`s and unregistering all mutate state shared by every test in
+/// this binary, so the tests are run one at a time.
+///
+/// # This lock is not a cycle-count workaround
+///
+/// It used to be documented as keeping the register→Run→unregister cycle count
+/// below the threshold of a use-after-free that appeared at cycle ≥6. Two
+/// things are wrong with that. The bug was fixed in `c92838dba`
+/// (`OrtMemoryInfo` released while ORT held the raw pointer) and is now
+/// *guarded* by `stress_register_run_unregister_cycles`, which drives 25 cycles
+/// on purpose. And serialising tests cannot lower a per-process cycle count in
+/// any case — it only orders the same cycles — so the stated mechanism could
+/// not have produced the claimed effect even while the bug was live. See the
+/// evidence block on `shared_ort_library`, which concludes from measurement
+/// that "cycle count is therefore not the variable; library load/unload is".
 static ORT_EP_LOCK: Mutex<()> = Mutex::new(());
 
 /// Acquire `ORT_EP_LOCK`, recovering from poisoning so that one test's panic
