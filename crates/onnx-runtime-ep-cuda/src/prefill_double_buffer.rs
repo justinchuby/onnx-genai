@@ -249,15 +249,18 @@ pub trait PrefillTransfer {
     /// Cloneable consumer handle to a filled slot's device buffer (real: the
     /// layer's device pages; fake: a copy of the slot's filled bytes/id).
     type Payload: Clone;
-    /// Describes one layer's source bytes (real: expert keys + lazy weights +
-    /// mmap source; fake: an id + byte count).
-    type LayerReq;
+    /// Describes one layer's source bytes (real: a lazy weight + the mmap
+    /// source it is read from, both borrowed for the duration of one prefetch;
+    /// fake: an id + byte count). The lifetime lets the CUDA request borrow the
+    /// executor's per-call weight-store source, which the real prefill lifecycle
+    /// hands in by reference at each look-ahead call.
+    type LayerReq<'a>;
     /// The transfer's error type.
     type Error: fmt::Display;
 
     /// Byte size of one layer's buffer, from a request. Used by the capacity
     /// gate and the empty-layer check.
-    fn layer_bytes(&self, req: &Self::LayerReq) -> u64;
+    fn layer_bytes(&self, req: &Self::LayerReq<'_>) -> u64;
 
     /// True while a device operation forbids allocator/VMM mutation (capture or
     /// replay in progress). Checked before every reservation and refill.
@@ -277,7 +280,7 @@ pub trait PrefillTransfer {
     fn fill_slot(
         &self,
         slot: usize,
-        req: &Self::LayerReq,
+        req: &Self::LayerReq<'_>,
         plan: SlotFillPlan,
     ) -> Result<FillOutcome, Self::Error>;
 
@@ -475,7 +478,7 @@ impl<T: PrefillTransfer> PrefillDoubleBuffer<T> {
     pub fn prefetch(
         &mut self,
         layer_id: u64,
-        req: &T::LayerReq,
+        req: &T::LayerReq<'_>,
     ) -> Result<LayerTicket, PrefillReject<T::Error>> {
         debug_assert!(!self.torn_down, "prefetch after teardown");
         if self.transfer.capture_active() {
@@ -738,11 +741,26 @@ impl std::error::Error for CudaPrefillError {}
 
 /// A whole layer's transfer request: the layer's device-bound regions expressed
 /// as a single [`LazyWeight`] whose `regions` are filled sequentially into the
-/// slot's staging buffer, read through the transfer's shared
-/// [`MmapRegionSource`]. Representing a "whole layer" as one region list keeps
-/// this primitive a pure *staging* concern — it copies bytes; it does not learn
+/// slot's staging buffer, read through the [`MmapRegionSource`] the executor
+/// hands in for this look-ahead call. Both borrows are valid only for the
+/// duration of one `prefetch`/`fill_slot`; the primitive never retains them
+/// (the H2D copy completes asynchronously, and the page-time consume only waits
+/// a fence). Representing a "whole layer" as one region list keeps this
+/// primitive a pure *staging* concern — it copies bytes; it does not learn
 /// per-expert keys or admit anything into the residency cache.
-pub type PrefillLayerRequest = LazyWeight;
+pub struct PrefillLayerRequest<'a> {
+    /// The layer's lazy weight whose `regions` are copied into the slot.
+    pub weight: &'a LazyWeight,
+    /// The per-call mmap source the layer's bytes are read from.
+    pub source: &'a dyn MmapRegionSource,
+}
+
+impl<'a> PrefillLayerRequest<'a> {
+    /// Bundle a borrowed layer weight with the source its bytes are read from.
+    pub fn new(weight: &'a LazyWeight, source: &'a dyn MmapRegionSource) -> Self {
+        Self { weight, source }
+    }
+}
 
 /// Consumer handle to a filled slot's device buffer. The pointer addresses the
 /// slot's *stable* device allocation (reused across layers); it is valid to a
@@ -795,7 +813,6 @@ impl CudaSlotBuffers {
 pub struct CudaPrefillTransfer {
     runtime: Arc<CudaRuntime>,
     staging_pool: Arc<PinnedStagingPool>,
-    source: Arc<dyn MmapRegionSource>,
     slots: [RefCell<CudaSlotBuffers>; SLOTS],
     /// Buffers moved out of a poisoned slot, retained for process lifetime (a
     /// DMA may still be reading them). Never freed on `Drop` — the same
@@ -806,17 +823,13 @@ pub struct CudaPrefillTransfer {
 
 impl CudaPrefillTransfer {
     /// Build a transfer over `runtime`'s streams and the residency's shared
-    /// `staging_pool`, reading layer bytes through `source`. Allocates nothing
-    /// until [`PrefillTransfer::reserve`] runs.
-    pub fn new(
-        runtime: Arc<CudaRuntime>,
-        staging_pool: Arc<PinnedStagingPool>,
-        source: Arc<dyn MmapRegionSource>,
-    ) -> Self {
+    /// `staging_pool`. Each layer's bytes are read through the source supplied
+    /// per fill (see [`PrefillLayerRequest`]), not a source owned by the
+    /// transfer. Allocates nothing until [`PrefillTransfer::reserve`] runs.
+    pub fn new(runtime: Arc<CudaRuntime>, staging_pool: Arc<PinnedStagingPool>) -> Self {
         Self {
             runtime,
             staging_pool,
-            source,
             slots: std::array::from_fn(|_| RefCell::new(CudaSlotBuffers::empty())),
             quarantined: RefCell::new(Vec::new()),
         }
@@ -830,11 +843,11 @@ impl CudaPrefillTransfer {
 
 impl PrefillTransfer for CudaPrefillTransfer {
     type Payload = PrefillLayerView;
-    type LayerReq = PrefillLayerRequest;
+    type LayerReq<'a> = PrefillLayerRequest<'a>;
     type Error = CudaPrefillError;
 
-    fn layer_bytes(&self, req: &Self::LayerReq) -> u64 {
-        req.region_bytes_len() as u64
+    fn layer_bytes(&self, req: &Self::LayerReq<'_>) -> u64 {
+        req.weight.region_bytes_len() as u64
     }
 
     fn capture_active(&self) -> bool {
@@ -892,7 +905,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
     fn fill_slot(
         &self,
         slot: usize,
-        req: &Self::LayerReq,
+        req: &Self::LayerReq<'_>,
         plan: SlotFillPlan,
     ) -> Result<FillOutcome, Self::Error> {
         let mut s = self.slots[slot].borrow_mut();
@@ -918,7 +931,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
             reuse_wait_ns = duration_ns(start.elapsed());
         }
 
-        let src_len = req.region_bytes_len();
+        let src_len = req.weight.region_bytes_len();
         if src_len == 0 {
             return Err(CudaPrefillError::new("fill_slot on a zero-byte layer"));
         }
@@ -936,7 +949,7 @@ impl PrefillTransfer for CudaPrefillTransfer {
                 .staging
                 .as_mut()
                 .ok_or_else(|| CudaPrefillError::new("fill_slot on an unreserved slot"))?;
-            fill_staging_from_regions(req, &*self.source, staging)
+            fill_staging_from_regions(req.weight, req.source, staging)
                 .map_err(|error| CudaPrefillError::new(format!("staging fill: {error}")))?;
         }
 
@@ -1202,10 +1215,10 @@ mod tests {
 
     impl PrefillTransfer for FakeTransfer {
         type Payload = u64;
-        type LayerReq = FakeLayer;
+        type LayerReq<'a> = FakeLayer;
         type Error = FakeError;
 
-        fn layer_bytes(&self, req: &Self::LayerReq) -> u64 {
+        fn layer_bytes(&self, req: &Self::LayerReq<'_>) -> u64 {
             req.bytes
         }
         fn capture_active(&self) -> bool {
@@ -1227,7 +1240,7 @@ mod tests {
         fn fill_slot(
             &self,
             slot: usize,
-            req: &Self::LayerReq,
+            req: &Self::LayerReq<'_>,
             plan: SlotFillPlan,
         ) -> Result<FillOutcome, Self::Error> {
             let mut s = self.state.borrow_mut();
