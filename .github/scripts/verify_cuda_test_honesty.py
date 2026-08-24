@@ -124,7 +124,7 @@ IGNORE_ATTR = re.compile(r"(?:^|[\[(,\s])ignore\s*(?:=|\]|,|\)|$)")
 # `#[cfg_attr(not(feature = "some-other-thing"), ignore = "...")]` still runs
 # the test with `gpu-tests` off, which is the defect, so the predicate has to be
 # read rather than assumed from the presence of an `ignore` token.
-GPU_TESTS_PREDICATE = re.compile(r"""not\s*\(\s*feature\s*=\s*["']gpu-tests["']\s*\)""")
+GPU_TESTS_PREDICATE = re.compile(r"""\s*not\s*\(\s*feature\s*=\s*["']gpu-tests["']\s*\)\s*""")
 RAW_STRING_START = re.compile(r"r(#*)\"")
 CHAR_LITERAL = re.compile(r"'(?:\\.|[^\\'])'")
 # Walking upward out of one item and into the one above it would let a test
@@ -134,6 +134,14 @@ ITEM_BOUNDARY = re.compile(
     r"^(?:\}|\{|fn\s|pub\s|async\s|unsafe\s|extern\s|mod\s|use\s|let\s|impl\s"
     r"|struct\s|enum\s|trait\s|const\s|static\s|type\s|macro_rules)"
 )
+# `pub(crate) fn neighbour()` is an item opener that `pub\s` above does not
+# match, and a walk that runs past it adopts the neighbour's ignore. Anchoring
+# on the `fn` token itself covers every visibility spelling at once, rather
+# than enumerating them and being one spelling short again later.
+FN_DECLARATION = re.compile(r"\bfn\s+[A-Za-z0-9_]+\s*[(<]")
+# `#[test]`, `#[ test ]`, and the same-line `#[test] fn a() {}` all produce a
+# running test. Matching only the canonical spelling left two of them uninspected.
+TEST_ATTR = re.compile(r"#\[\s*test\s*\]")
 
 
 def mask_source(source: str) -> list[tuple[str, bool]]:
@@ -229,20 +237,23 @@ def mask_source(source: str) -> list[tuple[str, bool]]:
     return masked
 
 
-def head_line_indices(masked: list[tuple[str, bool]], index: int) -> list[int]:
+def head_line_indices(masked: list[tuple[str, bool]], index: int, downward: bool = True) -> list[int]:
     """Line indices of the attribute head of the `#[test]` item at `index`."""
     above: list[int] = []
     pending = 0
     for cursor in range(index - 1, -1, -1):
         code, comment_only = masked[cursor]
         stripped = code.strip()
-        if not stripped and not comment_only:
+        # Gated on depth, like the downward walk: a blank line inside a
+        # multi-line attribute is legal and must not truncate the head, or a
+        # correctly ignored test gets reported and reds an otherwise green lane.
+        if pending == 0 and not stripped and not comment_only:
             break
         # Checked regardless of bracket depth, on purpose: this is the backstop
         # that makes the walk degrade closed if bracket accounting is ever
         # wrong. After masking, a continuation line cannot look like the start
         # of an item, because anything that could is inside a literal.
-        if stripped == "#[test]" or ITEM_BOUNDARY.match(stripped):
+        if TEST_ATTR.search(stripped) or ITEM_BOUNDARY.match(stripped) or FN_DECLARATION.search(stripped):
             break
         if pending == 0 and comment_only:
             continue
@@ -254,6 +265,8 @@ def head_line_indices(masked: list[tuple[str, bool]], index: int) -> list[int]:
         above.append(cursor)
         pending = max(0, pending + delta)
     head = list(reversed(above))
+    if not downward:
+        return head
     pending = 0
     for cursor in range(index + 1, len(masked)):
         code, comment_only = masked[cursor]
@@ -293,6 +306,39 @@ def attribute_spans(text: str) -> list[tuple[int, int]]:
         cursor = end + 1
 
 
+def cfg_attr_ignores_without_gpu_tests(masked_attribute: str, raw_attribute: str) -> bool:
+    """Whether a `cfg_attr` ignores the test exactly when `gpu-tests` is off.
+
+    Reading the predicate as a substring is not enough. `all(not(feature =
+    "gpu-tests"), windows)` contains it and still runs the test on the Linux
+    lane, and a nested `cfg_attr` can gate the ignore on something else
+    entirely. The predicate has to be the whole predicate, and the ignore has
+    to be the outer attribute's own.
+    """
+    opener = re.search(r"cfg_attr\s*\(", masked_attribute)
+    if not opener:
+        return False
+    depth, cursor, comma = 1, opener.end(), None
+    while cursor < len(masked_attribute):
+        char = masked_attribute[cursor]
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+            if depth == 0:
+                break
+        elif char == "," and depth == 1 and comma is None:
+            comma = cursor
+        cursor += 1
+    if comma is None:
+        return False
+    if "cfg_attr" in masked_attribute[comma:cursor]:
+        return False
+    if not IGNORE_ATTR.search("," + masked_attribute[comma + 1 : cursor]):
+        return False
+    return GPU_TESTS_PREDICATE.fullmatch(raw_attribute[opener.end() : comma]) is not None
+
+
 def has_effective_ignore(masked_head: str, raw_head: str) -> bool:
     """Whether the head ignores the test when `gpu-tests` is off.
 
@@ -306,7 +352,7 @@ def has_effective_ignore(masked_head: str, raw_head: str) -> bool:
             continue
         if "cfg_attr" not in attribute:
             return True
-        if GPU_TESTS_PREDICATE.search(raw_head[start:end]):
+        if cfg_attr_ignores_without_gpu_tests(attribute, raw_head[start:end]):
             return True
     return False
 
@@ -325,15 +371,20 @@ def un_ignored_tests(source: str) -> list[tuple[int, str]]:
     masked = mask_source(source)
     found: list[tuple[int, str]] = []
     for index, (code, _) in enumerate(masked):
-        if code.strip() != "#[test]":
+        spans = attribute_spans(code)
+        if not any(TEST_ATTR.fullmatch(code[start:end].strip()) for start, end in spans):
             continue
-        head = head_line_indices(masked, index)
+        # `#[test] fn a() {}` puts the whole item on one line, so walking
+        # downward would collect the *next* item's attributes and let this test
+        # inherit them. The line's own attributes are part of the head either way.
+        same_line_fn = FN_DECLARATION.search(code)
+        head = head_line_indices(masked, index, downward=not same_line_fn)
         # Joined unstripped: masking is length-preserving per line, so the two
         # blobs agree column for column and a span found in one can be read out
         # of the other. Stripping would break exactly that, because masking a
         # trailing comment leaves spaces that strip() then removes.
-        masked_head = "\n".join(masked[cursor][0] for cursor in head)
-        raw_head = "\n".join(lines[cursor] for cursor in head)
+        masked_head = "\n".join([masked[cursor][0] for cursor in head] + [code])
+        raw_head = "\n".join([lines[cursor] for cursor in head] + [lines[index]])
         if len(masked_head) != len(raw_head):
             # Masking is column-exact, so this cannot happen; if it ever does,
             # report rather than trust a span mapping that has drifted.
@@ -341,7 +392,8 @@ def un_ignored_tests(source: str) -> list[tuple[int, str]]:
             continue
         if has_effective_ignore(masked_head, raw_head):
             continue
-        found.append((index + 1, test_name_at(lines, index)))
+        name = same_line_fn.group(0) if same_line_fn else None
+        found.append((index + 1, name[3:].strip("(<").strip() if name else test_name_at(lines, index)))
     return found
 
 
@@ -764,6 +816,30 @@ def self_test() -> None:
         ("#[test]\nfn a() {}\n\n#[ignore]\n#[test]\nfn b() {}\n", ["a"]),
         ("#[ignore]\n#[test]\nfn a() {}\n#[test]\nfn b() {}\n", ["b"]),
         ("macro_rules! m {\n    () => {\n        #[ignore]\n        #[test]\n        fn a() {}\n    };\n}\n", []),
+        # A second review found these four, all of them residual holes in the
+        # first fix. Three were fail-open; the first would have reddened a green
+        # lane on correct code, which is worse than useless for a pre-merge gate.
+        #
+        # A blank line inside a multi-line attribute is legal, and truncating
+        # the head there reports a correctly ignored test.
+        ('#[cfg_attr(\n\n    not(feature = "gpu-tests"),\n    ignore = "x"\n)]\n#[test]\nfn a() {}\n', []),
+        # The predicate must be the whole predicate. Both of these contain
+        # `not(feature = "gpu-tests")` as a substring and both still run the
+        # test on the Linux CUDA lane with gpu-tests off.
+        ('#[cfg_attr(all(not(feature = "gpu-tests"), windows), ignore)]\n#[test]\nfn a() {}\n', ["a"]),
+        ('#[cfg_attr(not(feature = "gpu-tests"), cfg_attr(feature = "foo", ignore))]\n#[test]\nfn a() {}\n', ["a"]),
+        # `#[test]` is not always spelled `#[test]` on a line of its own. Both
+        # of these compile and run; matching only the canonical form never even
+        # looked at them.
+        ("#[test] fn foo() {}\n", ["foo"]),
+        ("#[ test ]\nfn spaced() {}\n", ["spaced"]),
+        ("#[ignore] #[test] fn foo() {}\n", []),
+        # ...and with the item on one line, walking downward would collect the
+        # *next* item's attributes and inherit its ignore.
+        ("#[test] fn foo() {}\n#[ignore]\n#[test]\nfn bar() {}\n", ["foo"]),
+        # `pub(crate) fn` is an item opener that a `pub\s` boundary misses, and
+        # the walk then climbs into the neighbour above and adopts its ignore.
+        ("#[test]\n#[ignore]\npub(crate) fn neighbour() { assert_eq!(\n    1, 1,\n); }\n#[test]\nfn ours() {}\n", ["ours"]),
         # An attribute below `#[test]` with a trailing comment. Masking that
         # comment leaves trailing spaces, so joining the stripped lines made the
         # masked and raw blobs different lengths and the span mapping drifted.
