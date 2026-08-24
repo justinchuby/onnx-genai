@@ -2004,10 +2004,39 @@ time. That figure is now stale; the re-measurement replaces it.
 > and not proposed, because the t=16 A/A null in the same run is **+-21.5%**.
 > **The binding constraint at t=16 is now the measurement, not the kernel:**
 > until the A/A instability is understood no improvement of realistic size can
-> clear a pre-registered bar there. Full records:
+> clear a pre-registered bar there.
+>
+> **The dispatcher/worker collision line above is withdrawn as unevidenced.**
+> It rested on a probe that sampled `/proc/<pid>/stat` -- the process **main
+> thread**, which is not the dispatcher. The dispatcher is a transient thread
+> that is usually gone before a bench can report, so its placement can only be
+> read from inside the dispatch path; a first attempt from the *reporting*
+> thread returned the exactly **inverted** answer, because the reporter is idle
+> and the scheduler parks it on the very core the reserve freed. Collision is
+> now neither asserted nor excluded.
+>
+> **What is established is structural: the pool reserves a CPU for the
+> dispatcher and binds nothing to it.** `DISPATCHER_RESERVED_CPUS = 1` and
+> `reserve_single_group_headroom` keep one allowed CPU clear of workers -- CPU
+> 30 at t=16 on this host, justified in-tree by a measured 1.57x -- and the
+> dispatcher is then left to the scheduler. Direct measurement confirms the gap
+> is real: unpinned, the dispatcher was last seen on a **worker's** core in one
+> launch of four. `ONNX_GENAI_CPU_DECODE_DISPATCHER_PIN=1` closes it and
+> **fails its own bar**: 15 of 15 trusted launches faster, median **1.0953**
+> against a pre-registered 1.10, with no t=8 regression; the companion
+> dispersion rule **failed its self-test** and certified nothing. An earlier
+> 6-launch run scored 1.1910/ACCEPT and **did not replicate** -- partly small-n,
+> partly because #1868's spin-deadline fix already took control `sys_frac` at
+> t=16 from 0.257 to 0.198. The mechanism is **unproven**: the unpinned
+> dispatcher migrates at most once per launch, so migration is not it. The knob
+> ships **off**, and would need prefill in the matrix before it could ship on --
+> the dispatcher is the session thread and keeps its affinity after decode ends.
+> **The A/A null therefore remains open, and the +23% steal-tiles candidate
+> remains blocked behind it.** Full records:
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
-> [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md).
+> [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md),
+> [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone

@@ -484,4 +484,7 @@ fn main() {
     // After the phases, never before: the pool is built at first decode, so this
     // is the earliest point the realized width exists to be read.
     common::report_decode_width();
+    // Same reason, same place: the reservation only exists once the pool does,
+    // and `sched_getcpu` must be read on the thread that dispatched.
+    common::report_dispatcher_cpu();
 }
