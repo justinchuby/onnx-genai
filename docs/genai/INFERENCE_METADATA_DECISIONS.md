@@ -704,8 +704,10 @@ components:
     implementation: { kind: onnx, artifact: encoder.onnx }
     batch_capacity:
       axis: 0                # axis along which independent items stack
-      max_rows: 4            # correctness bound of the artifact, not a tuning knob
+      max_items: 4           # correctness bound of the artifact, counted in items
       uniform_axes: [3]      # axes that must be equal across co-batched items
+      axis_budgets:          # summed extent bounds across the whole group
+        - { axis: 1, max_total: 64 }    # total frames in one invocation
     ports:
       inputs:
         pixel_values:
@@ -728,13 +730,23 @@ compete for one.
 
 - **`batch_capacity` absent means one request row per invocation** — today's
   behavior exactly. A runtime **MUST NOT** group a component that has not
-  declared a capacity, and `max_rows` is an upper bound, never an obligation.
+  declared a capacity, and `max_items` is an upper bound, never an obligation.
+- **`max_items` counts items, not requests and not decode rows.** One request may
+  contribute many items and many requests may contribute one between them, so a
+  grouping layer **MUST NOT** reuse a decode-side row bound as an item bound.
+- **`axis_budgets`** bounds the *summed* extent of a free axis across the group —
+  total frames, total tokens — because item count alone does not bound the work:
+  four one-frame clips and four sixty-frame clips satisfy the same `max_items`
+  and differ by an order of magnitude. A group **MUST** satisfy every entry as
+  well as `max_items`. Device memory is not among these bounds; it is runtime
+  measurement, never metadata ([§1.2](#12-non-goals)).
 - **`uniform_axes`** are the axes two items must agree on before they may share
-  an invocation, which makes batch compatibility a derived predicate rather than
-  a policy: a resolution-pinned encoder pins its spatial axes, a frame-count-
-  pinned encoder pins its temporal axis, and everything unpinned is free. Every
-  free axis **MUST** be reconciled either by padding declared through `pad_mask`
-  or by packing declared through `token_packed` — a component that declares
+  an invocation — spatial and temporal alike — which makes batch compatibility a
+  derived predicate rather than a policy: a resolution-pinned encoder pins its
+  spatial axes, a frame-count-pinned encoder pins its temporal axis, an encoder
+  pinned both ways pins both, and everything unpinned is free. Every free axis
+  **MUST** be reconciled either by padding declared through `pad_mask` or by
+  packing declared through `token_packed` — a component that declares
   batchability without declaring how raggedness is expressed is rejected at load.
 - **`pad_mask`** is a list of entries, each linking a padded value to the `bool`
   value that says which entries are real, so a runtime never fabricates padding
@@ -745,7 +757,12 @@ compete for one.
   question. It does not by itself make a component padding-invariant — that
   remains the profile's `batch_invariance` declaration, and a temporally pooling
   encoder is `padding_sensitive` for exactly the same reason a mean-pooling one
-  is.
+  is. **Padding is appended, never prepended or interleaved:** real entries along
+  a padded axis **MUST** form a prefix, so a mask is a leading run of `true`.
+  Interior holes would force every consumer that slices or pools to handle gaps
+  rather than a length, and left padding would shift position indices between a
+  solo item and the same item in a group, which is a wrong answer rather than a
+  slow one.
 - **Ownership content roles** — `item_offsets` / `item_owner` for items in rows
   and `subitem_offsets` / `subitem_owner` for parts in items — join the
   preprocessing content-role vocabularies, so a declared program can *produce*
@@ -753,7 +770,9 @@ compete for one.
   level, not the modality: clips in a request and frames in a clip use the same
   two rules that images in a request and audio windows in an utterance do. Both
   owner values carry a **position**, never a request identity
-  ([§8.3](#83-no-row-identity)).
+  ([§8.3](#83-no-row-identity)). Nesting stops at two levels; a value packed on
+  more than two axes is rejected, so a third level is a deliberate schema change
+  rather than something a package asserts into existence.
 
 Ownership is unchanged in shape: metadata describes the bound, the modality
 vocabulary defines the semantic values, the preprocessor produces the per-item
@@ -764,6 +783,20 @@ results. A runtime **MUST NOT** make two items compatible by changing them:
 trimming frames, resampling a clip to a common frame count, or downscaling to a
 common resolution are semantic changes, so the correct response to an
 incompatible pair is two groups.
+
+Two runtime obligations travel with the metadata and are stated here because
+they bound what "the interpreter executes it" may cost. First, grouping
+**MUST NOT** introduce a host round-trip for a value that is already device
+resident, and splitting a packed result back to rows is an aliasing operation
+wherever the packed span is contiguous — which is the practical reason the
+ownership rules demand contiguity at every level. Second, backend support for
+grouped execution is asked **before** a group is formed, never discovered by
+attempting one: a backend that has not proven parity reports that it cannot
+group, receives no group, and the workload runs item by item as it does today.
+Declining is safe; attempting is not. Neither fact is a metadata field —
+residency and execution capability are runtime-owned
+([§10.2](#102-externally-suppliable-results)) — and both are specified in
+[`ENCODER_BATCHING.md` §5.1](ENCODER_BATCHING.md#51-grouped-buffers-aliasing-residency-and-what-padding-costs).
 
 Grouping introduces **no new capability identifier**. A capability is a load-time
 promise that correct execution *requires* a behavior
@@ -785,7 +818,11 @@ extent; `axis` is within the packed value's rank; two packed values sharing one
 `pad_mask` entry **on the axis it packs**; a packed emit publishes its companions
 as outputs; and a value packed on a second, inner axis declares its own
 `offsets`/`owner` pair whose extents agree with the outer packed extent, so a
-group of clips is splittable into clips *and* into frames.
+group of clips is splittable into clips *and* into frames. **Packing depth is
+capped at two axes.** Parts in items and items in rows covers every known
+workload — frame → clip → request, frame → window → request, token → segment →
+request — and each further level multiplies the validation surface, the split
+implementation, and the corruption cases that must be tested.
 
 `offsets` is `shared` rather than `request_aligned` for a structural reason: an
 exclusive prefix sum is not permutation-followable. Permuting rows does not
@@ -795,8 +832,9 @@ grouping recomputes `offsets` instead of gathering it. The doc comment at
 
 At execution the runtime verifies, **at every nesting level**, `offsets[0] == 0`,
 monotonicity, `offsets[n] == packed_extent`, `owner[i]` in range, and contiguity
-of each parent's children, and reports a violation by naming the value, the
-level, the index, and the two facts that disagree — never by clamping or by a
+of each parent's children; for every padded axis it verifies that the mask's
+`true` positions form a leading run. It reports a violation by naming the value,
+the level, the index, and the two facts that disagree — never by clamping or by a
 best-effort split.
 
 ---

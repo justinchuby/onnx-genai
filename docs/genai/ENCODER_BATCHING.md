@@ -253,8 +253,10 @@ components:
     implementation: { kind: onnx, artifact: encoder.onnx }
     batch_capacity:
       axis: 0                # axis along which independent items (clips) stack
-      max_rows: 4            # correctness bound of the artifact
+      max_items: 4           # correctness bound of the artifact, counted in items
       uniform_axes: [3]      # feature width must agree; frames and patches need not
+      axis_budgets:          # summed extent bounds across the whole group
+        - { axis: 1, max_total: 64 }    # total frames in one invocation
     ports:
       inputs:
         pixel_values:
@@ -312,24 +314,34 @@ Semantics:
   equal the request axis of every `request_aligned` port and the packed axis of
   every `token_packed` port. `shared` ports do not participate; they are
   broadcast unchanged to the whole group.
-- **`max_rows`** is the largest number of items the artifact tolerates in one
-  invocation. It is *static geometry* — a fixed position table, an exported
-  constant, a kernel bound — never a measured throughput sweet spot. Metadata
-  never carries benchmark-derived cost models
+- **`max_items`** is the largest number of **items** — not requests, not decode
+  rows — that the artifact tolerates in one invocation. It is *static geometry* —
+  a fixed position table, an exported constant, a kernel bound — never a measured
+  throughput sweet spot. Metadata never carries benchmark-derived cost models
   ([§1.2 non-goal 4](INFERENCE_METADATA_DECISIONS.md#12-non-goals)). It is an
   upper bound and never an obligation: a runtime **MAY** group fewer, including
-  one.
+  one. The field is named for items because a request contributes zero, one, or
+  many of them ([§3.5](#35-budgets-items-parts-and-request-rows-are-different-numbers)).
 - **`uniform_axes`** lists the axes whose extent **MUST** be equal across every
-  co-batched item. A runtime **MUST NOT** place two items in one invocation
-  unless they agree on every listed axis. Anything not listed is free to vary,
-  and a free axis **MUST** be reconciled either by padding declared through
-  `pad_mask` ([§3.2](#32-tensorcontractpad_mask)) or by packing declared through
-  `token_packed` ([§4](#4-strict-token_packed-validation)).
+  co-batched item — **spatial and temporal alike**. A resolution-pinned encoder
+  lists its geometry axes, a frame-count-pinned encoder lists its temporal axis,
+  and an encoder pinned both ways lists both. A runtime **MUST NOT** place two
+  items in one invocation unless they agree on every listed axis. Anything not
+  listed is free to vary, and a free axis **MUST** be reconciled either by padding
+  declared through `pad_mask` ([§3.2](#32-tensorcontractpad_mask)) or by packing
+  declared through `token_packed` ([§4](#4-strict-token_packed-validation)).
+- **`axis_budgets`** bounds the *summed* extent of a free axis across the whole
+  group: total frames, total tokens, total spectrogram frames. It is the second
+  half of the capacity, because item count alone does not bound the work — four
+  one-frame clips and four sixty-frame clips are the same `max_items` and two
+  very different invocations. Each entry names a free axis and its `max_total`;
+  a group **MUST** satisfy every entry as well as `max_items`. Absent, only
+  `max_items` bounds the group.
 
 Validation rules (all fail-closed, all naming the offending component, field,
 axis, and the two facts that disagree, per Rule 1):
 
-1. `max_rows` **MUST** be at least 2. A capacity of one is spelled by omitting
+1. `max_items` **MUST** be at least 2. A capacity of one is spelled by omitting
    the field; two spellings of one fact is duplicated state (Rule 10).
 2. `axis` **MUST NOT** appear in `uniform_axes`, and `uniform_axes` entries
    **MUST** be distinct and within every participating port's rank.
@@ -347,6 +359,11 @@ axis, and the two facts that disagree, per Rule 1):
    layout on that axis. Declaring batchability without declaring how raggedness
    is expressed is the promise a runtime cannot honor, so it is rejected at load
    rather than discovered at run.
+6. `axis_budgets` entries **MUST** name distinct free axes — never `axis`, never
+   a `uniform_axes` member, since a pinned axis is already bounded by
+   `max_items` times its fixed extent — and each `max_total` **MUST** be at least
+   as large as the largest single item the component can accept, or the budget
+   would forbid an invocation the component is otherwise required to serve.
 
 ### 3.2 `TensorContract.pad_mask`
 
@@ -390,6 +407,23 @@ introduce any.
   packs. Padding and packing are two answers to the same question; a package
   picks one *per axis*. Padding a frame axis while packing the item axis is the
   normal case, not a conflict.
+- **Padding is appended, never prepended and never interleaved.** Real entries
+  along a padded axis **MUST** form a prefix: for each item, positions
+  `[0, valid)` are real and `[valid, padded_extent)` are padding, so a mask along
+  one axis is always a run of `true` followed by a run of `false`. This is the
+  right-padding rule, and it is a rule rather than a convention for three
+  reasons. A mask alone would permit interior holes, which forces every consumer
+  that slices, reduces, or pools to handle gaps rather than a length. Left
+  padding would make position indices — temporal position embeddings above all —
+  disagree between a solo item and the same item in a group, which is a
+  silent-wrong-answer class and not a performance question. And prefix validity
+  is what makes a packed level and a padded level describe the same geometry: an
+  `offsets` vector is a prefix sum, so contiguity at one level and prefix
+  validity at the next are the same statement made twice
+  ([§4](#4-strict-token_packed-validation)). The runtime checks it before the
+  invocation and reports the item, the axis, and the first offending position.
+  A joint multi-axis entry states prefix validity per axis it covers: a shorter
+  later frame is a shorter *prefix* of the patch axis, never a hole in it.
 - Padding is a *runtime* act. The package declares that padding is expressible
   and where its truth is recorded; it never states a batch width, a padded
   extent, or a fill value schedule.
@@ -489,11 +523,13 @@ and the package answers them separately:
   simply contributes an empty span.
 - *Two clips have different frame counts.* Item-extent raggedness on the temporal
   axis. Either pad to the group's frame count and record the truth in a temporal
-  mask, or pack the frame axis and carry `subitem_offsets`/`subitem_owner`. A
-  runtime **MUST NOT** reconcile the difference by trimming or resampling frames
-  — dropping a frame to fit a group changes what the caller asked for, and
-  silently, which [§6](#6-fail-closed-behavior-and-backward-compatible-defaults)
-  forbids.
+  mask, or pack the frame axis and carry `subitem_offsets`/`subitem_owner`, or —
+  if the artifact genuinely requires a fixed frame count — list the temporal axis
+  in `uniform_axes` so that only equal-length clips co-batch. A runtime
+  **MUST NOT** reconcile the difference by trimming or resampling frames —
+  dropping or interpolating a frame to fit a group changes what the caller asked
+  for, and silently, which
+  [§6](#6-fail-closed-behavior-and-backward-compatible-defaults) forbids.
 - *Two clips have different resolutions.* This one is genuinely the package's
   call, and `uniform_axes` is where it is stated. A resolution-agnostic encoder
   (patchified input, position from coordinates) leaves the patch axis free and
@@ -502,11 +538,54 @@ and the package answers them separately:
   groups only from items that agree — a compatibility test on declared extents,
   never on a model name or a resolution table.
 
+`uniform_axes` therefore spans both kinds of agreement, and a package may need
+both at once: a fixed-frame, fixed-resolution encoder pins its temporal *and* its
+spatial axes, and the predicate below reads the two identically because to the
+scheduler they are both just axes with extents.
+
 **Batch compatibility is therefore a derived predicate, not a policy.** Two items
 may share an invocation exactly when they belong to the same component, agree on
 every `uniform_axes` extent, and every axis on which they disagree is either
-masked or packed. The scheduler evaluates that predicate over declared contracts;
-it contains no per-modality branch and no notion of what a frame is.
+masked or packed — and the resulting group must still satisfy `max_items` and
+every `axis_budgets` entry
+([§3.5](#35-budgets-items-parts-and-request-rows-are-different-numbers)). The
+scheduler evaluates that predicate over declared contracts; it contains no
+per-modality branch and no notion of what a frame is.
+
+### 3.5 Budgets: items, parts, and request rows are different numbers
+
+Four quantities are routinely conflated, and video makes the conflation
+expensive. They are distinct, they are owned by different layers, and only two of
+them are metadata:
+
+| Quantity | What it counts | Bound by | Owner |
+| --- | --- | --- | --- |
+| **Request rows** | Concurrent requests in a decode batch | decode-side `BatchingCapability` and scheduler config | Engine, unchanged by this design |
+| **Items** | Independent encoder work units in one invocation — images, clips, windows, segments | `batch_capacity.max_items` | Metadata declares the bound; scheduler picks a size at or below it |
+| **Parts** | Summed extent along a free axis across the group — total frames, total tokens | `batch_capacity.axis_budgets` | Same |
+| **Memory** | Bytes the group will occupy on the device | runtime measurement and allocator state | Runtime only; **never** metadata |
+
+The first two are independent in both directions. One request can contribute
+eight clips, so items can exceed rows; seven requests can contribute one image
+between them, so rows can exceed items. A grouping layer that reuses the decode
+row bound as an item bound is wrong in both directions, and the decode path's own
+`ContinuousBatchManager` already refuses multi-row prompts outright
+(`crates/onnx-genai-engine/src/batched.rs:330-342`), so there is no existing
+number to borrow even if borrowing were correct.
+
+Items and parts are independent too, which is exactly why `axis_budgets` exists.
+Four one-frame clips and four sixty-frame clips both satisfy `max_items: 4` and
+differ by more than an order of magnitude in work and in activation footprint.
+An item bound alone therefore cannot bound an invocation of a video encoder,
+while a parts bound alone cannot either — one hundred one-frame clips is within
+any frame budget and beyond most position tables. A group **MUST** satisfy both.
+
+Memory stays out. `max_items` and `axis_budgets` are *correctness* bounds — what
+the artifact tolerates — and a runtime that can afford fewer items than the bound
+groups fewer, using its own measurement. Metadata carrying a memory number would
+be a cost model, which [§1.2](INFERENCE_METADATA_DECISIONS.md#12-non-goals)
+forbids, and would be wrong on the first machine that differs from the one it was
+measured on.
 
 ---
 
@@ -547,21 +626,33 @@ all load-time and all fail-closed:
    The existing serving-emit rule (`validation.rs:3306-3320`) accepts a packed
    emit today; without this rule the consumer receives a ragged buffer it cannot
    split.
-8. **Nested levels compose, and their bounds agree.** A value packed on two axes
-   declares one `offsets`/`owner` pair per axis. The inner pair's `offsets`
-   extent **MUST** be the outer packed extent plus one, and its `owner` values
-   **MUST** address positions within the outer extent. A package that packs an
-   inner axis without declaring an inner pair is rejected: the group would be
-   unsplittable at that level, which is exactly the frames-inside-clips case
+8. **Nested levels compose, their bounds agree, and the depth is capped at two.**
+   A value packed on two axes declares one `offsets`/`owner` pair per axis. The
+   inner pair's `offsets` extent **MUST** be the outer packed extent plus one,
+   and its `owner` values **MUST** address positions within the outer extent. A
+   package that packs an inner axis without declaring an inner pair is rejected:
+   the group would be unsplittable at that level, which is exactly the
+   frames-inside-clips case
    ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)).
+   **A value MUST NOT be packed on more than two axes.** Two levels —
+   parts in items, items in rows — is what every known workload needs
+   (frame → clip → request, frame → window → request, token → segment → request),
+   and each additional level multiplies the validation surface, the split
+   implementation, and the corruption cases that must be tested, while making the
+   worst-case split cost harder to reason about. The bound is stated rather than
+   left implicit so that a third level is a deliberate schema change with its own
+   design, not something a package can assert into existence. A three-level
+   declaration is rejected at load, naming the value and the packed axes.
 9. **Execution-time invariants are checked, not assumed.** Before a packed value
    is consumed the runtime verifies `offsets[0] == 0`, monotonic
    non-decreasing offsets, `offsets[rows] == packed_extent`, `owner[i]` in
    `[0, rows)`, and `owner` consistent with `offsets` (items of a row are
    contiguous) — **at every level**, so a frame owner that points outside its
-   clip fails the same way a clip owner that points outside its row does. A
-   violation is an error that names the value, the level, the index, and the two
-   facts that disagree — never a truncation, a clamp, or a best-effort split.
+   clip fails the same way a clip owner that points outside its row does. For
+   every padded axis it verifies prefix validity: the mask's `true` positions
+   form a leading run ([§3.2](#32-tensorcontractpad_mask)). A violation is an
+   error that names the value, the level, the index, and the two facts that
+   disagree — never a truncation, a clamp, or a best-effort split.
 
 Rules 1–8 are validator rules with negative fixtures; rule 9 is a runtime
 precondition with a test that corrupts each field at each level in turn and
@@ -579,24 +670,83 @@ owner of that layer doing its existing job over a new declared fact.
 | **Metadata** | That a component may be grouped, on which axis, up to what bound, which axes must agree, how raggedness is expressed at every level. | Whether to group, how many to group, when, or how fast it will be. |
 | **Modality vocabulary** | The *semantic* values a program produces — pixels, temporal and spatial validity masks, frame counts, grid geometry — and the transforms that produce them. | Anything about grouping. A content role never says an axis is batchable; it says what the numbers mean. |
 | **Preprocessor** | Producing per-item tensors and, when a program declares them, the ownership values (`item_*`, `subitem_*`) for the items it was handed. | Deciding which items are handed to it; any request identity; any cross-invocation state. |
-| **Scheduler** | Deciding which pending work items co-batch, by evaluating the declared compatibility predicate ([§3.4](#34-worked-cases-images-video-audio-text)) under `max_rows`; admission, fairness, latency-versus-throughput, deadlines, backpressure. | Model identity; modality; tensor construction; padding; any knowledge of what the component computes. |
-| **Interpreter** | Building the grouped invocation: broadcasting `shared` inputs, padding only where a `pad_mask` entry exists, concatenating only where a packed layout exists, invoking once, and splitting outputs back to rows through every declared ownership level. | Group composition policy; backend selection; storage layout. |
-| **Backends (ORT and native)** | Executing the grouped invocation through the one component-execution seam, with identical results. | Any batching decision of their own. A backend never has a private grouping path. |
+| **Scheduler** | Deciding which pending work items co-batch, by evaluating the declared compatibility predicate ([§3.4](#34-worked-cases-images-video-audio-text)) under `max_items` and `axis_budgets`; admission, fairness, latency-versus-throughput, deadlines, backpressure. | Model identity; modality; tensor construction; padding; any knowledge of what the component computes. |
+| **Interpreter** | Building the grouped invocation: broadcasting `shared` inputs, padding only where a `pad_mask` entry exists, concatenating only where a packed layout exists, invoking once, and splitting outputs back to rows through every declared ownership level — and doing all of it without a host round-trip for values already device-resident. | Group composition policy; backend selection; storage layout. |
+| **Backends (ORT and native)** | Executing the grouped invocation through the one component-execution seam, with identical results, and *declaring whether they can*. | Any batching decision of their own. A backend never has a private grouping path. |
 
 The seam that makes the last row true is `WorkflowComponentBackend`
 ([`../architecture/NATIVE_WORKFLOW_BACKEND.md` §3](../architecture/NATIVE_WORKFLOW_BACKEND.md)):
 grouping is built above it in the interpreter, so ORT and native receive the
-same named tensors and there is exactly one grouping implementation. If a
-backend cannot execute a grouped invocation it fails with a diagnostic naming
-the component and the bound — it does not quietly run the items one at a time,
-because a silent fallback makes a performance regression indistinguishable from
-correct behavior (Rule 4).
+same named tensors and there is exactly one grouping implementation.
+
+Backend grouped-execution support is a **runtime** fact, asked *before* a group
+is formed, never a metadata field and never discovered by attempting one. The
+interpreter asks the seam whether the backend can execute this component grouped;
+a backend that answers no simply never receives a group, and declining to group
+is always safe ([§6](#6-fail-closed-behavior-and-backward-compatible-defaults)).
+What is forbidden is the other order: forming a group, handing it to a backend
+that has not proven it, and discovering the answer as a wrong result or a crash.
+Equally forbidden is degrading *after* a group is formed — a backend that accepted
+a group and then ran the items one at a time makes a performance regression
+indistinguishable from correct behavior (Rule 4). A decline **MUST** be
+observable — counted and attributable — because "grouping silently never
+happened" and "grouping happened and did not help" are different bugs with the
+same throughput number.
 
 The scheduler's new work-item queue is generic over components. It reads
 `batch_capacity` and the participating port contracts; it never reads a
 component name, a modality, or an artifact filename
 ([`SCHEDULING.md`](SCHEDULING.md) owns the admission and preemption policy that
 this queue plugs into).
+
+### 5.1 Grouped buffers: aliasing, residency, and what padding costs
+
+Grouping exists to save time. A grouping layer that assembles its input by
+copying every item through host memory can consume the whole win before the
+kernel starts, so buffer handling is part of the design rather than an
+optimization to be added later.
+
+The currency is unchanged: `onnx_genai_ort::Value` is already a device-capable
+handle exposing `is_host_resident`, `device_id`, `try_alias_clone`,
+`into_alias_with_shape`, and `from_external_memory`, so a device allocation can
+be exposed as a device-resident value **without a host round-trip**
+([`../architecture/NATIVE_WORKFLOW_BACKEND.md` §3–§4](../architecture/NATIVE_WORKFLOW_BACKEND.md)).
+Grouping therefore inherits residency rather than inventing it, and metadata
+gains no residency field — transport, cache identity, and residency stay
+runtime-owned
+([§10.2](INFERENCE_METADATA_DECISIONS.md#102-externally-suppliable-results)).
+
+Three rules follow:
+
+- **A device-resident item stays device-resident when it joins a group.** The
+  interpreter **MUST NOT** move an already-resident value to the host and back in
+  order to concatenate it. If it cannot assemble the group on the device — mixed
+  devices, an allocator that cannot give a contiguous span — it declines to
+  group, which is safe, rather than paying a round-trip that grouping was
+  supposed to avoid.
+- **Splitting a packed output is an aliasing operation wherever the layout
+  allows.** This is the practical reason the ownership rules demand contiguity:
+  a row whose items are contiguous along the packed axis is a *slice*, so it is
+  handed back as an alias over the same allocation
+  (`try_alias_clone` / `into_alias_with_shape`), not a per-row copy. A layout
+  that did not guarantee contiguity would force a gather on every split, which
+  is the cost grouping is trying to amortize.
+- **Any copy that does happen is attributable.** Where an alias is impossible,
+  the copy is permitted but **MUST** be counted and reported alongside the
+  throughput numbers ([§9](#9-e2e-acceptance-matrix) row 19). An unmeasured
+  host-device transfer inside the grouping path is how a batching change ships as
+  a regression while its own benchmark says it helped.
+
+This also settles a question that looks like a preference and is not: **padding
+always materializes, packing can alias.** Padding an item to the group's extent
+writes a new, larger buffer for every participating item; packing concatenates
+items end to end and leaves each item's span addressable in place. Both are
+correct, and a package may only have one of them available, but where a package
+can express either, packing is the cheaper spelling on both edges of the
+invocation and padding's cost should be a deliberate choice rather than a
+surprise. For video the difference is not marginal: padding sixteen clips to the
+longest clip's frame count can multiply the input buffer several-fold, and every
+one of those bytes is a device write that produces nothing.
 
 ---
 
@@ -638,6 +788,54 @@ asymmetry matters:
 - A package that *declares* batchability it has not made expressible is rejected
   at load ([§3.1](#31-workflowcomponentbatch_capacity) rule 5), not at the first
   unlucky group.
+- A runtime **MUST NOT** exceed `max_items` or any `axis_budgets` entry, and
+  **MUST NOT** treat a decode-side row bound as an item bound
+  ([§3.5](#35-budgets-items-parts-and-request-rows-are-different-numbers)).
+
+**An unproven backend is a backend that does not group.** This is the concrete
+case today, not a hypothetical. The native path is reported to crash above batch
+one for vision models: the batch benchmark limits native to batch 1 and says so
+in two places — "the native runtime may segfault on batch>1 (a known bug)" and
+"batch>1 is known to segfault for vision models"
+(`crates/onnx-genai-bench/src/bin/batch_vision.rs:122-123,243,250`), and its
+`probe_native_max_batch` deliberately never attempts batch 2 so the process
+survives. The regression test that would catch it,
+`crates/onnx-runtime-session/tests/batch_vision_crash.rs`, asserts exactly the
+right property — batch 2 must not crash *and* must equal the two batch-1 runs
+element-wise — but it returns early when its model file is missing, so it is not
+a standing guard.
+
+Therefore, until parity is proven on a checked-in fixture:
+
+- The native backend **MUST** report grouped execution as unsupported for
+  components it has not proven, so the interpreter never forms a group for it
+  ([§5.1](#51-grouped-buffers-aliasing-residency-and-what-padding-costs)).
+  Reporting "no" is not a failure mode; it is the safe answer, and it costs only
+  the optimization.
+- The runtime **MUST NOT** discover the answer by attempting a grouped
+  invocation. A crash is not a diagnostic, and a segfault in a serving process
+  takes every unrelated in-flight request with it.
+- Flipping the answer to "yes" is gated on P5
+  ([§8](#8-execution-phases-and-pr-dag)): grouped-versus-solo equality under the
+  native backend on the synthetic fixture, plus the existing batch-invariance
+  test made unskippable by pointing it at that fixture instead of an absent model
+  file. The gate is a test that runs in CI, not a judgement that the bug is
+  probably fixed.
+- ORT grouping is not blocked by native's answer. The two backends answer
+  independently, which is the point of asking before forming rather than after.
+
+**Fixtures are synthetic, tiny, and checked in.** Every acceptance row runs on a
+generated fixture in `tests/fixtures/onnx_genai_workflows/`, built by a
+`scripts/build_tiny_*.py` generator like every other fixture in the repository
+(there are already ~40, including `build_tiny_vlm.py` and the `video` generation
+workflow). Video grouping needs a new one: a **synthetic video-encoder fixture**
+with a handful of frames at a small resolution, deterministic outputs so that
+solo-versus-group equality is exact rather than approximate, and enough shape
+variety to cover the matrix — clips of differing frame counts, requests carrying
+zero, one, and several clips, and both a resolution-pinned and a
+resolution-agnostic variant. No downloaded weights, no sample media files, no
+network access in the test path; a fixture that cannot be regenerated from a
+script in this repository is not a fixture, it is a dependency.
 
 **Row semantics survive.** Grouping introduces no new identity. Items are
 positional inside an invocation, exactly as rows are positional inside a batch
@@ -690,7 +888,7 @@ and bundling the two would mean this design could not land without also
 relitigating capability admission. The direction is recorded here so the new
 surface does not add to the pile; the audit is separate.
 
-**No cost model.** `max_rows` is a correctness bound. Metadata never carries
+**No cost model.** `max_items` and `axis_budgets` are correctness bounds. Metadata never carries
 measured throughput, an admission prediction, or a tuned heuristic
 ([§1.2](INFERENCE_METADATA_DECISIONS.md#12-non-goals)). Choosing a group size at
 or below the bound is a scheduler decision informed by runtime measurement.
@@ -706,25 +904,27 @@ one to be useful.
 P0 docs (this change)
      │
      ▼
-P1 schema surface ──────────────┬──────────────► P3 preprocessor produces
+P1 schema surface ──────────────┬──────────────► P3a/P3b preprocessor produces
   batch_capacity, pad_mask,     │                   ownership + validity values
   ownership content roles       │                          │
      │                          │                          │
-     ▼                          │                          │
-P2 validation                   │                          │
-  §3.1 rules 1-5, §4 rules 1-8  │                          │
+     ▼                          │                 P3c synthetic fixtures
+P2 validation                   │                   image + video encoder
+  §3.1 rules 1-6, §4 rules 1-8  │                          │
      └──────────────┬───────────┘                          │
                     └──────────────────┬───────────────────┘
                                        ▼
                           P4 interpreter grouped invocation
                             group build · broadcast · pad ·
-                            pack · invoke once · split
+                            pack · invoke once · split ·
+                            alias, never host round-trip
                                        │
                           ┌────────────┴────────────┐
                           ▼                         ▼
               P5 backend parity            P6 scheduler grouping
-                ORT ≡ native                 work-item queue,
-                                             max_rows / uniform_axes
+                ORT ≡ native, and             work-item queue,
+                native's grouped-             max_items / axis_budgets
+                execution answer              / uniform_axes
                           └────────────┬────────────┘
                                        ▼
                              P7 E2E + performance
@@ -739,8 +939,9 @@ P2 validation                   │                          │
   fixtures only; nothing reads the fields yet. Guard:
   `cargo test -p onnx-genai-metadata` including the committed-schema comparison.
 - **P2 — validation.** Implement [§3.1](#31-workflowcomponentbatch_capacity)
-  rules 1–5 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
-  negative fixture asserting the exact message. Depends on P1.
+  rules 1–6 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
+  negative fixture asserting the exact message — including a three-level packing
+  declaration, which is rejected for exceeding the depth bound. Depends on P1.
 - **P3 — preprocessor.** Two independent pieces, in this order.
   **P3a (items):** let the image adapter accept N encoded items and emit
   `item_offsets` / `item_owner`; unit tests over the offset and owner arithmetic
@@ -751,23 +952,44 @@ P2 validation                   │                          │
   emits `subitem_offsets` / `subitem_owner` plus a temporal validity mask. P3b
   needs no new *batching* concept; it is the modality vocabulary that makes the
   nested level producible. Depends on P1, not on P2.
+- **P3c (fixture):** a synthetic video-encoder workflow fixture generated by a
+  `scripts/build_tiny_*.py` script and checked in under
+  `tests/fixtures/onnx_genai_workflows/`, with tiny frames, deterministic
+  outputs, variable frame counts, variable clip counts, and both a
+  resolution-pinned and a resolution-agnostic variant
+  ([§6](#6-fail-closed-behavior-and-backward-compatible-defaults)). It gates P4's
+  video tests and every video row of the matrix, and it is what makes the
+  existing batch-invariance test unskippable in P5.
 - **P4 — interpreter.** Grouped invocation in the one interpreter: broadcast
   `shared`, pad where a `pad_mask` entry says to, pack where `token_packed` says
   to, invoke once, split results back through every declared ownership level,
   plus the [§4 rule 9](#4-strict-token_packed-validation) runtime precondition
-  checks. The default path stays one item per invocation. Key test: grouped
-  output equals sequential output row by row. Depends on P2 and P3a; the nested
-  split is exercised by P3b.
-- **P5 — backend parity.** Run P4's grouped invocation under ORT and under the
-  native backend through `WorkflowComponentBackend`; assert identical results and
-  identical rejection messages. Depends on P4.
+  checks. Group assembly and splitting follow the aliasing and residency rules in
+  [§5.1](#51-grouped-buffers-aliasing-residency-and-what-padding-costs): no host
+  round-trip for a device-resident item, splits as aliases where the span is
+  contiguous, and any unavoidable copy counted. The default path stays one item
+  per invocation. Key test: grouped output equals sequential output row by row.
+  Depends on P2, P3a, and P3c; the nested split is exercised by P3b.
+- **P5 — backend parity, and the native gate.** Run P4's grouped invocation under
+  ORT and under the native backend through `WorkflowComponentBackend`; assert
+  identical results and identical rejection messages. Until this phase passes,
+  native reports grouped execution as unsupported and therefore never receives a
+  group — the reported batch>1 vision crash
+  (`crates/onnx-genai-bench/src/bin/batch_vision.rs:122-123,243,250`) is not
+  something a serving path may discover at runtime. Passing includes repointing
+  `crates/onnx-runtime-session/tests/batch_vision_crash.rs` at the P3c fixture so
+  it stops skipping when a model file is absent. Depends on P4 and P3c.
 - **P6 — scheduler grouping.** A generic pending-work-item queue that forms
-  groups under `max_rows` and the `uniform_axes` compatibility predicate
-  ([§3.4](#34-worked-cases-images-video-audio-text)), with cancellation and
-  compaction while a group is in flight. Depends on P4; independent of P5.
+  groups under `max_items`, `axis_budgets`, and the `uniform_axes` compatibility
+  predicate ([§3.4](#34-worked-cases-images-video-audio-text)), with cancellation
+  and compaction while a group is in flight, and with declined groupings counted
+  so a missing win is distinguishable from an ineffective one. Depends on P4;
+  independent of P5.
 - **P7 — E2E and performance.** The full matrix in [§9](#9-e2e-acceptance-matrix)
   for both an image encoder and a video encoder, including grouped-versus-
-  sequential throughput on fixed hardware. Depends on P5 and P6.
+  sequential throughput on fixed hardware and the host-transfer counters from
+  [§5.1](#51-grouped-buffers-aliasing-residency-and-what-padding-costs). Depends
+  on P5 and P6.
 
 If P4 proves large — the split-by-owner path is the likeliest — it splits into
 "pad and broadcast" and "pack and split", in that order, since padding needs no
@@ -781,7 +1003,10 @@ Every row is an end-to-end test, not a unit assertion. "Solo" means the same
 item executed alone through the same package; per-row equality against solo is
 the correctness definition for every batching row. Rows 1–9 are modality-neutral
 and are run against both an image encoder and a video encoder; rows 10–15 pin the
-modality-specific geometry that motivated the design.
+modality-specific geometry that motivated the design; rows 16–20 cover the
+structural bounds, the memory path, and backend readiness. Every row runs on the
+synthetic checked-in fixtures from P3c — no downloaded weights, no sample media,
+no network in the test path.
 
 | # | Scenario | What it must prove | Gate |
 | --- | --- | --- | --- |
@@ -800,15 +1025,22 @@ modality-specific geometry that motivated the design.
 | 13 | **Nested ownership corruption.** `subitem_offsets` and `subitem_owner` corrupted in turn: an owner outside its clip, a non-monotonic inner offset, an inner total disagreeing with the outer extent. | Each case is a loud error naming value, level, index, and the two disagreeing facts — never a clamp or a partial split. | P4 |
 | 14 | **Mixed-modality serving.** Image items and video clips in flight for the same engine. | Grouping is per component, not per request; an image group and a video group are formed by the same code with no modality branch; per-row equality against solo. | P6 |
 | 15 | **A third modality reuses the path.** An audio (or text-segment) encoder declaring `batch_capacity` plus windows-in-rows ownership. | It batches with no new interpreter or scheduler code — the acceptance is that the diff is a fixture and a vocabulary, not a branch. | P6 |
-| 16 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed. Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |
+| 16 | **Depth bound.** A package declaring a value packed on three axes. | Rejected at load, naming the value and the packed axes; the two-level path is unaffected. | P2 |
+| 17 | **Right-padding enforced.** A mask whose `true` positions are not a leading run — an interior hole, and a left-padded item. | Both rejected before the invocation, naming the item, the axis, and the first offending position; no attempt to "handle" a hole. | P4 |
+| 18 | **Budgets bind independently.** Groups that hit `max_items` with few frames, and groups that hit an `axis_budgets` entry with few items (one long clip). | Both bounds are enforced separately; neither is inferred from the other; a decode-side row bound is never used as an item bound. | P6 |
+| 19 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
+| 20 | **Unproven backend declines, and says so.** Native reports grouped execution unsupported while ORT groups the same workload. | Outputs are identical between the two paths; native never receives a group; the decline is counted and attributable, not silent; no attempted grouped invocation on the unproven path. | P5 |
+| 21 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed and the padding overhead paid (padded elements as a fraction of real ones). Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |
 
-Row 16 follows the measurement protocol already used for batched decode
+Row 21 follows the measurement protocol already used for batched decode
 ([`NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md` §6](NATIVE_BATCH_DECODE_2B_IMPL_SCOPING.md)):
 report the mechanism-level counters and the achieved group sizes, never a bare
 wall-clock headline, and verify the device is idle before each run. Video is
 reported in frames/s *and* clips/s because a group of few long clips and a group
 of many short clips are different operating points that a single items/s number
-would blur.
+would blur, and padding overhead is reported next to them because a padded group
+can do several times the arithmetic of the packed group that produced the same
+answer.
 
 ---
 
@@ -816,9 +1048,12 @@ would blur.
 
 1. **Group-size choice.** The scheduler needs a policy for trading first-item
    latency against group occupancy. That is runtime policy and stays out of
-   metadata, but P6 should expose the chosen size so row 16 can attribute a
+   metadata, but P6 should expose the chosen size so row 21 can attribute a
    result. Video sharpens it: one long clip can exceed the useful work of a whole
-   image group, so the bound that matters may be total rows *and* total frames.
+   image group, which is why `axis_budgets` bounds parts as well as items
+   ([§3.5](#35-budgets-items-parts-and-request-rows-are-different-numbers)) —
+   what remains open is which of the two binds first under a given arrival
+   pattern, and that is measurement, not schema.
 2. **Cross-invocation reuse.** An encoder result declared
    `externally_suppliable`
    ([§10.2](INFERENCE_METADATA_DECISIONS.md#102-externally-suppliable-results))
@@ -832,10 +1067,14 @@ would blur.
    entry suffices — plausible for fixed-window speech encoders and fixed-frame
    video encoders, implausible for native-resolution image encoders — is decided
    per package, from its geometry, not decided here.
-4. **Naming of the nested level.** `subitem_offsets` / `subitem_owner` are
-   level-named on purpose so that clips-in-requests and frames-in-clips share one
-   rule. If a third nesting level ever appears, the naming should become
-   indexed rather than gaining a third bespoke prefix.
+4. **Naming of the nested level, and the depth cap.** `subitem_offsets` /
+   `subitem_owner` are level-named on purpose so that clips-in-requests and
+   frames-in-clips share one rule, and depth is capped at two
+   ([§4 rule 8](#4-strict-token_packed-validation)). If a workload ever genuinely
+   needs a third level, lifting the cap is a deliberate schema change and the
+   naming should become indexed rather than gaining a third bespoke prefix — the
+   cap exists so that decision is made on evidence rather than by a package
+   asserting depth into existence.
 5. **Where the frame-sequence producer lands.** P3b needs an input side that
    accepts an ordered frame sequence per clip; today the image path takes
    independent images and `temporal_patch_size` only replicates a frame
@@ -843,3 +1082,11 @@ would blur.
    Whether that is a new `preprocessing.video` program or a sequence-aware mode
    of the existing image program is a preprocessing decision, and it does not
    change any contract in this document.
+6. **When native's grouped-execution answer flips.** P5 gates it on parity
+   against the P3c fixture
+   ([§6](#6-fail-closed-behavior-and-backward-compatible-defaults)). What is not
+   yet known is whether the reported batch>1 vision crash is one defect or
+   several, and therefore whether the answer flips per component, per operator
+   set, or wholesale. Until it flips, native declines and ORT groups, and the
+   system is correct either way — which is the property that makes the unknown
+   affordable.
