@@ -366,6 +366,7 @@ whichever holder happened to be there at the end:
 | `unverified:<owner>` / `stale:<owner>` | held by an anchor whose liveness is unprovable, or provably gone |
 | `changed` | the window spans a change of custody; no single holder describes it |
 | `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
+| `unusable` | the lock could not exist here at all: no directory, and none creatable. Not `free` -- nobody declared the host **and nobody could have**, this row's peers included. The remedy is a working `lock_dir=` (see [Where the lock lives](#where-the-lock-lives)), not a retry |
 
 `run --owner leon -- ...` is enough: since #1929 `run` exports the declared
 owner into the wrapped command, so the obvious invocation is also the one that

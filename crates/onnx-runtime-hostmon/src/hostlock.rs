@@ -93,6 +93,19 @@ pub enum LockState {
     Unknown,
     /// Nobody holds it.
     Free,
+    /// Nobody holds it and nobody *can*: the lock directory does not exist and
+    /// cannot be created here, so on this host the declaration protocol is
+    /// unavailable.
+    ///
+    /// Distinct from [`Free`](LockState::Free) for the same reason
+    /// `hostlock.sh` grew its `UNUSABLE` state and exit 7: absent-because-idle
+    /// and absent-because-impossible are the same bytes on disk and opposite
+    /// facts about the host. Reporting the second as the first is a fail-open
+    /// -- a reader on a misconfigured box would stamp `host_lock=free` on every
+    /// row forever, and `free` reads as "nobody had declared the machine" when
+    /// the truth is "nobody could have, including the peer whose benchmark was
+    /// running alongside this one".
+    Unusable,
     /// Held, and the anchor process is provably alive.
     Held(LockHolder),
     /// Held, and liveness could not be established -- no anchor PID, no
@@ -115,7 +128,7 @@ impl LockState {
             LockState::Held(holder) | LockState::Unverified(holder) | LockState::Stale(holder) => {
                 Some(holder)
             }
-            LockState::Unknown | LockState::Free => None,
+            LockState::Unknown | LockState::Free | LockState::Unusable => None,
         }
     }
 }
@@ -129,6 +142,10 @@ pub enum LockField {
     /// without a declaration, which is worth knowing precisely because it is
     /// the state every unprotected run is in.
     Free,
+    /// The host cannot take the lock at all, so this row could not have been
+    /// protected and neither could anyone else's. Not `free`: the remedy is a
+    /// `lock_dir=` that works, not a retry.
+    Unusable,
     /// Held throughout by us -- the owner matched `HOSTLOCK_OWNER`.
     Mine(String),
     /// Held throughout by somebody else. Every number in this row was measured
@@ -152,6 +169,7 @@ impl fmt::Display for LockField {
         match self {
             LockField::Unknown => write!(f, "unknown"),
             LockField::Free => write!(f, "free"),
+            LockField::Unusable => write!(f, "unusable"),
             LockField::Mine(owner) => write!(f, "mine:{owner}"),
             LockField::Foreign(owner) => write!(f, "foreign:{owner}"),
             LockField::Held(owner) => write!(f, "held:{owner}"),
@@ -373,11 +391,99 @@ pub fn read() -> LockState {
         // such option, so it says it does not know.
         Err(_) => return LockState::Unknown,
     };
-    let meta_path = std::path::Path::new(&dir).join("meta");
+    state_at(&dir)
+}
+
+/// [`read`], for an already-resolved directory.
+///
+/// Split out so the ordering below is reachable from the differential test
+/// without setting `HOSTLOCK_DIR` on a shared process environment. The ordering
+/// is the load-bearing part and it mirrors `lock_state` in the script exactly:
+///
+/// 1. **A lock directory that exists wins.** Whether the box is *also*
+///    misconfigured is irrelevant once somebody has published a claim: the
+///    honest answer for a second participant is "held", not "your host is
+///    broken". A store that reported `unusable` here would relabel real
+///    contention as a config fault, which is how a peer's live benchmark gets
+///    walked over by someone off fixing their own machine.
+/// 2. Only when it is absent does the reason for the absence matter, and that
+///    is what [`dir_problem`] answers.
+#[cfg(target_os = "linux")]
+pub fn state_at(dir: &std::path::Path) -> LockState {
+    if !dir.is_dir() {
+        return match dir_problem(dir) {
+            Some(_) => LockState::Unusable,
+            None => LockState::Free,
+        };
+    }
     classify_io(
-        std::fs::read_to_string(&meta_path).map_err(|err| err.kind()),
+        std::fs::read_to_string(dir.join("meta")).map_err(|err| err.kind()),
         proc_info,
     )
+}
+
+/// Why a lock could not be created at `dir`, or `None` if one could.
+///
+/// The port of `lock_dir_problem` from the script, and it answers the same
+/// question the same way: not "is the lock directory writable" -- it does not
+/// exist yet -- but "can entries be created *beside* it". The script publishes
+/// by staging at a sibling and `mv -T`-ing it into place, so the permission
+/// that matters belongs to the nearest **existing ancestor**, which is where
+/// `mkdir -p` would start building.
+///
+/// Both bits are required and both have bitten this design once. A directory
+/// that is writable but not searchable (mode 0600) cannot hold entries at all
+/// -- `mkdir 0600-parent/sub` fails `EACCES` -- so a `-w`-only check passes a
+/// host on which nothing can be created.
+///
+/// `access(2)` is used rather than mode bits because the script's `test -w`
+/// resolves to `faccessat`: it accounts for uid, supplementary groups, ACLs and
+/// read-only mounts, and reimplementing that from `st_mode` would disagree with
+/// the writer on exactly the hosts where the answer is interesting. Note the
+/// shared blind spot, worth stating rather than discovering: `access` reports
+/// what the *kernel* permits, so a directory the caller may write but is
+/// forbidden to write by policy outside the filesystem reads as usable here and
+/// in the script alike.
+#[cfg(target_os = "linux")]
+pub fn dir_problem(dir: &std::path::Path) -> Option<String> {
+    if dir.exists() && !dir.is_dir() {
+        return Some(format!("{} exists and is not a directory", dir.display()));
+    }
+    let mut probe = dir.parent().unwrap_or_else(|| std::path::Path::new("."));
+    while !probe.exists() {
+        probe = match probe.parent() {
+            Some(parent) => parent,
+            None => std::path::Path::new("."),
+        };
+    }
+    if !probe.is_dir() {
+        return Some(format!("{} exists and is not a directory", probe.display()));
+    }
+    if !can_create_in(probe) {
+        return Some(format!(
+            "{} is not writable by uid {}",
+            probe.display(),
+            // SAFETY: `getuid` reads a field of the calling process's
+            // credentials. It cannot fail and takes no pointer.
+            unsafe { libc::getuid() }
+        ));
+    }
+    None
+}
+
+/// `test -w "$p" && test -x "$p"`, via the same syscall the shell uses.
+#[cfg(target_os = "linux")]
+fn can_create_in(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        // An interior NUL cannot name a path any syscall will accept, so
+        // nothing can be created there. Reporting it as usable would defer the
+        // failure to `mkdir` and blame the wrong thing.
+        return false;
+    };
+    // SAFETY: `c_path` is a NUL-terminated C string that outlives the call, and
+    // `access` only reads it.
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
 /// Nothing to read: liveness here depends on `/proc`, and there is no
@@ -547,6 +653,7 @@ pub fn field(before: &LockState, after: &LockState, self_owner: Option<&str>) ->
     match before {
         LockState::Unknown => LockField::Unknown,
         LockState::Free => LockField::Free,
+        LockState::Unusable => LockField::Unusable,
         LockState::Stale(holder) => LockField::Stale(holder.owner.clone()),
         LockState::Unverified(holder) => LockField::Unverified(holder.owner.clone()),
         LockState::Held(holder) => match self_owner.map(str::trim) {
@@ -1010,5 +1117,29 @@ mod tests {
         assert_eq!(reason(&a, &a).as_deref(), Some("acc0"));
         assert_eq!(reason(&a, &held("roy")), None);
         assert_eq!(reason(&LockState::Free, &LockState::Free), None);
+    }
+
+    /// The states a run may be certified under, and the states it may not, must
+    /// not print the same string. `free` and `unusable` are the pair worth
+    /// pinning: both mean "no lock was found", and only one of them means the
+    /// host was idle.
+    #[test]
+    fn an_unusable_host_does_not_print_as_a_free_one() {
+        assert_eq!(LockField::Free.to_string(), "free");
+        assert_eq!(LockField::Unusable.to_string(), "unusable");
+        assert_ne!(LockField::Unusable, LockField::Free);
+        assert!(!LockField::Unusable.is_protected());
+        assert_eq!(
+            field(&LockState::Unusable, &LockState::Unusable, Some("leon")),
+            LockField::Unusable,
+            "a name cannot certify a row on a host that has no lock to hold"
+        );
+        // A host that becomes usable mid-window changed custody in the only
+        // sense that matters: the second half could have been declared and the
+        // first half could not.
+        assert_eq!(
+            field(&LockState::Unusable, &LockState::Free, None),
+            LockField::Changed
+        );
     }
 }
