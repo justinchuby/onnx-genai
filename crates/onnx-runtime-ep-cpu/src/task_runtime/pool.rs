@@ -754,6 +754,20 @@ mod tests {
     /// that cost lands on a co-tenant, which is why this is worth a test rather
     /// than a comment.
     #[test]
+    // Miri makes the premise false rather than the assertion wrong. The test
+    // needs the spin phase to be short against the window -- 4096
+    // `spin_loop`s measure 128us natively against a 200ms window -- but under
+    // the interpreter those 4096 iterations and their strided `Instant::now()`
+    // calls outlast the window, so the yield phase is entered already expired
+    // and exits at yield 0. Both the strided and the every-yield form do that,
+    // so the test discriminates nothing there. It says so itself: the first CI
+    // run of this test failed under Miri on its own non-vacuity assertion
+    // ("left the yield phase after 0 yield(s) ... it is not a pass") rather
+    // than passing emptily, which is the behaviour that earned it this
+    // attribute instead of a silent green. Same reason as
+    // `workers_park_when_idle_and_wake_again` above: a wall-clock policy, not
+    // a memory-model one.
+    #[cfg_attr(miri, ignore = "spin-vs-window ratio is wall-clock, not emulated")]
     fn the_spin_window_deadline_is_evaluated_on_every_yield_not_on_a_stride() {
         /// Cost of one injected yield: the contended regime.
         const YIELD: Duration = Duration::from_millis(10);
