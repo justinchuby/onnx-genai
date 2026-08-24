@@ -67,6 +67,15 @@ pub struct InferenceMetadata {
     /// from tolerance of unknown keys. A producer that emits one is declaring
     /// that the package needs a reader which understands it, and a package that
     /// does not emit it keeps loading everywhere it loaded before.
+    ///
+    /// That is a statement about *additive* fields, and it is not a promise that
+    /// this schema never reshapes one it already had. It does, while it is
+    /// pre-release: `token_packed` moved its `offsets` and `owner` into a
+    /// `levels` chain in v1.1, and a document written against the flat spelling
+    /// does not load at any version. A version says which fields a reader must
+    /// understand; it is not a compatibility guarantee spanning a reshape, and
+    /// nothing here silently reads an old spelling as a new one. See
+    /// `reject_flat_token_packed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 

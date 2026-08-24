@@ -8,6 +8,15 @@
 //! newer document is reported as a typo. And a document has to declare the
 //! version whose fields it actually uses, or the comparison is made against a
 //! number that is not true.
+//!
+//! One limit on the first sentence, tested in `encoder_batching.rs` rather than
+//! here: it holds for fields that were *added*, not for a field that was
+//! reshaped. While this schema is pre-release a field may change shape outright
+//! — `token_packed` moved its ownership pair into a `levels` chain — and then a
+//! document using nothing new still does not load, because the spelling it uses
+//! is gone rather than merely older. That is a refusal naming the migration,
+//! never a silent reinterpretation, and it is not something a version number
+//! arbitrates.
 
 use onnx_genai_metadata::{
     INITIAL_SCHEMA_VERSION, SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, parse_metadata,

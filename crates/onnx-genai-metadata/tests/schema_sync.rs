@@ -97,6 +97,47 @@ fn generated_schema_preserves_all_root_constraints() {
     assert!(!serialized.contains("\"adapter_ids\""));
 }
 
+/// The published schema refuses the retired flat `token_packed` spelling, so a
+/// producer is not told its package is valid and then refused by the loader.
+///
+/// `token_packed` used to carry `offsets` and `owner` directly; it now carries a
+/// `levels` chain, and this is a reshape rather than an addition — the old
+/// spelling does not load at any declared version. The two readers of a document
+/// have to agree about that. `parser::reject_flat_token_packed` states it as an
+/// error naming the migration; the schema states it structurally, by requiring
+/// `levels` and admitting nothing else. This pins the second half, because a
+/// schema that merely omitted the retired keys while allowing extras would
+/// quietly bless a document the loader refuses.
+#[test]
+fn the_published_schema_agrees_that_the_flat_packed_spelling_is_gone() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&inference_metadata_schema_json().expect("schema serializes"))
+            .expect("generated schema is JSON");
+    let packed = schema["$defs"]["BatchLayout"]["oneOf"]
+        .as_array()
+        .expect("batch layout variants")
+        .iter()
+        .find(|variant| variant["properties"]["kind"]["const"] == "token_packed")
+        .expect("a token_packed variant");
+
+    assert_eq!(
+        packed["additionalProperties"],
+        serde_json::json!(false),
+        "the packed layout must not admit the retired keys as extras: {packed:#?}"
+    );
+    let required = packed["required"].as_array().expect("required list");
+    assert!(
+        required.contains(&serde_json::json!("levels")),
+        "the packed layout must require its ownership chain: {packed:#?}"
+    );
+    for retired in ["offsets", "owner"] {
+        assert!(
+            packed["properties"][retired].is_null(),
+            "the packed layout must not publish the retired `{retired}` key: {packed:#?}"
+        );
+    }
+}
+
 fn schema_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
