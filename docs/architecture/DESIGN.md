@@ -44,6 +44,13 @@ resources, device placement, and concurrency are generic services. Workflow valu
 declare active/done/accepted-length/slot data. Transfers are explicit and host code
 does not implement hidden reducers, scatter, append, scheduler, or sampler math.
 
+Grouping several independent items into one component invocation is the same kind
+of generic service, and is the one significant gap: the metadata vocabulary
+describes a packed encoder result, but no component declares a batching capacity
+and no runtime consumes a packed layout. The design of record — encoder-motivated,
+model-agnostic, with no model-specific booleans — is
+[ENCODER_BATCHING.md](../genai/ENCODER_BATCHING.md).
+
 ## Session concurrency
 
 Public session APIs are thread-safe, distinct sessions execute concurrently on a

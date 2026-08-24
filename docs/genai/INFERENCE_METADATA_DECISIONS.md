@@ -651,6 +651,122 @@ The decoder consumes encoder results through request-aligned splice descriptors
 splice is therefore correct under compaction for the same reason everything else
 is: it is request-aligned, so it permutes with its row.
 
+### 10.4 What §10.1 does not yet have
+
+[§10.1](#101-independent-encoder-batching) states the layout of a packed encoder
+result. It does not state whether a component may *see* more than one item in one
+invocation, and today nothing else does either:
+
+- `WorkflowComponent` declares no batching capacity, bound, or co-batching
+  precondition (`crates/onnx-genai-metadata/src/schema/ir.rs:697-724`);
+- `token_packed` has no runtime consumer outside this crate —
+  `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:67-72`),
+  so the interpreter's three request-axis call sites never see a packed value;
+- the image preprocessing adapter passes exactly one encoded item per invocation
+  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3084`), even though the
+  preprocessor underneath accepts many;
+- no declared preprocessing program can produce the `offsets`/`owner` pair that
+  `token_packed` names, because the content-role vocabulary has no entry for
+  either (`crates/onnx-genai-metadata/src/schema/mod.rs:293-303`);
+- validation checks nothing about `offsets`/`owner` beyond the serving-emit rule
+  in `validation.rs`, which accepts `request_aligned` or `token_packed` without
+  distinguishing them.
+
+The consequence of the last point is already visible: `ir.rs:52-53` calls
+`offsets` request-aligned, the canonical fixture declares it `shared`
+(`crates/onnx-genai-metadata/tests/redesign_invariants.rs:158-169`), and
+[§10.1](#101-independent-encoder-batching) describes it as a `cu_seqlens`-style
+`rows + 1` vector. Nothing rejects any of the three.
+
+### 10.5 Generic component batching — proposed
+
+**Status: proposed, not normative.** The requirement keywords in this subsection
+describe rules that are *not yet* schema fields or validator rules. The design of
+record, with the evidence, phasing, and acceptance matrix, is
+[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
+
+Vision encoders motivate the work; nothing about it is modality-specific. The
+proposed surface is three additions, each absent by default:
+
+```yaml
+components:
+  image_encoder:
+    implementation: { kind: onnx, artifact: vision.onnx }
+    batch_capacity:
+      axis: 0                # axis along which independent items stack
+      max_rows: 16           # correctness bound of the artifact, not a tuning knob
+      uniform_axes: [2]      # axes that must be equal across co-batched items
+    ports:
+      inputs:
+        pixel_values:
+          dtype: float32
+          rank: 3
+          shape: [items, patches, features]
+          batch_layout: { kind: token_packed, offsets: item_offsets,
+                          owner: item_owner, axis: 0 }
+          pad_mask: { value: patch_mask, axis: 1 }   # items may differ in patches
+```
+
+Grouping faces two independent kinds of raggedness: how many items a request
+owns, which `offsets`/`owner` answer along the item axis, and how far two items
+differ in extent, which a `pad_mask` (or a further packed axis) answers
+elsewhere. They are declared on different axes and never compete for one.
+
+- **`batch_capacity` absent means one request row per invocation** — today's
+  behavior exactly. A runtime **MUST NOT** group a component that has not
+  declared a capacity, and `max_rows` is an upper bound, never an obligation.
+- **`uniform_axes`** are the axes two items must agree on before they may share
+  an invocation. Every other axis is free, and a free axis **MUST** be reconciled
+  either by padding declared through `pad_mask` or by packing declared through
+  `token_packed` — a component that declares batchability without declaring how
+  raggedness is expressed is rejected at load.
+- **`pad_mask`** links a padded value to the `bool` value that says which entries
+  are real, so a runtime never fabricates padding it cannot describe. It is
+  mutually exclusive with packing *on the same axis*: padding and packing are two
+  answers to one question. It does not by itself make a component
+  padding-invariant — that remains the profile's `batch_invariance` declaration.
+- **`item_offsets` and `item_owner`** join the image (and, when needed, audio)
+  content-role vocabulary, so a declared preprocessing program can *produce* the
+  two values `token_packed` names. `item_owner` carries a row **position**, never
+  a request identity ([§8.3](#83-no-row-identity)).
+
+Ownership is unchanged in shape: metadata describes the bound, the preprocessor
+produces the per-item tensors and their packing metadata, the scheduler decides
+which pending items co-batch, the interpreter builds and splits the grouped
+invocation, and both backends execute it through the one component-execution
+seam with identical results.
+
+Grouping introduces **no new capability identifier**. A capability is a load-time
+promise that correct execution *requires* a behavior
+([§4.3a](#43a-capability-admission-and-complete-built-in-catalogue)); no
+package's correctness requires that its encoder be batched, so a runtime that
+ignores `batch_capacity` stays correct and an old runtime must not be made to
+refuse a package it can execute. This is the general direction: a fact the
+workflow structure already determines is not additionally serialized as a flag.
+
+### 10.6 Packed companions must validate — proposed
+
+**Status: proposed, not normative.** Full rules and their negative fixtures are
+in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-strict-token_packed-validation).
+In summary, a `token_packed` value's companions are checked at load: `offsets`
+and `owner` **MUST** resolve to declared values; `offsets` is `shared`, `int64`,
+rank 1, extent `rows + 1`; `owner` is `shared`, `int64`, rank 1, with the packed
+extent; `axis` is within the packed value's rank; two packed values sharing one
+`offsets` agree on the packed-extent symbol; a packed value declares no
+`pad_mask` **on the axis it packs**; and a packed emit publishes its companions
+as outputs.
+
+`offsets` is `shared` rather than `request_aligned` for a structural reason: an
+exclusive prefix sum is not permutation-followable. Permuting rows does not
+permute a prefix-offset vector, it invalidates it, so a runtime that changes the
+grouping recomputes `offsets` instead of gathering it. The doc comment at
+`ir.rs:52-53` is corrected when the rule lands.
+
+At execution the runtime verifies `offsets[0] == 0`, monotonicity,
+`offsets[rows] == packed_extent`, `owner[i]` in `[0, rows)`, and contiguity of
+each row's items, and reports a violation by naming the value, the index, and
+the two facts that disagree — never by clamping or by a best-effort split.
+
 ---
 
 ## 11. Cache correctness dependencies
@@ -1324,6 +1440,14 @@ and every declared output **MUST** carry a `TensorContract` compatible with the
 adapter port it binds to. A package **MAY** instead hand the server an
 already-featurized media tensor by declaring a `media` runtime input with the
 full contract and no program; there the input's own shape states the geometry.
+
+A program's outputs cannot currently state how several items pack together: the
+content-role vocabulary has no entry for per-item offsets or per-item ownership,
+so the `offsets`/`owner` pair that `token_packed` names
+([§8.2](#82-declared-layout-facts)) has no declared producer. The proposed
+`item_offsets` and `item_owner` roles close that gap — see
+[§10.5](#105-generic-component-batching--proposed) and
+[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request
 data**, not metadata. What metadata carries is everything needed to interpret
