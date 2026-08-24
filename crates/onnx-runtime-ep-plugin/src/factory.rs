@@ -122,6 +122,12 @@ unsafe fn init_host_api(
     // factory, so this is the one place that covers `export_ep_factories!`, the
     // CPU plugin's hand-written copy, and the shared-EP path alike. See
     // [`crate::pin`] for the hazard.
+    //
+    // The early returns above deliberately do *not* pin. On those paths the
+    // library published nothing ORT can reach, and an instrumented build's
+    // profile writer runs at unload rather than being left dangling, so there
+    // is nothing to protect -- while pinning would strand the mapping of a
+    // plugin that failed to load at all.
     crate::pin::pin_plugin_library();
     unsafe { set_host_api(api) };
     Ok(api)

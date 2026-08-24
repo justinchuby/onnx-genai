@@ -80,6 +80,16 @@ static PIN: OnceLock<PinOutcome> = OnceLock::new();
 /// reported through [`pin_outcome`] and to stderr rather than failing plugin
 /// load, because an unmap hazard at teardown is strictly better than an EP that
 /// refuses to load.
+///
+/// # Why [`PinOutcome::NotDynamicallyLoaded`] is silent
+///
+/// It is the correct and expected answer for every test binary that links these
+/// crates statically and calls `create_ep_factories*` directly, which is most of
+/// the plugin test suite. Warning there would train the reader to ignore the
+/// warning. The cost is that a *misdetection* under ORT would skip the pin
+/// quietly, so the production property is not left to this function's own
+/// reporting: `the_plugin_library_survives_unregister` asserts it end to end
+/// through real ONNX Runtime, from `/proc/self/maps`.
 pub fn pin_plugin_library() -> PinOutcome {
     *PIN.get_or_init(|| {
         let outcome = pin_once();
