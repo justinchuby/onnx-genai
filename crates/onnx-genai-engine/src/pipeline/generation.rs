@@ -1107,6 +1107,27 @@ fn test_decoder_runtime_inner(shape: TestWorkflowShape) -> anyhow::Result<Workfl
              or this fixture proves nothing about sessions"
         );
     }
+    if shape != TestWorkflowShape::Stateless {
+        // The lease and the capability are one statement, and the validator
+        // says so: a reader that cannot honour leased state must be able to
+        // see that it is being asked to. Both session shapes declare a lease,
+        // so both have to declare this.
+        workflow
+            .manifest
+            .capabilities
+            .insert("session_state_lease".to_string());
+        // `validate_generation_workflow` below is the engine's own loop
+        // validator, not the document validator, and nothing had ever asked
+        // these fixtures whether they are packages a real loader would accept.
+        // They were not: every session test in this crate was asserting
+        // runtime behaviour over a document shape `validate_pipeline_spec`
+        // refuses. A fixture that cannot be loaded is a weak premise for a
+        // test about what happens once it is.
+        onnx_genai_metadata::validate_pipeline_spec(&onnx_genai_metadata::PipelineSpec {
+            workflow: workflow.clone(),
+        })
+        .map_err(|error| anyhow::anyhow!("the fixture package must validate: {error:?}"))?;
+    }
     validate_generation_workflow(&workflow)?;
     let directory = onnx_genai_ort::PipelineModelDirectory {
         root: std::path::PathBuf::from("."),
