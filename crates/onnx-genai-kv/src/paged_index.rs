@@ -105,27 +105,39 @@ impl LatentCacheGeometry {
                 "latent_dim must be greater than zero".to_owned(),
             ));
         }
+        // The op treats `latent_dim` as the LATENT cache's `head_size`, which
+        // `check_q_k_latent` requires to be a multiple of 8.
+        if !self.latent_dim.is_multiple_of(8) {
+            return Err(KvError::LatentGeometryInvalid(format!(
+                "latent_dim ({}) must be a multiple of 8",
+                self.latent_dim
+            )));
+        }
         if self.v_head_size == 0 || self.v_head_size > self.latent_dim {
             return Err(KvError::LatentGeometryInvalid(format!(
                 "v_head_size ({}) must be in 1..=latent_dim ({})",
                 self.v_head_size, self.latent_dim
             )));
         }
-        if !self.rotary_dim.is_multiple_of(2) {
-            return Err(KvError::LatentGeometryInvalid(format!(
-                "rotary_dim ({}) must be even",
-                self.rotary_dim
-            )));
-        }
         // Mirror the op's rotary-cache contract: `rotary_dim = cos_cache.dims[1]
         // * 2` with `cos_cache.dims[1] % 8 == 0` (see `check_rotary_caches`), so
         // a non-zero rotary suffix is a multiple of 16. Reject a geometry the op
-        // would reject downstream rather than deferring the failure.
+        // would reject downstream rather than deferring the failure. `rotary_dim
+        // == 0` (no rotary) stays valid.
         if self.rotary_dim != 0 && !self.rotary_dim.is_multiple_of(16) {
             return Err(KvError::LatentGeometryInvalid(format!(
                 "rotary_dim ({}) must be a multiple of 16 (cos/sin cache last dim is rotary_dim/2 \
                  and must be a multiple of 8)",
                 self.rotary_dim
+            )));
+        }
+        // `check_inputs` requires `rotary_offset` to be a non-negative multiple
+        // of 8 (`rotary_offset % 8 == 0`). `rotary_offset` is unsigned here, so
+        // only the alignment needs checking.
+        if !self.rotary_offset.is_multiple_of(8) {
+            return Err(KvError::LatentGeometryInvalid(format!(
+                "rotary_offset ({}) must be a multiple of 8",
+                self.rotary_offset
             )));
         }
         if self.rotary_offset + self.rotary_dim > self.latent_dim {
@@ -496,5 +508,34 @@ mod tests {
             .validate(),
             Err(KvError::LatentGeometryInvalid(_))
         ));
+        // latent_dim must be a multiple of 8 (op treats it as head_size).
+        assert!(matches!(
+            LatentCacheGeometry {
+                latent_dim: 190,
+                ..base
+            }
+            .validate(),
+            Err(KvError::LatentGeometryInvalid(_))
+        ));
+        // rotary_offset must be a multiple of 8.
+        assert!(matches!(
+            LatentCacheGeometry {
+                rotary_offset: 4,
+                rotary_dim: 64,
+                ..base
+            }
+            .validate(),
+            Err(KvError::LatentGeometryInvalid(_))
+        ));
+        // rotary_offset 0 with a multiple-of-16 suffix is accepted.
+        assert!(
+            LatentCacheGeometry {
+                rotary_offset: 0,
+                rotary_dim: 64,
+                ..base
+            }
+            .validate()
+            .is_ok()
+        );
     }
 }

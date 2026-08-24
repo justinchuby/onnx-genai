@@ -2142,7 +2142,47 @@ time. That figure is now stale; the re-measurement replaces it.
 > [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
 > [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
 > [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md),
-> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md).
+> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md),
+> [`docs/benchmarks/2026-08-24-acc0-lowwidth-smt.md`](../benchmarks/2026-08-24-acc0-lowwidth-smt.md),
+> [`docs/benchmarks/2026-08-24-acc0-w16-clock-state.md`](../benchmarks/2026-08-24-acc0-w16-clock-state.md).
+>
+> **The t=2 `Percent of CPU` anomaly is retired (2026-08-24).** The old
+> 98 / 71 / 186 table at widths 1/2/4 had a t=2 cell below one core. Forcing
+> two workers onto one physical core was tested directly and costs 1.86x
+> throughput while leaving CPU-time at **200.0%** (vs 196.5% on two cores), so
+> SMT co-location cannot produce a sub-one-core reading -- it steals throughput
+> without stealing CPU-time, and the work-completed ratio 0.550 replicates an
+> independent scalar probe's 0.5505. Re-pointing the *retired instrument
+> itself* at current main reads **99 / 196 / 372**, with w=1 reproducing
+> exactly, so the anomaly was a property of an older tree, not of the
+> instrument. Neither the original wake-latency attribution nor the SMT
+> hypothesis survives; there is no anomaly left on this tree.
+>
+> Also recorded there: **decode width `w` builds `w - 1` `onnx-genai-spmd`
+> threads and runs the w-th lane on the dispatcher thread**, so any instrument
+> counting named worker threads is off by one.
+>
+> **Clock/boost state is excluded (2026-08-24).** This host has no direct clock
+> instrument -- no `cpufreq` sysfs, no vPMU (`perf stat -e cycles` reports
+> `<not supported>`), no readable MSR, and `/proc/cpuinfo` `cpu MHz` is a
+> constant 2870.7 in all 18 launches of both modes, i.e. nominal. None is
+> needed: a clock drop raises CPU-time per token by the *same* factor as wall
+> time, unlike SMT contention (wall up, CPU-time unchanged) or parking (wall
+> up, CPU-time down). Measured, wall/token ratio is **1.5225** while user
+> CPU/token ratio is **1.0250** -- 4.8% of the required inflation. REJECT.
+>
+> **Correction to the null record's sys reading.** That record reported the
+> slow mode as `+4.6% user, +170% sys` and I generalised the mode difference to
+> yield-loop time. In this run sys/token is flat to **2.4%** while wall is
+> +52%. Both runs are real; different slow launches were drawn. The statement
+> that holds in both is: **user CPU per token is flat between modes** (+2.5%
+> and +4.6%) while wall moves 1.5-1.7x, and in this run both user and sys are
+> flat, so the ~3.3 missing lanes are consuming no CPU at all rather than
+> spending longer in the kernel. The sys behaviour is not stable across slow
+> launches and is not carried as a mechanism until measured over several.
+>
+> **Weight-arena placement across the two L3/CCX domains is now the only live
+> candidate** for the straggler wait.
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
