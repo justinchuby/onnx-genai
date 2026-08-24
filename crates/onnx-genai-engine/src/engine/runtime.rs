@@ -2979,7 +2979,10 @@ mod tests {
     /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
-        interpreted_engine_inner(budget_bytes, false)
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestWorkflowShape::Stateless,
+        )
     }
 
     /// The same fixture over a package that declares session-scoped state.
@@ -2991,11 +2994,29 @@ mod tests {
     /// and the two differ in exactly one declared property.
     #[cfg(feature = "native-backend")]
     fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
-        interpreted_engine_inner(budget_bytes, true)
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestWorkflowShape::LoopCarriedSession,
+        )
+    }
+
+    /// An engine whose package carries its conversation as a prompt prefix,
+    /// which is the only shape whose turns cost more than the request states.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_conversation_engine_with_byte_budget(
+        budget_bytes: u64,
+    ) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(
+            budget_bytes,
+            crate::pipeline::generation::TestWorkflowShape::PromptPrefixConversation,
+        )
     }
 
     #[cfg(feature = "native-backend")]
-    fn interpreted_engine_inner(budget_bytes: u64, session_scoped: bool) -> anyhow::Result<Engine> {
+    fn interpreted_engine_inner(
+        budget_bytes: u64,
+        shape: crate::pipeline::generation::TestWorkflowShape,
+    ) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -3012,10 +3033,16 @@ mod tests {
             0,
         )?;
         Ok(Engine {
-            workflow: Box::new(if session_scoped {
-                crate::pipeline::generation::test_session_decoder_runtime()?
-            } else {
-                crate::pipeline::generation::test_decoder_runtime()?
+            workflow: Box::new(match shape {
+                crate::pipeline::generation::TestWorkflowShape::Stateless => {
+                    crate::pipeline::generation::test_decoder_runtime()?
+                }
+                crate::pipeline::generation::TestWorkflowShape::LoopCarriedSession => {
+                    crate::pipeline::generation::test_session_decoder_runtime()?
+                }
+                crate::pipeline::generation::TestWorkflowShape::PromptPrefixConversation => {
+                    crate::pipeline::generation::test_conversation_decoder_runtime()?
+                }
             }),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
@@ -3154,6 +3181,112 @@ mod tests {
              execution once an unbound loop value goes missing: {error}"
         );
         assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// A continuing turn is admitted for the conversation it carries, not just
+    /// for the tokens the request states.
+    ///
+    /// `generate_with_pipeline_callbacks` reuses the session's own scheduler id
+    /// when the request names a live workflow session, and mints a fresh one
+    /// otherwise. That choice is not bookkeeping: it is the whole input to the
+    /// carry lookup in `admit_interpreted_generate_request`, which adds
+    /// `session_prepended_prompt_len` only when the id it was handed is a
+    /// session it knows. Under a fresh id the carry silently reads 0 and turn N
+    /// of a conversation is admitted as though it were turn 1 -- verbatim the
+    /// under-reservation that function's own comment warns about, on exactly
+    /// the turns that need the most.
+    ///
+    /// Nothing caught that. Making the reuse arm unreachable
+    /// (`Some(id) if false && ...`) left the whole lib suite green, because the
+    /// only other test reaching this branch asserts a *refusal* -- and a
+    /// refusal arrives identically under a reused id and a fresh one.
+    ///
+    /// Both arms open a real session on one engine and differ **only** by
+    /// whether that session has heard anything. Not "session vs no session":
+    /// that would also change which branch runs, and a refusal could then be
+    /// blamed on the path rather than on the prefix. Holding the path fixed is
+    /// what makes the carried conversation the sole explanation for the
+    /// difference between them.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_continuing_turn_is_admitted_for_the_conversation_it_carries() -> anyhow::Result<()> {
+        // 10 B/token, so this budget holds 3 tokens. A turn stating 1 prompt
+        // token and 1 new token needs 2 of them and fits. The same turn on a
+        // session already holding 3 tokens needs 5 and cannot.
+        let mut engine = interpreted_conversation_engine_with_byte_budget(30)?;
+        assert!(!engine.holds_decode_core());
+
+        let fresh = engine.create_session()?;
+        let continuing = engine.create_session()?;
+        engine
+            .workflow
+            .seed_session_conversation(&continuing.to_string(), &[7, 8, 9])?;
+
+        // The seed has to be readable through the declaration the scheduler
+        // reads, or both arms would cost the same and this test would be
+        // pinning the budget rather than the carry.
+        assert_eq!(
+            engine
+                .workflow
+                .session_prepended_prompt_len(&continuing.to_string()),
+            3,
+            "the seeded conversation must be visible to the accounting under test"
+        );
+        assert_eq!(
+            engine
+                .workflow
+                .session_prepended_prompt_len(&fresh.to_string()),
+            0,
+            "a session that has heard nothing carries nothing"
+        );
+
+        let mut wrong = Vec::new();
+        for (label, session_id, refuse) in [
+            ("a session that has heard nothing", fresh, false),
+            ("a session holding 3 tokens", continuing, true),
+        ] {
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+
+            let mut admitted = false;
+            let mut on_admitted = || admitted = true;
+            let error = engine
+                .generate_in_workflow_session(session_id, request, Some(&mut on_admitted), None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            // The fixture's interpreted decoder cannot finish a generation, so
+            // the admitted arm still returns `Err`. Matching the admission
+            // refusal specifically is what keeps "was not refused" from being
+            // satisfied by any other failure.
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: a turn whose carried conversation exceeds the budget was \
+                     admitted; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a turn the budget has room for was refused: {error}"
+                )),
+                _ => {}
+            }
+            if admitted == refuse {
+                wrong.push(format!(
+                    "{label}: on_admitted() {} the scheduler {} this turn",
+                    if admitted {
+                        "fired although"
+                    } else {
+                        "stayed silent although"
+                    },
+                    if refuse { "refused" } else { "admitted" }
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         Ok(())
     }
 

@@ -925,7 +925,7 @@ fn loop_carried_cell_names(
 
 #[cfg(test)]
 pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(false)
+    test_decoder_runtime_inner(TestWorkflowShape::Stateless)
 }
 
 /// The same canonical decoder, declaring the conversation it carries.
@@ -945,11 +945,46 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
 /// unrelated fixtures.
 #[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
-    test_decoder_runtime_inner(true)
+    test_decoder_runtime_inner(TestWorkflowShape::LoopCarriedSession)
+}
+
+/// A package whose session carries the conversation as a **prompt prefix**.
+///
+/// The two fixtures above cover a package with no session state and one whose
+/// session state is loop-carried. Neither can express the third shape, and it
+/// is the one the scheduler charges for: a cell the workflow never reads,
+/// holding every token the session has seen, which the *request binding*
+/// prepends to each new turn's prompt. That is what makes turn N of a
+/// conversation cost turn N's prompt plus everything before it, and it is the
+/// only declaration `session_prepended_prompt_len` reads.
+///
+/// Loop-carried session state cannot substitute. `classify_session_state`
+/// reports one carrier per cell and reaches `PromptContinuation` first, but the
+/// validator refuses a cell that declares both -- "the lease and an SSA carry
+/// are two answers about the same value" -- so the continuation has to be its
+/// own cell, unread by any step. The doc on `SessionContinuation` names that as
+/// the intended shape rather than an oversight: a conversation the request
+/// binding carries has no reader inside the workflow.
+#[cfg(all(test, feature = "native-backend"))]
+pub(crate) fn test_conversation_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
+    test_decoder_runtime_inner(TestWorkflowShape::PromptPrefixConversation)
+}
+
+/// Which of the three declarable session shapes a test fixture should build.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestWorkflowShape {
+    /// All state invocation-scoped: every turn restarts.
+    Stateless,
+    /// The cells the loop threads are session-scoped, so turns continue.
+    LoopCarriedSession,
+    /// A session-scoped cell the workflow never reads, prepended to each turn's
+    /// prompt by the request binding.
+    PromptPrefixConversation,
 }
 
 #[cfg(test)]
-fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRuntime> {
+fn test_decoder_runtime_inner(shape: TestWorkflowShape) -> anyhow::Result<WorkflowRuntime> {
     let abi = onnx_genai_metadata::DecoderAbi {
         token_input: Some("input_ids".to_string()),
         logits_output: Some("logits".to_string()),
@@ -965,7 +1000,88 @@ fn test_decoder_runtime_inner(session_scoped: bool) -> anyhow::Result<WorkflowRu
     .map_err(|error| {
         anyhow::anyhow!("a minimal decoder is expressible as a workflow: {error:?}")
     })?;
-    if session_scoped {
+    if shape == TestWorkflowShape::PromptPrefixConversation {
+        // Every constraint below is one the validator enforces on a
+        // continuation, asserted here by construction rather than discovered as
+        // a validation failure with no explanation attached. `conversation` is
+        // deliberately absent from every step: a cell the request binding
+        // carries has no reader, and declaring both a lease and an SSA carry is
+        // refused outright.
+        const CONVERSATION_CELL: &str = "conversation";
+        let tokens = workflow
+            .inputs
+            .iter()
+            .find(|(_, input)| {
+                matches!(
+                    &input.role,
+                    onnx_genai_metadata::SemanticInputRole::Runtime { role, .. }
+                        if *role == onnx_genai_metadata::RuntimeInputRole::PromptTokens
+                )
+            })
+            .map(|(name, _)| name.clone())
+            .context("the canonical decoder workflow declares a prompt_tokens input")?;
+        let bound = workflow
+            .state
+            .values()
+            .find_map(|cell| match &cell.recurrence {
+                onnx_genai_metadata::ShapeRecurrence::Bounded { max, .. }
+                | onnx_genai_metadata::ShapeRecurrence::Growing { max, .. }
+                    if workflow.inputs.contains_key(max) =>
+                {
+                    Some(max.clone())
+                }
+                _ => None,
+            })
+            .context(
+                "a continuation's growth bound must name a declared workflow input, and this \
+                 fixture reuses the one the canonical decoder already declares",
+            )?;
+        let contract = workflow
+            .inputs
+            .get(&tokens)
+            .map(|input| input.contract.clone())
+            .context("the prompt_tokens input declares a contract")?;
+        anyhow::ensure!(
+            !loop_carried_cell_names(&workflow.steps).contains(CONVERSATION_CELL),
+            "a continuation cell must not also be loop-carried; the validator refuses a cell \
+             that declares both, so this fixture would fail to build rather than test anything"
+        );
+        workflow.state.insert(
+            CONVERSATION_CELL.to_string(),
+            onnx_genai_metadata::WorkflowStateCell {
+                // Tokens accumulate on the final axis, which is the axis the
+                // recurrence has to name for a rank-2 contract.
+                recurrence: onnx_genai_metadata::ShapeRecurrence::Bounded {
+                    axis: contract.rank.saturating_sub(1),
+                    max: bound,
+                },
+                contract,
+                class: onnx_genai_metadata::WorkflowStateClass::Semantic,
+                scope: onnx_genai_metadata::WorkflowStateScope::Session,
+                initializer: tokens.clone(),
+                management: onnx_genai_metadata::StateManagement::Runtime,
+                release_boundary: Some(onnx_genai_metadata::StateReleaseBoundary::Session),
+                service_group: None,
+                session: Some(onnx_genai_metadata::SessionLeaseContract {
+                    policy: onnx_genai_metadata::SessionMutationPolicy::Exclusive,
+                    ttl_seconds: None,
+                    optimistic_metadata_version: false,
+                    continuation: Some(onnx_genai_metadata::SessionContinuation::PromptPrefix {
+                        prompt_input: tokens,
+                        tokens_output: onnx_genai_metadata::decoder_workflow::TOKENS_OUTPUT
+                            .to_string(),
+                    }),
+                }),
+            },
+        );
+        let facts = onnx_genai_metadata::classify_session_state(&workflow);
+        anyhow::ensure!(
+            facts.prompt_continuation() == Some(CONVERSATION_CELL),
+            "the promoted cell must be the one `session_prepended_prompt_len` reads, or this \
+             fixture pins a carry the scheduler never charges for"
+        );
+    }
+    if shape == TestWorkflowShape::LoopCarriedSession {
         let carried = loop_carried_cell_names(&workflow.steps);
         anyhow::ensure!(
             !carried.is_empty(),
