@@ -891,23 +891,18 @@ impl Engine {
             GeneratePrompt::TokenRows(rows) => {
                 Ok(rows.iter().map(Vec::len).max().unwrap_or(0) * rows.len())
             }
-            // The package's tokenizer answers first, so a no-decode-core
-            // package gets exactly the count the interpreter will later
-            // produce. The fallback is for the case this path only started
-            // serving once tensor-bound requests began admitting here: a
-            // runtime that holds a decode core owns the tokenizer while its
-            // package may ship none, and refusing to admit such a request for
-            // want of an encoder the engine is holding would be the gate
-            // declining to do the one thing it needs a tokenizer for.
+            // The package's tokenizer and no other, because it is the one
+            // `run_declared_workflow_generation` will encode with: a count
+            // taken from a different vocabulary would gate the run on a length
+            // the run never produces. It is also why a package that ships none
+            // is refused here rather than admitted and failed at encode two
+            // frames later -- the two sites agree on when a text prompt is
+            // encodable, so the gate is the first thing to say so.
             GeneratePrompt::Text(text) => {
-                let tokenizer = self
-                    .workflow
-                    .package_tokenizer()
-                    .or(self.tokenizer.as_ref())
-                    .context(
-                        "this package declares a prompt_tokens input but ships no tokenizer, so a \
-                         text prompt cannot be encoded for it; supply token ids instead",
-                    )?;
+                let tokenizer = self.workflow.package_tokenizer().context(
+                    "this package declares a prompt_tokens input but ships no tokenizer, so a \
+                     text prompt cannot be encoded for it; supply token ids instead",
+                )?;
                 tokenizer
                     .encode(text)
                     .map(|ids| ids.len())
@@ -3329,25 +3324,38 @@ mod tests {
 
         // Both ways a request stops being prompt-only, because a fix that
         // admits bound tensors and forgets overrides leaves the same hole open
-        // through the other door.
+        // through the other door. The last arm is the other polarity: three
+        // refusals are equally consistent with a path that admits correctly and
+        // with one that refuses everything it cannot recognise, and only an arm
+        // that must be *accepted* tells those apart.
+        fn bound_tensor() -> anyhow::Result<onnx_genai_ort::Value> {
+            Ok(onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?)
+        }
         let arms = vec![
-            ("prompt-only (control)", over_budget_request()),
+            ("prompt-only (control)", 10u64, true, over_budget_request()),
             (
                 "one bound tensor",
-                over_budget_request().with_input(
-                    "pixel_values",
-                    onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?,
-                ),
+                10,
+                true,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
             ),
             (
                 "one component override",
+                10,
+                true,
                 over_budget_request().with_component_override("decoder", "decoder"),
+            ),
+            (
+                "one bound tensor, inside budget",
+                10_000,
+                false,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
             ),
         ];
 
         let mut wrong = Vec::new();
-        for (label, request) in arms {
-            let mut engine = interpreted_engine_with_byte_budget(10)?;
+        for (label, budget, refuse, request) in arms {
+            let mut engine = interpreted_engine_with_byte_budget(budget)?;
             assert!(!engine.holds_decode_core());
             let mut admitted = false;
             let mut on_admitted = || admitted = true;
@@ -3355,14 +3363,28 @@ mod tests {
                 .generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None)
                 .map(|_| String::from("<generation succeeded>"))
                 .unwrap_or_else(|error| error.to_string());
-            if !error.contains("scheduler admission failed: KV byte budget") {
-                wrong.push(format!(
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
                     "{label}: over-budget request was not refused at the door; got: {error}"
-                ));
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a request the budget has room for was refused: {error}"
+                )),
+                _ => {}
             }
-            if admitted {
+            // The callback reports the decision the scheduler made, so it fires
+            // exactly when the request was admitted -- never on a refusal, and
+            // never on a path that reached the workflow without asking.
+            if admitted == refuse {
                 wrong.push(format!(
-                    "{label}: on_admitted() fired with no admission decision behind it"
+                    "{label}: on_admitted() {} the scheduler {} this request",
+                    if admitted {
+                        "fired although"
+                    } else {
+                        "stayed silent although"
+                    },
+                    if refuse { "refused" } else { "admitted" }
                 ));
             }
         }
