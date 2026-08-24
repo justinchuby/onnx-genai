@@ -148,7 +148,13 @@ impl CoreTopology {
         let mut cpus: Vec<usize> = Vec::new();
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_str()?;
+            // Skip an unreadable entry rather than abandoning the walk: a `?`
+            // here would let one odd name in the directory return `None` for
+            // the whole machine, and `None` silently disables every placement
+            // assertion in this crate.
+            let Some(name) = name.to_str() else {
+                continue;
+            };
             let Some(index) = name.strip_prefix("cpu") else {
                 continue;
             };
@@ -705,6 +711,56 @@ mod tests {
             capped <= topology.core_count(),
             "cap {capped} exceeds {} physical cores",
             topology.core_count()
+        );
+    }
+
+    /// Non-vacuous on Linux, for the same reason as the Windows test above and
+    /// with more riding on it, because Linux is where the decode pool is
+    /// actually exercised in CI.
+    ///
+    /// Every placement assertion this crate added in #1805 reaches its subject
+    /// through `host()` returning `Some`: `placement_is_one_worker_per_physical_core`
+    /// opens with `host()?`, so it answers `None` when the topology is
+    /// undiscoverable, and each caller then skips. That includes the
+    /// `saw_placement_check` anti-vacuity guard in the width sweep, which is
+    /// itself written `if allowed_now >= 2 && core_topology::host().is_some()`.
+    /// So a detection regression to `None` would not fail anything -- it would
+    /// quietly convert the placement half of the decode-pool contract into a
+    /// no-op *and* silence the guard whose whole job is to say that happened.
+    ///
+    /// That is the #1792 shape one level down. #1792 was a pool reporting
+    /// `realized=16 as_requested` while running on half the cores it claimed;
+    /// this would be the check for it reporting nothing at all, which is
+    /// indistinguishable from the check passing. A label nothing can check is
+    /// a label that drifts, and a checker nothing can check is worse.
+    ///
+    /// This cannot be flaky on a real kernel. After the `to_str` fix in this
+    /// change, `detect_linux` returns `None` in exactly two cases: the sysfs
+    /// directory cannot be read at all, or it contains no `cpuN` entries. A CPU
+    /// exposing neither `core_cpus_list` nor `thread_siblings_list` still falls
+    /// back to being its own core, and entry names are kernel-generated ASCII,
+    /// so any host that can run this crate's decode pool yields a non-empty
+    /// topology. A Linux host with neither a readable `/sys` nor a `cpu0`
+    /// cannot run the pool this asserts about either.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_detection_succeeds_so_placement_checks_cannot_silently_skip() {
+        let topology = host().expect(
+            "Linux core-topology detection returned None, which silently turns every \
+             placement assertion in this crate into a no-op, including the anti-vacuity \
+             guard that exists to report exactly that",
+        );
+        assert!(topology.core_count() > 0, "no physical cores discovered");
+        // The discovered topology enumerates the machine, while
+        // `available_parallelism` reports the CPUs this process may use, so the
+        // former must cover the latter. A shortfall means the sysfs walk
+        // dropped CPUs, which understates the core count and lets the cap
+        // oversubscribe.
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!(
+            topology.logical_count() >= logical,
+            "topology covers {} logical CPUs but the process sees {logical}",
+            topology.logical_count()
         );
     }
 }

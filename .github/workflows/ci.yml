@@ -1008,6 +1008,23 @@ jobs:
       - name: Verify int4 MatMulNBits numerics oracle
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test matmul_nbits_marlin_oracle
 
+      # The safe-point rejection rules are pure predicate logic over
+      # ResizeSafePoint (no device). Same situation as the two targets above:
+      # the honesty checker deliberately does not police a non-_gpu target, and
+      # workspace_test_packages.py deny-lists this crate from every offline
+      # lane, so without this step the target would be compiled and never run
+      # (#1875).
+      - name: Verify granule transition safe-point rules
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test content_preserving_transition
+
+      # Non-`_gpu` targets in this crate run in no other lane: the honesty
+      # script skips them and workspace_test_packages.py deny-lists the crate
+      # from the offline lanes. Without this step the relocated CPU-only tests
+      # would compile and never execute, which is the failure they were moved
+      # out of `_gpu` targets to avoid.
+      - name: Verify expert route telemetry CPU oracle
+        run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
+
       - name: Clippy CUDA execution provider
         run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
 

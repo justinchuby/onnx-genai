@@ -1247,6 +1247,44 @@ require_ufloat() {
     esac
 }
 
+# `owner` travels in the `--oneline` provenance row, which is space-separated
+# `key=value` pairs that a consumer parses with awk. It is written by whichever
+# peer holds a shared fixed-path lock, so the text is not the reader's.
+#
+# `reason` was taken OUT of `--oneline` for exactly this reason. `owner` stayed
+# in as `held_by`, and it is the same free text with the same problem, only
+# earlier in the row:
+#
+#   $ hostlock.sh acquire --owner 'gaff hostlock_state=FREE declared=no'
+#   $ hostlock.sh provenance --oneline
+#   hostlock_state=HELD declared=yes held_by=gaff hostlock_state=FREE declared=no ...
+#
+# A last-wins awk parse -- the idiom this script's own documentation recommends
+# over the shell -- reads that row as FREE and undeclared. The row physically
+# says HELD. The two fields whose whole job is to disclose that the box is
+# claimed are the two an owner string can overwrite, and hostlock_state,
+# held_by and takeover were made to travel together precisely so that a row
+# could not misattribute itself.
+#
+# The benign case is the more likely one and fails the same way: `--owner
+# "gaff cpu team"` truncates held_by to `gaff` and injects the keys `cpu` and
+# `team` -- the HL_reason=moe truncation again, reassuring and wrong.
+#
+# A newline is worse than a space. publish_lock writes `owner=${OWNER}` into
+# the metadata file line by line, and meta_get is `sed -n "s/^key=//p" | head
+# -1`, so an embedded newline injects whole metadata keys and FIRST occurrence
+# wins -- the injected takeover= outranks the real one.
+#
+# So: an owner is a name. Restricting it to one is not a limitation, it is what
+# the field already meant.
+require_name() {
+    case "$2" in
+        '') die "$1 requires a non-empty name" ;;
+        *[!A-Za-z0-9_.-]*)
+            die "$1 takes a name of letters, digits, '_', '.' or '-' only, got: '$2' -- it is published in the provenance row as space-separated key=value pairs, where anything else can overwrite the fields that disclose whether the box is claimed" ;;
+    esac
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --reason | --owner | --timeout | --gate | --gate-timeout | --ttl | --pid | --on-gate-timeout | --expect-runnable | --expect-cores | --min-efficiency)
@@ -1260,6 +1298,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --owner)
             OWNER=${2:-}
+            require_name "$1" "$OWNER"
             shift 2
             ;;
         --wait)
@@ -1334,6 +1373,11 @@ while [ "$#" -gt 0 ]; do
         *) die "unknown option: $1" ;;
     esac
 done
+
+# The flag is validated at parse time for a precise message; this catches the
+# same text arriving through $HOSTLOCK_OWNER or a $USER with a space in it,
+# which reach the published row by exactly the same route.
+require_name "owner" "$OWNER"
 
 # `run` anchors to itself: that pid is exact and dies with the command on
 # every exit path, so it needs no expiry. `acquire` anchors to the invoking

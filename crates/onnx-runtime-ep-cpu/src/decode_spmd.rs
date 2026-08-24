@@ -154,10 +154,6 @@ pub const WORKER_PROFILE_ENV: &str = "ONNX_GENAI_CPU_DECODE_WORKER_PROFILE";
 /// pure spinning and only genuinely idle gaps ramp into yielding then parking.
 const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 
-/// Spin iterations between wall-clock checks, so `Instant::now()` (a vDSO read,
-/// ~20 ns) is amortised over the hot spin loop rather than read every iteration.
-const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
-
 /// How long [`SpmdDecodePools::build_with_schedule`]'s readiness barrier waits
 /// for every spawned worker to announce itself before declaring the pool
 /// unbuildable.
@@ -611,6 +607,21 @@ struct SharedState {
     /// at ~400 barriers per token is ~230 us/token of pure coherency traffic.
     dispatching: Padded<AtomicBool>,
     shutdown: AtomicBool,
+    /// Count of workers that have left [`worker_loop`] for good.
+    ///
+    /// The mirror of `ready`: `ready` makes "the workers have started" an
+    /// observable fact that `build` can block on, and this makes "the workers
+    /// have stopped" one that a teardown test can assert on. Without it the
+    /// only evidence of a completed teardown is the absence of thread names in
+    /// `/proc/self/task`, and a joined thread's entry lingers there for a short
+    /// window after `join` returns -- the futex that unblocks `join` is
+    /// signalled at `mm_release`, before the task is unhashed -- so an
+    /// assertion on that count is a race under load rather than an invariant.
+    /// This counter is ordered by the join itself and cannot lag it.
+    ///
+    /// One `fetch_add` per worker per process, so the cost is not on any path
+    /// that runs more than once.
+    workers_exited: AtomicUsize,
     /// Whether the per-worker ns timings are collected. Latched per *pool*, not
     /// per process (see [`parse_worker_profile`]), and immutable after build so
     /// every read is a plain load of a shared read-only word.
@@ -859,7 +870,28 @@ impl SharedState {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
-                if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= blocktime {
+                // Check the clock on *every* yield, not on a stride -- the same
+                // correction #1825 made to the readiness barrier below, which
+                // missed this site. The clock is never read during the pure
+                // spin phase here, so a stride amortised nothing: its only
+                // effect was to multiply the granularity of the blocktime
+                // deadline by 64 yields. `SPIN_LOOP_BUDGET` (4096) is itself a
+                // multiple of that removed 64-iteration stride, so the yield
+                // phase began exactly on a stride boundary -- the deadline was
+                // evaluated once, on the first yield, and then not again for 64
+                // more. A yield costs microseconds to milliseconds under
+                // contention, and contention is exactly when a worker holding a
+                // core past the window it was told to release at does the most
+                // damage. `Instant::now()` is a vDSO read against a yield that
+                // costs orders of magnitude more -- measured on this host,
+                // 32ns per read against 1214ns for an *uncontended*
+                // `yield_now`, i.e. 2.6%, and the fraction only shrinks as
+                // contention makes the yield slower. Checking every time is
+                // free exactly where it matters.
+                // With the stride gone this file has no clock-stride constant
+                // left: its only use was in the phase its own doc comment said
+                // it did not apply to.
+                if start.elapsed() >= blocktime {
                     break;
                 }
             }
@@ -1208,6 +1240,7 @@ impl SpmdDecodePools {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            workers_exited: AtomicUsize::new(0),
             profile_workers: worker_profile_enabled(),
             worker_counters: (0..total_threads)
                 .map(|_| Padded(WorkerCounters::default()))
@@ -1396,6 +1429,36 @@ impl SpmdDecodePools {
     /// Total decode workers across all node groups.
     pub fn total_workers(&self) -> usize {
         self.total_workers
+    }
+
+    /// How many *spawned* worker threads this pool has, excluding the inline
+    /// dispatcher shard.
+    ///
+    /// [`Self::total_workers`] counts compute participants, and the dispatching
+    /// thread is one of them whenever `reserve_single_group_headroom` keeps a
+    /// CPU free -- which is the common case on a fully-subscribed host, not a
+    /// corner. That participant runs its shard inline and never enters
+    /// [`worker_loop`], so it is not something teardown can join and not
+    /// something [`Self::workers_exited`] can ever count. This is the number to
+    /// compare an exit count against.
+    pub fn spawned_workers(&self) -> usize {
+        self.total_workers - usize::from(self.dispatcher_shard.is_some())
+    }
+
+    /// How many workers have left their loop for good.
+    ///
+    /// After [`Self::shutdown`] returns this equals [`Self::spawned_workers`],
+    /// because `shutdown` joins and a join happens-after the counted exit.
+    /// Deliberately *not* [`Self::total_workers`]: that includes the inline
+    /// dispatcher shard, which never runs [`worker_loop`] and so can never be
+    /// counted here. Before shutdown this is whatever has happened so far and
+    /// is only meaningful as "not all of them". Exists so that "teardown
+    /// finished" is assertable rather than inferred from thread names that
+    /// outlive the join.
+    pub fn workers_exited(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map_or(0, |shared| shared.workers_exited.load(Ordering::Acquire))
     }
 
     /// The CPU each spawned worker is *actually* pinned to, in global worker
@@ -2214,6 +2277,16 @@ impl Drop for WorkerCompletion<'_> {
 /// The persistent worker main loop: wait for a published op, run this worker's
 /// shard, acknowledge, repeat until shutdown.
 fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
+    /// Counts this worker out however it leaves -- including a panic unwind, so
+    /// a worker that dies mid-shard does not leave the pool permanently looking
+    /// as though it is still running one.
+    struct ExitCount<'a>(&'a SharedState);
+    impl Drop for ExitCount<'_> {
+        fn drop(&mut self) {
+            self.0.workers_exited.fetch_add(1, Ordering::Release);
+        }
+    }
+    let _exit_count = ExitCount(&shared);
     let node = shared.worker_node[global_index];
     // Track this node's sense line: 0 until the first op is published. Announce
     // readiness only after establishing the baseline; the dispatcher blocks in
@@ -2364,6 +2437,17 @@ pub struct DecodeWidth {
     /// width of the Rayon pool **the calling thread is on** -- meaningful inside
     /// `with_decode_pool_scope`, and the global width outside it. Same
     /// convention as [`crate::kernels::matmul_nbits::active_decode_worker_count`].
+    ///
+    /// This counts **compute participants**, which is the number a throughput
+    /// row should be labelled with. It is *not* the number of threads: on the
+    /// persistent pool one participant is the dispatching thread running its
+    /// shard inline, so the joinable-thread count is one lower whenever the
+    /// group is fully subscribed. Anything reading `/proc`, attributing thread
+    /// counts or joining at teardown wants
+    /// [`SpmdDecodePools::spawned_workers`] instead. Conflating the two is a
+    /// live hazard rather than a hypothetical one -- it produced an off-by-one
+    /// that passed on a 32-CPU host and would have failed every run on a
+    /// 2-core runner.
     pub realized: Option<usize>,
     /// The selected path, as [`decode_path_label`] reports it.
     pub path: &'static str,
@@ -4053,6 +4137,192 @@ mod tests {
              panicking while holding threads relocates the defect rather than \
              fixing it"
         );
+    }
+
+    /// Selects child mode for [`shutdown_join_child`].
+    #[cfg(target_os = "linux")]
+    const SHUTDOWN_JOIN_CHILD_ENV: &str = "ONNX_GENAI_TEST_SHUTDOWN_JOIN_CHILD";
+
+    /// Child half of [`shutdown_pools_is_a_barrier_not_a_request`].
+    #[test]
+    #[ignore = "child process driven by shutdown_pools_is_a_barrier_not_a_request"]
+    #[cfg(target_os = "linux")]
+    fn shutdown_join_child() {
+        if std::env::var(SHUTDOWN_JOIN_CHILD_ENV).is_err() {
+            return;
+        }
+        let built = pools().map_or(0, SpmdDecodePools::total_workers);
+        let spawned = pools().map_or(0, SpmdDecodePools::spawned_workers);
+        let threads_before = live_spmd_worker_threads();
+        shutdown_pools();
+        // Read immediately, with no polling and no sleep. Polling would test
+        // "the workers leave eventually", which is a weaker claim that a
+        // shutdown with no join also satisfies -- and the whole reason three
+        // child tests call this at exit is that "eventually" is not soon enough
+        // when the next thing the process does is tear down its C runtime.
+        let exited = pools().map_or(0, SpmdDecodePools::workers_exited);
+        let threads_after = live_spmd_worker_threads();
+        println!(
+            "spmd_built={built} spmd_spawned={spawned} spmd_exited={exited} \
+             spmd_threads_before={threads_before} spmd_threads_after={threads_after} \
+             spmd_avail={}",
+            std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get)
+        );
+    }
+
+    /// `shutdown_pools` must not return until the workers are gone.
+    ///
+    /// Three child processes (the parity child, the realized-width child and
+    /// the affinity-defer child) call this as their last act, and #1745 is a
+    /// `STATUS_ACCESS_VIOLATION` in exactly those children on Windows ARM64.
+    /// The remedy assumes shutdown is a *barrier*: if it merely asked the
+    /// workers to stop, the child would still be racing its own runtime
+    /// teardown against threads parked on an `Arc<SharedState>`, and the call
+    /// would be decoration.
+    ///
+    /// In a child process because `/proc/<pid>/task/*/comm` truncates at 15
+    /// bytes, so every SPMD worker of every pool reports the same name and a
+    /// concurrent test's pool is indistinguishable from this one's. A child owns
+    /// all of its threads, which makes the count exact. Same reasoning as
+    /// [`a_failed_build_leaves_no_workers_running`].
+    ///
+    /// The reference count is [`SpmdDecodePools::spawned_workers`], not
+    /// [`SpmdDecodePools::total_workers`]. The latter counts the inline
+    /// dispatcher shard, which never runs [`worker_loop`] and so is never
+    /// counted out -- an earlier version of this test compared against it and
+    /// failed on every fully-subscribed host, which is to say on a stock 2-core
+    /// CI runner, while the shutdown it was accusing was entirely correct.
+    ///
+    /// The assertion is on [`SpmdDecodePools::workers_exited`] rather than on a
+    /// thread count, and that choice was forced by evidence. The obvious
+    /// assertion -- zero `onnx-genai-spmd` threads left in `/proc/self/task` --
+    /// flaked here under load, because the futex that unblocks `join` is
+    /// signalled before the kernel unhashes the task, so a joined thread's
+    /// directory can still exist when the next statement runs. That is a race
+    /// in the *instrument*, and an intermittently-red teardown test would teach
+    /// exactly the wrong lesson about intermittently-red teardown. The counter
+    /// is incremented by the worker before it returns and therefore
+    /// happens-before the join that observes it. The thread counts are still
+    /// printed, but as a report, not an assertion.
+    ///
+    /// Dropping the join makes this *probabilistic* rather than
+    /// always-failing -- the workers do leave, just not before the next
+    /// statement -- so it is a falsifier with a measured catch rate rather than
+    /// a guaranteed one: **18 of 20 runs** on this host. The thread count would
+    /// have caught 20 of 20 in that same batch, and it is still the wrong
+    /// instrument: it also fails on a *correct* implementation, and a test that
+    /// is red for two different reasons cannot tell you which one it is. The
+    /// `built` count is asserted alongside so that a pass obtained by building
+    /// nothing cannot masquerade as a clean teardown.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
+    fn shutdown_pools_is_a_barrier_not_a_request() {
+        let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        // Two widths, because the two regimes fail differently. A width with
+        // headroom to spare spawns one thread per compute participant; a width
+        // that consumes the whole budget makes `reserve_single_group_headroom`
+        // hand one participant's shard to the dispatching thread inline, which
+        // is a participant that never enters `worker_loop` and can never be
+        // joined. An earlier version of this test compared the exit count
+        // against the participant count and so was wrong by exactly one in the
+        // second regime -- invisible on this 32-CPU host and a hard failure on
+        // a stock 2-core runner. Asking for the whole machine reproduces the
+        // second regime on any host wide enough to have one.
+        let mut saw_inline_shard = false;
+        for width in [8, available] {
+            saw_inline_shard |= shutdown_join_arm(width);
+        }
+        assert!(
+            saw_inline_shard || available < 4,
+            "no arm reached the inline-dispatcher-shard regime on a host \
+             reporting {available} CPUs, so the case that broke this test the \
+             first time went uncovered"
+        );
+    }
+
+    /// One width of [`shutdown_pools_is_a_barrier_not_a_request`]. Returns
+    /// whether this arm reached the inline-dispatcher-shard regime.
+    #[cfg(target_os = "linux")]
+    fn shutdown_join_arm(width: usize) -> bool {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("decode_spmd::tests::shutdown_join_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(SHUTDOWN_JOIN_CHILD_ENV, "1")
+            // Parked, not spinning. A worker still in its spin ramp would drift
+            // out on the stop flag alone, which would let a shutdown that never
+            // woke anyone pass; a parked worker can only leave if it is woken
+            // *and* waited for.
+            .env(DECODE_BLOCKTIME_ENV, "0")
+            .env(PERSISTENT_POOL_ENV, "1")
+            .env(
+                crate::kernels::matmul_nbits::DECODE_THREADS_ENV,
+                width.to_string(),
+            )
+            .env_remove(DECODE_SCHEDULE_ENV)
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        let output = cmd.output().expect("run shutdown-join child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let field = |key: &str| -> usize {
+            let needle = format!("{key}=");
+            stdout
+                .split_once(&needle)
+                .map(|(_, rest)| {
+                    rest.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|digits| digits.parse().ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "child never reported `{key}` at width {width}; stdout: \
+                         {stdout}\nstderr: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+        };
+        let built = field("spmd_built");
+        // Anti-vacuity: a child that spawned no worker thread would satisfy the
+        // teardown assertion for the least interesting reason there is.
+        let spawned = field("spmd_spawned");
+        if spawned == 0 {
+            // A host narrow enough to have no worker to join cannot exercise
+            // this property. That is an environment limit, not a pass -- but it
+            // is only allowed to be an environment limit on an environment
+            // narrow enough to explain it. On anything wider, a pool that
+            // spawned nothing is a defect and fails here rather than skipping.
+            let host = field("spmd_avail");
+            assert!(
+                host <= 2,
+                "width {width} spawned no worker threads on a host reporting \
+                 {host} CPUs, which no cpuset or headroom reservation explains: \
+                 stdout: {stdout}"
+            );
+            println!(
+                "SKIPPED (width {width}): {host} available CPU(s) left no \
+                 spawned worker to join (the child reported {built} compute \
+                 participant(s), none of them a spawned thread), so there is no \
+                 teardown to observe here"
+            );
+            return false;
+        }
+        assert!(
+            field("spmd_threads_before") > 0,
+            "width {width} spawned {spawned} worker thread(s) but none were \
+             visible in /proc before shutdown: stdout: {stdout}"
+        );
+        assert_eq!(
+            field("spmd_exited"),
+            spawned,
+            "shutdown_pools returned with decode workers still inside their \
+             loop at width {width}, so the call three child processes make \
+             before exiting does not actually wait for anything: stdout: \
+             {stdout}"
+        );
+        built > spawned
     }
 
     /// A worker that never announces must fail the build loudly, not spin.
@@ -6269,6 +6539,7 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            workers_exited: AtomicUsize::new(0),
             profile_workers: false,
             worker_counters: Vec::new(),
             dispatch_counters: Padded(DispatchCounters::default()),
@@ -6288,6 +6559,7 @@ mod dispatch_claim_tests {
             poisoned_worker: AtomicUsize::new(0),
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
+            workers_exited: AtomicUsize::new(0),
             profile_workers: false,
             worker_counters: vec![Padded(WorkerCounters::default())],
             dispatch_counters: Padded(DispatchCounters::default()),

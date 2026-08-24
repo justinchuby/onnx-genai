@@ -98,8 +98,11 @@ const MAX_SPIN: Duration = Duration::from_micros(500);
 /// Pure `spin_loop` iterations before a spinning worker starts yielding.
 const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 
-/// Spin iterations between wall-clock reads, so `Instant::now()` (~20 ns) is
-/// amortised rather than paid every iteration.
+/// Spin iterations between wall-clock reads *during the pure-`spin_loop` phase*,
+/// so `Instant::now()` (~20 ns) is amortised rather than paid every iteration.
+/// It deliberately does not gate the yield phase: a yield costs microseconds to
+/// milliseconds under contention, so a stride there would multiply the spin
+/// window's granularity by 64 yields of an already-starved thread (#1825).
 const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 
 /// Dispatcher spins between `yield_now` calls while waiting for stragglers.
@@ -395,11 +398,34 @@ impl Shared {
                 spins = spins.wrapping_add(1);
                 if spins < SPIN_LOOP_BUDGET {
                     std::hint::spin_loop();
+                    // The stride belongs here and only here: a `spin_loop`
+                    // iteration costs nanoseconds, so an unamortised
+                    // `Instant::now()` would dominate the phase. And the check
+                    // has to run here at all, because at the converged idle
+                    // window (`MIN_SPIN`, 20us) the deadline expires *before*
+                    // the spin phase ends: 4096 `spin_loop`s measure 128us on
+                    // this host.
+                    if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= spin_window {
+                        break;
+                    }
                 } else {
                     thread::yield_now();
-                }
-                if spins.is_multiple_of(CLOCK_CHECK_STRIDE) && start.elapsed() >= spin_window {
-                    break;
+                    // ...and must not apply here. A yield costs microseconds to
+                    // milliseconds under contention, so a stride of 64
+                    // multiplies the window's granularity by 64 yields of an
+                    // already-starved thread -- see #1825, which made this
+                    // correction in `decode_spmd`'s readiness barrier. It bites
+                    // whenever the window outlasts the spin phase, which is the
+                    // whole grown range: 4096 `spin_loop`s measure 128us on
+                    // this host, well under `MAX_SPIN` (500us), so every window
+                    // above the floor reaches the yield phase. `MAX_SPIN`'s
+                    // contract is that a process which stops inferencing
+                    // returns to ~0% CPU in under a millisecond; a
+                    // stride-gated check cannot honour that under exactly the
+                    // load that makes it matter.
+                    if start.elapsed() >= spin_window {
+                        break;
+                    }
                 }
             }
             if caught {
