@@ -236,7 +236,17 @@ never reaped, which still resolves in `/proc`. The same is true of the
 internal guard that serialises reclaiming, so there is no state a kill can
 leave that requires a human with `rm -rf`. If you want to see it before
 trusting it: `hostlock.sh status` distinguishes FREE / HELD / STALE /
-EXPIRED, and `provenance` prints who holds it and since when.
+EXPIRED / UNUSABLE, and `provenance` prints who holds it and since when.
+
+`UNUSABLE` is the answer that is neither "yours" nor "somebody else's": no
+lock can be **created** at the configured path on this host, so nobody here
+can participate. `status` names the reason (also `lock_dir_problem=` in
+`--porcelain`, always emitted and empty when there is none), and `acquire`,
+`wait` and `run` refuse with exit **7** — distinct from 1, because a
+misconfigured host is not a bad argument, and distinct from 2 and 3, which
+both assert that a peer holds the box. `run` refuses *without* running your
+command, which is the whole point: the failure it replaces was a host that
+reported `FREE`, ran the benchmark unlocked, and said nothing.
 
 ### Where the lock lives
 
@@ -249,6 +259,11 @@ a machine-local config, which every invocation by every agent reads:
 mkdir -p ~/.config/onnx-genai
 echo 'lock_dir=/var/lib/onnx-genai/hostlock' > ~/.config/onnx-genai/hostlock.conf
 ```
+
+You will be told when you need this rather than having to guess: on a host
+where the path cannot be created, `status` reports `UNUSABLE` with the reason
+and `acquire`/`run`/`wait` exit 7. Until that existed the same host reported
+`FREE` and ran unlocked.
 
 `$HOSTLOCK_DIR` also moves the path and is **not** the same thing: it is set per
 process, so it does not move your peers with you. It is a **private** lock. It

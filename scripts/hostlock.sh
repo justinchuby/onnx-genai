@@ -142,6 +142,11 @@
 #     wrapped command that exits 6 by itself, exactly as 5 collides with the
 #     gate: `run` multiplexes two status spaces onto one, and the `cpu ...
 #     verdict=` line, not the exit code, is what tells them apart.
+#   7 lock dir unusable -- no lock can be created at LOCK_DIR on this host, so
+#     the answer is neither "yours" nor "somebody else's". It is separate from
+#     1 because a misconfigured or unwritable host is not a bad argument and
+#     must not be retried as one, and separate from 2 and 3 because those two
+#     assert a peer holds the box. See lock_dir_problem.
 #
 # `run` otherwise does NOT use this table: it returns the wrapped command's
 # own status, so a command exiting 5 is indistinguishable from a gate failure.
@@ -922,8 +927,75 @@ publish_lock() {
 # reads STALE by the liveness test and BUSY by `acquire`, and of those two
 # the reassuring one is STALE: it tells a human the box is abandoned, and
 # they take it. Report what the tool will actually do.
+# Echo why no lock can be taken at LOCK_DIR and return 0; return 1 when one can.
+#
+# FREE is not a fact about the directory, it is a promise to the caller: "the
+# host is yours, go ahead". On a host where the lock cannot be CREATED that
+# promise is false, and until this existed `status` made it anyway -- printing
+# `FREE  (runnable=4)`, and `state=FREE` in porcelain, in bytes IDENTICAL to a
+# genuinely free and usable host. That is the same defect `warn_if_private`
+# was written for one level up (#1942): output that is not wrong about what it
+# measured, and silent about what it measured.
+#
+# It is not hypothetical here. This box's default lock_dir is under /tmp, and
+# at least one agent on it is under a hard prohibition on writing /tmp at all;
+# `acquire` failed for that agent with a raw `mkdir: Permission denied` and
+# exit 1 -- "usage/error", the code for a bad argument -- while `status` went
+# on saying FREE. An unattended harness reading either one proceeds unlocked,
+# which is precisely what the lock became mandatory to prevent.
+#
+# What is tested is the PARENT, never LOCK_DIR itself: publish_lock stages at
+# `${LOCK_DIR}.stage.$$`, a SIBLING, and renames it into place. A lock dir that
+# exists but is unwritable is therefore still perfectly publishable, and an
+# absent one whose parent is writable is fine too -- so the question is always
+# "can we create entries next to it", answered at the nearest ancestor that
+# exists, because `mkdir -p` will make the rest.
+#
+# `-w` lies under CAP_DAC_OVERRIDE, so root sees "usable" where a mortal would
+# not. That is the safe direction: it is exactly today's behaviour, and root
+# can in fact write there.
+lock_dir_problem() {
+    local p
+    if [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; then
+        printf '%s\n' "${LOCK_DIR} exists and is not a directory"
+        return 0
+    fi
+    case "$LOCK_DIR" in
+        */*) p=${LOCK_DIR%/*}; [ -n "$p" ] || p=/ ;;
+        *) p=. ;;
+    esac
+    while [ ! -e "$p" ]; do
+        case "$p" in
+            */*) p=${p%/*}; [ -n "$p" ] || p=/ ;;
+            *) p=. ; break ;;
+        esac
+    done
+    if [ ! -d "$p" ]; then
+        printf '%s\n' "${p} exists and is not a directory"
+        return 0
+    fi
+    if [ ! -w "$p" ] || [ ! -x "$p" ]; then
+        printf '%s\n' "${p} is not writable by $(id -un 2>/dev/null || echo "uid $(id -u 2>/dev/null)")"
+        return 0
+    fi
+    return 1
+}
+
+# Say the UNUSABLE part out loud, on stderr, wherever a caller was about to be
+# told the host is available. Three lines, because one is not enough to stop an
+# agent that has been told the lock is mandatory and has just read "free".
+explain_unusable() {
+    local problem=$1
+    echo "hostlock: UNUSABLE: ${problem}" >&2
+    echo "hostlock: no lock can be created at ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE}), so this host cannot participate." >&2
+    echo "hostlock: set lock_dir in ${HOSTLOCK_CONF_PATH} to a path you can write; do NOT run saturating benchmarks unlocked." >&2
+}
+
 lock_state() {
-    [ -d "$LOCK_DIR" ] || { echo FREE; return 0; }
+    if [ ! -d "$LOCK_DIR" ]; then
+        if lock_dir_problem >/dev/null; then echo UNUSABLE; else echo FREE; fi
+        return 0
+    fi
     # unverifiable_live_anchor is the class this tool cannot verify but can
     # SEE running. Routing it through the STALE arm made `status` say "is
     # gone" about a pid the reaper had just confirmed present -- the same
@@ -1100,6 +1172,22 @@ status_lock_dir_note() {
     return 0
 }
 
+print_free_or_unusable() {
+    local problem
+    if problem=$(lock_dir_problem); then
+        echo "UNUSABLE  ${problem}"
+        # Exactly one lock line either way: status_lock_dir_note prints it for
+        # every non-default source, and the default source is the case that
+        # needs it most -- /tmp is where this actually bites.
+        [ "$LOCK_DIR_SOURCE" = default ] && echo "  lock: ${LOCK_DIR} (${LOCK_DIR_SOURCE}, ${LOCK_SCOPE})"
+        echo "  no lock can be created here; this host cannot participate"
+        echo "  runnable=$(runnable_now)"
+        return 0
+    fi
+    echo "FREE  (runnable=$(runnable_now))"
+    return 0
+}
+
 cmd_status() {
     local legacy
     legacy=$(legacy_holder) || legacy="none"
@@ -1109,6 +1197,11 @@ cmd_status() {
         echo "lock_dir=${LOCK_DIR}"
         echo "lock_scope=${LOCK_SCOPE}"
         echo "lock_dir_source=${LOCK_DIR_SOURCE}"
+        # Always emitted, empty when there is none, so the key set does not
+        # change shape between hosts -- a consumer that has to test for a key's
+        # PRESENCE to learn the state is one `grep` away from reading absence
+        # as "fine", which is the failure this whole field exists to report.
+        echo "lock_dir_problem=$(lock_dir_problem || true)"
         echo "legacy_dir=$(legacy_consult_path)"
         echo "legacy_held_by=${legacy%% *}"
         if [ -d "$LOCK_DIR" ]; then
@@ -1121,7 +1214,7 @@ cmd_status() {
         return 0
     fi
     if [ ! -d "$LOCK_DIR" ]; then
-        echo "FREE  (runnable=$(runnable_now))"
+        print_free_or_unusable
         status_lock_dir_note "$legacy"
         return 0
     fi
@@ -1157,7 +1250,7 @@ cmd_status() {
         *)
             # lock_state saw no lock dir; it was released under us since the
             # test above. Report what is true now rather than a stale label.
-            echo "FREE  (runnable=$(runnable_now))"
+            print_free_or_unusable
             ;;
     esac
     status_lock_dir_note "$legacy"
@@ -1178,7 +1271,18 @@ abandon_lock() {
 }
 
 cmd_acquire() {
-    local deadline=$((SECONDS + TIMEOUT)) rc
+    local deadline=$((SECONDS + TIMEOUT)) rc problem
+    # Refuse BEFORE anything else, including the legacy consult. An acquire
+    # that cannot possibly publish must not spend --timeout looking busy: with
+    # --wait (which `run` always sets) the unusable host reported "timed out
+    # after 900s waiting for the lock", i.e. it blamed peers for contention
+    # that did not exist, and returned 3 -- a code whose documented meaning is
+    # that somebody else has the box. Distinct outcomes, or the label launders
+    # the fault.
+    if problem=$(lock_dir_problem); then
+        explain_unusable "$problem"
+        return 7
+    fi
     refuse_if_legacy_held || return $?
     while :; do
         if publish_lock; then
@@ -1325,7 +1429,14 @@ cmd_release() {
 }
 
 cmd_wait() {
-    local deadline=$((SECONDS + TIMEOUT))
+    local deadline=$((SECONDS + TIMEOUT)) problem
+    # An unusable lock dir is never HELD, so the loop below falls straight
+    # through and announces "free" -- the one word this caller is waiting to
+    # hear, on the one host where it cannot be true.
+    if problem=$(lock_dir_problem); then
+        explain_unusable "$problem"
+        return 7
+    fi
     # Wait only while somebody actually has a live claim. An EXPIRED lock is
     # one the next acquirer would take over, so blocking on it would disagree
     # with what `status` and `acquire` both say.
