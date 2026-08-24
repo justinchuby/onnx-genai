@@ -76,6 +76,37 @@ impl InferenceRegistry {
         self.handlers.values().map(Vec::len).sum()
     }
 
+    /// Every registered rule as `(domain, operator, min_opset)`, sorted.
+    ///
+    /// This is the full identity of the catalog — its keys and opset floors,
+    /// not its handler bodies — and the thing to pin. A swap of the
+    /// [`InferenceFn`] behind an unchanged triple is deliberately out of scope
+    /// here; that is what the behavioural rule tests cover. Neither count above
+    /// can see a change that preserves them:
+    ///
+    /// - a **rename** drops one key and adds another, so `operator_count` and
+    ///   `entry_count` both hold;
+    /// - an **opset move** rewrites an existing entry's `min_opset` in place,
+    ///   so `entry_count` holds too.
+    ///
+    /// Both are silent in production rather than loud: [`Self::get`] returns
+    /// `None` for a key it does not know *and* for a version below every
+    /// registration, and [`Self::infer_node`] treats `None` permissively —
+    /// outputs are left unknown and the model still runs.
+    pub fn operator_versions(&self) -> Vec<(&str, &str, u64)> {
+        let mut rules: Vec<(&str, &str, u64)> = self
+            .handlers
+            .iter()
+            .flat_map(|((domain, op), entries)| {
+                entries
+                    .iter()
+                    .map(move |(min_opset, _)| (domain.as_str(), op.as_str(), *min_opset))
+            })
+            .collect();
+        rules.sort_unstable();
+        rules
+    }
+
     /// Infer a single node's outputs.
     ///
     /// Returns one [`NodeIo`] per output slot. An unregistered op (or one whose
