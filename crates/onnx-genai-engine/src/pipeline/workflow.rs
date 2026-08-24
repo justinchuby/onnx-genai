@@ -33,21 +33,6 @@ impl Drop for ActiveAdapterContextGuard<'_> {
 /// constant.
 pub const MISSING_REQUIRED_INPUT: &str = "required workflow package input ";
 
-/// Prefix of the error a workflow raises when a session's conversation would
-/// exceed the bound the package declares for it.
-///
-/// A front end turns this into a request-level refusal rather than a server
-/// fault: the caller can shorten the turn, ask for fewer tokens, or start a new
-/// session, and none of those are things the server did wrong.
-pub const CONVERSATION_OVER_BOUND: &str = "session conversation exceeds its declared bound";
-
-/// True when `error`, or anything it wraps, is a conversation over its bound.
-pub fn is_conversation_over_bound(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains(CONVERSATION_OVER_BOUND))
-}
-
 /// True when `error`, or anything it wraps, is a required package input the
 /// request never supplied.
 pub fn is_missing_required_input(error: &anyhow::Error) -> bool {
@@ -627,12 +612,12 @@ impl<'a> SessionLeaseGuard<'a> {
         leases: &'a RefCell<std::collections::HashSet<String>>,
         session: &str,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            leases.borrow_mut().insert(session.to_string()),
-            "session {session} already has a turn in flight, and its workflow declares the \
-             conversation an exclusive lease; run the turns one after another so neither reads a \
-             conversation the other is about to replace"
-        );
+        if !leases.borrow_mut().insert(session.to_string()) {
+            return Err(crate::engine::PackageCapabilityError::SessionBusy {
+                session: session.to_string(),
+            }
+            .into());
+        }
         Ok(Self {
             leases,
             session: session.to_string(),
@@ -1185,14 +1170,17 @@ impl<'a> WorkflowExecutionPlan<'a> {
         {
             let bound = continuation_bound(cell, state, &values)?;
             let budget = request.options.max_new_tokens;
-            anyhow::ensure!(
-                conversation.len().saturating_add(budget) <= bound,
-                "{CONVERSATION_OVER_BOUND}: this turn would leave {} tokens ({} of conversation \
-                 and up to {budget} generated) and '{cell}' declares a bound of {bound}; reset or \
-                 close the session to start a new one, or ask for fewer tokens",
-                conversation.len() + budget,
-                conversation.len()
-            );
+            let reached = conversation.len().saturating_add(budget);
+            if reached > bound {
+                return Err(
+                    crate::engine::PackageCapabilityError::ConversationOverBound {
+                        cell: cell.to_string(),
+                        reached,
+                        bound,
+                    }
+                    .into(),
+                );
+            }
         }
         let input_aliases = workflow
             .inputs
@@ -1497,11 +1485,13 @@ impl<'a> WorkflowExecutionPlan<'a> {
                     // because a caller cannot cause it.
                     let bound = continuation_bound(cell, state, &values)?;
                     if conversation.len() > bound {
-                        anyhow::bail!(
-                            "{CONVERSATION_OVER_BOUND}: this package published more tokens than \
-                             the turn was admitted for, leaving a conversation of {} tokens \
-                             against a declared bound of {bound} on '{cell}'",
-                            conversation.len()
+                        return Err(
+                            crate::engine::PackageCapabilityError::ConversationOverBound {
+                                cell: cell.to_string(),
+                                reached: conversation.len(),
+                                bound,
+                            }
+                            .into(),
                         );
                     }
                     let shape = match state.contract.rank {

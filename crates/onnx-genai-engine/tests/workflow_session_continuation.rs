@@ -58,6 +58,27 @@ fn copy_package(destination: &Path) -> anyhow::Result<()> {
     copy_tree(&decoder_package(), destination)
 }
 
+/// Narrow only the conversation's own bound.
+///
+/// Narrowing `package.max_context` would narrow the cache cells with it and
+/// prove nothing about the conversation's bound.
+fn narrow_the_conversation_bound(root: &Path, limit: i64) -> anyhow::Result<()> {
+    let metadata = root.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
+    let declared: serde_yaml::Value = serde_yaml::from_str(&format!(
+        "contract: {{ dtype: int64, rank: 1, shape: [1] }}\nrole: {{ kind: opaque }}\nsource:          {{ kind: literal }}\nrequired: false\ndefault: {limit}\n"
+    ))?;
+    document["pipeline"]["workflow"]["inputs"]
+        .as_mapping_mut()
+        .expect("workflow declares inputs")
+        .insert("package.conversation_limit".into(), declared);
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        serde_yaml::Value::String("package.conversation_limit".into());
+    std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
+    Ok(())
+}
+
 fn tokens(ids: &[u32], max_new_tokens: usize) -> GenerateRequest {
     GenerateRequest {
         prompt: GeneratePrompt::TokenIds(ids.to_vec()),
@@ -313,22 +334,9 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
     let metadata = scratch.join("inference_metadata.yaml");
     let mut document: serde_yaml::Value =
         serde_yaml::from_str(&std::fs::read_to_string(&metadata)?)?;
-    // Only the conversation's bound is narrowed. Narrowing `package.max_context`
-    // would narrow the cache cells with it and prove nothing about this check.
-    let limit: serde_yaml::Value = serde_yaml::from_str(
-        "contract: { dtype: int64, rank: 1, shape: [1] }\n\
-         role: { kind: opaque }\n\
-         source: { kind: literal }\n\
-         required: false\n\
-         default: 6\n",
-    )?;
-    document["pipeline"]["workflow"]["inputs"]
-        .as_mapping_mut()
-        .expect("workflow declares inputs")
-        .insert("package.conversation_limit".into(), limit);
-    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
-        serde_yaml::Value::String("package.conversation_limit".into());
-    std::fs::write(&metadata, serde_yaml::to_string(&document)?)?;
+    let _ = &mut document;
+    drop(document);
+    narrow_the_conversation_bound(&scratch, 6)?;
 
     let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
     let session = engine.create_session()?;
@@ -602,4 +610,74 @@ fn a_group_lease_is_bound_at_its_port_and_must_have_a_reader() -> anyhow::Result
         "expected the missing-reader refusal, got {reported:?}"
     );
     Ok(())
+}
+
+/// A turn that fails hands back everything it took, so the next one is not
+/// refused for it.
+///
+/// Two things are released on the error path and neither has an observable of
+/// its own: the session's exclusive lease, which a later turn would be refused
+/// by name for, and the scheduler reservation #1900 added for the interpreted
+/// path, which a later turn would be refused admission for. A refusal followed
+/// by a success is falsified by leaking either, which is what makes this the
+/// test for both.
+#[test]
+fn a_failed_turn_releases_its_lease_and_its_reservation() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("released_after_failure_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    narrow_the_conversation_bound(&scratch, 6)?;
+
+    let mut engine = Engine::from_dir(&scratch, EngineConfig::default())?;
+    let session = engine.create_session()?;
+    // Four prompt tokens and two generated leaves the conversation at the bound.
+    engine.generate_in_session(session, tokens(&[2, 4, 6, 3], 2))?;
+    assert_eq!(engine.session_token_count(session)?, 6);
+
+    // This turn is refused, after taking a lease and a reservation.
+    let refused = engine
+        .generate_in_session(session, tokens(&[5, 7], 2))
+        .expect_err("a turn past the declared bound must be refused");
+    let capability = onnx_genai_engine::package_capability_error(&refused)
+        .expect("the refusal is typed, so a front end never reads its wording");
+    assert!(
+        matches!(
+            capability,
+            onnx_genai_engine::PackageCapabilityError::ConversationOverBound { bound: 6, .. }
+        ),
+        "{capability:?}"
+    );
+    assert!(
+        !capability.is_retryable(),
+        "the same request against the same conversation will not start succeeding"
+    );
+
+    // The conversation is untouched, and the next turn runs — which it could not
+    // if the failed turn had kept either the lease or the reservation.
+    assert_eq!(engine.session_token_count(session)?, 6);
+    engine.reset_session(session)?;
+    let after = engine.generate_in_session(session, tokens(&[5, 7], 2))?;
+    assert_eq!(after.token_ids.len(), 2);
+    assert_eq!(engine.session_token_count(session)?, 4);
+    Ok(())
+}
+
+/// A busy session is the other capability refusal, and it is retryable.
+///
+/// The lease is what makes `policy: exclusive` true rather than assumed. Its
+/// variant is separated from the others because the answer a caller should get
+/// is different: the same request succeeds once the turn in flight finishes.
+#[test]
+fn a_busy_session_is_a_retryable_capability_refusal() {
+    let busy = onnx_genai_engine::PackageCapabilityError::SessionBusy {
+        session: "shared".to_string(),
+    };
+    assert!(busy.is_retryable());
+    assert!(busy.to_string().contains("already has a turn in flight"));
+
+    let error: anyhow::Error = busy.into();
+    assert!(matches!(
+        onnx_genai_engine::package_capability_error(&error),
+        Some(onnx_genai_engine::PackageCapabilityError::SessionBusy { .. })
+    ));
 }

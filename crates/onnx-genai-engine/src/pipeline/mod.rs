@@ -44,9 +44,8 @@ pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
 pub use workflow::{
-    CONVERSATION_OVER_BOUND, MISSING_REQUIRED_INPUT, WorkflowExecutionPlan,
-    WorkflowPerformanceDiagnostic, is_conversation_over_bound, is_missing_required_input,
-    workflow_carries_session_state,
+    MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
+    is_missing_required_input, workflow_carries_session_state,
 };
 pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
 
@@ -1026,6 +1025,31 @@ impl WorkflowRuntime {
     pub(crate) fn session_conversation_len(&self, session_id: &str) -> Option<usize> {
         self.session_conversation(session_id)
             .map(|conversation| conversation.len())
+    }
+
+    /// Tokens this runtime will put in front of the next turn's prompt.
+    ///
+    /// Only a `prompt_prefix` continuation prepends anything: it is the one
+    /// carrier whose mechanism *is* the prompt binding, so the tokens it holds
+    /// are prefilled again on every turn and are part of what the next request
+    /// costs. A loop carry or a state service group hands its lease back inside
+    /// the graph — the tokens it represents are already in a cache, not in front
+    /// of the prompt — so nothing is prepended and this is zero.
+    ///
+    /// Answered from the typed classification rather than from "does this
+    /// session hold a conversation", because those are different questions and
+    /// only this one is a length a caller's request will be charged for.
+    pub(crate) fn session_prepended_prompt_len(&self, session_id: &str) -> usize {
+        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
+        let Some(cell) = facts.prompt_continuation() else {
+            return 0;
+        };
+        self.workflow_session_state
+            .borrow()
+            .get(&(session_id.to_string(), cell.to_string()))
+            .and_then(|value| value.to_vec_i64().ok())
+            .map(|tokens| tokens.len())
+            .unwrap_or(0)
     }
 
     /// The tokens a session's declared conversation holds, oldest first.

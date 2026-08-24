@@ -849,7 +849,17 @@ impl Engine {
         prompt: &GeneratePrompt,
         max_new_tokens: usize,
     ) -> anyhow::Result<(Option<GenerationBudgetCap>, usize)> {
-        let prompt_tokens = self.interpreted_prompt_token_count(prompt)?;
+        // What this request costs is its prompt plus whatever the runtime will
+        // put in front of it, which for a package continuing its conversation by
+        // prepending is every earlier turn. Admitting on the request alone
+        // under-reserves for exactly the turns that need the most.
+        let carried = if self.workflow_sessions.contains_key(&session_id) {
+            self.workflow
+                .session_prepended_prompt_len(&session_id.to_string())
+        } else {
+            0
+        };
+        let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens,
@@ -1736,6 +1746,40 @@ impl Engine {
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::token_count(&OrtSessionsRef(self), session_id)
+    }
+
+    /// Tokens this session will put in front of the next turn's prompt.
+    ///
+    /// This is what a front end has to add to a request's own prompt length
+    /// before it enforces a context limit, admits a budget, or reports
+    /// `usage.prompt_tokens` — and it is **zero** for every session that does
+    /// not prepend anything, which is most of them:
+    ///
+    /// * a decode core reuses its KV against the conversation the client
+    ///   resends, so the request already carries every token that will be
+    ///   prefilled and adding the session's retained count would charge each
+    ///   turn twice;
+    /// * a loop-carried or group-held lease is handed back inside the graph, so
+    ///   the tokens it stands for live in a cache rather than in front of the
+    ///   prompt.
+    ///
+    /// Only a package declaring a `prompt_prefix` continuation prepends, and
+    /// that is read from the typed carrier classification rather than from
+    /// whether a session happens to hold state.
+    pub fn session_prefill_carry(&self, session_id: SessionId) -> anyhow::Result<usize> {
+        if self.holds_decode_core() {
+            // Resolved through the same accessor a caller would use, so an
+            // unknown id is reported as one rather than answered with a zero.
+            self.session_token_count(session_id)?;
+            return Ok(0);
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        Ok(self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string()))
     }
 
     /// The tokens a session's conversation holds, oldest first.

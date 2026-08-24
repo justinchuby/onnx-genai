@@ -1544,6 +1544,43 @@ decoder, and requiring a declaration nothing reads would be noise.
 
 ---
 
+### 18.2 Session state: what tightened, and what it rejects
+
+`scope: session` used to validate on its own. It now has to say **how the next
+invocation reaches what the lease keeps** (§12.5a), because a lease nothing
+carries is written back on every pass and read by nothing — the package
+advertises a conversation that silently restarts every turn.
+
+A document that validated before and does not now is one of these. None is a
+rename; each is a statement the document was missing.
+
+| Rejected | Why | Fix |
+| --- | --- | --- |
+| a **semantic** session cell that no loop carries, no state service group holds, and whose lease names no `continuation` | nothing reaches the kept value | carry it in the loop, bind it to a group, or declare `session.continuation` |
+| a session cell naming a `service_group` the document does not declare | the lease has nothing to hold | declare the group, or drop `service_group` |
+| a session cell whose group declares no alias for it | same | add the alias, with `input` and `output` ports |
+| a group-only-carried cell whose alias declares no `output` port | the lease could be read and never advanced, so every turn replays the first | declare the port that advances the state |
+| a group-only-carried cell whose alias `input` port no step binds | the lease would have no reader | invoke the component binding that port |
+| a group-only-carried cell whose alias `input` port is bound to a value a step produces | the step would overwrite the lease | bind a workflow input, or carry the cell in the loop |
+| a `session.continuation` that is not `scope: session`, `class: semantic`, `management: runtime`, `release_boundary: session`, growing on the final axis, or is also loop-carried | the contract contradicts itself | see §12.5a |
+| a `session.continuation` whose `recurrence.max` names anything but a declared input with a value | the bound could not be read before the turn that would exceed it | name a required input, or an optional one with a default |
+| two `session.continuation` cells in one workflow | a package has one conversation | keep one |
+
+**Advisory session state is exempt** from the reachability rule: it is droppable
+by declaration, so a lease nothing reads costs correctness nothing.
+
+Runtime behaviour changed alongside it, for packages rather than documents:
+
+* a package that publishes a `tokens` output and declares no session state at all
+  still **loads and generates**, but `create_session` refuses it — typed, so a
+  server answers 409 rather than 500. Stateless generation is untouched;
+* a package that publishes no token stream is unaffected and keeps its session
+  handle;
+* `session_token_count` means the same thing on every backend (§12.5a), and only
+  a `prompt_prefix` continuation contributes to what a turn is *prefilled* with —
+  a decode core reuses its KV against the conversation the client resends, and a
+  loop or group lease lives in a cache rather than in front of the prompt.
+
 ## 19. Invariants
 
 A conforming document satisfies all of these. Each is validator-enforced, and

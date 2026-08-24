@@ -389,9 +389,9 @@ struct ErrorBody {
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
-    status: StatusCode,
-    message: String,
-    kind: &'static str,
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    pub(crate) kind: &'static str,
     retry_after_secs: Option<u64>,
 }
 
@@ -413,12 +413,28 @@ pub(crate) enum CompletionGeneration {
         options: GenerateOptions,
     },
 }
+/// `error.type` for a request the loaded package cannot serve as asked.
+///
+/// A distinct kind so a client can tell "this package will never do that" from
+/// "the server broke", which a shared `server_error` hid.
+pub(crate) const PACKAGE_CAPABILITY_ERROR_KIND: &str = "package_capability_error";
+
 impl ApiError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             kind: "server_error",
+            retry_after_secs: None,
+        }
+    }
+
+    /// A request the loaded package cannot serve, and no retry will change.
+    fn capability_bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+            kind: PACKAGE_CAPABILITY_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -450,11 +466,16 @@ impl ApiError {
         }
     }
 
+    /// The caller and the loaded package disagree about what was asked for.
+    ///
+    /// Not `server_error`: nothing failed, and a client that retries the same
+    /// request against the same package gets the same answer. The kind is what
+    /// a client branches on, so it names the disagreement rather than a fault.
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
-            kind: "server_error",
+            kind: PACKAGE_CAPABILITY_ERROR_KIND,
             retry_after_secs: None,
         }
     }
@@ -492,7 +513,7 @@ pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     }
 }
 
-fn generation_failure(error: DriverFailure) -> ApiError {
+pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
     match error.kind {
         DriverFailureKind::MemoryOverload => {
             tracing::warn!(
@@ -500,6 +521,18 @@ fn generation_failure(error: DriverFailure) -> ApiError {
                 "generation rejected by the KV memory governor"
             );
             ApiError::too_many_requests(MEMORY_OVERLOAD_MESSAGE)
+        }
+        // The caller asked this package for something it cannot serve as asked.
+        // A conversation past its declared bound is a request that is too large
+        // and the caller can shorten; a busy session is a conflict that the same
+        // request succeeds at once the turn in flight finishes. Both are read
+        // off the engine's own type, so neither status depends on wording.
+        DriverFailureKind::PackageCapability(capability) => {
+            if capability.is_retryable() {
+                ApiError::conflict(capability.to_string())
+            } else {
+                ApiError::capability_bad_request(capability.to_string())
+            }
         }
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))

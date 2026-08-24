@@ -1247,14 +1247,18 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
-/// How much conversation a client session already holds, without opening one.
+/// Tokens the runtime will put in front of this turn's prompt, without opening
+/// a session.
 ///
-/// The tokens a turn is actually prefilled with are the conversation plus this
-/// turn's prompt, so admission, the context cap and `usage` all have to be
-/// computed from that number rather than from the request alone. Counting the
-/// request only let an overlong session pass admission and fail inside the
-/// engine, and reported a conversation of thousands of tokens as a prompt of a
-/// dozen.
+/// A turn is prefilled with its own request *plus whatever the runtime prepends
+/// to it*, so admission, the context cap and `usage` are computed from that
+/// sum. What matters is that the second term is almost always zero: a decode
+/// core reuses its KV against the conversation the client resends, so the
+/// request already carries every token that will be prefilled, and a
+/// loop-carried or group-held lease lives in a cache rather than in front of the
+/// prompt. Adding a session's retained token count for those would charge every
+/// turn twice and refuse a request at half the model's context. The engine
+/// answers it from the typed carrier classification instead.
 ///
 /// A session is deliberately *not* created here. A request that then fails
 /// admission would leave an engine session nobody uses, and — once the registry
@@ -1276,9 +1280,9 @@ async fn carried_session_tokens(
     };
     handle
         .engine
-        .session_token_count(session_id)
+        .session_prefill_carry(session_id)
         .await
-        .map_err(|err| ApiError::internal(format!("session token count failed: {err}")))
+        .map_err(|err| ApiError::internal(format!("session prefill carry failed: {err}")))
 }
 
 /// Open the client's session once the request has been admitted.

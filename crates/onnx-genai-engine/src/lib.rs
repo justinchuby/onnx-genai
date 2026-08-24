@@ -173,7 +173,7 @@ pub use onnx_runtime_session::DecodePrecision;
 pub use pipeline::{
     AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection, EncodedAudio,
     PipelineGenerateRequest, PipelineTensors, RowScopedState, RowTable, WorkflowSessionCheckpoint,
-    is_conversation_over_bound, is_missing_required_input, validate_pipeline_backend_request,
+    is_missing_required_input, validate_pipeline_backend_request,
 };
 pub use sampling::{CategoricalSampler, GreedySampler, Sampler};
 pub use speculative::{
