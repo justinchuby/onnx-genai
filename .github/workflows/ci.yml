@@ -1069,11 +1069,23 @@ jobs:
       - name: Verify expert route telemetry CPU oracle
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
 
+      # `--all-targets` and `gpu-tests` are both load-bearing. Without them
+      # clippy sees only the library's non-test code: every `#[cfg(test)]`
+      # module and all 58 `*_gpu.rs` targets go unlinted, and a lint error can
+      # sit on `main` indefinitely because no job ever parses those blocks. One
+      # did -- an `approx_constant` error in `optimizer.rs`'s test module,
+      # invisible to this step for as long as it omitted the flags.
+      #
+      # This costs an extra pass: clippy-driver caches separately from `cargo
+      # test`, so the honesty check's `cuda,gpu-tests` build above is not
+      # reused for this crate (its dependency builds are). The Windows CUDA
+      # lane deliberately keeps the narrower invocation -- it does not build
+      # the gpu-tests binaries at all, so the same change there would be a
+      # full extra build for lints this Linux step already covers.
       - name: Clippy CUDA execution provider
-        run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
-
-      # `onnx-genai-engine`'s CUDA integration layer is gated on `native-cuda`,
-      # and until this step existed no job in any workflow enabled that feature
+        run: >-
+          cargo clippy -p onnx-runtime-ep-cuda
+          --all-targets --features cuda,gpu-tests -- -D warnings
       # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
       # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
       # pipeline/* -- never type-checked, linted, or tested, so a change could

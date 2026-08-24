@@ -15,8 +15,8 @@
 //! real `QMoEKernel::execute()` public API. The only thing this file adds is
 //! a way to point one of QMoE's *whole* expert-bank weight tensors (fc1,
 //! fc2, or fc3) at host-mapped memory registered via the exact same
-//! `cuMemHostRegister(CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY)`
-//! + `cuMemHostGetDevicePointer` primitive `HostMapRegistry`
+//! `cuMemHostRegister(CU_MEMHOSTREGISTER_DEVICEMAP | CU_MEMHOSTREGISTER_READ_ONLY)` +
+//! `cuMemHostGetDevicePointer` primitive `HostMapRegistry`
 //! (`src/weight_paging.rs`) already uses, instead of uploading it to a
 //! `cuMemAlloc`'d VRAM buffer -- i.e. the exact zero-copy *mechanism*, reused
 //! unchanged, applied to a shape-faithful real QMoE tensor rather than to

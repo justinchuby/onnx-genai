@@ -837,8 +837,7 @@ mod tests {
 
         assert!(
             addresses.windows(2).any(|w| w[0] == w[1]),
-            "the arena never recycled an address across rounds, so nothing was falsified: {:#x?}",
-            addresses
+            "the arena never recycled an address across rounds, so nothing was falsified: {addresses:#x?}"
         );
         assert_eq!(
             runtime.interleaved_weight_count(),
