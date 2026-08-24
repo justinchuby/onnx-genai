@@ -391,11 +391,17 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
 /// A document declares the version whose fields it actually uses.
 ///
 /// Absence is the compatibility mechanism in a schema that denies unknown
-/// fields: a package that uses nothing new keeps loading on every runtime it
-/// loaded on before, and one that uses something new needs a reader that knows
-/// it. That only works if the declared version tells the truth, so a document
-/// carrying a `1.1` field while claiming `1.0` is refused here rather than
-/// discovered by an older runtime as a mystery unknown-field error.
+/// fields: a package that uses no *added* field keeps loading on every runtime
+/// it loaded on before, and one that uses something new needs a reader that
+/// knows it. That only works if the declared version tells the truth, so a
+/// document carrying a `1.1` field while claiming `1.0` is refused here rather
+/// than discovered by an older runtime as a mystery unknown-field error.
+///
+/// The emphasis is load-bearing: absence buys nothing for a field that was
+/// *reshaped* rather than added, because the old spelling is absent from the
+/// new reader by construction. `token_packed` is this schema's one such case
+/// while it is pre-release, and it is refused by name in
+/// [`crate::parser`] instead of being read as a version mismatch it is not.
 fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
     let declared = match crate::version::normalize(metadata.schema_version.as_deref()) {
         Ok(version) => version,
