@@ -2212,6 +2212,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "onnx-genai-paged-attention"
+version = "0.1.0-dev.5"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "onnx-genai-preprocess"
 version = "0.1.0-dev.5"
 dependencies = [
