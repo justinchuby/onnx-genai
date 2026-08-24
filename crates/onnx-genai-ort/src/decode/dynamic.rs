@@ -65,7 +65,7 @@ fn retry_pre_run_captured_failure<T>(
 /// A stateful IoBinding decode runner that keeps KV OrtValues inside ORT.
 pub struct DecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     kv_pairs: Vec<KvPair>,
     token_input: String,
     attention_mask_input: Option<String>,
@@ -80,7 +80,7 @@ pub struct DecodeSession<'a> {
     /// field is declared after `current_kv` so Rust drops the KV `Value`s first
     /// and releases this allocator afterwards; releasing it earlier caused a
     /// use-after-free SIGSEGV at session close.
-    kv_allocator: Option<crate::Allocator>,
+    kv_allocator: Option<crate::Allocator<'a>>,
     /// Static-shape captured-decode state, populated lazily on the first
     /// single-token step when the session has CUDA graph capture enabled.
     /// Holds the persistent, fixed-address I/O buffers a captured graph replays
