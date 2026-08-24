@@ -2974,6 +2974,12 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
     // packed value is derived by rebasing that request's offsets to zero — not
     // by reading an owner vector back. So an owner companion is runtime-internal
     // plumbing, and an application cannot hand one in.
+    //
+    // This reaches the owner and nothing else. Offsets are per-request
+    // meaningful and are delivered rebased, and a `valid_lengths` is already
+    // relative to the item it measures — it means the same number in any group,
+    // so a request states its own and receives the slice that indexes its own
+    // items, with nothing to rebase and no group position to leak.
     for (name, first) in &owners {
         let Some(input) = workflow.inputs.get(*name) else {
             continue;
@@ -5673,6 +5679,16 @@ fn validate_workflow_node(
 /// rank-four media tensor is what that version introduced — and an older
 /// document keeps the final-axis default it was written against. An explicitly
 /// named axis is checked against the rank at every version.
+///
+/// The general shape of that split is worth stating, because the two halves look
+/// alike in a validator and are opposites in effect: a version may gate what a
+/// document must *say*, but it never gates what a document may say *wrongly*. A
+/// demand to state intent explicitly starts at the version that made the default
+/// ambiguous, because a document written earlier meant the default it was
+/// written against. Range checks, well-formedness, and every rule about a value
+/// a document did state stay unconditional at every version, because relaxing
+/// those would let an older spelling assert something false rather than merely
+/// leave something unsaid.
 fn validate_emit_axis(
     contract: Option<&crate::schema::TensorContract>,
     mode: &crate::schema::WorkflowEmitMode,
