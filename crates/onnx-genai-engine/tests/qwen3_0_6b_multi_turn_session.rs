@@ -12,27 +12,18 @@
 //! the same tokens as one request carrying the whole conversation, and must not
 //! decode the same tokens as its own prompt sent cold.
 //!
-//! # The revision this needs
+//! # Published revision
 //!
 //! ```text
-//! justinchuby/qwen3-0.6b-onnx-genai @ 24da071476fdd1abaf7bb514424af8bc6604827f
-//! (branch `session-continuation`)
+//! justinchuby/qwen3-0.6b-onnx-genai @ def72a7301e47386dac4f002554c46051a684cbc
 //! ```
 //!
-//! That revision is **not** the repository's default branch. `session.continuation`
-//! is a field no released `onnx-genai` knows and the schema rejects unknown keys,
-//! so publishing it as the default would make the package unloadable by every
-//! engine in the wild until this change ships. `main` therefore still carries the
-//! metadata of `a89c02d343fc2b3c49d61b33d61f686698be1e4d`, and the corrected
-//! metadata is promoted to `main` once this has merged.
-//!
-//! Running this against the default branch is a real failure, not a skip: that
-//! package loads and quietly restarts every turn, which is exactly the
-//! regression under test. It says so by name rather than reporting green.
+//! This is the repository's default branch. The package and its documentation
+//! publish the session-continuation contract exercised here.
 //!
 //! ```text
 //! huggingface-cli download justinchuby/qwen3-0.6b-onnx-genai \
-//!   --revision 24da071476fdd1abaf7bb514424af8bc6604827f --local-dir /path/to/pkg
+//!   --revision def72a7301e47386dac4f002554c46051a684cbc --local-dir /path/to/pkg
 //!
 //! ONNX_GENAI_QWEN3_WORKFLOW_DIR=/path/to/pkg ONNX_GENAI_KV_MAX_LEN=1024 \
 //!   cargo test -p onnx-genai-engine --test qwen3_0_6b_multi_turn_session \
@@ -44,10 +35,7 @@ use std::path::PathBuf;
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
 
 /// The revision whose metadata declares the conversation.
-const PINNED_REVISION: &str = "24da071476fdd1abaf7bb514424af8bc6604827f";
-
-/// The revision the hub's default branch still serves, which does not.
-const COMPATIBLE_DEFAULT: &str = "a89c02d343fc2b3c49d61b33d61f686698be1e4d";
+const PINNED_REVISION: &str = "def72a7301e47386dac4f002554c46051a684cbc";
 
 /// Resolve the package, failing with what to do rather than skipping.
 ///
@@ -60,9 +48,8 @@ fn package() -> PathBuf {
         .unwrap_or_else(|| {
             panic!(
                 "set ONNX_GENAI_QWEN3_WORKFLOW_DIR to a checkout of \
-                 justinchuby/qwen3-0.6b-onnx-genai@{PINNED_REVISION} (branch \
-                 `session-continuation`). The hub's default branch still serves \
-                 {COMPATIBLE_DEFAULT}, whose metadata declares no session state."
+                 justinchuby/qwen3-0.6b-onnx-genai@{PINNED_REVISION} (the published \
+                 default revision)."
             )
         });
     let metadata = dir.join("inference_metadata.yaml");
@@ -70,10 +57,8 @@ fn package() -> PathBuf {
         .unwrap_or_else(|error| panic!("{}: {error}", metadata.display()));
     assert!(
         document.contains("continuation:"),
-        "{} declares no `session.continuation`, so it is the compatible default revision \
-         ({COMPATIBLE_DEFAULT}) rather than {PINNED_REVISION}. Every turn of a session against \
-         it restarts from its own prompt — the regression this test exists for. Fetch the \
-         `session-continuation` branch.",
+        "{} declares no `session.continuation`; fetch the published default revision \
+         {PINNED_REVISION}.",
         metadata.display()
     );
     dir
@@ -93,7 +78,7 @@ fn tokens(ids: &[u32], max_new_tokens: usize) -> GenerateRequest {
 }
 
 #[test]
-#[ignore = "requires justinchuby/qwen3-0.6b-onnx-genai@24da0714 (branch session-continuation) \
+#[ignore = "requires justinchuby/qwen3-0.6b-onnx-genai@def72a73 (default branch) \
             in ONNX_GENAI_QWEN3_WORKFLOW_DIR"]
 fn a_third_turn_decodes_the_conversation_and_not_its_own_prompt() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
