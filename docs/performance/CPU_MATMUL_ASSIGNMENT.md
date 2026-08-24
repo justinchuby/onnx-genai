@@ -2301,6 +2301,32 @@ time. That figure is now stale; the re-measurement replaces it.
 > tension, not resolved. Full record:
 > [`docs/benchmarks/2026-08-24-acc0-steal-selector.md`](../benchmarks/2026-08-24-acc0-steal-selector.md).
 >
+> **The straggler's selector is unknown after six rejected hypotheses, and the
+> seventh cannot be tested with the EP as it stands (#2017).** Lane *i* always
+> runs on cpu *2i* and always computes chunk *i*, so "slow lane" (a
+> thread/core/hardware property) and "slow chunk" (a data property) predict
+> *identical* observations in every dataset collected to date. Both maps are
+> static for the life of a process; this is a structural ambiguity, not a
+> sample-size problem, and more repetitions cannot resolve it. Both readings
+> currently score ~0.208 against a 0.5 bar **only because they are the same
+> number**. `ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION` (`rotate:<k>` / `seed:<n>`)
+> breaks the tie by permuting lane->chunk while holding lane->cpu fixed. Off by
+> default, and its default is the *identity function*, so the shipped path is
+> byte-for-byte unchanged: the permutation reorders an already-computed segment
+> table (alignment is applied to the canonical order and permuted afterwards), it
+> stays inside a NUMA node group, and `place_rows` and dispatch read the same
+> permuted table so a lane touches and computes the same rows. **No timing claim
+> is made and the experiment has not been run** -- the instrument is published
+> before its verdict on purpose. Reachability is asserted from the documented env
+> string in a child process, with the anti-vacuity assertion that the map must
+> *change*, because this is the third knob in a family (#1792 inert affinity, the
+> latched-`OnceLock` A/B, and #2014's MLAS-gated `steal`) where the
+> implementation was covered and its reachability was not: **a knob is not
+> verified until an observable changes when you turn it.** Both negative controls
+> fired -- a dead env read, and a corrupted permutation caught by the dispatch's
+> own per-row coverage counter. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md`](../benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md).
+>
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
 > (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not
