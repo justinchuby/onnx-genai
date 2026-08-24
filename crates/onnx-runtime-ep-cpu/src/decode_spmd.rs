@@ -115,6 +115,15 @@ pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 /// SPMD split; `steal` decomposes the op into coarser tiles and lets resident
 /// workers claim tiles dynamically, so a delayed worker does not strand a whole
 /// static shard behind the per-op barrier.
+///
+/// `steal` is honoured in a **default (MLAS-free) build**: the dynamic claim is
+/// an `AtomicUsize` cursor over the tile table, run on the ordinary native SPMD
+/// pool. Building with the `mlas` feature additionally swaps the *executor* for
+/// `mlas_sys::WorkStealingThreadPool`, but that is a research reference and not
+/// what production selects -- the scheduling policy itself carries no MLAS
+/// dependency. Until 2026-08-24 the parse arms below were themselves gated on
+/// `feature = "mlas"`, which made this switch silently inert in every
+/// production build while the native claim path it selects sat unreachable.
 pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 
 /// Bounded active-spin window before a worker parks, mirroring the
@@ -1494,9 +1503,7 @@ fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
     match raw.map(str::trim) {
         Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
         Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
         _ => DecodeSchedule::Fixed,
     }
@@ -4526,20 +4533,75 @@ mod tests {
             decode_schedule_from_raw(Some("fixed")),
             DecodeSchedule::Fixed
         );
-        let expected_steal = if cfg!(feature = "mlas") {
+        // The scheduling *policy* has no MLAS dependency -- the dynamic claim is
+        // an atomic cursor over the tile table dispatched on the native SPMD
+        // pool. Only the optional alternative executor is MLAS-provided, so
+        // `steal` must parse identically in a default build. Asserted
+        // unconditionally on purpose: a `cfg!(feature = "mlas")` expectation here
+        // is what let the selector go inert in production unnoticed.
+        assert_eq!(
+            decode_schedule_from_raw(Some("steal")),
             DecodeSchedule::Steal
-        } else {
-            DecodeSchedule::Fixed
-        };
-        assert_eq!(decode_schedule_from_raw(Some("steal")), expected_steal);
+        );
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            expected_steal
+            DecodeSchedule::Steal
         );
         assert_eq!(
             decode_schedule_from_raw(Some("bogus")),
             DecodeSchedule::Fixed
         );
+    }
+
+    /// The dynamic claim must be reachable *and correct* in a default,
+    /// MLAS-free build. The other `work_stealing_*` tests construct
+    /// `DecodeSchedule::Steal` directly, which is precisely how the selector
+    /// came to be inert in production without any test noticing: the
+    /// implementation was covered, its reachability was not. This one starts
+    /// from the env string a user actually sets and asserts the whole chain --
+    /// parse, build, dispatch -- covers every output exactly once, with no gaps
+    /// from a cursor that overruns and no duplicates from two workers claiming
+    /// one tile.
+    #[test]
+    fn work_stealing_is_reachable_from_the_env_string_without_mlas() {
+        let schedule = decode_schedule_from_raw(Some("steal"));
+        assert_eq!(
+            schedule,
+            DecodeSchedule::Steal,
+            "the documented `steal` value must select the dynamic claim in a default build"
+        );
+        let pools = single_group_pool_with_schedule(4, schedule);
+        assert!(pools.uses_work_stealing());
+
+        let n = 8192;
+        let k = 4096;
+        // Control: a serial fallback would satisfy the coverage assertions below
+        // without ever exercising the claim loop, so refuse to pass vacuously.
+        assert!(
+            pools.total_workers > 1 && output_chunk_len_for(pools.total_workers, n, k) < n,
+            "test must reach the fan-out, not the serial threshold"
+        );
+
+        let mut result = vec![0.0f32; n];
+        let claims: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let claims = &claims;
+        pools.dispatch_output_rows(&mut result, k, &|start, outputs| {
+            for (offset, slot) in outputs.iter_mut().enumerate() {
+                let index = start + offset;
+                claims[index].fetch_add(1, Ordering::Relaxed);
+                *slot = index as f32;
+            }
+        });
+        pools.shutdown();
+
+        for index in 0..n {
+            let claimed = claims[index].load(Ordering::Relaxed);
+            assert_eq!(claimed, 1, "output {index} was claimed {claimed} times");
+            assert_eq!(
+                result[index], index as f32,
+                "output {index} holds a stale value"
+            );
+        }
     }
 
     #[test]
