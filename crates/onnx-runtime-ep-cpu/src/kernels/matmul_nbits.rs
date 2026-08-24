@@ -20236,10 +20236,14 @@ mod tests {
             .parse()
             .expect("the parent passes a decimal width");
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
-        let cores = crate::core_topology::host().map_or(allowed, |topology| {
-            crate::decode_affinity::allowed_cpus()
-                .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
-        });
+        // Fails closed on a supported target: silently substituting the logical
+        // count for the physical one here would hand the parent an inflated
+        // `cores` and make its placement expectation trivially satisfiable.
+        let cores =
+            crate::core_topology::require_host_for_placement().map_or(allowed, |topology| {
+                crate::decode_affinity::allowed_cpus()
+                    .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
+            });
         let (pool_built, workers, nodes, placement, honest, fully_pinned) =
             match crate::decode_spmd::pools() {
                 Some(pool) => {
@@ -20469,7 +20473,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn a_pool_that_misreports_its_placement_is_caught_end_to_end() {
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
-        if allowed < 2 || crate::core_topology::host().is_none() {
+        // Fails closed on the topology: this used to skip on
+        // `core_topology::host().is_none()`, so a detection regression turned
+        // the end-to-end falsification into a no-op that still reported green.
+        // A small cpuset is a legitimate skip (there is no second core to
+        // spread onto); an unanswerable topology on a supported target is not.
+        if let Err(reason) = crate::core_topology::require_host_for_placement() {
+            eprintln!("skipping placement falsification: {reason}");
+            return;
+        }
+        if allowed < 2 {
             return;
         }
         let honest = realized_width_report_with(2, false);
@@ -20734,7 +20747,20 @@ mod tests {
         // skipped and this test verified width only -- exactly the blind spot
         // it was extended to close. An unpinned host is a legitimate reason,
         // but it has to be stated rather than silently passed.
-        if allowed_now >= 2 && crate::core_topology::host().is_some() {
+        //
+        // The condition was `allowed_now >= 2 && core_topology::host().is_some()`
+        // and that second term made the guard self-defeating: it is predicated
+        // on the runtime success of the very call whose failure it exists to
+        // report, so a detection regression silenced the placement checks *and*
+        // this guard together, and the sweep still passed. It is now keyed on
+        // `DETECTION_SUPPORTED`, a compile-time property of the target, which
+        // cannot become false on a host that should have answered --
+        // `require_host_for_placement` panics there instead.
+        if crate::core_topology::DETECTION_SUPPORTED {
+            crate::core_topology::require_host_for_placement()
+                .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        }
+        if allowed_now >= 2 && crate::core_topology::DETECTION_SUPPORTED {
             assert!(
                 saw_placement_check,
                 "no swept width produced a checkable placement on a {allowed_now}-CPU cpuset, \
