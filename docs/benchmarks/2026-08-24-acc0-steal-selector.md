@@ -158,6 +158,40 @@ lane->cpu map across 24 launches while the victim moved — and this is the
 matching result for the mode structure. Recorded because it bears on numbers
 other people are carrying, not because it changes the disposition below.
 
+## 3b. The slow mode is a stable state of a process, not intermittent stalling
+
+From the same 240 launches, using the two columns the production reader already
+emits alongside `ms_token` (`spread_%` is `(max - min) / median` across the
+repetitions *within* one launch):
+
+| arm | mode | n | med ms | med spread_% | med tps |
+|---|---|---|---|---|---|
+| fixed  | fast | 32 | 1.6045 | 11.45 | 598.1 |
+| fixed  | slow | 28 | 3.6090 | 6.45 | 282.2 |
+| steal4 | fast | 30 | 1.6100 | 9.55 | 589.0 |
+| steal4 | slow | 30 | 2.8725 | 3.35 | 360.6 |
+| null   | fast | 28 | 1.6570 | 14.85 | 580.6 |
+| null   | slow | 32 | 3.6245 | 10.85 | 301.5 |
+
+Two things follow.
+
+**The mode is real work, not a timing label.** `tps` moves with `ms_token` --
+`fixed` slow/fast is 2.249 on latency against 2.119 on throughput. A launch in
+the slow mode is genuinely producing fewer tokens per second, so this is not an
+artifact of how the steady window is chosen.
+
+**The slow mode is *more* internally consistent, not less** (6.45% vs 11.45%
+rep-to-rep for `fixed`). If the slow mode were occasional stalling, its
+repetitions would disagree with each other more than the fast mode's; they
+disagree less. A launch picks a mode and then stays in it. That is the same
+signature the straggler has -- fixed for a process, different between processes
+-- and it is why per-launch bimodality has been so hard to average away.
+
+`steal4` also halves the slow mode's rep-to-rep spread (6.45 -> 3.35), which is
+what absorbing an imbalance should look like from the outside, and is
+independent corroboration that the ~20% it recovers there is work-distribution
+cost rather than noise.
+
 ## 4. Disposition
 
 **No default change.** The pre-registered rule requires a resolvable end-to-end
