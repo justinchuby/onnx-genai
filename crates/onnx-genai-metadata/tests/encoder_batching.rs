@@ -35,7 +35,7 @@ fn assert_reports(document: &str, expected: &str) {
 /// extents its artifact was built for, and bounds what one call materializes on
 /// the dimension the rows differ in.
 const PADDED_VISION_ENCODER: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -69,7 +69,8 @@ pipeline:
         batch_capacity:
           uniform_dimensions: [height, width]
           budgets:
-            - { dimensions: [max_tiles], max_total: 64 }
+            - { dimensions: [batch], max_total: 8 }
+            - { dimensions: [batch, max_tiles], max_total: 64 }
         ports:
           inputs:
             pixels:
@@ -108,7 +109,7 @@ pipeline:
 /// concatenated onto one item axis and one ownership level maps each item back
 /// to the row that asked for it.
 const PACKED_VISION_ENCODER: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -210,7 +211,7 @@ fn a_component_without_a_declared_capacity_carries_one_request_row() {
     // package that predates this surface valid.
     let document = PADDED_VISION_ENCODER
         .replace(
-            "        batch_capacity:\n          uniform_dimensions: [height, width]\n          budgets:\n            - { dimensions: [max_tiles], max_total: 64 }\n",
+            "        batch_capacity:\n          uniform_dimensions: [height, width]\n          budgets:\n            - { dimensions: [batch], max_total: 8 }\n            - { dimensions: [batch, max_tiles], max_total: 64 }\n",
             "",
         );
     let metadata = parse(&document);
@@ -237,9 +238,11 @@ fn a_padded_encoder_declares_its_capacity_and_its_validity() {
         .as_ref()
         .expect("fixture declares a capacity");
     assert_eq!(capacity.uniform_dimensions, ["height", "width"]);
-    assert_eq!(capacity.budgets.len(), 1);
-    assert_eq!(capacity.budgets[0].dimensions, ["max_tiles"]);
-    assert_eq!(capacity.budgets[0].max_total, 64);
+    assert_eq!(capacity.budgets.len(), 2);
+    assert_eq!(capacity.budgets[0].dimensions, ["batch"]);
+    assert_eq!(capacity.budgets[0].max_total, 8);
+    assert_eq!(capacity.budgets[1].dimensions, ["batch", "max_tiles"]);
+    assert_eq!(capacity.budgets[1].max_total, 64);
 
     let padding = &workflow.inputs["pixel_values"].contract.padding;
     assert_eq!(padding.len(), 1);
@@ -676,15 +679,34 @@ fn uniform_dimensions_are_distinct_declared_symbols() {
 }
 
 #[test]
-fn a_pinned_symbol_is_never_budgeted_on_its_own() {
+fn a_budget_is_rooted_in_a_count_of_items_rather_than_a_property_of_one() {
+    // `channels` alone counts channels *per image*, which is the same number
+    // whether the group holds one image or a thousand. A bound on it constrains
+    // nothing the scheduler decides.
     let document = PACKED_VISION_ENCODER.replace(
         "            - { dimensions: [items], max_total: 32 }",
         "            - { dimensions: [items], max_total: 32 }\n            - { dimensions: [channels], max_total: 3 }",
     );
     assert_reports(
         &document,
-        "both pins 'channels' across the group and budgets it on its own; a pinned dimension has \
-         one extent for every item",
+        "whose outermost dimension 'channels' is a property of one item rather than a count of \
+         them",
+    );
+}
+
+#[test]
+fn a_padded_dimension_does_not_root_a_budget_either() {
+    // The rule is about reaching the group, not about pinning: a padded extent
+    // is as per-item as a pinned one, so a singleton naming it is refused for
+    // the same reason.
+    let document = PADDED_VISION_ENCODER.replace(
+        "            - { dimensions: [batch, max_tiles], max_total: 64 }",
+        "            - { dimensions: [max_tiles], max_total: 64 }",
+    );
+    assert_reports(
+        &document,
+        "whose outermost dimension 'max_tiles' is a property of one item rather than a count of \
+         them",
     );
 }
 
@@ -977,7 +999,7 @@ fn pixel_programs_can_emit_the_offsets_and_owner_of_a_packed_batch() {
 /// that run back into rows. Both companions are its own outputs, so the level
 /// they describe is one the preprocessor produced.
 const PACKED_PIXEL_PROGRAM: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 preprocessing:
   image:
     transforms:
@@ -1100,7 +1122,7 @@ fn a_packing_preprocessor_produces_the_companions_it_describes() {
 /// capacity pins the spatial extents in the same list that would pin a temporal
 /// one.
 const PADDED_VIDEO_ENCODER: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 preprocessing:
   video:
     transforms:
@@ -1180,7 +1202,8 @@ pipeline:
         batch_capacity:
           uniform_dimensions: [channels, height, width]
           budgets:
-            - { dimensions: [frames], max_total: 64 }
+            - { dimensions: [batch], max_total: 4 }
+            - { dimensions: [batch, frames], max_total: 64 }
         ports:
           inputs:
             frames:
@@ -1285,7 +1308,7 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
     // is which.
     let document = PADDED_VIDEO_ENCODER
         .replace(
-            "          uniform_dimensions: [channels, height, width]\n          budgets:\n            - { dimensions: [frames], max_total: 64 }\n",
+            "          uniform_dimensions: [channels, height, width]\n          budgets:\n            - { dimensions: [batch], max_total: 4 }\n            - { dimensions: [batch, frames], max_total: 64 }\n",
             "          uniform_dimensions: [frames, channels, height, width]\n",
         )
         .replace(
@@ -1312,28 +1335,18 @@ fn uniformity_is_required_of_temporal_and_spatial_dimensions_alike() {
         "a pinned encoder with nothing free needs no footprint bound"
     );
 
-    // And a fixed-frame video is exactly this: an ordinary request-aligned
-    // tensor with the temporal extent pinned, and no ownership level at all.
-    // There is nothing ragged to fold back, so there is nothing to declare.
-    let contracts = workflow
-        .components
-        .values()
-        .flat_map(|component| {
-            component
-                .ports
-                .inputs
-                .values()
-                .chain(component.ports.outputs.values())
-        })
-        .chain(workflow.inputs.values().map(|input| &input.contract))
-        .chain(workflow.outputs.values().map(|output| &output.contract));
-    for contract in contracts {
+    // A pinned temporal extent is not a level: there is nothing ragged between
+    // frames and their clip, so nothing to fold back. What that does *not* buy
+    // is the clips-to-rows level, which this fixture happens not to need only
+    // because it takes one clip per request; see FIXED_FRAME_VIDEO_ENCODER for
+    // the packed form of the same pinning.
+    let encoder = &workflow.components["video_encoder"].ports;
+    for contract in encoder.inputs.values().chain(encoder.outputs.values()) {
         assert!(
             contract.batch_layout.levels().is_empty(),
-            "a fixed-frame video needs no ownership level: {contract:?}"
+            "one clip per row needs no ownership level: {contract:?}"
         );
     }
-    let encoder = &workflow.components["video_encoder"].ports;
     for contract in encoder.inputs.values().chain(encoder.outputs.values()) {
         assert!(
             contract.padding.is_empty(),
@@ -1365,7 +1378,7 @@ fn a_pinned_temporal_extent_is_not_also_an_ownership_level() {
 ///
 /// Three kinds of raggedness, three dimensions of one contract, no two competing.
 const NESTED_VIDEO_ENCODER: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -1503,6 +1516,178 @@ pipeline:
         output: clip_owner
         mode: replace
 "#;
+
+/// The same workload with a fixed frame count, which is a *shallower* chain and
+/// not a deeper one: with every clip carrying sixteen frames there is nothing
+/// ragged between frames and clips, so the frame level is dropped and `frames`
+/// becomes an ordinary per-clip dimension that co-batched clips must agree on.
+///
+/// What does not go away is the clips-to-rows level. A request still contributes
+/// whatever number of clips it happens to carry, and a request-aligned tensor
+/// would have to pad that away — which is the cost packing exists to avoid.
+const FIXED_FRAME_VIDEO_ENCODER: &str = r#"
+schema_version: v1.1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      pixel_values:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [clips, frames, patches, features]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:
+              - { offsets: clip_offsets, owner: clip_owner }
+        role: { kind: opaque }
+        source: { kind: application, name: pixel_values }
+      clip_offsets:
+        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        role: { kind: opaque }
+        source: { kind: application, name: clip_offsets }
+      clip_owner:
+        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        role: { kind: opaque }
+        source: { kind: application, name: clip_owner }
+    outputs:
+      clip_embeddings:
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [clips, hidden]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:
+              - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
+        role: tensor
+        stage: pre_adapter
+      clip_offsets:
+        contract: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+        role: tensor
+        stage: pre_adapter
+      clip_owner:
+        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+        role: tensor
+        stage: pre_adapter
+    components:
+      clip_encoder:
+        implementation: { kind: onnx, artifact: encoder.onnx }
+        batch_capacity:
+          uniform_dimensions: [frames, patches, features]
+          budgets:
+            - { dimensions: [clips], max_total: 4 }
+            - { dimensions: [clips, frames, patches], max_total: 65536 }
+        ports:
+          inputs:
+            pixel_values:
+              dtype: float32
+              rank: 4
+              shape: [clips, frames, patches, features]
+              batch_layout:
+                kind: token_packed
+                axis: 0
+                levels:
+                  - { offsets: clip_offsets, owner: clip_owner }
+            clip_offsets: { dtype: int64, rank: 1, shape: [clip_offsets_len], batch_layout: { kind: shared } }
+            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+          outputs:
+            clip_embeddings:
+              dtype: float32
+              rank: 2
+              shape: [clips, hidden]
+              batch_layout:
+                kind: token_packed
+                axis: 0
+                levels:
+                  - { offsets: clip_offsets, owner: clip_owner, extent: preserved }
+    steps:
+      - kind: invoke
+        component: clip_encoder
+        inputs:
+          pixel_values: pixel_values
+          clip_offsets: clip_offsets
+          clip_owner: clip_owner
+        outputs:
+          clip_embeddings: clips.embeddings
+      - kind: emit
+        value: clips.embeddings
+        output: clip_embeddings
+        mode: replace
+      - kind: emit
+        value: clip_offsets
+        output: clip_offsets
+        mode: replace
+      - kind: emit
+        value: clip_owner
+        output: clip_owner
+        mode: replace
+"#;
+
+#[test]
+fn a_fixed_frame_count_drops_the_frame_level_and_keeps_the_clip_level() {
+    let metadata = parse(FIXED_FRAME_VIDEO_ENCODER);
+    validate_metadata(&metadata).expect("a fixed-frame video encoder is valid");
+    let workflow = &metadata.pipeline.expect("pipeline").workflow;
+    let levels = workflow.inputs["pixel_values"]
+        .contract
+        .batch_layout
+        .levels();
+    assert_eq!(
+        levels.len(),
+        1,
+        "a fixed frame count is a pinned dimension, not a level"
+    );
+    assert_eq!(levels[0].owner, "clip_owner");
+    let capacity = workflow.components["clip_encoder"]
+        .batch_capacity
+        .as_ref()
+        .expect("fixture declares a capacity");
+    assert_eq!(
+        capacity.uniform_dimensions,
+        ["frames", "patches", "features"],
+        "the temporal extent is pinned exactly like the spatial ones"
+    );
+    assert!(
+        workflow.inputs["pixel_values"].contract.padding.is_empty(),
+        "nothing is ragged in time, so nothing is padded in time"
+    );
+}
+
+#[test]
+fn a_fixed_frame_clip_still_belongs_to_a_request() {
+    // Dropping the clips-to-rows level as well would say every request carries
+    // the same number of clips, which is the raggedness packing exists for.
+    let document = FIXED_FRAME_VIDEO_ENCODER.replace(
+        "          uniform_dimensions: [frames, patches, features]",
+        "          uniform_dimensions: [frames, patches, features, clips]",
+    );
+    assert_reports(
+        &document,
+        "requires uniform dimension 'clips', which is the packed extent of port 'pixel_values' \
+         rather than a property of one item",
+    );
+}
+
+#[test]
+fn a_pair_carries_the_same_two_counts_wherever_it_is_named() {
+    // A pair *is* a mapping from child units to parent units, so the two numbers
+    // it carries belong to the mapping. A port that read the same two vectors as
+    // a different grouping would split the payload at boundaries that describe
+    // something else.
+    let document = FIXED_FRAME_VIDEO_ENCODER.replace(
+        "            clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }",
+        "            clip_owner: { dtype: int64, rank: 1, shape: [other_clips], batch_layout: { kind: shared } }",
+    );
+    assert_reports(
+        &document,
+        "a pair is one mapping wherever it is named, so its counts cannot differ by the port that \
+         names it",
+    );
+}
 
 #[test]
 fn a_packing_resolves_frames_through_clips_to_request_rows() {
@@ -1688,7 +1873,7 @@ fn every_nested_level_is_budgeted() {
 /// A serving workflow that hands a packed result back to its caller, together
 /// with the companions that make it splittable.
 const PACKED_EMIT_WORKFLOW: &str = r#"
-schema_version: "1.1"
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -1908,25 +2093,12 @@ fn an_emit_axis_must_be_an_axis_the_value_has() {
 }
 
 #[test]
-fn a_length_companion_carries_a_role_that_says_it_is_a_length() {
-    // The reference says *that* a value describes a padded tensor; the content
-    // role says what a caller may do with it. A program that emitted a length
-    // under the role `pixels` would hand its caller a tensor it could only guess
-    // at, so the two statements have to agree.
-    let document =
-        PADDED_VIDEO_ENCODER.replace("        content: valid_lengths", "        content: pixels");
-    assert_reports(
-        &document,
-        "output 'video.pixel_values' names 'video.frame_lengths' as its valid lengths, but that \
-         output carries content role 'pixels'",
-    );
-}
-
-#[test]
-fn the_audio_length_roles_say_the_same_thing_as_the_generic_one() {
-    // Audio named lengths before there was a generic word for them. Those names
-    // stay, and stay usable, wherever a length is what is meant — otherwise the
-    // generic role would quietly deprecate correct programs.
+fn a_padding_entry_names_its_length_by_name_and_not_by_role() {
+    // Audio named lengths before there was a generic word for them, and a
+    // program that already emits `frame_lengths` should point its padding entry
+    // at that value rather than emit a second copy under the new name. So the
+    // reference decides what the value is *for*, and the role is left to say
+    // what the numbers mean.
     for role in LENGTH_CONTENT_ROLES {
         let document = PADDED_VIDEO_ENCODER.replace(
             "        content: valid_lengths",
@@ -1935,9 +2107,10 @@ fn the_audio_length_roles_say_the_same_thing_as_the_generic_one() {
         validate_metadata(&parse(&document))
             .unwrap_or_else(|errors| panic!("'{role}' is a length role: {errors:#?}"));
     }
-    assert!(LENGTH_CONTENT_ROLES.contains(&"valid_lengths"));
-    assert!(LENGTH_CONTENT_ROLES.contains(&"frame_lengths"));
-    assert!(LENGTH_CONTENT_ROLES.contains(&"sample_lengths"));
+    assert_eq!(
+        LENGTH_CONTENT_ROLES,
+        ["valid_lengths", "sample_lengths", "frame_lengths"]
+    );
 }
 
 #[test]

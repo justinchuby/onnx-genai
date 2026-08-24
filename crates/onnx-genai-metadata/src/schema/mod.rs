@@ -348,21 +348,23 @@ mod schema_vocabulary {
         ]
     );
 
-    /// Content roles that count how much of a padded dimension is real.
+    /// Content roles that state how much of a padded dimension is real.
     ///
-    /// One `padding` entry names one companion, and the companion may carry any
-    /// of these: `valid_lengths` is the medium-independent spelling, and the
-    /// audio-side names that predate it say the same thing about a particular
-    /// unit. A validator that recognized only the generic name would refuse
-    /// programs that were already correct, and one that recognized only the
-    /// specific names could not describe a padded video at all.
-    pub const LENGTH_CONTENT_ROLES: [&str; 5] = [
-        "valid_lengths",
-        "sample_lengths",
-        "frame_lengths",
-        "valid_frames",
-        "valid_samples",
-    ];
+    /// `valid_lengths` is the medium-independent spelling, added because a
+    /// padded video, a padded image grid, and a padded text segment all need one
+    /// and none of them is audio. The two audio names that predate it say the
+    /// same thing about a particular unit and remain correct, so a program that
+    /// already emits `frame_lengths` points its `padding` entry at that value
+    /// rather than emitting a second copy under a new name.
+    ///
+    /// This list is *informative*: a `padding` entry names its length value by
+    /// name, and nothing dispatches on which of these spellings the value
+    /// carries. Deciding validity by role would refuse correct audio programs
+    /// and would put two statements where the reference already makes one.
+    /// `valid_frames` and `valid_samples` are deliberately absent — those are
+    /// counts a graph consumes as ordinary inputs, not statements about padding.
+    pub const LENGTH_CONTENT_ROLES: [&str; 3] =
+        ["valid_lengths", "sample_lengths", "frame_lengths"];
 
     /// Content role of the exclusive prefix offsets of an ownership level.
     pub const PACK_OFFSETS_CONTENT: &str = "pack_offsets";

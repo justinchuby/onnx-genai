@@ -872,11 +872,11 @@ impl<'a> PreprocessingOutputView<'a> {
 
 /// A companion a program emits carries the role that says what it is.
 ///
-/// The reference in a `padding` entry or an ownership level says *that* a value
-/// describes a packed or padded tensor; the content role says *what a runtime
-/// may do with it*. A program that emitted a length under the role `pixels`
-/// would be handing a preprocessor's caller a tensor it could only guess at, so
-/// the two statements have to agree.
+/// The reference in an ownership level says *that* a value describes a packed
+/// tensor; the content role says *what a runtime may do with it*. There are two
+/// ownership roles for every level and every modality — `pack_offsets` and
+/// `pack_owner` — so a program that emitted an owner map under the role `pixels`
+/// would be handing its caller a tensor it could only guess at.
 fn validate_program_companion_roles(
     kind: &str,
     outputs: &[PreprocessingOutputView<'_>],
@@ -908,14 +908,11 @@ fn validate_program_companion_roles(
         let Some(contract) = output.contract else {
             continue;
         };
-        for padded in &contract.padding {
-            require(
-                output.name,
-                &padded.valid_lengths,
-                &crate::schema::LENGTH_CONTENT_ROLES,
-                "valid lengths",
-            );
-        }
+        // A `padding` entry names its length value by name, not by role. The
+        // audio vocabulary already spells a length `frame_lengths` and
+        // `sample_lengths`, and a program pointing its padding entry at the one
+        // it already emits is right rather than in need of a second output, so
+        // nothing here dispatches on which spelling it chose.
         for level in contract.batch_layout.levels() {
             require(
                 output.name,
@@ -2532,6 +2529,7 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
 /// the component's own ABI is what pairs a padded tensor with its lengths or a
 /// packed tensor with its offsets; which SSA value reaches that port is the
 /// invocation's business, not the port's.
+#[derive(Clone, Copy)]
 struct LayoutReferenceScope<'a> {
     declared: &'a BTreeSet<String>,
     contracts: &'a BTreeMap<String, crate::schema::TensorContract>,
@@ -2807,18 +2805,52 @@ fn validate_packed_extent(
 /// same grouping. If they pair it with different owner maps, one of the two is
 /// packed against a grouping that does not describe it, and a runtime would
 /// split whichever it read second at the wrong boundaries.
+/// The two counts a companion pair carries, and the site that first stated them.
+struct PairExtents<'a> {
+    offsets: Option<&'a str>,
+    owner: Option<&'a str>,
+    first: String,
+}
+
 fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
-    let mut sites: Vec<(String, &crate::schema::TensorContract)> = Vec::new();
+    let (declared, contracts) = workflow_declared_values(workflow);
+    let workflow_scope = LayoutReferenceScope {
+        declared: &declared,
+        contracts: &contracts,
+        ports: None,
+    };
+    let mut sites: Vec<(
+        String,
+        &crate::schema::TensorContract,
+        LayoutReferenceScope<'_>,
+    )> = Vec::new();
     for (name, input) in &workflow.inputs {
-        sites.push((format!("workflow input '{name}'"), &input.contract));
+        sites.push((
+            format!("workflow input '{name}'"),
+            &input.contract,
+            workflow_scope,
+        ));
     }
     for (name, output) in &workflow.outputs {
-        sites.push((format!("workflow output '{name}'"), &output.contract));
+        sites.push((
+            format!("workflow output '{name}'"),
+            &output.contract,
+            workflow_scope,
+        ));
     }
     for (name, state) in &workflow.state {
-        sites.push((format!("workflow state '{name}'"), &state.contract));
+        sites.push((
+            format!("workflow state '{name}'"),
+            &state.contract,
+            workflow_scope,
+        ));
     }
     for (component, spec) in &workflow.components {
+        let scope = LayoutReferenceScope {
+            declared: &declared,
+            contracts: &contracts,
+            ports: Some(&spec.ports),
+        };
         for (direction, ports) in [
             ("input", &spec.ports.inputs),
             ("output", &spec.ports.outputs),
@@ -2827,6 +2859,7 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
                 sites.push((
                     format!("workflow component '{component}' {direction} '{port}'"),
                     contract,
+                    scope,
                 ));
             }
         }
@@ -2838,7 +2871,8 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
     // conflict and would miss a genuine one a level apart.
     let mut pairings: BTreeMap<&str, (&str, String)> = BTreeMap::new();
     let mut owners: BTreeMap<&str, String> = BTreeMap::new();
-    for (path, contract) in &sites {
+    let mut extents: BTreeMap<(&str, &str), PairExtents<'_>> = BTreeMap::new();
+    for (path, contract, scope) in &sites {
         for level in contract.batch_layout.levels() {
             owners
                 .entry(level.owner.as_str())
@@ -2855,6 +2889,47 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
                 continue;
             }
             pairings.insert(level.offsets.as_str(), (level.owner.as_str(), path.clone()));
+            // The pair is a mapping from child units to parent units, so the two
+            // numbers it carries — the child count and the parent count plus one
+            // — are properties of the mapping and not of the port that names it.
+            // A port that resolved either to a different symbol would be reading
+            // the same vectors as a different grouping.
+            let key = (level.offsets.as_str(), level.owner.as_str());
+            let stated = (
+                scope.contract(&level.offsets).and_then(extent_symbol),
+                scope.contract(&level.owner).and_then(extent_symbol),
+            );
+            match extents.get(&key) {
+                Some(seen) => {
+                    let first = &seen.first;
+                    for (role, previous, now, companion) in [
+                        ("offsets", &seen.offsets, &stated.0, &level.offsets),
+                        ("owner map", &seen.owner, &stated.1, &level.owner),
+                    ] {
+                        if let (Some(previous), Some(now)) = (previous, now)
+                            && previous != now
+                        {
+                            errors.push(format!(
+                                "{path} resolves the {role} '{companion}' of the level pairing \
+                                 '{}' with '{}' to extent '{now}', but {first} resolves the same \
+                                 companion to '{previous}'; a pair is one mapping wherever it is \
+                                 named, so its counts cannot differ by the port that names it",
+                                level.offsets, level.owner
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    extents.insert(
+                        key,
+                        PairExtents {
+                            offsets: stated.0,
+                            owner: stated.1,
+                            first: path.clone(),
+                        },
+                    );
+                }
+            }
         }
     }
     // An owner map indexes into a batch the caller never sees. Its positions
@@ -3285,9 +3360,10 @@ fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         let path = format!("workflow component '{name}' batch_capacity");
         let ports = &component.ports;
         let declared = declared_symbols(ports);
-        let (budgeted, pinned_alone) = validate_budgets(&path, capacity, &declared, errors);
         let counts = ownership_count_symbols(ports);
-        validate_uniform_dimensions(&path, capacity, &declared, &counts, &pinned_alone, errors);
+        let rooted = group_rooted_symbols(ports);
+        let budgeted = validate_budgets(&path, capacity, &declared, &rooted, errors);
+        validate_uniform_dimensions(&path, capacity, &declared, &counts, errors);
         validate_level_budgets(&path, ports, &budgeted, errors);
         validate_free_dimensions(&path, capacity, ports, errors);
         if let Some(row_scope) = &component.row_scope {
@@ -3318,14 +3394,19 @@ fn declared_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, &st
 }
 
 /// Check the footprint bounds and hand back the symbols they bind.
+///
+/// A `dimensions` list is a nesting path read outermost first, so `[frames,
+/// patches]` bounds "for each packed frame, its materialized patch slots". The
+/// first symbol is what roots the entry in the group, which is why it must be a
+/// quantity the scheduler chooses rather than a property of one item.
 fn validate_budgets<'a>(
     path: &str,
     capacity: &'a crate::schema::ComponentBatchCapacity,
     declared: &BTreeMap<&str, &str>,
+    rooted: &BTreeMap<&str, String>,
     errors: &mut Vec<String>,
-) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
+) -> BTreeSet<&'a str> {
     let mut budgeted: BTreeSet<&str> = BTreeSet::new();
-    let mut alone: BTreeSet<&str> = BTreeSet::new();
     let mut bounded: BTreeSet<Vec<&str>> = BTreeSet::new();
     for budget in &capacity.budgets {
         let entry = describe_symbols(&budget.dimensions);
@@ -3341,6 +3422,27 @@ fn validate_budgets<'a>(
                 "{path} budgets {entry} at 0; every budget is an upper bound on an assembled \
                  group, and a bound of zero forbids the single-item invocation the component is \
                  otherwise required to serve"
+            ));
+        }
+        // Bounding a per-item extent on its own bounds nothing about the
+        // invocation being assembled: `patches` alone counts patches per frame,
+        // which is a fact about one item and is the same whether the group holds
+        // one of them or a thousand.
+        if let Some(first) = budget.dimensions.first()
+            && declared.contains_key(first.as_str())
+            && !rooted.contains_key(first.as_str())
+        {
+            errors.push(format!(
+                "{path} budgets {entry}, whose outermost dimension '{first}' is a property of one \
+                 item rather than a count of them; a budget is a nesting path read outermost \
+                 first, and one that never reaches a quantity the scheduler chooses bounds \
+                 nothing about the group. Root it at {}, or compose it as a path beginning there",
+                describe_declared(
+                    &rooted
+                        .keys()
+                        .map(|symbol| (*symbol, "a group count"))
+                        .collect::<BTreeMap<_, _>>()
+                )
             ));
         }
         let mut within: BTreeSet<&str> = BTreeSet::new();
@@ -3361,9 +3463,6 @@ fn validate_budgets<'a>(
                 continue;
             }
             budgeted.insert(dimension.as_str());
-            if budget.dimensions.len() == 1 {
-                alone.insert(dimension.as_str());
-            }
         }
         let key: Vec<&str> = budget.dimensions.iter().map(String::as_str).collect();
         if !bounded.insert(key) {
@@ -3373,7 +3472,63 @@ fn validate_budgets<'a>(
             ));
         }
     }
-    (budgeted, alone)
+    budgeted
+}
+
+/// Symbols that count what a scheduler put in a group, so a budget rooted at one
+/// bounds the invocation rather than one item.
+///
+/// Three things count a group: the extent a layout packs, the unit count of each
+/// declared ownership level — the `owner` companion's extent — and the batch
+/// axis of a row-shaped layout, which is how many rows the scheduler put
+/// together. A level's `offsets` extent is the parent count plus one, which
+/// counts a group too but is a derived spelling of the level above it, so it
+/// never roots a budget.
+fn group_rooted_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
+    let mut rooted: BTreeMap<&str, String> = BTreeMap::new();
+    fn axis_symbol(contract: &crate::schema::TensorContract, axis: usize) -> Option<&str> {
+        contract
+            .shape
+            .as_ref()
+            .and_then(|shape| shape.get(axis))
+            .and_then(symbol_of)
+    }
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        match &contract.batch_layout {
+            crate::schema::BatchLayout::TokenPacked { axis, levels } => {
+                if let Some(symbol) = axis_symbol(contract, *axis) {
+                    rooted
+                        .entry(symbol)
+                        .or_insert_with(|| format!("the packed extent of port '{port}'"));
+                }
+                for (index, level) in levels.iter().enumerate() {
+                    if let Some(symbol) = ports
+                        .inputs
+                        .get(&level.owner)
+                        .or_else(|| ports.outputs.get(&level.owner))
+                        .and_then(extent_symbol)
+                    {
+                        rooted.entry(symbol).or_insert_with(|| {
+                            format!("the units of ownership level {index} of port '{port}'")
+                        });
+                    }
+                }
+            }
+            // A component that pads rather than packs still assembles a group,
+            // and what it assembles is rows. Its row axis is therefore the item
+            // count a budget roots at, exactly as a packed extent is.
+            crate::schema::BatchLayout::RequestAligned { axis }
+            | crate::schema::BatchLayout::RequestExpanded { axis, .. } => {
+                if let Some(symbol) = axis_symbol(contract, *axis) {
+                    rooted
+                        .entry(symbol)
+                        .or_insert_with(|| format!("the row count of port '{port}'"));
+                }
+            }
+            _ => {}
+        }
+    }
+    rooted
 }
 
 /// Symbols that count units rather than describe one.
@@ -3420,19 +3575,19 @@ fn ownership_count_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&s
     counts
 }
 
-/// Symbols pinned across a group are stated once, name a property of an item
-/// rather than a count of items, and are never budgeted on their own.
+/// Symbols pinned across a group are stated once and name a property of an item
+/// rather than a count of them.
 ///
-/// A pinned dimension has one extent across the whole group, so a bound naming
-/// it alone is a second spelling of a number the item budget already carries. A
-/// *composed* budget may name it, because there the pinned extent multiplies a
-/// count that does vary, which is a footprint and not a restatement.
+/// Pinning is not the opposite of budgeting. A pinned symbol has one extent
+/// *within* a group and may differ between groups, so a composed budget that
+/// multiplies it by a count is the only thing that bounds the footprint it
+/// contributes to; what it may never be is the symbol a layout packs or a
+/// level's unit count, because those are what the scheduler chose.
 fn validate_uniform_dimensions(
     path: &str,
     capacity: &crate::schema::ComponentBatchCapacity,
     declared: &BTreeMap<&str, &str>,
     counts: &BTreeMap<&str, String>,
-    pinned_alone: &BTreeSet<&str>,
     errors: &mut Vec<String>,
 ) {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -3464,15 +3619,6 @@ fn validate_uniform_dimensions(
                  them to share an invocation, and pinning a count would forbid the very \
                  raggedness the packed layout declares. Bound it with a budget instead, or drop \
                  the ownership level and declare a fixed group"
-            ));
-            continue;
-        }
-        if pinned_alone.contains(symbol.as_str()) {
-            errors.push(format!(
-                "{path} both pins '{symbol}' across the group and budgets it on its own; a pinned \
-                 dimension has one extent for every item, so a bound naming it alone is a second \
-                 spelling of a number the item budget already carries. A composed budget may name \
-                 it, because there the extent multiplies a count that does vary"
             ));
         }
     }
@@ -4635,10 +4781,18 @@ fn validate_compaction_derivability(
                      the emitted value and the declared output must agree"
                 ));
             }
+            // The carve-out is deliberately narrow: a `shared` emitted value is
+            // admitted only when it is one of the int64 rank-1 vectors some
+            // other emitted value's layout names, which is decidable from the
+            // declared outputs alone. Anything else `shared` and rank > 0 is
+            // still a per-request result with no way back to a request.
+            let is_ownership_companion = contract.dtype == "int64"
+                && contract.rank == 1
+                && ownership_companions(workflow).contains(output.as_str());
             if contract.rank > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
-                && !ownership_companions(workflow).contains(output.as_str())
+                && !is_ownership_companion
             {
                 errors.push(format!(
                     "{path} emits per-request value '{value}' without a declared batch_layout; a \

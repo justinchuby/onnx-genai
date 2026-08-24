@@ -2,15 +2,18 @@
 //!
 //! Implements the spec from <https://github.com/onnx/onnx/issues/8184>
 
-/// Canonical spelling of the base inference-metadata schema version.
+/// The spelling of the base schema version that emitters stamp.
 ///
-/// Emitters that use nothing newer stamp this into
-/// [`schema::InferenceMetadata::schema_version`]. Readers treat an absent value
-/// as the same version, and normalize the spellings already in the wild — `v1`,
-/// `1`, `1.0` — onto [`INITIAL_SCHEMA_VERSION`], so an old package keeps loading
-/// byte for byte. A package that uses a field a later version introduced states
-/// that later version instead; see [`version`].
-pub const SCHEMA_VERSION: &str = "1.0";
+/// It stays `v1` because that is what every writer in this repository already
+/// stamps and what 19 in-tree documents already say. Readers normalize the
+/// spellings in the wild — absent, `v1`, `1`, `1.0` — onto
+/// [`INITIAL_SCHEMA_VERSION`], so changing what is emitted would rewrite bytes
+/// and semantic identities to say something no reader distinguishes.
+///
+/// A package that uses a field a later version introduced states that later
+/// version instead, and must: see [`version`] and
+/// [`BATCHING_SCHEMA_VERSION`].
+pub const SCHEMA_VERSION: &str = "v1";
 
 /// Built-in serialized capability identifiers.
 ///
