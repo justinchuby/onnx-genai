@@ -23,6 +23,8 @@ mod ir;
 mod package;
 mod pipeline;
 
+pub use schema_vocabulary::{LENGTH_CONTENT_ROLES, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT};
+
 pub use decoder_abi::*;
 pub use generation::*;
 pub use hardware::*;
@@ -44,10 +46,13 @@ pub use pipeline::*;
     transform = schema_helpers::inference_metadata_constraints
 )]
 pub struct InferenceMetadata {
-    /// Schema version of this inference-metadata document, e.g. `"v1"`.
+    /// Schema version of this inference-metadata document, e.g. `"1.1"`.
     ///
-    /// Absent means the initial `"v1"` contract (readers default to `v1`).
-    /// Bump this only for breaking schema changes.
+    /// Canonically `"<major>.<minor>"`. Absence means the initial `1.0`
+    /// contract, as do the spellings `"v1"`, `"1"` and `"v1.0"` that predate a
+    /// canonical form; readers normalize before comparing, so all four keep
+    /// loading. Bump the major only for breaking schema changes, and the minor
+    /// whenever a document may carry a field an older reader would not know.
     ///
     /// An additive field keeps the same major version, but note what that does
     /// and does not buy: the v1 surface is closed — every structure here denies
@@ -343,6 +348,28 @@ mod schema_vocabulary {
         ]
     );
 
+    /// Content roles that count how much of a padded dimension is real.
+    ///
+    /// One `padding` entry names one companion, and the companion may carry any
+    /// of these: `valid_lengths` is the medium-independent spelling, and the
+    /// audio-side names that predate it say the same thing about a particular
+    /// unit. A validator that recognized only the generic name would refuse
+    /// programs that were already correct, and one that recognized only the
+    /// specific names could not describe a padded video at all.
+    pub const LENGTH_CONTENT_ROLES: [&str; 5] = [
+        "valid_lengths",
+        "sample_lengths",
+        "frame_lengths",
+        "valid_frames",
+        "valid_samples",
+    ];
+
+    /// Content role of the exclusive prefix offsets of an ownership level.
+    pub const PACK_OFFSETS_CONTENT: &str = "pack_offsets";
+
+    /// Content role of the owner map of an ownership level.
+    pub const PACK_OWNER_CONTENT: &str = "pack_owner";
+
     extensible_string!(
         /// Optional-thumbnail ordering vocabulary.
         ThumbnailOrder,
@@ -384,6 +411,16 @@ mod schema_vocabulary {
 
     extensible_string!(
         /// Generic audio-output content-role vocabulary.
+        ///
+        /// Audio arrived at lengths first and named them for what they count:
+        /// `sample_lengths` counts raw samples, `frame_lengths` counts frames
+        /// after framing, and `valid_frames`/`valid_samples` are the same fact
+        /// spelled as a count of the real entries. They stay, because a program
+        /// that already emits one keeps loading and because the finer name is
+        /// worth reading. `valid_lengths` joins them as the medium-independent
+        /// spelling, and all five are one role to the validator: the value a
+        /// `padding` entry names must carry one of them, whichever the producer
+        /// chose. See [`LENGTH_CONTENT_ROLES`].
         AudioOutputContent,
         audio_output_content,
         AUDIO_OUTPUT_CONTENT,

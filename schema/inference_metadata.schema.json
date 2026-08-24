@@ -527,7 +527,7 @@
       "type": "object"
     },
     "AudioOutputContent": {
-      "description": "Generic audio-output content-role vocabulary.",
+      "description": "Generic audio-output content-role vocabulary.\n\nAudio arrived at lengths first and named them for what they count:\n`sample_lengths` counts raw samples, `frame_lengths` counts frames\nafter framing, and `valid_frames`/`valid_samples` are the same fact\nspelled as a count of the real entries. They stay, because a program\nthat already emits one keeps loading and because the finer name is\nworth reading. `valid_lengths` joins them as the medium-independent\nspelling, and all five are one role to the validator: the value a\n`padding` entry names must carry one of them, whichever the producer\nchose. See [`LENGTH_CONTENT_ROLES`].",
       "oneOf": [
         {
           "enum": [
@@ -897,17 +897,6 @@
               "maxItems": 2,
               "minItems": 1,
               "type": "array"
-            },
-            "packed_extent": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/PackedExtent"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Where the extent of this packed axis comes from, for a value a\ncomponent produces.\n\nAbsent is right for a value a component consumes, whose extent the\ncaller assembled. An output must state it: a runtime that assumed\nthe input's offsets still describe the result would split a\ntoken-merging encoder's output at the wrong boundaries and report\nnothing."
             }
           },
           "required": [
@@ -985,9 +974,8 @@
           "type": "array"
         },
         "uniform_dimensions": {
-          "description": "Shape symbols whose extents must be equal across every co-batched item.\n\nA component that accepts several items may still require them to agree\non something no amount of padding or packing reconciles — an encoder\nwhose artifact is built for one spatial extent, say, or one that groups\nclips only when they carry the same number of frames. Spatial and\ntemporal extents are listed the same way: a symbol is a symbol, and the\nruntime compares the dimensions it is told to compare rather than\nguessing which ones matter. A symbol left off this list is free to vary,\nand must then be reconciled by padding or by packing.",
+          "description": "Shape symbols whose extents every item in a group must agree on.\n\nA symbol here names a property of one item — a patch width, a mel bin, a\nframe count of a fixed-length clip — that the artifact cannot vary\nwithin a single call. Items that disagree on it cannot share an\ninvocation, so a scheduler splits them into separate groups.\n\nIt may not name a count: not the extent of a packed axis, and not the\nunit or run count of an ownership level. Those are the numbers a packed\nlayout exists to let vary per request, and pinning one would describe a\nfixed-shape batch the package did not declare. A video whose frame count\nreally is fixed is expressed by pinning the frame dimension of an\nordinary request-aligned tensor and declaring no frame ownership level\nat all.",
           "items": {
-            "minLength": 1,
             "type": "string"
           },
           "type": "array"
@@ -2221,6 +2209,17 @@
       "additionalProperties": false,
       "description": "One level of a packed value's ownership chain.\n\nA level is a pair, never a tensor axis: `offsets` gives the exclusive prefix\noffset of each parent's run and `owner` gives the owning position of each\nentry at this level. The two together are what a runtime walks to answer\n\"which request does this item belong to\".\n\nBoth are `shared`, never `request_aligned`. An exclusive prefix sum is not\npermutation-followable — permuting rows does not permute a prefix-offset\nvector, it invalidates it — so a runtime that compacts rebuilds the chain\nrather than gathering it.",
       "properties": {
+        "extent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackedExtent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where this level's unit count comes from, for a value a component\nproduces.\n\nAbsent is right for a value a component consumes, whose every count the\ncaller assembled. An output states it per level, because the levels of\none chain do not answer together: a token-merging encoder decides how\nmany tokens each clip becomes while leaving which clip belongs to which\nrequest exactly as it found it. A single answer for the whole chain\ncould only be wrong at one end or the other."
+        },
         "offsets": {
           "description": "Value holding the exclusive prefix offset of each parent's run at this\nlevel, with a final entry holding the total. Its extent is the parent\ncount plus one.",
           "minLength": 1,
@@ -2264,7 +2263,7 @@
       "type": "object"
     },
     "PackedExtent": {
-      "description": "Where the extent of a component output's packed axis comes from.\n\nNeither answer is derivable from the contract: an output of the same rank\nand symbols as its input may be a per-item transform or a token merger, and\nthe two split at completely different boundaries.",
+      "description": "Where the unit count of one ownership level comes from.\n\nNeither answer is derivable from the contract: an output of the same rank\nand symbols as its input may be a per-item transform or a token merger, and\nthe two split at completely different boundaries.",
       "oneOf": [
         {
           "const": "preserved",
@@ -5416,7 +5415,7 @@
       "type": "array"
     },
     "schema_version": {
-      "description": "Schema version of this inference-metadata document, e.g. `\"v1\"`.\n\nAbsent means the initial `\"v1\"` contract (readers default to `v1`).\nBump this only for breaking schema changes.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.",
+      "description": "Schema version of this inference-metadata document, e.g. `\"1.1\"`.\n\nCanonically `\"<major>.<minor>\"`. Absence means the initial `1.0`\ncontract, as do the spellings `\"v1\"`, `\"1\"` and `\"v1.0\"` that predate a\ncanonical form; readers normalize before comparing, so all four keep\nloading. Bump the major only for breaking schema changes, and the minor\nwhenever a document may carry a field an older reader would not know.\n\nAn additive field keeps the same major version, but note what that does\nand does not buy: the v1 surface is closed — every structure here denies\nunknown fields — so a reader built before a field was added rejects a\ndocument that uses it rather than ignoring it. Compatibility with older\nreaders therefore comes from a new field being *absent by default*, not\nfrom tolerance of unknown keys. A producer that emits one is declaring\nthat the package needs a reader which understands it, and a package that\ndoes not emit it keeps loading everywhere it loaded before.",
       "type": [
         "string",
         "null"

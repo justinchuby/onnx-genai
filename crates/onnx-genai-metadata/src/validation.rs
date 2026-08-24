@@ -368,6 +368,7 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             }
         }
     }
+    validate_schema_version(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
@@ -379,6 +380,121 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     } else {
         Err(errors)
     }
+}
+
+/// A document declares the version whose fields it actually uses.
+///
+/// Absence is the compatibility mechanism in a schema that denies unknown
+/// fields: a package that uses nothing new keeps loading on every runtime it
+/// loaded on before, and one that uses something new needs a reader that knows
+/// it. That only works if the declared version tells the truth, so a document
+/// carrying a `1.1` field while claiming `1.0` is refused here rather than
+/// discovered by an older runtime as a mystery unknown-field error.
+fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    let declared = match crate::version::normalize(metadata.schema_version.as_deref()) {
+        Ok(version) => version,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+    if declared > crate::version::SUPPORTED_SCHEMA_VERSION {
+        errors.push(format!(
+            "this package declares inference-metadata schema version {declared}, and this build \
+             reads up to {}",
+            crate::version::SUPPORTED_SCHEMA_VERSION
+        ));
+        return;
+    }
+    let Some(feature) = batching_schema_feature(metadata) else {
+        return;
+    };
+    let required = crate::version::BATCHING_SCHEMA_VERSION;
+    if declared < required {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package {feature}, which schema version {required} introduced, but declares \
+             schema_version '{spelled}' ({declared}). Every structure in this schema refuses \
+             fields it does not know, so a reader built for {declared} would reject this document \
+             with a puzzled unknown-field error; declare schema_version '{required}' so it is \
+             refused for the reason that is true"
+        ));
+    }
+}
+
+/// The first `1.1` field this document uses, described the way a document
+/// writer would recognize it.
+fn batching_schema_feature(metadata: &InferenceMetadata) -> Option<String> {
+    let mut sites: Vec<(String, &crate::schema::TensorContract)> = Vec::new();
+    if let Some(preprocessing) = &metadata.preprocessing {
+        if preprocessing.video.is_some() {
+            return Some("declares preprocessing.video".to_string());
+        }
+        if let Some(program) = &preprocessing.image {
+            for binding in &program.outputs {
+                if let Some(contract) = &binding.contract {
+                    sites.push((
+                        format!("preprocessing.image output '{}'", binding.name),
+                        contract,
+                    ));
+                }
+            }
+        }
+        if let Some(program) = &preprocessing.audio {
+            for binding in &program.outputs {
+                if let Some(contract) = &binding.contract {
+                    sites.push((
+                        format!("preprocessing.audio output '{}'", binding.name),
+                        contract,
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    {
+        for (name, component) in &workflow.components {
+            if component.batch_capacity.is_some() {
+                return Some(format!(
+                    "declares batch_capacity on workflow component '{name}'"
+                ));
+            }
+        }
+        for (name, input) in &workflow.inputs {
+            sites.push((format!("workflow input '{name}'"), &input.contract));
+        }
+        for (name, output) in &workflow.outputs {
+            sites.push((format!("workflow output '{name}'"), &output.contract));
+        }
+        for (name, state) in &workflow.state {
+            sites.push((format!("workflow state '{name}'"), &state.contract));
+        }
+        for (component, spec) in &workflow.components {
+            for (direction, ports) in [
+                ("input", &spec.ports.inputs),
+                ("output", &spec.ports.outputs),
+            ] {
+                for (port, contract) in ports {
+                    sites.push((
+                        format!("workflow component '{component}' {direction} '{port}'"),
+                        contract,
+                    ));
+                }
+            }
+        }
+    }
+    for (path, contract) in sites {
+        if !contract.padding.is_empty() {
+            return Some(format!("declares padding on {path}"));
+        }
+        if !contract.batch_layout.levels().is_empty() {
+            return Some(format!("declares a token_packed ownership chain on {path}"));
+        }
+    }
+    None
 }
 
 /// Generation overrides must be structural: every overridable field binds a
@@ -719,6 +835,7 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
 struct PreprocessingOutputView<'a> {
     name: &'a str,
     dtype: &'a str,
+    content: &'a str,
     contract: Option<&'a crate::schema::TensorContract>,
     optional: bool,
 }
@@ -731,6 +848,7 @@ impl<'a> PreprocessingOutputView<'a> {
             .map(|output| PreprocessingOutputView {
                 name: &output.name,
                 dtype: &output.dtype,
+                content: &output.content,
                 contract: output.contract.as_ref(),
                 optional: output.optional.unwrap_or(false),
             })
@@ -744,10 +862,74 @@ impl<'a> PreprocessingOutputView<'a> {
             .map(|output| PreprocessingOutputView {
                 name: &output.name,
                 dtype: &output.dtype,
+                content: &output.content,
                 contract: output.contract.as_ref(),
                 optional: output.optional.unwrap_or(false),
             })
             .collect()
+    }
+}
+
+/// A companion a program emits carries the role that says what it is.
+///
+/// The reference in a `padding` entry or an ownership level says *that* a value
+/// describes a packed or padded tensor; the content role says *what a runtime
+/// may do with it*. A program that emitted a length under the role `pixels`
+/// would be handing a preprocessor's caller a tensor it could only guess at, so
+/// the two statements have to agree.
+fn validate_program_companion_roles(
+    kind: &str,
+    outputs: &[PreprocessingOutputView<'_>],
+    errors: &mut Vec<String>,
+) {
+    let role_of: BTreeMap<&str, &str> = outputs
+        .iter()
+        .map(|output| (output.name, output.content))
+        .collect();
+    let mut require = |referrer: &str, companion: &str, allowed: &[&str], what: &str| {
+        let Some(role) = role_of.get(companion) else {
+            return;
+        };
+        if allowed.contains(role) {
+            return;
+        }
+        errors.push(format!(
+            "preprocessing.{kind} output '{referrer}' names '{companion}' as its {what}, but that \
+             output carries content role '{role}'; a companion says what it is by its role, and \
+             the roles that say this are {}",
+            allowed
+                .iter()
+                .map(|role| format!("'{role}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    for output in outputs {
+        let Some(contract) = output.contract else {
+            continue;
+        };
+        for padded in &contract.padding {
+            require(
+                output.name,
+                &padded.valid_lengths,
+                &crate::schema::LENGTH_CONTENT_ROLES,
+                "valid lengths",
+            );
+        }
+        for level in contract.batch_layout.levels() {
+            require(
+                output.name,
+                &level.offsets,
+                &[crate::schema::PACK_OFFSETS_CONTENT],
+                "ownership offsets",
+            );
+            require(
+                output.name,
+                &level.owner,
+                &[crate::schema::PACK_OWNER_CONTENT],
+                "ownership owner map",
+            );
+        }
     }
 }
 
@@ -818,6 +1000,7 @@ fn validate_preprocessing_program(
     let Some(program_outputs) = program_outputs else {
         return;
     };
+    validate_program_companion_roles(kind, &program_outputs, errors);
     if adapters.len() != 1 {
         errors.push(format!(
             "preprocessing.{kind} requires exactly one workflow adapter component using \
@@ -2535,67 +2718,84 @@ fn validate_packed_extent(
     errors: &mut Vec<String>,
 ) {
     let levels = contract.batch_layout.levels();
-    let Some(level) = levels.first() else {
-        if contract.batch_layout.packed_extent().is_some() {
-            errors.push(format!(
-                "{path} declares packed_extent but declares no packed layout; the field says \
-                 where a packed axis's extent comes from, and there is no packed axis here"
-            ));
-        }
-        return;
-    };
-    let extent = contract.batch_layout.packed_extent();
-    if direction == "input" {
-        if let Some(extent) = extent {
-            errors.push(format!(
-                "{path} declares packed_extent {}; the extent of a value a component consumes is \
-                 the one its caller assembled, so only an output states where its extent came \
-                 from",
-                extent.name()
-            ));
-        }
+    if levels.is_empty() {
         return;
     }
-    let Some(extent) = extent else {
-        errors.push(format!(
-            "{path} packs items but declares no packed_extent; an output either preserves an \
-             input's units one for one or produces its own, and a runtime that guessed would \
-             split the result at the wrong boundaries"
-        ));
-        return;
-    };
-    // Only level zero is at stake: `packed_extent` is a statement about the
-    // physically packed axis. Coarser levels are ordinary references, and the
-    // mixed chain — an inner level the graph produced over an outer one it left
-    // alone — is the normal case for a token-merging encoder.
-    for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
-        match extent {
-            // Preserving an extent means reusing the companions that already
-            // describe it. A companion the component's own graph emits describes
-            // an extent that did not exist when the call was assembled, so it
-            // cannot be the one being preserved.
-            crate::schema::PackedExtent::Preserved => {
-                if ports.outputs.contains_key(companion) {
-                    errors.push(format!(
-                        "{path} declares packed_extent preserved but its level 0 {role} \
-                         '{companion}' is an output port of the same component; preserving an \
-                         extent means reusing the companions that already described it, and one \
-                         the graph emits describes an extent the caller never assembled"
-                    ));
+    for (index, level) in levels.iter().enumerate() {
+        if direction == "input" {
+            if let Some(extent) = level.extent {
+                errors.push(format!(
+                    "{path} declares level {index} extent {}; every count of a value a component \
+                     consumes is one its caller assembled, so only an output states where a level \
+                     came from",
+                    extent.name()
+                ));
+            }
+            continue;
+        }
+        let Some(extent) = level.extent else {
+            errors.push(format!(
+                "{path} packs items but declares no extent for level {index}; a level either \
+                 preserves an input level's units one for one or produces its own, and a runtime \
+                 that guessed would split the result at the wrong boundaries"
+            ));
+            continue;
+        };
+        // Each level answers for itself. The mixed chain — an inner level the
+        // graph produced sitting under an outer one it left exactly as it found
+        // it — is the ordinary shape of a token-merging encoder, and a single
+        // answer for the whole chain could only be wrong at one end.
+        for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
+            match extent {
+                // Preserving a count means reusing the companions that already
+                // describe it. A companion the component's own graph emits
+                // describes units that did not exist when the call was
+                // assembled, so it cannot be the one being preserved.
+                crate::schema::PackedExtent::Preserved => {
+                    if ports.outputs.contains_key(companion) {
+                        errors.push(format!(
+                            "{path} declares level {index} extent preserved but its {role} \
+                             '{companion}' is an output port of the same component; preserving a \
+                             level means reusing the companions that already described it, and \
+                             one the graph emits describes units the caller never assembled"
+                        ));
+                    }
+                }
+                // A count the graph decides is described by companions the graph
+                // emits. Reusing an input's offsets here would describe a length
+                // the output does not have, and the split would land between
+                // items.
+                crate::schema::PackedExtent::Produced => {
+                    if !ports.outputs.contains_key(companion) {
+                        errors.push(format!(
+                            "{path} declares level {index} extent produced but its {role} \
+                             '{companion}' is not an output port of the same component; a level \
+                             the graph decides is described by companions the graph emits"
+                        ));
+                    }
                 }
             }
-            // An extent the graph decides is described by companions the graph
-            // emits. Reusing an input's offsets here would describe a length the
-            // output does not have, and the split would land between items.
-            crate::schema::PackedExtent::Produced => {
-                if !ports.outputs.contains_key(companion) {
-                    errors.push(format!(
-                        "{path} declares packed_extent produced but its level 0 {role} \
-                         '{companion}' is not an output port of the same component; an extent the \
-                         graph decides is described by companions the graph emits"
-                    ));
-                }
-            }
+        }
+        // Correspondence is by the pair, not by the position. An output that
+        // consumed its inner level carries the surviving pair at index zero
+        // while the input carries it at index one, so matching by index would
+        // reject the ordinary token-merging encoder and accept an output that
+        // claims to preserve a grouping nothing handed it.
+        if extent == crate::schema::PackedExtent::Preserved
+            && !ports.inputs.values().any(|input| {
+                input.batch_layout.levels().iter().any(|candidate| {
+                    candidate.offsets == level.offsets && candidate.owner == level.owner
+                })
+            })
+        {
+            errors.push(format!(
+                "{path} declares level {index} extent preserved but no input port of the \
+                 component declares an ownership level pairing offsets '{}' with owner map '{}'; \
+                 a level is preserved by reusing the very pair that described it, and levels \
+                 correspond by that pair rather than by their position, since an output may drop \
+                 an inner level it consumed",
+                level.offsets, level.owner
+            ));
         }
     }
 }
@@ -2618,22 +2818,61 @@ fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>)
     for (name, state) in &workflow.state {
         sites.push((format!("workflow state '{name}'"), &state.contract));
     }
-    let mut pairings: BTreeMap<(&str, usize), (&str, String)> = BTreeMap::new();
+    for (component, spec) in &workflow.components {
+        for (direction, ports) in [
+            ("input", &spec.ports.inputs),
+            ("output", &spec.ports.outputs),
+        ] {
+            for (port, contract) in ports {
+                sites.push((
+                    format!("workflow component '{component}' {direction} '{port}'"),
+                    contract,
+                ));
+            }
+        }
+    }
+    // A level is identified by the pair it names, never by where it sits in a
+    // chain. An output that consumed its inner level carries the surviving pair
+    // at index zero while its input carries the same pair at index one, so a
+    // check keyed on position would call two spellings of one grouping a
+    // conflict and would miss a genuine one a level apart.
+    let mut pairings: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    let mut owners: BTreeMap<&str, String> = BTreeMap::new();
     for (path, contract) in &sites {
-        for (level, owner) in contract.batch_layout.levels().iter().enumerate() {
-            let key = (owner.offsets.as_str(), level);
-            if let Some((previous, first)) = pairings.get(&key)
-                && *previous != owner.owner.as_str()
+        for level in contract.batch_layout.levels() {
+            owners
+                .entry(level.owner.as_str())
+                .or_insert_with(|| path.clone());
+            if let Some((previous, first)) = pairings.get(level.offsets.as_str())
+                && *previous != level.owner.as_str()
             {
                 errors.push(format!(
-                    "{path} pairs level {level} offsets '{}' with owner map '{}', but {first} \
-                     pairs the same offsets with '{previous}'; one offsets vector describes one \
-                     grouping, so the two cannot both be right",
-                    owner.offsets, owner.owner
+                    "{path} pairs offsets '{}' with owner map '{}', but {first} pairs the same \
+                     offsets with '{previous}'; one offsets vector describes one grouping, so the \
+                     two cannot both be right",
+                    level.offsets, level.owner
                 ));
                 continue;
             }
-            pairings.insert(key, (owner.owner.as_str(), path.clone()));
+            pairings.insert(level.offsets.as_str(), (level.owner.as_str(), path.clone()));
+        }
+    }
+    // An owner map indexes into a batch the caller never sees. Its positions
+    // exist only once a group has been formed, and the per-request view of a
+    // packed value is derived by rebasing that request's offsets to zero — not
+    // by reading an owner vector back. So an owner companion is runtime-internal
+    // plumbing, and an application cannot hand one in.
+    for (name, first) in &owners {
+        let Some(input) = workflow.inputs.get(*name) else {
+            continue;
+        };
+        if input.externally_suppliable {
+            errors.push(format!(
+                "workflow input '{name}' is externally_suppliable but {first} names it as an \
+                 ownership owner map; an owner map indexes into a batch the application never \
+                 sees, and the per-request view is derived by rebasing that request's offsets, so \
+                 an owner map is runtime-internal and cannot be supplied"
+            ));
         }
     }
 }
@@ -3046,8 +3285,9 @@ fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
         let path = format!("workflow component '{name}' batch_capacity");
         let ports = &component.ports;
         let declared = declared_symbols(ports);
-        let budgeted = validate_budgets(&path, capacity, &declared, errors);
-        validate_uniform_dimensions(&path, capacity, &declared, &budgeted, errors);
+        let (budgeted, pinned_alone) = validate_budgets(&path, capacity, &declared, errors);
+        let counts = ownership_count_symbols(ports);
+        validate_uniform_dimensions(&path, capacity, &declared, &counts, &pinned_alone, errors);
         validate_level_budgets(&path, ports, &budgeted, errors);
         validate_free_dimensions(&path, capacity, ports, errors);
         if let Some(row_scope) = &component.row_scope {
@@ -3083,8 +3323,9 @@ fn validate_budgets<'a>(
     capacity: &'a crate::schema::ComponentBatchCapacity,
     declared: &BTreeMap<&str, &str>,
     errors: &mut Vec<String>,
-) -> BTreeSet<&'a str> {
+) -> (BTreeSet<&'a str>, BTreeSet<&'a str>) {
     let mut budgeted: BTreeSet<&str> = BTreeSet::new();
+    let mut alone: BTreeSet<&str> = BTreeSet::new();
     let mut bounded: BTreeSet<Vec<&str>> = BTreeSet::new();
     for budget in &capacity.budgets {
         let entry = describe_symbols(&budget.dimensions);
@@ -3120,6 +3361,9 @@ fn validate_budgets<'a>(
                 continue;
             }
             budgeted.insert(dimension.as_str());
+            if budget.dimensions.len() == 1 {
+                alone.insert(dimension.as_str());
+            }
         }
         let key: Vec<&str> = budget.dimensions.iter().map(String::as_str).collect();
         if !bounded.insert(key) {
@@ -3129,19 +3373,66 @@ fn validate_budgets<'a>(
             ));
         }
     }
-    budgeted
+    (budgeted, alone)
 }
 
-/// Symbols pinned across a group are stated once, and are never also budgeted.
+/// Symbols that count units rather than describe one.
 ///
-/// A pinned dimension has one extent across the whole group, so its footprint is
-/// already the item count times that extent; budgeting it as well is a second
-/// spelling of a bound the item budget already carries.
+/// A packed extent, and the extents of the companions of an ownership chain,
+/// are exactly the numbers that change when a scheduler forms a group. Each is
+/// mapped to the site that made it a count, so a refusal can say which
+/// declaration it is arguing with.
+fn ownership_count_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
+    let mut counts: BTreeMap<&str, String> = BTreeMap::new();
+    let resolve = |name: &str| {
+        ports
+            .inputs
+            .get(name)
+            .or_else(|| ports.outputs.get(name))
+            .and_then(extent_symbol)
+    };
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        let levels = contract.batch_layout.levels();
+        if levels.is_empty() {
+            continue;
+        }
+        if let Some(axis) = contract.batch_layout.packed_axis()
+            && let Some(symbol) = contract
+                .shape
+                .as_ref()
+                .and_then(|shape| shape.get(axis))
+                .and_then(symbol_of)
+        {
+            counts
+                .entry(symbol)
+                .or_insert_with(|| format!("the packed extent of port '{port}'"));
+        }
+        for (index, level) in levels.iter().enumerate() {
+            for (role, companion) in [("units", &level.owner), ("run count", &level.offsets)] {
+                if let Some(symbol) = resolve(companion) {
+                    counts.entry(symbol).or_insert_with(|| {
+                        format!("the {role} of ownership level {index} of port '{port}'")
+                    });
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Symbols pinned across a group are stated once, name a property of an item
+/// rather than a count of items, and are never budgeted on their own.
+///
+/// A pinned dimension has one extent across the whole group, so a bound naming
+/// it alone is a second spelling of a number the item budget already carries. A
+/// *composed* budget may name it, because there the pinned extent multiplies a
+/// count that does vary, which is a footprint and not a restatement.
 fn validate_uniform_dimensions(
     path: &str,
     capacity: &crate::schema::ComponentBatchCapacity,
     declared: &BTreeMap<&str, &str>,
-    budgeted: &BTreeSet<&str>,
+    counts: &BTreeMap<&str, String>,
+    pinned_alone: &BTreeSet<&str>,
     errors: &mut Vec<String>,
 ) {
     let mut seen: BTreeSet<&str> = BTreeSet::new();
@@ -3161,11 +3452,27 @@ fn validate_uniform_dimensions(
             ));
             continue;
         }
-        if budgeted.contains(symbol.as_str()) {
+        // Pinning a count is pinning the raggedness away. `uniform_dimensions`
+        // says which properties of an *item* must agree for items to share an
+        // invocation; how many items a request contributes is the thing a
+        // packed layout exists to let vary, and a package that pinned it would
+        // be describing a fixed-shape batch it did not declare.
+        if let Some(reason) = counts.get(symbol.as_str()) {
             errors.push(format!(
-                "{path} both pins '{symbol}' across the group and budgets it; a pinned dimension \
-                 has one extent for every item, so its footprint is already bounded by the item \
-                 budget and a second bound is a second truth"
+                "{path} requires uniform dimension '{symbol}', which is {reason} rather than a \
+                 property of one item; a uniform dimension says what must agree between items for \
+                 them to share an invocation, and pinning a count would forbid the very \
+                 raggedness the packed layout declares. Bound it with a budget instead, or drop \
+                 the ownership level and declare a fixed group"
+            ));
+            continue;
+        }
+        if pinned_alone.contains(symbol.as_str()) {
+            errors.push(format!(
+                "{path} both pins '{symbol}' across the group and budgets it on its own; a pinned \
+                 dimension has one extent for every item, so a bound naming it alone is a second \
+                 spelling of a number the item budget already carries. A composed budget may name \
+                 it, because there the extent multiplies a count that does vary"
             ));
         }
     }
