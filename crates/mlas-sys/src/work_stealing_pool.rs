@@ -11,7 +11,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 type JobFn = unsafe fn(*const (), usize, usize);
 
@@ -19,6 +19,43 @@ const SPIN_LOOP_BUDGET: usize = 1 << 12;
 const YIELD_ROUNDS: usize = 64;
 const PARK_TIMEOUT: Duration = Duration::from_micros(50);
 const MAX_LOOP_COUNTER_SHARDS: usize = 8;
+
+/// How long [`WorkStealingThreadPool::new`] waits for every spawned worker to
+/// reach its loop before giving up.
+///
+/// Deliberately far beyond any real startup: a worker announces on the first
+/// line of `worker_loop`, so the only thing between `spawn` returning `Ok` and
+/// the announcement is the OS scheduling the new thread once. A wait that
+/// reaches this deadline is reporting a pool that can no longer become ready,
+/// not a slow one. Matches `onnx-runtime-ep-cpu`'s `POOL_READY_TIMEOUT`, which
+/// is the same backstop against the same failure.
+const POOL_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Both knobs below are thread-scoped rather than global, so injecting a fault
+// into one test cannot reach a pool another test is building concurrently.
+#[cfg(test)]
+thread_local! {
+    /// Test override for [`POOL_READY_TIMEOUT`], in milliseconds; `0` means
+    /// "use the real one".
+    pub(super) static POOL_READY_TIMEOUT_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test fault injection: the worker index that must never announce
+    /// readiness, or `usize::MAX` for none.
+    pub(super) static HOLD_WORKER_BEFORE_READY: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Read on the builder thread, which is where the barrier runs.
+fn pool_ready_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = POOL_READY_TIMEOUT_MS.with(std::cell::Cell::get);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    POOL_READY_TIMEOUT
+}
 
 #[repr(align(128))]
 struct PaddedAtomicUsize(AtomicUsize);
@@ -136,22 +173,89 @@ impl WorkStealingThreadPool {
         });
 
         let mut workers = Vec::with_capacity(worker_count);
+        // Latch the fault-injection knob on the builder thread: it is
+        // thread-local to the injecting test, and a worker runs on its own
+        // thread where it is always at its default.
+        #[cfg(test)]
+        let held_worker = HOLD_WORKER_BEFORE_READY.with(std::cell::Cell::get);
         for worker_id in 0..worker_count {
             let shared = Arc::clone(&shared);
             let queue_id = worker_id + 1;
             workers.push(
                 thread::Builder::new()
                     .name(format!("mlas-sys-ws-{worker_id}"))
-                    .spawn(move || worker_loop(shared, queue_id))?,
+                    .spawn(move || {
+                        #[cfg(test)]
+                        if worker_id == held_worker {
+                            // Not a panic: a panicking worker drops its
+                            // `Arc<Shared>`, a tidier failure than the one being
+                            // reproduced. The defect is a worker that exists,
+                            // holds its share of the pool, and never announces.
+                            while !shared.shutdown.load(Ordering::Acquire) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            return;
+                        }
+                        worker_loop(shared, queue_id);
+                    })?,
             );
         }
 
-        let worker_threads = workers
+        let worker_threads: Vec<Thread> = workers
             .iter()
             .map(|worker| worker.thread().clone())
             .collect();
-        while shared.ready.load(Ordering::Acquire) != worker_count {
-            std::hint::spin_loop();
+        // Spin briefly, then *yield*, then give up. A pure `spin_loop` here
+        // waits on threads that need a core to make progress, so where the
+        // builder and its workers contend for the same CPU the spinner starves
+        // the very workers it is waiting for -- livelock, not slow progress,
+        // and most reachable exactly where cores are scarcest (an emulated
+        // target, a cpuset-confined process, a loaded host). A worker that dies
+        // before announcing makes the condition permanently unsatisfiable, and
+        // spinning on it burns a core forever while looking exactly like work.
+        //
+        // The deadline is a liveness backstop, not a performance bound.
+        let ready_since = Instant::now();
+        let mut spins = 0usize;
+        while shared.ready.load(Ordering::Acquire) < worker_count {
+            spins = spins.wrapping_add(1);
+            if spins < SPIN_LOOP_BUDGET {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+                // Every yield, not on a stride: a yield under contention costs
+                // microseconds to milliseconds, so a stride of N multiplies the
+                // deadline's granularity by N yields of an already-starved
+                // thread.
+                if ready_since.elapsed() >= pool_ready_timeout() {
+                    let ready = shared.ready.load(Ordering::Acquire);
+                    // Two separate reads, so a worker can announce between
+                    // them; accept that pool rather than tearing down a healthy
+                    // one.
+                    if ready >= worker_count {
+                        break;
+                    }
+                    // Release the workers that did start, using the same
+                    // publish-then-wake sequence as `shutdown`. Deliberately
+                    // not joined: this build has a worker that never reached
+                    // its loop, and blocking on it would reintroduce the
+                    // unbounded wait this backstop exists to remove.
+                    shared.shutdown.store(true, Ordering::SeqCst);
+                    shared.epoch.fetch_add(1, Ordering::Release);
+                    for thread in &worker_threads {
+                        thread.unpark();
+                    }
+                    drop(workers);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "work-stealing pool never became ready: {ready} of \
+                             {worker_count} workers announced within {:?}",
+                            pool_ready_timeout()
+                        ),
+                    ));
+                }
+            }
         }
         Ok(Self {
             shared,
@@ -479,5 +583,74 @@ mod tests {
         }
 
         assert_eq!(calls.load(Ordering::Relaxed), 1000 * 8);
+    }
+}
+
+/// The readiness backstop: a pool that cannot become ready must report an error
+/// rather than hold the machine at full occupancy indefinitely.
+#[cfg(test)]
+mod ready_backstop_tests {
+    use super::*;
+
+    /// Sets the readiness knobs for the test and clears them afterwards.
+    struct Injected;
+
+    impl Injected {
+        fn new(timeout_ms: u64, held: usize) -> Self {
+            POOL_READY_TIMEOUT_MS.with(|cell| cell.set(timeout_ms));
+            HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(held));
+            Self
+        }
+    }
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            POOL_READY_TIMEOUT_MS.with(|cell| cell.set(0));
+            HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(usize::MAX));
+        }
+    }
+
+    /// A worker that never announces must fail the build, not hang it.
+    ///
+    /// Before this change the constructor ran `while ready != worker_count {
+    /// spin_loop() }` with no yield, no bound and no exit, so one wedged worker
+    /// held the builder's core at 100% for the life of the process --
+    /// indistinguishable from work.
+    #[test]
+    fn a_worker_that_never_announces_fails_the_build_instead_of_hanging() {
+        let injected = Injected::new(250, 0);
+        let started = Instant::now();
+        let err = WorkStealingThreadPool::new(4)
+            .err()
+            .expect("a pool with a worker that never announces was reported as built");
+        let elapsed = started.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
+        assert!(
+            err.to_string().contains("2 of 3 workers announced"),
+            "the diagnostic does not say how far the pool got, which is the only \
+             thing that distinguishes this from a spawn failure: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the build took {elapsed:?} against a 250ms deadline, so it is not the \
+             deadline that ended it"
+        );
+        drop(injected);
+    }
+
+    /// The negative control: the same deadline must build a healthy pool, so
+    /// the test above cannot be passing because the backstop fires on every
+    /// build.
+    #[test]
+    fn the_same_deadline_builds_a_healthy_pool() {
+        let injected = Injected::new(250, usize::MAX);
+        let pool = WorkStealingThreadPool::new(4).expect("healthy pool must build");
+        assert_eq!(pool.thread_count(), 4);
+        let calls = AtomicUsize::new(0);
+        pool.parallel_for(0, 64, 1, |begin, end| {
+            calls.fetch_add(end - begin, Ordering::Relaxed);
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 64);
+        drop(injected);
     }
 }

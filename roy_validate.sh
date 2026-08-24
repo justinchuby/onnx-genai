@@ -48,10 +48,50 @@ step "G clippy-aarch64-linux" cargo clippy --locked --target aarch64-unknown-lin
 # the binfmt-launched child does not inherit a `-L` sysroot -- without it five
 # affinity/SPMD tests fail with "Could not open '/lib/ld-linux-aarch64.so.1'",
 # which looks like a code defect and is not one.
+#
+# Bounded on three axes, because this is the one step that can take a shared
+# host down. qemu-user runs every guest thread as a host thread, so the suite's
+# own parallelism multiplies by each test's pool width; a single wedged pool
+# then holds every core it was given for as long as the process lives. The two
+# CPU knobs are *bounds*, not tuning -- they decide how much of a shared box one
+# lane may take, not how fast it runs -- and the timeout converts a hang into a
+# FAIL with a log instead of an occupancy nobody can distinguish from work.
+#
+# Override any of them if you own the host:
+#   RV_QEMU_CPUS=0-15 RV_QEMU_TEST_THREADS=8 RV_QEMU_TIMEOUT=5400 ./roy_validate.sh
+rv_default_cpu_bound() {
+  local n quarter
+  n=$(nproc 2> /dev/null || echo 4)
+  quarter=$((n / 4))
+  [ "$quarter" -lt 1 ] && quarter=1
+  echo "0-$((quarter - 1))"
+}
+RV_QEMU_CPUS="${RV_QEMU_CPUS:-$(rv_default_cpu_bound)}"
+RV_QEMU_TEST_THREADS="${RV_QEMU_TEST_THREADS:-4}"
+RV_QEMU_TIMEOUT="${RV_QEMU_TIMEOUT:-2700}"
+
+# `taskset` is coreutils-adjacent but not universal, and an absent bound must be
+# reported rather than silently dropped: a lane that quietly runs unbounded is
+# exactly the failure this block exists to prevent.
+rv_qemu_prefix=()
+if command -v timeout > /dev/null 2>&1; then
+  rv_qemu_prefix+=(timeout --signal=TERM --kill-after=120 "$RV_QEMU_TIMEOUT")
+else
+  echo "  WARN: 'timeout' not found -- the aarch64 lane will run unbounded in time."
+fi
+if command -v taskset > /dev/null 2>&1; then
+  rv_qemu_prefix+=(taskset -c "$RV_QEMU_CPUS")
+else
+  echo "  WARN: 'taskset' not found -- the aarch64 lane will run unbounded in CPUs."
+fi
+
+echo "G2 bounds: cpus=$RV_QEMU_CPUS test-threads=$RV_QEMU_TEST_THREADS timeout=${RV_QEMU_TIMEOUT}s"
 step_if "G2 test-aarch64-qemu" qemu-aarch64-static "apt install qemu-user-static" \
+  "${rv_qemu_prefix[@]}" \
   env QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER=qemu-aarch64-static \
-      cargo test --locked --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu --lib
+      cargo test --locked --target aarch64-unknown-linux-gnu -p onnx-runtime-ep-cpu --lib \
+      -- --test-threads="$RV_QEMU_TEST_THREADS"
 # Windows ARM64. Plain `cargo check --target aarch64-pc-windows-msvc` cannot
 # work on Linux: ort-sys runs bindgen over the ORT headers, which #include
 # <stdlib.h>, so it needs the MSVC CRT/SDK headers and dies with
