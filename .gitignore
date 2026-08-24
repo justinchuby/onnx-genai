@@ -104,3 +104,4 @@ roy_validate.log
 # hostlock self-test scratch (scripts/hostlock_test.sh writes these into the repo
 # root deliberately -- /tmp is off-limits here -- and an aborted run leaves them)
 .hostlock-selftest*
+.scratch-paged/
