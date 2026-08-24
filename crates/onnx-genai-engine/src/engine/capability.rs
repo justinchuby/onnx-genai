@@ -71,3 +71,25 @@ pub fn package_capability_error(error: &anyhow::Error) -> Option<PackageCapabili
         .chain()
         .find_map(|cause| cause.downcast_ref::<PackageCapabilityError>().cloned())
 }
+
+/// What a session already holds in front of the next turn's prompt.
+///
+/// Two numbers, because two different questions are asked of the same session
+/// and they have different answers:
+///
+/// * `attended` is what the model's window has to fit *besides* this request —
+///   what a context cap, an output budget and `usage.prompt_tokens` are about;
+/// * `reprefilled` is how much of that this turn will compute again — what a
+///   "prompt tokens processed" metric is about.
+///
+/// They coincide only for a package that carries its conversation by prepending
+/// it. A decode core that appends each turn to a retained sequence attends to
+/// everything it holds and re-prefills none of it, because the rest is served
+/// from its KV.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPrefillCarry {
+    /// Tokens the model holds in front of this turn's prompt.
+    pub attended: usize,
+    /// Of those, the tokens this turn will prefill again.
+    pub reprefilled: usize,
+}

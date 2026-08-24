@@ -681,3 +681,59 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
         Some(onnx_genai_engine::PackageCapabilityError::SessionBusy { .. })
     ));
 }
+
+/// What a session holds in front of a turn, and what that turn computes again,
+/// are different numbers for every carrier.
+///
+/// One table, asserted where the answers are decided, because a front end reads
+/// both and gets a context cap or a throughput metric wrong by conflating them.
+/// The two decode-core rows are opposites and neither is guessable from the
+/// other: an ORT session appends each turn to what it retains, a native session
+/// truncates its history to the common prefix with the incoming prompt and
+/// replaces it.
+#[test]
+fn a_carrier_decides_what_is_attended_and_what_is_recomputed() -> anyhow::Result<()> {
+    // A prompt-prefix continuation: prepended, and prefilled again with the
+    // turn, because the package's own cache does not survive the invocation.
+    let mut interpreted = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let session = interpreted.create_session()?;
+    assert_eq!(
+        interpreted.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry::default(),
+        "a session that has heard nothing carries nothing"
+    );
+    let opening = [2u32, 4, 6, 3];
+    let first = interpreted.generate_in_session(session, tokens(&opening, 3))?;
+    let conversation = opening.len() + first.token_ids.len();
+    assert_eq!(
+        interpreted.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry {
+            attended: conversation,
+            reprefilled: conversation,
+        }
+    );
+
+    // An ORT decode core: everything it retains is in front of the next turn,
+    // and none of it is computed again.
+    let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let mut decode_core = Engine::from_dir(&tiny, EngineConfig::default())?;
+    let session = decode_core.create_session()?;
+    let first = decode_core.generate_in_session(session, tokens(&[2, 4, 3], 2))?;
+    let retained = 3 + first.token_ids.len();
+    assert_eq!(decode_core.session_token_count(session)?, retained);
+    assert_eq!(
+        decode_core.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry {
+            attended: retained,
+            reprefilled: 0,
+        },
+        "a decode core's conversation is ahead of the turn and served from its KV"
+    );
+    // It reports no token conversation, because what it holds is a KV sequence.
+    assert_eq!(decode_core.session_conversation(session)?, None);
+
+    // An unknown session is reported as one rather than answered with a zero.
+    decode_core.close_session(session)?;
+    assert!(decode_core.session_prefill_carry(session).is_err());
+    Ok(())
+}

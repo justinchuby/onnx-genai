@@ -1773,17 +1773,45 @@ impl Engine {
     /// Read from the typed carrier classification rather than from whether a
     /// session happens to hold state — those are different questions, and only
     /// this one is a length a request will be charged for.
-    pub fn session_prefill_carry(&self, session_id: SessionId) -> anyhow::Result<usize> {
+    pub fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<SessionPrefillCarry> {
         if self.holds_decode_core() {
-            return self.session_token_count(session_id);
+            let retained = self.session_token_count(session_id)?;
+            #[cfg(feature = "native-backend")]
+            if self.decode_backend == EngineDecodeBackend::Native {
+                // The native session is a prefix-reuse cache, not a sequence
+                // this turn is appended to: it truncates its history to the
+                // common prefix with the incoming prompt and replaces it. The
+                // decoder is fed the prompt and nothing else, so nothing the
+                // session retains is in front of it.
+                return Ok(SessionPrefillCarry::default());
+            }
+            // The ORT session appends: its prefix cache is consulted only for a
+            // session that starts empty, so a continuing turn sits behind
+            // everything the session already holds. None of it is computed
+            // again — that is what its KV is for.
+            return Ok(SessionPrefillCarry {
+                attended: retained,
+                reprefilled: 0,
+            });
         }
         anyhow::ensure!(
             self.workflow_sessions.contains_key(&session_id),
             "session {session_id} not found"
         );
-        Ok(self
+        // A prompt prefix is put in front of the prompt *and* prefilled with it,
+        // every turn: it is carried as tokens because the package's own cache
+        // does not survive the invocation. Everything else the interpreter
+        // carries lives in a cache the package bounds itself.
+        let prepended = self
             .workflow
-            .session_prepended_prompt_len(&session_id.to_string()))
+            .session_prepended_prompt_len(&session_id.to_string());
+        Ok(SessionPrefillCarry {
+            attended: prepended,
+            reprefilled: prepended,
+        })
     }
 
     /// The tokens a session's conversation holds, oldest first.
