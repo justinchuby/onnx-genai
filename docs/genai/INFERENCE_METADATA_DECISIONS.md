@@ -663,7 +663,7 @@ invocation, and today nothing else does either:
   `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:67-72`),
   so the interpreter's three request-axis call sites never see a packed value;
 - the image preprocessing adapter passes exactly one encoded item per invocation
-  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3084`), even though the
+  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3089`), even though the
   preprocessor underneath accepts many;
 - no declared preprocessing program can produce the `offsets`/`owner` pair that
   `token_packed` names, because the content-role vocabulary has no entry for
@@ -851,7 +851,7 @@ resident, and splitting a packed result back to rows is an aliasing operation â€
 which is the practical reason the packed axis is pinned to 0 and the ownership
 rules demand contiguity, since a no-copy view is a contiguous element window and
 "a slice along an inner axis is not a contiguous range"
-(`crates/onnx-genai-ort/src/value.rs:1521-1537`). Second, backend support for
+(`crates/onnx-genai-ort/src/value.rs:1526-1542`). Second, backend support for
 grouped execution is asked **before** a group is formed, never discovered by
 attempting one, and it is recorded per (component implementation, operator class,
 execution provider) rather than as one global flip: a triple that has not proven

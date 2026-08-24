@@ -125,7 +125,7 @@ The engine, scheduler, server, and ORT crates contain no reference to it. The
 layouts the interpreter actually honors are `request_aligned` and
 `request_expanded`, through `BatchLayout::request_axis()`, at three call sites:
 row-wise emit dispatch, symbolic-shape validation, and inactive-row merging
-(`crates/onnx-genai-engine/src/pipeline/workflow.rs:2152,4181,4846`).
+(`crates/onnx-genai-engine/src/pipeline/workflow.rs:2158,4186,4851`).
 `request_axis()` deliberately returns `None` for `TokenPacked`
 (`ir.rs:67-72`), so a packed value is invisible to every one of them. It is a
 declared shape with no reader.
@@ -133,12 +133,12 @@ declared shape with no reader.
 ### 2.4 The image adapter is single-item by construction
 
 `run_image_preprocess_adapter`
-(`crates/onnx-genai-engine/src/pipeline/workflow.rs:3020-3116`) validates one
+(`crates/onnx-genai-engine/src/pipeline/workflow.rs:3025-3121`) validates one
 `uint8` rank-1 `encoded` input and calls `preprocess_encoded([encoded_bytes])`
-with a one-element array (`workflow.rs:3084`). The multi-image capability of the
+with a one-element array (`workflow.rs:3089`). The multi-image capability of the
 preprocessor underneath is unreachable from a workflow. Each `Invoke` runs one
 session call over whatever is bound to its ports
-(`workflow.rs:1713-1927`, `invoke_onnx_component` at `workflow.rs:2535`), so an
+(`workflow.rs:1719-1933`, `invoke_onnx_component` at `workflow.rs:2541`), so an
 encoder invocation carries exactly one request's payload.
 
 ### 2.5 The scheduler groups decode rows only
@@ -278,7 +278,7 @@ and a component-global integer axis cannot be interpreted coherently across them
 A `TensorDimension` is already either a fixed extent or a **runtime shape
 symbol** (`crates/onnx-genai-metadata/src/schema/decoder_abi.rs:266-273`), and the
 interpreter already binds those symbols to concrete extents per invocation
-(`crates/onnx-genai-engine/src/pipeline/workflow.rs:1115-1145`), so a symbol names
+(`crates/onnx-genai-engine/src/pipeline/workflow.rs:1121-1151`), so a symbol names
 the same quantity on every port that mentions it, whatever its rank.
 
 The example below is a **video** encoder, because it is the case that exercises
@@ -934,7 +934,7 @@ profile and are listed separately for that reason.
    the owner's allocation, and the aliasing API says so outright — "a slice along
    an inner axis is not a contiguous range, and asking for one here would silently
    return the wrong elements. Callers that need one must copy"
-   (`crates/onnx-genai-ort/src/value.rs:1521-1537`). With `axis: 0`, every row's
+   (`crates/onnx-genai-ort/src/value.rs:1526-1542`). With `axis: 0`, every row's
    and every unit's span is a contiguous range, so splitting is
    `alias_with_offset` and costs nothing. With an inner packed axis, every split
    is a strided gather — a full copy of the payload on the device, per row, on
@@ -1070,7 +1070,7 @@ profile and are listed separately for that reason.
      preserved, extent 0 on the packed axis — and the runtime **MUST NOT**
      fabricate a placeholder item, and **MUST NOT** treat the absence as a
      failure. A zero-element alias is already a supported value
-     (`crates/onnx-genai-ort/src/value.rs:1567-1573`). A group whose total packed
+     (`crates/onnx-genai-ort/src/value.rs:1572-1578`). A group whose total packed
      extent is zero is **not invoked at all**; every participating request
      receives its empty span directly.
    **These checks never cause a host transfer.** Companions the runtime itself
@@ -1154,7 +1154,7 @@ Three rules follow:
   reason [§4](#4-strict-token_packed-validation) rule 2 pins the packed axis to 0
   and the ownership rules demand contiguity: a row's span is then a contiguous
   element range, so it is handed back as an alias over the same allocation
-  (`alias_with_offset`, `crates/onnx-genai-ort/src/value.rs:1538-1546`), not a
+  (`alias_with_offset`, `crates/onnx-genai-ort/src/value.rs:1543-1551`), not a
   per-row copy.
 - **Any copy that does happen is attributable.** Where an alias is impossible —
   and for companions on `extent: produced` levels, which must reach the host to be
