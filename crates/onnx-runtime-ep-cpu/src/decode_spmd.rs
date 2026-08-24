@@ -205,6 +205,13 @@ thread_local! {
     /// Manufacturing real contention in a unit test is exactly the kind of
     /// load-dependent arrangement that flakes; injecting the yield *cost* makes
     /// the same regime deterministic.
+    ///
+    /// Read by [`slow_yield`], which both yield phases in this file call: the
+    /// readiness barrier, which runs on the *builder* thread like the knobs
+    /// above, and [`SharedState::worker_wait`], which runs on whichever thread
+    /// is waiting. A real pool's workers are other threads and so always see
+    /// `0`; only a test calling `worker_wait` on its own thread can reach that
+    /// second site. [`YIELD_COUNT`] counts the yields injected here.
     static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
 
     /// Test override for [`WORKER_PROFILE_ENV`]: `Some(v)` forces the per-worker
@@ -213,24 +220,6 @@ thread_local! {
     /// -- `set_var` around a build -- is a data race against every other test
     /// thread's `getenv` and would need a lock this module does not have.
     static FORCE_WORKER_PROFILE: Cell<Option<bool>> = const { Cell::new(None) };
-
-    /// Test injection of an *expensive* `yield_now`, in microseconds; `0` means
-    /// "use the real one". [`YIELD_COUNT`] counts the yields it injects.
-    ///
-    /// Unlike the knobs above this one is read on the thread that runs
-    /// [`SharedState::worker_wait`], not on the builder thread, so only a test
-    /// calling `worker_wait` on its own thread can set it. That is deliberate:
-    /// a real pool's workers are other threads and therefore always see `0`.
-    ///
-    /// It exists because the blocktime deadline's stride defect is only
-    /// observable in a *regime*, not at an assertion. An uncontended
-    /// `yield_now` measures ~1.2us on this host, so a 64-yield stride moves the
-    /// deadline by ~78us -- invisible against any deadline a test can afford to
-    /// wait for, which is why the obvious guard (shrink the deadline, assert
-    /// the backstop fires) passes against the defect. The damage is
-    /// proportional to the *yield cost*, so that is the axis to inject;
-    /// shrinking the deadline measures the wrong one and looks like coverage.
-    static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
 
     /// Yields injected by [`slow_yield`] on this thread. The observable for the
     /// stride, chosen because it is *monotone in the right direction under
@@ -242,7 +231,8 @@ thread_local! {
     static YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Injected yield cost, read on the *waiting* thread. See [`SLOW_YIELD_US`].
+/// Injected yield cost, shared by both yield phases in this file. See
+/// [`SLOW_YIELD_US`], which documents which thread reads it at each site.
 #[cfg(test)]
 fn slow_yield() {
     let us = SLOW_YIELD_US.with(Cell::get);
@@ -1452,12 +1442,7 @@ impl SpmdDecodePools {
             } else {
                 thread::yield_now();
                 #[cfg(test)]
-                {
-                    let slow = SLOW_YIELD_US.with(Cell::get);
-                    if slow != 0 {
-                        thread::sleep(Duration::from_micros(slow));
-                    }
-                }
+                slow_yield();
                 // Check the clock on *every* yield, not on a stride. The stride
                 // is right for the spin phase, where an iteration costs
                 // nanoseconds and `Instant::now()` would dominate; it is wrong
