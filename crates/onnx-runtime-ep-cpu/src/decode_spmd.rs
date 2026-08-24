@@ -201,6 +201,43 @@ thread_local! {
     /// -- `set_var` around a build -- is a data race against every other test
     /// thread's `getenv` and would need a lock this module does not have.
     static FORCE_WORKER_PROFILE: Cell<Option<bool>> = const { Cell::new(None) };
+
+    /// Test injection of an *expensive* `yield_now`, in microseconds; `0` means
+    /// "use the real one". [`YIELD_COUNT`] counts the yields it injects.
+    ///
+    /// Unlike the knobs above this one is read on the thread that runs
+    /// [`SharedState::worker_wait`], not on the builder thread, so only a test
+    /// calling `worker_wait` on its own thread can set it. That is deliberate:
+    /// a real pool's workers are other threads and therefore always see `0`.
+    ///
+    /// It exists because the blocktime deadline's stride defect is only
+    /// observable in a *regime*, not at an assertion. An uncontended
+    /// `yield_now` measures ~1.2us on this host, so a 64-yield stride moves the
+    /// deadline by ~78us -- invisible against any deadline a test can afford to
+    /// wait for, which is why the obvious guard (shrink the deadline, assert
+    /// the backstop fires) passes against the defect. The damage is
+    /// proportional to the *yield cost*, so that is the axis to inject;
+    /// shrinking the deadline measures the wrong one and looks like coverage.
+    static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
+
+    /// Yields injected by [`slow_yield`] on this thread. The observable for the
+    /// stride, chosen because it is *monotone in the right direction under
+    /// load*: a starved thread accumulates wall time faster per yield, so it
+    /// crosses the deadline in FEWER yields, never more. A wall-clock
+    /// observable ("was it parked at T?") is not monotone that way and is
+    /// flaky in the parallel suite, which is how the first version of this test
+    /// failed -- passing alone and failing beside 1695 siblings.
+    static YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Injected yield cost, read on the *waiting* thread. See [`SLOW_YIELD_US`].
+#[cfg(test)]
+fn slow_yield() {
+    let us = SLOW_YIELD_US.with(Cell::get);
+    if us > 0 {
+        YIELD_COUNT.with(|c| c.set(c.get() + 1));
+        thread::sleep(Duration::from_micros(us));
+    }
 }
 
 /// Read on the builder thread only: both the barrier and the pre-spawn fault
@@ -872,6 +909,8 @@ impl SharedState {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
+                #[cfg(test)]
+                slow_yield();
                 // Check the clock on *every* yield, not on a stride -- the same
                 // correction #1825 made to the readiness barrier below, which
                 // missed this site. The clock is never read during the pure
@@ -6986,6 +7025,113 @@ mod dispatch_claim_tests {
             completion_sense: Padded(AtomicU32::new(0)),
             dispatcher_parked: Padded(AtomicBool::new(false)),
         })
+    }
+
+    /// The blocktime deadline must be re-evaluated on *every* yield, not on a
+    /// 64-iteration stride.
+    ///
+    /// #1868 removed that stride from `worker_wait`'s yield phase (and #1825
+    /// from the readiness barrier before it), but nothing guarded either site:
+    /// with the stride reinstated this crate still reported **1695 passed, 0
+    /// failed**. This is the guard, and it has this shape because the obvious
+    /// one does not work and the first version of this one was flaky.
+    ///
+    /// **Why not shrink the deadline and assert the backstop fires.** That
+    /// passes against the defect. An uncontended `yield_now` costs ~1.2us here,
+    /// so a 64-yield stride moves the deadline by ~78us -- invisible against
+    /// any deadline a test can afford to wait for. The defect's damage is
+    /// proportional to the *yield cost*, so that is the axis injected here.
+    ///
+    /// **Why the observable is a yield count and not a duration.** The first
+    /// version asked "was the worker parked when a bump landed at 400ms?". That
+    /// passed alone and failed in the parallel suite, because it is not monotone
+    /// under load: a starved thread can still be in the spin phase at 400ms for
+    /// reasons that have nothing to do with the stride. Counting yields is
+    /// monotone in the safe direction -- a starved thread accumulates wall time
+    /// faster per yield, so it crosses the deadline in FEWER yields, never more.
+    /// Load can only push this test towards passing, and the one way it could
+    /// go vacuous (deadline already expired before the first yield) is asserted
+    /// against rather than left to chance.
+    ///
+    /// The arithmetic, which is what makes the margin host-independent:
+    ///
+    /// | | first deadline check | exits after |
+    /// |---|---|---|
+    /// | checked every yield | yield 1 | ~`BLOCKTIME / YIELD` = 20 yields |
+    /// | checked on a stride | yield 1, then yield 65 | **65 yields** |
+    ///
+    /// `SPIN_LOOP_BUDGET` (4096) is a multiple of 64, so the strided form gets
+    /// its first check for free on yield 1 and then goes blind for 64 more --
+    /// which is why the deadline must expire *during* the yield phase for this
+    /// to discriminate at all. A deadline that has already expired when the
+    /// yield phase starts exits on yield 1 in both worlds.
+    #[test]
+    fn the_blocktime_deadline_is_evaluated_on_every_yield_not_on_a_stride() {
+        /// Cost of one injected yield: the contended regime, where a yield
+        /// costs microseconds to milliseconds rather than ~1.2us.
+        const YIELD: Duration = Duration::from_millis(10);
+        /// Long enough that the first yield's check does not already satisfy it
+        /// (or the strided form exits on yield 1 too and nothing is measured),
+        /// and long enough that the spin phase cannot plausibly consume it.
+        const BLOCKTIME: Duration = Duration::from_millis(200);
+        /// Later than the strided form's own exit (65 * 10ms = 650ms), so the
+        /// release cannot rescue the defect by ending its wait early. Only the
+        /// test's duration depends on this, never its verdict.
+        const RELEASE_AT: Duration = Duration::from_millis(1200);
+        /// One stride. The strided form cannot exit in fewer.
+        const STRIDE: u64 = 64;
+
+        let shared = one_worker_shared_state();
+        // Both knobs are read on this thread, which is the one that runs
+        // `worker_wait` below. A real pool's workers never see them.
+        SLOW_YIELD_US.with(|c| c.set(YIELD.as_micros() as u64));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        let last_seen = shared.node_sense[0].0.wake.load(Ordering::Acquire);
+        let release = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                thread::sleep(RELEASE_AT);
+                // The bare sense bump `publish` ends with -- enough to release a
+                // parked worker, which is all this thread is for.
+                let sense = &shared.node_sense[0].0.wake;
+                sense.fetch_add(1, Ordering::Release);
+                atomic_wait::wake_all(sense);
+            })
+        };
+
+        let observed = shared.worker_wait(0, 0, last_seen, BLOCKTIME);
+        release.join().expect("release thread panicked");
+
+        let yields = YIELD_COUNT.with(Cell::get);
+        // Cleared before asserting: a panic here would otherwise leave the knob
+        // set for whatever else libtest runs on this thread.
+        SLOW_YIELD_US.with(|c| c.set(0));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        assert_ne!(
+            observed, last_seen,
+            "worker_wait returned without observing the sense bump"
+        );
+        // Non-vacuity, asserted rather than hoped for: if the deadline had
+        // already expired when the yield phase began, both the strided and the
+        // every-yield form exit on yield 1 and this test discriminates nothing.
+        assert!(
+            yields >= 2,
+            "inconclusive: left the yield phase after {yields} yield(s), so the \
+             {BLOCKTIME:?} deadline had already expired before the second \
+             check. This test cannot tell a strided clock read from an \
+             unstrided one in that regime -- it is not a pass"
+        );
+        assert!(
+            yields < STRIDE,
+            "left the yield phase after {yields} yields against a {BLOCKTIME:?} \
+             deadline and {YIELD:?} yields, i.e. it did not re-check the clock \
+             for at least a full {STRIDE}-yield stride. The deadline is being \
+             evaluated on a stride in a phase where each iteration costs orders \
+             of magnitude more than the `Instant::now()` the stride was \
+             amortising"
+        );
     }
 
     /// Counts calls so a re-run of a retired op is visible.
