@@ -833,7 +833,7 @@ mod tests {
                 .map(|row| {
                     let mut seed = 0x9E37_79B9_u32
                         .wrapping_mul(row as u32 + 1)
-                        .wrapping_add(0x1234_5);
+                        .wrapping_add(0x0001_2345);
                     (0..VOCAB)
                         .map(|_| {
                             seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -915,7 +915,7 @@ mod tests {
             // Wallace's exact {3, 76032, 152063} case at vocab 152064 (→ 3). The
             // lowest global index must win in every case. One config per row
             // (cycled) so each batch exercises several boundary layouts.
-            const STRIDE: usize = 256 * ((VOCAB + 1023) / 1024); // 38_144 for 152_064
+            const STRIDE: usize = 256 * VOCAB.div_ceil(1024); // 38_144 for 152_064
             let boundary_configs: [[usize; 3]; 6] = [
                 [3, VOCAB / 2, VOCAB - 1],        // Wallace's exact {3, 76032, 152063} → 3
                 [STRIDE - 1, STRIDE, STRIDE + 1], // straddles the first seam → STRIDE-1
