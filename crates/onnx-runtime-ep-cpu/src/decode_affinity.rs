@@ -748,7 +748,15 @@ impl ObservedAffinity {
 /// catch. Keying a guard on `observe_current_thread_cpus().cpus().is_some()`
 /// would switch the guard off in precisely the case it is there to report.
 pub const fn affinity_observation_supported() -> bool {
-    cfg!(any(target_os = "linux", target_os = "windows"))
+    // `not(miri)` because [`observe_current_thread_cpus`] answers `Unsupported`
+    // there -- Miri has no scheduler affinity and calling the shim would abort.
+    // The two must agree: a constant claiming the query exists while the query
+    // reports it does not would fire every fail-closed guard keyed on it, in a
+    // run that is testing something else entirely.
+    cfg!(all(
+        any(target_os = "linux", target_os = "windows"),
+        not(miri)
+    ))
 }
 
 /// Ask the **calling thread** which CPUs it is currently permitted to run on.
