@@ -1599,8 +1599,16 @@ impl SpmdDecodePools {
 
     /// Record the calling thread's current CPU as the dispatcher's placement,
     /// and count the sample as a change if it moved since the last one.
+    ///
+    /// Inert under Miri. Miri has no `sched_getcpu` shim, and the module's
+    /// panic-safety test dispatches on a real pool under it, so an
+    /// unconditional call aborts that test with an unsupported-operation
+    /// error. Nothing is lost: a CPU-placement sample is meaningless under an
+    /// interpreter that does not model CPUs, and the thing Miri is here to
+    /// check -- that the unsafe blocks around it are sound -- is unaffected by
+    /// not taking the sample.
     fn sample_dispatcher_cpu(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         {
             // SAFETY: `sched_getcpu` takes no arguments and only reads the
             // calling thread's current CPU.
@@ -1841,6 +1849,13 @@ impl SpmdDecodePools {
             if recorded {
                 self.sample_dispatcher_cpu();
             }
+            return;
+        }
+        // Miri has no `sched_setaffinity` shim either, and a pin is not a
+        // property Miri can check. Refuse rather than abort, so that setting
+        // the knob in a Miri environment degrades to "not pinned" instead of
+        // failing an unrelated test.
+        if cfg!(miri) {
             return;
         }
         match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
@@ -3417,15 +3432,21 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 /// stable per-thread id. Linux only in practice: this exists so a harness can
 /// find the dispatcher's `/proc/self/task/<tid>` entry, which has no
 /// counterpart elsewhere.
+///
+/// `None` under Miri as well, for the same reason
+/// [`SpmdDecodePools::sample_dispatcher_cpu`] is inert there: there is no
+/// `/proc` to look the id up in, so recording one buys nothing and calling the
+/// shim risks an unsupported-operation abort in a test that is running for a
+/// different reason entirely.
 fn current_thread_os_id() -> Option<i64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         // SAFETY: `gettid` takes no arguments, cannot fail, and returns the
         // calling thread's kernel id.
         let tid = unsafe { libc::gettid() };
         (tid > 0).then_some(i64::from(tid))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(miri))))]
     {
         None
     }
