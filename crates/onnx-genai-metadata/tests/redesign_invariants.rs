@@ -160,7 +160,7 @@ pipeline:
         source: { kind: application, name: image_features }
         externally_suppliable: true
       image_offsets:
-        contract: { dtype: int64, rank: 1, shape: [batch_plus_one], batch_layout: { kind: shared } }
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: image_offsets }
       image_owner:

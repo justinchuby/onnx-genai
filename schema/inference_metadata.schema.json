@@ -929,6 +929,40 @@
       },
       "type": "object"
     },
+    "ComponentBatchCapacity": {
+      "additionalProperties": false,
+      "description": "Batching capacity of one invocation of a component.\n\nThis describes the shape of an invocation, never a scheduling policy: how\nmany request rows may share a call, along which axis they stack, and which\naxes must already agree before they can. A runtime decides whether to use\nthe capacity; the package only says what its artifact can accept.",
+      "properties": {
+        "axis": {
+          "description": "Axis of this component's request-scoped ports along which rows stack.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_rows": {
+          "description": "Largest number of request rows one invocation may carry.\n\nAbsent means the component accepts as many rows as the runtime can fit,\nso the bound is memory rather than the artifact. Zero is never a capacity.",
+          "format": "uint",
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "uniform_axes": {
+          "description": "Axes whose dimensions must be equal across rows for those rows to share\none invocation.\n\nA component that accepts several rows may still require them to agree on\nsomething the batch axis does not cover — an encoder whose artifact is\nbuilt for one spatial extent, say. Listing those axes lets a scheduler\ngroup compatible rows instead of guessing from shapes it cannot compare.",
+          "items": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "axis"
+      ],
+      "type": "object"
+    },
     "ComponentContract": {
       "additionalProperties": false,
       "properties": {
@@ -1570,7 +1604,7 @@
       "properties": {
         "content": {
           "$ref": "#/$defs/ImageOutputContent",
-          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, or validity mask) — never a model-family label."
+          "description": "Generic content role this tensor carries (pixels, coordinates, grid,\noriginal size, validity mask, or the offsets/owner map of a packed\nbatch) — never a model-family label."
         },
         "contract": {
           "anyOf": [
@@ -1625,7 +1659,7 @@
       "type": "object"
     },
     "ImageOutputContent": {
-      "description": "Generic image-output content-role vocabulary.",
+      "description": "Generic image-output content-role vocabulary.\n\nA program that packs the images of several requests into one batch\nemits the two values that map packed items back to request rows —\n`item_offsets` and `item_owner` — alongside the pixels themselves.\nThey are content roles like any other: the runtime reads what a\ntensor means from here, never from the name a producer chose.",
       "oneOf": [
         {
           "enum": [
@@ -1634,7 +1668,9 @@
             "grid_dimensions",
             "original_size",
             "transformed_size",
-            "validity_mask"
+            "validity_mask",
+            "item_offsets",
+            "item_owner"
           ],
           "title": "Known standard value"
         },
@@ -1646,7 +1682,9 @@
               "grid_dimensions",
               "original_size",
               "transformed_size",
-              "validity_mask"
+              "validity_mask",
+              "item_offsets",
+              "item_owner"
             ]
           },
           "title": "Forward-compatible extension value",
@@ -4204,6 +4242,13 @@
           "default": false,
           "type": "boolean"
         },
+        "pad_mask": {
+          "description": "Workflow value whose booleans or integers mark which entries of this\ntensor are real rather than padding.\n\nA dense tensor is the only shape a fixed-arity component can consume, so\na batch whose rows carry different amounts of data has to be padded up to\na common extent. Nothing in the padded tensor says where the real entries\nstop, and guessing from a sentinel is exactly the hidden heuristic this\nschema refuses: the mask is named, typed, and validated like any other\nvalue. Absence means every entry is valid.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "rank": {
           "format": "uint",
           "minimum": 0,
@@ -4480,6 +4525,17 @@
           "default": false,
           "description": "Allow an application to select another declared component with the same\nversioned contract ABI for this invocation.",
           "type": "boolean"
+        },
+        "batch_capacity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentBatchCapacity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How many request rows one invocation of this component may carry.\n\nAbsence means one request row per invocation: a runtime that wants to\nserve two requests calls the component twice. That is the safe reading\nfor every component whose producer has not thought about batching, so it\nis the default. A component that declares a capacity is stating that its\nartifact accepts several rows stacked on one axis, which is the fact a\nscheduler needs before it may coalesce work."
         },
         "cache_affects_state": {
           "description": "Non-dataflow facts that change this component's observable state.\n\nCache correctness dependencies of ONNX components are derived from the\nworkflow SSA graph. Native and external components must declare any\nadditional state they read that is not visible as a typed input.",

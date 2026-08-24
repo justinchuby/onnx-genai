@@ -295,6 +295,12 @@ mod schema_vocabulary {
 
     extensible_string!(
         /// Generic image-output content-role vocabulary.
+        ///
+        /// A program that packs the images of several requests into one batch
+        /// emits the two values that map packed items back to request rows —
+        /// `item_offsets` and `item_owner` — alongside the pixels themselves.
+        /// They are content roles like any other: the runtime reads what a
+        /// tensor means from here, never from the name a producer chose.
         ImageOutputContent,
         image_output_content,
         IMAGE_OUTPUT_CONTENT,
@@ -304,7 +310,9 @@ mod schema_vocabulary {
             "grid_dimensions",
             "original_size",
             "transformed_size",
-            "validity_mask"
+            "validity_mask",
+            "item_offsets",
+            "item_owner"
         ]
     );
 

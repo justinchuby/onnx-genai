@@ -253,7 +253,8 @@ pub struct ImageOutputBinding {
     pub name: String,
 
     /// Generic content role this tensor carries (pixels, coordinates, grid,
-    /// original size, or validity mask) — never a model-family label.
+    /// original size, validity mask, or the offsets/owner map of a packed
+    /// batch) — never a model-family label.
     #[schemars(with = "schema_vocabulary::ImageOutputContent")]
     pub content: String,
 

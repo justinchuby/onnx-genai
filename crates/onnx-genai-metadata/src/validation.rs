@@ -933,13 +933,15 @@ fn require_compatible_tensor_contracts(
             other => other,
         }
     }
-    // batch_layout is part of the contract: a preprocessing output that claims a
-    // different row correspondence than the port it feeds would let per-request
-    // rows drift out of alignment with the rest of the workflow.
+    // batch_layout and pad_mask are part of the contract: a preprocessing output
+    // that claims a different row correspondence, or a different notion of which
+    // entries are real, than the port it feeds would let per-request rows drift
+    // out of alignment with the rest of the workflow.
     if normalize(&source.dtype) != normalize(&target.dtype)
         || source.rank != target.rank
         || source.shape != target.shape
         || source.batch_layout != target.batch_layout
+        || source.pad_mask != target.pad_mask
     {
         errors.push(format!(
             "{path} has a contract incompatible with its adapter output port"
@@ -2060,6 +2062,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     shape: Some(Vec::new()),
                     optional: false,
                     batch_layout: crate::schema::BatchLayout::Shared,
+                    pad_mask: None,
                 },
             );
         }
@@ -2091,6 +2094,8 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     );
     validate_effect_declarations(workflow, errors);
     validate_row_scoped_components(workflow, errors);
+    validate_batch_layout_references(workflow, errors);
+    validate_batch_capacity(workflow, errors);
     validate_state_lifetimes(workflow, errors);
     validate_session_continuity(workflow, errors);
     if let Some(serving) = &workflow.serving {
@@ -2318,6 +2323,530 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
                     ));
                 }
             }
+        }
+    }
+}
+
+/// Values a packed layout or a pad mask may name from one declaration site.
+///
+/// A workflow-level contract may only name workflow values. A component port
+/// contract may additionally name a sibling port of the same component, because
+/// the component's own ABI is what pairs a padded tensor with its mask or a
+/// packed tensor with its offsets; which SSA value reaches that port is the
+/// invocation's business, not the port's.
+struct LayoutReferenceScope<'a> {
+    declared: &'a BTreeSet<String>,
+    contracts: &'a BTreeMap<String, crate::schema::TensorContract>,
+    ports: Option<&'a crate::schema::ComponentPorts>,
+}
+
+impl LayoutReferenceScope<'_> {
+    fn is_declared(&self, value: &str) -> bool {
+        self.declared.contains(value)
+            || self.ports.is_some_and(|ports| {
+                ports.inputs.contains_key(value) || ports.outputs.contains_key(value)
+            })
+    }
+
+    /// The contract of a referenced value, when the document states one.
+    ///
+    /// A value produced by control flow or by a component with inferred ports
+    /// has no stated contract; such a reference is checked for existence only,
+    /// which is all the document can support.
+    fn contract(&self, value: &str) -> Option<&crate::schema::TensorContract> {
+        self.ports
+            .and_then(|ports| ports.inputs.get(value).or_else(|| ports.outputs.get(value)))
+            .or_else(|| self.contracts.get(value))
+    }
+}
+
+fn is_integer_dtype(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+    )
+}
+
+/// Every value name the workflow declares, with the contracts it states directly.
+fn workflow_declared_values(
+    workflow: &WorkflowSpec,
+) -> (
+    BTreeSet<String>,
+    BTreeMap<String, crate::schema::TensorContract>,
+) {
+    fn collect_invoke_contracts(
+        steps: &[WorkflowStep],
+        workflow: &WorkflowSpec,
+        contracts: &mut BTreeMap<String, crate::schema::TensorContract>,
+    ) {
+        for step in steps {
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    collect_invoke_contracts(steps, workflow, contracts)
+                }
+                WorkflowStep::Invoke {
+                    component, outputs, ..
+                } => {
+                    let Some(declaration) = workflow.components.get(component) else {
+                        continue;
+                    };
+                    for (port, value) in outputs {
+                        if let Some(contract) = declaration.ports.outputs.get(port) {
+                            contracts.insert(value.clone(), contract.clone());
+                        }
+                    }
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    collect_invoke_contracts(setup, workflow, contracts);
+                    collect_invoke_contracts(steps, workflow, contracts);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for case in cases.values() {
+                        collect_invoke_contracts(std::slice::from_ref(case), workflow, contracts);
+                    }
+                    if let Some(default) = default {
+                        collect_invoke_contracts(
+                            std::slice::from_ref(default),
+                            workflow,
+                            contracts,
+                        );
+                    }
+                }
+                WorkflowStep::Emit { .. } => {}
+            }
+        }
+    }
+
+    let mut declared = workflow_step_produced_values(&workflow.steps);
+    let mut contracts = BTreeMap::new();
+    for (name, input) in &workflow.inputs {
+        declared.insert(name.clone());
+        contracts.insert(name.clone(), input.contract.clone());
+        if let Some(present_as) = &input.present_as {
+            declared.insert(present_as.clone());
+        }
+    }
+    for (name, state) in &workflow.state {
+        declared.insert(name.clone());
+        contracts.insert(name.clone(), state.contract.clone());
+    }
+    for (name, output) in &workflow.outputs {
+        declared.insert(name.clone());
+        contracts
+            .entry(name.clone())
+            .or_insert_with(|| output.contract.clone());
+    }
+    collect_invoke_contracts(&workflow.steps, workflow, &mut contracts);
+    (declared, contracts)
+}
+
+/// A packed layout and a pad mask are references, and a reference that resolves
+/// to nothing — or to a value that cannot carry what it is asked to carry — is
+/// a contract no runtime can execute.
+///
+/// `token_packed` is the only layout whose meaning lives in other values: the
+/// offsets say how many items each row contributed and the owner map says which
+/// row each item came from. Together they are what lets a runtime split a packed
+/// result back into per-request pieces without any serialized row identity, so
+/// they must be values that exist, are integers, and are shaped the way that
+/// mapping requires. A `pad_mask` is the same kind of fact for a padded batch.
+fn validate_batch_layout_references(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let (declared, contracts) = workflow_declared_values(workflow);
+    let workflow_scope = LayoutReferenceScope {
+        declared: &declared,
+        contracts: &contracts,
+        ports: None,
+    };
+    for (name, input) in &workflow.inputs {
+        validate_contract_references(
+            &format!("workflow input '{name}'"),
+            Some(name),
+            &input.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, output) in &workflow.outputs {
+        validate_contract_references(
+            &format!("workflow output '{name}'"),
+            Some(name),
+            &output.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, state) in &workflow.state {
+        validate_contract_references(
+            &format!("workflow state '{name}'"),
+            Some(name),
+            &state.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, component) in &workflow.components {
+        let scope = LayoutReferenceScope {
+            declared: &declared,
+            contracts: &contracts,
+            ports: Some(&component.ports),
+        };
+        for (direction, ports) in [
+            ("input", &component.ports.inputs),
+            ("output", &component.ports.outputs),
+        ] {
+            for (port, contract) in ports {
+                validate_contract_references(
+                    &format!("workflow component '{name}' {direction} '{port}'"),
+                    Some(port),
+                    contract,
+                    &scope,
+                    errors,
+                );
+            }
+        }
+    }
+}
+
+fn validate_contract_references(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    if let crate::schema::BatchLayout::TokenPacked {
+        offsets,
+        owner,
+        axis,
+    } = &contract.batch_layout
+    {
+        validate_token_packed_layout(path, value, contract, *axis, offsets, owner, scope, errors);
+    }
+    if let Some(mask) = &contract.pad_mask {
+        validate_pad_mask(path, value, contract, mask, scope, errors);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_token_packed_layout(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    axis: usize,
+    offsets: &str,
+    owner: &str,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    if axis >= contract.rank {
+        errors.push(format!(
+            "{path} packs items on axis {axis}, outside rank {}",
+            contract.rank
+        ));
+    }
+    if offsets.trim().is_empty() || owner.trim().is_empty() {
+        errors.push(format!(
+            "{path} is token_packed but does not name both an offsets value and an owner map; \
+             without them the runtime cannot map packed items back to request rows"
+        ));
+        return;
+    }
+    if offsets == owner {
+        errors.push(format!(
+            "{path} names '{offsets}' as both its packed offsets and its owner map; offsets hold \
+             one prefix offset per request row and the owner map holds one row index per packed \
+             item, so one value cannot be both"
+        ));
+    }
+    if value == Some(offsets) {
+        errors.push(format!(
+            "{path} names itself as its own packed offsets; the offsets are a separate \
+             request-aligned value"
+        ));
+    }
+
+    if !scope.is_declared(offsets) {
+        errors.push(format!(
+            "{path} token_packed offsets reference '{offsets}', which this workflow does not \
+             declare as a value or as a port of the same component"
+        ));
+    } else if let Some(offsets_contract) = scope.contract(offsets) {
+        if !is_integer_dtype(&offsets_contract.dtype) {
+            errors.push(format!(
+                "{path} token_packed offsets '{offsets}' must have an integer dtype, not '{}'",
+                offsets_contract.dtype
+            ));
+        }
+        if offsets_contract.rank != 1 {
+            errors.push(format!(
+                "{path} token_packed offsets '{offsets}' must be rank one with one prefix offset \
+                 per request row, not rank {}",
+                offsets_contract.rank
+            ));
+        }
+        if offsets_contract.batch_layout.request_axis() != Some(0) {
+            errors.push(format!(
+                "{path} token_packed offsets '{offsets}' must declare a request_aligned \
+                 batch_layout on axis 0; the offsets describe the rows they are permuted with \
+                 when the runtime compacts the batch"
+            ));
+        }
+    }
+
+    if !scope.is_declared(owner) {
+        errors.push(format!(
+            "{path} token_packed owner map references '{owner}', which this workflow does not \
+             declare as a value or as a port of the same component"
+        ));
+        return;
+    }
+    let Some(owner_contract) = scope.contract(owner) else {
+        return;
+    };
+    if !is_integer_dtype(&owner_contract.dtype) {
+        errors.push(format!(
+            "{path} token_packed owner map '{owner}' must have an integer dtype, not '{}'",
+            owner_contract.dtype
+        ));
+    }
+    if owner_contract.rank != 1 {
+        errors.push(format!(
+            "{path} token_packed owner map '{owner}' must be rank one with one owning row index \
+             per packed item, not rank {}",
+            owner_contract.rank
+        ));
+    }
+    match &owner_contract.batch_layout {
+        crate::schema::BatchLayout::Shared => {}
+        crate::schema::BatchLayout::TokenPacked {
+            offsets: owner_offsets,
+            owner: owner_owner,
+            axis: owner_axis,
+        } => {
+            if *owner_axis != 0 {
+                errors.push(format!(
+                    "{path} token_packed owner map '{owner}' packs on axis {owner_axis}; a \
+                     rank-one owner map packs on axis 0"
+                ));
+            }
+            if owner_offsets != offsets {
+                errors.push(format!(
+                    "{path} token_packed owner map '{owner}' is packed against offsets \
+                     '{owner_offsets}', not the '{offsets}' this value is packed against; one \
+                     packing has one offsets value"
+                ));
+            }
+            if owner_owner != owner {
+                errors.push(format!(
+                    "{path} token_packed owner map '{owner}' names '{owner_owner}' as its own \
+                     owner map; an owner map describes its own items and must name itself"
+                ));
+            }
+        }
+        other => errors.push(format!(
+            "{path} token_packed owner map '{owner}' declares a {} batch_layout; an owner map has \
+             one entry per packed item, not one per request row, so it is either shared or packed \
+             against the same offsets",
+            other.kind_name()
+        )),
+    }
+}
+
+fn validate_pad_mask(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    mask: &str,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    if mask.trim().is_empty() {
+        errors.push(format!(
+            "{path} declares an empty pad_mask; omit pad_mask to declare that every entry is valid"
+        ));
+        return;
+    }
+    if value == Some(mask) {
+        errors.push(format!(
+            "{path} names itself as its own pad_mask; the mask is a separate value marking which \
+             of this value's entries are real"
+        ));
+        return;
+    }
+    if let crate::schema::BatchLayout::TokenPacked { offsets, .. } = &contract.batch_layout {
+        errors.push(format!(
+            "{path} is token_packed and declares pad_mask '{mask}'; packed items are contiguous \
+             and carry no padding, so their validity is already given by offsets '{offsets}'"
+        ));
+        return;
+    }
+    if !scope.is_declared(mask) {
+        errors.push(format!(
+            "{path} pad_mask references '{mask}', which this workflow does not declare as a value \
+             or as a port of the same component"
+        ));
+        return;
+    }
+    let Some(mask_contract) = scope.contract(mask) else {
+        return;
+    };
+    if mask_contract.dtype != "bool" && !is_integer_dtype(&mask_contract.dtype) {
+        errors.push(format!(
+            "{path} pad_mask '{mask}' must have a bool or integer dtype marking valid entries, \
+             not '{}'",
+            mask_contract.dtype
+        ));
+    }
+    if mask_contract.rank == 0 || mask_contract.rank > contract.rank {
+        errors.push(format!(
+            "{path} pad_mask '{mask}' has rank {}, which cannot mark the valid entries of a \
+             rank-{} value",
+            mask_contract.rank, contract.rank
+        ));
+    }
+    if mask_contract.batch_layout.request_axis() != contract.batch_layout.request_axis() {
+        errors.push(format!(
+            "{path} pad_mask '{mask}' is {} but the value it masks is {}; a mask is permuted with \
+             the rows it describes, so both must declare the same request axis",
+            request_axis_description(&mask_contract.batch_layout),
+            request_axis_description(&contract.batch_layout)
+        ));
+    }
+}
+
+/// How a layout relates to the request axis, spelled for an error message.
+fn request_axis_description(layout: &crate::schema::BatchLayout) -> String {
+    match layout.request_axis() {
+        Some(axis) => format!("request-aligned on axis {axis}"),
+        None => format!("{} with no request axis", layout.kind_name()),
+    }
+}
+
+/// A declared batching capacity is a promise about the artifact's own shape, so
+/// it must agree with the ports that carry the rows.
+///
+/// Absence of `batch_capacity` already has a meaning — one request row per
+/// invocation — so a declared capacity only ever adds a claim: rows stack on
+/// this axis, at most this many of them, and only when these axes already agree.
+/// A capacity that no port can honour would let a scheduler build an invocation
+/// the component cannot execute, which is exactly the kind of contradiction that
+/// has to fail at load time.
+fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    for (name, component) in &workflow.components {
+        let Some(capacity) = &component.batch_capacity else {
+            continue;
+        };
+        if capacity.max_rows == Some(0) {
+            errors.push(format!(
+                "workflow component '{name}' declares batch_capacity max_rows 0; an invocation \
+                 carries at least one request row, and omitting max_rows declares no bound"
+            ));
+        }
+        let mut seen_uniform = BTreeSet::new();
+        for axis in &capacity.uniform_axes {
+            if !seen_uniform.insert(*axis) {
+                errors.push(format!(
+                    "workflow component '{name}' repeats axis {axis} in \
+                     batch_capacity.uniform_axes"
+                ));
+            }
+            if *axis == capacity.axis {
+                errors.push(format!(
+                    "workflow component '{name}' requires uniformity on batch_capacity axis \
+                     {axis}, which is the axis rows stack along; rows differ there by construction"
+                ));
+            }
+        }
+        if let Some(row_scope) = &component.row_scope
+            && row_scope.axis != capacity.axis
+        {
+            errors.push(format!(
+                "workflow component '{name}' declares batch_capacity axis {} but row_scope axis \
+                 {}; rows must stack along the axis the runtime compacts",
+                capacity.axis, row_scope.axis
+            ));
+        }
+
+        let batched_ports = [
+            ("input", &component.ports.inputs),
+            ("output", &component.ports.outputs),
+        ]
+        .into_iter()
+        .flat_map(|(direction, ports)| {
+            ports.iter().filter_map(move |(port, contract)| {
+                contract
+                    .batch_layout
+                    .batch_axis()
+                    .map(|axis| (direction, port, contract, axis))
+            })
+        })
+        .collect::<Vec<_>>();
+        for (direction, port, contract, axis) in &batched_ports {
+            if *axis != capacity.axis {
+                errors.push(format!(
+                    "workflow component '{name}' {direction} port '{port}' batches on axis \
+                     {axis} but the component declares batch_capacity axis {}",
+                    capacity.axis
+                ));
+            }
+            if capacity.axis >= contract.rank {
+                errors.push(format!(
+                    "workflow component '{name}' declares batch_capacity axis {} but \
+                     {direction} port '{port}' has rank {}",
+                    capacity.axis, contract.rank
+                ));
+            }
+            // A fixed dimension on the batch axis pins how many rows the
+            // artifact can ever accept. A row bound that disagrees with it
+            // is a promise the graph itself refuses to keep.
+            if let Some(max_rows) = capacity.max_rows
+                && contract.batch_layout.request_axis() == Some(capacity.axis)
+                && let Some(crate::schema::TensorDimension::Fixed(fixed)) = contract
+                    .shape
+                    .as_ref()
+                    .and_then(|shape| shape.get(capacity.axis))
+            {
+                let rows =
+                    max_rows.saturating_mul(contract.batch_layout.request_expansion_factor());
+                if i64::try_from(rows).is_ok_and(|rows| rows != *fixed) {
+                    errors.push(format!(
+                        "workflow component '{name}' declares batch_capacity max_rows \
+                         {max_rows} but {direction} port '{port}' pins axis {} to a fixed \
+                         dimension of {fixed}",
+                        capacity.axis
+                    ));
+                }
+            }
+        }
+        // Uniformity is required of the rows, not of any single port: the ports
+        // of one component legitimately have different ranks, so an axis is in
+        // range when some batched port actually has it. An axis no batched port
+        // has is a grouping key nothing can be compared on.
+        let widest_port = batched_ports
+            .iter()
+            .map(|(_, _, contract, _)| contract.rank)
+            .max();
+        if let Some(widest_port) = widest_port {
+            for axis in &capacity.uniform_axes {
+                if *axis >= widest_port {
+                    errors.push(format!(
+                        "workflow component '{name}' declares batch_capacity uniform axis {axis} \
+                         but its widest request-scoped port has rank {widest_port}"
+                    ));
+                }
+            }
+        }
+        let inferred_ports = component.ports.inputs.is_empty()
+            && component.ports.outputs.is_empty()
+            && matches!(
+                component.implementation,
+                crate::schema::ComponentImplementation::Onnx { .. }
+            );
+        if batched_ports.is_empty() && !inferred_ports {
+            errors.push(format!(
+                "workflow component '{name}' declares batch_capacity but no port declares a \
+                 request-scoped or token_packed batch_layout; there is nothing to batch"
+            ));
         }
     }
 }
@@ -4374,10 +4903,7 @@ fn validate_integer_control_contract(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if !matches!(
-        contract.dtype.as_str(),
-        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-    ) {
+    if !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have an integer dtype"));
     }
     if !matches!(contract.rank, 0 | 1) {
@@ -4403,12 +4929,7 @@ fn validate_predicate_contract(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if contract.dtype != "bool"
-        && !matches!(
-            contract.dtype.as_str(),
-            "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-        )
-    {
+    if contract.dtype != "bool" && !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have a bool or integer dtype"));
     }
     if !matches!(contract.rank, 0 | 1) {

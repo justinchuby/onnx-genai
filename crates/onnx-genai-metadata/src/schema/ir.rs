@@ -21,6 +21,17 @@ pub struct TensorContract {
     /// stay runtime-private.
     #[serde(default, skip_serializing_if = "BatchLayout::is_shared")]
     pub batch_layout: BatchLayout,
+    /// Workflow value whose booleans or integers mark which entries of this
+    /// tensor are real rather than padding.
+    ///
+    /// A dense tensor is the only shape a fixed-arity component can consume, so
+    /// a batch whose rows carry different amounts of data has to be padded up to
+    /// a common extent. Nothing in the padded tensor says where the real entries
+    /// stop, and guessing from a sentinel is exactly the hidden heuristic this
+    /// schema refuses: the mask is named, typed, and validated like any other
+    /// value. Absence means every entry is valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pad_mask: Option<String>,
 }
 
 /// Structural relationship between a typed value and the runtime batch.
@@ -80,9 +91,46 @@ impl BatchLayout {
         }
     }
 
+    /// Axis along which items belonging to many requests are concatenated.
+    pub fn packed_axis(&self) -> Option<usize> {
+        match self {
+            Self::TokenPacked { axis, .. } => Some(*axis),
+            _ => None,
+        }
+    }
+
+    /// Values a packed layout needs to map items back to rows: `(offsets, owner)`.
+    pub fn packing(&self) -> Option<(&str, &str)> {
+        match self {
+            Self::TokenPacked { offsets, owner, .. } => Some((offsets.as_str(), owner.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Axis a runtime groups this value along when it fills one invocation.
+    ///
+    /// A request-aligned value groups by row and a packed value groups by item,
+    /// but both stack along exactly one axis, and that axis is what a batching
+    /// capacity is declared against.
+    pub fn batch_axis(&self) -> Option<usize> {
+        self.request_axis().or_else(|| self.packed_axis())
+    }
+
     /// Whether the runtime must move this value when it compacts or releases rows.
     pub fn is_row_scoped(&self) -> bool {
         !matches!(self, Self::Shared)
+    }
+
+    /// Serialized `kind` of this layout, for diagnostics that name what a
+    /// document declared rather than how the reader spells it.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::RequestAligned { .. } => "request_aligned",
+            Self::RequestExpanded { .. } => "request_expanded",
+            Self::TokenPacked { .. } => "token_packed",
+            Self::RuntimeSequenceState => "runtime_sequence_state",
+        }
     }
 }
 
@@ -721,6 +769,45 @@ pub struct WorkflowComponent {
     /// additional state they read that is not visible as a typed input.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub cache_affects_state: BTreeSet<String>,
+    /// How many request rows one invocation of this component may carry.
+    ///
+    /// Absence means one request row per invocation: a runtime that wants to
+    /// serve two requests calls the component twice. That is the safe reading
+    /// for every component whose producer has not thought about batching, so it
+    /// is the default. A component that declares a capacity is stating that its
+    /// artifact accepts several rows stacked on one axis, which is the fact a
+    /// scheduler needs before it may coalesce work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_capacity: Option<ComponentBatchCapacity>,
+}
+
+/// Batching capacity of one invocation of a component.
+///
+/// This describes the shape of an invocation, never a scheduling policy: how
+/// many request rows may share a call, along which axis they stack, and which
+/// axes must already agree before they can. A runtime decides whether to use
+/// the capacity; the package only says what its artifact can accept.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentBatchCapacity {
+    /// Axis of this component's request-scoped ports along which rows stack.
+    pub axis: usize,
+    /// Largest number of request rows one invocation may carry.
+    ///
+    /// Absent means the component accepts as many rows as the runtime can fit,
+    /// so the bound is memory rather than the artifact. Zero is never a capacity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub max_rows: Option<usize>,
+    /// Axes whose dimensions must be equal across rows for those rows to share
+    /// one invocation.
+    ///
+    /// A component that accepts several rows may still require them to agree on
+    /// something the batch axis does not cover — an encoder whose artifact is
+    /// built for one spatial extent, say. Listing those axes lets a scheduler
+    /// group compatible rows instead of guessing from shapes it cannot compare.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uniform_axes: Vec<usize>,
 }
 
 /// Row scope of a component's runtime-private state.
