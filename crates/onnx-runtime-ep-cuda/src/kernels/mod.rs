@@ -1686,6 +1686,30 @@ mod tests {
         );
     }
 
+    /// `com.microsoft::PackedMultiHeadAttention` is a *documented non-gap*, not
+    /// an oversight — this test pins that decision so nobody re-opens it.
+    ///
+    /// It is emitted only by ORT's BERT encoder packing-mode fusion and never
+    /// appears on the decoder-only LLM path this project targets (which uses
+    /// `Attention` / `MultiHeadAttention` / `GroupQueryAttention`, and the
+    /// runtime-invented `pkg.nxrt::PackedVarlenAttention` for packed sequences).
+    /// The real Qwen3.5-0.8B hybrid decode graph places on CUDA with zero
+    /// declines; the only producer in the repo is a synthetic CPU-EP fixture.
+    /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`.
+    ///
+    /// If a real target model ever emits this op, implement it as an adapter
+    /// over the packed varlen SDPA core (`packed_varlen_attention.rs`), add it
+    /// to the five-place registration contract, and delete this test.
+    #[test]
+    fn packed_multi_head_attention_is_a_documented_non_gap() {
+        assert!(
+            !CUDA_COVERED_OPS.contains(&"PackedMultiHeadAttention"),
+            "PackedMultiHeadAttention was added to CUDA_COVERED_OPS: if this is a \
+             real implementation, remove this non-gap test and update \
+             docs/execution/CUDA_COVERAGE.md; if it is accidental, revert it"
+        );
+    }
+
     #[test]
     fn indexing_and_scan_ops_are_listed_in_coverage() {
         for op in [
