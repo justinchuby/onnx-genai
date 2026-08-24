@@ -130,12 +130,16 @@ pub(crate) struct CsaDeviceBufferManager {
     /// scores). Reserved once at runner init with stable addresses so the
     /// device-only capture path never allocates per call.
     workspaces: Vec<CUdeviceptr>,
-    /// RAII accounting charge against the CSA state-group ledger. Held for the
-    /// manager's lifetime so residency is released exactly when the physical
-    /// buffers are freed (`Drop`) or the reservation is rolled back. The ledger
-    /// is mandatory: every CSA device-buffer reservation is accounted, so there
-    /// is no unaccounted path (B6). Read only through its `Drop` in production;
-    /// `charged_bytes` reads it under test.
+    /// RAII accounting charge against the CSA state-group ledger, holding the
+    /// governor [`MemoryLease`] for these bytes. Held for the manager's lifetime
+    /// so residency is released from the one accounting authority
+    /// (`MemoryGovernor::used(Tier::Device)`) exactly when the physical buffers
+    /// are freed (`Drop`) or the reservation is rolled back. The ledger is
+    /// mandatory: every CSA device-buffer reservation is charged to the shared
+    /// governor, so there is no unaccounted path (B6/B6.2). Read only through
+    /// its `Drop` in production; `charged_bytes` reads it under test.
+    ///
+    /// [`MemoryLease`]: onnx_runtime_memory_governor::MemoryLease
     #[allow(dead_code)]
     charge: CsaStateGroupCharge,
 }
@@ -148,14 +152,17 @@ impl CsaDeviceBufferManager {
         ledger: Arc<CsaStateGroupLedger>,
         charge_key: (u64, u32),
     ) -> Result<Self> {
-        // Fail closed on the accounting authority BEFORE touching CUDA: if the
-        // state group cannot be admitted (e.g. the ledger limit is exhausted)
-        // no physical device memory is reserved, so a rejected group can never
-        // leak. The ledger is always present — it is the single accountant for
-        // every CSA device buffer — so "disarmed" is an unlimited limit, not a
-        // structural bypass; an unlimited ledger never refuses and adds no
-        // device op, keeping the reservation byte-identical. `charge` is kept
-        // in a local so any early return below releases it via RAII.
+        // Fail closed on the one accounting authority BEFORE touching CUDA: the
+        // charge reserves these bytes from the shared `MemoryGovernor` (B6.2),
+        // so an over-budget state group is refused with a typed reason and no
+        // physical device memory is reserved — a rejected group can never leak,
+        // and the reserved bytes are visible in the same device books as every
+        // other holder. The ledger is always present (single accountant, no
+        // unaccounted bypass); "disarmed" means the backing governor is
+        // unlimited, so it never refuses and adds no device op, keeping the
+        // reservation byte-identical. `charge` holds the governor lease in a
+        // local so any early return below releases both the lease and the
+        // attribution mirror via RAII (transaction rollback).
         let charge = ledger
             .try_charge(
                 charge_key,
@@ -395,8 +402,7 @@ mod tests {
         let workspaces = [4096usize];
         let needed = CsaStateGroupBytes::from_layout(&layout, &workspaces).total();
 
-        let ledger = Arc::new(CsaStateGroupLedger::default());
-        ledger.set_limit(needed - 1);
+        let ledger = Arc::new(CsaStateGroupLedger::with_device_limit(needed - 1));
         let result = CsaDeviceBufferManager::reserve(
             runtime.clone(),
             layout,
@@ -412,6 +418,11 @@ mod tests {
         assert_eq!(ledger.resident_bytes(), 0, "nothing charged on refusal");
         assert_eq!(ledger.active_group_count(), 0, "no group admitted");
         assert_eq!(ledger.charge_failures(), 1, "the refusal is counted");
+        assert_eq!(
+            ledger.governor_device_used(),
+            0,
+            "the governor's device books also stay at baseline on refusal"
+        );
     }
 
     /// Two reservations under distinct `(request, device)` keys are isolated:
@@ -505,7 +516,11 @@ mod tests {
         let workspaces = [1024usize];
         let expected = CsaStateGroupBytes::from_layout(&sample_layout(), &workspaces).total();
         let ledger = Arc::new(CsaStateGroupLedger::default());
-        assert_eq!(ledger.limit(), 0, "default ledger is unlimited");
+        assert_eq!(
+            ledger.device_available_bytes(),
+            u64::MAX,
+            "default ledger's backing governor is unlimited"
+        );
         let manager = CsaDeviceBufferManager::reserve(
             runtime.clone(),
             sample_layout(),
@@ -520,11 +535,21 @@ mod tests {
             "reservation is accounted"
         );
         assert_eq!(
+            ledger.governor_device_used(),
+            expected,
+            "the physical reservation is visible in the one governor's device books"
+        );
+        assert_eq!(
             ledger.charge_failures(),
             0,
             "no refusal on the disarmed path"
         );
         drop(manager);
         assert_eq!(ledger.resident_bytes(), 0, "teardown returns to baseline");
+        assert_eq!(
+            ledger.governor_device_used(),
+            0,
+            "teardown also returns the governor's device books to baseline"
+        );
     }
 }

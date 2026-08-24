@@ -308,15 +308,32 @@ pub struct CsaMetrics {
     host_bytes_total: AtomicU64,
     bytes_avoided_total: AtomicU64,
     layers: Mutex<BTreeMap<u64, CsaLayerMetrics>>,
-    /// B6 accounting authority: the single ledger every CSA device-buffer
-    /// reservation charges, isolated per `(request, device)`. Threaded from the
-    /// EP into every kernel via this metrics surface, so there is no
-    /// process-wide global. Unlimited by default (`Arc::default`), which keeps
-    /// the reservation path byte-identical until a limit is armed.
+    /// B6/B6.2 accounting authority: the single ledger every CSA device-buffer
+    /// reservation charges, isolated per `(request, device)`. Its admission
+    /// delegates to the shared [`MemoryGovernor`] threaded from the EP, so CSA
+    /// bytes are counted in the one set of device books; the `Default` surface
+    /// backs it with a private unlimited reference governor, which keeps the
+    /// reservation path byte-identical until a real budget is threaded in.
+    ///
+    /// [`MemoryGovernor`]: onnx_runtime_memory_governor::MemoryGovernor
     state_groups: Arc<CsaStateGroupLedger>,
 }
 
 impl CsaMetrics {
+    /// A telemetry surface whose CSA state-group ledger charges the shared
+    /// process `governor` — the B6.2 unification, so CSA device residency lands
+    /// in the same books (`MemoryGovernor::used(Tier::Device)`) as every other
+    /// device holder. The EP threads its governor here at construction; the
+    /// `Default` surface uses a private unlimited reference governor instead.
+    pub(crate) fn with_governor(
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Self {
+        Self {
+            state_groups: Arc::new(CsaStateGroupLedger::new(governor)),
+            ..Self::default()
+        }
+    }
+
     /// Record one decode's observability for `layer_id`.
     pub fn record_layer(&self, layer_id: u64, sample: CsaLayerMetrics) {
         self.device_bytes_total
@@ -385,15 +402,19 @@ impl CsaMetrics {
         self.state_groups.resident_for(request, device_ordinal)
     }
 
-    /// The managed CSA state-group byte limit (`0` = unlimited, the default).
-    pub fn csa_state_group_limit(&self) -> u64 {
-        self.state_groups.limit()
+    /// Device bytes the backing governor can still grant — the live ceiling CSA
+    /// state groups fail closed against. There is no private CSA limit: the one
+    /// governor authority owns admission (B6.2), so this is a read-only view.
+    pub fn csa_state_group_device_available_bytes(&self) -> u64 {
+        self.state_groups.device_available_bytes()
     }
 
-    /// Arm the managed CSA state-group byte limit (`0` = unlimited). A group
-    /// whose reservation would cross it is refused *before* device allocation.
-    pub fn set_csa_state_group_limit(&self, bytes: u64) {
-        self.state_groups.set_limit(bytes);
+    /// Device bytes the backing governor accounts across every holder — the
+    /// single-authority total CSA residency now contributes to. In a
+    /// CSA-dedicated governor this equals `csa_state_group_resident_bytes`; in
+    /// the shared process governor it also includes weights, KV and workspaces.
+    pub fn csa_state_group_governor_device_used(&self) -> u64 {
+        self.state_groups.governor_device_used()
     }
 
     /// Total speculative rollbacks observed.

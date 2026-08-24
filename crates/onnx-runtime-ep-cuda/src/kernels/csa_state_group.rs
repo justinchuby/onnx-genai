@@ -1,6 +1,7 @@
 //! Single property-typed accounting authority for Compressed-Sparse-Attention
 //! (CSA / HCA) device state groups — the C1 closure of design blocker **B6**
-//! (`docs/memory/...` DeepSeek-V4 CSA/HCA slice, §7).
+//! (`docs/memory/...` DeepSeek-V4 CSA/HCA slice, §7) and its **B6.2** follow-up
+//! (unify the accounting under the one governor authority).
 //!
 //! Before this module the CUDA CSA runner reserved its fixed-capacity device
 //! buffers (compressed records, carry, dense sliding-window ring, index streams
@@ -12,18 +13,30 @@
 //!
 //! [`CsaStateGroupLedger`] is the single authority the CSA reservation now
 //! routes through. It does **not** allocate device memory and it is **not** a
-//! second cache/page manager: it is the ownership/accounting ledger the runner
-//! consults *before* it reserves, so that
+//! second cache/page manager. **B6.2:** its admission delegates to the shared
+//! [`MemoryGovernor`] — every CSA byte is reserved with
+//! `governor.reserve(Tier::Device, .., MemoryRole::Workspace { .. }, holder)`
+//! *before* the physical [`CudaRuntime::alloc_raw`], and the returned
+//! [`MemoryLease`] is held for the buffers' lifetime — so the bytes are counted
+//! in the same books (`MemoryGovernor::used(Tier::Device)`) as every other
+//! device holder. There is no private byte limit and no second admission gate;
+//! the governor is the one accountant. On top of that single authority the
+//! ledger keeps a *derived* attribution mirror so that
 //!
 //! * every CSA byte is charged to one place, per `(request, device)` for
 //!   multi-request / multi-device isolation,
-//! * a reservation **fails closed** against an optional managed byte limit with
+//! * a reservation **fails closed** against the governor's device ceiling with
 //!   a typed refusal *before* any physical allocation (no partial, no leak),
 //! * residency is exposed per state class (compressed / carry / dense-ring /
 //!   index / scratch) so a test or operator can assert "compressed < dense" and
-//!   "returns to baseline on teardown",
+//!   "returns to baseline on teardown" — attribution the governor deliberately
+//!   does not itemise per holder,
 //! * and the backend keeps its logical cursors (`csa_checkpoint::CsaCursors`) —
 //!   the ledger owns *bytes*, never cursor semantics.
+//!
+//! The mirror never gates admission; the governor alone decides "may I take
+//! these bytes", so the mirror is complementary observability, not a competing
+//! second set of books.
 //!
 //! [`CsaStateGroupDescriptor`] is the property-typed gate in front of it: it
 //! decides support from the graph's declared *properties* (compression ratio,
@@ -32,6 +45,8 @@
 //! case was refused ([`CsaStateGroupRefusal`]).
 //!
 //! [`CudaRuntime::alloc_raw`]: crate::runtime::CudaRuntime::alloc_raw
+//! [`MemoryGovernor`]: onnx_runtime_memory_governor::MemoryGovernor
+//! [`MemoryLease`]: onnx_runtime_memory_governor::MemoryLease
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,8 +54,20 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::EpError;
 use onnx_runtime_ir::Node;
+use onnx_runtime_memory_governor::{
+    HolderId, LeaseLedger, LedgerGovernor, MemoryError, MemoryGovernor, MemoryLease, MemoryRole,
+    Tier,
+};
 
 use crate::kernels::csa_device_state::CsaBufferLayout;
+
+/// Process-unique identity for one CSA state-group holder of device memory, so
+/// each ledger instance charges the shared [`MemoryGovernor`] under a stable
+/// [`HolderId`].
+fn next_holder_id() -> HolderId {
+    static NEXT_HOLDER: AtomicU64 = AtomicU64::new(1);
+    HolderId::new(NEXT_HOLDER.fetch_add(1, Ordering::Relaxed))
+}
 
 /// Record/cache encoding a graph declares for a CSA state group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,13 +406,23 @@ impl CsaStateGroupBytes {
 
 /// The single ownership/accounting authority for CSA device state groups.
 ///
-/// Owns *bytes*, never cursors. Charges are per `(request, device)` for
-/// isolation, checked against an optional managed limit (0 = unlimited) that
-/// fails closed *before* physical allocation, and released on
-/// [`CsaStateGroupCharge`] drop so teardown returns to baseline.
-#[derive(Debug, Default)]
+/// Owns *bytes*, never cursors. **B6.2:** admission delegates to the shared
+/// [`MemoryGovernor`] — the one authority that decides whether the device tier
+/// can take these bytes — so CSA residency lands in the same books as every
+/// other device holder and fails closed against the governor's ceiling *before*
+/// physical allocation. Charges are attributed per `(request, device)` for
+/// isolation and released on [`CsaStateGroupCharge`] drop (which drops the
+/// governor [`MemoryLease`]) so teardown returns to baseline. The per-class /
+/// per-`(request, device)` counters are a derived attribution *mirror*: they
+/// never gate admission, so they are complementary observability rather than a
+/// second set of books.
 pub(crate) struct CsaStateGroupLedger {
-    limit: AtomicU64,
+    /// The one accounting authority. Every CSA byte is reserved through this
+    /// governor's `reserve`, so `governor.used(Tier::Device)` sees CSA state
+    /// groups exactly like any other device holder (the B6.2 unification).
+    governor: Arc<dyn MemoryGovernor + Send + Sync>,
+    /// Stable identity this ledger holds device memory under.
+    holder: HolderId,
     resident: AtomicU64,
     peak: AtomicU64,
     compressed: AtomicU64,
@@ -396,21 +433,84 @@ pub(crate) struct CsaStateGroupLedger {
     scratch: AtomicU64,
     charge_failures: AtomicU64,
     request_seq: AtomicU64,
-    /// Resident bytes per `(request, device)` — the isolation ledger, and the
-    /// serialization point that makes the check-then-charge atomic.
+    /// Resident bytes per `(request, device)` — the isolation attribution and
+    /// the serialization point that keeps the mirror update consistent.
     charges: Mutex<HashMap<(u64, u32), u64>>,
 }
 
+impl std::fmt::Debug for CsaStateGroupLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CsaStateGroupLedger")
+            .field("holder", &self.holder)
+            .field("resident", &self.resident.load(Ordering::Relaxed))
+            .field("peak", &self.peak.load(Ordering::Relaxed))
+            .field(
+                "charge_failures",
+                &self.charge_failures.load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for CsaStateGroupLedger {
+    /// A ledger over a private, effectively-unlimited reference governor. This
+    /// is the disarmed default: the governor never refuses, so the reservation
+    /// is byte-identical to the pre-accounting path, and the accounting is still
+    /// the single authority (no unaccounted bypass). Production threads the
+    /// shared process governor via [`Self::new`] so CSA joins the real books.
+    fn default() -> Self {
+        Self::new(Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            u64::MAX,
+            0,
+            0,
+        ))))
+    }
+}
+
 impl CsaStateGroupLedger {
-    /// Set the managed byte limit (0 = unlimited). Steady state leaves it 0 so
-    /// the accounting is observable without changing behaviour; a test or an
-    /// operator sets it to prove fail-closed admission.
-    pub(crate) fn set_limit(&self, bytes: u64) {
-        self.limit.store(bytes, Ordering::Relaxed);
+    /// A ledger backed by `governor` — the one accounting authority for CSA
+    /// device state groups. Every charge reserves from and releases to it.
+    pub(crate) fn new(governor: Arc<dyn MemoryGovernor + Send + Sync>) -> Self {
+        Self {
+            governor,
+            holder: next_holder_id(),
+            resident: AtomicU64::new(0),
+            peak: AtomicU64::new(0),
+            compressed: AtomicU64::new(0),
+            carry: AtomicU64::new(0),
+            dense_ring: AtomicU64::new(0),
+            index: AtomicU64::new(0),
+            index_carry: AtomicU64::new(0),
+            scratch: AtomicU64::new(0),
+            charge_failures: AtomicU64::new(0),
+            request_seq: AtomicU64::new(0),
+            charges: Mutex::new(HashMap::new()),
+        }
     }
 
-    pub(crate) fn limit(&self) -> u64 {
-        self.limit.load(Ordering::Relaxed)
+    /// A ledger over a private reference governor whose device tier is capped at
+    /// `device_bytes` — used to prove fail-closed admission at a chosen ceiling
+    /// without touching the shared process books.
+    #[cfg(test)]
+    pub(crate) fn with_device_limit(device_bytes: u64) -> Self {
+        Self::new(Arc::new(LedgerGovernor::new(LeaseLedger::new(
+            device_bytes,
+            0,
+            0,
+        ))))
+    }
+
+    /// Bytes the backing governor can still grant on the device tier — the
+    /// live ceiling this ledger fails closed against (there is no private
+    /// limit; the governor owns it).
+    pub(crate) fn device_available_bytes(&self) -> u64 {
+        self.governor.available(Tier::Device)
+    }
+
+    /// Total device bytes the backing governor currently accounts, across every
+    /// holder — the single-authority view CSA residency now contributes to.
+    pub(crate) fn governor_device_used(&self) -> u64 {
+        self.governor.used(Tier::Device)
     }
 
     /// A fresh, process-unique request id for one runner instance, so distinct
@@ -419,33 +519,42 @@ impl CsaStateGroupLedger {
         self.request_seq.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Charge `bytes` for `(request, device)`, failing closed if it would cross
-    /// the managed limit. The whole check-then-charge runs under the isolation
-    /// lock, so a concurrent charge can never race past the limit, and no state
-    /// is mutated on refusal (no partial reservation).
+    /// Charge `bytes` for `(request, device)` by reserving them from the shared
+    /// governor — the single admission authority — *before* any physical
+    /// allocation. A refusal fails closed with a typed reason and mutates no
+    /// state (no partial reservation). On success the derived attribution mirror
+    /// is updated under the isolation lock and the governor [`MemoryLease`] is
+    /// handed to the returned [`CsaStateGroupCharge`], which releases it (and
+    /// the mirror) on drop.
     pub(crate) fn try_charge(
         self: &Arc<Self>,
         key: (u64, u32),
         bytes: CsaStateGroupBytes,
     ) -> Result<CsaStateGroupCharge, CsaStateGroupRefusal> {
         let total = bytes.total();
+        // The one accounting authority decides admission. This is host-side
+        // atomics under the governor's own claim gate — no device op, no
+        // capture-stream work — and it fails closed before `alloc_raw`.
+        let lease = self
+            .governor
+            .reserve(
+                Tier::Device,
+                total,
+                MemoryRole::Workspace { step_scoped: false },
+                self.holder,
+            )
+            .map_err(|error| {
+                self.charge_failures.fetch_add(1, Ordering::Relaxed);
+                self.refusal_from(key, total, &error)
+            })?;
+        // Update the derived attribution mirror. It never gates admission (the
+        // governor already granted); it only records per-class / per-request
+        // residency the governor does not itemise.
         let mut charges = self
             .charges
             .lock()
             .expect("CSA state-group ledger poisoned");
-        let limit = self.limit.load(Ordering::Relaxed);
-        let resident = self.resident.load(Ordering::Relaxed);
-        let next = resident.saturating_add(total);
-        if limit != 0 && next > limit {
-            self.charge_failures.fetch_add(1, Ordering::Relaxed);
-            return Err(CsaStateGroupRefusal::OutOfMemory {
-                request: key.0,
-                device_ordinal: key.1,
-                requested: total,
-                resident,
-                limit,
-            });
-        }
+        let next = self.resident.load(Ordering::Relaxed).saturating_add(total);
         self.resident.store(next, Ordering::Relaxed);
         bump_peak(&self.peak, next);
         self.compressed
@@ -463,7 +572,36 @@ impl CsaStateGroupLedger {
             ledger: Arc::clone(self),
             key,
             bytes,
+            lease,
         })
+    }
+
+    /// Translate a governor admission failure into the property-typed CSA
+    /// refusal, preserving the `(request, device)` identity and the governor's
+    /// own account of the shortfall.
+    fn refusal_from(
+        &self,
+        key: (u64, u32),
+        requested: u64,
+        error: &MemoryError,
+    ) -> CsaStateGroupRefusal {
+        let (resident, limit) = match error {
+            MemoryError::TierExhausted { used, limit, .. } => (*used, *limit),
+            _ => {
+                let used = self.governor.used(Tier::Device);
+                (
+                    used,
+                    used.saturating_add(self.governor.available(Tier::Device)),
+                )
+            }
+        };
+        CsaStateGroupRefusal::OutOfMemory {
+            request: key.0,
+            device_ordinal: key.1,
+            requested,
+            resident,
+            limit,
+        }
     }
 
     fn release(&self, key: (u64, u32), bytes: CsaStateGroupBytes) {
@@ -530,19 +668,32 @@ impl CsaStateGroupLedger {
     }
 }
 
-/// RAII charge against a [`CsaStateGroupLedger`]. Dropping it returns every
-/// byte to the ledger, so a runner's teardown restores baseline residency with
-/// no explicit accounting call.
+/// RAII charge against a [`CsaStateGroupLedger`]. It owns the governor
+/// [`MemoryLease`] for the reservation, so dropping it returns every byte to the
+/// one accounting authority *and* clears the derived attribution mirror — a
+/// runner's teardown restores baseline residency with no explicit accounting
+/// call, and a rolled-back reservation releases exactly once.
 pub(crate) struct CsaStateGroupCharge {
     ledger: Arc<CsaStateGroupLedger>,
     key: (u64, u32),
     bytes: CsaStateGroupBytes,
+    /// Governor accounting for these bytes. Held for the buffers' lifetime;
+    /// its `Drop` returns the bytes to `MemoryGovernor::used(Tier::Device)`.
+    /// Declared last so it drops after [`Drop::drop`] clears the mirror.
+    lease: MemoryLease,
 }
 
 impl CsaStateGroupCharge {
     #[cfg(test)]
     pub(crate) fn total(&self) -> u64 {
         self.bytes.total()
+    }
+
+    /// The governor lease backing this charge — lets a test assert the bytes
+    /// are accounted on the device tier by the one authority.
+    #[cfg(test)]
+    pub(crate) fn lease_bytes(&self) -> u64 {
+        self.lease.bytes()
     }
 }
 
@@ -551,12 +702,16 @@ impl std::fmt::Debug for CsaStateGroupCharge {
         f.debug_struct("CsaStateGroupCharge")
             .field("key", &self.key)
             .field("total", &self.bytes.total())
+            .field("lease_bytes", &self.lease.bytes())
             .finish()
     }
 }
 
 impl Drop for CsaStateGroupCharge {
     fn drop(&mut self) {
+        // Clear the derived attribution mirror first; the `lease` field then
+        // auto-drops (declaration order, after this returns), returning the
+        // bytes to the governor. Both are infallible and run exactly once.
         self.ledger.release(self.key, self.bytes);
     }
 }
@@ -750,8 +905,10 @@ mod tests {
 
     #[test]
     fn ledger_fails_closed_over_limit_without_mutating() {
-        let ledger = Arc::new(CsaStateGroupLedger::default());
-        ledger.set_limit(150);
+        // A ledger over a governor capped at 150 device bytes: the first 100-byte
+        // group is admitted, the second is refused by the one accounting
+        // authority before any allocation.
+        let ledger = Arc::new(CsaStateGroupLedger::with_device_limit(150));
         let _first = ledger
             .try_charge((1, 0), bytes([100, 0, 0, 0, 0, 0]))
             .unwrap();
@@ -763,6 +920,9 @@ mod tests {
         assert_eq!(ledger.resident_bytes(), 100);
         assert_eq!(ledger.resident_for(2, 0), 0);
         assert_eq!(ledger.charge_failures(), 1);
+        // The governor's own device books also see exactly the admitted bytes —
+        // no partial reservation leaked from the refused charge.
+        assert_eq!(ledger.governor_device_used(), 100);
     }
 
     #[test]
@@ -828,14 +988,156 @@ mod tests {
     }
 
     #[test]
-    fn ledger_limit_round_trips() {
-        let ledger = Arc::new(CsaStateGroupLedger::default());
+    fn ledger_reports_governor_device_ceiling() {
+        // There is no private limit any more: the ceiling the ledger fails
+        // closed against is the backing governor's device availability.
+        let unlimited = Arc::new(CsaStateGroupLedger::default());
         assert_eq!(
-            ledger.limit(),
-            0,
-            "default ledger is unlimited (0 sentinel)"
+            unlimited.device_available_bytes(),
+            u64::MAX,
+            "disarmed default is an unlimited reference governor"
         );
-        ledger.set_limit(4096);
-        assert_eq!(ledger.limit(), 4096);
+
+        let capped = Arc::new(CsaStateGroupLedger::with_device_limit(4096));
+        assert_eq!(capped.device_available_bytes(), 4096);
+        let _charge = capped
+            .try_charge((1, 0), bytes([1000, 0, 0, 0, 0, 0]))
+            .unwrap();
+        // A charge consumes governor capacity, so the live ceiling drops — the
+        // ledger and the governor agree on one number.
+        assert_eq!(capped.device_available_bytes(), 3096);
+        assert_eq!(capped.governor_device_used(), 1000);
+    }
+
+    #[test]
+    fn governor_sees_csa_reservation_in_shared_books() {
+        // B6.2 crux: a CSA charge lands in the *same* device books as every
+        // other holder on the shared governor, not a private CSA limit.
+        let ledger_books = Arc::new(LeaseLedger::new(8 << 20, 0, 0));
+        let governor = Arc::new(LedgerGovernor::new(Arc::clone(&ledger_books)));
+        // A pre-existing unrelated holder already occupies the device tier.
+        let other = governor
+            .reserve(Tier::Device, 4096, MemoryRole::KvCache, HolderId::new(999))
+            .unwrap();
+        let ledger = Arc::new(CsaStateGroupLedger::new(
+            Arc::clone(&governor) as Arc<dyn MemoryGovernor + Send + Sync>
+        ));
+
+        let charge = ledger
+            .try_charge((1, 0), bytes([100, 20, 40, 0, 0, 8]))
+            .unwrap();
+        // The governor's device total is the other holder plus the CSA group —
+        // one set of books, not two.
+        assert_eq!(governor.used(Tier::Device), 4096 + 168);
+        assert_eq!(ledger.governor_device_used(), 4096 + 168);
+        assert_eq!(charge.lease_bytes(), 168);
+
+        drop(charge);
+        // Teardown returns the CSA bytes to baseline; the unrelated holder is
+        // untouched (isolation).
+        assert_eq!(governor.used(Tier::Device), 4096);
+        drop(other);
+        assert_eq!(governor.used(Tier::Device), 0);
+    }
+
+    /// Books for [`CountingGovernor`]: a device-byte counter plus reserve/release
+    /// call counts, so a test can prove exactly one reserve and one release back
+    /// the CSA charge (no double charge, no second unaccounted path).
+    #[derive(Debug, Default)]
+    struct CountingBooks {
+        device_used: Mutex<u64>,
+        reserves: AtomicU64,
+        releases: AtomicU64,
+    }
+
+    impl onnx_runtime_memory_governor::LeaseAccounting for CountingBooks {
+        fn try_claim(
+            &self,
+            _tier: Tier,
+            _bytes: u64,
+            _role: MemoryRole,
+        ) -> Result<(), MemoryError> {
+            // Admission is counted in `CountingGovernor::reserve`; the lease's
+            // Drop path only releases.
+            Ok(())
+        }
+
+        fn release(&self, _tier: Tier, bytes: u64) {
+            self.releases.fetch_add(1, Ordering::Relaxed);
+            let mut used = self.device_used.lock().unwrap();
+            *used = used.saturating_sub(bytes);
+        }
+    }
+
+    /// A minimal external [`MemoryGovernor`] that records how many times it is
+    /// reserved from and released to.
+    #[derive(Debug)]
+    struct CountingGovernor {
+        books: Arc<CountingBooks>,
+        authority: onnx_runtime_memory_governor::MemoryAuthorityId,
+    }
+
+    impl MemoryGovernor for CountingGovernor {
+        fn authority_id(&self) -> onnx_runtime_memory_governor::MemoryAuthorityId {
+            self.authority
+        }
+
+        fn reserve(
+            &self,
+            tier: Tier,
+            bytes: u64,
+            role: MemoryRole,
+            holder: HolderId,
+        ) -> Result<MemoryLease, MemoryError> {
+            self.books.reserves.fetch_add(1, Ordering::Relaxed);
+            {
+                let mut used = self.books.device_used.lock().unwrap();
+                *used += bytes;
+            }
+            Ok(MemoryLease::new(
+                tier,
+                bytes,
+                role,
+                holder,
+                Arc::clone(&self.books) as Arc<dyn onnx_runtime_memory_governor::LeaseAccounting>,
+            ))
+        }
+
+        fn available(&self, _tier: Tier) -> u64 {
+            u64::MAX
+        }
+
+        fn used(&self, _tier: Tier) -> u64 {
+            *self.books.device_used.lock().unwrap()
+        }
+    }
+
+    #[test]
+    fn charge_reserves_and_releases_governor_exactly_once() {
+        let books = Arc::new(CountingBooks::default());
+        let governor = Arc::new(CountingGovernor {
+            books: Arc::clone(&books),
+            authority: onnx_runtime_memory_governor::MemoryAuthorityId::new(
+                onnx_runtime_memory_governor::DeviceKey::device(0),
+            ),
+        });
+        let ledger = Arc::new(CsaStateGroupLedger::new(
+            governor as Arc<dyn MemoryGovernor + Send + Sync>,
+        ));
+
+        let charge = ledger
+            .try_charge((7, 0), bytes([100, 20, 40, 0, 0, 8]))
+            .unwrap();
+        // Exactly one reservation on the one authority — no double charge, no
+        // raw escape hatch, no allocator-specific second ledger.
+        assert_eq!(books.reserves.load(Ordering::Relaxed), 1);
+        assert_eq!(books.releases.load(Ordering::Relaxed), 0);
+        assert_eq!(*books.device_used.lock().unwrap(), 168);
+
+        drop(charge);
+        // Exactly one release: the RAII charge returns the bytes once.
+        assert_eq!(books.reserves.load(Ordering::Relaxed), 1);
+        assert_eq!(books.releases.load(Ordering::Relaxed), 1);
+        assert_eq!(*books.device_used.lock().unwrap(), 0);
     }
 }
