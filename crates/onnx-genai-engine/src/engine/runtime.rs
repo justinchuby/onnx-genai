@@ -807,6 +807,73 @@ impl Engine {
         )
     }
 
+    /// Admit a prompt-only request through the scheduler for a package this
+    /// runtime has no decode core for.
+    ///
+    /// A no-decode-core request still shares this runtime's scheduler, and —
+    /// when the process configured one — its KV byte budget: components own
+    /// their own caches, but the byte accounting a shared budget protects is
+    /// shared regardless of which executor a step names. Called from
+    /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
+    /// no-decode-core branch — the one place every prompt-only request for
+    /// such a package passes through, whether it arrived cold
+    /// ([`Self::generate_interpreted`]) or through a continuing workflow
+    /// session ([`Self::generate_in_workflow_session`]) — this gives the path
+    /// the same "reject at the door" guarantee
+    /// [`Self::generate_native_cold_with_callback`] already has instead of
+    /// letting the request fail deep inside node execution once a value the
+    /// loop needed never arrives.
+    pub(crate) fn admit_interpreted_generate_request(
+        &mut self,
+        session_id: SessionId,
+        prompt: &GeneratePrompt,
+        max_new_tokens: usize,
+    ) -> anyhow::Result<(Option<GenerationBudgetCap>, usize)> {
+        let prompt_tokens = self.interpreted_prompt_token_count(prompt)?;
+        let scheduled = self.admit_generate_request_with_scheduler(
+            session_id,
+            prompt_tokens,
+            max_new_tokens,
+            Priority::Normal,
+        )?;
+        Ok((
+            scheduled.budget_cap.map(generation_budget_cap),
+            scheduled.max_tokens,
+        ))
+    }
+
+    /// Prompt length for scheduler admission before a no-decode-core request's
+    /// workflow has bound any input.
+    ///
+    /// The interpreter tokenizes a text prompt itself once the workflow runs
+    /// (from the package's own tokenizer, since this engine owns none for a
+    /// workflow package); admission needs that count earlier, to gate the run
+    /// rather than join it, so it is derived the same way here rather than
+    /// waiting for the loop to do it.
+    fn interpreted_prompt_token_count(&self, prompt: &GeneratePrompt) -> anyhow::Result<usize> {
+        match prompt {
+            GeneratePrompt::TokenIds(tokens) => Ok(tokens.len()),
+            // Equal-length rows bind into one `[rows, columns]` tensor and run
+            // as a single batched step (see
+            // `workflow.rs::workflow_request_value`'s `PromptTokens` binding),
+            // so the KV byte budget a batch of `rows` sequences needs scales
+            // with the whole rectangle, not just its widest row.
+            GeneratePrompt::TokenRows(rows) => {
+                Ok(rows.iter().map(Vec::len).max().unwrap_or(0) * rows.len())
+            }
+            GeneratePrompt::Text(text) => {
+                let tokenizer = self.workflow.package_tokenizer().context(
+                    "this package declares a prompt_tokens input but ships no tokenizer, so a \
+                     text prompt cannot be encoded for it; supply token ids instead",
+                )?;
+                tokenizer
+                    .encode(text)
+                    .map(|ids| ids.len())
+                    .map_err(|e| anyhow::anyhow!("Failed to tokenize prompt: {e}"))
+            }
+        }
+    }
+
     /// Access the engine-owned Resource Governor handle.
     pub fn governor(&self) -> &EngineResourceGovernor {
         &self.governor
@@ -2730,9 +2797,18 @@ mod tests {
         assert_eq!(native_workspace_query_rows(3, None, 8, None), 3);
     }
 
+    /// An engine whose package the interpreter drives, sharing one scheduler.
+    ///
+    /// `holds_decode_core()` is false here (no `session`, no `native_session`),
+    /// so generation takes the no-decode-core branch #1723 introduced and #1900
+    /// wired admission into. `budget_bytes` is the whole KV byte budget, which
+    /// is what decides whether a request is admitted at all.
+    ///
+    /// This literal was written out three times across these tests before it
+    /// was a helper; every field but the budget was identical in all three, and
+    /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
-    #[test]
-    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+    fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2748,7 +2824,7 @@ mod tests {
             ModelKvConfig::known(10, 1),
             0,
         )?;
-        let mut engine = Engine {
+        Ok(Engine {
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
@@ -2762,7 +2838,7 @@ mod tests {
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::with_byte_budget(
                 scheduler_config,
-                onnx_genai_scheduler::ByteBudget::new(10),
+                onnx_genai_scheduler::ByteBudget::new(budget_bytes),
             ),
             governor,
             sessions: HashMap::new(),
@@ -2787,7 +2863,13 @@ mod tests {
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
             _environment: None,
-        };
+        })
+    }
+
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_rejects_over_kv_byte_budget_before_backend_run() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
         let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
         request.options.max_new_tokens = 1;
         request.options.stop_on_eos = false;
@@ -2808,6 +2890,112 @@ mod tests {
             "native backend was touched before scheduler admission rejected: {error}"
         );
         assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// The cold-call test above exercises `generate_interpreted`; a
+    /// continuing workflow session reaches the exact same no-decode-core
+    /// branch through [`Engine::generate_in_workflow_session`] instead (the
+    /// path a server session-continuation route uses), and must be admitted
+    /// through the identical scheduler mechanism rather than skip it because
+    /// the request already names a session.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
+
+        // No decode core: this engine's sessions are workflow sessions,
+        // opened through the same public `create_session` a real caller
+        // (e.g. a server session-continuation route) would use.
+        assert!(!engine.holds_decode_core());
+        let session_id = engine.create_session()?;
+
+        let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(vec![1]),
+        ));
+        request.request.options.max_new_tokens = 1;
+        request.request.options.stop_on_eos = false;
+
+        let mut admitted = false;
+        let mut on_admitted = || admitted = true;
+        let error = engine
+            .generate_in_workflow_session(session_id, request, Some(&mut on_admitted), None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("scheduler admission failed: KV byte budget"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("references unavailable value"),
+            "a continuing session must be rejected at admission, not deep inside node \
+             execution once an unbound loop value goes missing: {error}"
+        );
+        assert!(!admitted, "refused requests must not signal admission");
+        Ok(())
+    }
+
+    /// The half of #1900 that a rejection test cannot reach: the reservation an
+    /// admitted request takes is handed back when it finishes.
+    ///
+    /// Both tests above assert a *refusal*, and a refusal is equally consistent
+    /// with an engine that admits nothing and with one that admits correctly
+    /// but never releases. So `scheduler.complete()` on this path was not under
+    /// test: deleting that one line left the whole 618-test lib suite green.
+    ///
+    /// The observable chosen here is the user-visible consequence rather than
+    /// the internal counter. On a budget sized for exactly one request, a leak
+    /// makes the *second* request fail admission -- the first never let go.
+    /// A test that asserts "refused because over budget" and a test that
+    /// asserts "not refused, because the previous request released" are
+    /// falsified by opposite mutations, which is the point of having both.
+    ///
+    /// The fixture cannot complete a generation -- its interpreted decoder
+    /// wants a KV value no component produces -- so neither call returns `Ok`.
+    /// That is exactly the case the release has to survive: `complete()` runs
+    /// on the error path too, and a request that admits and then fails must not
+    /// strand its bytes.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn an_admitted_interpreted_request_releases_its_reservation_for_the_next_one()
+    -> anyhow::Result<()> {
+        // One prompt token plus one new token at 10 bytes each, and nothing to
+        // spare: enough for a single request at a time, never for two at once.
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut refusals = Vec::new();
+        let mut admissions = 0usize;
+        for _ in 0..2 {
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(vec![1]));
+            request.options.max_new_tokens = 1;
+            request.options.stop_on_eos = false;
+            let mut on_admitted = || admissions += 1;
+            if let Err(error) =
+                engine.generate_with_callbacks(request, Some(&mut on_admitted), None)
+            {
+                let error = error.to_string();
+                if error.contains("scheduler admission failed") {
+                    refusals.push(error);
+                }
+            }
+        }
+
+        assert!(
+            refusals.is_empty(),
+            "a request must not be refused for bytes an earlier finished request still holds: {}",
+            refusals.join(" | ")
+        );
+        assert_eq!(
+            admissions, 2,
+            "the admission callback fires once per request the scheduler accepted"
+        );
+        assert_eq!(
+            engine.scheduler.running_count(),
+            0,
+            "no sequence may still be running once every request has finished"
+        );
         Ok(())
     }
 

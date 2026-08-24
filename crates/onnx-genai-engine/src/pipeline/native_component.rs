@@ -74,28 +74,14 @@ fn ir_dtype_from_ort(dtype: DataType) -> IrDataType {
 /// output fails with an actionable diagnostic naming the component, port, and
 /// observed type.
 fn ort_dtype_from_ir(component: &str, port: &str, dtype: IrDataType) -> anyhow::Result<DataType> {
-    Ok(match dtype {
-        IrDataType::Float32 => DataType::Float32,
-        IrDataType::Float16 => DataType::Float16,
-        IrDataType::BFloat16 => DataType::BFloat16,
-        IrDataType::Float8E4M3FN => DataType::Float8E4M3,
-        IrDataType::Float8E5M2 => DataType::Float8E5M2,
-        IrDataType::Int8 => DataType::Int8,
-        IrDataType::Int16 => DataType::Int16,
-        IrDataType::Int32 => DataType::Int32,
-        IrDataType::Int64 => DataType::Int64,
-        IrDataType::Uint8 => DataType::Uint8,
-        IrDataType::Uint16 => DataType::Uint16,
-        IrDataType::Uint32 => DataType::Uint32,
-        IrDataType::Uint64 => DataType::Uint64,
-        IrDataType::Bool => DataType::Bool,
-        other => anyhow::bail!(
-            "native workflow component '{component}' output '{port}' has element type {other:?}, \
+    super::device_ops::value_dtype_from_ir(dtype).with_context(|| {
+        format!(
+            "native workflow component '{component}' output '{port}' has element type {dtype:?}, \
              which the workflow value currency does not carry; the pipeline value pool supports \
-             float{{32,16}}, bfloat16, float8{{e4m3fn,e5m2}}, int{{8,16,32,64}}, uint{{8,16,32,64}}, \
-             and bool. Run this component on the ORT backend (decode_backend = Ort) or narrow the \
-             graph's output dtype."
-        ),
+             float{{32,16}}, bfloat16, float8{{e4m3fn,e5m2}}, int{{8,16,32,64}}, \
+             uint{{8,16,32,64}}, and bool. Run this component on the ORT backend (decode_backend \
+             = Ort) or narrow the graph's output dtype."
+        )
     })
 }
 

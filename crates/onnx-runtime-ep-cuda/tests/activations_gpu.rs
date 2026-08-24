@@ -264,3 +264,53 @@ fn clip_optional_bounds_match_cpu_reference() {
         );
     }
 }
+
+/// `Mish(x) = x · tanh(softplus(x))`, opset 22.
+///
+/// The values deliberately include large positives. Written the obvious way as
+/// `log1pf(expf(x))`, softplus overflows to `inf` around x ≈ 89 and Mish then
+/// returns NaN, where the correct answer converges to x. The CPU kernel uses the
+/// overflow-stable form and the CUDA one must agree — a test that only probed
+/// small inputs would pass against the broken spelling.
+#[test]
+fn mish_matches_cpu_including_the_saturating_tail() {
+    let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+        Ok(Ok(ep)) => ep,
+        Ok(Err(error)) => {
+            eprintln!("skip: no CUDA GPU/runtime available ({error})");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+        Err(_) => {
+            eprintln!("skip: CUDA runtime library loading panicked (library unavailable)");
+            panic!(
+                "CUDA test path did not run; this must be reported as a failed GPU test, not a pass"
+            );
+        }
+    };
+    let x = [
+        -20.0f32, -3.0, -1.0, -0.0, 0.0, 0.5, 2.0, 20.0, 100.0, 200.0,
+    ];
+    let node = Node::new(NodeId(0), "Mish", vec![], vec![]);
+    let got = run(&ep, &node, &x, None);
+
+    let expected: Vec<f32> = x
+        .iter()
+        .map(|&v| {
+            // Same stable spelling as the CPU kernel.
+            let softplus = v.max(0.0) + (-v.abs()).exp().ln_1p();
+            v * softplus.tanh()
+        })
+        .collect();
+    assert_close(&got, &expected);
+
+    // The property the tail is really about: for large x, Mish(x) -> x. If
+    // softplus overflowed, these would be NaN rather than close to the input.
+    for (input, output) in x.iter().zip(got.iter()).filter(|(v, _)| **v >= 20.0) {
+        assert!(
+            (output - input).abs() < 1e-3,
+            "Mish({input}) = {output}; expected it to converge to the input"
+        );
+    }
+}

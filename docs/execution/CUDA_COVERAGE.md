@@ -273,6 +273,15 @@ For `com.microsoft`, the remaining CPU-only gap is `FusedAttention`;
 additionally exposes `com.microsoft::Attention`. CUDA standard-domain extras not
 currently registered by the CPU EP include `Conv` (cuDNN).
 
+`com.microsoft::MoE` (the float/unquantized form, with dense f32/f16/bf16 FC
+weight tensors) is present in the CPU EP but is **not a real CUDA gap**: no
+Mobius-exported model fixture emits it — every MoE model we target uses
+`com.microsoft::QMoE` (INT4/INT8 packed weights, covered by `qmoe.rs`) or
+`pkg.nxrt::BlockQuantizedMoE`. The only `MoE` producers in the repo are synthetic
+benchmark harnesses (`scripts/ort_ab/gen_moe.py`) and CPU-EP-only e2e test
+fixtures. Registering a CUDA `MoE` kernel would be dead code for current targets;
+this non-gap is explicitly recorded here to prevent future re-investigation.
+
 
 ### Library mapping for the remaining CPU gaps
 

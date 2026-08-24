@@ -239,6 +239,80 @@ pub fn assert_close(actual: &[f32], expected: &[f32], tolerance: f32) {
 /// `kernels.rs`, which sweeps `[1, 8]`) will oversubscribe that pool onto a
 /// smaller budget's cores -- which is what production does with the same two
 /// settings, and is why this is applied there too rather than special-cased.
+/// Process-wide CPU time, split into user and system, in seconds.
+#[derive(Clone, Copy, Debug)]
+pub struct CpuTime {
+    pub user_s: f64,
+    pub sys_s: f64,
+}
+
+impl CpuTime {
+    pub fn total_s(self) -> f64 {
+        self.user_s + self.sys_s
+    }
+
+    /// `self - earlier`, for bracketing a measured window.
+    pub fn since(self, earlier: CpuTime) -> CpuTime {
+        CpuTime {
+            user_s: self.user_s - earlier.user_s,
+            sys_s: self.sys_s - earlier.sys_s,
+        }
+    }
+}
+
+/// CPU seconds consumed by **every thread of this process**, user and system
+/// separately.
+///
+/// Bracket a measured window with two reads and subtract. Wall time answers
+/// "how long did it take"; this answers "how much machine did it cost", and the
+/// two together decide a question wall time alone cannot: when a width doubling
+/// fails to halve the wall, are the extra workers *idle* (CPU flat, the loss is
+/// in dispatch, wake or join) or *busy* (CPU up, the loss is inside the kernel
+/// or is spin burned waiting)? Those want opposite fixes, and a throughput
+/// curve is consistent with both.
+///
+/// The user/system split is not decoration either. `sched_yield` in a park
+/// path is charged to **system**, so a spin-then-park barrier that ramps its
+/// yields with width shows up here as a rising `sys` fraction while `user`
+/// stays flat -- a signature that names the mechanism rather than just
+/// bounding it.
+///
+/// Robust to contention in a way wall time is not: another agent saturating
+/// the box steals wall from us but does not add to our `utime`. `/usr/bin/time`'s
+/// `Percent of CPU` is *not* an independent check on a wall-time result -- it is
+/// `(user+sys)/wall`, the same wall in the denominator, so it degrades exactly
+/// when wall does.
+///
+/// `/proc/self/stat`'s `utime`/`stime` are thread-group totals, so this covers
+/// the decode pool's workers without enumerating them. `comm` is arbitrary
+/// bytes in parentheses that may itself contain spaces and parentheses, so the
+/// field walk starts at the *last* `)` -- the same convention as
+/// `onnx_runtime_hostmon::own_jiffies_of_self_stat`, which this splits rather
+/// than sums.
+#[cfg(target_os = "linux")]
+pub fn process_cpu_time() -> Option<CpuTime> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let fields: Vec<&str> = tail.split_whitespace().collect();
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let hz = onnx_runtime_hostmon::clock_tick_hz();
+    if hz <= 0.0 {
+        return None;
+    }
+    Some(CpuTime {
+        user_s: utime as f64 / hz,
+        sys_s: stime as f64 / hz,
+    })
+}
+
+/// Non-Linux hosts have no `/proc/self/stat`; a bench that wants this reports
+/// the row as unavailable rather than substituting a wall-derived stand-in.
+#[cfg(not(target_os = "linux"))]
+pub fn process_cpu_time() -> Option<CpuTime> {
+    None
+}
+
 pub fn init_decode_topology() {
     CpuExecutionProvider::new()
         .initialize(&Default::default())

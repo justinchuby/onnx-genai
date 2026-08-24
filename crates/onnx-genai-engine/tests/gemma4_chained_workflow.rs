@@ -66,7 +66,7 @@ fn token_embedding_gather_matches_the_declared_table() -> anyhow::Result<()> {
     let source = chained::token_embedding_source(contract);
     assert_eq!(source.component, "target");
 
-    let table = engine.embedding_table(&source.component, &source.table)?;
+    let table = engine.embedding_table(&source)?;
     assert_eq!(table.hidden_size(), HIDDEN);
 
     let raw = std::fs::read(root.join("input_embedding.f32"))?;

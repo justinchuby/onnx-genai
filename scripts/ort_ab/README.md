@@ -250,6 +250,13 @@ scripts/hostlock.sh run --owner leon --reason "softmax 28-cell matrix" \
     -- python3 scripts/ort_ab/ab.py ...
 ```
 
+Both knobs are **opt-in**, and deliberately so. Without them `run` measures
+and prints (`verdict=unjudged`) but enforces nothing, because a shared,
+co-tenanted host is the normal case here and on the edge devices this engine
+targets — a tool that failed by default on a busy box would be asserting a
+dedicated machine that nobody promised. A low efficiency is information about
+one measurement, never a claim that the host owes you every core.
+
 That compares the CPU the command actually consumed against `N x wall` and
 exits 6 if it falls short, so an unattended harness stops instead of
 publishing. It needs no quiet host -- it tells you which reps to throw away.

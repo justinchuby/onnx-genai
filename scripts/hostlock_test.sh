@@ -15,6 +15,14 @@
 # run. Do not run this during a benchmark you intend to publish, and take the
 # real lock first, exactly as this tool asks everyone else to.
 #
+# EVERY ASSERTION IN THIS FILE MUST HOLD ON A CO-TENANTED HOST. Where a cell
+# needs to know what a run achieved, it measures this host and derives its
+# threshold, rather than asserting a number that only a quiet box can produce
+# (see R2b). Verified by re-running those cells with a competitor pinned to
+# the same cpu: the old fixed 0.8 threshold reported `contended` at a
+# measured efficiency of 0.503, i.e. the suite would have failed for the
+# reason it exists to detect in others.
+#
 # The test that earned its place is the atomicity watcher. An earlier
 # implementation acquired with `mkdir` and then wrote its metadata as a
 # second step, and it was caught handing the host to THREE simultaneous
@@ -527,7 +535,9 @@ forge_stale_lock
 t0=$(date +%s)
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
 t1=$(date +%s)
-chk "the stall seam does nothing when unset" "$([ "$((t1 - t0))" -lt 3 ] && echo fast || echo stalled)" "fast"
+# Bounded well under the 30s seam used above, but not so tight that a loaded
+# host fails it: this asserts the seam is inert, not that the box is quiet.
+chk "the stall seam does nothing when unset" "$([ "$((t1 - t0))" -lt 10 ] && echo fast || echo stalled)" "fast"
 chk "and the reap still happened" "$(st owner)" "roy"
 cleanup
 
@@ -1400,14 +1410,33 @@ echo "-- R2b: a run that did not get its cores must say so --"
 #
 # --min-efficiency measures the run itself instead: CPU-seconds actually
 # consumed over cores x wall. It needs no quiet host and it is not a proxy.
+#
+# THESE CELLS MUST PASS ON A BUSY HOST. An assertion of the form "this run
+# achieved 0.99 of a core" is an exclusive-host assumption wearing a test's
+# clothes: it holds on a quiet box and fails on the shared, co-tenanted one
+# that is the actual deployment target -- and a suite that only passes when
+# nobody else is working is a suite people learn to re-run until it is green.
+# So the acceptance threshold is DERIVED from what this environment actually
+# delivered, and the falsifiers that need an absolute number are the ones
+# that stay true under any load: a sleeping command consumes no CPU whatever
+# the neighbours do, and one core of work judged against two is half
+# efficient by construction.
 cleanup
 busy1s='import time
 t = time.time()
 while time.time() - t < 1.5:
     pass'
-out=$($HL run --owner leon --reason "cpu ok" --expect-cores 1 --min-efficiency 0.8 \
+# Measure first, judge second. `run` without a threshold still emits the
+# number, which is what makes this possible at all.
+out=$($HL run --owner leon --reason "cpu probe" --expect-cores 1 -- python3 -c "$busy1s" 2>&1)
+eff_user=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+chk "the efficiency of a real run is measured, not labelled" \
+    "$(awk -v e="${eff_user:-0}" 'BEGIN { print (e > 0 && e <= 1.05) ? "plausible" : "implausible" }')" \
+    "plausible"
+thr=$(awk -v e="${eff_user:-0}" 'BEGIN { t = e * 0.9; if (t < 0.05) t = 0.05; printf "%.3f", t }')
+out=$($HL run --owner leon --reason "cpu ok" --expect-cores 1 --min-efficiency "$thr" \
     -- python3 -c "$busy1s" 2>&1); rc=$?
-chk "a run that owns its core passes the efficiency gate" "$rc" "0"
+chk "a run that got what this host had to give passes the gate" "$rc" "0"
 chk "and is reported as ok" "$(echo "$out" | grep -c 'verdict=ok')" "1"
 # The number has to be a MEASUREMENT, not a label: a constant 1.000 would pass
 # the assertion above forever. A sleeping command consumes no CPU at all, so
@@ -1433,11 +1462,20 @@ t = time.time()
 while time.time() - t < 1.5:
     for _ in range(200):
         os.write(fd, buf)'
-out=$($HL run --owner leon --reason "cpu sys" --expect-cores 1 --min-efficiency 0.8 \
+# Compared against the user-mode probe taken moments ago on this same host,
+# not against a fixed 0.8: co-tenancy scales both down together, so the RATIO
+# survives a busy box while still collapsing to ~0.23 the moment kernel time
+# stops being counted.
+out=$($HL run --owner leon --reason "cpu sys" --expect-cores 1 -- python3 -c "$syscall1s" 2>&1)
+eff_sys=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+chk "a run whose time is mostly kernel time still counts as using its core" \
+    "$(awk -v s="${eff_sys:-0}" -v u="${eff_user:-1}" 'BEGIN { print (u > 0 && s / u >= 0.7) ? "counted" : "under-measured" }')" \
+    "counted"
+out=$($HL run --owner leon --reason "cpu sys judged" --expect-cores 1 --min-efficiency "$thr" \
     -- python3 -c "$syscall1s" 2>&1); rc=$?
-chk "a run whose time is mostly kernel time still counts as using its core" "$rc" "0"
 chk "and is reported as ok rather than under-measured" \
     "$(echo "$out" | grep -c 'verdict=ok')" "1"
+chk "and it passes the same threshold the user-mode run did" "$rc" "0"
 
 # The denominator must be the declared core count, not a constant 1. A
 # one-core load judged against two cores is half-efficient by construction,
@@ -1619,7 +1657,7 @@ chk "and it is accepted quietly, not with a refusal it then ignores" "$ttl0_msg"
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "254"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "256"
 
 echo
 echo "passed=${pass} failed=${fail}"

@@ -27,6 +27,31 @@ in-memory byte buffer with no model-directory context and therefore cannot
 resolve external data. The binary ``model.onnx`` Mobius writes as an
 intermediate artifact is never committed (see ``.gitignore``'s ``*.onnx``
 rule); only the ``.textproto`` twin is git-tracked.
+
+Regenerating (required two-step recipe -- this script alone is NOT enough,
+for EITHER variant): ``write_onnx_genai_config`` reproduces
+``model.onnx.textproto``/``tokenizer.json`` byte-for-byte, but its
+``inference_metadata.yaml`` is the pre-canonicalization document Mobius
+commit MOBIUS_COMMIT emits -- not the canonical single-``decoder``-component
+shape actually committed in this directory (or in
+``../tiny-glm52-full-attention/``). After running this script, canonicalize
+with:
+
+    cargo run -p onnx-genai-engine --bin migrate_model_io -- --reemit \\
+        <output-dir>
+
+(the same offline step that brought the other converted fixtures forward
+when the emitter gained the decode contract; see
+``docs/architecture/WORKFLOW_RUNTIME_UNIFICATION.md``). This is required for
+the ``--full-attention`` variant especially: skipping it reintroduces the ten
+hand-authored, never-real auxiliary policy components #1883 removed from
+``../tiny-glm52-full-attention/`` (each referencing a ``policies/*.onnx``
+artifact that was never committed), which fails
+``decoder_recognizer_agreement.rs``'s classification matrix and package
+loading itself (`crates/onnx-genai-ort/src/loader.rs` eagerly resolves every
+declared workflow component's artifact at load time). Verified (2026-08-23):
+``generate.py`` [+ ``--full-attention``] + ``migrate_model_io --reemit``
+reproduces both fixtures' ``inference_metadata.yaml`` byte-identically.
 """
 
 from __future__ import annotations

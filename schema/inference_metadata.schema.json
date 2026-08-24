@@ -4313,6 +4313,14 @@
           "minLength": 1,
           "type": "string"
         },
+        "scale": {
+          "description": "Normalizer the target applies to a looked-up row before its backbone\nreads it.\n\nA gathered row is not always the tensor a graph feeds its first block:\nseveral architectures scale the embedding by a constant folded into the\ngraph (`sqrt(hidden_size)` is the common one), so the initializer alone\nis not what a proposer's fused input needs. The proposer stands in for\nthe target's own embedding step, so it must see the *scaled* row — and\nthe factor has to be declared rather than guessed: nothing in a\n`[vocab, hidden]` initializer says whether one was applied, and a\nproposer fed the unscaled row drafts fluent, plausible, uniformly\nrejected tokens. It is the acceptance rate that collapses, not the\noutput, so the failure is invisible to a token-parity check.\n\nAbsent means 1.0: a package whose graph gathers and feeds directly.\n\nSingle precision because that is the precision it is *used* in: the\nfactor multiplies a float16 or float32 table, so declaring more would\npromise an accuracy the application of it discards.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "table": {
           "description": "The named embedding table (graph initializer) on that component, e.g.\n`model.embed_tokens.weight`. A `[vocab, hidden]` row-major matrix. It\nmust name a real initializer in the target model/artifact.",
           "minLength": 1,
