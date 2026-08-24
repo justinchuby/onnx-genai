@@ -2395,6 +2395,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "PagedAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::paged_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         let output_layouts = vec![TensorLayout::contiguous(); op.outputs.len()];
         // Report *structure only*, never a machine rate (issue #995). The old
         // `Cost::new(elems*0.01, elems*0.01, 0.0).with_launch_us(10.0)
