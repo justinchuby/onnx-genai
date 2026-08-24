@@ -2475,3 +2475,159 @@ fn a_length_needs_no_rebasing_and_so_is_the_plainest_companion_of_the_three() {
     );
     validate_metadata(&parse(&document)).expect("lengths may be supplied");
 }
+
+/// The flat spelling `token_packed` carried before ownership became a chain.
+///
+/// A packed axis used to state one `offsets` and one `owner` directly on the
+/// layout, which could say only that items sat in rows. It is a valid v1.0
+/// document, and it does not load.
+const FLAT_TOKEN_PACKED: &str = r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, linear_effects, typed_emit]
+    inputs:
+      image_pixels:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [items, channels, height, width]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            offsets: image_offsets
+            owner: image_owner
+        role: { kind: opaque }
+        source: { kind: application, name: image_pixels }
+    outputs: {}
+    components: {}
+    steps: []
+"#;
+
+fn gated(document: &str) -> Result<InferenceMetadata, onnx_genai_metadata::MetadataError> {
+    onnx_genai_metadata::parse_metadata(document, Some("yaml"))
+}
+
+fn gated_error(document: &str) -> String {
+    gated(document)
+        .expect_err("the document must be refused")
+        .to_string()
+}
+
+#[test]
+fn the_flat_packed_spelling_is_refused_by_the_migration_it_needs() {
+    // This is a deliberate break, not an oversight, so the whole burden falls on
+    // the error. `serde` alone reports "unknown field `offsets`", which reads
+    // like a typo and sends a reader hunting for a misspelling instead of
+    // telling them their document is written against a shape that was replaced.
+    let message = gated_error(FLAT_TOKEN_PACKED);
+    assert!(
+        message.contains("retired flat spelling of ownership"),
+        "the refusal must say what is wrong, got: {message}"
+    );
+    assert!(
+        message.contains("levels: [{ offsets: <o>, owner: <w> }]"),
+        "the refusal must show the replacement, got: {message}"
+    );
+    assert!(
+        message.contains("no document is converted for you"),
+        "the refusal must say no shim will do it, got: {message}"
+    );
+}
+
+#[test]
+fn the_refusal_says_where_in_the_document_to_look() {
+    // A packed layout is nested four levels down inside a port's contract, and
+    // a package can hold many of them. An error that named only the shape would
+    // leave a reader grepping.
+    let message = gated_error(FLAT_TOKEN_PACKED);
+    assert!(
+        message.contains("`pipeline.workflow.inputs.image_pixels.contract.batch_layout`"),
+        "the refusal must name the path, got: {message}"
+    );
+}
+
+#[test]
+fn declaring_the_old_version_does_not_buy_back_the_old_spelling() {
+    // A version gates what a document must *say*, never what a document may say
+    // wrongly — and after the reshape the flat pair says nothing this crate
+    // reads. `v1` is the version this document was legitimately written
+    // against, and it is refused all the same, because being refused with an
+    // explanation is the honest outcome and loading as something unintended is
+    // not.
+    for version in ["v1", "\"1.0\"", "v1.0", "v1.1"] {
+        let document = FLAT_TOKEN_PACKED.replace(
+            "schema_version: v1\n",
+            &format!("schema_version: {version}\n"),
+        );
+        let message = gated_error(&document);
+        assert!(
+            message.contains("retired flat spelling of ownership"),
+            "declaring {version} must not resurrect the flat pair, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn half_of_the_old_spelling_is_recognized_as_the_old_spelling() {
+    // A document part-way through a hand migration keeps one of the two keys.
+    // Falling back to the unknown-field error exactly for the reader who is
+    // mid-migration would be the worst possible time to stop explaining.
+    for retired in ["offsets: image_offsets", "owner: image_owner"] {
+        let document = FLAT_TOKEN_PACKED
+            .replace("            offsets: image_offsets\n", "")
+            .replace("            owner: image_owner\n", "")
+            .replace(
+                "            axis: 0\n",
+                &format!("            axis: 0\n            {retired}\n"),
+            );
+        let message = gated_error(&document);
+        assert!(
+            message.contains("retired flat spelling of ownership"),
+            "a half-migrated layout must still be explained, got: {message}"
+        );
+    }
+}
+
+#[test]
+fn the_migrated_document_loads() {
+    // The refusal is only worth having if following it works. This is the same
+    // document with the replacement the error prints, and nothing else changed.
+    let document = FLAT_TOKEN_PACKED.replace(
+        "            offsets: image_offsets\n            owner: image_owner\n",
+        "            levels:\n              - { offsets: image_offsets, owner: image_owner }\n",
+    );
+    gated(&document).expect("the migrated spelling loads");
+}
+
+#[test]
+fn the_recognizer_reaches_packed_layouts_and_nothing_else() {
+    // `offsets` and `owner` are ordinary words. A value named for what it holds,
+    // or any other mapping that happens to carry those keys, is not a retired
+    // layout, and a recognizer that guessed from key names alone would refuse
+    // documents that are perfectly current.
+    let document = PACKED_VISION_ENCODER.replace(
+        "      prompt:\n",
+        "      offsets:\n        contract: { dtype: int64, rank: 1, shape: [rows], batch_layout: { kind: shared } }\n        role: { kind: opaque }\n        source: { kind: application, name: offsets }\n      prompt:\n",
+    );
+    gated(&document).expect("a value named `offsets` is not a retired layout");
+}
+
+#[test]
+fn a_document_from_a_version_this_build_cannot_read_is_refused_for_that() {
+    // The flat pair is a reshape inside the v1 line, so refusing it presumes the
+    // document belongs to that line. A v2 document is refused for being v2 — a
+    // reader that has never seen v2 has no standing to say what a spelling means
+    // there, and "upgrade the runtime" is the only true remedy it can offer.
+    let document = FLAT_TOKEN_PACKED.replace("schema_version: v1\n", "schema_version: v2.0\n");
+    let message = gated_error(&document);
+    assert!(
+        !message.contains("retired flat spelling of ownership"),
+        "a future version must not be lectured about a v1 migration, got: {message}"
+    );
+    assert!(
+        message.contains("v2.0"),
+        "the refusal must name the version it cannot read, got: {message}"
+    );
+}
