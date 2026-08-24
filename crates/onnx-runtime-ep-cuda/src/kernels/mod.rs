@@ -491,10 +491,15 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("GatherBlockQuantized", _) => CUDA_GATHER_QUANT_DTYPES,
 
         // Attention family: f16/bf16 Q/K/V + Int32 seqlens.
+        // `PackedMultiHeadAttention` is deliberately absent — see the non-gap
+        // note in `docs/execution/CUDA_COVERAGE.md`. It had an arm here while
+        // having no factory and no `CUDA_COVERED_OPS` entry, which is the
+        // five-place registration contract half-wired: harmless today because
+        // this function is only reached for ops the EP actually claims, but it
+        // would let a future kernel look more registered than it is.
         ("Attention", _)
         | ("GroupQueryAttention", _)
         | ("MultiHeadAttention", _)
-        | ("PackedMultiHeadAttention", _)
         | ("PackedVarlenAttention", _)
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
@@ -1620,7 +1625,7 @@ pub fn build_cuda_registry_with_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::CUDA_COVERED_OPS;
+    use super::{CUDA_COVERED_OPS, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op};
 
     #[test]
     fn wave2_ops_are_listed_in_coverage() {
@@ -1689,13 +1694,22 @@ mod tests {
     /// `com.microsoft::PackedMultiHeadAttention` is a *documented non-gap*, not
     /// an oversight — this test pins that decision so nobody re-opens it.
     ///
-    /// It is emitted only by ORT's BERT encoder packing-mode fusion and never
-    /// appears on the decoder-only LLM path this project targets (which uses
-    /// `Attention` / `MultiHeadAttention` / `GroupQueryAttention`, and the
-    /// runtime-invented `pkg.nxrt::PackedVarlenAttention` for packed sequences).
-    /// The real Qwen3.5-0.8B hybrid decode graph places on CUDA with zero
-    /// declines; the only producer in the repo is a synthetic CPU-EP fixture.
-    /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`.
+    /// Upstream emits it only from ORT's **opt-in packing-mode conversion**
+    /// (`python/tools/transformers/convert_to_packing_mode.py`), a separate
+    /// tool a user runs deliberately — not part of default graph optimization,
+    /// so it cannot arrive through ordinary export. It never appears on the
+    /// decoder-only LLM path this project targets (which uses `Attention` /
+    /// `MultiHeadAttention` / `GroupQueryAttention`, plus the runtime-invented
+    /// `pkg.nxrt::PackedVarlenAttention` for packed sequences). The real
+    /// Qwen3.5-0.8B hybrid decode graph places on CUDA with zero declines, and
+    /// the only producer anywhere in the repo is a synthetic CPU-EP fixture.
+    /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`, which
+    /// records the exact condition that would flip this decision.
+    ///
+    /// This checks both halves of the registration state, because half-wiring
+    /// is the failure this file is prone to: an op present in one of the five
+    /// registration places and absent from the others is silently declined at
+    /// runtime rather than reported.
     ///
     /// If a real target model ever emits this op, implement it as an adapter
     /// over the packed varlen SDPA core (`packed_varlen_attention.rs`), add it
@@ -1707,6 +1721,13 @@ mod tests {
             "PackedMultiHeadAttention was added to CUDA_COVERED_OPS: if this is a \
              real implementation, remove this non-gap test and update \
              docs/execution/CUDA_COVERAGE.md; if it is accidental, revert it"
+        );
+        assert_eq!(
+            cuda_supported_dtypes_for_op("PackedMultiHeadAttention", "com.microsoft"),
+            CUDA_FLOAT_DTYPES,
+            "PackedMultiHeadAttention gained an attention-family dtype arm without a \
+             kernel: that is the registration contract half-wired, and it makes an \
+             unregistered op look registered"
         );
     }
 
