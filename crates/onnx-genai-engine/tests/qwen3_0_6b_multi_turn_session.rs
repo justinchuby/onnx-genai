@@ -15,15 +15,15 @@
 //! # Published revision
 //!
 //! ```text
-//! justinchuby/qwen3-0.6b-onnx-genai @ def72a7301e47386dac4f002554c46051a684cbc
+//! justinchuby/qwen3-0.6b-onnx-genai @ 38714511f57e01df01808b930168459a8e7aa9a3
 //! ```
 //!
-//! This is the repository's default branch. The package and its documentation
-//! publish the session-continuation contract exercised here.
+//! This was the repository's default revision when the session-continuation
+//! contract and development-runtime requirement were published.
 //!
 //! ```text
 //! huggingface-cli download justinchuby/qwen3-0.6b-onnx-genai \
-//!   --revision def72a7301e47386dac4f002554c46051a684cbc --local-dir /path/to/pkg
+//!   --revision 38714511f57e01df01808b930168459a8e7aa9a3 --local-dir /path/to/pkg
 //!
 //! ONNX_GENAI_QWEN3_WORKFLOW_DIR=/path/to/pkg ONNX_GENAI_KV_MAX_LEN=1024 \
 //!   cargo test -p onnx-genai-engine --test qwen3_0_6b_multi_turn_session \
@@ -33,9 +33,12 @@
 use std::path::PathBuf;
 
 use onnx_genai_engine::{Engine, EngineConfig, GenerateOptions, GeneratePrompt, GenerateRequest};
+use sha2::{Digest, Sha256};
 
 /// The revision whose metadata declares the conversation.
-const PINNED_REVISION: &str = "def72a7301e47386dac4f002554c46051a684cbc";
+const PINNED_REVISION: &str = "38714511f57e01df01808b930168459a8e7aa9a3";
+const PINNED_METADATA_SHA256: &str =
+    "277582c682e3136854ef87be949467bd8308d22ffc3dc0f2aef7f13b7fe8f015";
 
 /// Resolve the package, failing with what to do rather than skipping.
 ///
@@ -55,6 +58,13 @@ fn package() -> PathBuf {
     let metadata = dir.join("inference_metadata.yaml");
     let document = std::fs::read_to_string(&metadata)
         .unwrap_or_else(|error| panic!("{}: {error}", metadata.display()));
+    let digest = format!("{:x}", Sha256::digest(document.as_bytes()));
+    assert_eq!(
+        digest,
+        PINNED_METADATA_SHA256,
+        "{} is not the metadata published at {PINNED_REVISION}",
+        metadata.display()
+    );
     assert!(
         document.contains("continuation:"),
         "{} declares no `session.continuation`; fetch the published default revision \
@@ -78,7 +88,7 @@ fn tokens(ids: &[u32], max_new_tokens: usize) -> GenerateRequest {
 }
 
 #[test]
-#[ignore = "requires justinchuby/qwen3-0.6b-onnx-genai@def72a73 (default branch) \
+#[ignore = "requires justinchuby/qwen3-0.6b-onnx-genai@38714511 \
             in ONNX_GENAI_QWEN3_WORKFLOW_DIR"]
 fn a_third_turn_decodes_the_conversation_and_not_its_own_prompt() -> anyhow::Result<()> {
     let mut engine = Engine::from_dir(&package(), EngineConfig::default())?;
