@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use onnx_genai_ort::{
     Allocator, ConcurrentRunSupport, DataType, Environment, IoBinding, Session, SessionOptions,
-    ThreadAffinity, Value,
+    ThreadAccess, ThreadAffinity, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -96,6 +96,24 @@ const _SEND_SYNC_CONTRACT: () = {
         "Value must not be Send: an OrtValue may reference device memory owned by one thread"
     );
     assert!(!IsSync::<Value>::VALUE, "Value must not be Sync");
+
+    // The access guard is the strictest of the lot, and the least obvious. It
+    // holds only `Option<&OwnerThread>`, and `OwnerThread` is `Sync` (atomics
+    // and `&'static` identity records), so without an explicit opt-out the
+    // guard would be `Send` by auto-derivation - and a `Send` guard defeats the
+    // whole module in safe code: take the resource on A, move the guard to B,
+    // let B's drop clear A's ownership while A is still inside, and C walks in.
+    // `ThreadAccess` carries a `PhantomData<*const ()>` to prevent exactly that;
+    // deleting it stops this crate from compiling, here.
+    assert!(
+        !IsSend::<ThreadAccess<'static>>::VALUE,
+        "ThreadAccess must not be Send: releasing a resource is only meaningful on the thread \
+         that took it"
+    );
+    assert!(
+        !IsSync::<ThreadAccess<'static>>::VALUE,
+        "ThreadAccess must not be Sync"
+    );
 };
 
 #[test]
@@ -341,4 +359,66 @@ fn a_real_binding_refuses_a_second_thread_mid_operation() {
     drop(binding);
     drop(session);
     drop(environment);
+}
+
+#[test]
+fn an_access_guard_cannot_be_released_by_a_thread_that_did_not_take_it() {
+    // The regression this locks down: if `ThreadAccess` were `Send`, this test
+    // would be *writable* - move the guard into the scoped thread, let it drop
+    // there, and the owner slot is cleared while this thread is still inside.
+    // A third thread then enters unopposed. Because the guard is `!Send`, the
+    // move does not compile, so the only thing left to assert at runtime is the
+    // consequence: while the taker holds it, nobody else gets in, and the guard
+    // is still the taker's to release.
+    let owner = onnx_genai_ort::OwnerThread::new("IoBinding", ThreadAffinity::Exclusive);
+    let held = owner.enter("run_with_binding").expect("taker enters");
+
+    // Thread B: cannot receive the guard (see the compile_fail doctest on
+    // `ThreadAccess`), and cannot release it by other means either.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                owner
+                    .enter("bind_input")
+                    .expect_err("B must not be able to take a held resource");
+                // B dropping its *failed* attempt must not release A's claim.
+            })
+            .join()
+            .expect("thread B");
+    });
+    assert!(
+        owner.held_by_current_thread(),
+        "a refused attempt by another thread must leave the taker's claim intact"
+    );
+
+    // Thread C, arriving after B failed, is refused for the same reason - which
+    // is the property that would break if B's drop had released the resource.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                owner
+                    .enter("bind_output")
+                    .expect_err("C must still be refused while A holds the resource")
+            })
+            .join()
+            .expect("thread C");
+    });
+
+    // Releasing on the taker's thread works normally, and only then may another
+    // thread take over.
+    drop(held);
+    assert!(!owner.held_by_current_thread());
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                drop(
+                    owner
+                        .enter("bind_input")
+                        .expect("D may take an idle resource"),
+                )
+            })
+            .join()
+            .expect("thread D");
+    });
+    assert_eq!(owner.migration_count(), 1);
 }
