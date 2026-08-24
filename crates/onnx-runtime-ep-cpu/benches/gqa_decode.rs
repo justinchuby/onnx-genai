@@ -108,6 +108,9 @@ fn bench_sdpa_group_vs_row(c: &mut Criterion) {
                                 scale,
                                 None,
                                 SoftmaxExp::F64Intermediate,
+                                // Pre-sink numerics, which is what this arm is
+                                // here to be the baseline for.
+                                None,
                                 &mut out[g * head_size..(g + 1) * head_size],
                             );
                         }
@@ -131,6 +134,10 @@ fn bench_sdpa_group_vs_row(c: &mut Criterion) {
                             scale,
                             None,
                             SoftmaxExp::F64Intermediate,
+                            // Pre-sink numerics: this benchmark compares
+                            // schedules, so both arms must stay the shape they
+                            // were measured in before #1956.
+                            None,
                             &mut out,
                             &mut scores,
                         );
