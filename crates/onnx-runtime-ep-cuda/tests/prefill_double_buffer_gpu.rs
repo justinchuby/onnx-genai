@@ -27,13 +27,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use onnx_runtime_ep_api::{
-    ExternalMmapRegion, LazyWeight, MmapRegionSource, ResidentWeight, WeightHandleError,
+    ExternalMmapRegion, LazyWeight, LazyWeightBoundary, MmapRegionSource, ResidentWeight,
+    WeightHandleError,
 };
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::prefill_double_buffer::{
-    LayerTicket, PrefillDoubleBuffer, PrefillReject, PrefillSlotStatus,
+    LayerTicket, PrefillDoubleBuffer, PrefillLayerRequest, PrefillReject, PrefillSlotStatus,
 };
-use onnx_runtime_ep_cuda::weight_paging::prefill_double_buffer_enabled;
+use onnx_runtime_ep_cuda::weight_paging::{
+    PrefillRoute, PrefillWireDecline, prefill_double_buffer_enabled,
+};
 use onnx_runtime_ir::DataType;
 
 fn require_cuda() -> CudaExecutionProvider {
@@ -176,18 +179,24 @@ fn whole_layer_prefill_is_byte_identical_across_wraparound() {
     let residency = ep.weight_residency(layer_bytes * layers as u64);
 
     let mut db = residency
-        .build_prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("capacity-sufficient synthetic layer must build the pipeline");
 
     // Prime the pipeline one layer ahead, then for each layer prefetch N+1
     // *before* consuming N — the double-buffer overlap ordering.
-    let mut pending: Option<LayerTicket> = Some(db.prefetch(0, &lazies[0]).unwrap());
+    let mut pending: Option<LayerTicket> = Some(
+        db.prefetch(0, &PrefillLayerRequest::new(&lazies[0], &*host))
+            .unwrap(),
+    );
     for layer in 0..layers {
         let ticket = pending.take().expect("a prefetch is always pending here");
         if layer + 1 < layers {
             pending = Some(
-                db.prefetch((layer + 1) as u64, &lazies[layer + 1])
-                    .expect("look-ahead prefetch (incl. slot reuse) must succeed"),
+                db.prefetch(
+                    (layer + 1) as u64,
+                    &PrefillLayerRequest::new(&lazies[layer + 1], &*host),
+                )
+                .expect("look-ahead prefetch (incl. slot reuse) must succeed"),
             );
         }
         let view = db.wait(&ticket).expect("ready slot must consume");
@@ -243,10 +252,12 @@ fn single_and_final_layer_teardown_is_clean() {
     let residency = ep.weight_residency(layer_bytes);
 
     let mut db = residency
-        .build_prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("pipeline builds");
 
-    let ticket = db.prefetch(0, &lazies[0]).unwrap();
+    let ticket = db
+        .prefetch(0, &PrefillLayerRequest::new(&lazies[0], &*host))
+        .unwrap();
     let view = db.wait(&ticket).unwrap();
     runtime.sync_copy_stream().unwrap();
     let mut readback = vec![0u8; view.len];
@@ -290,14 +301,18 @@ fn cancellation_frees_slot_for_reuse_without_quarantine() {
     let residency = ep.weight_residency(layer_bytes * 3);
 
     let mut db = residency
-        .build_prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("pipeline builds");
 
     // Occupy the other Free slot first so the cancelled slot is the only
     // claimable one on reuse (mirrors the CPU cancellation unit test).
-    let keep = db.prefetch(0, &lazies[0]).unwrap();
+    let keep = db
+        .prefetch(0, &PrefillLayerRequest::new(&lazies[0], &*host))
+        .unwrap();
 
-    let doomed = db.prefetch(1, &lazies[1]).unwrap();
+    let doomed = db
+        .prefetch(1, &PrefillLayerRequest::new(&lazies[1], &*host))
+        .unwrap();
     let doomed_view = db.wait(&doomed).unwrap();
     let doomed_slot = doomed_view.device_ptr;
     // Cancel mid-use: no release yet. Slot must go Draining, reusable.
@@ -311,7 +326,7 @@ fn cancellation_frees_slot_for_reuse_without_quarantine() {
 
     // Reuse the cancelled slot for a brand-new layer; it must page byte-identically.
     let reuse = db
-        .prefetch(2, &lazies[2])
+        .prefetch(2, &PrefillLayerRequest::new(&lazies[2], &*host))
         .expect("cancelled slot must be reusable");
     let reuse_view = db.wait(&reuse).unwrap();
     assert_eq!(
@@ -350,17 +365,23 @@ fn stale_ticket_after_reuse_is_refused() {
     let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 3);
     let residency = ep.weight_residency(layer_bytes * 3);
     let mut db = residency
-        .build_prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("pipeline builds");
 
     // Consume+release layer 0 in slot A, filling slot B first so the reuse
     // claims slot A (the one ticket_a points at).
-    let ticket_b = db.prefetch(0, &lazies[0]).unwrap();
-    let ticket_a = db.prefetch(1, &lazies[1]).unwrap();
+    let ticket_b = db
+        .prefetch(0, &PrefillLayerRequest::new(&lazies[0], &*host))
+        .unwrap();
+    let ticket_a = db
+        .prefetch(1, &PrefillLayerRequest::new(&lazies[1], &*host))
+        .unwrap();
     let _ = db.wait(&ticket_a).unwrap();
     db.release(ticket_a.clone()).unwrap();
     // Reuse ticket_a's slot for layer 2 (advances its generation).
-    let reuse = db.prefetch(2, &lazies[2]).unwrap();
+    let reuse = db
+        .prefetch(2, &PrefillLayerRequest::new(&lazies[2], &*host))
+        .unwrap();
 
     // The old ticket is now stale: refused, not served.
     match db.wait(&ticket_a) {
@@ -398,10 +419,10 @@ fn two_pipelines_on_one_device_are_isolated() {
     let residency = ep.weight_residency(layer_bytes * layers as u64 * 2);
 
     let mut a = residency
-        .build_prefill_double_buffer(host_a.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("pipeline A builds");
     let mut b = residency
-        .build_prefill_double_buffer(host_b.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
+        .build_prefill_double_buffer(layer_bytes)
         .expect("pipeline B builds");
 
     let read = |db: &mut PrefillDoubleBuffer<
@@ -410,7 +431,9 @@ fn two_pipelines_on_one_device_are_isolated() {
                 layer: usize,
                 lazy: &LazyWeight,
                 host: &LayeredMmap| {
-        let t = db.prefetch(layer as u64, lazy).unwrap();
+        let t = db
+            .prefetch(layer as u64, &PrefillLayerRequest::new(lazy, host))
+            .unwrap();
         let view = db.wait(&t).unwrap();
         runtime.sync_copy_stream().unwrap();
         let mut readback = vec![0u8; view.len];
@@ -454,7 +477,7 @@ fn oversized_layer_declines_pool_capacity_without_reserving() {
     let layer_bytes = 300 * 1024 * 1024u64;
     // A tiny single-region descriptor is enough; the gate fires on size alone
     // and no fill is ever attempted.
-    let (host, lazies) = whole_layer_weights(1024, 1, 1);
+    let (_host, lazies) = whole_layer_weights(1024, 1, 1);
     let residency = ep.weight_residency(layer_bytes);
 
     // The gate is checked *before* any reservation in `PrefillDoubleBuffer::new`
@@ -462,9 +485,7 @@ fn oversized_layer_declines_pool_capacity_without_reserving() {
     // no staging and allocated no device buffer. (A process-global alloc-count
     // assertion would be racy under parallel GPU tests, so we rely on the typed
     // rejection + the construction order instead.)
-    match residency
-        .build_prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes)
-    {
+    match residency.build_prefill_double_buffer(layer_bytes) {
         Err(PrefillReject::PoolCapacity {
             layer_bytes: declined,
         }) => assert_eq!(declined, layer_bytes),
@@ -489,11 +510,10 @@ fn disabled_by_default_declines_and_stays_byte_identical() {
     let ep = require_cuda();
 
     let layer_bytes = 2 * 1024 * 1024u64;
-    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 1);
+    let (_host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 1);
     let residency = ep.weight_residency(layer_bytes);
 
-    let gated =
-        residency.prefill_double_buffer(host.clone() as Arc<dyn MmapRegionSource>, layer_bytes);
+    let gated = residency.prefill_double_buffer(layer_bytes);
     if prefill_double_buffer_enabled() {
         assert!(
             gated.is_ok(),
@@ -509,8 +529,410 @@ fn disabled_by_default_declines_and_stays_byte_identical() {
 }
 
 // ===========================================================================
-// Overlap probe (measurement, not a gate). See the module doc + the CUDA
-// measurement-discipline skill. Compares one-slot (serial) vs two-slot
+// Production-caller wiring: the two-slot pipeline routed through the residency
+// and the `ExecutionProvider` prefetch/page trait methods the executor's
+// prefill look-ahead actually calls. These traverse the *real* seam
+// (`prefetch_lazy_weight` -> `prefill_pipeline_prefetch`; `page_lazy_weight` ->
+// `prefill_pipeline_page` -> `PagedWeight` whose keep-alive releases the slot),
+// not just the primitive. Every eligibility decision is a property (boundary,
+// storage location, format size, lifecycle), never a model name.
+// ===========================================================================
+
+/// Read back `paged`'s device bytes (draining the copy stream first, off the
+/// hot path) and assert they are byte-identical to the layer's source regions.
+fn assert_paged_bytes_identical(
+    runtime: &onnx_runtime_ep_cuda::runtime::CudaRuntime,
+    paged: &onnx_runtime_ep_api::PagedWeight,
+    host: &LayeredMmap,
+    lazy: &LazyWeight,
+) {
+    runtime.sync_copy_stream().unwrap();
+    let mut readback = vec![0u8; paged.len()];
+    // SAFETY: `readback` is sized to the paged length, and `device_ptr` is the
+    // slot's stable device buffer holding exactly this layer's bytes.
+    unsafe {
+        runtime
+            .dtoh(
+                &mut readback,
+                onnx_runtime_ep_cuda::runtime::cuptr(paged.device_ptr()),
+            )
+            .unwrap()
+    };
+    assert_eq!(readback, canonical_layer(host, lazy), "paged bytes");
+}
+
+/// Drive the *production* provider entry points (`prefetch_lazy_weight` one
+/// layer ahead, then `page_lazy_weight`) across four whole layers with the
+/// double buffer enabled: proves N/N+1 overlap ordering, slot wraparound (>2
+/// layers reuse both slots), byte-identity of every paged layer, and that
+/// dropping each `PagedWeight` releases its slot for the next look-ahead. Also
+/// checks the wiring accounting and that nothing is quarantined on the clean
+/// path.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn provider_double_buffers_across_wraparound_byte_identical() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let mut ep = require_cuda();
+    let runtime = ep.runtime().clone();
+
+    let region_bytes = 2 * 1024 * 1024;
+    let regions_per_layer = 2;
+    let layers = 4; // > 2 so both slots wrap around.
+    let layer_bytes = (region_bytes * regions_per_layer) as u64;
+    let (host, lazies) = whole_layer_weights(region_bytes, regions_per_layer, layers);
+
+    let residency = ep
+        .weight_residency(layer_bytes * layers as u64)
+        .with_prefill_double_buffer_enabled(true);
+    ep.install_residency_for_test(residency);
+    let source: &dyn MmapRegionSource = &*host;
+
+    // Prime one layer ahead (the executor's look-ahead), then for each layer
+    // prefetch N+1 before paging N — the double-buffer overlap ordering.
+    assert!(
+        ep.prefetch_lazy_weight(0, &lazies[0], source).unwrap(),
+        "cold prime prefetch must route through the pipeline"
+    );
+    for layer in 0..layers {
+        if layer + 1 < layers {
+            assert!(
+                ep.prefetch_lazy_weight((layer + 1) as u64, &lazies[layer + 1], source)
+                    .unwrap(),
+                "look-ahead prefetch of layer {} must route through the pipeline",
+                layer + 1
+            );
+        }
+        let paged = ep
+            .page_lazy_weight(layer as u64, &lazies[layer], source)
+            .unwrap()
+            .expect("an in-pipeline layer must page through the double buffer");
+        assert_eq!(
+            paged.len(),
+            layer_bytes as usize,
+            "layer {layer} byte count"
+        );
+        assert_paged_bytes_identical(&runtime, &paged, &host, &lazies[layer]);
+        // Kernel done: dropping the binding releases the slot for the next
+        // look-ahead to reuse (the executor drops `InInfo.paged` after the node).
+        drop(paged);
+    }
+
+    let residency = ep.residency().expect("installed above");
+    let stats = residency
+        .prefill_pipeline_stats()
+        .expect("an eligible layer built the pipeline");
+    assert_eq!(stats.routed, layers as u64, "every layer routed");
+    assert_eq!(stats.consumed, layers as u64, "every layer consumed");
+    assert_eq!(stats.released, layers as u64, "every slot released on drop");
+    assert_eq!(
+        residency.prefill_pipeline_quarantined(),
+        Some(0),
+        "clean path quarantines nothing"
+    );
+}
+
+/// A single / final layer pages through the pipeline and releases cleanly with
+/// no slot reuse (mirrors the primitive's single-layer invariant, but via the
+/// production provider path).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn provider_single_layer_pages_and_releases() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let mut ep = require_cuda();
+    let runtime = ep.runtime().clone();
+
+    let layer_bytes = 4 * 1024 * 1024u64;
+    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 1);
+    let residency = ep
+        .weight_residency(layer_bytes)
+        .with_prefill_double_buffer_enabled(true);
+    ep.install_residency_for_test(residency);
+    let source: &dyn MmapRegionSource = &*host;
+
+    assert!(ep.prefetch_lazy_weight(0, &lazies[0], source).unwrap());
+    let paged = ep
+        .page_lazy_weight(0, &lazies[0], source)
+        .unwrap()
+        .expect("single layer pages");
+    assert_eq!(paged.len(), layer_bytes as usize);
+    assert_paged_bytes_identical(&runtime, &paged, &host, &lazies[0]);
+    drop(paged);
+
+    let residency = ep.residency().unwrap();
+    let stats = residency.prefill_pipeline_stats().unwrap();
+    assert_eq!((stats.routed, stats.consumed, stats.released), (1, 1, 1));
+    assert_eq!(residency.prefill_pipeline_quarantined(), Some(0));
+}
+
+/// With the double buffer disabled (the default), the provider path issues no
+/// pipeline CUDA work and builds no pipeline: `prefetch_lazy_weight` declines
+/// with `Disabled` and the shipped single-slot path stays authoritative. This
+/// is the byte-identical default-off guarantee at the wiring level.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn disabled_provider_path_builds_no_pipeline() {
+    let ep = require_cuda();
+
+    let layer_bytes = 2 * 1024 * 1024u64;
+    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 2);
+    // Force disabled regardless of the ambient env so the assertion is
+    // deterministic under parallel runs.
+    let residency = ep
+        .weight_residency(layer_bytes * 2)
+        .with_prefill_double_buffer_enabled(false);
+    let source: &dyn MmapRegionSource = &*host;
+
+    match residency.prefill_pipeline_prefetch(0, &lazies[0], source) {
+        PrefillRoute::Declined(PrefillWireDecline::Disabled) => {}
+        other => panic!("disabled residency must decline with Disabled, got {other:?}"),
+    }
+    assert!(
+        !residency.prefill_pipeline_active(),
+        "disabled path must not build the pipeline (no extra CUDA work)"
+    );
+    assert_eq!(
+        residency.prefill_pipeline_stats(),
+        None,
+        "no pipeline means no wiring stats"
+    );
+}
+
+/// The pipeline is sized to the first eligible layer; a later layer larger than
+/// that fixed capacity is declined with a typed `Oversize` reason *before* any
+/// fill (so a capacity error can never poison a slot), the counter attributes
+/// it, and the already-built pipeline keeps serving the layers that do fit.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn oversize_later_layer_declines_typed_and_pipeline_survives() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let ep = require_cuda();
+    let runtime = ep.runtime().clone();
+
+    let small = 2 * 1024 * 1024usize;
+    let large = 8 * 1024 * 1024usize;
+    let (host_small, small_layer) = whole_layer_weights(small, 1, 1);
+    let (_host_large, large_layer) = whole_layer_weights(large, 1, 1);
+    let residency = Arc::new(
+        ep.weight_residency(large as u64 * 4)
+            .with_prefill_double_buffer_enabled(true),
+    );
+    let source_small: &dyn MmapRegionSource = &*host_small;
+
+    // First eligible layer builds + sizes the pipeline to `small`.
+    match residency.prefill_pipeline_prefetch(0, &small_layer[0], source_small) {
+        PrefillRoute::Prefetched => {}
+        other => panic!("first small layer must route, got {other:?}"),
+    }
+    // A larger later layer exceeds the fixed slot capacity: typed decline.
+    match residency.prefill_pipeline_prefetch(1, &large_layer[0], source_small) {
+        PrefillRoute::Declined(PrefillWireDecline::Oversize {
+            layer_bytes,
+            capacity,
+        }) => {
+            assert_eq!(layer_bytes, large as u64);
+            assert_eq!(capacity, small as u64);
+        }
+        other => panic!("oversize later layer must decline via Oversize, got {other:?}"),
+    }
+    let stats = residency.prefill_pipeline_stats().unwrap();
+    assert_eq!(stats.routed, 1);
+    assert_eq!(stats.declined_oversize, 1);
+
+    // The pipeline still serves the layer that fits.
+    let paged = residency
+        .prefill_pipeline_page(0, ep.device_id())
+        .unwrap()
+        .expect("the fitting layer still pages");
+    assert_paged_bytes_identical(&runtime, &paged, &host_small, &small_layer[0]);
+    drop(paged);
+    assert_eq!(residency.prefill_pipeline_quarantined(), Some(0));
+}
+
+/// Eligibility is by boundary property, not model name: a non-`BlockQuantizedMoe`
+/// weight is declined with a typed `Boundary` reason and never builds the
+/// pipeline (the decision precedes any allocation).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn ineligible_boundary_declines_typed_without_building() {
+    let ep = require_cuda();
+
+    let region_bytes = 1024usize;
+    let (host, _bqmoe) = whole_layer_weights(region_bytes, 1, 1);
+    // A dense MatMul-boundary weight over the same backing: eligible by nothing
+    // but boundary, so it must be refused before any fill.
+    let region = ExternalMmapRegion {
+        mapping_id: 42,
+        offset: 4096,
+        len: region_bytes,
+    };
+    let materialize_len = region_bytes;
+    let matmul = LazyWeight::new(
+        LazyWeightBoundary::MatMul,
+        onnx_runtime_ir::DataType::Uint8,
+        vec![region_bytes],
+        vec![region],
+        move || {
+            ResidentWeight::new(
+                onnx_runtime_ir::DataType::Uint8,
+                vec![materialize_len],
+                vec![0u8; materialize_len],
+            )
+        },
+    )
+    .unwrap();
+
+    let residency = ep
+        .weight_residency(1 << 20)
+        .with_prefill_double_buffer_enabled(true);
+    let source: &dyn MmapRegionSource = &*host;
+
+    match residency.prefill_pipeline_prefetch(7, &matmul, source) {
+        PrefillRoute::Declined(PrefillWireDecline::Boundary) => {}
+        other => panic!("non-BQMoE weight must decline via Boundary, got {other:?}"),
+    }
+    assert!(
+        !residency.prefill_pipeline_active(),
+        "an ineligible-boundary decline must not build the pipeline"
+    );
+}
+
+/// Two independent enabled residencies on the same device (two concurrent
+/// requests) never cross-contaminate: interleaving their layers, each reads back
+/// only its own salted content, and each pipeline is isolated (its own stable
+/// buffers, its own accounting). Device/request isolation at the wiring level.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn two_enabled_residencies_are_isolated() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let ep = require_cuda();
+    let runtime = ep.runtime().clone();
+
+    let region_bytes = 2 * 1024 * 1024;
+    let layer_bytes = (region_bytes * 2) as u64;
+    let layers = 3usize;
+    let (host_a, lazies_a) = whole_layer_weights_salted(region_bytes, 2, layers, 0x00);
+    let (host_b, lazies_b) = whole_layer_weights_salted(region_bytes, 2, layers, 0x24);
+
+    let res_a = Arc::new(
+        ep.weight_residency(layer_bytes * layers as u64)
+            .with_prefill_double_buffer_enabled(true),
+    );
+    let res_b = Arc::new(
+        ep.weight_residency(layer_bytes * layers as u64)
+            .with_prefill_double_buffer_enabled(true),
+    );
+    let device = ep.device_id();
+
+    let read = |res: &Arc<onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency>,
+                layer: usize,
+                lazy: &LazyWeight,
+                host: &LayeredMmap| {
+        let src: &dyn MmapRegionSource = host;
+        match res.prefill_pipeline_prefetch(layer as u64, lazy, src) {
+            PrefillRoute::Prefetched => {}
+            other => panic!("layer {layer} must route, got {other:?}"),
+        }
+        let paged = res
+            .prefill_pipeline_page(layer as u64, device)
+            .unwrap()
+            .expect("routed layer pages");
+        assert_paged_bytes_identical(&runtime, &paged, host, lazy);
+        drop(paged);
+    };
+
+    for layer in 0..layers {
+        read(&res_a, layer, &lazies_a[layer], &host_a);
+        read(&res_b, layer, &lazies_b[layer], &host_b);
+    }
+
+    assert_eq!(res_a.prefill_pipeline_quarantined(), Some(0));
+    assert_eq!(res_b.prefill_pipeline_quarantined(), Some(0));
+    assert_eq!(
+        res_a.prefill_pipeline_stats().unwrap().consumed,
+        layers as u64
+    );
+    assert_eq!(
+        res_b.prefill_pipeline_stats().unwrap().consumed,
+        layers as u64
+    );
+}
+
+/// Teardown with in-flight slots: prefetch two layers into both slots, page one
+/// (leaving it in-flight, held by the executor), and drop the residency while a
+/// slot binding is still alive. The `PagedWeight` keep-alive holds the residency
+/// alive; dropping it releases the slot, and the final residency drop drains the
+/// pipeline without leaking or quarantining. Also exercises an *unconsumed*
+/// prefetch being drained at teardown (the cancellation-at-teardown path).
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn teardown_with_inflight_and_unconsumed_slots_no_leak() {
+    use onnx_runtime_ep_api::ExecutionProvider;
+
+    let ep = require_cuda();
+
+    let layer_bytes = 2 * 1024 * 1024u64;
+    let (host, lazies) = whole_layer_weights(layer_bytes as usize, 1, 2);
+    let residency = Arc::new(
+        ep.weight_residency(layer_bytes * 2)
+            .with_prefill_double_buffer_enabled(true),
+    );
+    let source: &dyn MmapRegionSource = &*host;
+
+    // Fill both slots; consume only one, leave the other prefetched-but-unpaged.
+    match residency.prefill_pipeline_prefetch(0, &lazies[0], source) {
+        PrefillRoute::Prefetched => {}
+        other => panic!("layer 0 must route, got {other:?}"),
+    }
+    match residency.prefill_pipeline_prefetch(1, &lazies[1], source) {
+        PrefillRoute::Prefetched => {}
+        other => panic!("layer 1 must route, got {other:?}"),
+    }
+    let paged0 = residency
+        .prefill_pipeline_page(0, ep.device_id())
+        .unwrap()
+        .expect("layer 0 pages");
+    assert_eq!(
+        residency.prefill_pipeline_quarantined(),
+        Some(0),
+        "an in-flight slot is not quarantined"
+    );
+
+    // Drop the local residency handle first: the paged weight's keep-alive still
+    // holds an `Arc`, so the residency stays alive until the binding drops.
+    drop(residency);
+    // Kernel done: releasing the in-flight slot drops the last residency ref,
+    // draining the pipeline (including the unconsumed layer-1 fill) at teardown.
+    // The read-back proves the bytes were valid right up to release.
+    drop(paged0);
+    // Reaching here without a panic/deadlock/leak-abort is the assertion: the
+    // teardown drained an in-flight and an unconsumed slot cleanly.
+}
+
 // (pipelined) issue orderings of the *same* primitive over shape-faithful
 // synthetic layers, with the copy stream overlapping a fixed device
 // compute-proxy kernel. Reports host-enqueue and event-derived reuse-drain
@@ -600,12 +1022,15 @@ impl ComputeProxy {
 fn run_serial_arm(
     db: &mut PrefillDoubleBuffer<onnx_runtime_ep_cuda::prefill_double_buffer::CudaPrefillTransfer>,
     lazies: &[LazyWeight],
+    source: &dyn MmapRegionSource,
     proxy: &mut ComputeProxy,
     ep: &CudaExecutionProvider,
 ) -> Duration {
     let start = Instant::now();
     for (layer, lazy) in lazies.iter().enumerate() {
-        let ticket = db.prefetch(layer as u64, lazy).unwrap();
+        let ticket = db
+            .prefetch(layer as u64, &PrefillLayerRequest::new(lazy, source))
+            .unwrap();
         let _ = db.wait(&ticket).unwrap();
         proxy.run(ep);
         db.release(ticket).unwrap();
@@ -618,15 +1043,25 @@ fn run_serial_arm(
 fn run_pipelined_arm(
     db: &mut PrefillDoubleBuffer<onnx_runtime_ep_cuda::prefill_double_buffer::CudaPrefillTransfer>,
     lazies: &[LazyWeight],
+    source: &dyn MmapRegionSource,
     proxy: &mut ComputeProxy,
     ep: &CudaExecutionProvider,
 ) -> Duration {
     let start = Instant::now();
-    let mut pending = Some(db.prefetch(0, &lazies[0]).unwrap());
+    let mut pending = Some(
+        db.prefetch(0, &PrefillLayerRequest::new(&lazies[0], source))
+            .unwrap(),
+    );
     for layer in 0..lazies.len() {
         let ticket = pending.take().unwrap();
         if layer + 1 < lazies.len() {
-            pending = Some(db.prefetch((layer + 1) as u64, &lazies[layer + 1]).unwrap());
+            pending = Some(
+                db.prefetch(
+                    (layer + 1) as u64,
+                    &PrefillLayerRequest::new(&lazies[layer + 1], source),
+                )
+                .unwrap(),
+            );
         }
         let _ = db.wait(&ticket).unwrap();
         proxy.run(ep);
@@ -678,12 +1113,12 @@ fn one_slot_vs_two_slot_overlap_probe() {
         let residency = ep.weight_residency(layer_bytes * layers as u64);
         let reserve_start = Instant::now();
         let mut db = residency
-            .build_prefill_double_buffer(source.clone(), layer_bytes)
+            .build_prefill_double_buffer(layer_bytes)
             .expect("capacity-sufficient synthetic build");
         if run_idx == 0 {
             cold_reserve_us = reserve_start.elapsed().as_secs_f64() * 1e6;
         }
-        let host_wall = run_serial_arm(&mut db, &lazies, &mut proxy, &ep);
+        let host_wall = run_serial_arm(&mut db, &lazies, source.as_ref(), &mut proxy, &ep);
         let drain_start = Instant::now();
         runtime.synchronize().unwrap();
         let total_wall = host_wall + drain_start.elapsed();
@@ -694,9 +1129,9 @@ fn one_slot_vs_two_slot_overlap_probe() {
         // --- pipelined (two-slot) arm ---
         let residency = ep.weight_residency(layer_bytes * layers as u64);
         let mut db = residency
-            .build_prefill_double_buffer(source.clone(), layer_bytes)
+            .build_prefill_double_buffer(layer_bytes)
             .expect("capacity-sufficient synthetic build");
-        let host_wall = run_pipelined_arm(&mut db, &lazies, &mut proxy, &ep);
+        let host_wall = run_pipelined_arm(&mut db, &lazies, source.as_ref(), &mut proxy, &ep);
         let drain_start = Instant::now();
         runtime.synchronize().unwrap();
         let total_wall = host_wall + drain_start.elapsed();
@@ -712,10 +1147,8 @@ fn one_slot_vs_two_slot_overlap_probe() {
     // sampled runs (a large drift signals thermal/clock instability, not a real
     // result). We assert only that it stays finite and non-decreasing-to-absurd.
     let residency = ep.weight_residency(layer_bytes * layers as u64);
-    let mut db = residency
-        .build_prefill_double_buffer(source.clone(), layer_bytes)
-        .unwrap();
-    let _ = run_pipelined_arm(&mut db, &lazies, &mut proxy, &ep);
+    let mut db = residency.build_prefill_double_buffer(layer_bytes).unwrap();
+    let _ = run_pipelined_arm(&mut db, &lazies, source.as_ref(), &mut proxy, &ep);
     runtime.synchronize().unwrap();
     let recheck_reuse_wait_ns = db.metrics().reuse_wait_ns;
     drop(db);

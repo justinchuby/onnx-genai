@@ -27,9 +27,9 @@ use cudarc::driver::sys;
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{
     ExternalMmapRegion, LazyDeviceWeightBinder, LazyWeight, LazyWeightBoundary, MmapRegionSource,
-    WeightHandleError,
+    PagedWeight, WeightHandleError,
 };
-use onnx_runtime_ir::DataType;
+use onnx_runtime_ir::{DataType, DeviceId};
 use onnx_runtime_memory_governor::{AllocationReleaseState, Tier, VirtualBacking};
 
 use crate::deferred_release::{
@@ -37,7 +37,8 @@ use crate::deferred_release::{
 };
 use crate::pinned_pool::{PinnedStagingPool, PooledStaging};
 use crate::prefill_double_buffer::{
-    CudaPrefillError, CudaPrefillTransfer, PrefillDoubleBuffer, PrefillReject,
+    CudaPrefillError, CudaPrefillTransfer, LayerTicket, PrefillDoubleBuffer, PrefillLayerRequest,
+    PrefillReject,
 };
 use crate::runtime::{CopyCompleted, CudaRuntime, FailedHtodCompletion, PinnedStaging, raw_ptr};
 
@@ -2802,6 +2803,20 @@ pub struct CudaWeightResidency {
     /// `routed_guards_active` so a resize fails closed while any dispatch
     /// still holds a proof that a region set stays resident.
     routed_guards_active: AtomicU64,
+    /// Whether the whole-layer prefill double-buffer pipeline may be used for
+    /// eligible `BlockQuantizedMoe` prefetch/page-in. Read once from
+    /// [`PREFILL_DOUBLE_BUFFER_ENV`] at construction; when `false` the pipeline
+    /// is never built and every prefetch/page call is byte-identical to the
+    /// shipped single-slot path (it issues no extra CUDA work).
+    prefill_double_buffer_enabled: bool,
+    /// The two-slot streaming pipeline, lazily built (sized to the first
+    /// eligible layer) the first time an eligible whole-layer BQMoE prefetch is
+    /// routed while enabled. `None` until then. A separate lock from `inner`
+    /// because a fill's only host-wait (a reused slot's prior-copy drain) must
+    /// not contend the residency mutex an on-demand page-in also takes. This is
+    /// a *staging* pipeline over the shared runtime/pool — it admits nothing to
+    /// `inner.pages`, so it is not a second residency/cache authority.
+    prefill_pipeline: Mutex<Option<PrefillPipeline>>,
 }
 
 /// RAII handle for a live [`onnx_runtime_ep_api::RoutedResidencyProof`],
@@ -3320,6 +3335,8 @@ impl CudaWeightResidency {
                 prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
+            prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
+            prefill_pipeline: Mutex::new(None),
         }
     }
 
@@ -3385,6 +3402,8 @@ impl CudaWeightResidency {
                 prefetch_stats: PrefetchStats::default(),
             }),
             routed_guards_active: AtomicU64::new(0),
+            prefill_double_buffer_enabled: prefill_double_buffer_enabled(),
+            prefill_pipeline: Mutex::new(None),
         })
     }
 
@@ -5745,17 +5764,19 @@ impl CudaWeightResidency {
     /// existing paging lifecycle stays the sole mapping/accounting authority.
     ///
     /// `layer_bytes` is the largest layer's transfer size the pipeline is sized
-    /// for; every layer submitted must fit it. `source` supplies the layer
-    /// region bytes for every fill.
+    /// for; every layer submitted must fit it. The layer region bytes for each
+    /// fill are supplied per call via
+    /// [`PrefillLayerRequest`](crate::prefill_double_buffer::PrefillLayerRequest),
+    /// not owned by the
+    /// pipeline.
     pub fn prefill_double_buffer(
         &self,
-        source: Arc<dyn MmapRegionSource>,
         layer_bytes: u64,
     ) -> Result<PrefillDoubleBuffer<CudaPrefillTransfer>, PrefillReject<CudaPrefillError>> {
         if !prefill_double_buffer_enabled() {
             return Err(PrefillReject::Disabled);
         }
-        self.build_prefill_double_buffer(source, layer_bytes)
+        self.build_prefill_double_buffer(layer_bytes)
     }
 
     /// Construct the pipeline regardless of the env gate. Exposed for the GPU
@@ -5765,16 +5786,316 @@ impl CudaWeightResidency {
     #[doc(hidden)]
     pub fn build_prefill_double_buffer(
         &self,
-        source: Arc<dyn MmapRegionSource>,
         layer_bytes: u64,
     ) -> Result<PrefillDoubleBuffer<CudaPrefillTransfer>, PrefillReject<CudaPrefillError>> {
-        let transfer = CudaPrefillTransfer::new(
-            Arc::clone(&self.runtime),
-            Arc::clone(&self.staging_pool),
-            source,
-        );
+        let transfer =
+            CudaPrefillTransfer::new(Arc::clone(&self.runtime), Arc::clone(&self.staging_pool));
         PrefillDoubleBuffer::new(transfer, layer_bytes)
     }
+
+    /// Test/advanced override: force the whole-layer prefill double buffer on
+    /// (or off) for this residency regardless of [`PREFILL_DOUBLE_BUFFER_ENV`].
+    ///
+    /// The env gate remains the production default control; this exists so the
+    /// wiring can be driven deterministically in tests without mutating
+    /// process-global environment under parallel execution. It only flips the
+    /// eligibility gate — every downstream refusal (capture, pool capacity,
+    /// oversize, boundary) still applies, so it cannot manufacture a
+    /// success-shaped path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_prefill_double_buffer_enabled(mut self, enabled: bool) -> Self {
+        self.prefill_double_buffer_enabled = enabled;
+        self
+    }
+
+    /// Try to route an eligible whole-layer `BlockQuantizedMoe` look-ahead
+    /// prefetch through the two-slot streaming pipeline.
+    ///
+    /// Returns [`PrefillRoute::Prefetched`] when an async fill was started (a
+    /// later [`Self::prefill_pipeline_page`] for the same `key` redeems it), or
+    /// [`PrefillRoute::Declined`] with a typed, property-based reason the caller
+    /// falls back to the single-slot path on. Every decision is a *property*
+    /// (boundary, storage location, format size, lifecycle), never a model
+    /// name.
+    ///
+    /// The pipeline is built lazily, sized to the first eligible layer's
+    /// transfer bytes; a later layer larger than that fixed capacity is declined
+    /// *before* prefetch (so a `fill_slot` capacity error can never poison a
+    /// slot), while a smaller one fits. When the residency is not
+    /// double-buffer-enabled this is a byte-identical no-op: nothing is built
+    /// and no CUDA work is issued.
+    pub fn prefill_pipeline_prefetch(
+        &self,
+        key: u64,
+        weight: &LazyWeight,
+        source: &dyn MmapRegionSource,
+    ) -> PrefillRoute {
+        if !self.prefill_double_buffer_enabled {
+            return PrefillRoute::Declined(PrefillWireDecline::Disabled);
+        }
+        // Whole-layer BlockQuantizedMoe only — the single boundary this
+        // streaming primitive stages. Any other boundary is the single-slot
+        // path's business.
+        if weight.boundary != LazyWeightBoundary::BlockQuantizedMoe {
+            return PrefillRoute::Declined(PrefillWireDecline::Boundary);
+        }
+        // VMM stable-VA admission and the zero-copy hybrid own their own
+        // mapping/lifecycle state machines; the streaming pipeline only drives
+        // the plain runtime-alloc paging path, mirroring the single-slot
+        // prefetch's own decline so the two never both claim a layer.
+        if self.physical.get().is_some() || self.zero_copy_hybrid {
+            return PrefillRoute::Declined(PrefillWireDecline::Unsupported);
+        }
+        let bytes = weight.region_bytes_len() as u64;
+        if bytes == 0 {
+            return PrefillRoute::Declined(PrefillWireDecline::Empty);
+        }
+
+        let mut guard = self
+            .prefill_pipeline
+            .lock()
+            .expect("prefill pipeline lock poisoned");
+        if guard.is_none() {
+            // Lazily size the whole pipeline to this first eligible layer. Uses
+            // the ungated builder (the env gate is already proven above), so a
+            // build refusal here is a real fail-closed reason (capture active /
+            // pool cannot retain two buffers), not the disabled gate.
+            match self.build_prefill_double_buffer(bytes) {
+                Ok(inner) => {
+                    *guard = Some(PrefillPipeline {
+                        inner,
+                        tickets: HashMap::new(),
+                        stats: PrefillWireStats::default(),
+                    });
+                }
+                Err(reject) => {
+                    return PrefillRoute::Declined(PrefillWireDecline::Build(reject));
+                }
+            }
+        }
+        let pipeline = guard.as_mut().expect("pipeline built above");
+        let capacity = pipeline.inner.layer_bytes();
+        if bytes > capacity {
+            pipeline.stats.declined_oversize += 1;
+            return PrefillRoute::Declined(PrefillWireDecline::Oversize {
+                layer_bytes: bytes,
+                capacity,
+            });
+        }
+        let req = PrefillLayerRequest::new(weight, source);
+        match pipeline.inner.prefetch(key, &req) {
+            Ok(ticket) => {
+                pipeline.tickets.insert(key, ticket);
+                pipeline.stats.routed += 1;
+                PrefillRoute::Prefetched
+            }
+            Err(PrefillReject::SlotsBusy) => {
+                // Both slots still hold un-released layers (the executor's
+                // look-ahead ran deeper than the pipeline's depth of two). Fall
+                // back for this layer; a freed slot lets the next one route.
+                pipeline.stats.declined_slots_busy += 1;
+                PrefillRoute::Declined(PrefillWireDecline::Prefetch(PrefillReject::SlotsBusy))
+            }
+            Err(reject) => {
+                pipeline.stats.declined_prefetch += 1;
+                PrefillRoute::Declined(PrefillWireDecline::Prefetch(reject))
+            }
+        }
+    }
+
+    /// Redeem a pipeline-prefetched layer for `key`, if one is pending.
+    ///
+    /// Orders the caller's compute stream after the layer's H2D copy
+    /// (enqueue-only, no host sync) and returns a [`PagedWeight`] whose
+    /// keep-alive releases the slot back to the pipeline when the kernel binding
+    /// drops. Returns `Ok(None)` when `key` was not routed through the pipeline,
+    /// so the caller uses the single-slot page path unchanged.
+    pub fn prefill_pipeline_page(
+        self: &Arc<Self>,
+        key: u64,
+        device: DeviceId,
+    ) -> Result<Option<PagedWeight>, WeightHandleError> {
+        if !self.prefill_double_buffer_enabled {
+            return Ok(None);
+        }
+        let mut guard = self
+            .prefill_pipeline
+            .lock()
+            .expect("prefill pipeline lock poisoned");
+        let Some(pipeline) = guard.as_mut() else {
+            return Ok(None);
+        };
+        let Some(ticket) = pipeline.tickets.remove(&key) else {
+            return Ok(None);
+        };
+        let view = match pipeline.inner.wait(&ticket) {
+            Ok(view) => view,
+            Err(reject) => {
+                pipeline.stats.wait_failed += 1;
+                // The staged bytes for this key are unusable (slot reused out
+                // from under the ticket / poisoned / fence failure). Fail closed
+                // rather than serve another layer's bytes; the ticket is already
+                // consumed, so there is nothing to release.
+                return Err(WeightHandleError::DeviceBinding(format!(
+                    "prefill double-buffer wait for key {key}: {reject:?}"
+                )));
+            }
+        };
+        pipeline.stats.consumed += 1;
+        let device_ptr = raw_ptr(view.device_ptr) as *const std::ffi::c_void;
+        let len = view.len;
+        drop(guard);
+
+        let keep_alive: Arc<dyn Any + Send + Sync> = Arc::new(PrefillSlotGuard {
+            residency: Arc::clone(self),
+            ticket: Some(ticket),
+        });
+        Ok(Some(PagedWeight::new(device_ptr, device, len, keep_alive)))
+    }
+
+    /// Release a consumed pipeline slot back for reuse. Best-effort, called from
+    /// [`PrefillSlotGuard`]'s `Drop` after the kernel that read the slot has
+    /// been dropped: a failure here means the slot was already reused or the
+    /// pipeline torn down, so there is nothing to undo.
+    fn prefill_pipeline_release(&self, ticket: LayerTicket) {
+        if let Ok(mut guard) = self.prefill_pipeline.lock()
+            && let Some(pipeline) = guard.as_mut()
+            && pipeline.inner.release(ticket).is_ok()
+        {
+            pipeline.stats.released += 1;
+        }
+    }
+
+    /// Snapshot of the double-buffer *wiring* counters, or `None` if the
+    /// pipeline was never built (disabled, or no eligible layer routed). For
+    /// tests/telemetry.
+    pub fn prefill_pipeline_stats(&self) -> Option<PrefillWireStats> {
+        self.prefill_pipeline
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|pipeline| pipeline.stats)
+    }
+
+    /// Snapshot of the primitive's own activity metrics, or `None` if unbuilt.
+    pub fn prefill_pipeline_metrics(&self) -> Option<crate::prefill_double_buffer::PrefillMetrics> {
+        self.prefill_pipeline
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|pipeline| pipeline.inner.metrics())
+    }
+
+    /// Number of pipeline slot-buffer sets quarantined for process lifetime
+    /// (transfer failure/poison), or `None` if unbuilt. For leak/accounting
+    /// tests.
+    pub fn prefill_pipeline_quarantined(&self) -> Option<usize> {
+        self.prefill_pipeline
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|pipeline| pipeline.inner.transfer().quarantined_len())
+    }
+
+    /// Whether the pipeline has been built (an eligible layer was routed). For
+    /// the disabled-path byte-identity assertion.
+    pub fn prefill_pipeline_active(&self) -> bool {
+        self.prefill_pipeline
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+}
+
+/// The residency-owned two-slot streaming pipeline plus the map from a paging
+/// `key` to the in-flight ticket that redeems it. Lazily built and sized to the
+/// first eligible layer. Not a residency/cache authority: it admits nothing to
+/// `ResidencyInner::pages`; it stages layer bytes through two stable buffers and
+/// hands each straight to the kernel that consumes it.
+struct PrefillPipeline {
+    inner: PrefillDoubleBuffer<CudaPrefillTransfer>,
+    /// Paging key -> ticket for a layer prefetched but not yet consumed.
+    tickets: HashMap<u64, LayerTicket>,
+    stats: PrefillWireStats,
+}
+
+/// Keep-alive for a pipeline-paged weight: its `Drop` records the slot's
+/// release fence (enqueue-only) so the two-slot pipeline can reuse the slot for
+/// a later layer once the kernel that read it has finished. The executor holds
+/// exactly one per paged weight for the kernel's lifetime via [`PagedWeight`]'s
+/// keep-alive, so slot release is tied to weight-binding drop.
+struct PrefillSlotGuard {
+    residency: Arc<CudaWeightResidency>,
+    ticket: Option<LayerTicket>,
+}
+
+impl Drop for PrefillSlotGuard {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            self.residency.prefill_pipeline_release(ticket);
+        }
+    }
+}
+
+/// Per-layer counters for the whole-layer prefill double-buffer *wiring*
+/// (residency-level routing), distinct from the primitive's own
+/// [`crate::prefill_double_buffer::PrefillMetrics`]. Every `declined_*` field is
+/// a property-based routing refusal, so a test attributes each declined layer to
+/// its exact cause without matching on model names.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PrefillWireStats {
+    /// Layers whose prefetch the pipeline accepted (async fill started).
+    pub routed: u64,
+    /// Layers redeemed by a later page-in (consumed a Ready slot).
+    pub consumed: u64,
+    /// Slots released back for reuse after the kernel dropped its binding.
+    pub released: u64,
+    /// Larger than the pipeline's fixed slot capacity; declined before fill.
+    pub declined_oversize: u64,
+    /// Both slots still busy (look-ahead deeper than depth two); declined.
+    pub declined_slots_busy: u64,
+    /// Prefetch refused for any other typed reason (e.g. capture went active).
+    pub declined_prefetch: u64,
+    /// A redeem found its slot no longer serving the ticket (stale/poisoned).
+    pub wait_failed: u64,
+}
+
+/// Typed, property-based reason a layer was not routed through the double-buffer
+/// pipeline. None of these is an error — each tells the caller to use the
+/// single-slot path for this layer.
+#[derive(Debug)]
+pub enum PrefillWireDecline {
+    /// The residency is not double-buffer-enabled (default).
+    Disabled,
+    /// Not a whole-layer `BlockQuantizedMoe` weight.
+    Boundary,
+    /// A VMM/zero-copy-hybrid residency owns this layer's lifecycle instead.
+    Unsupported,
+    /// The layer has zero transfer bytes.
+    Empty,
+    /// The layer exceeds the pipeline's fixed slot capacity.
+    Oversize {
+        /// This layer's transfer bytes.
+        layer_bytes: u64,
+        /// The pipeline's fixed per-slot capacity.
+        capacity: u64,
+    },
+    /// Building the pipeline failed closed (capture active / pool capacity).
+    Build(PrefillReject<CudaPrefillError>),
+    /// The primitive refused the prefetch (slots busy / capture / transfer).
+    Prefetch(PrefillReject<CudaPrefillError>),
+}
+
+/// Outcome of routing a layer to the double-buffer pipeline.
+#[derive(Debug)]
+pub enum PrefillRoute {
+    /// The pipeline started an async fill for this key; a later
+    /// [`CudaWeightResidency::prefill_pipeline_page`] for the same key redeems
+    /// it.
+    Prefetched,
+    /// The pipeline declined; the caller uses the single-slot path.
+    Declined(PrefillWireDecline),
 }
 
 impl std::fmt::Debug for CudaWeightResidency {
