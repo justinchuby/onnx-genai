@@ -2181,8 +2181,32 @@ time. That figure is now stale; the re-measurement replaces it.
 > spending longer in the kernel. The sys behaviour is not stable across slow
 > launches and is not carried as a mechanism until measured over several.
 >
-> **Weight-arena placement across the two L3/CCX domains is now the only live
-> candidate** for the straggler wait.
+> **The candidate list is empty (2026-08-24).** "Weight-arena placement across
+> the two L3/CCX domains" was carried as the last live candidate for two
+> records and is **malformed on this host**: `numactl --hardware` reports one
+> NUMA node over all 32 CPUs at a single distance, so there is no second memory
+> domain to place an arena in, and an L3 is a cache rather than an allocation
+> target. I listed it twice without checking the host could express it.
+>
+> **Mode-stratifying the worker-split instrument reports nothing, and says
+> why**: under `ONNX_GENAI_CPU_DECODE_WORKER_PROFILE` the width-16 `wall_s`
+> values are one broad distribution (between-mode gap 0.106 s against a
+> within-mode spread of 0.292 s), i.e. two clock reads per worker per op
+> dissolve the bimodality. The counters that would explain the modes perturb
+> them away.
+>
+> **New lead, not the bimodality:** the aggregate width-16 window spends
+> **0.313** in straggler wait, with one worker holding **0.565** of
+> `last_arrivals` against a chance share of 0.067 (`straggler_excess` 8.47) and
+> `work_skew` **0.562** -- one worker doing ~56% more than the mean, with every
+> other worker waiting on it. A direct per-CPU scalar census shows **cpu 0 is
+> not degraded** (rel 0.965 inside a 0.965-1.032 band), contradicting an
+> external report of a permanent competitor there, so the imbalance is ours.
+> Deliberately *not* diagnosed from source: `output_chunk_len_for` returns
+> `n.div_ceil(tasks)` and every llama width divides evenly by 16, so static
+> reading predicts no skew while measurement says 0.562. That contradiction is
+> recorded rather than resolved by argument. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-straggler-lead.md`](../benchmarks/2026-08-24-acc0-straggler-lead.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
