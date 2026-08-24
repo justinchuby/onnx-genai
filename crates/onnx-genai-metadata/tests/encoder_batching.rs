@@ -2804,3 +2804,26 @@ fn a_shared_result_that_describes_nothing_is_still_refused() {
         "emits per-request value 'patch_lengths' without a declared batch_layout",
     );
 }
+
+#[test]
+fn a_companion_of_a_result_nobody_produces_describes_nothing() {
+    // The carve-out asks whether a value describes the shape of a result the
+    // caller receives. A declaration no step writes is not such a result, so it
+    // cannot be the reason another value is admitted -- otherwise a package
+    // could smuggle any `shared` vector past the serving rule by declaring a
+    // padded output beside it and never emitting one.
+    //
+    // This is the same fact as the emitted-not-declared obligation, seen from
+    // the other side: the payload must be produced for the companion to be
+    // admitted, and the companion must be produced for the payload to be legal.
+    // Answering the two differently would be answering one question twice.
+    let document = two_padded_dimensions().replace(
+        "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
+        "",
+    );
+    assert_reports(
+        &document,
+        "which only output 'features' names as a shape companion, and that output is never \
+         emitted",
+    );
+}
