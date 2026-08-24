@@ -20,6 +20,18 @@ onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 
+# `pin.rs` takes one never-released reference to this library's own module so
+# ORT's unregister cannot unmap text that thread-local destructors and
+# instrumentation callbacks still point into.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
 [dev-dependencies]
 onnx-runtime-ort-testkit = { workspace = true }
 libloading = { workspace = true }

@@ -2513,6 +2513,7 @@ dependencies = [
 name = "onnx-runtime-ep-plugin"
 version = "0.1.0-dev.5"
 dependencies = [
+ "libc",
  "libloading 0.8.9",
  "onnx-genai-ort-sys",
  "onnx-runtime-ep-api",
@@ -2520,6 +2521,7 @@ dependencies = [
  "onnx-runtime-ir",
  "onnx-runtime-memory-governor",
  "onnx-runtime-ort-testkit",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
