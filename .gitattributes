@@ -16,6 +16,11 @@ schema/inference_metadata.schema.json text eol=lf
 # Windows checkout into CRLF and silently break those exact string matches.
 examples/inference_metadata/catalogue/*.yaml text eol=lf
 
+# The root-file allowlist is compared byte-for-byte against `git ls-files`, so a
+# CRLF checkout would put a stray \r on every entry and mismatch all of them at
+# once. The check strips CR defensively; this keeps it from arising.
+.github/root-file-allowlist.txt text eol=lf
+
 # Shell scripts and the extension-less git hooks are executed by bash. With
 # core.autocrlf=true (the Git-for-Windows default) they check out as CRLF, and
 # bash then chokes on the stray carriage returns ("$'\r': command not found",

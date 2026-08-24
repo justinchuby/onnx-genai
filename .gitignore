@@ -76,6 +76,12 @@ PR*.md
 /.commitmsg
 # Issue and review bodies staged the same way, for gh issue create --body-file.
 .issue-*.md
+# Shorter variant of .pr-body.md above. Reached main in #2026 as the fourth file
+# of this class, hours after two separate fixes to this very block. Root-level
+# only, per /*.log below. This line is the trailing half of that repair: see
+# .github/root-file-allowlist.txt for the half that does not have to guess what
+# the next one will be called.
+/.body.md
 # Scratch buffers used when moving a block of code between files.
 .block.txt
 # Test/build output teed to a file while investigating. Root-level only, so a
