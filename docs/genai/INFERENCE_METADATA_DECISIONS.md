@@ -832,6 +832,16 @@ declared on its own dimension and they never compete for one.
   **position**, never a request identity ([§8.3](#83-no-row-identity)). Depth
   stops at two levels, so a third is a deliberate schema change rather than
   something a package asserts into existence.
+- **Raggedness leaves a workflow with the metadata that decodes it.** An emitted
+  `token_packed` value declares every level's `offsets` and `owner` as outputs,
+  and an emitted padded value declares each entry's `valid_lengths`. The serving
+  rule that rejects an emitted rank > 0 `shared` value
+  (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`) is carved out for
+  exactly those referenced companions — `int64`, rank 1, named by another emitted
+  value's layout or `padding` entry in the same workflow — and for nothing else.
+  Withholding a length vector is not a smaller version of the same package: since
+  a materialized validity mask is rejected for the contract, that vector is the
+  only account of the padding that exists.
 - **A row selection is lifted, never applied to a packed axis.**
   `BatchLayout::request_axis()` returns `None` for `TokenPacked`
   (`crates/onnx-genai-metadata/src/schema/ir.rs:67-72`) while `is_row_scoped()`
@@ -952,16 +962,20 @@ silence.
 **Serving admits companions, and only companions.** A serving workflow rejects an
 emitted value of rank > 0 that declares `shared`
 (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`), which would reject
-the very companions a packed emit is required to publish. The carve-out is
+the very companions a ragged emit is required to publish — a packed value's
+`offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
 minimal and decidable from the declared outputs alone: a `shared` emitted value
 is admitted **iff** it is `int64`, rank 1, and named as an `offsets` or `owner`
-of another emitted value's layout in the same workflow; anything else keeps the
-existing rejection. A companion is never compacted and never split like a
-payload — each request receives its own span plus **rebased**, zero-based offsets
-for that span. A declared `owner` output is **internal**: it must be declared so
-the workflow validates and the runtime can check the level, and it is never
-delivered, because its values are positions within a grouping the caller cannot
-see ([§8.3](#83-no-row-identity)). Per-request owners, where a consumer wants
+of another emitted value's layout, or as the `valid_lengths` of another emitted
+value's `padding` entry, in the same workflow; anything else keeps the existing
+rejection. A companion is never compacted and never split like a payload — each
+request receives its own span plus **rebased**, zero-based offsets for that span,
+and the slice of any `valid_lengths` that indexes its own items, which needs no
+rebasing because a length is already relative to what it measures. A declared
+`owner` output is **internal**: it must be declared so the workflow validates and
+the runtime can check the level, and it is never delivered, because its values
+are positions within a grouping the caller cannot see
+([§8.3](#83-no-row-identity)). Per-request owners, where a consumer wants
 them, are **derived** by the runtime from the rebased offsets.
 
 `offsets` is `shared` rather than `request_aligned` for a structural reason: an
