@@ -40,6 +40,7 @@
 //! builds, where the concurrency bug it catches actually happens.
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Which threads may use a resource.
@@ -220,7 +221,7 @@ impl OwnerThread {
         operation: &'static str,
     ) -> std::result::Result<ThreadAccess<'_>, ThreadAffinityError> {
         if self.affinity == ThreadAffinity::Shared {
-            return Ok(ThreadAccess { owner: None });
+            return Ok(ThreadAccess::unguarded());
         }
         let me = identity_ptr(current_identity());
         match self.owner.compare_exchange(
@@ -235,11 +236,11 @@ impl OwnerThread {
                 if !previous.is_null() && !std::ptr::eq(previous, me) {
                     self.migrations.fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(ThreadAccess { owner: Some(self) })
+                Ok(ThreadAccess::held_by_caller(self))
             }
             Err(current) if std::ptr::eq(current, me) => {
                 self.depth.fetch_add(1, Ordering::Relaxed);
-                Ok(ThreadAccess { owner: Some(self) })
+                Ok(ThreadAccess::held_by_caller(self))
             }
             Err(current) => Err(self.violation(operation, current)),
         }
@@ -281,9 +282,43 @@ impl OwnerThread {
         }
     }
 
+    /// Give up one guarded section held by the calling thread.
+    ///
+    /// [`ThreadAccess`] is `!Send`, so safe code cannot reach this from a thread
+    /// that did not enter. The ownership check is defense in depth for the
+    /// `unsafe` route: releasing on behalf of a thread that is still inside
+    /// would clear `owner` and let a third thread in, which is precisely the
+    /// race this module exists to prevent. So a foreign release is reported and
+    /// *declined* — the resource stays held. That can strand it as permanently
+    /// busy, which fails closed: later use is refused with a name instead of
+    /// racing.
     fn release(&self) {
-        if self.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.owner.store(std::ptr::null_mut(), Ordering::Release);
+        let me = identity_ptr(current_identity());
+        let current = self.owner.load(Ordering::Acquire);
+        if std::ptr::eq(current, me) {
+            if self.depth.fetch_sub(1, Ordering::Relaxed) == 1 {
+                self.owner.store(std::ptr::null_mut(), Ordering::Release);
+            }
+            return;
+        }
+        // `Drop` cannot fail, so a foreign release is reported and declined.
+        // The two cases are distinguished because they mean different bugs: a
+        // null owner is a double release, a live one is a guard that reached
+        // the wrong thread.
+        let resource = self.resource;
+        if current.is_null() {
+            let offender = current_identity();
+            tracing::error!(
+                "{resource} was released twice: thread {offender} dropped a \
+                 ThreadAccess for a resource that is not held. Fix: do not \
+                 reconstruct or duplicate access guards; take one from \
+                 OwnerThread::enter and let it drop."
+            );
+            debug_assert!(false, "{resource} released twice by thread {offender}");
+        } else {
+            let violation = self.violation("release", current);
+            tracing::error!("{violation}");
+            debug_assert!(false, "{violation}");
         }
     }
 }
@@ -291,10 +326,74 @@ impl OwnerThread {
 /// Proof that the current thread holds a resource for one operation.
 ///
 /// Dropping it releases the resource so another thread may take it over.
+///
+/// # This guard must not leave the thread that took it
+///
+/// The guard *is* the claim, and dropping it is what gives the resource back.
+/// If it could be sent, safe code could take a resource on thread A, move the
+/// guard to thread B, and have B's drop clear A's ownership while A is still
+/// inside — after which thread C enters unopposed and the guard has handed out
+/// exactly the concurrent access it exists to refuse. No `unsafe` needed.
+///
+/// `&OwnerThread` alone does not prevent that: `OwnerThread` is `Sync` (it is
+/// atomics and `&'static` identity records), so a guard holding only a shared
+/// reference would be `Send` by auto-derivation. The `PhantomData<*const ()>`
+/// below is therefore load-bearing rather than decorative, and
+/// `tests/session_thread_contract.rs` fails to compile if it is removed.
+///
+/// The first block is a positive control: a `compile_fail` block passes when its
+/// snippet fails to build for *any* reason, so on its own it is evidence of
+/// nothing.
+///
+/// ```
+/// use onnx_genai_ort::{OwnerThread, ThreadAffinity};
+///
+/// // Taking and releasing a resource on one thread is the supported route,
+/// // and a second thread may take it over once it is idle.
+/// let owner = OwnerThread::new("IoBinding", ThreadAffinity::Exclusive);
+/// let access = owner.enter("bind_input").unwrap();
+/// drop(access);
+/// std::thread::scope(|scope| {
+///     scope.spawn(|| drop(owner.enter("bind_input").unwrap())).join().unwrap();
+/// });
+/// ```
+///
+/// ```compile_fail
+/// use onnx_genai_ort::{OwnerThread, ThreadAffinity};
+///
+/// // Sending the guard elsewhere would let another thread hand this thread's
+/// // resource to a third one. `ThreadAccess` is `!Send`, so it does not build.
+/// let owner = OwnerThread::new("IoBinding", ThreadAffinity::Exclusive);
+/// let access = owner.enter("bind_input").unwrap();
+/// std::thread::scope(|scope| {
+///     scope.spawn(move || drop(access)).join().unwrap();
+/// });
+/// ```
 #[derive(Debug)]
 #[must_use = "the resource is only held for as long as this guard lives"]
 pub struct ThreadAccess<'a> {
     owner: Option<&'a OwnerThread>,
+    /// Makes the guard `!Send + !Sync`. A raw pointer is the zero-sized,
+    /// zero-cost way to opt out of both auto traits; it is never dereferenced.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl<'a> ThreadAccess<'a> {
+    /// A guard over a resource that needs no exclusion.
+    fn unguarded() -> Self {
+        Self {
+            owner: None,
+            _not_send: PhantomData,
+        }
+    }
+
+    /// A guard the calling thread has just taken over `owner`.
+    fn held_by_caller(owner: &'a OwnerThread) -> Self {
+        Self {
+            owner: Some(owner),
+            _not_send: PhantomData,
+        }
+    }
 }
 
 impl Drop for ThreadAccess<'_> {
