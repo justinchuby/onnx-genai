@@ -20959,6 +20959,68 @@ mod tests {
         (width >= 2).then_some((width, cores))
     }
 
+    /// The placement the named policy predicts for a `workers`-wide pool on
+    /// `allowed`, expressed in the same wire codes the child reports.
+    ///
+    /// Exact rather than approximate, and that matters: `node_shards_with`
+    /// orders the *whole* allowed set through `order_pin_targets_for` and then
+    /// caps only the worker *count* (`reserve_single_group_headroom` returns a
+    /// count, it does not remove CPUs from the list), and the pool pins worker
+    /// `i` to `cpus[i % len]`. So the first `workers` entries of that ordering
+    /// are the CPUs the workers actually get.
+    ///
+    /// Comparing this against `realized` is not circular. The prediction comes
+    /// from the ordering policy; `realized` comes from each worker reading the
+    /// affinity mask the kernel is actually enforcing for it. The claim is that
+    /// those two agree.
+    fn predicted_placement_code(
+        allowed: &[usize],
+        topology: &crate::core_topology::CoreTopology,
+        policy: crate::decode_affinity::CorePlacement,
+        workers: usize,
+    ) -> &'static str {
+        let ordered =
+            crate::decode_affinity::order_pin_targets_for(allowed, Some(topology), policy);
+        if ordered.is_empty() || workers == 0 {
+            return "one-per-core";
+        }
+        let taken: Vec<usize> = (0..workers).map(|i| ordered[i % ordered.len()]).collect();
+        if topology.physical_cores_within(&taken) < workers {
+            "shared-core"
+        } else {
+            "one-per-core"
+        }
+    }
+
+    /// The parent's own cpuset, and the topology, when the child's report says
+    /// it saw the same host shape the parent sees.
+    ///
+    /// The child inherits this process's affinity mask, so the two agree by
+    /// construction. Checking rather than assuming is the point: if they ever
+    /// diverge, every layout this parent predicts is about a different machine
+    /// than the one the child measured, and a wrong prediction must announce
+    /// itself rather than quietly grade the wrong host.
+    fn parent_cpuset_matching(
+        report: &RealizedWidth,
+    ) -> (Vec<usize>, &'static crate::core_topology::CoreTopology) {
+        let allowed = crate::decode_affinity::allowed_cpus()
+            .expect("a target that passed `placement_probe_width` reports its cpuset");
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
+        assert_eq!(
+            (report.allowed, report.cores),
+            (allowed.len(), topology.physical_cores_within(&allowed)),
+            "the child measured a different cpuset than this parent can see \
+             ({} CPUs / {} cores against {} / {}), so any layout predicted here is about \
+             another machine ({report:?})",
+            report.allowed,
+            report.cores,
+            allowed.len(),
+            topology.physical_cores_within(&allowed)
+        );
+        (allowed, topology)
+    }
+
     /// With the spread policy **selected**, the workers must land one per
     /// physical core.
     ///
@@ -20986,6 +21048,14 @@ mod tests {
             "the child did not receive the policy this test selected, so it is measuring \
              something else ({report:?})"
         );
+        if report.nodes > 1 {
+            eprintln!(
+                "skipping explicit-spread placement check: a NUMA-split pool rebalances \
+                 workers per node, so the single-group layout this asserts is not the one \
+                 that ran ({report:?})"
+            );
+            return;
+        }
         assert!(
             report.pool_built && report.workers >= 2 && report.workers <= cores,
             "the probe width did not produce a pool inside the core budget, so the \
@@ -21030,8 +21100,6 @@ mod tests {
             );
             return;
         };
-        let topology = crate::core_topology::require_host_for_placement()
-            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
         let report = realized_width_report_with(
             width,
             false,
@@ -21065,21 +21133,57 @@ mod tests {
              `off` rather than as a layout ({report:?})"
         );
 
-        // ...and the claim that makes the selector worth having. Only on an SMT
-        // host: without siblings, compact and spread are the same layout and
-        // demanding a shared core would be demanding a host feature.
-        if topology.has_smt() && report.workers >= 2 {
-            assert_eq!(
-                report.realized, "shared-core",
-                "`compact` was selected on an SMT host with {} workers, yet the workers \
-                 observed `{}` -- the selector parses and changes nothing, which is the \
-                 #1792 shape ({report:?})",
-                report.workers, report.realized
+        // ...and the claim that makes the selector worth having: the workers
+        // are where the compact ordering says they are.
+        //
+        // The predicate is derived from *this cpuset*, not from the machine.
+        // An earlier version demanded `shared-core` whenever the host had SMT
+        // anywhere, which is a different question: `taskset -c 0,2,4,6` on an
+        // SMT host leaves no sibling pair inside the allowed set, so compact
+        // and spread are the same layout there and the demand would have failed
+        // a legitimate host. Predicting from the allowed set answers what the
+        // policy will actually do here, so the assertion holds on every cpuset
+        // and still catches an inert selector on the ones that can show it.
+        if report.nodes > 1 {
+            eprintln!(
+                "skipping the compact layout prediction: a NUMA-split pool rebalances \
+                 workers per node, so the single-group ordering predicted here is not the \
+                 one that ran ({report:?})"
+            );
+            return;
+        }
+        let (allowed, topology) = parent_cpuset_matching(&report);
+        let compact_predicted = predicted_placement_code(
+            &allowed,
+            topology,
+            crate::decode_affinity::CorePlacement::Compact,
+            report.workers,
+        );
+        let spread_predicted = predicted_placement_code(
+            &allowed,
+            topology,
+            crate::decode_affinity::CorePlacement::Spread,
+            report.workers,
+        );
+        assert_eq!(
+            report.realized, compact_predicted,
+            "the compact ordering puts {} workers on {compact_predicted}, but the workers \
+             observed `{}` for themselves -- either the selector parses and changes \
+             nothing (the #1792 shape) or the pin did not take ({report:?})",
+            report.workers, report.realized
+        );
+        if compact_predicted == spread_predicted {
+            eprintln!(
+                "the discrimination half of the compact check did not run: on this \
+                 {}-CPU / {}-core cpuset both policies predict `{compact_predicted}` at \
+                 {} workers, so no layout difference exists to observe",
+                report.allowed, report.cores, report.workers
             );
         } else {
-            eprintln!(
-                "compact/spread are the same layout on a host without SMT; the \
-                 shared-core half of this test did not run"
+            assert_ne!(
+                report.realized, spread_predicted,
+                "compact was selected but the pool landed in the layout `spread` would \
+                 have produced, so the selector is inert ({report:?})"
             );
         }
     }
@@ -21099,20 +21203,40 @@ mod tests {
             eprintln!("skipping spread-assertion mutation: unsupported target");
             return;
         };
-        let topology = crate::core_topology::require_host_for_placement()
-            .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
-        if !topology.has_smt() {
-            eprintln!(
-                "skipping spread-assertion mutation: without SMT siblings the two \
-                 policies are the same layout, so no mutation exists to apply"
-            );
-            return;
-        }
         let compact = realized_width_report_with(
             width,
             false,
             Some(crate::decode_affinity::CorePlacement::Compact),
         );
+        if compact.nodes > 1 {
+            eprintln!(
+                "skipping spread-assertion mutation: a NUMA-split pool rebalances workers \
+                 per node, so the single-group ordering predicted here is not the one that \
+                 ran ({compact:?})"
+            );
+            return;
+        }
+        let (allowed, topology) = parent_cpuset_matching(&compact);
+        // Whether a mutation exists at all is a property of *this cpuset*, not
+        // of the machine: `taskset -c 0,2,4,6` on an SMT host admits no sibling
+        // pair, so compact and spread are the same layout and there is nothing
+        // to mutate. Keying this off whole-machine `has_smt()` would have
+        // demanded a difference the cpuset cannot produce.
+        if predicted_placement_code(
+            &allowed,
+            topology,
+            crate::decode_affinity::CorePlacement::Compact,
+            compact.workers,
+        ) == "one-per-core"
+        {
+            eprintln!(
+                "skipping spread-assertion mutation: this {}-CPU / {}-core cpuset has no \
+                 SMT sibling pair among the first {} compact slots, so `compact` is the \
+                 same layout as `spread` here and no mutation exists to apply",
+                compact.allowed, compact.cores, compact.workers
+            );
+            return;
+        }
         assert_ne!(
             compact.realized, "one-per-core",
             "a compact placement satisfied the one-per-core predicate, so that \

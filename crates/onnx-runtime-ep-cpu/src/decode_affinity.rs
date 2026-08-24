@@ -1093,7 +1093,9 @@ pub(crate) fn order_pin_targets(
 /// The returned list is always a permutation of `cpus`: a CPU the topology does
 /// not know about keeps its place at the end rather than being dropped. The
 /// caller's set is a *permission*, and silently shrinking it would shrink the
-/// pool.
+/// pool. (A *repeated* CPU is de-duplicated rather than repeated, under both
+/// policies and both before and after #1805's follow-up; the callers are
+/// cpusets, which cannot contain one.)
 ///
 /// # Who uses it, and a reversal
 ///
