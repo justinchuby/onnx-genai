@@ -131,6 +131,33 @@ gap was noise.
 statement is licensed. The bimodality dominates the expectation and this harness
 cannot resolve a 5% effect through it at n=60.
 
+## 3a. The bimodality is not a placement artifact
+
+It has been proposed that the width-16 "fast mode" simply *is* the correctly
+placed pool, on the reasoning that the old compact mask put 16 workers on 8
+physical cores inside one L3. That is not what these 240 launches were run on.
+Read straight out of `/proc/<pid>/task/*/status` for the exact binary used
+here, no timing involved:
+
+```
+spmd worker threads found: 15
+Cpus_allowed_list: ['0','2','4','6','8','10','12','14','16','18','20','22','24','26','28']
+distinct logical cpus = 15, distinct physical cores = 15
+VERDICT: SPREAD (one worker per physical core)
+```
+
+Siblings on this host are `(2k, 2k+1)`, so even-numbered CPUs only means one
+worker per physical core, and the set spans **both** 32 MiB L3 domains. Every
+launch in this study had the spread placement, and every arm still came back
+bimodal at roughly 50/50 (`frac_fast` 0.533 / 0.433 / 0.500 / 0.467).
+
+So **correct placement does not remove the bimodality**, and "the fast mode is
+the placed pool" is not a sufficient explanation for this workload. Placement
+was already excluded as the *straggler* selector by a different route — one
+lane->cpu map across 24 launches while the victim moved — and this is the
+matching result for the mode structure. Recorded because it bears on numbers
+other people are carrying, not because it changes the disposition below.
+
 ## 4. Disposition
 
 **No default change.** The pre-registered rule requires a resolvable end-to-end
