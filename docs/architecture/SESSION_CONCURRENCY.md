@@ -115,6 +115,28 @@ code rather than from folklore.
 | `CublasLt` | `crates/onnx-runtime-ep-cuda/src/blas.rs:97-101` | "a cuBLASLt handle is not thread-affine" |
 | `PinnedStaging` | `crates/onnx-runtime-ep-cuda/src/runtime.rs:2123-2127` | a page-locked host allocation; the pointer is a plain address |
 
+**`Session` is the only ORT handle in that list that a session's execution
+actually reaches, and the exception does not extend to anything derived from
+it.** `IoBinding`, `Allocator` and `Value` carry no `Send`/`Sync` claim of any
+kind — not an `unsafe impl`, not a derived one that survives their raw pointers
+— and none is being added. ORT's guarantee is about `Run`; the objects around a
+run are per-run or per-worker state that the caller supplies, which the
+`Session` safety comment says in as many words: *"per-run inputs, outputs, and
+`IoBinding` values are supplied by the caller and are not stored in `Session`"*
+(`session/mod.rs:1226-1227`). Decision 4 therefore places `IoBinding`,
+`Allocator` and `Value` in the per-worker category (§3.2) even though `Session`
+itself could be shared.
+
+**A graph-capture session is not concurrent, even though `Session` is `Sync`.**
+A session created with `enable_cuda_graph=1` reports `graph_capture == true`
+(`session/mod.rs:487-490,823-825`) and replays one captured graph against one
+set of bound device addresses — which is why island binding exists *"so CUDA
+graph capture sees stable, device-resident input and output addresses"*
+(`session/mod.rs:1168-1172`). Two concurrent `Run`s against one captured graph
+would replay it against addresses the other is writing. Combined with the
+thread-local capture rules below, a capture-enabled session is **single-flight
+and thread-affine**, and the `Sync` impl on `Session` does not reach it.
+
 **Thread-affine or context-bound, per their own safety comments:**
 
 | Handle | Location | Claim |
@@ -128,7 +150,7 @@ code rather than from folklore.
 **CUDA graph capture is thread-local, and the repo already knows it.** Capture
 begins with `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL` (`graph.rs:177`), must end on
 the thread that began it (`graph.rs:184-193`), must abort on that same thread
-(`graph.rs:282-287`), and the allocator's capture gate is a `thread_local!`
+(`graph.rs:274-285`), and the allocator's capture gate is a `thread_local!`
 depth counter (`crates/onnx-runtime-cuda-memory/src/capture_gate.rs:93-100`).
 
 The shape of the constraint is therefore precise, and it is not "CUDA is
@@ -141,7 +163,86 @@ and violates the affinity half, and the failure that produces is not a data race
 the compiler or a sanitizer will name — it is a capture that silently belongs to
 the wrong thread.
 
-### 1.4 Where session state, memory accounting, and KV actually live
+### 1.4 A concrete lifecycle bug the current arrangement already permits
+
+The categories in §1.3 are not theoretical. A backend audit found a live
+drop-order defect that exists *today*, at `W = 1`, and it is the sharpest
+available evidence for why §3's ownership rules have to be structural.
+
+**Rust drops struct fields in declaration order.** `ExecutionIsland` declares:
+
+```rust
+    session: Session,                                                    // :74
+    ...
+    bindings: RefCell<HashMap<IslandBindingKey, StableIslandBinding>>,   // :78
+    device_allocator: Option<Allocator>,                                 // :79
+```
+— `crates/onnx-genai-engine/src/pipeline/islands.rs:74,78,79`
+
+So the session is released **first**, and the resources derived from it are
+released **after** the handle they depend on is gone. Each of the three levels
+states its own dependency, and none of them enforces it:
+
+- `IoBinding` holds `_session: *const Session`, annotated in the source as
+  *"reference back to session (non-owning)"* (`crates/onnx-genai-ort/src/binding.rs:12-15`),
+  and its `Drop` calls `ReleaseIoBinding` (`binding.rs:173-182`) — after
+  `Session::drop` has already called `ReleaseSession`
+  (`session/mod.rs:1213-1222`). `StableIslandBinding` is what holds those
+  bindings (`islands.rs:108-109`).
+- `Allocator::for_session_device` says the rule outright in its own doc comment:
+  *"The returned allocator becomes invalid when the session is dropped, so it
+  must not outlive the session it was created from"*
+  (`crates/onnx-genai-ort/src/allocator.rs:236-238`). The field order at
+  `islands.rs:74,79` makes it do precisely that. Nothing in the type ties the
+  allocator to the session — `Session::device_allocator` returns an owned
+  `Allocator` by value with no lifetime and no shared handle
+  (`session/mod.rs:1168-1175`).
+- `Value`s allocated from that device allocator (`Value::empty_in`,
+  `value.rs:232-240`) are the third level, and are held inside
+  `StableIslandBinding`'s `inputs`/`outputs` (`islands.rs:110-111`).
+
+**The compensating code is a convention, not an invariant.** `WorkflowRuntime`'s
+`Drop` reaches into every island to clear its bindings, then clears three maps,
+in that order:
+
+```rust
+impl Drop for WorkflowRuntime {
+    fn drop(&mut self) {
+        for island in &mut self.execution_islands {
+            island.clear_bindings();
+        }
+        self.component_bindings.get_mut().clear();
+        self.component_outputs.get_mut().clear();
+        self.component_allocators.get_mut().clear();
+    }
+}
+```
+— `crates/onnx-genai-engine/src/pipeline/mod.rs:270-279`
+
+That works, and it is why the defect has not bitten. But it is a hand-maintained
+teardown running *outside* the type that has the problem: it papers over
+`ExecutionIsland`'s internal field order from one level up. Any path that drops
+an `ExecutionIsland` without going through `WorkflowRuntime::drop` — a
+constructor that fails partway, a panic during load, a future refactor that
+moves islands into a different owner — gets the raw order. §7's worker-failure
+path is exactly such a path.
+
+The codebase already knows field drop order is load-bearing. `Value::drop`
+carries a careful comment reasoning about it — *"Any `_owner` here is a struct
+field, so drop glue frees it after this body releases the `OrtValue` below — ORT
+is always done with the allocation before the owner frees it"*
+(`value.rs:1699-1701`). The same reasoning was simply not applied one level up.
+
+**Why this belongs in a concurrency document.** At `W = 1` the window is narrow
+and the manual clear closes it. Under a worker pool the same teardown happens
+`W` times, concurrently with other workers still running, on paths where nobody
+runs the compensating clear — and a `ReleaseIoBinding` against a released
+session is not a data race any sanitizer will name. Multiplying an ordering
+defect by `W` and adding failure paths is how a latent bug becomes a
+reproducible crash. It is fixed *before* the pool exists (§13, Phase 1), and the
+rule that prevents its return is structural (§3.4), not another convention.
+
+### 1.5 Where session state, memory accounting, and KV actually live
 
 - **Session maps.** `Engine` holds `sessions: HashMap<SessionId, EngineSession>`
   for decode-core packages and `workflow_sessions: HashMap<SessionId, usize>`
@@ -154,7 +255,7 @@ the wrong thread.
   (`crates/onnx-genai-engine/src/config.rs:389`) and
   `pub type SequenceId = u64` (`crates/onnx-genai-kv/src/lib.rs:61`). On the ORT
   path `create_session` *returns the KV sequence id directly*
-  (`engine/runtime.rs:1537`), so the session identifier and the paged-KV
+  (`engine/runtime.rs:1538`), so the session identifier and the paged-KV
   sequence identifier are the same number. This matters in §4.1.
 - **Memory accounting is deliberately singular.** The `governor` field's doc
   comment states: *"Exactly one exists per runtime — a second would double-count
@@ -201,7 +302,10 @@ These are the commitments this document makes. Sections 3–13 derive from them.
    it does not interleave, and it does not lose an update.
 4. **Backend handles stay thread-affine and are not made `Sync` by wrapping raw
    handles in locks.** Where a handle names a bound context or an owning stream,
-   the design supplies a thread, not a mutex.
+   the design supplies a thread, not a mutex. Affinity is recorded and asserted
+   (`OwnerThread`), and a resource derived from a session owns that session
+   (`Arc<Session>`) rather than pointing at it — §3.4. Both are structural
+   because §1.4 shows a convention already failed here.
 5. **Execution uses a bounded pool of session workers with deterministic session
    ownership and stateless load distribution.** A session belongs to exactly one
    worker for its entire life; the routing decision is a pure function of the
@@ -264,14 +368,23 @@ the construction and teardown obligations that follow, because they are the
 sharp edge.
 
 Note that ORT's `Session` is `Send + Sync` (§1.3) and would not strictly need
-this. It is placed here anyway. Two reasons. First, ORT's concurrency guarantee
-is about `Run`, and the objects around a run — IO bindings, decode state,
-captured graphs, the CUDA context they were bound under — do not inherit it.
-Second, a rule that holds only for the subset of handles that happen to be
-`Sync` today is a rule that breaks the first time an execution provider ships a
-handle that is not, which is exactly the failure mode `Engine`'s own safety
-comment already anticipates: *"This would stop being sound if an execution
-provider introduced thread-affine handles"* (`engine/model.rs:227-228`).
+this. It is placed here anyway. Three reasons. First, ORT's concurrency
+guarantee is about `Run`, and the objects around a run — `IoBinding`,
+`Allocator`, `Value`, decode state, captured graphs, the CUDA context they were
+bound under — do not inherit it, and none of them carries any `Send`/`Sync`
+claim of its own (§1.3). Second, a capture-enabled session is single-flight and
+thread-affine regardless of the `Sync` impl (§1.3), so the exception would have
+to be carved back out for exactly the configuration that matters most on CUDA.
+Third, a rule that holds only for the subset of handles that happen to be `Sync`
+today is a rule that breaks the first time an execution provider ships a handle
+that is not, which is exactly the failure mode `Engine`'s own safety comment
+already anticipates: *"This would stop being sound if an execution provider
+introduced thread-affine handles"* (`engine/model.rs:227-228`).
+
+**`Session` is therefore the only ORT handle this design permits to be shared at
+all**, and only through `Arc` for *ownership* (§3.4), never for concurrent use
+across workers. `IoBinding`, `Allocator` and `Value` are per-worker without
+exception.
 
 ### 3.3 Per-execution: mutable turn state
 
@@ -288,6 +401,104 @@ rather than a cleanup path someone has to remember to call.
 Session-scoped state — the conversation cell a `session.continuation` names — is
 deliberately *not* in this category. It is per-session state living on the owning
 worker: category 3.2 storage under category 3.3 access discipline.
+
+### 3.4 Session-derived resources own the session, and know their thread
+
+The three categories above say *where* state lives. This section says how the
+type system is made to enforce it, because §1.4 is proof that a categorisation
+maintained by convention does not survive contact with a refactor.
+
+Two rules, both structural.
+
+**Rule A — ownership, not adjacency.** Every resource derived from a `Session`
+holds an `Arc<Session>`.
+
+That means:
+
+- `IoBinding` replaces its non-owning `_session: *const Session`
+  (`crates/onnx-genai-ort/src/binding.rs:12-15`) with an `Arc<Session>`.
+- `Allocator`, when produced by `Allocator::for_session_device`
+  (`crates/onnx-genai-ort/src/allocator.rs:236-238`), carries the
+  `Arc<Session>` it was derived from. Today it carries nothing
+  (`allocator.rs:205-209`) and the invariant lives only in a doc comment.
+- Any `Value` allocated from a session-derived allocator
+  (`crates/onnx-genai-ort/src/value.rs:232-240`) keeps that allocator alive,
+  transitively keeping the session alive.
+- `Session::device_allocator` (`session/mod.rs:1168-1175`) is therefore callable
+  only on an `Arc<Session>`, not on a bare `Session`.
+
+`Arc<Session>` is not a new idea in this codebase — it is already how the engine
+holds its session (`engine/model.rs:245`), how MTP holds its draft and target
+sessions (`crates/onnx-genai-ort/src/mtp.rs:122`, `:166`), and how the
+speculative decoder holds its sessions (`speculative/mod.rs:1056`). The gap is
+narrow and specific: the edge from a session to the resources *derived* from it
+is the one edge that was left as a raw pointer.
+
+The payoff is that teardown order stops being a property of source-file layout.
+`ExecutionIsland`'s field declaration order (`pipeline/islands.rs:74`, `:78`,
+`:79`) becomes irrelevant — the session cannot be released while a binding,
+allocator or value still refers to it, because the refcount says so. And
+`WorkflowRuntime::drop`'s manual `clear_bindings`-then-clear-maps sequence
+(`pipeline/mod.rs:270-279`) stops being load-bearing. §13 Phase 1 removes it in
+the same change that adds the `Arc`, rather than leaving a correct-but-redundant
+cleanup path for a future reader to mistake for a live invariant (RULES.md
+Rule 3).
+
+**Rule B — thread identity, checked.** Every per-worker backend handle records
+the `ThreadId` it was constructed on, and asserts it on use and on drop.
+
+```rust
+/// The thread a backend handle was constructed on and must be used and
+/// dropped on. Recorded at construction; asserted, never inferred.
+pub(crate) struct OwnerThread(std::thread::ThreadId);
+
+impl OwnerThread {
+    pub(crate) fn current() -> Self {
+        Self(std::thread::current().id())
+    }
+
+    #[track_caller]
+    pub(crate) fn assert_owned(&self, what: &'static str) {
+        let now = std::thread::current().id();
+        assert_eq!(
+            self.0, now,
+            "{what} is thread-affine: constructed on {:?}, used on {now:?}",
+            self.0
+        );
+    }
+}
+```
+
+No such concept exists today. Grepping `onnx-genai-ort` and `onnx-genai-engine`
+for a thread-identity check returns nothing; affinity is documented in SAFETY
+comments (§1.3) and enforced by the fact that there is currently one thread.
+Once there are `W`, the documentation is all that remains, and documentation
+does not fail a test.
+
+Three properties of Rule B are deliberate:
+
+1. **It is always on, not `debug_assertions`-only.** The bug it catches is a
+   CUDA context bound to the wrong thread or a handle released off its owning
+   thread. That is silent undefined behaviour, not a wrong number — it will not
+   reproduce under a debug build on demand, and a release build is exactly where
+   it will be met. The cost is one `ThreadId` comparison against operations that
+   already cost a device round trip.
+2. **It asserts on `Drop`, not only on use.** §1.4's defect is a teardown bug.
+   A check that only fires on use would not have caught it.
+3. **It panics rather than returning an error.** A handle used from the wrong
+   thread means the ownership routing in §4 is broken; there is no caller-level
+   recovery, and §7's worker-failure path already converts a worker panic into a
+   typed, actionable refusal for every affected request. This is the one place
+   this design prefers a panic to a typed error, and it is because a wrong-thread
+   handle has already violated the precondition that made the surrounding code
+   sound.
+
+Which handles carry an `OwnerThread`: the native decode session, the CUDA
+context binding, `CudnnBackend` and its reduce cache, `CudaGraphLifecycle`,
+`CudaReservation`, the paged KV cache, and every session-derived `IoBinding`,
+`Allocator` and `Value`. ORT's `Session` does not need one for `Run` (it is
+`Sync`), and takes one when `graph_capture` is enabled (§1.3), where it is
+single-flight and affine like everything else.
 
 ---
 
@@ -331,7 +542,7 @@ over `pub type SequenceId = u64` (`config.rs:389`,
 Second, it is forced. Under §3.2 each worker owns its own `PagedKvCache`, so
 each worker mints sequence ids from its own `PageTable` and those id spaces
 collide across workers. Today `create_session` returns the KV sequence id as the
-session id (`engine/runtime.rs:1537`); once there are `W` page tables that is
+session id (`engine/runtime.rs:1538`); once there are `W` page tables that is
 ambiguous. Splitting `SessionId` from `SequenceId` is the same change as making
 routing total.
 
@@ -397,9 +608,15 @@ This is the part that is easy to get wrong quietly, so it is normative.
 - any `CudaReservation`, which its own comment calls thread-affine
   (`virtual_memory.rs:2749-2752`);
 - the CUDA graph capture: begin, end, and abort must all be the same thread
-  (`graph.rs:177,184-193,282-287`);
+  (`graph.rs:177,184-193,274-285`);
 - the native decode session and the per-worker `PagedKvCache`, so their
-  allocations are charged under the right context.
+  allocations are charged under the right context;
+- every session-derived `IoBinding`, `Allocator` and `Value` (§3.4), which today
+  are built wherever the workflow runtime happens to run
+  (`pipeline/islands.rs:78-79`, `allocator.rs:236-238`, `value.rs:232-240`).
+
+Each of these records an `OwnerThread` at construction (§3.4, Rule B). The
+recording is what makes the drop rule below checkable instead of aspirational.
 
 **Must be dropped on the worker thread that constructed it.** Teardown makes
 driver calls that bind the context first
@@ -408,6 +625,21 @@ foreign thread is the same violation as running the work there. Concretely: a
 worker's `join` must happen only after that worker has dropped its own
 category-3.2 state, and nothing may claw a handle back to the coordinator to
 drop it. §7 makes this a shutdown ordering rule.
+
+Native CUDA teardown is the strictest case and is called out separately: the
+CUDA context binding, the captured graph and its lifecycle, the reservation, the
+device allocator and the KV pages beneath it are all released by the owner
+thread, in that thread's own unwind or shutdown path. `OwnerThread::assert_owned`
+fires in each of their `Drop` impls, so an attempt to release them elsewhere
+aborts loudly at the point of the mistake rather than corrupting a context that
+some other worker is mid-capture on.
+
+The two rules compose. Rule A of §3.4 guarantees a session outlives everything
+derived from it; Rule B guarantees that everything derived from it is released
+by the thread entitled to release it. Neither alone is sufficient: an
+`Arc<Session>` dropped on the wrong thread is still a wrong-thread teardown, and
+a correct-thread teardown of a resource whose session has already been released
+is still a use-after-free.
 
 **May cross threads:** the `Arc`-shared immutable plan (§3.1), request and
 response payloads, host-side token buffers, and `PinnedStaging`, which is a
@@ -424,7 +656,7 @@ than leaving a pool with a hole in it.
 
 `W` is bounded by three independent limits, and the effective value is the
 minimum, reported once at startup the way batching capability already is
-(`driver.rs:294-302`):
+(`driver.rs:297-303`):
 
 1. **Backend capability.** A backend that cannot hold more than one decode
    session gives `W = 1`. The native path is already documented this way — *"the
@@ -485,7 +717,7 @@ if the lease is held, matching the retryable contract
 The server maps client `X-Session-Id` strings to engine `SessionId`s through
 `SessionRegistry`, an `Arc<Mutex<SessionRegistryInner>>` with its own LRU
 (`crates/onnx-genai-server/src/session.rs:9-34`,
-`routes/completions.rs:1057-1096`). That map is already thread-safe and already
+`routes/completions.rs:1309-1340`). That map is already thread-safe and already
 handles the create race explicitly with
 `SessionClaim::{Existing, Claimed}` (`session.rs:22-29`). It is untouched:
 `SessionId` becoming a newtype is invisible to it because it only stores and
@@ -650,7 +882,7 @@ Two consequences that follow, and are not optional:
   configures `W` and `max_batch` independently can request more concurrent rows
   than the device can fund. The effective values are resolved together and
   reported once, in the same way `BatchingReport` already clamps a requested
-  width to what the decode path can honour (`driver.rs:294-306`).
+  width to what the decode path can honour (`driver.rs:289-296`).
 - **Sessionless requests go to any worker.** They own no state, so stateless
   distribution (§4.1) applies directly, and a sessionless request should prefer
   the shard with the shallowest queue for the same reason a sessionful one
@@ -699,6 +931,22 @@ individual backend handles in `onnx-runtime-ep-cuda` and `onnx-runtime-cuda-memo
 are out of scope and unchanged: they are narrow claims about specific handles,
 each with its own audited justification, and this document neither relies on nor
 weakens them.
+
+**A second, structural rule lands with it:** *no type that owns a backend handle
+may depend on field declaration order for teardown correctness, and no such
+dependency may be discharged by a `Drop` impl one level up.* Ownership is
+expressed with `Arc` (§3.4, Rule A) so that the refcount, not the source-file
+layout, decides release order; thread affinity is expressed with `OwnerThread`
+(§3.4, Rule B) so that the assertion, not the reviewer, decides who may release
+it. §1.4 is the worked example of what the absence of both rules already costs
+at `W = 1`, and the cost is not linear in `W` — it is the difference between one
+thread reliably reproducing a bug and `W` threads producing it intermittently.
+
+The three rules are one rule seen from three sides. A `Send` claim asserts a
+handle may cross threads; `Arc` ownership asserts a handle outlives its
+dependents; `OwnerThread` asserts a handle is touched only by its owner. Each
+replaces a comment that a human has to keep true with a fact the compiler or the
+runtime keeps true.
 
 ---
 
@@ -832,9 +1080,25 @@ concurrency. Every test below spawns real OS threads and synchronizes on a
 9. **Shard exhaustion refuses.** Fill a shard past its bound and assert
    `create_session` returns the typed refusal naming the shard and the bound,
    rather than over-subscribing.
+10. **Session-derived resources keep the session alive.** Build an `IoBinding`
+    and a device `Allocator` from a session, allocate a `Value` from that
+    allocator, then drop the caller's `Session` handle *first* and assert the
+    binding, allocator and value tear down cleanly afterwards. This test fails
+    against today's code (§1.4) and passes once §3.4's `Arc<Session>` edge
+    exists, which is the point: it is the regression test for the defect, and it
+    is written before the fix. A companion test asserts that a struct owning a
+    session and a binding tears down correctly under *both* field declaration
+    orders, so the property is ownership rather than layout.
+11. **Wrong-thread use and teardown are refused, not tolerated.** Construct a
+    per-worker handle on thread A, move it to thread B, and assert
+    `OwnerThread::assert_owned` fires — once for use and once, separately, for
+    drop, because §1.4 was a teardown bug and a use-only check would have missed
+    it. Run it against a release build too: §3.4 specifies the check is always
+    on, and a test that only proves it under `debug_assertions` proves the wrong
+    thing.
 
-Tests 1–5, 7 and 9 must run on CPU without a model where possible, so they gate
-every PR rather than only CUDA runs. Tests 6 and 8 need the real backend.
+Tests 1–5, 7 and 9–11 must run on CPU without a model where possible, so they
+gate every PR rather than only CUDA runs. Tests 6 and 8 need the real backend.
 
 ### 12.2 ORT / native parity
 
@@ -921,12 +1185,25 @@ field that is always `0`. Behaviour is unchanged; this is Rule 5 cleanup that
 happens to be a prerequisite. Callers that treat the id as opaque — including
 `SessionRegistry` (`server/src/session.rs:31-34`) — need no logic change.
 
-**Phase 1 — split the state.** Extract the immutable package and compiled
-workflow plan (§3.1) behind `Arc`; separate per-execution turn state (§3.3) from
-the interpreter; move `workflow_session_leases` out of `RefCell` and into
-per-turn-owned worker state (§4.2). Still one thread, still one worker. This is
-the largest refactor and the one that carries no concurrency risk, which is why
-it is isolated.
+**Phase 1 — split the state, and fix the lifecycle defect first.** This phase
+begins with §1.4, because it is a live bug at `W = 1` and it is far cheaper to
+fix before a pool exists than after. Give `IoBinding` and session-derived
+`Allocator`s an `Arc<Session>` (§3.4, Rule A), replacing the non-owning
+`*const Session` (`binding.rs:12-15`) and the untied allocator
+(`allocator.rs:205-209`); land tests 10 and 11 from §12.1 with it; then delete
+the compensating manual clears in `WorkflowRuntime::drop`
+(`pipeline/mod.rs:270-279`), because leaving a redundant cleanup path next to a
+now-structural invariant is exactly the kind of shim RULES.md Rule 3 forbids —
+the next reader cannot tell whether it is load-bearing.
+
+The rest of the phase is the state split proper: extract the immutable package
+and compiled workflow plan (§3.1) behind `Arc`; separate per-execution turn state
+(§3.3) from the interpreter; move `workflow_session_leases` out of `RefCell` and
+into per-turn-owned worker state (§4.2); introduce `OwnerThread` (§3.4, Rule B)
+on the per-worker handles listed in §4.3, where at `W = 1` every assertion passes
+trivially and therefore establishes the baseline rather than chasing a
+regression. Still one thread, still one worker. This is the largest refactor and
+the one that carries no concurrency risk, which is why it is isolated.
 
 **Phase 2 — introduce the worker as a structure of one.** Build the worker
 thread, the routing façade, and the command protocol, with `W` hard-pinned to 1.
