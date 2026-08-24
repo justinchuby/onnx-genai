@@ -60,7 +60,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran "$LOCK".conf "$LOCK".legacy "$LOCK".box "$LOCK".sourced "$LOCK".legacyran "$LOCK".owner "$LOCK".nested "$LOCK".ro "$LOCK".deep "$LOCK".file "$LOCK".nox "$LOCK".conf2 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -2214,6 +2214,29 @@ chmod 700 "$LOCK"
 "$HL" release >/dev/null 2>&1
 rm -rf "$LOCK"
 
+# Ordering pin. The preflight has to run BEFORE the legacy consult, and that
+# ordering is invisible to every cell above: they all set HOSTLOCK_DIR, so
+# LOCK_DIR_SOURCE is `env`, and refuse_if_legacy_held returns immediately for
+# any source but `config`. Swap the two and the whole suite stays green while
+# a host that cannot take the lock at all is told a peer has the box -- exit 2
+# instead of 7, which sends the agent away to wait for a lock it could never
+# have acquired. Raised by review as the one surviving mutation; this is the
+# fixture that reddens it.
+rm -rf "$LOCK.legacy"
+printf 'lock_dir=%s\n' "$UNUSABLE_DIR" >"$LOCK.conf2"
+sleep 300 &
+unusable_legacy_pid=$!
+unusable_legacy_start=$(sed 's/.*) //' "/proc/${unusable_legacy_pid}/stat" | awk '{print $20}')
+mkdir -p "$LOCK.legacy"
+printf 'owner=roy\nanchor_pid=%s\nstart_time=%s\nacquired_epoch=%s\nttl=0\nreason=prefill matrix\n' \
+    "$unusable_legacy_pid" "$unusable_legacy_start" "$(date +%s)" >"$LOCK.legacy/meta"
+chk "an unusable configured dir refuses as 7 even while the legacy path is live" \
+    "$(env -u HOSTLOCK_DIR HOSTLOCK_CONF="$LOCK.conf2" HOSTLOCK_LEGACY_DIR="$LOCK.legacy" \
+        "$HL" acquire --owner leon >/dev/null 2>&1; echo $?)" "7"
+kill "$unusable_legacy_pid" 2>/dev/null
+wait "$unusable_legacy_pid" 2>/dev/null
+rm -rf "$LOCK.legacy" "$LOCK.conf2"
+
 chmod 700 "$UNUSABLE_PARENT" 2>/dev/null
 rm -rf "$UNUSABLE_PARENT"
 cleanup
@@ -2224,7 +2247,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "340"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "341"
 
 echo
 echo "passed=${pass} failed=${fail}"
