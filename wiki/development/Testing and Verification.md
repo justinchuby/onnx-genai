@@ -170,8 +170,59 @@ toolkit 或 GPU 的情况下编译 CUDA 集成。这能证明 feature 接线和�
 
 ## 测试诚实性检查
 
-一个被 ignore 的测试不是已执行的证据。CUDA CI 会运行
-`.github/scripts/verify_cuda_test_honesty.py` 来审计 GPU 测试清单及其跳过条件。
+一个被 ignore 的测试不是已执行的证据。`.github/scripts/verify_cuda_test_honesty.py`
+审计 GPU 测试清单及其跳过条件。它在两条通道上运行:
+
+- **CUDA compile 通道**——权威检查。它构建两次 CUDA 测试目标(一次不带
+  `gpu-tests` feature,一次带),并要求两者的目标集合与每个目标的测试名集合
+  **完全一致**。这是唯一能证明清单一致性的检查,但它需要两次完整构建。
+- **Rust quality 通道**——同一条规则直接读源码,约一秒,不需要 CUDA 工具链
+  (`--source-scan`,以及先行的 `--self-test`)。它**补充**而非取代权威检查:
+  它看不到宏展开产生的测试,也无法验证两种 feature 配置之间的清单一致性。
+
+之所以两条都要,是因为权威检查只在一条约 20 分钟、且经常已经因别的原因而红
+的通道上运行——作者在能够修复的时间点上得不到信号。本类缺陷因此反复出现:
+issue #1875 之下先后需要四个 PR 才收干净(#1881、#1911、#1920、#1927)。
+**一条没人能及时读到其输出的检查不构成检查。**
+
+对 CUDA 测试目标(文件名以 `_gpu` 结尾者)有两条硬性规则:
+
+1. **每个 `#[test]` 都必须被 ignore**,否则它会在没有设备的机器上真正运行:
+
+   ```rust
+   #[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]
+   #[test]
+   fn kernel_matches_cpu() { /* ... */ }
+   ```
+
+2. **不要用 `cfg` 把测试从清单里删掉。** `#![cfg(feature = "gpu-tests")]`(整个
+   目标)、测试或其所在 `mod` 上的 `#[cfg(feature = "gpu-tests")]`、以及清单里的
+   `required-features`,都会让这些测试在基础配置下**根本不存在**。这比规则 1
+   更危险:通道是绿的,而它绿是因为测试不在那里。需要 feature 的应当是**辅助
+   函数**,用双分支 shim 包起来——两个分支同名同签名,测试本身及其调用点在两种
+   配置下都原样保留(取自
+   `crates/onnx-runtime-cuda-memory/tests/vmm_release_quarantine_gpu.rs`):
+
+   ```rust
+   #[cfg(feature = "gpu-tests")]
+   fn install_faults(allocator: &mut CudaVmmAllocator, plan: Arc<DriverFaultPlan>) {
+       allocator.install_driver_faults(plan);
+   }
+
+   #[cfg(not(feature = "gpu-tests"))]
+   fn install_faults(_allocator: &mut CudaVmmAllocator, _plan: Arc<DriverFaultPlan>) {
+       unreachable!("driver fault injection is only compiled under the gpu-tests feature");
+   }
+   ```
+
+   关闭分支永远不会被执行,因为每个调用点所在的测试都被 ignore 了;它的作用是
+   让这些测试在两份清单中都存在。
+
+   > 一个反复踩到的陷阱:`#[cfg(any(test, feature = "gpu-tests"))]` **并不**覆盖集成
+   > 测试。`tests/*.rs` 是独立的 crate,链接的是**不带** `cfg(test)` 构建的库,
+   > 所以 `test` 分支在这里不成立。于是在关闭 `gpu-tests` 时该项不存在,用顶层
+   > `use` 引用它就是 `E0432`——而这正是有人会用整目标 `#![cfg(...)]` "修好"它、
+   > 从而把十三个测试一并删掉的原因(#1927)。
 
 新增一个依赖硬件的测试时:
 
