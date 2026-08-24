@@ -115,7 +115,9 @@ pub fn declared_in(document: &serde_yaml::Value) -> Result<Option<&str>, String>
     match value.as_str() {
         Some(spelling) => Ok(Some(spelling)),
         None => Err(format!(
-            "schema_version must be a quoted string such as '{SUPPORTED_SCHEMA_VERSION}'. This              document writes it unquoted, so it reads as a number rather than a version, and              '1.10' and '1.1' would be the same document"
+            "schema_version must be a quoted string such as '{SUPPORTED_SCHEMA_VERSION}'. This \
+             document writes it unquoted, so it reads as a number rather than a version, and \
+             '1.10' and '1.1' would be the same document"
         )),
     }
 }

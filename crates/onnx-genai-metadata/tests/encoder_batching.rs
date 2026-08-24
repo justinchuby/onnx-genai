@@ -2092,6 +2092,268 @@ fn an_emit_axis_must_be_an_axis_the_value_has() {
     assert_reports(&document, "axis is 3, outside the rank 1 of value it emits");
 }
 
+/// A diffusion package as they were written before video existed: a rank-4
+/// latent appended along its final axis, which is what the default already
+/// meant, stated the only way the schema then had — by saying nothing.
+const LEGACY_TRAJECTORY_APPEND: &str = r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      latent:
+        contract: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: latent }
+    outputs:
+      trajectory:
+        contract: { dtype: float32, rank: 4, shape: [batch, channels, height, trajectory_width], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tensor
+        stage: pre_adapter
+    components:
+      denoiser:
+        implementation: { kind: onnx, artifact: denoiser.onnx }
+        ports:
+          inputs:
+            latent: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+          outputs:
+            estimate: { dtype: float32, rank: 4, shape: [batch, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }
+    steps:
+      - kind: invoke
+        component: denoiser
+        inputs: { latent: latent }
+        outputs: { estimate: denoiser.estimate }
+      - kind: emit
+        value: denoiser.estimate
+        output: trajectory
+        mode: append
+"#;
+
+#[test]
+fn a_package_written_before_the_rule_keeps_the_default_it_was_written_against() {
+    // The rank-4 append rule is a demand the video version makes, not a verdict
+    // on the documents that predate it. A diffusion package on a shelf appends
+    // latents along the final axis and is correct: the default is what it meant,
+    // and it had no way to say so explicitly because nothing asked. Refusing it
+    // now would be this crate deciding that shipped packages expired.
+    validate_metadata(&parse(LEGACY_TRAJECTORY_APPEND))
+        .expect("a v1.0 package keeps the default axis it was written against");
+}
+
+#[test]
+fn the_same_document_at_the_version_that_asks_must_answer() {
+    // Same bytes, one field different. Declaring the version that introduced
+    // rank-4 media tensors is what makes the final axis ambiguous, so it is what
+    // makes naming the axis a requirement.
+    let document =
+        LEGACY_TRAJECTORY_APPEND.replace("schema_version: v1\n", "schema_version: v1.1\n");
+    assert_reports(
+        &document,
+        "grows a rank-4 output but names no axis; the default final axis is a spatial extent for \
+         a value of this rank, so the axis it grows along must be stated",
+    );
+}
+
+#[test]
+fn saying_which_axis_satisfies_the_rule_without_changing_the_meaning() {
+    // The migration a shipped package makes: state the axis the default already
+    // chose. It then declares the newer version and says the same thing.
+    let document = LEGACY_TRAJECTORY_APPEND
+        .replace("schema_version: v1\n", "schema_version: v1.1\n")
+        .replace(
+            "        output: trajectory\n        mode: append\n",
+            "        output: trajectory\n        mode: append\n        axis: 3\n",
+        );
+    validate_metadata(&parse(&document)).expect("naming the default axis is naming an axis");
+}
+
+#[test]
+fn an_axis_a_value_does_not_have_is_wrong_at_every_version() {
+    // Version scoping relaxes what a document must *say*, never what it may say
+    // wrongly. An axis outside the rank names nothing at any version.
+    let document = LEGACY_TRAJECTORY_APPEND.replace(
+        "        output: trajectory\n        mode: append\n",
+        "        output: trajectory\n        mode: append\n        axis: 7\n",
+    );
+    assert_reports(&document, "axis is 7, outside the rank 4 of value it emits");
+}
+
+/// A serving workflow whose result is padded rather than packed: one row per
+/// request, `max_tiles` slots in each, and `tile_lengths` saying how many of
+/// those slots hold a real tile.
+const PADDED_EMIT_WORKFLOW: &str = r#"
+schema_version: v1.1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit, serving_service_contract]
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          cache:
+            kind: full_attention
+            sequence_axis: 1
+            layout: batch_sequence
+            logical_lengths: cache_lengths
+            aliasing: permitted
+    state:
+      cache_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        scope: invocation
+        initializer: cache_lengths.initial
+        recurrence: { kind: invariant }
+      cache:
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [batch, capacity]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        scope: invocation
+        initializer: cache.initial
+        recurrence: { kind: invariant }
+        service_group: cache
+        management: runtime
+        release_boundary: invocation
+    inputs:
+      active:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: active }
+      done:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: done }
+      accepted_len:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_len }
+      cache_lengths.initial:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: cache_lengths.initial }
+      cache.initial:
+        contract: { dtype: float32, rank: 2, shape: [batch, capacity], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: cache.initial }
+      pixel_values:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, max_tiles, height, width]
+          batch_layout: { kind: request_aligned, axis: 0 }
+          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]
+        role: { kind: opaque }
+        source: { kind: application, name: pixel_values }
+      tile_lengths:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        role: { kind: opaque }
+        source: { kind: application, name: tile_lengths }
+    outputs:
+      features:
+        contract:
+          dtype: float32
+          rank: 3
+          shape: [batch, max_tiles, hidden]
+          batch_layout: { kind: request_aligned, axis: 0 }
+          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]
+        role: tensor
+        stage: pre_adapter
+      tile_lengths:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+        role: tensor
+        stage: pre_adapter
+    components:
+      vision:
+        implementation: { kind: onnx, artifact: vision.onnx }
+        ports:
+          inputs:
+            pixels:
+              dtype: float32
+              rank: 4
+              shape: [batch, max_tiles, height, width]
+              batch_layout: { kind: request_aligned, axis: 0 }
+              padding: [{ dimension: max_tiles, valid_lengths: lengths }]
+            lengths: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }
+          outputs:
+            features:
+              dtype: float32
+              rank: 3
+              shape: [batch, max_tiles, hidden]
+              batch_layout: { kind: request_aligned, axis: 0 }
+              padding: [{ dimension: max_tiles, valid_lengths: lengths }]
+    steps:
+      - kind: invoke
+        component: vision
+        inputs: { pixels: pixel_values, lengths: tile_lengths }
+        outputs: { features: image_features }
+      - kind: emit
+        value: image_features
+        output: features
+        mode: replace
+      - kind: emit
+        value: tile_lengths
+        output: tile_lengths
+        mode: replace
+"#;
+
+#[test]
+fn a_padded_emit_hands_back_the_lengths_that_read_it() {
+    validate_metadata(&parse(PADDED_EMIT_WORKFLOW)).expect("a padded emit is describable");
+}
+
+#[test]
+fn a_validity_companion_may_be_emitted_by_a_serving_workflow() {
+    // A length vector is `shared` for the same reason an offsets vector is: it
+    // has one entry per position outside the dimension it bounds, which is a
+    // statement about the whole result rather than one row of it. The serving
+    // rule makes room for exactly the values that describe a declared output's
+    // shape, and for nothing else — an unrelated `shared` result is still a
+    // per-request answer with no way back to a request.
+    let document = PADDED_EMIT_WORKFLOW
+        .replace(
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n      unrelated:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+        )
+        .replace(
+            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
+            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n      - kind: emit\n        value: tile_lengths\n        output: unrelated\n        mode: replace\n",
+        );
+    assert_reports(
+        &document,
+        "emits per-request value 'tile_lengths' without a declared batch_layout",
+    );
+}
+
+#[test]
+fn a_padded_emit_cannot_hide_the_lengths_that_bound_it() {
+    // Without them the caller holds a tensor whose trailing entries mean
+    // nothing and no way to learn how many there are — and the schema refuses a
+    // payload-shaped validity mask as the alternative, so this vector is the
+    // only account of the padding that exists.
+    let document = PADDED_EMIT_WORKFLOW
+        .replace(
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "",
+        )
+        .replace(
+            "      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
+            "",
+        );
+    assert_reports(
+        &document,
+        "declares padding on dimension 'max_tiles' whose valid_lengths 'tile_lengths' is not \
+         itself a declared workflow output",
+    );
+}
+
 #[test]
 fn a_padding_entry_names_its_length_by_name_and_not_by_role() {
     // Audio named lengths before there was a generic word for them, and a
