@@ -3499,7 +3499,10 @@ mod workspace_governance_tests {
         )
         .unwrap();
         assert_eq!(req.bytes, layout.total_bytes as u64);
-        assert_eq!(layout.scores_bytes, 1 * 32 * 2048 * 2048 * 4);
+        // batch(1) x heads x q_seq x kv_seq x f32, in the order
+        // std_attention_workspace_layout multiplies them; the unit batch is
+        // elided so the expression is not an identity op.
+        assert_eq!(layout.scores_bytes, 32 * 2048 * 2048 * 4);
         assert!(layout.present_key_offset.is_none());
         assert_eq!(req.lifetime, WorkspaceLifetime::StepScoped);
         assert!(matches!(
@@ -3519,8 +3522,8 @@ mod workspace_governance_tests {
         .unwrap();
         let req = std_attention_workspace_requirement(&inputs, Some(32), Some(8), true, 3).unwrap();
         assert_eq!(req.bytes, layout.total_bytes as u64);
-        assert_eq!(layout.stage_key_bytes, 1 * 8 * 2049 * 128 * 2);
-        assert_eq!(layout.stage_value_bytes, 1 * 8 * 2049 * 128 * 2);
+        assert_eq!(layout.stage_key_bytes, 8 * 2049 * 128 * 2);
+        assert_eq!(layout.stage_value_bytes, 8 * 2049 * 128 * 2);
         assert_eq!(req.lifetime, WorkspaceLifetime::SessionPersistent);
         assert!(matches!(
             req.role,
@@ -3669,8 +3672,9 @@ mod workspace_governance_tests {
 }
 
 /// Regression guard for issue #736: the governed default-domain `Attention`
-/// score + staged-K/V composite is routed through `Kernel::workspace_requirement`
-/// + an executor-prepared workspace, consumed via `execute_with_workspace`.
+/// score + staged-K/V composite is routed through
+/// `Kernel::workspace_requirement` + an executor-prepared workspace, consumed
+/// via `execute_with_workspace`.
 /// This CPU-only source scan fails if the governed dispatch reintroduces raw
 /// staged K/V allocation, and runs on CI without a GPU.
 #[cfg(test)]

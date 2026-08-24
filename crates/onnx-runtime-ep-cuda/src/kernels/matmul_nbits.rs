@@ -11465,7 +11465,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
         let blob_size = block_size / 2;
         let zp_row_bytes = k_blocks.div_ceil(2);
 
-        let mut state = 0xcafef00d_1234_5678u64;
+        let mut state = 0xcafe_f00d_1234_5678_u64;
         let mut next = || {
             state = state
                 .wrapping_mul(6364136223846793005)
@@ -12492,6 +12492,11 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
     /// split-K heuristic is pinned OFF so the non-interleaved reference always
     /// takes the wide-load multicol kernel that the interleaved path replaces.
     /// Returns `None` when no CUDA device / fp16 NVRTC headers are available.
+    // Eight parameters is the point: this helper exists to sweep a matrix of
+    // independent route toggles, and naming each one at the call site is what
+    // makes the A/B tests below readable. Bundling them into a struct would
+    // move that matrix somewhere the reader has to go look for it.
+    #[allow(clippy::too_many_arguments)]
     fn run_symmetric_block_raw(
         k: usize,
         n: usize,
@@ -15150,8 +15155,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                     &a_strides_m,
                     device,
                 ),
-                packed_view.clone(),
-                scales_view.clone(),
+                packed_view,
+                scales_view,
             ];
             {
                 let mut outputs_m = [TensorMut::new(
@@ -15196,8 +15201,8 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
                         &a_strides_1,
                         device,
                     ),
-                    packed_view.clone(),
-                    scales_view.clone(),
+                    packed_view,
+                    scales_view,
                 ];
                 let mut outputs_1 = [TensorMut::new(
                     device_ptr_mut(ref_out_dev),
@@ -15771,7 +15776,7 @@ extern "C" __global__ void matmul_nbits_gemv_f16_scales_f16_down_staged_referenc
             for n in [1usize, 2, 8, 64, 256, 257, 431, 432, 433, 4096, 202048] {
                 let factor = scales_f16_zp_split_factor(n, mp);
                 assert!(
-                    factor <= warps && warps % factor == 0,
+                    factor <= warps && warps.is_multiple_of(factor),
                     "N={n} mp={mp} produced factor {factor}, which does not divide {warps} warps"
                 );
             }

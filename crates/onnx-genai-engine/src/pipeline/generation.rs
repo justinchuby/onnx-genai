@@ -943,8 +943,7 @@ pub(crate) fn test_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
 /// the next. Nothing else about the workflow changes, so a session test and a
 /// stateless test still differ in one declared property rather than in two
 /// unrelated fixtures.
-#[cfg(test)]
-#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+#[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
     test_decoder_runtime_inner(TestWorkflowShape::LoopCarriedSession)
 }
@@ -966,8 +965,7 @@ pub(crate) fn test_session_decoder_runtime() -> anyhow::Result<WorkflowRuntime> 
 /// own cell, unread by any step. The doc on `SessionContinuation` names that as
 /// the intended shape rather than an oversight: a conversation the request
 /// binding carries has no reader inside the workflow.
-#[cfg(test)]
-#[cfg_attr(not(feature = "native-backend"), allow(dead_code))]
+#[cfg(all(test, feature = "native-backend"))]
 pub(crate) fn test_conversation_decoder_runtime() -> anyhow::Result<WorkflowRuntime> {
     test_decoder_runtime_inner(TestWorkflowShape::PromptPrefixConversation)
 }
