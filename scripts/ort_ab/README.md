@@ -230,13 +230,16 @@ hypothetical: a peer ran `ps`, saw no benchmark process, and started a sweep
 *between two arms* of somebody else's A/B.
 
 That is the general rule, and it is worth stating on its own. **Never conclude
-the host is free from "nothing of mine is running", from `ps`, or from a
-point-in-time `loadavg`.** All three sample an instant, occupancy is a property
-of an interval, and the lock is the only statement about the interval — because
-it is a *declaration* rather than a measurement. `--gate N` additionally waits
-for the *instantaneous runnable count* to fall to N before starting, which
-drains load from people who never took the lock; it is a start admission
-control and nothing more.
+the host is free from "nothing of mine is running", from `ps`, or from a single
+`loadavg` reading.** The first two sample an instant, and occupancy is a
+property of an interval. `loadavg` fails the other way — it is an exponential
+moving average, so it stays high after a heavy run has ended and reads low
+while a burst is still in flight (see below) — but the conclusion is the same:
+the lock is the only statement about the interval, because it is a
+*declaration* rather than a measurement. `--gate N` additionally waits for the
+*instantaneous runnable count* to fall to N before starting, which drains load
+from people who never took the lock; it is a start admission control and
+nothing more.
 
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
@@ -301,7 +304,7 @@ The lock and the gate decide whether to **start**. They cannot tell you
 afterwards whether the numbers are any good, because they sample instants: a
 gate sampled either side of a 2 s arm reported "runnable 2-4, clean" for runs
 that were getting 50-70% of a core, against a 52% A/A null. Add
-`--expect-cores N --min-efficiency F` to decide whether to **believe** it:
+`--expect-cores N --min-efficiency F` to decide whether to **reject** it:
 
 ```sh
 scripts/hostlock.sh run --owner leon --reason "softmax 28-cell matrix" \
