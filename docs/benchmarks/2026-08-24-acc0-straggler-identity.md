@@ -180,9 +180,47 @@ conflicts vary per process while virtual layout does not. That is per-process,
 durable, invisible to the layout arm, and able to slow equal work.
 
 It is written here as the next hypothesis to test, explicitly **not** as a
-finding. The way to test it is to vary physical backing — for example by
-forcing or forbidding huge pages for the weight arena, which changes colouring
-granularity — and to pre-register the rule before looking, exactly as above.
+finding.
+
+### 4a. And it is wrong — physical backing is excluded too
+
+Tested immediately rather than left as a lead, because a hypothesis named in a
+record acquires weight it has not earned. Physical frames cannot be read here
+(`/proc/self/pagemap` returns PFN 0 without `CAP_SYS_ADMIN`) and the sysfs THP
+control is root-only, so the one unprivileged lever is
+`prctl(PR_SET_THP_DISABLE)`, which is inherited across `exec`. This host has
+THP `[always]` with 2.18 GB of `AnonHugePages` live, so the arena really is
+2 MiB-backed by default.
+
+`work_skew` is the right metric for this arm precisely because disabling THP
+slows everything: `max/mean − 1` is **scale-invariant**, so a uniform slowdown
+cannot manufacture a result in either direction.
+
+14 launches per arm, interleaved, alternating order:
+
+| arm | median `work_skew` | median share (excess) | median wall | `ops_spread` | lane→cpu maps |
+|---|---|---|---|---|---|
+| `thp` (2 MiB) | 0.5329 | 0.5766 (+0.5099) | 0.851 | 0.0000 | 1 |
+| `nothp` (4 KiB) | 0.5454 | 0.6599 (+0.5932) | 0.874 | 0.0000 | 1 |
+
+```
+S(nothp)/S(thp) = 1.023      (ACCEPT <= 0.60, REJECT >= 0.85)
+VERDICT: REJECT
+```
+
+The imbalance survives 4 KiB backing **entirely intact** — 1.023, i.e. very
+slightly *larger*, nowhere near the 0.60 the hypothesis required. Physical page
+backing is not the selector.
+
+The lever was verified before measuring (`AnonHugePages` default 262144 kB,
+wrapper 0 kB), and that control had already earned its keep twice: a first
+verification attempt appeared to show the wrapper doing nothing because the
+test mapping was not 2 MiB-aligned, and a first probe run aborted because the
+self-test source was passed through shell quoting that mangled its newlines.
+Both would have produced two identical arms and a free, confident REJECT.
+
+Incidentally, disabling THP costs only **1.027×** wall here, so this decode
+workload is not meaningfully TLB-bound.
 
 ## Where this leaves the straggler
 
@@ -194,21 +232,31 @@ Established by measurement, not argument:
 * **Not assignment.** `ops_spread` = 0.0000 in 24/24 launches.
 * **Not placement.** One lane→CPU map across 24 launches; victim moves anyway.
 * **Not address layout.** `setarch -R` gives the same concentration as ASLR.
+* **Not physical page backing.** Disabling THP leaves `work_skew` at 1.023× —
+  unchanged.
 * **Per-process and durable.** Persistent within a launch, different between
   launches.
 * **Usually genuinely slower at computing** (post-hoc, 73 launches across three
   experiments): the last-arriving lane is also the highest-`work_ns` lane in
   0.667 / 0.667 / 0.684 of launches against a chance share of 0.067.
 
-What has *not* been established, and is the next question: what picks the
-victim at startup. The remaining shape is something that varies between
-processes but is not the address layout and not the CPU assignment. Section 4
-narrows it further — the victim usually computes longer, so the selector has to
-make identical work on a fixed core at fixed virtual addresses take longer, and
-**physical** page assignment is the family that fits. That is recorded as the
-next hypothesis rather than a conclusion; naming a mechanism as established here
-would repeat the error of carrying "weight-arena placement across the two
-L3/CCX domains" for two records on a single-NUMA host.
+What has *not* been established: what picks the victim. Five mechanisms are
+now excluded by measurement — assignment, placement, virtual address layout,
+physical page backing, and (from the earlier records) clock/boost state and
+foreign load. The constraint is tight and worth stating precisely, because it
+is what the next probe has to satisfy:
+
+> Something that is fixed for the lifetime of a process and different between
+> processes, that is **not** the lane index, **not** the CPU, **not** the
+> virtual layout and **not** the page size, and that makes an identical number
+> of identical ops take ~55% longer on one lane out of fifteen.
+
+**No candidate is carried forward.** The candidate list is empty and this
+record says so rather than nominating a replacement. Section 4 nominated
+physical page backing and section 4a killed it inside the same session; the
+lesson from carrying "weight-arena placement across the two L3/CCX domains"
+for two records on a single-NUMA host is that an untested nomination in a
+record acquires weight it has not earned.
 
 ## Method notes
 

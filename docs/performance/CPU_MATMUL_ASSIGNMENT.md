@@ -2249,6 +2249,20 @@ time. That figure is now stale; the re-measurement replaces it.
 > still hands out different physical frames each exec, and the large caches
 > here are physically indexed. Not yet tested, and not to be cited as a cause.
 >
+> **Tested the same session, and rejected.** `prctl(PR_SET_THP_DISABLE)` is the
+> only unprivileged lever on this host (pagemap PFNs are masked, the sysfs THP
+> control is root-only), and it was verified to work before measuring
+> (`AnonHugePages` 262144 kB default, 0 kB under the wrapper). 14 launches per
+> arm, interleaved: `work_skew` **0.5329** with 2 MiB backing against **0.5454**
+> with 4 KiB backing, ratio **1.023** against a required 0.60. Both arms held
+> `ops_spread` = 0.0000 and one lane->cpu map. `work_skew` is scale-invariant,
+> so the 1.027x wall cost of disabling THP cannot have manufactured this.
+> **Physical page backing is not the selector**, and no candidate replaces it:
+> the list is empty. The straggler is real, costs ~0.31 of the width-16 window,
+> and is unexplained. What the next probe must satisfy: fixed for a process,
+> different between processes, and none of lane index, CPU, virtual layout or
+> page size.
+>
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
 > (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not
