@@ -1077,8 +1077,13 @@ mod lpi_ex {
     pub(super) const AFFINITY_MASK_OFFSET: usize = 0;
     /// Offset of `GROUP_AFFINITY::Group` within the affinity.
     pub(super) const AFFINITY_GROUP_OFFSET: usize = 8;
-    /// Bytes a `RelationNumaNode` record must have for its affinity to be
-    /// readable: the header plus the whole `NUMA_NODE_RELATIONSHIP`.
+    /// Size of a well-formed `RelationNumaNode` record: the header plus the
+    /// whole `NUMA_NODE_RELATIONSHIP`. This is what the OS emits and what the
+    /// tests build; the parser itself does not gate on it, and in fact needs
+    /// only 42 bytes to reach the last field it reads. Nothing depends on the
+    /// difference because the OS never emits a 42..48-byte record -- but the
+    /// constant is the record's *size*, not a parser minimum, and naming it as
+    /// a minimum would be describing a check that does not exist.
     pub(super) const NUMA_RECORD_MIN_LEN: usize = HEADER_LEN + 40;
     /// Bits per processor group mask (`KAFFINITY` is 64-bit on x64/arm64
     /// Windows), and the crate-wide CPU encoding's group stride.
@@ -1086,9 +1091,18 @@ mod lpi_ex {
 
     /// Tie the literals above to the ABI of the `windows-sys` types actually
     /// compiled against, so a struct change upstream breaks the build instead
-    /// of silently shifting a field. Restricted to 64-bit Windows because the
-    /// literals describe that ABI; on a 32-bit Windows target the derived
-    /// offsets in [`super::windows_imp`] still apply and these do not.
+    /// of silently shifting a field.
+    ///
+    /// Restricted to 64-bit Windows because the literals *are* the 64-bit ABI
+    /// and nothing here derives them at runtime. On a 32-bit Windows target
+    /// `GROUP_AFFINITY` is 12 bytes rather than 16, so `GROUP_MASK_OFFSET`,
+    /// `AFFINITY_GROUP_OFFSET` and `GROUP_BITS` would all be wrong and this
+    /// module would misparse rather than fail to build. That is not a
+    /// regression -- the previous code's `1usize << bit` for `bit` up to 63 was
+    /// already 32-bit-broken, and no 32-bit Windows target appears in
+    /// `.github/workflows/` or in any manifest -- but it is the honest reason
+    /// the assertions are gated rather than a claim that something else covers
+    /// that case. Nothing does.
     #[cfg(all(target_os = "windows", target_pointer_width = "64"))]
     const _: () = {
         use core::mem::{offset_of, size_of};
@@ -1491,9 +1505,13 @@ mod tests {
     /// this asserts the observable half: a buffer sized to exactly one record,
     /// with no slack whatsoever, parses correctly.
     ///
-    /// Under Miri this is also the direct falsifier: the old by-value read of
-    /// `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` out of a 48-byte allocation is
-    /// exactly what Miri reports as an out-of-bounds access.
+    /// Miri would have caught the old read instantly -- an 80-byte
+    /// `read_unaligned` out of a 48-byte allocation is precisely what it
+    /// reports -- but it never had the chance: the old code was
+    /// `cfg(target_os = "windows")` and the Miri lane runs the Linux host
+    /// target, so it was never compiled there. Worth stating rather than
+    /// leaving as an implied guarantee: the tool that would have found this
+    /// cannot see the platform it lived on.
     #[test]
     fn a_numa_buffer_with_no_slack_past_the_last_record_still_parses() {
         let buffer = numa_record(0, 0, 0b1111, None);
