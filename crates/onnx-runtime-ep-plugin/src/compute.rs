@@ -197,6 +197,15 @@ pub enum ShapeInference {
     /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
     /// has to be read off input 1.
     CausalConvWithState,
+    /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
+    /// when absent) using a 1-D Bool `condition`.
+    ///
+    /// The selected extent is **data-dependent** — it is the number of true
+    /// entries in `condition`, which no amount of shape reasoning can supply.
+    /// That is expressible here because `infer_shapes` runs at Compute time and
+    /// receives `TensorView`s, so it reads the condition's *values*. Capability
+    /// only needs the rule to exist, not to produce an extent.
+    Compress { axis: Option<i64> },
     /// Op the shape table cannot resolve. `reason` separates the two cases,
     /// which look identical at the decline site and are not the same defect.
     Declined {
@@ -540,6 +549,13 @@ impl ShapeInference {
                     num_outputs,
                 }
             }
+
+            // ── Compress ──────────────────────────────────────────────────
+            // `axis` is optional: absent means the input is flattened first.
+            // Both spellings are modelled, so neither reaches `Unmodelled`.
+            "Compress" => Self::Compress {
+                axis: int_attr("axis"),
+            },
 
             _ => Self::Declined {
                 op_type: op.to_string(),
@@ -3557,6 +3573,59 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
 // Shape inference implementations
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Indices of the true entries in a 1-D Bool `condition`.
+///
+/// This is the only place the shape table reads a tensor's *values*, so the two
+/// ways it can be wrong are worth naming.
+///
+/// **Device memory.** `TensorView::data` may point at device memory, and this
+/// runs on the host. A device-resident condition is refused rather than read
+/// through a pointer the host cannot dereference. That is a hard error, not a
+/// silent decline, because by Compute time the claim has already been accepted —
+/// the honest outcome is to say why. Making the CUDA plugin claim `Compress`
+/// needs a D2H copy of the condition (a 1-D Bool tensor, so cheap) plus a stream
+/// sync, which belongs with that EP rather than here.
+///
+/// **Strides.** ORT may hand back a non-contiguous view, so the stride is
+/// honoured instead of assuming packed bytes.
+fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
+    if condition.dtype != DataType::Bool {
+        return Err(format!(
+            "Compress: condition must be Bool, got {:?}",
+            condition.dtype
+        ));
+    }
+    if !condition.device.is_host_accessible() {
+        return Err(format!(
+            "Compress: condition is on {:?}, which the host cannot read during \
+             shape inference. Compress needs the condition's values to size its \
+             output; an EP with device-resident inputs must copy it to the host \
+             before Compute.",
+            condition.device
+        ));
+    }
+
+    let len = condition.shape.first().copied().unwrap_or(0);
+    let stride = condition.strides.first().copied().unwrap_or(1);
+    let base = condition.data.as_ptr() as *const u8;
+    if base.is_null() {
+        return Err("Compress: condition has a null data pointer".into());
+    }
+
+    let mut out = Vec::new();
+    for i in 0..len {
+        let offset = condition.byte_offset as isize + (i as isize) * (stride as isize);
+        // SAFETY: `condition` is a host-accessible Bool view of `len` elements;
+        // the offset is inside it by the view's own contract, and Bool is one
+        // byte so the element stride is the byte stride.
+        let byte = unsafe { *base.offset(offset) };
+        if byte != 0 {
+            out.push(i);
+        }
+    }
+    Ok(out)
+}
+
 /// Infer output shapes from the shape inference strategy and input views.
 fn infer_shapes(
     strategy: &ShapeInference,
@@ -4298,6 +4367,50 @@ fn infer_shapes(
             Ok(outputs)
         }
 
+        ShapeInference::Compress { axis } => {
+            // The only rule here that reads input *values* rather than shapes.
+            // `Compress` selects the entries where `condition` is true, so the
+            // output extent is a popcount and is unknowable until Compute —
+            // which is precisely when this runs.
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "Compress: expected 2 inputs (data, condition), got {}",
+                    inputs.len()
+                ));
+            }
+            let data = &inputs[0];
+            let condition = &inputs[1];
+            if condition.shape.len() != 1 {
+                return Err(format!(
+                    "Compress: condition must be 1-D, got rank {}",
+                    condition.shape.len()
+                ));
+            }
+
+            // Mirror the kernel: with no axis the input is flattened first.
+            let (mut shape, axis_idx) = match axis {
+                Some(a) => {
+                    let rank = data.shape.len() as i64;
+                    let a = if *a < 0 { a + rank } else { *a };
+                    if a < 0 || a >= rank {
+                        return Err(format!("Compress: axis {a} out of range for rank {rank}"));
+                    }
+                    (data.shape.to_vec(), a as usize)
+                }
+                None => (vec![data.shape.iter().product::<usize>()], 0),
+            };
+
+            // `condition` may be shorter or longer than the axis; the spec
+            // selects over the overlap, which is what the kernel does too.
+            let axis_len = shape[axis_idx];
+            let selected = count_true(condition)?
+                .into_iter()
+                .filter(|&i| i < axis_len)
+                .count();
+            shape[axis_idx] = selected;
+            Ok(vec![shape])
+        }
+
         ShapeInference::Declined {
             op_type,
             domain,
@@ -4696,6 +4809,115 @@ fn after() {}
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
+    }
+
+    // ── Compress ─────────────────────────────────────────────────────────────
+    //
+    // The only rule that reads input *values*, so it gets its own tests rather
+    // than riding on the claimability guard: that guard only asserts the op has
+    // an arm, which a wrong arm satisfies just as well as a right one.
+
+    /// Build a host Bool condition view over `bits`.
+    fn bool_condition<'a>(
+        bits: &'a [u8],
+        shape: &'a [usize],
+        strides: &'a [i64],
+    ) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(bits.as_ptr() as *mut std::ffi::c_void),
+            DataType::Bool,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    fn f32_data<'a>(shape: &'a [usize], strides: &'a [i64], buf: &'a [f32]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(buf.as_ptr() as *mut std::ffi::c_void),
+            DataType::Float32,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn compress_axis_extent_is_the_condition_popcount() {
+        // 3x4, compress along axis 1 keeping columns 0 and 2.
+        let buf = vec![0.0f32; 12];
+        let data = f32_data(&[3, 4], &[4, 1], &buf);
+        let bits = [1u8, 0, 1, 0];
+        let cond = bool_condition(&bits, &[4], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(1) }, &[data, cond]).unwrap(),
+            vec![vec![3, 2]]
+        );
+    }
+
+    #[test]
+    fn compress_without_axis_flattens_first() {
+        // No axis: the input is flattened, so the output is 1-D of the popcount.
+        let buf = vec![0.0f32; 6];
+        let data = f32_data(&[2, 3], &[3, 1], &buf);
+        let bits = [1u8, 1, 0, 1, 0, 0];
+        let cond = bool_condition(&bits, &[6], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: None }, &[data, cond]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn compress_ignores_condition_entries_past_the_axis() {
+        // The spec selects over the overlap: a condition longer than the axis
+        // does not invent rows. Picking a *true* entry past the end is what
+        // makes this discriminating — a rule that counted the whole condition
+        // would answer 3 here instead of 2.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1, 1, 1];
+        let cond = bool_condition(&bits, &[5], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap(),
+            vec![vec![2]]
+        );
+    }
+
+    #[test]
+    fn compress_honours_a_non_unit_condition_stride() {
+        // A strided view must not be read as packed bytes. Every other element
+        // is true, so a packed read would answer 1 where the truth is 2.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1, 0, 1];
+        let cond = bool_condition(&bits, &[3], &[2]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn compress_refuses_a_device_resident_condition() {
+        // The host cannot dereference device memory. Erroring names the reason;
+        // reading through the pointer would be undefined behaviour and sizing
+        // the output from a guess would be silently wrong.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1];
+        let cond = TensorView::new(
+            DevicePtr(bits.as_ptr() as *mut std::ffi::c_void),
+            DataType::Bool,
+            &[3],
+            &[1],
+            onnx_runtime_ir::DeviceId::cuda(0),
+        );
+        let err = infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap_err();
+        assert!(
+            err.contains("host cannot read"),
+            "error should name the device restriction: {err}"
+        );
     }
 
     // ── AttentionStd (ai.onnx::Attention, opset 23+) ──────────────────────────

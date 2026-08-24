@@ -70,7 +70,6 @@ const NOT_CLAIMABLE: &[(&str, &str)] = &[
     ("CastLike", ""),
     ("CenterCropPad", ""),
     ("Col2Im", ""),
-    ("Compress", ""),
     ("CompressedSparseAttention", "pkg.nxrt"),
     ("Constant", ""),
     ("ConstantOfShape", ""),
