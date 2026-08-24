@@ -122,6 +122,18 @@
 //! spawned wide and joined entirely between the two snapshots; see
 //! [`Contention::own_time_complete`] for why that is stated rather than
 //! sampled around.
+//!
+//! # Measured contention and declared intent are different questions
+//!
+//! Everything above measures what the host *did*. [`hostlock`] reads what
+//! somebody *said they were doing* -- the advisory lock in `scripts/hostlock.sh`
+//! that has existed on `main` with no in-tree consumer. Neither substitutes for
+//! the other: an unlocked run on a genuinely idle box is fine, and a locked run
+//! next to a co-tenant's unannounced `cargo test` is not. A row wants both, and
+//! [`hostlock::field`] deliberately reads at both ends of the window so it
+//! cannot report a single credible holder for a window that changed hands.
+
+pub mod hostlock;
 
 use std::time::Instant;
 
