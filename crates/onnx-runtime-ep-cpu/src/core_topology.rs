@@ -422,6 +422,59 @@ pub(crate) fn require_host_for_placement() -> Result<&'static CoreTopology, &'st
     topology_or_fail_closed(host(), DETECTION_SUPPORTED)
 }
 
+/// The variable a CI lane sets to declare that this crate's placement
+/// falsifiers must actually execute there.
+///
+/// Modelled on `NXRT_REQUIRE_ORT_TESTS`, which the `cli-ort` job sets so that a
+/// missing ORT reddens the one lane whose job is to run against ORT, while a
+/// developer without ORT still gets a skip. The same asymmetry applies here:
+/// no host is obliged to have two physical cores or a working
+/// `sched_setaffinity`, but the lanes we point at this crate are, and until
+/// something says so their absence is indistinguishable from a pass.
+#[cfg(test)]
+pub(crate) const REQUIRE_PLACEMENT_ENV: &str = "NXRT_REQUIRE_PLACEMENT_TESTS";
+
+/// Whether the current lane has declared the placement falsifiers mandatory.
+#[cfg(test)]
+pub(crate) fn placement_tests_required() -> bool {
+    std::env::var(REQUIRE_PLACEMENT_ENV).as_deref() == Ok("1")
+}
+
+/// The second placement capability, after detection: at least two physical
+/// cores to place workers on.
+///
+/// Returns `true` when the check may proceed. When it may not, this panics in a
+/// lane that declared the checks mandatory and otherwise states the skip on
+/// stderr -- as opposed to the bare `return` these sites used before, which is
+/// a silent pass.
+///
+/// Detection already fails closed through [`require_host_for_placement`], but
+/// that only proves the topology is *readable*. A host that reads back one
+/// physical core switches every "one worker per physical core" assertion off
+/// while satisfying the anti-vacuity guard, because the guard asserts
+/// `core_count() > 0`. The capabilities the assertions need and the capability
+/// the guard checks are not the same set.
+#[cfg(test)]
+pub(crate) fn require_two_cores_for_placement(cores: &CoreTopology, what: &str) -> bool {
+    if cores.core_count() >= 2 {
+        return true;
+    }
+    assert!(
+        !placement_tests_required(),
+        "{REQUIRE_PLACEMENT_ENV}=1 but this host reports {} physical core(s), so `{what}` cannot \
+         distinguish one worker per physical core from two workers sharing one, and would report \
+         success without testing anything. Point this lane at a runner with two physical cores or \
+         stop requiring placement tests on it.",
+        cores.core_count()
+    );
+    eprintln!(
+        "skipping {what}: {} physical core(s) cannot express \"one worker per core\" \
+         distinguishably",
+        cores.core_count()
+    );
+    false
+}
+
 /// The number of physical cores the current process may actually run on.
 ///
 /// Intersects the detected core topology with the process's allowed CPU set
@@ -834,6 +887,70 @@ mod tests {
         assert!(
             topology.logical_count() >= logical,
             "topology covers {} logical CPUs but the process sees {logical}",
+            topology.logical_count()
+        );
+    }
+
+    /// The anti-vacuity guard for the *other two* capabilities.
+    ///
+    /// `linux_detection_succeeds_so_placement_checks_cannot_silently_skip`
+    /// proves detection answers. The placement falsifiers need three things,
+    /// not one: detection, at least two physical cores, and an environment that
+    /// accepts `sched_setaffinity`. The existing guard is satisfied on hosts
+    /// where the other two are absent -- a 2-vCPU runner exposing one SMT pair
+    /// reports `core_count() == 1`, and every placement check returns early
+    /// while the guard reports the machine is fine.
+    ///
+    /// So this is deliberately *not* an unconditional assertion. A developer
+    /// laptop in a 1-core container is a legitimate environment and reddening
+    /// it gets the guard deleted. `NXRT_REQUIRE_PLACEMENT_TESTS=1` is the lane
+    /// saying "here, absence is a defect" -- the same shape as
+    /// `NXRT_REQUIRE_ORT_TESTS=1` on the `cli-ort` job.
+    #[test]
+    fn placement_capabilities_are_present_when_the_lane_requires_them() {
+        if !placement_tests_required() {
+            eprintln!(
+                "{REQUIRE_PLACEMENT_ENV} is unset, so placement capabilities are not required \
+                 here; the placement checks in this crate may be skipping"
+            );
+            return;
+        }
+        assert!(
+            crate::decode_affinity::affinity_observation_supported(),
+            "{REQUIRE_PLACEMENT_ENV}=1 on a target with no affinity backend. Placement is \
+             unanswerable there by construction, so requiring it can only ever be a false \
+             failure -- unset it for this lane."
+        );
+        let topology = require_host_for_placement()
+            .expect("affinity is supported here, so detection must be too");
+        assert!(
+            topology.core_count() >= 2,
+            "{REQUIRE_PLACEMENT_ENV}=1 but this host reports {} physical core(s) across {} \
+             logical CPUs. Every `one worker per physical core` check in this crate returns \
+             early below two, so this lane is running them as no-ops.",
+            topology.core_count(),
+            topology.logical_count()
+        );
+        // Probing the CPUs the placement checks actually pin to, not a
+        // representative one: a confined process (cgroup cpuset, `taskset`)
+        // can pin to some CPUs and not others, and the checks derive their
+        // targets from the machine's topology rather than from the allowed set.
+        let cpus: Vec<usize> = (0..topology.logical_count()).collect();
+        let pinnable = crate::decode_affinity::order_pin_targets(&cpus, Some(topology))
+            .into_iter()
+            .take(2)
+            .all(|cpu| {
+                std::thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
+                })
+                .join()
+                .unwrap_or(false)
+            });
+        assert!(
+            pinnable,
+            "{REQUIRE_PLACEMENT_ENV}=1 but this environment refuses to pin a thread to the first \
+             two CPUs the placement policy would choose out of {} logical CPUs, so every \
+             observed-placement check skips here.",
             topology.logical_count()
         );
     }

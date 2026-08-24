@@ -75,6 +75,10 @@ impl MockCompiledEp {
 }
 
 impl ExecutionProvider for MockCompiledEp {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "mock_compiled_ep"
     }

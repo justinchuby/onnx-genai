@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Result};
 
+use crate::kernels::csa_state_group::CsaStateGroupLedger;
 use crate::runtime::CudaRuntime;
 
 /// The five logical CSA cursors (D6, §4.6). Every cursor is a bounded scalar
@@ -307,6 +308,12 @@ pub struct CsaMetrics {
     host_bytes_total: AtomicU64,
     bytes_avoided_total: AtomicU64,
     layers: Mutex<BTreeMap<u64, CsaLayerMetrics>>,
+    /// B6 accounting authority: the single ledger every CSA device-buffer
+    /// reservation charges, isolated per `(request, device)`. Threaded from the
+    /// EP into every kernel via this metrics surface, so there is no
+    /// process-wide global. Unlimited by default (`Arc::default`), which keeps
+    /// the reservation path byte-identical until a limit is armed.
+    state_groups: Arc<CsaStateGroupLedger>,
 }
 
 impl CsaMetrics {
@@ -328,6 +335,65 @@ impl CsaMetrics {
     /// Increment the speculative rollback counter (§8 "rollback counts").
     pub fn record_rollback(&self) {
         self.rollback_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The shared CSA state-group accounting ledger (B6). Every CSA device
+    /// buffer reservation charges this ledger, so it is the single authority
+    /// for CSA device residency. Clone is cheap (`Arc`); all clones share the
+    /// same accounting state.
+    pub(crate) fn state_group_ledger(&self) -> Arc<CsaStateGroupLedger> {
+        Arc::clone(&self.state_groups)
+    }
+
+    /// Resident CSA state-group device bytes across all requests/devices (B6).
+    /// This is the accounting authority's residency observed through the §8
+    /// telemetry surface, so callers never reach into the ledger directly.
+    pub fn csa_state_group_resident_bytes(&self) -> u64 {
+        self.state_groups.resident_bytes()
+    }
+
+    /// High-water mark of CSA state-group residency since process start.
+    pub fn csa_state_group_peak_bytes(&self) -> u64 {
+        self.state_groups.peak_bytes()
+    }
+
+    /// Resident compressed-record bytes — the class the HCA path shrinks
+    /// relative to `csa_state_group_dense_ring_bytes`.
+    pub fn csa_state_group_compressed_bytes(&self) -> u64 {
+        self.state_groups.compressed_bytes()
+    }
+
+    /// Resident dense-ring bytes (the uncompressed sliding window).
+    pub fn csa_state_group_dense_ring_bytes(&self) -> u64 {
+        self.state_groups.dense_ring_bytes()
+    }
+
+    /// Count of reservations refused because they would cross the managed
+    /// limit (fail-closed admissions).
+    pub fn csa_state_group_charge_failures(&self) -> u64 {
+        self.state_groups.charge_failures()
+    }
+
+    /// Number of distinct `(request, device)` CSA state groups currently
+    /// resident.
+    pub fn csa_state_group_active_count(&self) -> usize {
+        self.state_groups.active_group_count()
+    }
+
+    /// Resident bytes for one `(request, device)` group — the isolation view.
+    pub fn csa_state_group_resident_for(&self, request: u64, device_ordinal: u32) -> u64 {
+        self.state_groups.resident_for(request, device_ordinal)
+    }
+
+    /// The managed CSA state-group byte limit (`0` = unlimited, the default).
+    pub fn csa_state_group_limit(&self) -> u64 {
+        self.state_groups.limit()
+    }
+
+    /// Arm the managed CSA state-group byte limit (`0` = unlimited). A group
+    /// whose reservation would cross it is refused *before* device allocation.
+    pub fn set_csa_state_group_limit(&self, bytes: u64) {
+        self.state_groups.set_limit(bytes);
     }
 
     /// Total speculative rollbacks observed.

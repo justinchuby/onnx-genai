@@ -2263,6 +2263,44 @@ time. That figure is now stale; the re-measurement replaces it.
 > different between processes, and none of lane index, CPU, virtual layout or
 > page size.
 >
+> **The dynamic decode claim was unreachable in production (2026-08-24).**
+> `ONNX_GENAI_CPU_DECODE_SCHEDULE=steal` is documented as selecting a dynamic
+> tile claim and was **inert in every default build**: the parse arms
+> recognising it were `#[cfg(feature = "mlas")]`, while the path they select --
+> an `AtomicUsize` cursor over the tile table on the ordinary native SPMD pool
+> -- has no MLAS dependency at all. Only the *optional executor* needs `mlas`,
+> and `mlas` is off by default by policy. It survived because the existing
+> `work_stealing_*` tests construct `DecodeSchedule::Steal` directly, bypassing
+> the parser: the implementation was covered, its reachability was not. Third
+> member of the family after #1792 and the latched-`OnceLock` A/B. Un-gated, with
+> a test that starts from the env string and asserts parse -> build -> dispatch
+> with every output claimed exactly once; the control (gate restored) fails it
+> with `left: Fixed`.
+>
+> **What it is worth, and why the default did not change.** Four interleaved
+> arms with an A/A null, 60 launches each, width 16. Every arm is bimodal with
+> modes ~2.25x apart, so a pooled median estimates the *mode fraction* rather
+> than the effect and the report stratifies per arm. **Inside the slow mode the
+> dynamic claim removes ~20% of decode latency** (steal1 +19.44%, steal4
+> +20.41%, A/A null **0.0043**), replicated at n=24 (+19.72 / +21.46, A/A
+> 0.0223). The fast mode is unresolvable (A/A 0.0327) and the **A/A null on the
+> mode-weighted expectation is 0.0655**, so *no end-to-end claim is licensed and
+> `decode_schedule_from_raw` still falls through to `Fixed`*. The fix ships on
+> contract grounds -- a documented switch that silently does nothing is wrong
+> independently of whether turning it on is faster.
+>
+> Two things this changes for the straggler. The slow mode's excess over the
+> fast mode is ~2.01 ms and the claim recovers ~0.74 of it, so **~37% of the
+> width-16 slow mode is work-distribution cost that scheduling can recover** --
+> the first bite taken out of the straggler after five rejected hypotheses, and
+> it lands without identifying the selector. But **both granularities win
+> equally**, which undercuts the discrimination the probe was built for: a
+> `steal1` win (tiles == workers) is what absorbing a *late-waking* lane looks
+> like, and argues against the slow-executor reading that
+> `straggler_idx == slowest_idx` (0.667/0.667/0.684) supports. Recorded as a
+> tension, not resolved. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-steal-selector.md`](../benchmarks/2026-08-24-acc0-steal-selector.md).
+>
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
 > (it reproduces to +4.4%, 30.632 → 31.99 ms). **That control is not

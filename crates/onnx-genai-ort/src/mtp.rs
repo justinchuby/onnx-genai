@@ -133,7 +133,7 @@ impl MtpSessionHandle<'_> {
 
 pub struct MtpDecodeSession<'a> {
     session: MtpSessionHandle<'a>,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: MtpHeadSignature,
     mode: MtpDraftKvMode,
     batch_size: i64,
@@ -203,7 +203,13 @@ impl<'a> MtpDecodeSession<'a> {
                 io.hidden_rank
             )));
         }
-        let binding = IoBinding::new(session)?;
+        // The handle decides how the binding keeps its session alive: a
+        // borrowed head is outlived by the caller's session, an owned one has
+        // to hold its own strong reference.
+        let binding = match &session_handle {
+            MtpSessionHandle::Borrowed(session) => IoBinding::new(session)?,
+            MtpSessionHandle::Owned(session) => IoBinding::for_shared_session(Arc::clone(session))?,
+        };
         Ok(Self {
             session: session_handle,
             binding,

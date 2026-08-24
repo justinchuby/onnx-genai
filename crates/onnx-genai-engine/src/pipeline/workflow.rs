@@ -165,7 +165,11 @@ pub(crate) type ComponentBindingKey = (String, Vec<(String, Vec<i64>)>);
 pub(crate) type ComponentOutputKey = (String, String, Vec<i64>, String);
 
 pub(crate) struct StableComponentBinding {
-    binding: IoBinding,
+    /// Co-owns the component session it was created from: ORT frees the bound
+    /// state through that session, so it must not be released first. The
+    /// `Arc<Session>` inside the binding is what guarantees it, independently of
+    /// where this struct is stored or which field of the owner drops when.
+    binding: IoBinding<'static>,
     inputs: Vec<(String, Arc<Value>)>,
     outputs: Vec<(String, Arc<Value>)>,
     shared_outputs: Vec<(String, usize)>,
@@ -173,7 +177,9 @@ pub(crate) struct StableComponentBinding {
     service_generation: u64,
     graph_id: i32,
     captured: bool,
-    _allocator: Arc<onnx_genai_ort::Allocator>,
+    /// Kept alive because the stable input/output values were allocated from it
+    /// and ORT frees them through it. Like `binding`, it co-owns the session.
+    _allocator: Arc<onnx_genai_ort::Allocator<'static>>,
 }
 
 fn stable_component_outputs(
@@ -2581,7 +2587,7 @@ impl WorkflowRuntime {
             }
             EngineDecodeBackend::Ort | EngineDecodeBackend::Auto => {
                 let _ = output_shapes;
-                let session = self.models.session(selected_component).with_context(|| {
+                let session = self.models.sessions.get(selected_component).with_context(|| {
                     format!(
                         "workflow ONNX component '{selected_component}' selected for '{component}' \
                          was not loaded"
@@ -2623,7 +2629,7 @@ impl WorkflowRuntime {
         component: &str,
         declaration: &onnx_genai_metadata::WorkflowComponent,
         component_symbols: &HashMap<String, i64>,
-        session: &Session,
+        session: &Arc<Session>,
         resolved: &[(&str, &Value)],
         selected_outputs: &std::collections::BTreeMap<String, String>,
     ) -> anyhow::Result<Vec<(String, Value)>> {
@@ -2737,8 +2743,7 @@ impl WorkflowRuntime {
                 allocator
             } else {
                 let allocator = Arc::new(
-                    session
-                        .device_kv_allocator()?
+                    Session::shared_device_allocator(session)?
                         .context("stable component execution requires a CUDA allocator")?,
                 );
                 self.component_allocators
@@ -2784,7 +2789,7 @@ impl WorkflowRuntime {
         } else {
             None
         };
-        let mut binding = IoBinding::new(session)?;
+        let mut binding = IoBinding::for_shared_session(Arc::clone(session))?;
         let mut inputs = Vec::with_capacity(resolved.len());
         for (name, source) in resolved {
             let stable = if source.numel() == 0 {

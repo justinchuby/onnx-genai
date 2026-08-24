@@ -115,6 +115,15 @@ pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 /// SPMD split; `steal` decomposes the op into coarser tiles and lets resident
 /// workers claim tiles dynamically, so a delayed worker does not strand a whole
 /// static shard behind the per-op barrier.
+///
+/// `steal` is honoured in a **default (MLAS-free) build**: the dynamic claim is
+/// an `AtomicUsize` cursor over the tile table, run on the ordinary native SPMD
+/// pool. Building with the `mlas` feature additionally swaps the *executor* for
+/// `mlas_sys::WorkStealingThreadPool`, but that is a research reference and not
+/// what production selects -- the scheduling policy itself carries no MLAS
+/// dependency. Until 2026-08-24 the parse arms below were themselves gated on
+/// `feature = "mlas"`, which made this switch silently inert in every
+/// production build while the native claim path it selects sat unreachable.
 pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
 
 /// Bounded active-spin window before a worker parks, mirroring the
@@ -1525,9 +1534,7 @@ fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
     match raw.map(str::trim) {
         Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
         Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
         _ => DecodeSchedule::Fixed,
     }
@@ -4640,20 +4647,75 @@ mod tests {
             decode_schedule_from_raw(Some("fixed")),
             DecodeSchedule::Fixed
         );
-        let expected_steal = if cfg!(feature = "mlas") {
+        // The scheduling *policy* has no MLAS dependency -- the dynamic claim is
+        // an atomic cursor over the tile table dispatched on the native SPMD
+        // pool. Only the optional alternative executor is MLAS-provided, so
+        // `steal` must parse identically in a default build. Asserted
+        // unconditionally on purpose: a `cfg!(feature = "mlas")` expectation here
+        // is what let the selector go inert in production unnoticed.
+        assert_eq!(
+            decode_schedule_from_raw(Some("steal")),
             DecodeSchedule::Steal
-        } else {
-            DecodeSchedule::Fixed
-        };
-        assert_eq!(decode_schedule_from_raw(Some("steal")), expected_steal);
+        );
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            expected_steal
+            DecodeSchedule::Steal
         );
         assert_eq!(
             decode_schedule_from_raw(Some("bogus")),
             DecodeSchedule::Fixed
         );
+    }
+
+    /// The dynamic claim must be reachable *and correct* in a default,
+    /// MLAS-free build. The other `work_stealing_*` tests construct
+    /// `DecodeSchedule::Steal` directly, which is precisely how the selector
+    /// came to be inert in production without any test noticing: the
+    /// implementation was covered, its reachability was not. This one starts
+    /// from the env string a user actually sets and asserts the whole chain --
+    /// parse, build, dispatch -- covers every output exactly once, with no gaps
+    /// from a cursor that overruns and no duplicates from two workers claiming
+    /// one tile.
+    #[test]
+    fn work_stealing_is_reachable_from_the_env_string_without_mlas() {
+        let schedule = decode_schedule_from_raw(Some("steal"));
+        assert_eq!(
+            schedule,
+            DecodeSchedule::Steal,
+            "the documented `steal` value must select the dynamic claim in a default build"
+        );
+        let pools = single_group_pool_with_schedule(4, schedule);
+        assert!(pools.uses_work_stealing());
+
+        let n = 8192;
+        let k = 4096;
+        // Control: a serial fallback would satisfy the coverage assertions below
+        // without ever exercising the claim loop, so refuse to pass vacuously.
+        assert!(
+            pools.total_workers > 1 && output_chunk_len_for(pools.total_workers, n, k) < n,
+            "test must reach the fan-out, not the serial threshold"
+        );
+
+        let mut result = vec![0.0f32; n];
+        let claims: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let claims = &claims;
+        pools.dispatch_output_rows(&mut result, k, &|start, outputs| {
+            for (offset, slot) in outputs.iter_mut().enumerate() {
+                let index = start + offset;
+                claims[index].fetch_add(1, Ordering::Relaxed);
+                *slot = index as f32;
+            }
+        });
+        pools.shutdown();
+
+        for index in 0..n {
+            let claimed = claims[index].load(Ordering::Relaxed);
+            assert_eq!(claimed, 1, "output {index} was claimed {claimed} times");
+            assert_eq!(
+                result[index], index as f32,
+                "output {index} holds a stale value"
+            );
+        }
     }
 
     #[test]
@@ -5028,14 +5090,26 @@ mod tests {
     /// single-CPU probe reports "pinning works" and the test then fails on the
     /// sandbox's virtual topology instead of on the pool.
     fn environment_can_pin(cpus: &[usize]) -> bool {
-        !cpus.is_empty()
+        let can = !cpus.is_empty()
             && cpus.iter().all(|&cpu| {
                 std::thread::spawn(move || {
                     crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
                 })
                 .join()
                 .unwrap_or(false)
-            })
+            });
+        // Every caller treats `false` as a skip, so on a lane that declared
+        // placement checks mandatory this one helper is the switch that turns
+        // seven of them off at once. Refusing to pin is a real property of a
+        // sandbox and a legitimate skip elsewhere; it is not a pass.
+        assert!(
+            can || !crate::core_topology::placement_tests_required(),
+            "{}=1 but this environment refuses to pin a thread to {cpus:?}, which turns every \
+             observed-placement check in this crate into a no-op that still reports success. \
+             Either the lane must not require placement tests or the confinement must be lifted.",
+            crate::core_topology::REQUIRE_PLACEMENT_ENV
+        );
+        can
     }
 
     /// Selects child mode for [`ready_leak_child`].
@@ -5812,8 +5886,12 @@ mod tests {
         };
         // A single-core budget cannot express "one worker per core" as a
         // distinguishable claim. That is a host fact and a legitimate skip;
-        // an unanswerable topology is not, and panics above.
-        if cores.core_count() < 2 {
+        // an unanswerable topology is not, and panics above. Stated rather than
+        // silent, and fatal in a lane that requires these checks.
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "the_planner_lays_out_one_worker_per_physical_core",
+        ) {
             return;
         }
         // Two full physical cores' worth of CPUs, spread the way the placement
@@ -5908,7 +5986,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pinned_pool_is_observed_one_worker_per_physical_core",
+        ) {
             return; // one core cannot express "one per core" distinguishably
         }
         // Stated, not implied. Today no target can pin without also being able
@@ -6118,7 +6199,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pin_that_reports_success_without_the_syscall_fails_the_realized_check",
+        ) {
             return;
         }
         let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
@@ -6633,7 +6717,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_partially_pinned_pool_is_not_scored_on_its_pinned_half",
+        ) {
             return;
         }
         let spread = crate::decode_affinity::order_pin_targets(
