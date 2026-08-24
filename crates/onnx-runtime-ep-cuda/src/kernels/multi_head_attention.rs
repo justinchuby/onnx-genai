@@ -333,6 +333,26 @@ pub(crate) fn unsupported_reason(
             q.len()
         ));
     }
+    // Packed-KV supplies a rank-5 `key` and omits `value` entirely. Both halves
+    // of that shape must be declined *here*: a rejection raised from `execute`
+    // arrives after ORT has already compiled the node onto this EP, which is a
+    // hard session failure that no fallback recovers from. The two checks below
+    // mirror the execute-time guards so the pair cannot disagree.
+    if present(1) && !present(2) {
+        return Some(
+            "cuda_ep MultiHeadAttention: value is required when key is present; packed-KV layouts are unsupported".into(),
+        );
+    }
+    for (slot, name) in [(1usize, "key"), (2, "value")] {
+        let rank = shape_at(slot).len();
+        // A rank of 0 or 1 here means "no static shape recorded", not a real
+        // scalar/vector input; only a concretely known rank is judged.
+        if present(slot) && rank >= 2 && !matches!(rank, 3 | 4) {
+            return Some(format!(
+                "cuda_ep MultiHeadAttention: {name} must be rank 3 (B, T, hidden) or rank 4 (B, N, T, H); rank {rank} is unsupported"
+            ));
+        }
+    }
     // Static extent of `shape[axis]`, or `None` when symbolic / out of range.
     let dim =
         |shape: &[onnx_runtime_ir::Dim], axis: usize| shape.get(axis).and_then(|d| d.as_static());
@@ -1123,6 +1143,55 @@ mod tests {
         let n = node(&[("num_heads", Attribute::Int(2))]);
         let s = shapes(&[&[1, 2, 2, 3, 4], &[1, 2, 8], &[1, 2, 8]]);
         assert!(unsupported_reason(&n, &s, &[]).is_some());
+    }
+
+    // Packed-KV is a rank-5 `key` with `value` omitted. Both halves of that
+    // shape must be refused at *claim* time: this EP has no packed-KV path, and
+    // a rejection from `execute` lands after ORT has compiled the node here,
+    // which fails the session outright instead of falling back. These two cases
+    // were previously rejected only at execute time.
+    #[test]
+    fn claim_declines_packed_kv_rank5_key() {
+        let n = node(&[("num_heads", Attribute::Int(2))]);
+        let s = shapes(&[&[1, 2, 8], &[1, 2, 2, 2, 4], &[]]);
+        // Query f32, key f32, value absent — the packed-KV input signature.
+        let dtypes = [DataType::Float32, DataType::Float32];
+        let reason = unsupported_reason(&n, &s, &dtypes).expect("packed KV declined at claim time");
+        assert!(
+            reason.contains("packed-KV"),
+            "expected a packed-KV decline, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn claim_declines_key_of_unsupported_rank() {
+        let n = node(&[("num_heads", Attribute::Int(2))]);
+        let s = shapes(&[&[1, 2, 8], &[1, 2, 2, 2, 4], &[1, 2, 8]]);
+        let dtypes = [DataType::Float32, DataType::Float32, DataType::Float32];
+        let reason = unsupported_reason(&n, &s, &dtypes).expect("rank-5 key declined");
+        assert!(
+            reason.contains("key must be rank"),
+            "expected a key-rank decline, got: {reason}"
+        );
+    }
+
+    // The guard must not over-decline: rank 3 and rank 4 key/value are both
+    // supported layouts, and a symbolic shape (recorded as empty here) is
+    // accepted at claim time and re-validated in `execute`.
+    #[test]
+    fn claim_accepts_supported_key_value_ranks() {
+        let n = node(&[("num_heads", Attribute::Int(2))]);
+        let dtypes = [DataType::Float32, DataType::Float32, DataType::Float32];
+        for s in [
+            shapes(&[&[1, 2, 8], &[1, 2, 8], &[1, 2, 8]]),
+            shapes(&[&[1, 2, 8], &[1, 2, 2, 4], &[1, 2, 2, 4]]),
+            shapes(&[&[1, 2, 8], &[], &[]]),
+        ] {
+            assert!(
+                unsupported_reason(&n, &s, &dtypes).is_none(),
+                "supported layout wrongly declined: {s:?}"
+            );
+        }
     }
 
     #[test]
