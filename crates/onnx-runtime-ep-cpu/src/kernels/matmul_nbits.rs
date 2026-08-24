@@ -20236,10 +20236,14 @@ mod tests {
             .parse()
             .expect("the parent passes a decimal width");
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
-        let cores = crate::core_topology::host().map_or(allowed, |topology| {
-            crate::decode_affinity::allowed_cpus()
-                .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
-        });
+        // Fails closed on a supported target: silently substituting the logical
+        // count for the physical one here would hand the parent an inflated
+        // `cores` and make its placement expectation trivially satisfiable.
+        let cores =
+            crate::core_topology::require_host_for_placement().map_or(allowed, |topology| {
+                crate::decode_affinity::allowed_cpus()
+                    .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
+            });
         let (pool_built, workers, nodes, placement, honest, fully_pinned) =
             match crate::decode_spmd::pools() {
                 Some(pool) => {

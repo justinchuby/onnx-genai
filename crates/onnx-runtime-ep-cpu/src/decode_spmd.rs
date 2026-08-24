@@ -3913,7 +3913,14 @@ mod tests {
         // must land on *distinct physical cores*, so the first workers never
         // share a front end. Dropping the spread from this arm fails here on
         // any host with core topology.
-        if let Some(cores) = crate::core_topology::host() {
+        let detected = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => Some(cores),
+            Err(reason) => {
+                eprintln!("skipping planned-affinity spread check: {reason}");
+                None
+            }
+        };
+        if let Some(cores) = detected {
             let core_count = cores.leaders_within(&planned).len();
             let mut seen_cores = std::collections::BTreeSet::new();
             for &cpu in &shards[0].cpus[..core_count] {

@@ -899,10 +899,14 @@ mod tests {
     /// that panics unconditionally.
     #[test]
     fn a_detected_topology_resolves_regardless_of_support_flag() {
-        let Some(detected) = host() else {
+        let detected = match require_host_for_placement() {
+            Ok(detected) => detected,
             // Only reachable on a target with no backend, where the two tests
             // above already pin the behaviour.
-            return;
+            Err(reason) => {
+                eprintln!("skipping the resolve-either-way check: {reason}");
+                return;
+            }
         };
         assert!(topology_or_fail_closed(Some(detected), true).is_ok());
         assert!(topology_or_fail_closed(Some(detected), false).is_ok());
