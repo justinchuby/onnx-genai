@@ -2308,6 +2308,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "MultiHeadAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::multi_head_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "GatherBlockQuantized"
             && op.domain == "com.microsoft"
             && let Some(reason) =

@@ -6370,3 +6370,360 @@ fn tensor_scatter_rejects_an_axis_that_selects_the_batch_dimension() {
         "must not select the batch dimension",
     );
 }
+
+/// Every rule the shape-inference registry claims, as `(domain, operator,
+/// min_opset)`, sorted.
+///
+/// This is the catalog pin proper; `expanded_registry_catalog_count_is_pinned`
+/// pins its two summary numbers. Those numbers are the cheaper and more
+/// readable signal, but each is blind to a change that preserves it:
+///
+/// - a **rename** -- registering `LinearAttenion` instead of `LinearAttention`
+///   -- drops one key and adds another, so both counts hold;
+/// - an **opset move** -- changing an existing `reg.register(.., 1, ..)` to
+///   `13` -- rewrites an entry in place, so `entry_count` holds too.
+///
+/// Neither is loud anywhere else. `InferenceRegistry::get` returns `None` both
+/// for an unknown key and for a version below every registration, and
+/// `infer_node` treats `None` permissively: outputs are left unknown and the
+/// model still runs, having quietly lost shape inference. Both mutations were
+/// constructed against this crate and the whole suite stayed green -- 281 and
+/// 282 passed, 0 failed -- before this pin existed.
+const PINNED_CATALOG: &[(&str, &str, u64)] = &[
+    ("", "Abs", 1),
+    ("", "Acos", 7),
+    ("", "Acosh", 9),
+    ("", "Add", 1),
+    ("", "AffineGrid", 20),
+    ("", "And", 1),
+    ("", "ArgMax", 1),
+    ("", "ArgMax", 11),
+    ("", "ArgMax", 12),
+    ("", "ArgMax", 13),
+    ("", "ArgMin", 1),
+    ("", "ArgMin", 11),
+    ("", "ArgMin", 12),
+    ("", "ArgMin", 13),
+    ("", "Asin", 7),
+    ("", "Asinh", 9),
+    ("", "Atan", 7),
+    ("", "Atanh", 9),
+    ("", "Attention", 23),
+    ("", "AveragePool", 1),
+    ("", "BatchNormalization", 9),
+    ("", "BatchNormalization", 14),
+    ("", "BatchNormalization", 15),
+    ("", "Bernoulli", 15),
+    ("", "BitShift", 11),
+    ("", "BitwiseAnd", 18),
+    ("", "BitwiseNot", 18),
+    ("", "BitwiseOr", 18),
+    ("", "BitwiseXor", 18),
+    ("", "BlackmanWindow", 17),
+    ("", "Cast", 1),
+    ("", "CastLike", 1),
+    ("", "CausalConvWithState", 27),
+    ("", "Ceil", 1),
+    ("", "Celu", 12),
+    ("", "CenterCropPad", 18),
+    ("", "Clip", 1),
+    ("", "Col2Im", 18),
+    ("", "Compress", 9),
+    ("", "Compress", 11),
+    ("", "Concat", 1),
+    ("", "ConcatFromSequence", 11),
+    ("", "Constant", 1),
+    ("", "ConstantOfShape", 1),
+    ("", "Conv", 1),
+    ("", "ConvTranspose", 1),
+    ("", "Cos", 1),
+    ("", "Cosh", 9),
+    ("", "CumSum", 11),
+    ("", "CumSum", 14),
+    ("", "DFT", 17),
+    ("", "DFT", 20),
+    ("", "DepthToSpace", 1),
+    ("", "DepthToSpace", 11),
+    ("", "DepthToSpace", 13),
+    ("", "DequantizeLinear", 10),
+    ("", "DequantizeLinear", 13),
+    ("", "DequantizeLinear", 19),
+    ("", "DequantizeLinear", 21),
+    ("", "DequantizeLinear", 23),
+    ("", "DequantizeLinear", 25),
+    ("", "Det", 11),
+    ("", "Div", 1),
+    ("", "Dropout", 1),
+    ("", "DynamicQuantizeLinear", 11),
+    ("", "Einsum", 12),
+    ("", "Elu", 1),
+    ("", "Equal", 1),
+    ("", "Erf", 1),
+    ("", "Exp", 1),
+    ("", "Expand", 8),
+    ("", "EyeLike", 9),
+    ("", "Flatten", 1),
+    ("", "Floor", 1),
+    ("", "GRU", 1),
+    ("", "GRU", 14),
+    ("", "Gather", 1),
+    ("", "GatherElements", 1),
+    ("", "GatherND", 11),
+    ("", "GatherND", 12),
+    ("", "GatherND", 13),
+    ("", "Gelu", 20),
+    ("", "Gemm", 1),
+    ("", "GlobalAveragePool", 1),
+    ("", "GlobalLpPool", 1),
+    ("", "GlobalMaxPool", 1),
+    ("", "Greater", 1),
+    ("", "GreaterOrEqual", 12),
+    ("", "GridSample", 16),
+    ("", "GroupNormalization", 18),
+    ("", "GroupNormalization", 21),
+    ("", "HammingWindow", 17),
+    ("", "HannWindow", 17),
+    ("", "HardSigmoid", 1),
+    ("", "HardSwish", 14),
+    ("", "Hardmax", 13),
+    ("", "Identity", 1),
+    ("", "InstanceNormalization", 6),
+    ("", "IsInf", 10),
+    ("", "IsNaN", 9),
+    ("", "LRN", 1),
+    ("", "LSTM", 1),
+    ("", "LSTM", 14),
+    ("", "LayerNormalization", 1),
+    ("", "LeakyRelu", 1),
+    ("", "Less", 1),
+    ("", "LessOrEqual", 12),
+    ("", "LinearAttention", 1),
+    ("", "Log", 1),
+    ("", "LogSoftmax", 1),
+    ("", "LpNormalization", 1),
+    ("", "LpPool", 1),
+    ("", "MatMul", 1),
+    ("", "Max", 1),
+    ("", "MaxPool", 1),
+    ("", "MaxUnpool", 9),
+    ("", "MaxUnpool", 11),
+    ("", "Mean", 1),
+    ("", "MeanVarianceNormalization", 9),
+    ("", "MelWeightMatrix", 17),
+    ("", "Min", 1),
+    ("", "Mish", 18),
+    ("", "Mod", 10),
+    ("", "Mul", 1),
+    ("", "Multinomial", 7),
+    ("", "Neg", 1),
+    ("", "NegativeLogLikelihoodLoss", 12),
+    ("", "NonMaxSuppression", 10),
+    ("", "NonZero", 9),
+    ("", "NonZero", 13),
+    ("", "Not", 1),
+    ("", "OneHot", 9),
+    ("", "OneHot", 11),
+    ("", "Or", 1),
+    ("", "PRelu", 16),
+    ("", "Pad", 1),
+    ("", "Pow", 1),
+    ("", "QLinearMatMul", 10),
+    ("", "QuantizeLinear", 10),
+    ("", "QuantizeLinear", 13),
+    ("", "QuantizeLinear", 19),
+    ("", "QuantizeLinear", 21),
+    ("", "QuantizeLinear", 23),
+    ("", "QuantizeLinear", 25),
+    ("", "RMSNormalization", 23),
+    ("", "RNN", 1),
+    ("", "RNN", 14),
+    ("", "RandomNormal", 1),
+    ("", "RandomNormalLike", 1),
+    ("", "RandomUniform", 1),
+    ("", "RandomUniformLike", 1),
+    ("", "Range", 11),
+    ("", "Reciprocal", 1),
+    ("", "ReduceL1", 1),
+    ("", "ReduceL2", 1),
+    ("", "ReduceLogSum", 1),
+    ("", "ReduceLogSumExp", 1),
+    ("", "ReduceMax", 1),
+    ("", "ReduceMean", 1),
+    ("", "ReduceMin", 1),
+    ("", "ReduceProd", 1),
+    ("", "ReduceSum", 1),
+    ("", "ReduceSumSquare", 1),
+    ("", "Relu", 1),
+    ("", "Reshape", 1),
+    ("", "Resize", 10),
+    ("", "Resize", 11),
+    ("", "ReverseSequence", 10),
+    ("", "RotaryEmbedding", 23),
+    ("", "Round", 1),
+    ("", "STFT", 17),
+    ("", "Scatter", 9),
+    ("", "ScatterElements", 11),
+    ("", "ScatterElements", 13),
+    ("", "ScatterElements", 16),
+    ("", "ScatterND", 11),
+    ("", "ScatterND", 13),
+    ("", "ScatterND", 16),
+    ("", "ScatterND", 18),
+    ("", "Selu", 6),
+    ("", "SequenceAt", 11),
+    ("", "SequenceConstruct", 11),
+    ("", "SequenceEmpty", 11),
+    ("", "SequenceErase", 11),
+    ("", "SequenceInsert", 11),
+    ("", "SequenceLength", 11),
+    ("", "Shape", 1),
+    ("", "Shrink", 9),
+    ("", "Sigmoid", 1),
+    ("", "Sign", 1),
+    ("", "SimplifiedLayerNormalization", 1),
+    ("", "Sin", 1),
+    ("", "Sinh", 9),
+    ("", "Size", 1),
+    ("", "Slice", 1),
+    ("", "Softmax", 1),
+    ("", "SoftmaxCrossEntropyLoss", 12),
+    ("", "Softplus", 1),
+    ("", "Softsign", 1),
+    ("", "SpaceToDepth", 1),
+    ("", "SpaceToDepth", 13),
+    ("", "Split", 1),
+    ("", "SplitToSequence", 11),
+    ("", "Sqrt", 1),
+    ("", "Squeeze", 1),
+    ("", "Squeeze", 13),
+    ("", "StringNormalizer", 10),
+    ("", "Sub", 1),
+    ("", "Sum", 1),
+    ("", "Swish", 24),
+    ("", "Tan", 7),
+    ("", "Tanh", 1),
+    ("", "TensorScatter", 24),
+    ("", "TfIdfVectorizer", 9),
+    ("", "ThresholdedRelu", 10),
+    ("", "Tile", 6),
+    ("", "TopK", 1),
+    ("", "TopK", 10),
+    ("", "TopK", 11),
+    ("", "Transpose", 1),
+    ("", "Trilu", 14),
+    ("", "Unique", 11),
+    ("", "Unsqueeze", 1),
+    ("", "Unsqueeze", 13),
+    ("", "Where", 1),
+    ("", "Xor", 1),
+    ("ai.onnx.ml", "ArrayFeatureExtractor", 1),
+    ("ai.onnx.ml", "Binarizer", 1),
+    ("ai.onnx.ml", "CategoryMapper", 1),
+    ("ai.onnx.ml", "Imputer", 1),
+    ("ai.onnx.ml", "LabelEncoder", 1),
+    ("ai.onnx.ml", "LabelEncoder", 2),
+    ("ai.onnx.ml", "LabelEncoder", 4),
+    ("ai.onnx.ml", "Normalizer", 1),
+    ("ai.onnx.ml", "Scaler", 1),
+    ("com.microsoft", "Attention", 1),
+    ("com.microsoft", "BiasGelu", 1),
+    ("com.microsoft", "CausalConvWithState", 1),
+    ("com.microsoft", "CompressedSparseAttention", 1),
+    ("com.microsoft", "FastGelu", 1),
+    ("com.microsoft", "FusedAttention", 1),
+    ("com.microsoft", "FusedGemm", 1),
+    ("com.microsoft", "FusedMatMul", 1),
+    ("com.microsoft", "FusedMatMulBias", 1),
+    ("com.microsoft", "GatherBlockQuantized", 1),
+    ("com.microsoft", "Gelu", 1),
+    ("com.microsoft", "GroupQueryAttention", 1),
+    ("com.microsoft", "LayerNormalization", 1),
+    ("com.microsoft", "LinearAttention", 1),
+    ("com.microsoft", "MatMulNBits", 1),
+    ("com.microsoft", "MoE", 1),
+    ("com.microsoft", "MultiHeadAttention", 1),
+    ("com.microsoft", "QMoE", 1),
+    ("com.microsoft", "QuickGelu", 1),
+    ("com.microsoft", "RotaryEmbedding", 1),
+    ("com.microsoft", "Silu", 1),
+    ("com.microsoft", "SimplifiedLayerNormalization", 1),
+    ("com.microsoft", "SkipLayerNormalization", 1),
+    ("com.microsoft", "SkipSimplifiedLayerNormalization", 1),
+    ("pkg.nxrt", "BlockQuantizedMatMul", 1),
+    ("pkg.nxrt", "BlockQuantizedMoE", 1),
+    ("pkg.nxrt", "CompressedSparseAttention", 1),
+    ("pkg.nxrt", "IndexShare", 1),
+    ("pkg.nxrt", "KvCacheCapacityAppend", 1),
+    ("pkg.nxrt", "SparseKvGather", 1),
+    ("pkg.nxrt", "VarlenAttention", 1),
+];
+
+/// `""` is the normalized spelling of the default ONNX domain (see
+/// `normalize_domain`); render it as `ai.onnx` so a failure names something a
+/// reader can search the model for.
+fn catalog_label((domain, op, min_opset): &(&str, &str, u64)) -> String {
+    let domain = if domain.is_empty() { "ai.onnx" } else { domain };
+    format!("{domain}::{op}@{min_opset}")
+}
+
+#[test]
+fn expanded_registry_catalog_is_pinned() {
+    // The literal has to be sorted and duplicate-free before it can be binary
+    // searched below; a mis-sorted pin would report spurious adds and removes
+    // forever after, which is a worse failure than no pin at all.
+    let mut sorted = PINNED_CATALOG.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.as_slice() != PINNED_CATALOG {
+        let at = sorted
+            .iter()
+            .zip(PINNED_CATALOG)
+            .position(|(a, b)| a != b)
+            .unwrap_or_else(|| sorted.len().min(PINNED_CATALOG.len()));
+        panic!(
+            "PINNED_CATALOG must be sorted and duplicate-free; it first diverges at index {at}, \
+             where the corrected form has {} and the literal has {}. Regenerate it from \
+             `InferenceRegistry::default_registry().operator_versions()` rather than editing by \
+             hand.",
+            sorted.get(at).map_or("(end)".to_string(), catalog_label),
+            PINNED_CATALOG
+                .get(at)
+                .map_or("(end)".to_string(), catalog_label),
+        );
+    }
+
+    let registry = InferenceRegistry::default_registry();
+    let live = registry.operator_versions();
+
+    let added: Vec<String> = live
+        .iter()
+        .filter(|r| PINNED_CATALOG.binary_search(r).is_err())
+        .map(catalog_label)
+        .collect();
+    let removed: Vec<String> = PINNED_CATALOG
+        .iter()
+        .filter(|r| live.binary_search(r).is_err())
+        .map(catalog_label)
+        .collect();
+
+    let render = |v: &[String]| {
+        if v.is_empty() {
+            "(none)".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "shape-inference operator catalog moved.\n  registered but not pinned: {}\n  pinned \
+         but not registered: {}\nEach entry reads `domain::Op@min_opset`. If you added, removed \
+         or re-versioned a handler, regenerate PINNED_CATALOG from `operator_versions()` and \
+         update the counts in the same commit, and cover the rule with a test (RULES.md section \
+         8). `pinned but not registered` is the direction to read first: nothing else in this \
+         suite fails when an operator loses its handler or gains a higher opset floor, because \
+         unregistered and under-versioned ops are both inferred permissively rather than \
+         rejected.",
+        render(&added),
+        render(&removed),
+    );
+}

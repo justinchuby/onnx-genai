@@ -195,6 +195,18 @@ thread_local! {
     /// is what makes "slow is not the same as broken" an actual assertion.
     static DELAY_WORKER_BEFORE_READY_MS: Cell<u64> = const { Cell::new(0) };
 
+    /// Test injection of a *contended* yield, in microseconds; `0` means "yield
+    /// normally". The readiness backstop's stride defect is invisible when
+    /// yields are cheap: an uncontended `yield_now` costs ~1.2us, so a stride of
+    /// 64 moves the deadline by ~78us and no assertion against a millisecond
+    /// deadline can see it. The production measurement that found it recorded
+    /// ~7ms per yield on a contended pair of CPUs -- three orders of magnitude
+    /// larger -- which is what turns the stride into a 3x deadline overrun.
+    /// Manufacturing real contention in a unit test is exactly the kind of
+    /// load-dependent arrangement that flakes; injecting the yield *cost* makes
+    /// the same regime deterministic.
+    static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
+
     /// Test override for [`WORKER_PROFILE_ENV`]: `Some(v)` forces the per-worker
     /// timing gate to `v` for pools built on this thread. Thread-scoped for the
     /// same reason as the knobs above, and additionally because the alternative
@@ -1439,6 +1451,13 @@ impl SpmdDecodePools {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
+                #[cfg(test)]
+                {
+                    let slow = SLOW_YIELD_US.with(Cell::get);
+                    if slow != 0 {
+                        thread::sleep(Duration::from_micros(slow));
+                    }
+                }
                 // Check the clock on *every* yield, not on a stride. The stride
                 // is right for the spin phase, where an iteration costs
                 // nanoseconds and `Instant::now()` would dominate; it is wrong
@@ -1638,8 +1657,16 @@ impl SpmdDecodePools {
 
     /// Record the calling thread's current CPU as the dispatcher's placement,
     /// and count the sample as a change if it moved since the last one.
+    ///
+    /// Inert under Miri. Miri has no `sched_getcpu` shim, and the module's
+    /// panic-safety test dispatches on a real pool under it, so an
+    /// unconditional call aborts that test with an unsupported-operation
+    /// error. Nothing is lost: a CPU-placement sample is meaningless under an
+    /// interpreter that does not model CPUs, and the thing Miri is here to
+    /// check -- that the unsafe blocks around it are sound -- is unaffected by
+    /// not taking the sample.
     fn sample_dispatcher_cpu(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         {
             // SAFETY: `sched_getcpu` takes no arguments and only reads the
             // calling thread's current CPU.
@@ -1880,6 +1907,13 @@ impl SpmdDecodePools {
             if recorded {
                 self.sample_dispatcher_cpu();
             }
+            return;
+        }
+        // Miri has no `sched_setaffinity` shim either, and a pin is not a
+        // property Miri can check. Refuse rather than abort, so that setting
+        // the knob in a Miri environment degrades to "not pinned" instead of
+        // failing an unrelated test.
+        if cfg!(miri) {
             return;
         }
         match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
@@ -3456,15 +3490,21 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 /// stable per-thread id. Linux only in practice: this exists so a harness can
 /// find the dispatcher's `/proc/self/task/<tid>` entry, which has no
 /// counterpart elsewhere.
+///
+/// `None` under Miri as well, for the same reason
+/// [`SpmdDecodePools::sample_dispatcher_cpu`] is inert there: there is no
+/// `/proc` to look the id up in, so recording one buys nothing and calling the
+/// shim risks an unsupported-operation abort in a test that is running for a
+/// different reason entirely.
 fn current_thread_os_id() -> Option<i64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         // SAFETY: `gettid` takes no arguments, cannot fail, and returns the
         // calling thread's kernel id.
         let tid = unsafe { libc::gettid() };
         (tid > 0).then_some(i64::from(tid))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(miri))))]
     {
         None
     }
@@ -4896,6 +4936,98 @@ mod tests {
              delay could have elapsed, so it never reached the deadline path"
         );
         pools.shutdown();
+    }
+
+    /// The backstop must fire *within* its deadline, not a stride of yields
+    /// later.
+    ///
+    /// This is the assertion #1825 and #1868 were both missing. Both fixed a
+    /// deadline that was evaluated on a `spins.is_multiple_of(64)` stride in a
+    /// *yield* phase that began at `SPIN_LOOP_BUDGET` -- itself a multiple of
+    /// 64 -- so the clock was read once, on the first yield, and then not for
+    /// 64 more. Reverting either fix leaves the whole crate green, so nothing
+    /// stops a third reintroduction.
+    ///
+    /// The observable here is deliberately *binary* rather than a duration.
+    /// Overshoot bounds are the natural way to test a granularity defect and
+    /// they are flaky by construction: the margin that makes them stable on a
+    /// loaded runner is wider than the defect. Choosing a deadline the pool is
+    /// guaranteed to exceed converts the same defect into panic-versus-success
+    /// -- with the stride, the deadline is consulted once while it is still
+    /// unexpired and the build reports success having blown its budget 3x,
+    /// which is exactly the measurement recorded at the production site. Load
+    /// can only make the injected delay longer, so this cannot flake toward a
+    /// false failure.
+    #[test]
+    fn the_readiness_backstop_fires_within_its_deadline_not_a_stride_later() {
+        assert_eq!(
+            FAIL_WORKER_BEFORE_READY.with(Cell::get),
+            usize::MAX,
+            "no fault may be injected; the workers here are slow, not broken"
+        );
+        // Sized so the two behaviours are separated by a wide margin rather
+        // than a granularity: the deadline expires on the yield path at
+        // ~DEADLINE_MS, while a stride of 64 injected yields would not consult
+        // it again until 64 * SLOW_US = 1280ms -- long after the workers
+        // announce at DELAY_MS and the loop has already exited. Fires-late
+        // becomes never-fires, which is an outcome rather than a duration.
+        //
+        // The 8x gap between when the barrier should give up (~100ms) and when
+        // it would be let off the hook (800ms) is deliberate headroom for a
+        // loaded runner: this test may only fail because the deadline was not
+        // consulted, never because the builder thread was descheduled.
+        const DELAY_MS: u64 = 800;
+        const DEADLINE_MS: u64 = 100;
+        const SLOW_US: u64 = 20_000;
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
+        SLOW_YIELD_US.with(|slot| slot.set(SLOW_US));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(|| {
+            SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 2,
+                }],
+                DecodeSchedule::Fixed,
+                false,
+            )
+        });
+        let elapsed = started.elapsed();
+
+        std::panic::set_hook(previous);
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+        SLOW_YIELD_US.with(|slot| slot.set(0));
+
+        let panic = outcome.err().unwrap_or_else(|| {
+            panic!(
+                "the pool exceeded its {DEADLINE_MS}ms deadline by design and the \
+                 barrier reported success after {elapsed:?}: the deadline was \
+                 consulted once, before it expired, and never again"
+            )
+        });
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("never became ready"),
+            "the build must say why it gave up, got: {message}"
+        );
+        // Pins the granularity itself: the barrier may overrun its deadline by
+        // the cost of one yield, never by the injected delay that a strided
+        // check would have slept through.
+        assert!(
+            elapsed < Duration::from_millis(DELAY_MS),
+            "the barrier gave up only after {elapsed:?}, past the {DELAY_MS}ms \
+             delay it was supposed to abandon at {DEADLINE_MS}ms"
+        );
     }
 
     /// A pool that reports its width honestly must also *place* honestly.
