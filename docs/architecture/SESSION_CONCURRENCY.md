@@ -7,6 +7,19 @@ This document is a design, not a status report. Everything in §1 is a statement
 about code that exists today, with a citation. Everything from §2 onward is a
 decision about code that does not exist yet, and says so.
 
+**Two prerequisites have already merged, and the text reflects that rather than
+proposing them again.**
+[#2012](https://github.com/justinchuby/onnx-genai/pull/2012) (`1bf87c86`) built
+the worker abstraction, `WorkerId`/`SessionPlacement`, and a `WorkerPool` of one
+— §1.1 and §4 are written on top of it.
+[#2019](https://github.com/justinchuby/onnx-genai/pull/2019) (`27b8945e2` +
+`f3c89255a`) gave session-derived ORT handles a structural `Arc<Session>`
+ownership edge and shipped `crates/onnx-genai-ort/src/thread_affinity.rs` — so
+§3.4's two rules, and §13's Phase 1 prerequisite, are **partly done** for the ORT
+layer rather than pending. Sections that were written against the pre-#2019 code
+have been rewritten to say what shipped, what it means, and what is left; §1.4
+in particular is now a past-tense account of the defect that motivated it.
+
 Related: [`DESIGN.md`](DESIGN.md) for the execution architecture,
 [`../genai/SCHEDULING.md`](../genai/SCHEDULING.md) for inter-session scheduling
 policy, [`../genai/PIPELINE.md`](../genai/PIPELINE.md) for the workflow
@@ -72,6 +85,14 @@ depends on are **already merged**. `WorkerPool::single` is a pool of one
 (`worker.rs:261-265`), and `placement_worker` hands out the only id there is
 (`worker.rs:276-279`). What remains is `W > 1`, the state split that makes it
 sound, and — separately and more urgently — a lease that actually refuses.
+
+**#2019 merged the other prerequisite: the backend layer beneath a worker.** A
+worker pool is only sound if the handles a worker owns cannot outlive their
+session and cannot be reached from a second thread. Both are now facts about the
+types rather than about review discipline — §1.3, §1.4 and §3.4 give the
+detail. The consequence for this document is that §4's model no longer has to
+propose the ownership and affinity primitives it depends on; it consumes them,
+and §13 Phase 1 shrinks accordingly.
 
 `EngineOwner`'s `unsafe impl Send` survived #2012 deliberately: the engine is
 still thread-affine and still moved exactly once
@@ -197,32 +218,57 @@ code rather than from folklore.
 
 | Handle | Location | Claim |
 |---|---|---|
-| `Session` (ORT) | `crates/onnx-genai-ort/src/session/mod.rs:1224-1235` | `Send + Sync`; "ONNX Runtime documents `OrtSession::Run`/`RunWithBinding` as safe for concurrent calls on the same session" |
+| `Session` (ORT) | `crates/onnx-genai-ort/src/session/mod.rs:1389-1396` (`Send`), `:1397-1406` (`Sync`) | `Send` unconditionally; `Sync` because "ORT documents concurrent `Run` on one session as safe *when the providers underneath it are*, which is precisely what `Session::supports_concurrent_run` reports" |
 | `Environment` (ORT) | `crates/onnx-genai-ort/src/env.rs:326-335` | `Send + Sync`; process-level handle ORT permits from multiple threads |
 | `CublasLt` | `crates/onnx-runtime-ep-cuda/src/blas.rs:97-101` | "a cuBLASLt handle is not thread-affine" |
 | `PinnedStaging` | `crates/onnx-runtime-ep-cuda/src/runtime.rs:2123-2127` | a page-locked host allocation; the pointer is a plain address |
 
 **`Session` is the only ORT handle in that list that a session's execution
 actually reaches, and the exception does not extend to anything derived from
-it.** `IoBinding`, `Allocator` and `Value` carry no `Send`/`Sync` claim of any
-kind — not an `unsafe impl`, not a derived one that survives their raw pointers
-— and none is being added. ORT's guarantee is about `Run`; the objects around a
-run are per-run or per-worker state that the caller supplies, which the
-`Session` safety comment says in as many words: *"per-run inputs, outputs, and
-`IoBinding` values are supplied by the caller and are not stored in `Session`"*
-(`session/mod.rs:1226-1227`). Decision 4 therefore places `IoBinding`,
-`Allocator` and `Value` in the per-worker category (§3.2) even though `Session`
-itself could be shared.
+it.** Since #2019 the `Sync` safety comment says so itself: *"Sharing a
+`&Session` never hands out an `IoBinding`, `Allocator`, or `Value` — those are
+`!Send + !Sync` and stay with the thread that created them — so `Sync` here does
+not make the non-thread-safe handles shareable"* (`session/mod.rs:1402-1405`).
+That is now a fact about the types rather than a hope: all three are structurally
+`!Send + !Sync`, as the `thread_affinity` module records — *"Rust already forbids
+that for a value the compiler can see: `IoBinding`, `Allocator`, and `Value` are
+`!Send + !Sync`, so a shared reference cannot reach a second thread"*
+(`crates/onnx-genai-ort/src/thread_affinity.rs:11-13`). Decision 4 therefore
+places `IoBinding`, `Allocator` and `Value` in the per-worker category (§3.2)
+even though `Session` itself may be shared.
 
-**A graph-capture session is not concurrent, even though `Session` is `Sync`.**
-A session created with `enable_cuda_graph=1` reports `graph_capture == true`
-(`session/mod.rs:487-490,823-825`) and replays one captured graph against one
-set of bound device addresses — which is why island binding exists *"so CUDA
-graph capture sees stable, device-resident input and output addresses"*
-(`session/mod.rs:1168-1172`). Two concurrent `Run`s against one captured graph
-would replay it against addresses the other is writing. Combined with the
-thread-local capture rules below, a capture-enabled session is **single-flight
-and thread-affine**, and the `Sync` impl on `Session` does not reach it.
+**`Session`'s `Sync` is conditional, and the condition is now a queryable
+capability.** `supports_concurrent_run()` answers from the execution providers
+the session actually resolved to plus its graph-capture state, and fails closed
+(`session/mod.rs:861-871`). Its doc comment states the consequence this document
+depends on: *"A session worker pool may only share one `Session` across threads
+when this is `true`; otherwise each worker needs its own session"*
+(`session/mod.rs:850-856`). `concurrent_run_support()` returns the reason for a
+refusal rather than a bare `false`, and there are exactly three refusals
+(`session/mod.rs:1352-1386`):
+
+| Refusal | Why |
+|---|---|
+| graph capture enabled | capture/replay is per-session state keyed by `gpu_graph_id`; "a second concurrent run would capture the first run's buffers" |
+| no resolved execution provider | "nothing declares that concurrent `Run` is safe" |
+| any provider lacking `capability::CONCURRENT_RUN` | ORT's session-level contract extends only as far as every provider under it |
+
+Each refusal names the remedy — *"Give each worker thread its own session"* —
+which is precisely §4's model, so the backend and this design already agree on
+the answer.
+
+**A graph-capture session is therefore not concurrent, even though `Session` is
+`Sync`.** A session created with `enable_cuda_graph=1` reports
+`graph_capture == true` (`session/mod.rs:492`, accessor `:846-848`) and replays
+one captured graph against one set of bound device addresses — which is why
+island binding exists *"so CUDA graph capture sees stable, device-resident input
+and output addresses"* (`session/mod.rs:1262-1264`). #2019 made that structural:
+graph capture is the *first* refusal `concurrent_run_support` checks
+(`session/mod.rs:1356-1364`), and `run_affinity` turns a second overlapping run
+into a named error rather than a corrupted capture (`session/mod.rs:503-508`,
+`:874-889`). Combined with the thread-local capture rules below, a
+capture-enabled session is **single-flight and thread-affine**, and the `Sync`
+impl on `Session` does not reach it.
 
 **Thread-affine or context-bound, per their own safety comments:**
 
@@ -250,84 +296,94 @@ and violates the affinity half, and the failure that produces is not a data race
 the compiler or a sanitizer will name — it is a capture that silently belongs to
 the wrong thread.
 
-### 1.4 A concrete lifecycle bug the current arrangement already permits
+### 1.4 The lifecycle defect that set the precedent, and how it was fixed
 
-The categories in §1.3 are not theoretical. A backend audit found a live
-drop-order defect that exists *today*, at `W = 1`, and it is the sharpest
-available evidence for why §3's ownership rules have to be structural.
+The categories in §1.3 are not theoretical. Until
+[#2019](https://github.com/justinchuby/onnx-genai/pull/2019) — landed as
+`27b8945e2` and `f3c89255a` — there was a live drop-order defect at `W = 1`. It
+is fixed. It is kept here in the past tense because it is the sharpest available
+evidence for why §3's ownership rules are structural rather than documented, and
+because the shape of the fix is now the precedent the rest of this document
+builds on.
 
-**Rust drops struct fields in declaration order.** `ExecutionIsland` declares:
+**What was wrong.** Rust drops struct fields in declaration order, and
+`ExecutionIsland` declared `session: Session` *before* `bindings` and
+`device_allocator`. So ORT ran `ReleaseSession` first and freed the session-owned
+state that the island's `IoBinding` and its `CreateAllocator` device allocator
+still pointed into. `IoBinding` held an unenforced `*const Session` back-pointer;
+`Allocator` distinguished ownership with an `owned: bool` and held no session at
+all. `WorkflowRuntime::Drop` hid half of it by clearing bindings by hand, but it
+never cleared `device_allocator`, so `ReleaseAllocator` still ran after the
+session was gone. Nothing in the types said the order mattered.
 
-```rust
-    session: Session,                                                    // :74
-    ...
-    bindings: RefCell<HashMap<IslandBindingKey, StableIslandBinding>>,   // :78
-    device_allocator: Option<Allocator>,                                 // :79
-```
-— `crates/onnx-genai-engine/src/pipeline/islands.rs:74,78,79`
-
-So the session is released **first**, and the resources derived from it are
-released **after** the handle they depend on is gone. Each of the three levels
-states its own dependency, and none of them enforces it:
-
-- `IoBinding` holds `_session: *const Session`, annotated in the source as
-  *"reference back to session (non-owning)"* (`crates/onnx-genai-ort/src/binding.rs:12-15`),
-  and its `Drop` calls `ReleaseIoBinding` (`binding.rs:173-182`) — after
-  `Session::drop` has already called `ReleaseSession`
-  (`session/mod.rs:1213-1222`). `StableIslandBinding` is what holds those
-  bindings (`islands.rs:108-109`).
-- `Allocator::for_session_device` says the rule outright in its own doc comment:
-  *"The returned allocator becomes invalid when the session is dropped, so it
-  must not outlive the session it was created from"*
-  (`crates/onnx-genai-ort/src/allocator.rs:236-238`). The field order at
-  `islands.rs:74,79` makes it do precisely that. Nothing in the type ties the
-  allocator to the session — `Session::device_allocator` returns an owned
-  `Allocator` by value with no lifetime and no shared handle
-  (`session/mod.rs:1168-1175`).
-- `Value`s allocated from that device allocator (`Value::empty_in`,
-  `value.rs:232-240`) are the third level, and are held inside
-  `StableIslandBinding`'s `inputs`/`outputs` (`islands.rs:110-111`).
-
-**The compensating code is a convention, not an invariant.** `WorkflowRuntime`'s
-`Drop` reaches into every island to clear its bindings, then clears three maps,
-in that order:
+**How it was fixed: ownership, not ordering.** `IoBinding<'s>` and
+`Allocator<'s>` now either borrow their session or co-own it through
+`Arc<Session>`, and which one a value holds is the proof:
 
 ```rust
-impl Drop for WorkflowRuntime {
-    fn drop(&mut self) {
-        for island in &mut self.execution_islands {
-            island.clear_bindings();
-        }
-        self.component_bindings.get_mut().clear();
-        self.component_outputs.get_mut().clear();
-        self.component_allocators.get_mut().clear();
-    }
+enum BindingSession<'s> {
+    /// The binding borrows the session, so the compiler rejects any owner that
+    /// could outlive it.
+    Borrowed(&'s Session),
+    /// The binding co-owns the session. Owners that hold the session and the
+    /// binding in the same struct need this: struct fields drop in declaration
+    /// order, so field order alone would decide the release order, and a shared
+    /// owner takes that decision away from whoever edits the struct next.
+    Shared(Arc<Session>),
 }
 ```
-— `crates/onnx-genai-engine/src/pipeline/mod.rs:270-279`
+— `crates/onnx-genai-ort/src/binding.rs:17-26`
 
-That works, and it is why the defect has not bitten. But it is a hand-maintained
-teardown running *outside* the type that has the problem: it papers over
-`ExecutionIsland`'s internal field order from one level up. Any path that drops
-an `ExecutionIsland` without going through `WorkflowRuntime::drop` — a
-constructor that fails partway, a panic during load, a future refactor that
-moves islands into a different owner — gets the raw order. §7's worker-failure
-path is exactly such a path.
+`Allocator` carries the same distinction as `AllocatorOrigin::{ProcessDefault,
+SessionBorrowed, SessionShared}` (`crates/onnx-genai-ort/src/allocator.rs:207-219`),
+which decides both who releases the allocator and how long the session behind it
+must live. `PipelineModels::sessions` is now `BTreeMap<String, Arc<Session>>` so
+component code can take the owning form (`crates/onnx-genai-ort/src/loader.rs:429-436`),
+handed out by `shared_session` (`loader.rs:581-587`).
+`ExecutionIsland::session` is an `Arc<Session>` whose doc comment states the
+rule in the type's own words — *"`bindings` and `device_allocator` below each
+hold their own `Arc<Session>` and the refcount, not the field list, decides"*
+(`crates/onnx-genai-engine/src/pipeline/islands.rs:75-83`) — and
+`StableIslandBinding` holds an `IoBinding<'static>` that co-owns it
+(`islands.rs:117-119`). A `compile_fail` doctest with a positive control holds
+the borrowed form to its lifetime (`binding.rs:46-70`).
 
-The codebase already knows field drop order is load-bearing. `Value::drop`
-carries a careful comment reasoning about it — *"Any `_owner` here is a struct
-field, so drop glue frees it after this body releases the `OrtValue` below — ORT
-is always done with the allocation before the owner frees it"*
-(`value.rs:1699-1701`). The same reasoning was simply not applied one level up.
+**What the fix did not reach, and why the manual clears stay.** The compensating
+teardown in `WorkflowRuntime::Drop` was **not** deleted, and this document does
+not ask for it to be. `Value` is a bare `OrtValue` handle with **no
+back-reference to the allocator whose memory it holds**, so ORT still requires
+every value to be released before that allocator, and no refcount expresses it.
+The `Drop` impl now says exactly that:
 
-**Why this belongs in a concurrency document.** At `W = 1` the window is narrow
-and the manual clear closes it. Under a worker pool the same teardown happens
-`W` times, concurrently with other workers still running, on paths where nobody
-runs the compensating clear — and a `ReleaseIoBinding` against a released
-session is not a data race any sanitizer will name. Multiplying an ordering
-defect by `W` and adding failure paths is how a latent bug becomes a
-reproducible crash. It is fixed *before* the pool exists (§13, Phase 1), and the
-rule that prevents its return is structural (§3.4), not another convention.
+> Bindings and session-derived allocators now co-own their `Arc<Session>`, so
+> they can no longer outlive the session whatever order the fields drop in. A
+> `Value` cannot: it is a bare `OrtValue` handle with no back-reference to the
+> allocator whose memory it holds, so ORT still requires every value to be
+> released before that allocator. Nothing in the type system says so, which is
+> exactly why it is done here explicitly instead of left to the field list.
+> — `crates/onnx-genai-engine/src/pipeline/mod.rs:270-287`
+
+That is the correct scope for the remaining manual code: it no longer papers over
+a session/binding ordering problem that the types now solve, and it survives only
+for the value/allocator edge that they do not. §13 Phase 1 therefore does *not*
+list deleting it, and §3.4 does not claim `Arc<Session>` permits removing it.
+
+**Why this still belongs in a concurrency document.** Two reasons, both forward-
+looking rather than historical.
+
+First, the defect was a `W = 1` bug that would have been multiplied by the pool:
+the same teardown happens `W` times, concurrently with other workers still
+running, on failure paths where nobody runs a compensating clear — and a
+`ReleaseIoBinding` against a released session is not a data race any sanitizer
+will name. That is why the ownership work was a prerequisite for sharding and not
+a cleanup to do afterwards, and it is why §13 Phase 1's backend half is already
+complete rather than still ahead.
+
+Second, the remaining `Value` → `Allocator` edge is a real constraint on §4.3.
+Because it is enforced by an explicit teardown rather than by the type system, a
+worker that owns values and allocators must run that teardown itself, on its own
+thread, in that order. §4.3 states it as a worker obligation for exactly this
+reason.
 
 ### 1.5 Where session state, memory accounting, and KV actually live
 
@@ -397,7 +453,8 @@ These are the commitments this document makes. Sections 3–13 derive from them.
    where the type allows it (a worker-owned resource that is not `Send` cannot be
    moved at all) and by typed errors otherwise, and a resource derived from a
    session owns that session (`Arc<Session>`) rather than pointing at it — §3.4.
-   Both are structural because §1.4 shows a convention already failed here.
+   Both are structural because §1.4 shows a convention already failed here, and
+   both are already shipped for the ORT layer by #2019.
 5. **Execution uses a bounded pool of session workers with deterministic session
    ownership and stateless load distribution.** A session belongs to exactly one
    worker for its entire life; the routing decision is a pure function of the
@@ -500,28 +557,47 @@ The three categories above say *where* state lives. This section says how the
 type system is made to enforce it, because §1.4 is proof that a categorisation
 maintained by convention does not survive contact with a refactor.
 
-Two rules, both structural.
+Two rules, both structural. **Both are now partly shipped**, by #2019, for the
+ORT layer. What follows states each rule, then what remains.
 
 **Rule A — ownership, not adjacency.** Every resource derived from a `Session`
 holds an `Arc<Session>`.
 
-That means:
+**For ORT session-derived resources this is done.** #2019 added the ownership
+edge in exactly the shape this rule asks for:
 
-- `IoBinding` replaces its non-owning `_session: *const Session`
-  (`crates/onnx-genai-ort/src/binding.rs:12-15`) with an `Arc<Session>`.
-- `Allocator`, when produced by `Allocator::for_session_device`
-  (`crates/onnx-genai-ort/src/allocator.rs:236-238`), carries the
-  `Arc<Session>` it was derived from. Today it carries nothing
-  (`allocator.rs:205-209`) and the invariant lives only in a doc comment.
-- Any `Value` allocated from a session-derived allocator
-  (`crates/onnx-genai-ort/src/value.rs:232-240`) keeps that allocator alive,
-  transitively keeping the session alive.
-- `Session::device_allocator` (`session/mod.rs:1168-1175`) is therefore callable
-  only on an `Arc<Session>`, not on a bare `Session`.
+- `IoBinding` replaced its non-owning `*const Session` with
+  `BindingSession { Borrowed(&'s Session), Shared(Arc<Session>) }`
+  (`crates/onnx-genai-ort/src/binding.rs:17-26`), and
+  `IoBinding::for_shared_session` yields the `IoBinding<'static>` a worker needs
+  (`binding.rs:100-102`).
+- `Allocator` carries `AllocatorOrigin { ProcessDefault, SessionBorrowed(&'s Session), SessionShared(Arc<Session>) }`
+  (`crates/onnx-genai-ort/src/allocator.rs:207-219`) instead of nothing, with
+  `Allocator::for_shared_session_device` producing `Allocator<'static>`
+  (`allocator.rs:294-300`).
+- `Session::shared_device_allocator` is callable only on an `Arc<Session>`
+  (`session/mod.rs:1178-1183`) and its doc states the resulting guarantee:
+  the allocator is released *"before the session no matter which field the owner
+  declared first"* (`session/mod.rs:1175-1177`).
+- The holders that hand these out were converted with it:
+  `PipelineModels::sessions: BTreeMap<String, Arc<Session>>`
+  (`crates/onnx-genai-ort/src/loader.rs:435`) and
+  `ExecutionIsland::session: Arc<Session>`
+  (`crates/onnx-genai-engine/src/pipeline/islands.rs:83`).
 
-`Arc<Session>` is a partial precedent in this codebase, and it is worth being
-accurate about how partial, because the change is larger than "one more `Arc`".
-Today:
+**One edge is still missing, and it bounds what Rule A currently buys.** `Value`
+does not hold a back-reference to the `Allocator` it was allocated from, so a
+device `Value` can still outlive its allocator by field order. The `Drop for
+WorkflowRuntime` doc comment states this as the reason its manual clears remain
+(`crates/onnx-genai-engine/src/pipeline/mod.rs:270-277`), and the ORT test helper
+spells out the order a caller must keep: *"`Value` (frees memory through the
+allocator), then the `Allocator`, then …"* (`value.rs:2443-2448`). §4.3 therefore
+carries "release values before their allocator" as an explicit worker obligation
+rather than treating Rule A as complete.
+
+**What remains for Rule A is the `Box<Session>` holders.** `Arc<Session>` is a
+partial precedent in this codebase, and it is worth being accurate about how
+partial, because the change is larger than "one more `Arc`". Today:
 
 | Holder | Type | Citation |
 |---|---|---|
@@ -532,8 +608,9 @@ Today:
 | `MtpSession::Owned` | `Arc<Session>` | `crates/onnx-genai-ort/src/mtp.rs:122`, `:166` |
 | speculative head | `Arc<Session>` | `speculative/mod.rs:1056` |
 
-So only the MTP and speculative paths use `Arc` today; the engine's own session
-and both draft-model sessions are `Box`. `Box<Session>` is deliberate — it is
+So the engine's own session and both draft-model sessions are still `Box`; the
+MTP and speculative paths, and everything #2019 converted, use `Arc`.
+`Box<Session>` is deliberate — it is
 what gives the ORT decode runners the stable address their self-references need,
 which `Engine`'s safety comment states explicitly: *"Self-references in ORT
 decode runners point into boxed `Session` allocations, whose addresses remain
@@ -553,14 +630,21 @@ that goes with it — but it is not permitted to convert *some* holders, delete 
 compensating teardown, and leave the rest relying on an invariant that no longer
 has a keeper.
 
-The payoff is that teardown order stops being a property of source-file layout.
-`ExecutionIsland`'s field declaration order (`pipeline/islands.rs:74`, `:78`,
-`:79`) becomes irrelevant — the session cannot be released while a binding,
-allocator or value still refers to it, because the refcount says so. And
-`WorkflowRuntime::drop`'s manual `clear_bindings`-then-clear-maps sequence
-(`pipeline/mod.rs:270-279`) stops being load-bearing. §13 Phase 1 removes it only
-after the ownership edge exists for every holder that feeds it, per §3.5's
-sequencing rule — never before.
+The payoff, where the edge exists, is that teardown order stops being a property
+of source-file layout. `ExecutionIsland` now says so in its own field doc:
+*"Field declaration order alone cannot promise that — it silently reverses the
+moment a field is moved during a refactor — so `bindings` and `device_allocator`
+below each hold their own `Arc<Session>` and the refcount, not the field list,
+decides"* (`pipeline/islands.rs:75-83`).
+
+**`WorkflowRuntime::drop`'s manual clears stay.** It is tempting to read Rule A
+as licence to delete them, and that is wrong: they were never only about
+bindings. The binding and allocator half is now structural, but the value half
+is not, because `Value` has no back-reference to its allocator
+(`pipeline/mod.rs:270-277`). §13 Phase 1 explicitly retains this `Drop`. A
+compensating teardown may only be deleted once the structural edge that replaces
+it exists for every resource it covers — §3.5 states that sequencing rule in
+general, and this is its first live application.
 
 ### 3.5 What Rule A does *not* fix: the environment above the session
 
@@ -572,24 +656,38 @@ dependencies" rule in §10 would be claiming more than it delivers.
 repository structurally enforces that.** The requirement is written down:
 
 > ORT requires the `OrtEnv` to outlive every `OrtSession`. Releasing the session
-> after its environment is a use-after-free…
-> — `crates/onnx-genai-ort/src/value.rs:2388-2393` (and again at `:2435-2440`)
+> after its environment is a use-after-free that crashes with
+> STATUS_ACCESS_VIOLATION at `ReleaseSession`.
+> — `crates/onnx-genai-ort/src/value.rs:2394-2397` (and again at `:2443-2448`)
 
 And `Environment`'s own SAFETY comment describes the discipline it depends on:
 it *"releases it once from `Drop` after owning structs have dropped their
-sessions"* (`env.rs:326-331`). But `Session` holds no environment handle at all —
-its fields are the ORT pointer, names, I/O metadata and EP bookkeeping
-(`session/mod.rs:477-499`), and it merely borrows `&Environment` during
-construction (`session/mod.rs:508-523`). The environment lives in a process-wide
+sessions"* (`env.rs:326-335`). But `Session` holds no environment handle at all —
+its fields are the ORT pointer, names, I/O metadata, EP bookkeeping and, since
+#2019, `run_affinity` (`session/mod.rs:479-508`), and it merely borrows
+`&Environment` during construction (`session/mod.rs:517`, `:531`, `:629`).
+
+**#2019 did not change this, and the one place that compensates shows why the
+gap is real.** `WorkflowRuntime` holds `_ort_environment: Option<Arc<Environment>>`
+as its **last** field, documented as *"Kept last so the ORT environment, its
+registered allocator bridge, and their plugin/provider teardown outlive every
+component and execution-island session that may still call back into them"*
+(`pipeline/mod.rs:264-267`). That is a
+per-owner, field-order-dependent workaround for a missing structural edge — the
+exact pattern Rule A removed one level down. It is a useful partial precedent
+(the environment *is* already an `Arc` that an owner can co-own) and it is not a
+fix, because any other owner that forgets to keep it last is wrong again.
+
+The environment lives in a process-wide
 `OnceLock<Mutex<EnvironmentLifecycle>>` (`env.rs:45-48`), and EP plugin
 registration is likewise ambient — *"ORT plugin registration is process-global"*
 (`crates/onnx-genai-ort/src/session/plugin.rs:120-123`), serialized through a
 global registry (`env.rs:50-55`, `:255-257`).
 
 So session → environment is exactly the same category of defect as §1.4's
-session → binding, one level up, and it is **out of scope for this document to
-fix**. Two options exist and the choice is deferred to the implementation, not
-elided:
+session → binding — the one #2019 fixed one level down — and it is **out of
+scope for this document to fix**. Two options exist and the choice is deferred to
+the implementation, not elided:
 
 - **Structural:** `Session` gains an `Arc<Environment>`, and the environment
   becomes un-droppable while any session lives. This is the honest fix and would
@@ -606,33 +704,79 @@ Until one is chosen, two things follow, and both are normative:
    It does not yet claim anything about `Environment`, providers or plugins.
 2. **No compensating teardown may be deleted before the structural lifetime that
    replaces it exists.** This applies to `WorkflowRuntime::drop`
-   (`pipeline/mod.rs:270-279`) and to `Environment::drop`'s ordering discipline
-   (`env.rs:308-321`) alike. Deleting a manual teardown is the *last* step of a
+   (`pipeline/mod.rs:270-287`), to `WorkflowRuntime`'s last-field environment
+   (`pipeline/mod.rs:264-267`), and to `Environment::drop`'s ordering discipline
+   (`env.rs:308-324`) alike. Deleting a manual teardown is the *last* step of a
    conversion, never the first, and §13 Phase 1 sequences it that way.
 
 **Rule B — thread affinity, structural first, then typed, never a panic in
 `Drop`.** Affinity is enforced in three layers, in order of preference.
 
+**This rule is no longer a proposal for the ORT layer.** #2019 shipped
+`crates/onnx-genai-ort/src/thread_affinity.rs`, which implements all three layers
+in the shape below. What this section now does is (a) state the semantics
+precisely, because a reader who assumes "pinning" will design the wrong routing
+layer, and (b) scope the remaining work, which is the native/CUDA handles and
+the `Engine` container.
+
+**The shipped rule is *exclusive use*, not *pinning*.** This distinction is
+load-bearing for §4 and §5 and the module states it directly
+(`thread_affinity.rs:17-31`):
+
+> * A resource has at most one owning thread **while a guarded section is live**.
+>   A second thread entering one is a hard, reported violation.
+> * Ownership may move to another thread **while the resource is idle**. …
+>   Pinning ("only ever the constructing thread") would reject that legitimate
+>   handoff — the server builds a model on a `spawn_blocking` thread and then
+>   drives it from a dedicated driver thread — so it would be a rule this
+>   codebase violates by design.
+
+Migrations are therefore legal and **counted**, not refused
+(`OwnerThread::migration_count`, `thread_affinity.rs:201-203`). This document
+must not be read as requiring a resource to live forever on its constructing
+thread. §4.3's obligation is narrower and matches the module: a resource is
+constructed and dropped *on a thread that owns it at that moment*, and it is
+never **concurrently** reachable from two. A worker that takes ownership of an
+idle session's resources at handoff is doing the supported thing; §5's session
+create/fork/reset routing relies on exactly that.
+
 **B.1 — Make the type structurally `!Send`.** The strongest enforcement is the
-one the compiler performs. A per-worker backend handle should not be movable
-across threads at all, and the workspace already does this: `CapturedGraph` is
-*"intentionally neither `Send` nor `Sync`"* (`crates/onnx-runtime-ep-cuda/src/graph.rs:103-108`).
-Per-worker handles follow that precedent — no `unsafe impl Send`, no
-`unsafe impl Sync`, and where a wrapper would otherwise be auto-`Send`, an
-explicit `PhantomData<*const ()>` marker to remove it. No such marker exists in
-the workspace today (grepping for `PhantomData<*`, `PhantomData<Rc`, `NotSend`
-returns nothing), so this is new, and it is where the design puts its weight: a
-handle that cannot be moved to the wrong thread does not need to be checked for
-being on the wrong thread.
+one the compiler performs, and for ORT this is done: `IoBinding`, `Allocator` and
+`Value` are `!Send + !Sync` (`thread_affinity.rs:11-13`), and the guard type
+`ThreadAccess<'a>` carries `_not_send: PhantomData<*const ()>`
+(`thread_affinity.rs:374-379`) so a live guarded section cannot cross a thread
+either. That marker is protected by a `compile_fail` doctest paired with a
+positive control, so a future refactor that makes it `Send` fails the build
+rather than the invariant (`thread_affinity.rs:326-372`). `IoBinding` carries the
+same pairing for its lifetime edge (`binding.rs:46-70`). The pre-existing
+precedent this followed is `CapturedGraph`, *"intentionally neither `Send` nor
+`Sync`"* (`crates/onnx-runtime-ep-cuda/src/graph.rs:103-108`).
 
-Structural `!Send` is not always achievable — the ORT `Session` is `Send + Sync`
-today (§1.3), and some handles must be constructed in one place and installed in
+Structural `!Send` is not always achievable — ORT's `Session` is `Send + Sync`
+(§1.3), and some handles must be constructed in one place and installed in
 another. Where it is achievable it is mandatory; where it is not, B.2 and B.3
-apply.
+apply. **The remaining B.1 work is the container, not the leaf**: the module doc
+names it — *"What the compiler cannot see is a resource smuggled inside a
+container that carries its own `unsafe impl Send` (`onnx_genai_engine::Engine`
+does), and that is the case this module names"* (`thread_affinity.rs:13-15`).
+§10 is that case.
 
-**B.2 — Normal operations return a typed affinity error.** For anything that is
-already fallible, a wrong-thread use is an ordinary error value, not a panic.
-This is exactly what the CUDA graph code already does:
+**B.2 — Normal operations return a typed affinity error.** For anything already
+fallible, a wrong-thread use is an ordinary error value, not a panic. This is
+shipped as `OwnerThread::enter(operation) -> Result<ThreadAccess, ThreadAffinityError>`
+(`thread_affinity.rs:219-251`): a `Shared` resource takes one branch and returns
+an unguarded token, an `Exclusive` resource takes one uncontended
+`compare_exchange`, re-entry on the owning thread bumps a depth counter, and a
+foreign thread gets a typed error. The error is actionable in the RULES.md Rule 1
+sense by construction — it names the resource, the operation, the owning thread,
+the offending thread, the creating thread, and the fix
+(`thread_affinity.rs:113-140`). Call sites take the guard before touching the
+handle, e.g. `IoBinding::bind_input` (`binding.rs:131-137`) and
+`Value::empty_in` through `Allocator::enter` (`value.rs:247`,
+`allocator.rs:337-340`).
+
+This extended an existing precedent rather than inventing a policy: the CUDA
+graph code already returned a typed wrong-thread error,
 
 ```rust
 CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
@@ -641,14 +785,13 @@ CaptureState::Capturing(_) => {
         "cuda_ep: CUDA graph capture must end on the thread that began the \
          thread-local capture"
 ```
-— `crates/onnx-runtime-ep-cuda/src/graph.rs:188-195`, and the same shape for
-`abort` at `:277-283`
+— `crates/onnx-runtime-ep-cuda/src/graph.rs:188-195`, same shape for `abort` at
+`:277-283`.
 
-So the precedent is established and this design extends it rather than inventing
-a policy: a `ThreadId` recorded at construction, compared on use, and reported as
-a typed error naming the handle, the owning thread and the calling thread —
-actionable per RULES.md Rule 1. The routing layer converts it into a 500 with the
-worker named, because a caller cannot fix it and an operator can.
+The routing layer converts a `ThreadAffinityError` into a 500 with the worker
+named, because a caller cannot fix it and an operator can. It is **not** a
+`ExclusiveLeaseConflict` 409: a 409 means "you sent two overlapping turns", an
+affinity error means "the server routed one to the wrong thread".
 
 **B.3 — Teardown never panics.** `Drop` is the one place where an assertion is
 actively harmful: a `Drop` running during unwind that panics aborts the process,
@@ -657,10 +800,23 @@ recoverable worker failure into a hard abort, and §7's "degrade to `W-1`" promi
 would be a lie. A design cannot both panic in `Drop` and claim graceful
 degradation.
 
-The workspace has already solved this, and the solution is richer than anything
-this document would invent. `onnx-runtime-memory-api` defines a vocabulary for
-*"what is true after a release partially fails"*
-(`crates/onnx-runtime-memory-api/src/deferred.rs:5-6`):
+The shipped module honours this. `OwnerThread::check(operation)` is the
+`Drop`-side form for callers that cannot return an error
+(`thread_affinity.rs:254-272`), and `release()` **declines a foreign release**
+rather than forcing one: *"a foreign release is reported and *declined* — the
+resource stays held. That can strand it as permanently busy, which fails closed:
+later use is refused with a name instead of racing"*
+(`thread_affinity.rs:288-294`). Both the double-release and wrong-thread cases
+report through `tracing::error!` plus `debug_assert!`
+(`thread_affinity.rs:304-322`) — so a release build reports and continues, and
+`Drop for IoBinding` (`binding.rs:282-299`) and `Drop for Allocator`
+(`allocator.rs:347-369`) inherit that behaviour. `#2019`'s follow-up commit
+(`f3c89255a`) exists precisely to stop a guard from releasing a resource it never
+took.
+
+The workspace's richer vocabulary for a partially failed release is in
+`onnx-runtime-memory-api`, and the native side reuses it — it defines
+*"what is true after a release partially fails"* (`crates/onnx-runtime-memory-api/src/deferred.rs:5-6`):
 
 - `AllocationReleaseState::Quarantined` — *"Ownership is retained deliberately
   because releasing it would be unsafe or dishonest"* (`deferred.rs:70-73`).
@@ -678,8 +834,8 @@ this document would invent. `onnx-runtime-memory-api` defines a vocabulary for
   principle directly: *"A pin does not ask a context to stay alive; it makes
   teardown observe the outstanding work"* (`context_pin.rs:15-19`).
 
-The same shape already appears outside the memory API: `Drop for CapturedGraph`
-records the error through the context and destroys what it can, without panicking
+The same shape appears elsewhere: `Drop for CapturedGraph` records the error
+through the context and destroys what it can, without panicking
 (`graph.rs:82-99`); `Drop for OwningAllocation` quarantines rather than freeing
 (`crates/onnx-runtime-memory-api/src/binding.rs:2102-2119`); and
 `Drop for PooledStaging` degrades to *"Leak-safe fallback only: free the buffer,
@@ -691,13 +847,15 @@ that is not its owner must, in this order,
 1. emit telemetry naming the resource, its owner thread and the dropping thread —
    never `panic!`, and never conditioned on `std::thread::panicking()`, which
    appears nowhere in the workspace today and would make the behaviour depend on
-   whether a panic happened to be in progress;
+   whether a panic happened to be in progress. For ORT resources this is already
+   `OwnerThread::check` plus the declined `release`;
 2. hand the release to the owning worker's deferred-release queue if that worker
    is still alive, which is the `DeferredReleaseDisposition::Queued` case; and
 3. quarantine the ownership if it is not, with `QuarantineReason::OwnerDropped`
    for a dead owner or `MechanismTerminated` for a torn-down context —
    deliberately retaining memory rather than making a driver call from the wrong
-   thread.
+   thread. The ORT analogue is `release()`'s "stays held" outcome: a stranded
+   resource, reported, never a wrong-thread free.
 
 Quarantine leaks device memory, and that is the point: leaking a reservation is
 a bounded, observable, reportable cost, and freeing it from the wrong context is
@@ -713,12 +871,20 @@ and it does not: §7's degradation promise is explicitly scoped to worker panics
 and construction failures, both of which unwind normally and release through the
 paths above.
 
-Which handles carry an owner-thread record: the native decode session, the CUDA
-context binding, `CudnnBackend` and its reduce cache, `CudaGraphLifecycle`,
-`CudaReservation`, the paged KV cache, and every session-derived `IoBinding`,
-`Allocator` and `Value`. ORT's `Session` does not need one for `Run` (it is
-`Sync`), and takes one when `graph_capture` is enabled (§1.3), where it is
-single-flight and affine like everything else.
+**Which handles carry an owner-thread record.** Done, by #2019:
+`IoBinding` (`binding.rs:82`), session-derived `Allocator`
+(`allocator.rs:243`), and `Session` itself for the run path
+(`run_affinity`, `session/mod.rs:507`) — the last declared `Exclusive` only when
+`supports_concurrent_run()` is false, so a graph-capture session is single-flight
+and affine while a concurrently-runnable one takes the `Shared` fast path
+(`session/mod.rs:874-889`). `Value` is covered transitively: it can only be
+allocated through a guarded `Allocator::enter` (`value.rs:247`).
+
+Still outstanding, and the scope of §13 Phase 1's remainder: the native decode
+session, the CUDA context binding, `CudnnBackend` and its reduce cache,
+`CudaGraphLifecycle`, `CudaReservation`, and the paged KV cache. Several of these
+already enforce affinity in their own idiom (§1.3); the work is to express it in
+one vocabulary so the routing layer can report one error shape.
 
 ---
 
@@ -879,7 +1045,7 @@ can end and all five must release:
 
 The send-failure row is the one that is easy to miss. `EngineDriver`'s submit
 paths already convert a closed channel into `GenerateSubmitError::DriverStopped`
-(`driver.rs:502-506`, `:519-523`); because the guard is moved into the command
+(`driver.rs:502-506`, `:510-523`); because the guard is moved into the command
 and the command is moved into `send`, a failed send returns ownership and the
 guard drops on the spot. No explicit release call exists, and none should — an
 explicit release is a line someone can forget to add to a sixth exit path.
@@ -903,6 +1069,16 @@ statement is simply false.
 
 This is the part that is easy to get wrong quietly, so it is normative.
 
+**First, the precise form of the rule.** §3.4's Rule B is *exclusive use*, not
+pinning: a resource may change owning thread while it is idle, and the shipped
+`thread_affinity` module counts such migrations rather than refusing them
+(`thread_affinity.rs:17-31`). So the obligations below say *"the thread that
+owns it"*, not *"the thread that first created it"*. A worker taking over an
+idle session's resources at a handoff (§5 create/fork/reset, §7 worker
+replacement) is doing the supported thing. What is never permitted is two
+threads inside the same resource at once, or a release performed by a thread
+that is not the current owner.
+
 **Must be constructed on the worker thread that will use it:**
 
 - the CUDA context binding, and everything created under it;
@@ -916,12 +1092,15 @@ This is the part that is easy to get wrong quietly, so it is normative.
   allocations are charged under the right context;
 - every session-derived `IoBinding`, `Allocator` and `Value` (§3.4), which today
   are built wherever the workflow runtime happens to run
-  (`pipeline/islands.rs:78-79`, `allocator.rs:236-238`, `value.rs:232-240`).
+  (`pipeline/islands.rs:87-88`, `allocator.rs:280-300`, `value.rs:244-247`).
 
-Each of these records an `OwnerThread` at construction (§3.4, Rule B). The
-recording is what makes the drop rule below checkable instead of aspirational.
+The ORT members of that list already record an `OwnerThread` at construction
+(`binding.rs:104-117`, `allocator.rs:302-322`) and `Session` records one for the
+run path (`session/mod.rs:507`). The recording is what makes the drop rules below
+checkable instead of aspirational; §3.4 lists the native handles that still need
+the same treatment.
 
-**Must be dropped on the worker thread that constructed it.** Teardown makes
+**Must be dropped on the thread that owns them at that moment.** Teardown makes
 driver calls that bind the context first
 (`virtual_memory.rs:186-189`, `vmm_allocator.rs:686-689`); running those on a
 foreign thread is the same violation as running the work there. Concretely: a
@@ -929,13 +1108,28 @@ worker's `join` must happen only after that worker has dropped its own
 category-3.2 state, and nothing may claw a handle back to the coordinator to
 drop it. §7 makes this a shutdown ordering rule.
 
+**And in the right order within a worker: values before their allocator.** This
+is a separate obligation from Rule A, because Rule A's ownership edge stops one
+level short. A `Value` is a bare `OrtValue` handle with no back-reference to the
+allocator whose memory it holds, so nothing in the type system prevents an
+allocator from being released first (`pipeline/mod.rs:270-277`). The required
+order is written down in the ORT crate — *"the device `Value` (frees memory
+through the allocator), then the `Allocator`, then the `Session`, and finally the
+`Environment`"* (`value.rs:2443-2448`) — and it is why
+`WorkflowRuntime::drop` still clears bindings, outputs and allocators by hand
+(`pipeline/mod.rs:278-287`). A worker's teardown path carries the same duty: it
+drops its bound `Value`s, then its `Allocator`s, then releases its `Arc<Session>`.
+This is normative for §7's shutdown sequence and for the worker-failure path.
+
 Native CUDA teardown is the strictest case and is called out separately: the
 CUDA context binding, the captured graph and its lifecycle, the reservation, the
 device allocator and the KV pages beneath it are all released by the owner
-thread, in that thread's own unwind or shutdown path. `OwnerThread::assert_owned`
-fires in each of their `Drop` impls, so an attempt to release them elsewhere
-aborts loudly at the point of the mistake rather than corrupting a context that
-some other worker is mid-capture on.
+thread, in that thread's own unwind or shutdown path. Their `Drop` impls use the
+non-failing check form — `OwnerThread::check`, which reports and, on the release
+side, *declines* a foreign release rather than performing one
+(`thread_affinity.rs:254-272`, `:288-294`). **They do not panic**, per §3.4's
+B.3: a wrong-thread release is reported and the resource is left held or
+quarantined, never freed from a context some other worker may be mid-capture on.
 
 The two rules compose. Rule A of §3.4 guarantees a session outlives everything
 derived from it; Rule B guarantees that everything derived from it is released
@@ -1326,6 +1520,19 @@ Both hand-written impls exist to paper over the gap between "this type is not
 provably `Send`" and "we know it never leaves its thread". The worker model
 closes that gap structurally, so both are removed rather than re-justified.
 
+**#2019 made this urgent rather than merely tidy.** `Engine`'s safety comment
+still reads *"Neither runtime's sessions, values, bindings, allocators, or CPU
+tensors have thread affinity"* (`engine/model.rs:221-223`). Since #2019 that
+sentence is false for three of the five: `IoBinding`, `Allocator` and `Value` are
+`!Send + !Sync` and carry `OwnerThread` records (§3.4). The `thread_affinity`
+module names the situation explicitly — *"What the compiler cannot see is a
+resource smuggled inside a container that carries its own `unsafe impl Send`
+(`onnx_genai_engine::Engine` does), and that is the case this module names"*
+(`thread_affinity.rs:13-15`). The runtime guard now catches a violation and
+reports it; §10's job is to make the violation unrepresentable, and until it is
+done the `unsafe impl` is the thing standing between the compiler and a bug it
+could otherwise reject outright.
+
 **`unsafe impl Send for EngineOwner` (`driver.rs:278-281`) is deleted.** Its
 entire safety argument is *"The engine is moved exactly once into the dedicated
 driver thread"*. Under §4.3 the backend state is constructed on the worker thread
@@ -1362,13 +1569,21 @@ discharged by a `Drop` impl one level up.* Ownership is expressed with `Arc`
 (§3.4, Rule A) so that the refcount, not the source-file layout, decides release
 order; thread affinity is expressed structurally where possible and reported as a
 typed error otherwise (§3.4, Rule B). §1.4 is the worked example of what the
-absence of both rules already costs at `W = 1`, and the cost is not linear in
-`W` — it is the difference between one thread reliably reproducing a bug and `W`
-threads producing it intermittently.
+absence of both rules cost at `W = 1`, and the cost is not linear in `W` — it is
+the difference between one thread reliably reproducing a bug and `W` threads
+producing it intermittently.
+
+**For ORT session-derived handles that rule is now satisfied, not proposed.**
+`IoBinding` and `Allocator` co-own their session (§3.4, Rule A), so
+`ExecutionIsland` and `PipelineModels` no longer depend on field order for the
+session edge. What remains inside the scope of the rule is the `Value` →
+`Allocator` edge, which has no ownership link and is still discharged by a `Drop`
+one level up (`pipeline/mod.rs:270-287`) — the rule's own exception, kept
+visible rather than quietly satisfied.
 
 The scoping is not a hedge; it is §3.5. The `Session → Environment` edge has the
 same defect and is **not** fixed here, because `Session` holds no environment
-handle (`session/mod.rs:477-499`) and the environment is a process-global
+handle (`session/mod.rs:479-508`) and the environment is a process-global
 `OnceLock` (`env.rs:45-48`). Claiming the rule for that edge without doing the
 work would make the rule decorative. Until §3.5's structural option is taken, the
 environment's ordering remains discipline-enforced, and — the part that matters
@@ -1377,7 +1592,8 @@ lifetime that replaces it exists.**
 
 The three rules are one rule seen from three sides. A `Send` claim asserts a
 handle may cross threads; `Arc` ownership asserts a handle outlives its
-dependents; owner-thread recording asserts a handle is touched only by its owner.
+dependents; owner-thread recording asserts a handle is touched by one owner at a
+time.
 Each replaces a comment that a human has to keep true with a fact the compiler or
 the runtime keeps true.
 
@@ -1453,7 +1669,7 @@ sufficient.
 **The condition for revisiting.** This rejection is contingent, and the condition
 is precise: if every handle a session transitively owns proves `Send + Sync`
 *with an audited justification of the kind ORT's `Session` already carries*
-(`onnx-genai-ort/src/session/mod.rs:1224-1235`) — meaning no bound context, no
+(`onnx-genai-ort/src/session/mod.rs:1389-1406`) — meaning no bound context, no
 owning stream, no thread-local capture state — then a lock-based design becomes
 sound, and grounds 3 and 4 fall away. Grounds 1 and 2 would still stand. Today
 that condition is not met, and the evidence is in the table in §1.3.
@@ -1580,25 +1796,36 @@ concurrency. Every test below spawns real OS threads and synchronizes on a
     idle, and a shard under its session bound but at its *memory* ceiling refuses
     with the memory error instead — see §4.4 on why session count and active load
     are different quantities.
-13. **Session-derived resources keep the session alive.** Build an `IoBinding`
-    and a device `Allocator` from a session, allocate a `Value` from that
-    allocator, then drop the caller's `Session` handle *first* and assert the
-    binding, allocator and value tear down cleanly afterwards. This test fails
-    against today's code (§1.4) and passes once §3.4's `Arc<Session>` edge
-    exists, which is the point: it is the regression test for the defect, and it
-    is written before the fix. A companion test asserts that a struct owning a
-    session and a binding tears down correctly under *both* field declaration
-    orders, so the property is ownership rather than layout.
-14. **Wrong-thread use returns a typed error.** Construct a per-worker handle on
-    thread A, use it from thread B, and assert it returns the typed affinity
-    error naming both threads — not a panic, matching the precedent the CUDA
-    graph code already sets (`graph.rs:188-195`). Where §3.4's Rule B.1 applies,
-    the stronger test is that the code *does not compile*: a
-    `trybuild`-style compile-fail case asserting the handle is not `Send` is
-    better evidence than any runtime check.
+13. **Session-derived resources keep the session alive.** ✅ **Shipped by #2019
+    for ORT** — `a_shared_binding_keeps_its_session_alive_past_the_owners_last_handle`
+    and `a_shared_allocator_keeps_its_session_alive_and_releases_before_it`
+    (`crates/onnx-genai-ort/tests/session_thread_contract.rs:203-245`) drop the
+    caller's last `Session` handle first and assert the derived resource still
+    tears down cleanly. What this design adds is the same test for the holders
+    §3.4 has not converted (`Engine::session`, `Eagle3Model`, `DraftModel`), and
+    the `Value` → `Allocator` order obligation of §4.3, which has no ownership
+    edge and must therefore be asserted by teardown order rather than by
+    refcount.
+14. **Wrong-thread use returns a typed error.** ✅ **Shipped by #2019 for ORT** —
+    `a_second_thread_reaching_a_held_resource_is_refused_by_name`
+    (`session_thread_contract.rs:130-163`), plus the structural half as a
+    `const { assert!(..) }` contract that *fails to build* if anyone adds an
+    `unsafe impl Send` (`session_thread_contract.rs:60-125`), which is stronger
+    than a `trybuild` case because it breaks the crate rather than a test. Two
+    further shipped tests pin the semantics this document depends on:
+    `an_idle_resource_may_move_to_another_thread_and_records_it`
+    (`:164-187`) — the exclusive-use-not-pinning rule of §3.4 — and
+    `a_concurrently_runnable_session_can_actually_be_run_from_two_threads`
+    (`:285-320`), which runs one `Session` from two real threads rather than
+    trusting the `Sync` impl. The remaining work is the same coverage for the
+    native/CUDA handles §3.4 lists as outstanding, matching the precedent the
+    CUDA graph code already sets (`graph.rs:188-195`).
 15. **Wrong-thread teardown degrades, and does not abort.** Drop a per-worker
     resource on a foreign thread and assert three things: the process does not
-    abort, telemetry names the resource and both threads, and the ownership is
+    abort — `OwnerThread::release` already reports and declines rather than
+    panicking (`thread_affinity.rs:304-322`), so this test pins existing
+    behaviour for ORT and new behaviour for the native handles — telemetry names
+    the resource and both threads, and the ownership is
     accounted — either queued to the owner's deferred-release queue
     (`DeferredReleaseDisposition::Queued`) or quarantined with
     `QuarantineReason::OwnerDropped` (`deferred.rs:440-449`, `:153-174`). Run the
@@ -1668,8 +1895,9 @@ Both backends are selected as CI already selects them:
 `cargo test --locked -p onnx-genai-engine --features native-backend --
 --test-threads=1` for native, and the ORT-backed package set likewise with
 `--test-threads=1` (`.github/workflows/ci.yml:960-968` and `:949-953`
-respectively). Note the irony and handle it explicitly: the harness pins `--test-threads=1` so that tests do not
-contend for the device, which means the concurrency tests in §12.1 must create
+respectively). Note the irony and handle it explicitly: the harness pins
+`--test-threads=1` so that tests do not contend for the device, which means the
+concurrency tests in §12.1 must create
 their own threads inside a single test binary rather than rely on the test
 runner. They are written that way.
 
@@ -1729,49 +1957,66 @@ field that is always `0`. Behaviour is unchanged; this is Rule 5 cleanup that
 happens to be a prerequisite. Callers that treat the id as opaque — including
 `SessionRegistry` (`server/src/session.rs:11-20`) — need no logic change.
 
-**Phase 1 — split the state, and fix the lifecycle defect first.** This phase
-begins with §1.4, because it is a live bug at `W = 1` and it is far cheaper to
-fix before a pool exists than after. Give `IoBinding` and session-derived
-`Allocator`s an `Arc<Session>` (§3.4, Rule A), replacing the non-owning
-`*const Session` (`binding.rs:12-15`) and the untied allocator
-(`allocator.rs:205-209`), and land tests 13–15 from §12.1 with it.
+**Phase 1 — split the state. The backend ownership/affinity prerequisite is
+already complete.**
 
-The `Arc` conversion is not confined to the two call sites above, and the phase
-is not done until every holder in §3.4's table is converted or the rule is
-narrowed in writing. Today the holders are mixed: `Engine::session` is
+✅ **Done, by #2019 (`27b8945e2` + `f3c89255a`).** This phase used to begin with
+§1.4's lifecycle defect. It no longer does, because that work has shipped:
+`IoBinding` and session-derived `Allocator`s co-own their `Arc<Session>`
+(`binding.rs:17-26`, `allocator.rs:207-219`), the `thread_affinity` module
+supplies structural `!Send`, typed affinity errors and a non-panicking teardown
+form (§3.4, Rule B), and §12.1's tests 13–15 exist in
+`crates/onnx-genai-ort/tests/session_thread_contract.rs`. Phase 1 no longer
+blocks on it, and Phase 2 no longer waits for it.
+
+⚠️ **Still open, and the phase is not done without it: the `Box<Session>`
+holders.** #2019 converted the holders it needed (`PipelineModels::sessions`,
+`ExecutionIsland::session`); it did not convert the engine's. The phase is not
+done until every holder in §3.4's table is converted or the rule is narrowed in
+writing, because a session-derived binding whose parent is still a `Box` on some
+other path reintroduces exactly the defect the ORT crate just removed. Today the
+holders are mixed: `Engine::session` is
 `Option<Box<Session>>` (`engine/model.rs:68`), `Eagle3Model::session` and
 `DraftModel::session` are `Box<Session>` (`engine/model.rs:255`,
 `engine/session.rs:50`), and only `MtpModel::session` is already `Arc<Session>`
 (`engine/model.rs:245`). The `Box` choices are deliberate — self-referential
 runners point into the boxed allocation for a stable address
-(`engine/model.rs:225-226`) — and `Arc` preserves that property, so the
-conversion is mechanical but must be exhaustive: a session-derived binding whose
-parent is still a `Box` on some other path reintroduces exactly the defect this
-phase exists to remove. If some holder cannot be converted, §3.4 Rule A is
-amended to name that holder as out of scope rather than left implying coverage it
-does not have.
+(`engine/model.rs:224-226`) — and `Arc` preserves that property, so the
+conversion is mechanical but must be exhaustive. If some holder cannot be
+converted, §3.4 Rule A is amended to name that holder as out of scope rather than
+left implying coverage it does not have.
 
-**What this phase must not do is delete the compensating teardown before the
-structural replacement exists.** The manual map clears in `WorkflowRuntime::drop`
-(`pipeline/mod.rs:270-279`) may be removed *in this phase, after* the `Arc` edge
-lands and the tests prove ordering is no longer load-bearing — that is Rule 3
-cleanup. The `Drop for Environment` teardown (`env.rs:308-321`) may **not**:
-§3.5 shows nothing structurally keeps the environment alive behind a session, so
-that `Drop` is the only thing enforcing an ORT lifetime requirement, and deleting
-it before the structural lifetime exists trades a correct-by-convention teardown
-for an unsound one. It is removed only in whichever later phase adopts §3.5's
-structural option, and only together with it.
+**What this phase must not do is delete a compensating teardown before the
+structural replacement exists.** Two are explicitly retained:
+
+- **`WorkflowRuntime::drop`'s manual clears stay** (`pipeline/mod.rs:278-287`).
+  `Arc<Session>` does *not* license removing them. Its own doc comment says why:
+  bindings and session-derived allocators are now structural, but *"A `Value`
+  cannot: it is a bare `OrtValue` handle with no back-reference to the allocator
+  whose memory it holds, so ORT still requires every value to be released before
+  that allocator. Nothing in the type system says so, which is exactly why it is
+  done here explicitly instead of left to the field list"*
+  (`pipeline/mod.rs:270-277`). Removing it becomes possible only if a later phase
+  gives `Value` an ownership edge to its `Allocator`; until then §4.3 carries the
+  ordering as a worker obligation.
+- **`Drop for Environment`'s ordering discipline stays** (`env.rs:308-324`), as
+  does `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:264-267`).
+  §3.5 shows nothing structurally keeps the environment alive behind a session,
+  so these are the only things enforcing an ORT lifetime requirement. They are
+  removed only in whichever later phase adopts §3.5's structural option, and only
+  together with it.
 
 The rest of the phase is the state split proper: extract the immutable package
 and compiled workflow plan (§3.1) behind `Arc`; separate per-execution turn state
 (§3.3) from the interpreter; move the interpreter's `workflow_session_leases` out
 of `RefCell` and into per-turn-owned worker state, where it stays as the
-inner-layer invariant §4.2 describes. Introduce the per-worker affinity marking
-(§3.4, Rule B) on the handles listed in §4.3 — structural `!Send` where the type
-allows it, typed affinity errors otherwise — where at `W = 1` every check passes
-trivially and therefore establishes the baseline rather than chasing a
-regression. Still one thread, still one worker. This is the largest refactor and
-the one that carries no concurrency risk, which is why it is isolated.
+inner-layer invariant §4.2 describes. Extend the shipped `thread_affinity` vocabulary
+(§3.4, Rule B) to the native handles §4.3 lists as still outstanding — structural
+`!Send` where the type allows it, `OwnerThread` plus typed affinity errors
+otherwise — where at `W = 1` every check passes trivially and therefore
+establishes the baseline rather than chasing a regression. Still one thread,
+still one worker. This is the largest refactor and the one that carries no
+concurrency risk, which is why it is isolated.
 
 **Phase 2 — the routing lease, on the worker pool of one that already exists.**
 PR #2012 (merged as `1bf87c86`) already built the worker thread, the
@@ -1875,5 +2120,6 @@ rows in flight.
    `Arc<Environment>` or the process-global `OnceLock` stays with a documented
    scope rule is left to implementation, because the answer depends on how much
    of the EP plugin registry moves with it. What is *not* open is the ordering:
-   the compensating `Drop for Environment` (`env.rs:308-321`) is not removed
-   before whichever option is chosen actually lands.
+   the compensating `Drop for Environment` (`env.rs:308-324`) and
+   `WorkflowRuntime`'s last-field `_ort_environment` (`pipeline/mod.rs:264-267`)
+   are not removed before whichever option is chosen actually lands.
