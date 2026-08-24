@@ -2158,12 +2158,14 @@ impl SpmdDecodePools {
     /// must not race a live decode dispatch -- after it returns the workers are
     /// gone.
     ///
-    /// A dispatch that arrives afterwards no longer hangs: [`Self::dispatch`]
-    /// observes the stop flag and runs every shard inline on the calling thread,
-    /// counting it in [`SpmdCounters::post_shutdown_dispatches`]. That is a
-    /// correctness backstop, not a supported mode -- the pool cannot be rebuilt
-    /// (`POOLS` is a `OnceLock`), so decode stays serial for the rest of the
-    /// process.
+    /// A dispatch that arrives afterwards no longer hangs: `dispatch` observes
+    /// the stop flag and runs every shard inline on the calling thread, counting
+    /// it in [`SpmdCounters::post_shutdown_dispatches`]. That is a correctness
+    /// backstop, not a supported mode. This receiver is any `SpmdDecodePools`,
+    /// so nothing here says the pool cannot be replaced -- but the only pool
+    /// production has is the one [`pools`] holds in a `OnceLock`, and *that* one
+    /// cannot be rebuilt, so in a real process decode stays serial for the rest
+    /// of its life. See [`shutdown_pools`].
     pub fn shutdown(&self) {
         if self.shared.is_none() {
             return;
@@ -7850,8 +7852,19 @@ mod tests {
     /// pool that never dispatched at all would pass.
     ///
     /// Mutation-checked: deleting the `shared.shutdown` check in
-    /// [`SpmdDecodePools::dispatch`] makes this time out at every width, and no
-    /// other test in this module fails.
+    /// [`SpmdDecodePools::dispatch`] makes this time out, and no other test in
+    /// this module fails. Note precisely what that kill does and does not show
+    /// -- the panic aborts the loop at the *first* width, so the mutation
+    /// demonstrates the hang at width 2 only. Widths 3 and 4 are exercised by
+    /// the passing run, not by the kill. The three are structurally identical
+    /// (`single_group_pool` builds no dispatcher shard, so
+    /// `node_thread_counts == [width]` in every arm), so this is a limit on the
+    /// evidence rather than a suspected difference between them.
+    ///
+    /// The one-shot warning `report_dispatch_after_shutdown` emits is expected
+    /// output of this test and escapes libtest's capture, because it is printed
+    /// from the spawned thread rather than the test's own. A single such line
+    /// per binary run is the fix working, not a leak.
     #[test]
     fn a_dispatch_after_shutdown_runs_inline_instead_of_hanging() {
         for width in [2usize, 3, 4] {
