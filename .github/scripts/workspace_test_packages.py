@@ -255,6 +255,13 @@ def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
 # it names the step when it refuses.
 _STEP_ITEM = re.compile(r"^\s*- ")
 _STEP_IF = re.compile(r"^\s*if:\s*(.+?)\s*$")
+# `continue-on-error: true` lets the step (or job) fail without failing the
+# check, so its tests run but cannot block a merge -- which is the only property
+# this gate cares about. Crediting it would satisfy the gate with coverage that
+# is decorative.
+_STEP_COE = re.compile(r"^\s*continue-on-error:\s*(.+?)\s*$")
+_JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
+_FALSEY = {"false", "${{ false }}", "'false'", '"false"'}
 _RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
 
 
@@ -275,27 +282,34 @@ def job_steps(job_body: str) -> list[tuple[str | None, str]]:
 
 
 def _step_entry(lines: list[str]) -> tuple[str | None, str]:
+    """(reason this step must not be credited, step text). None means credit it."""
     first = lines[0]
-    item_indent = len(first) - len(first.lstrip())
-    body_indent = item_indent + 2
-    condition: str | None = None
+    body_indent = len(first) - len(first.lstrip()) + 2
+    keys: dict[str, str] = {}
     for index, line in enumerate(lines):
         if not line.strip():
             continue
         if index == 0:
-            # `- if: cond` puts the key straight after the list marker.
             stripped = first.lstrip()
             text = stripped[2:] if stripped.startswith("- ") else ""
         elif len(line) - len(line.lstrip()) == body_indent:
             # A key at the step's own depth. Anything deeper is shell text
-            # inside a run block and must not be read as a step condition.
+            # inside a run block and must not be read as a step key.
             text = line.lstrip()
         else:
             continue
         if match := _STEP_IF.match(text):
-            condition = match.group(1)
-            break
-    return condition, "\n".join(lines)
+            keys.setdefault("if", match.group(1))
+        elif match := _STEP_COE.match(text):
+            keys.setdefault("continue-on-error", match.group(1))
+    reason: str | None = None
+    condition = keys.get("if")
+    if condition is not None and condition not in _RUNS_IN_A_PASSING_JOB:
+        reason = f"if: {condition}"
+    tolerated = keys.get("continue-on-error")
+    if reason is None and tolerated is not None and tolerated not in _FALSEY:
+        reason = f"continue-on-error: {tolerated}"
+    return reason, "\n".join(lines)
 
 
 def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
@@ -306,14 +320,19 @@ def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
     """
     kept: list[str] = []
     refused: list[str] = []
-    for condition, text in job_steps(job_body):
+    if match := _JOB_COE.search(job_body):
+        if match.group(1) not in _FALSEY:
+            # The job itself is allowed to fail, so nothing it runs can block a
+            # merge. Refuse every block rather than a step at a time.
+            return [], [f"continue-on-error: {match.group(1)} (job level)"]
+    for reason, text in job_steps(job_body):
         blocks = run_blocks(text)
         if not blocks:
             continue
-        if condition is None or condition in _RUNS_IN_A_PASSING_JOB:
+        if reason is None:
             kept.extend(blocks)
         else:
-            refused.append(condition)
+            refused.append(reason)
     return kept, refused
 
 
@@ -437,8 +456,8 @@ _PARSER_FIXTURE = """jobs:
 """
 
 
-_CONDITIONAL_ARMS: tuple[tuple[str, str, list[str], list[str]], ...] = (
-    # label, step YAML, packages that must be credited, `if:`s that must be refused
+_CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
+    # label, step YAML (None = job-level arm), packages credited, reasons refused
     (
         "unconditional step is credited",
         "      - name: x\n        run: cargo test -p pkg-alpha\n",
@@ -455,19 +474,37 @@ _CONDITIONAL_ARMS: tuple[tuple[str, str, list[str], list[str]], ...] = (
         "if: false is not credited",
         "      - name: x\n        if: false\n        run: cargo test -p pkg-alpha\n",
         [],
-        ["false"],
+        ["if: false"],
     ),
     (
         "a platform guard is not credited",
         "      - name: x\n        if: runner.os == 'Windows'\n        run: cargo test -p pkg-alpha\n",
         [],
-        ["runner.os == 'Windows'"],
+        ["if: runner.os == 'Windows'"],
     ),
     (
         "if: on the list-item line is still a step condition",
         "      - if: false\n        run: cargo test -p pkg-alpha\n",
         [],
-        ["false"],
+        ["if: false"],
+    ),
+    (
+        "continue-on-error: true is not credited",
+        "      - name: x\n        continue-on-error: true\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["continue-on-error: true"],
+    ),
+    (
+        "job-level continue-on-error refuses the whole job",
+        None,
+        [],
+        ["continue-on-error: true (job level)"],
+    ),
+    (
+        "continue-on-error: false is credited",
+        "      - name: x\n        continue-on-error: false\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
     ),
     (
         "`if:` inside shell text is not a step condition",
@@ -482,7 +519,13 @@ def _conditional_arms() -> int:
     """A step the job may skip must not count as having run its tests."""
     failures = 0
     for label, step, want_credited, want_refused in _CONDITIONAL_ARMS:
-        kept, refused = unconditional_run_blocks("    steps:\n" + step)
+        body = (
+            "    continue-on-error: true\n    steps:\n"
+            "      - name: x\n        run: cargo test -p pkg-alpha\n"
+            if step is None
+            else "    steps:\n" + step
+        )
+        kept, refused = unconditional_run_blocks(body)
         credited = sorted(packages_tested_by(kept))
         if credited != want_credited or refused != want_refused:
             failures += 1
