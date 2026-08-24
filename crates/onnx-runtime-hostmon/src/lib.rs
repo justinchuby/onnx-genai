@@ -134,6 +134,7 @@
 //! cannot report a single credible holder for a window that changed hands.
 
 pub mod hostlock;
+pub mod window;
 
 use std::time::Instant;
 
