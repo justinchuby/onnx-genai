@@ -22,6 +22,7 @@ use crate::kernels::expert_route_telemetry::{
     ArmedTelemetry, MARK_DEVICE_SRC, RouteTelemetryConfig, TelemetrySnapshot, TelemetryUnsupported,
 };
 use crate::kernels::{qmoe_gemm, qmoe_grouping};
+use crate::route_residency::RouteTelemetrySource;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const MODULE: &str = "qmoe_affine_v1";
@@ -3210,6 +3211,21 @@ fn as_u64(name: &str, value: usize) -> Result<u64> {
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep com.microsoft::QMoE: {}", message.into()))
+}
+
+/// The armed `QMoEKernel` is the production [`RouteTelemetrySource`]: the
+/// boundary consumer drives a live kernel through exactly the two existing,
+/// already-tested window primitives (snapshot self-synchronizes; reset is
+/// rejected under capture). No new mechanism — this only names the ordered pair
+/// for the Slice-7C boundary caller.
+impl RouteTelemetrySource for QMoEKernel {
+    fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>> {
+        QMoEKernel::route_telemetry_snapshot(self)
+    }
+
+    fn reset_route_telemetry_boundary(&self) -> Result<()> {
+        QMoEKernel::reset_route_telemetry_boundary(self)
+    }
 }
 
 #[cfg(test)]

@@ -129,7 +129,16 @@ impl Executor {
         // reset failure is never silently discarded.
         let reset = self.ep.reset_device_validation_error();
         match (checked, reset) {
-            (Ok(0), Ok(())) => Ok(()),
+            (Ok(0), Ok(())) => {
+                // The single coarse safe boundary: the request's kernels and any
+                // captured replay have completed (the sync above), the stream is
+                // no longer capturing, and the device validation latch is clean.
+                // Consume any completed route-telemetry window here and nowhere
+                // else (issue #1810 Slice 7C). The default EP path is a no-op, so
+                // this is byte-identical unless a provider opts in.
+                self.ep.consume_route_residency_at_boundary()?;
+                Ok(())
+            }
             (Ok(flags), Ok(())) => Err(EpError::KernelFailed(format!(
                 "{}: device validation failed (flags=0x{flags:x})",
                 self.ep.name()

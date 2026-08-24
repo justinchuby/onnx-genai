@@ -1345,6 +1345,27 @@ pub trait ExecutionProvider: Send + Sync {
         Ok(0)
     }
 
+    /// Consume any completed coarse-boundary route-telemetry window and apply
+    /// the resulting per-expert residency plan through the provider's existing
+    /// coarse-residency lifecycle (issue #1810 Slice 7C).
+    ///
+    /// Session executors call this **once per top-level request**, at the single
+    /// request-level host boundary that runs after [`Self::sync`] — i.e. after
+    /// every kernel and captured replay from the request has completed and the
+    /// stream is no longer capturing. It is never called per token, per replay,
+    /// or from a nested control-flow subgraph run.
+    ///
+    /// The default is a no-op: stock EPs, and the CUDA EP whenever device weight
+    /// offload or the coarse-residency profile is disabled (the shipped
+    /// default), do nothing here and are byte-identical to this method not
+    /// existing. A provider that overrides it must remain fail-closed and must
+    /// perform no mapping change during capture/replay — it reuses its own
+    /// already-validated safe-boundary authority to decide whether the boundary
+    /// is safe before it consumes or resets anything.
+    fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        Ok(())
+    }
+
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None
