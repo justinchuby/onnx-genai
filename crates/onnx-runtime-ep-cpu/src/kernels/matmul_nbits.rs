@@ -20535,11 +20535,26 @@ mod tests {
     /// #1792 shape of "reports one placement, runs another" -- and requires the
     /// verdict to come back false.
     ///
-    /// Linux-only because the cross-check reads `/proc`; elsewhere the verdict
-    /// is `None` by design and there is nothing to falsify.
+    /// Linux-only for the harness, not for the property: the child is driven
+    /// through this crate's subprocess machinery. The *cross-check* itself is
+    /// per-thread `sched_getaffinity`/`GetThreadGroupAffinity` and is no longer
+    /// a `/proc` read, so the capability it actually needs is asserted below
+    /// rather than assumed from the target.
     #[test]
     #[cfg(target_os = "linux")]
     fn a_pool_that_misreports_its_placement_is_caught_end_to_end() {
+        // The capability this test needs is the affinity *query*, not pinning
+        // and not `/proc`. Naming it here keeps the precondition attached to
+        // the mechanism: the previous version inherited its skip from the
+        // target triple, which was correct only while the cross-check read
+        // `/proc`.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping placement falsification: this target has no per-thread affinity \
+                 query, so a misreported placement is unobservable rather than false"
+            );
+            return;
+        }
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
         // Fails closed on the topology: this used to skip on
         // `core_topology::host().is_none()`, so a detection regression turned
@@ -20797,11 +20812,17 @@ mod tests {
             //
             // Blind spots are named, and none of them is `one-per-core`: a
             // child that could not answer fails the guard below rather than
-            // passing this one. On a target with an affinity query -- which is
-            // every target this sweep runs on, Linux and Windows -- an
-            // unanswerable report is a defect in the apparatus, not a host
-            // property to tolerate.
-            if report.fully_pinned && report.workers <= report.cores {
+            // passing this one. Conditioned on the affinity query existing --
+            // `fully_pinned` reports the *pinning* capability, and a target
+            // that can pin without being able to read a mask back would fail
+            // this for a host limitation rather than a defect. The guard
+            // immediately after is what stops that condition from becoming an
+            // escape: where the query does exist, a child claiming it does not
+            // is a defect in the apparatus.
+            if crate::decode_affinity::affinity_observation_supported()
+                && report.fully_pinned
+                && report.workers <= report.cores
+            {
                 assert_eq!(
                     report.realized, "one-per-core",
                     "requested width {requested}: every worker reports an applied pin and the                      host has room, but the placement the workers actually observed for                      themselves is `{}` -- so the label t={requested} describes a placement                      the kernel did not enforce ({report:?})",
@@ -20813,7 +20834,10 @@ mod tests {
                     || report.realized != "no-affinity-query",
                 "width {requested}: this target has a per-thread affinity query, yet the                  child reported it had none -- the realized-placement observation is                  switched off, which is the exact shape of a check that cannot fail                  ({report:?})"
             );
-            saw_realized_placement_check |= report.fully_pinned && report.workers <= report.cores;
+            saw_realized_placement_check |=
+                crate::decode_affinity::affinity_observation_supported()
+                    && report.fully_pinned
+                    && report.workers <= report.cores;
 
             assert_eq!(
                 report.workers, effective,
@@ -20870,11 +20894,13 @@ mod tests {
             // actually took. A single flag would let the planner's assertions
             // vouch for a realized check that never ran.
             assert!(
-                saw_realized_placement_check || !crate::decode_affinity::pinning_supported(),
+                saw_realized_placement_check
+                    || !crate::decode_affinity::pinning_supported()
+                    || !crate::decode_affinity::affinity_observation_supported(),
                 "no swept width produced a checkable *realized* placement on a \
-                 {allowed_now}-CPU cpuset that supports pinning, so every assertion about \
-                 where the workers actually ran was skipped and the sweep verified only \
-                 what the planner intended"
+                 {allowed_now}-CPU cpuset that supports pinning and can read affinity \
+                 back, so every assertion about where the workers actually ran was \
+                 skipped and the sweep verified only what the planner intended"
             );
         }
     }

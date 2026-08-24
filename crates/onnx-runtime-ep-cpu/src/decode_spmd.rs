@@ -1172,6 +1172,17 @@ impl WorkerPlacement {
             _ => None,
         }
     }
+
+    /// Does this worker assert a placement that something could contradict?
+    ///
+    /// The difference between the two kinds of `None` [`Self::report_is_honest`]
+    /// returns, and the whole reason the pool-level verdict can be precise: a
+    /// worker that never asked for a pin claims nothing and cannot be lying,
+    /// while a worker that claims an applied pin and whose mask cannot be read
+    /// is an *unverified claim*. Only the second has to withdraw a verdict.
+    pub fn claims_a_pin(&self) -> bool {
+        matches!(self.attempt, PinAttempt::Applied) && self.attempted_cpu.is_some()
+    }
 }
 
 /// Why a realized-placement question could not be answered.
@@ -1284,6 +1295,50 @@ fn realized_placement_of(
         }
     }
     RealizedPlacement::OneWorkerPerPhysicalCore
+}
+
+/// Whether every worker that claims a pin is observably on the CPU it claims.
+///
+/// `None` means *unanswerable*, and it is answered for the pool rather than
+/// per worker on purpose. Round-one review caught the obvious version of this
+/// returning `Some(true)` the moment a single worker verified clean, discarding
+/// the `None`s from workers whose masks could not be read -- the
+/// unanswerable-read-as-answered defect this whole change exists to remove,
+/// reintroduced one level up from where it was removed.
+///
+/// The two `None`s a worker can produce are *not* the same, and collapsing them
+/// would swing the check from too weak to too strict:
+///
+/// * a worker that never asked for a pin claims nothing, cannot contradict
+///   anything, and must not withdraw a verdict its peers can support -- a
+///   partially pinned pool would otherwise become permanently unanswerable;
+/// * a worker that claims an applied pin and cannot read its mask is an
+///   *unverified claim*, and one of those is enough to sink the pool's verdict.
+///
+/// A definite `Some(false)` outranks both: "this worker is not where it says it
+/// is" stays true however many of its peers went unchecked.
+///
+/// Taken as a free function over the evidence so the case that matters -- some
+/// workers readable, some not -- is testable at all. It cannot be produced by
+/// building a real pool on any host in CI, where readability is a property of
+/// the target and so is uniform across a pool's workers.
+fn placement_report_is_honest_of(placements: &[WorkerPlacement]) -> Option<bool> {
+    if placements
+        .iter()
+        .any(|placement| placement.report_is_honest() == Some(false))
+    {
+        return Some(false);
+    }
+    if placements
+        .iter()
+        .any(|placement| placement.claims_a_pin() && placement.report_is_honest().is_none())
+    {
+        return None;
+    }
+    placements
+        .iter()
+        .any(|placement| placement.report_is_honest() == Some(true))
+        .then_some(true)
 }
 
 /// A persistent SPMD decode pool: hot worker threads plus the shared barrier
@@ -2006,20 +2061,14 @@ impl SpmdDecodePools {
     /// [`Self::worker_cpus`], which benchmark rows label placement from, is not
     /// a claim the process failed to carry out.
     ///
-    /// `None` when unanswerable: nothing was pinned, or no worker's mask could
-    /// be read. Answered from each worker's own recorded mask rather than by
-    /// scanning `/proc/self/task` for thread names, so a second pool running
-    /// concurrently cannot contaminate the answer.
+    /// `None` when unanswerable: nothing was pinned, or a worker that claims a
+    /// pin could not have that claim checked. Answered from each worker's own
+    /// recorded mask rather than by scanning `/proc/self/task` for thread names,
+    /// so a second pool running concurrently cannot contaminate the answer. See
+    /// [`placement_report_is_honest_of`] for why the two unanswerable cases are
+    /// kept apart.
     pub fn placement_report_is_honest(&self) -> Option<bool> {
-        let mut answered = false;
-        for placement in &self.worker_placements {
-            match placement.report_is_honest() {
-                Some(true) => answered = true,
-                Some(false) => return Some(false),
-                None => {}
-            }
-        }
-        answered.then_some(true)
+        placement_report_is_honest_of(&self.worker_placements)
     }
 
     /// Number of node groups in the layout.
@@ -5475,6 +5524,19 @@ mod tests {
         if cores.core_count() < 2 {
             return; // one core cannot express "one per core" distinguishably
         }
+        // Stated, not implied. Today no target can pin without also being able
+        // to read a mask back, so on every real host this is decided by
+        // `environment_can_pin` below -- but *that* gates on the pinning
+        // capability while everything after it needs the observation
+        // capability, and a guard standing in for a different capability than
+        // the one it protects is the defect this whole change is about.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping observed-placement check: this target has no per-thread affinity \
+                 query, so there is no realized placement to observe"
+            );
+            return;
+        }
         let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
@@ -5585,6 +5647,15 @@ mod tests {
             .unwrap_or_else(|| (0..cores.logical_count()).collect())
             .into_iter()
             .collect();
+        // This control judges from observed masks, so it needs the observation
+        // capability specifically -- see the note on the positive case above.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping observed shared-core control: this target has no per-thread \
+                 affinity query"
+            );
+            return;
+        }
         // Pick the sibling pair from CPUs this process may actually use, or a
         // `taskset`ed runner -- the most common way this suite runs -- skips.
         let pair = cores.cores().iter().find_map(|group| {
@@ -5703,31 +5774,72 @@ mod tests {
              machine ({realized:?}, {:?})",
             pools.worker_placements()
         );
-        assert_eq!(
-            realized,
-            RealizedPlacement::SharedCore,
-            "unpinned workers share whatever cores the scheduler picks; an `Unobservable` \
-             here would mean the masks could not be read, which is a different failure \
-             ({:?})",
-            pools.worker_placements()
-        );
-        assert_eq!(
+        assert_ne!(
             pools.placement_report_is_honest(),
-            Some(false),
-            "the pool reports CPUs its workers are not confined to, which is the #1792 \
-             shape exactly ({:?})",
+            Some(true),
+            "the pool vouched for CPUs its workers were never put on ({:?})",
             pools.worker_placements()
         );
+
+        // The two assertions above are the property, and they hold on every
+        // target. The two below are the *sharper* claim, and it is available
+        // only where a thread can read its own mask. Split rather than relaxed:
+        // each branch still names one exact expected value, so neither is a
+        // skip.
+        //
+        // The gate is `cfg!`-derived -- a property of the target -- and not
+        // "did the observation happen to work", which is the thing whose
+        // failure this test exists to report and so cannot be allowed to
+        // decide whether the test runs.
+        if crate::decode_affinity::affinity_observation_supported() {
+            assert_eq!(
+                realized,
+                RealizedPlacement::SharedCore,
+                "unpinned workers share whatever cores the scheduler picks; an \
+                 `Unobservable` on a target that has the affinity query means the masks \
+                 could not be read, which is a different failure ({:?})",
+                pools.worker_placements()
+            );
+            assert_eq!(
+                pools.placement_report_is_honest(),
+                Some(false),
+                "the pool reports CPUs its workers are not confined to, which is the #1792 \
+                 shape exactly ({:?})",
+                pools.worker_placements()
+            );
+        } else {
+            // macOS arm64 reaches here: the stub makes the pin *report* success
+            // on a target whose real `pin_current_thread_to_cpu` returns `Err`,
+            // and there is no affinity query to catch it out. Failing closed is
+            // the only correct answer, and it is worth an explicit assertion --
+            // this is the one lane that proves the blind-spot path is not
+            // decorative.
+            assert_eq!(
+                realized,
+                RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported),
+                "this target has no per-thread affinity query, so the only honest verdict \
+                 on a stubbed pin is that the placement is unobservable ({:?})",
+                pools.worker_placements()
+            );
+            assert_eq!(
+                pools.placement_report_is_honest(),
+                None,
+                "every worker claims a pin whose mask cannot be read, so the pool's report \
+                 is unverified and must not be scored either way ({:?})",
+                pools.worker_placements()
+            );
+        }
         pools.shutdown();
     }
 
     /// A blind spot is never success -- asserted on the decision itself, over
     /// evidence that cannot be produced on the hosts this suite runs on.
     ///
-    /// Every target in CI has a per-thread affinity query, so `Unsupported` and
-    /// `QueryFailed` are unreachable through a real pool here. Reachable only
-    /// through a real pool would mean untested, and "unanswerable must not read
-    /// as answered" is the single property the whole redesign turns on.
+    /// `QueryFailed` is unreachable through a real pool anywhere in CI, and
+    /// `Unsupported` is reachable only on macOS, where nothing else in this
+    /// module can construct a pinned pool to observe. Reachable only through a
+    /// real pool would mean untested on most lanes, and "unanswerable must not
+    /// read as answered" is the single property the whole redesign turns on.
     #[test]
     fn an_unanswerable_placement_is_never_reported_as_placed() {
         use crate::decode_affinity::ObservedAffinity;
@@ -5785,6 +5897,100 @@ mod tests {
                 "{placement:?} is classified wrongly"
             );
         }
+    }
+
+    /// Some workers readable, some not -- the case a real pool cannot produce.
+    ///
+    /// Readability is a property of the *target*, so every worker in a real
+    /// pool answers the same way and this mixture is unreachable through
+    /// `build`. It is also exactly where round-one review found the aggregator
+    /// wrong: it answered `Some(true)` on the strength of the one worker it
+    /// could check and threw away the unverified claim next to it. Injected as
+    /// evidence for that reason -- unreachable through a real pool would have
+    /// meant untested.
+    #[test]
+    fn an_unreadable_worker_mask_withdraws_the_whole_honesty_verdict() {
+        use crate::decode_affinity::ObservedAffinity;
+        let honest = WorkerPlacement {
+            tid: Some(1),
+            attempted_cpu: Some(0),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::Cpus(vec![0]),
+        };
+        let unverifiable = WorkerPlacement {
+            tid: Some(2),
+            attempted_cpu: Some(1),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::QueryFailed("injected".to_string()),
+        };
+        let lying = WorkerPlacement {
+            tid: Some(3),
+            attempted_cpu: Some(2),
+            attempt: PinAttempt::Applied,
+            observed: ObservedAffinity::Cpus(vec![7]),
+        };
+        let claims_nothing = WorkerPlacement {
+            tid: Some(4),
+            attempted_cpu: None,
+            attempt: PinAttempt::NotRequested,
+            observed: ObservedAffinity::Cpus(vec![0, 1, 2, 3]),
+        };
+
+        assert_eq!(
+            placement_report_is_honest_of(std::slice::from_ref(&honest)),
+            Some(true),
+            "a single verified worker is a verified pool"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[honest.clone(), unverifiable.clone()]),
+            None,
+            "one worker verified and one unverifiable is not a verified pool -- this is \
+             the exact shape that read as `Some(true)` before"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable.clone(), honest.clone()]),
+            None,
+            "the verdict must not depend on which worker the loop reaches first"
+        );
+
+        // A definite contradiction outranks an unreadable mask: it stays true
+        // regardless of how many peers went unchecked, so it must not be
+        // downgraded to "cannot tell".
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable.clone(), lying.clone()]),
+            Some(false),
+            "a worker demonstrably not where it claims is a dishonest report, not an \
+             unanswerable one"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[honest.clone(), lying]),
+            Some(false)
+        );
+
+        // The other direction, and the reason the two `None`s are kept apart: a
+        // worker that never asked for a pin claims nothing, so it cannot
+        // withdraw a verdict its peers support. Collapsing both `None`s would
+        // make every partially pinned pool permanently unanswerable.
+        assert_eq!(
+            placement_report_is_honest_of(&[honest, claims_nothing.clone()]),
+            Some(true),
+            "a worker that claims no pin must not sink a verdict the pinned workers earned"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[claims_nothing]),
+            None,
+            "claiming nothing is not honest success"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[]),
+            None,
+            "no evidence is not success"
+        );
+        assert_eq!(
+            placement_report_is_honest_of(&[unverifiable]),
+            None,
+            "an unverified claim on its own is unanswerable"
+        );
     }
 
     /// A worker that was never asked to pin claims nothing, and "claims
