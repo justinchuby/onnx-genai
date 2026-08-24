@@ -208,3 +208,62 @@ fn a_document_that_uses_nothing_new_is_free_to_say_nothing() {
     assert!(metadata.schema_version.is_none());
     validate_metadata(&metadata).expect("an unversioned plain document is valid");
 }
+
+#[test]
+fn the_canonical_spelling_of_a_new_batching_document_carries_the_v() {
+    // Two versions are in play and they are canonically spelled the same way.
+    // `v1` is what a writer stamps on a document that uses nothing new; `v1.1`
+    // is what a document using a batching field must say. Dropping the `v` from
+    // the newer one would leave one schema with two house styles.
+    assert_eq!(SCHEMA_VERSION, "v1");
+    assert_eq!(version::BATCHING_SCHEMA_VERSION.to_string(), "v1.1");
+    assert_eq!(SUPPORTED_SCHEMA_VERSION.to_string(), "v1.1");
+
+    // And it is the spelling the document is *told* to write, not merely one the
+    // reader tolerates.
+    let errors = validate_metadata(&parse_metadata(PADDED, Some("yaml")).expect("parses"))
+        .expect_err("an unversioned batching document is not truthful");
+    let reported = errors.join("\n");
+    assert!(
+        reported.contains("declare schema_version 'v1.1'"),
+        "{reported}"
+    );
+}
+
+#[test]
+fn a_synonym_is_read_but_is_not_the_canonical_spelling() {
+    // `1.1` normalizes to the same version for the same reason the four
+    // spellings of the first version do — a reader compares versions, not
+    // strings — but a writer emitting a new batching document writes `v1.1`.
+    assert_eq!(
+        version::normalize(Some("1.1")).expect("a synonym is a version"),
+        version::BATCHING_SCHEMA_VERSION
+    );
+    assert_ne!("1.1", version::BATCHING_SCHEMA_VERSION.to_string());
+}
+
+#[test]
+fn reading_a_document_never_rewrites_the_version_it_declares() {
+    // A version string is part of a package's semantic identity, so normalizing
+    // for comparison must not become normalizing on disk. A reader that
+    // helpfully rewrote `v1` to `1.0` would change what every existing package
+    // hashes to in exchange for nothing a reader can observe — so the spelling
+    // survives the load verbatim, and two spellings of one version stay two
+    // distinct identities rather than being silently merged.
+    let mut identities = std::collections::BTreeSet::new();
+    for spelling in [None, Some("v1"), Some("1"), Some("1.0"), Some("v1.0")] {
+        let document = with_version(PLAIN, spelling);
+        let metadata = parse_metadata(&document, Some("yaml"))
+            .unwrap_or_else(|error| panic!("{spelling:?} loads: {error}"));
+        assert_eq!(metadata.schema_version.as_deref(), spelling, "{spelling:?}");
+        identities.insert(
+            onnx_genai_metadata::semantic_identity_of_str(&document)
+                .unwrap_or_else(|error| panic!("{spelling:?} has an identity: {error}")),
+        );
+    }
+    assert_eq!(
+        identities.len(),
+        5,
+        "normalizing for comparison must not collapse the identities on disk"
+    );
+}

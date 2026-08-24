@@ -46,13 +46,18 @@ pub use pipeline::*;
     transform = schema_helpers::inference_metadata_constraints
 )]
 pub struct InferenceMetadata {
-    /// Schema version of this inference-metadata document, e.g. `"1.1"`.
+    /// Schema version of this inference-metadata document, e.g. `"v1.1"`.
     ///
-    /// Canonically `"<major>.<minor>"`. Absence means the initial `1.0`
-    /// contract, as do the spellings `"v1"`, `"1"` and `"v1.0"` that predate a
-    /// canonical form; readers normalize before comparing, so all four keep
-    /// loading. Bump the major only for breaking schema changes, and the minor
-    /// whenever a document may carry a field an older reader would not know.
+    /// Canonically `"v<major>.<minor>"`, matching the `v1` that every writer in
+    /// this repository already stamps. Absence means the initial `v1.0`
+    /// contract, as do the spellings `"v1"`, `"1"`, `"1.0"` and `"v1.0"` that
+    /// predate a canonical form; readers normalize before comparing, so all of
+    /// them keep loading and `"1.1"` is an accepted synonym for `"v1.1"`. A
+    /// document that uses nothing new keeps stamping what it already stamped —
+    /// rewriting an existing spelling would change the package's semantic
+    /// identity to say something no reader distinguishes. Bump the major only
+    /// for breaking schema changes, and the minor whenever a document may carry
+    /// a field an older reader would not know.
     ///
     /// An additive field keeps the same major version, but note what that does
     /// and does not buy: the v1 surface is closed — every structure here denies
