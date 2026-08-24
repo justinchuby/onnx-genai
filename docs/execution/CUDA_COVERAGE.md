@@ -384,22 +384,48 @@ It is the safest class of non-gap in this document — safer than both `MoE` and
   bioacoustics model**, exercised by `crates/onnx-runtime-session/tests/perch_dft.rs`.
   Perch takes a raw `[1, 160000]` waveform and computes its transform (N=1024)
   inside the graph. It is a **CPU-EP workload**, not a CUDA decode target: the
-  integration test loads it through the native CPU EP only, the fast path is a
-  macOS/iOS Accelerate vDSP DFT aimed at edge/laptop deployment, and the DFT is
-  ~0.80% of Perch model time (measured; PR #368 review). Perch is not in the
-  CUDA target set and there is no Perch-on-CUDA path.
+  integration test loads it through the native CPU EP only, and the fast path is
+  a macOS/iOS Accelerate vDSP DFT aimed at edge/laptop deployment. Perch is not
+  in the CUDA target set and there is no Perch-on-CUDA path. *(A measurement
+  exists that `DFT` is ~0.80% of Perch's total model time — PR #368 review — but
+  it says nothing about the cost of a CUDA decline and must not be read that
+  way; see the next bullet.)*
 
-* **Declining is harmless — this is why it is the safest non-gap.** Unlike
-  `PackedMultiHeadAttention` (no CPU kernel anywhere, so a decline of an
-  appearing node would be a hard session-load failure), `DFT` has a complete,
-  reviewed CPU kernel in **both** this repo's CPU EP (`dft.rs`: real and complex
+* **What declining actually costs here, stated in this repo's own terms.**
+  It is tempting to reason "the op is a tiny fraction of runtime, so declining
+  it is cheap". That intuition comes from ONNX Runtime, which assigns
+  **per node** and leaves the rest of the graph on the GPU. It holds only on one
+  of this repo's two paths:
+
+  | Path | What a declined node does |
+  |---|---|
+  | **ORT plugin EP** (`onnx-runtime-ep-cuda-plugin`) | ORT assigns per node, so the declined node goes to another ORT provider and the rest of the graph stays put — the familiar cheap case |
+  | **Native session** (`onnx-runtime-session`), default | `*ep = auto_detect_cpu_ep()` — the **whole session** drops to CPU (`executor/build.rs`), with a warning |
+  | **Native session**, `ONNX_GENAI_HETERO=1`, mixed graph | fails closed, `HeterogeneousExecutionUnsupported` (`hetero.rs`) — per-node heterogeneous *execution* is not wired, deferred under #603 |
+  | **Native session**, `ONNX_GENAI_REQUIRE_CUDA=1` | hard error rather than accept the fallback |
+
+  On the native path there is therefore no configuration in which a decline
+  costs a few percent: the cost is all of the GPU acceleration, or a load
+  failure. **This is why the load-bearing argument is the absence of a producer,
+  and nothing else.** An "op X is only N% of runtime" figure is not evidence
+  about a coverage decision, and reasoning from ORT's per-node behaviour alone
+  understates the native path's risk.
+
+* **Given a node did appear, it would still load.** `DFT` has a complete,
+  reviewed CPU kernel in this repo's own CPU EP (`dft.rs`: real and complex
   input, forward/inverse, full/onesided, opset-17 axis attribute and opset-20
-  axis input) **and** upstream ORT. ORT itself ships **no CUDA `DFT` kernel** —
-  it is CPU-only upstream (ORT issue #21164: running a `DFT` model on ORT's CUDA
-  EP yields "CUDA kernel not found in registries for Op type: DFT" and falls back
-  to CPU). So a CUDA-plugin decline of `DFT` can only ever degrade to a CPU DFT
-  that is guaranteed to exist — a slow fallback, never a hard failure. Even ORT's
-  own CUDA EP behaves identically (declines to CPU).
+  axis input), so the whole-session CPU fallback above succeeds. That is the
+  precise sense in which this is a safer non-gap than
+  `PackedMultiHeadAttention`, where no CPU kernel exists anywhere and a fallback
+  could not even load. It is *not* the sense of "a cheap slowdown".
+
+  Weak corroboration only: upstream ORT ships no CUDA `DFT` kernel either
+  (ORT issue #21164), so nothing is lost relative to it. This is deliberately
+  not load-bearing — the conclusion would be unchanged if ORT *did* have one,
+  which is exactly why it cannot be evidence. Note also that "CPU-only upstream"
+  would be imprecise: ORT ships DFT for its DML and WebGPU providers, so a GPU
+  DFT is plainly implementable. The reason it is absent here is the absence of a
+  producer, not anything inherent to the operator.
 
 * **The condition that would flip this decision.** If an in-scope model ever
   computes its STFT / mel-spectrogram (or any Fourier transform) **inside** the
@@ -417,7 +443,7 @@ It is the safest class of non-gap in this document — safer than both `MoE` and
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
 | **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
 | **deferred heavy operators** | `NonMaxSuppression` | Data-dependent selection deserves a dedicated follow-up wave and focused review. |
-| **none (documented non-gap)** | `DFT` | Not emitted in-graph by any in-scope CUDA target; only the CPU-EP Perch model produces it. A decline degrades to the always-present CPU DFT. See the DFT non-gap write-up above. |
+| **none (documented non-gap)** | `DFT` | Not emitted in-graph by any in-scope CUDA target; only the CPU-EP Perch model produces it. Were one to appear, this repo's own CPU `dft.rs` lets the whole-session fallback still load. See the DFT non-gap write-up above. |
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
