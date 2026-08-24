@@ -133,6 +133,78 @@ is a property of the *host*, and it would flatten both arms. **ORT scales 1.76x
 across the same doubling on the same host in the same launch.** Whatever binds
 us at `t=16` is in our pool or our kernel, not in the DRAM.
 
+### What `t=8` and `t=16` physically are on this host
+
+Added 2026-08-24 after a cross-agent report claimed the decode pool places two
+workers per physical core on a single L3. The claim is false on this tree (see
+below), but checking it established something about the scaling comparison that
+was not previously written down, and it belongs beside the result.
+
+Realized placement, read out of `/proc/<tid>/status` (`Cpus_allowed_list`) for
+every `onnx-genai-spmd` thread on `0a668d54b` —
+`crates/onnx-runtime-ep-cpu/benches/decode_placement_census.sh`. This is a
+categorical read, not a timing: it does not need a quiet host.
+
+| configuration | spawned workers | pinned CPUs | L3 spread |
+|---|---:|---|---|
+| default, no `taskset`, no env | 15 | `0,2,4,…,28` | 8 in L3#0, 7 in L3#1 |
+| `THREADS=16` under the even mask | 15 | `0,2,4,…,28` | 8 in L3#0, 7 in L3#1 |
+| `THREADS=8` under the even mask | 7 | `0,2,…,12` | **7 in L3#0** |
+
+Host: `cpu0/topology/thread_siblings_list` = `0-1` (siblings adjacent), L3 in two
+32 MiB instances, `shared_cpu_list` `0-15` and `16-31`.
+
+So **one worker per physical core in every configuration**, with the reserved
+dispatcher CPU (`30` at width 16, `14` at width 8) left clear, exactly as
+`reserve_single_group_headroom` and `decode_affinity::order_pin_targets`
+specify.
+
+The part that bears on the scaling number: `ONNX_GENAI_CPU_DECODE_THREADS=8`
+confines the process to `[0,2,4,6,8,10,12,14]`, and **all eight of those CPUs
+are inside one 32 MiB L3 instance**, while width 16 spans both. The `t=8 → t=16`
+doubling on this host is therefore a doubling of cores *and* of L3 *and* of
+memory-controller reach — a bigger change than "twice the threads", on a
+workload that is bandwidth-bound by construction.
+
+**This does not confound the comparison, because both arms get the same CPUs at
+each width.** `acc0_gap_matrix.ort()` defaults its pin to `native_pin(threads)`
+— `EVEN[:threads]`, the set native confines itself to — and
+`acc0_w8_w16_scaling.py` calls it without an override, so ORT ran on
+`[0,2,4,6,8,10,12,14]` at `t=8` and on all sixteen even CPUs at `t=16`, the same
+machine as native in each case. That symmetry was added in `4b4dacc7e` and both
+the 1.762x and 1.319x figures were measured after it.
+
+It does mean the 2.0x "ideal" quoted above is a *conservative* reference for
+both arms: a doubling that also doubles cache and bandwidth could exceed it. The
+direction of the finding is unchanged and if anything understated — ORT converts
+this change into 1.76x and we convert it into 1.32x.
+
+**The cross-agent claim itself was a stale build.** It reported 16 workers on
+cpus `0-15` and offered PR #1729 as the fix. #1729 merged as `6e8c31ebd` on
+2026-08-23T01:11:35Z, and the related width-halving report (`available / 2` in
+`default_persistent_threads`) was fixed by #1794 (`0652fdd2e`) the same night.
+Both are ancestors of `origin/main`; the census above is what the merged tree
+does. Recorded because the claim was circulating with a measured-looking table
+attached to it, and because the tell was visible in that table without any
+re-measurement: its two arms reported 16 and 15 shard participants, and 15
+spawned workers plus an inline dispatcher is precisely what current main
+builds.
+
+**A permanent per-CPU competitor was also reported and is not reproducible.**
+The same report measured cpu 0 delivering 50.3% of a core with 344 involuntary
+switches in 2 s, and cpu 1 at full CPU *share* but 55% of the *work* — the SMT
+signature of a busy sibling. Re-run with an equivalent work-completed probe
+(`benches/cpu_work_probe.py`, iterations against `CLOCK_THREAD_CPUTIME_ID`) on an
+idle host, cpu 0 reads `cpu_share` 0.999–1.000 at 9429/9482/9489 iterations,
+inside the 8744–9499 band spanned by cpus 1, 2, 3, 14, 15, 16, 17, 18, 30 and
+31. One transient outlier appeared (cpu 16 at 6485) and did not survive two
+re-probes. The original observation was real; "permanent" was an inference from
+a single sweep, and on a host shared by several agents that is load, not
+topology. **The instrument point stands and is the useful part**: a CPU that is
+granted 100% and delivers 55% is invisible to every CPU-time instrument, which
+is a second and independent reason not to read `Percent of CPU` as utilisation
+here.
+
 **One number in that run disagrees with the merged matrix and is not
 suppressed.** Its `t=8` gap reads **1.264x** [1.191–1.660], against the
 `1.120x` established in `4b4dacc7e`. The difference is on the native side —
