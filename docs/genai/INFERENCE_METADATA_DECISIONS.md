@@ -685,6 +685,18 @@ The consequence of the last point is already visible: `ir.rs:52-53` calls
 [§10.1](#101-independent-encoder-batching) describes it as a `cu_seqlens`-style
 `rows + 1` vector. Nothing rejects any of the three.
 
+There is also no mechanism through which any of it could ship. The metadata
+structs are closed — `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
+(`crates/onnx-genai-metadata/src/schema/mod.rs:36-38`) and `schema/ir.rs` carries
+45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
+`WorkflowComponent` — so an older runtime meeting a new field **rejects the whole
+document** rather than ignoring it, contrary to the "ignore unknown fields" claim
+in the `schema_version` doc comment (`schema/mod.rs:47-53`). And nothing
+validates `schema_version`: `crates/onnx-genai-metadata/src/validation.rs` never
+mentions it, so a document declaring a future version is accepted and then
+rejected field by field, which is the least actionable order in which to learn
+that a runtime upgrade is required.
+
 ### 10.5 Generic component batching — proposed
 
 **Status: proposed, not normative.** The requirement keywords in this subsection
@@ -693,86 +705,109 @@ record, with the evidence, phasing, and acceptance matrix, is
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Vision encoders — images and video — motivate the work; nothing about it is
-modality-specific. The contracts carry axes, bounds, masks, and ownership levels;
-a modality vocabulary only produces the semantic values those contracts point at,
-so audio windows and text segments reach the same path without a new concept. The
-proposed surface is three additions, each absent by default:
+modality-specific. The contracts carry shape symbols, bounds, lengths, and
+ownership levels; a modality vocabulary only produces the semantic values those
+contracts point at, so audio windows and text segments reach the same path
+without a new concept. The proposed surface is three additions, each absent by
+default:
 
 ```yaml
 components:
   media_encoder:
     implementation: { kind: onnx, artifact: encoder.onnx }
     batch_capacity:
-      axis: 0                # axis along which independent items stack
-      max_items: 4           # correctness bound of the artifact, counted in items
-      uniform_axes: [3]      # axes that must be equal across co-batched items
-      axis_budgets:          # summed extent bounds across the whole group
-        - { axis: 1, max_total: 64 }    # total frames in one invocation
+      uniform_dimensions: [features]         # symbols that must agree across items
+      budgets:                                # materialized-footprint bounds
+        - { dimensions: [clips],  max_total: 4 }
+        - { dimensions: [frames], max_total: 64 }
+        - { dimensions: [frames, patches], max_total: 65536 }
     ports:
       inputs:
         pixel_values:
           dtype: float32
-          rank: 4
-          shape: [items, frames, patches, features]
-          batch_layout: { kind: token_packed, offsets: item_offsets,
-                          owner: item_owner, axis: 0 }
-          pad_mask:
-            - { value: temporal_mask, axes: [1] }   # items may differ in frames
-            - { value: patch_mask,    axes: [2] }   # frames may differ in patches
+          rank: 3
+          shape: [frames, patches, features]  # one flattened packed axis
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:                            # innermost first
+              - { offsets: frame_offsets, owner: frame_owner }   # frames -> clips
+              - { offsets: clip_offsets,  owner: clip_owner }    # clips  -> rows
+          padding:
+            - { dimension: patches, valid_lengths: patch_lengths }
 ```
 
 Grouping faces three independent kinds of raggedness: how many items a request
-owns, which `offsets`/`owner` answer along the item axis; how far two items
-differ in extent, which a `pad_mask` entry answers on the axis that differs; and
-how many parts an item nests — frames in a clip, windows in an utterance — which
-a second ownership level answers. Each is declared on its own axis and they never
-compete for one.
+owns, which an ownership level's `offsets`/`owner` answer; how far two items
+differ in extent, which a `padding` entry answers on the dimension that differs;
+and how many parts an item nests — frames in a clip, windows in an utterance —
+which an *additional ownership level over the same packed axis* answers. Each is
+declared on its own dimension and they never compete for one.
 
+- **Declarations are keyed by shape symbol, never by axis index.** A component's
+  ports differ in rank — a rank-3 payload, a rank-1 companion, a rank-2 pooled
+  output — so a component-global axis integer cannot be interpreted coherently
+  across them, while a `TensorDimension::Symbol`
+  (`crates/onnx-genai-metadata/src/schema/decoder_abi.rs:266-273`) names the same
+  quantity on every port that mentions it. The axis a value is packed on is a
+  property of that value's own layout.
 - **`batch_capacity` absent means one request row per invocation** — today's
   behavior exactly. A runtime **MUST NOT** group a component that has not
-  declared a capacity, and `max_items` is an upper bound, never an obligation.
-- **`max_items` counts items, not requests and not decode rows.** One request may
-  contribute many items and many requests may contribute one between them, so a
-  grouping layer **MUST NOT** reuse a decode-side row bound as an item bound.
-- **`axis_budgets`** bounds the *summed* extent of a free axis across the group —
-  total frames, total tokens — because item count alone does not bound the work:
-  four one-frame clips and four sixty-frame clips satisfy the same `max_items`
-  and differ by an order of magnitude. A group **MUST** satisfy every entry as
-  well as `max_items`. Device memory is not among these bounds; it is runtime
-  measurement, never metadata ([§1.2](#12-non-goals)).
-- **`uniform_axes`** are the axes two items must agree on before they may share
-  an invocation — spatial and temporal alike — which makes batch compatibility a
-  derived predicate rather than a policy: a resolution-pinned encoder pins its
-  spatial axes, a frame-count-pinned encoder pins its temporal axis, an encoder
-  pinned both ways pins both, and everything unpinned is free. Every free axis
-  **MUST** be reconciled either by padding declared through `pad_mask` or by
-  packing declared through `token_packed` — a component that declares
-  batchability without declaring how raggedness is expressed is rejected at load.
-- **`pad_mask`** is a list of entries, each linking a padded value to the `bool`
-  value that says which entries are real, so a runtime never fabricates padding
-  it cannot describe. Entries are disjoint and cover each free axis exactly once,
-  so a clip padded in both frames and patches carries a temporal mask and a
-  spatial mask (or one joint mask over both axes). It is mutually exclusive with
-  packing *on the same axis*: padding and packing are two answers to one
-  question. It does not by itself make a component padding-invariant — that
-  remains the profile's `batch_invariance` declaration, and a temporally pooling
-  encoder is `padding_sensitive` for exactly the same reason a mean-pooling one
-  is. **Padding is appended, never prepended or interleaved:** real entries along
-  a padded axis **MUST** form a prefix, so a mask is a leading run of `true`.
-  Interior holes would force every consumer that slices or pools to handle gaps
-  rather than a length, and left padding would shift position indices between a
-  solo item and the same item in a group, which is a wrong answer rather than a
-  slow one.
-- **Ownership content roles** — `item_offsets` / `item_owner` for items in rows
-  and `subitem_offsets` / `subitem_owner` for parts in items — join the
-  preprocessing content-role vocabularies, so a declared program can *produce*
-  the values `token_packed` names at each level. They are named for the nesting
-  level, not the modality: clips in a request and frames in a clip use the same
-  two rules that images in a request and audio windows in an utterance do. Both
-  owner values carry a **position**, never a request identity
-  ([§8.3](#83-no-row-identity)). Nesting stops at two levels; a value packed on
-  more than two axes is rejected, so a third level is a deliberate schema change
-  rather than something a package asserts into existence.
+  declared a capacity, and every budget is an upper bound, never an obligation.
+- **`budgets` bind the group's materialized footprint**, keyed by symbol: a
+  packed dimension is charged the sum of the participating items' valid extents,
+  a padded dimension is charged *enclosing count × padded extent* — the rectangle
+  actually allocated, not the sum of the valid lengths — a composed entry
+  multiplies its symbols' footprints, and a `request_expanded` axis is charged
+  `rows × factor`. There is no separate item-count integer: the item bound is the
+  budget on that level's own symbol. Items and packed positions bind
+  independently, and a grouping layer **MUST NOT** reuse a decode-side row bound
+  as an item bound — one request may contribute many items and many requests may
+  contribute one between them. Device memory is not among these bounds; it is
+  runtime measurement, never metadata ([§1.2](#12-non-goals)).
+- **`uniform_dimensions`** are the symbols two items must agree on before they
+  may share an invocation — spatial and temporal alike — which makes batch
+  compatibility a derived predicate rather than a policy. Every free dimension
+  **MUST** be reconciled either by a `padding` entry or by the packed axis; a
+  component that declares batchability without declaring how raggedness is
+  expressed is rejected at load. A symbol **MUST NOT** be both pinned and
+  budgeted.
+- **`padding`** is a list of entries, each linking a padded dimension to an
+  `int64` `valid_lengths` companion giving how much of each item is real, so a
+  runtime never fabricates padding it cannot describe. The companion is `shared`
+  and its shape is exactly the axes **outer** to the padded axis, in order — one
+  length per enclosing position. **Padding is appended, never prepended or
+  interleaved:** real entries form a prefix. Lengths rather than a boolean mask,
+  because right-padding makes a mask `O(items × extent)` state for an `O(items)`
+  fact, and because the runtime must read those numbers to build and split a
+  group — a payload-sized mask would have to come back from the device to do it.
+  A component whose graph consumes a materialized mask declares that mask as an
+  ordinary port and its program produces it; the lengths remain the single truth.
+  One entry per dimension, and never on the dimension the layout packs: padding
+  and packing are two answers to one question. `padding` does not by itself make
+  a component padding-invariant — that remains the profile's `batch_invariance`
+  declaration.
+- **Ownership is an ordered chain of levels over one physically packed axis.**
+  `TokenPacked` declares `axis` — which **MUST** be `0` for a batchable component
+  — and `levels`, one or two `{ offsets, owner }` pairs, innermost first. Level 0
+  maps packed positions to their parent unit, the last level maps units to
+  request rows, and composing them gives each row a single contiguous span. There
+  is no second physical packed axis: frames are flattened across clips and across
+  requests, and the frame→clip and clip→row maps are bookkeeping over that one
+  axis. Two content roles, `pack_offsets` and `pack_owner`, join the preprocessing
+  vocabularies so a declared program can produce them at any level; a third,
+  `valid_lengths`, generalizes the existing audio role. Owner values carry a
+  **position**, never a request identity ([§8.3](#83-no-row-identity)). Depth
+  stops at two levels, so a third is a deliberate schema change rather than
+  something a package asserts into existence.
+- **A row selection is lifted, never applied to a packed axis.**
+  `BatchLayout::request_axis()` returns `None` for `TokenPacked`
+  (`crates/onnx-genai-metadata/src/schema/ir.rs:67-72`) while `is_row_scoped()`
+  reports true, so compaction resolves each destination row's unit range through
+  the outer level, then each unit's positions through the inner level, producing
+  an item permutation; companions are then **recomputed**, never gathered.
+  `row_scope.axis` is therefore the component's **request row** axis and
+  **MUST NOT** be a packed item axis.
 
 Ownership is unchanged in shape: metadata describes the bound, the modality
 vocabulary defines the semantic values, the preprocessor produces the per-item
@@ -787,42 +822,89 @@ incompatible pair is two groups.
 Two runtime obligations travel with the metadata and are stated here because
 they bound what "the interpreter executes it" may cost. First, grouping
 **MUST NOT** introduce a host round-trip for a value that is already device
-resident, and splitting a packed result back to rows is an aliasing operation
-wherever the packed span is contiguous — which is the practical reason the
-ownership rules demand contiguity at every level. Second, backend support for
+resident, and splitting a packed result back to rows is an aliasing operation —
+which is the practical reason the packed axis is pinned to 0 and the ownership
+rules demand contiguity, since a no-copy view is a contiguous element window and
+"a slice along an inner axis is not a contiguous range"
+(`crates/onnx-genai-ort/src/value.rs:1521-1537`). Second, backend support for
 grouped execution is asked **before** a group is formed, never discovered by
-attempting one: a backend that has not proven parity reports that it cannot
-group, receives no group, and the workload runs item by item as it does today.
-Declining is safe; attempting is not. Neither fact is a metadata field —
-residency and execution capability are runtime-owned
+attempting one, and it is recorded per (component implementation, operator class,
+execution provider) rather than as one global flip: a triple that has not proven
+parity reports that it cannot group, receives no group, and the workload runs
+item by item as it does today. Declining is safe; attempting is not. Neither fact
+is a metadata field — residency and execution capability are runtime-owned
 ([§10.2](#102-externally-suppliable-results)) — and both are specified in
 [`ENCODER_BATCHING.md` §5.1](ENCODER_BATCHING.md#51-grouped-buffers-aliasing-residency-and-what-padding-costs).
 
-Grouping introduces **no new capability identifier**. A capability is a load-time
-promise that correct execution *requires* a behavior
+**Shipping this surface requires a version gate, not a compatibility claim.**
+`InferenceMetadata` and every struct this design extends are
+`#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:36-38`
+and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
+document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
+ignore them, and the forward-compatibility claim in the `schema_version` doc
+comment (`schema/mod.rs:47-53`) does not describe this codebase. Nothing
+validates `schema_version` today either
+([§10.4](#104-what-101-does-not-yet-have)). The mechanism this surface requires is
+therefore: a gate that reads `schema_version` from a generic parse and rejects an
+unsupported version with one actionable message **before** struct
+deserialization, on the precedent of
+`crates/onnx-model-package/src/lib.rs:563-579`; a **minor** bump for this
+additive surface; and conditional emission, so a package that does not declare
+`batch_capacity` still serializes as a v1.0 document and its minimum runtime does
+not move.
+
+Grouping still introduces **no new capability identifier** — but not because an
+old runtime would otherwise refuse a package it can execute, which
+`deny_unknown_fields` makes false. A capability is a load-time promise that
+correct execution *requires* a behavior
 ([§4.3a](#43a-capability-admission-and-complete-built-in-catalogue)); no
 package's correctness requires that its encoder be batched, so a runtime that
-ignores `batch_capacity` stays correct and an old runtime must not be made to
-refuse a package it can execute. This is the general direction: a fact the
-workflow structure already determines is not additionally serialized as a flag.
+parses the document and chooses not to group stays correct. Version gating says
+"this document uses a newer vocabulary"; a capability says "you must do this or
+be wrong". This is also the general direction: a fact the workflow structure
+already determines is not additionally serialized as a flag.
 
 ### 10.6 Packed companions must validate — proposed
 
 **Status: proposed, not normative.** Full rules and their negative fixtures are
 in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-strict-token_packed-validation).
-In summary, a `token_packed` value's companions are checked at load: `offsets`
-and `owner` **MUST** resolve to declared values; `offsets` is `shared`, `int64`,
-rank 1, extent `rows + 1`; `owner` is `shared`, `int64`, rank 1, with the packed
-extent; `axis` is within the packed value's rank; two packed values sharing one
-`offsets` agree on the packed-extent symbol; a packed value declares no
-`pad_mask` entry **on the axis it packs**; a packed emit publishes its companions
-as outputs; and a value packed on a second, inner axis declares its own
-`offsets`/`owner` pair whose extents agree with the outer packed extent, so a
-group of clips is splittable into clips *and* into frames. **Packing depth is
-capped at two axes.** Parts in items and items in rows covers every known
-workload — frame → clip → request, frame → window → request, token → segment →
-request — and each further level multiplies the validation surface, the split
-implementation, and the corruption cases that must be tested.
+In summary, a `token_packed` value's companions are checked at **load**: every
+level's `offsets` and `owner` **MUST** resolve to declared values; each is
+`shared`, `int64`, rank 1, with level `k`'s `owner` carrying that level's unit
+count and its `offsets` carrying the parent count plus one; `axis` **MUST** be
+`0` for a component that declares `batch_capacity`; `levels` holds one or two
+entries, innermost first; two packed values sharing one `offsets` agree on their
+extent symbols; a packed value declares no `padding` entry **on the dimension it
+packs**, and no port is both `request_expanded` and packed on one axis.
+
+**Packing depth is capped at two levels.** Parts in items and items in rows
+covers every known workload — frame → clip → request, frame → window → request,
+token → segment → request — and each further level multiplies the validation
+surface, the split implementation, and the corruption cases that must be tested.
+
+**A packed output declares who produces its raggedness.** An output may reuse an
+input's companions at a level only when that level's mapping is
+**extent-preserving** (`packed_extent: preserved`) — one output unit per input
+unit, in order — which the validator checks by comparing the referenced
+companions' extent symbols against the input port's. Where the graph decides the
+extent (`packed_extent: produced`), that level's `offsets` and `owner` **MUST**
+be declared outputs of the same component, and reusing an input companion is
+rejected. Chains may mix: a token-merging encoder produces its inner level and
+preserves the clip→row level it did not change. An output declaring neither is
+rejected, because the runtime would otherwise guess whether the input's offsets
+still describe the result and split at the wrong boundaries in silence.
+
+**Serving admits companions, and only companions.** A serving workflow rejects an
+emitted value of rank > 0 that declares `shared`
+(`crates/onnx-genai-metadata/src/validation.rs:3313-3321`), which would reject
+the very companions a packed emit is required to publish. The carve-out is
+minimal and decidable from the declared outputs alone: a `shared` emitted value
+is admitted **iff** it is `int64`, rank 1, and named as an `offsets` or `owner`
+of another emitted value's layout in the same workflow; anything else keeps the
+existing rejection. A companion is never compacted and never split like a
+payload — each request receives its own span plus **rebased**, zero-based offsets
+for that span, and never invocation-global `owner` values, which are positions
+within a grouping the caller cannot see ([§8.3](#83-no-row-identity)).
 
 `offsets` is `shared` rather than `request_aligned` for a structural reason: an
 exclusive prefix sum is not permutation-followable. Permuting rows does not
@@ -830,13 +912,20 @@ permute a prefix-offset vector, it invalidates it, so a runtime that changes the
 grouping recomputes `offsets` instead of gathering it. The doc comment at
 `ir.rs:52-53` is corrected when the rule lands.
 
-At execution the runtime verifies, **at every nesting level**, `offsets[0] == 0`,
-monotonicity, `offsets[n] == packed_extent`, `owner[i]` in range, and contiguity
-of each parent's children; for every padded axis it verifies that the mask's
-`true` positions form a leading run. It reports a violation by naming the value,
-the level, the index, and the two facts that disagree — never by clamping or by a
-best-effort split.
-
+At **invocation** the runtime verifies, at every level, that extents resolve
+consistently, `offsets[0] == 0`, monotonicity, that the last offset equals the
+child count, that `owner[i]` is in range, and that each parent's children are
+contiguous; that every `valid_lengths` companion has the exact shape above and
+lies in `[0, padded_extent]`; and that the assembled group satisfies every budget
+and every pinned dimension. It reports a violation by naming the value, the
+level, the index, and the two facts that disagree — never by clamping or by a
+best-effort split. A request whose span is empty receives an empty span with rank
+preserved — never a fabricated placeholder — and a group with no items is not
+invoked at all. **None of these checks may cause a host transfer:** companions
+the runtime built are host-resident already, and companions a component produced
+are checked for dtype, rank, and resolved extent without reading data, with
+value-level arithmetic done on the companion-only transfer the split already
+requires.
 ---
 
 ## 11. Cache correctness dependencies
@@ -1516,10 +1605,10 @@ content-role vocabulary has no entry for per-item offsets or per-item ownership,
 so the `offsets`/`owner` pair that `token_packed` names
 ([§8.2](#82-declared-layout-facts)) has no declared producer. Nor can a program
 state how an item nests — the frames of a video clip, the windows of an
-utterance — or which of an item's positions along a temporal axis are real. The
-proposed `item_offsets` / `item_owner` and `subitem_offsets` / `subitem_owner`
-roles close the first gap, and a temporal validity value closes the second — see
-[§10.5](#105-generic-component-batching--proposed) and
+utterance — or how much of a padded item is real. Two level-agnostic proposed
+roles, `pack_offsets` and `pack_owner`, close the first two gaps at any nesting
+level, and generalizing the existing audio `valid_lengths` role closes the third
+— see [§10.5](#105-generic-component-batching--proposed) and
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request
