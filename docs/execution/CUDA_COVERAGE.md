@@ -233,22 +233,43 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
 | `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 
-## Source-derived coverage audit (2026-07-29)
+## Source-derived coverage audit
 
-This snapshot is derived directly from `build_cpu_registry`,
-`build_cuda_registry`, and `CUDA_COVERED_OPS`. It supersedes the stale
-pre-batch counts retained in the historical wave notes below.
+The authoritative statement of coverage is the **gap set below**, and it is
+enforced by a test: `every_cpu_only_op_is_named_in_the_coverage_doc` in
+`crates/onnx-runtime-ep-cuda/src/kernels/mod.rs` builds the real CPU registry,
+subtracts `CUDA_COVERED_OPS`, and fails if any operator in the difference is not
+named in this file.
 
-| Measure | Count |
-|---------|------:|
-| CPU registry `(domain, op_type)` pairs | **173** |
-| CPU standard-domain (`ai.onnx`) op types | **145** |
-| CUDA registry `(domain, op_type)` pairs | **169** |
-| CUDA advertised op names (`CUDA_COVERED_OPS`) | **164** |
-| CPU pairs implemented by CUDA in the same domain | **166 / 173** |
-| CPU standard-domain op types implemented by CUDA | **143 / 145** |
+This section used to carry a table of six hand-maintained counts and the claim
+that *"the 2 remaining CPU `ai.onnx` gaps are `NonMaxSuppression` and `Unique`"*.
+Both went stale without anything noticing — the header of this very section
+already said it "supersedes the stale pre-batch counts retained in the
+historical wave notes below", which is the same failure one layer down. By the
+time it was re-measured, the advertised count was five short of the registry and
+`ai.onnx::DFT` was a third standard-domain gap that appeared nowhere in this
+document at all.
 
-The **2 remaining CPU `ai.onnx` gaps** are `NonMaxSuppression` and `Unique`.
+The counts are gone rather than corrected. A number no test derives will drift
+again, and a wrong number is worse than no number because it reads as evidence.
+For a current count, read `CUDA_COVERED_OPS` or run the test above; for what is
+missing and why, read the entries in this file. This follows the same reasoning
+as #1923: pin the set, not the count, because a count cannot detect a rename or
+the arrival of a gap nobody wrote down.
+
+The wave notes further down this file also open with "Current source-derived
+coverage is *N*". Those are point-in-time records of what each wave landed, and
+are correct as history — they are not a statement about today.
+
+### Remaining CPU-only operators
+
+`ai.onnx`: `NonMaxSuppression`, `Unique`, `DFT`.
+`com.microsoft`: `FusedAttention`, `MoE`, `PackedMultiHeadAttention`.
+
+Each is either explained as a deliberate non-gap in this file or is open work
+with a tracking entry. `DFT` is the newest and is under investigation — it was
+found by the re-measurement described above, not by a report, which is why the
+test now exists.
 
 Issue #67 batch (2026-07-30): a data-driven placement audit over the real target
 decode models (Qwen2.5 0.5b/1.5b/7b, Phi-4-mini, Qwen3.6-27B, Qwen3.5-35B-A3B)

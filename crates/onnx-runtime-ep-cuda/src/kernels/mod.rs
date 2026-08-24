@@ -1635,6 +1635,53 @@ pub fn build_cuda_registry_with_metrics(
 mod tests {
     use super::{CUDA_COVERED_OPS, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op};
 
+    /// Every operator the CPU EP registers but CUDA does not must be named in
+    /// the coverage document.
+    ///
+    /// This is a **set** check, not a count check, for the reason recorded in
+    /// #1923: a count detects that a number changed, and nothing else. It does
+    /// not detect a rename, and — the failure that produced this test — it does
+    /// not detect a *new* gap arriving while some other number happens to stay
+    /// plausible. `ai.onnx::DFT` sat in exactly that blind spot: registered on
+    /// CPU, absent from CUDA, mentioned nowhere in the document, while the
+    /// document simultaneously asserted "the 2 remaining CPU `ai.onnx` gaps are
+    /// `NonMaxSuppression` and `Unique`". Both the omission and the false claim
+    /// survived because the numbers beside them were hand-maintained prose.
+    ///
+    /// A gap is allowed to exist. What is not allowed is a gap nobody wrote
+    /// down, because that is indistinguishable from an oversight and gets
+    /// rediscovered by whoever next audits the registries.
+    ///
+    /// Deliberately GPU-free: it reads `CUDA_COVERED_OPS`, which is a const, and
+    /// builds only the CPU registry, so it runs on every lane rather than the
+    /// CUDA ones alone. `CUDA_COVERED_OPS` is kept in step with the real factory
+    /// table by the two sanity tests in this module, so using the const here
+    /// does not weaken the check.
+    #[test]
+    fn every_cpu_only_op_is_named_in_the_coverage_doc() {
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+
+        let cpu_registry = onnx_runtime_ep_cpu::kernels::build_cpu_registry();
+        let mut cpu_only: Vec<String> = cpu_registry
+            .keys()
+            .map(|key| key.op_type.clone())
+            .filter(|op| !CUDA_COVERED_OPS.contains(&op.as_str()))
+            .collect();
+        cpu_only.sort();
+        cpu_only.dedup();
+
+        let undocumented: Vec<&String> = cpu_only.iter().filter(|op| !DOC.contains(*op)).collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "these operators are registered on CPU, absent from CUDA, and named \
+             nowhere in docs/execution/CUDA_COVERAGE.md: {undocumented:?}\n\
+             Either implement them on CUDA, or document why the gap is deliberate \
+             (see the MoE and PackedMultiHeadAttention entries for the shape of \
+             that write-up). A gap is fine; an undocumented one is not."
+        );
+    }
+
     #[test]
     fn wave2_ops_are_listed_in_coverage() {
         for op in [
