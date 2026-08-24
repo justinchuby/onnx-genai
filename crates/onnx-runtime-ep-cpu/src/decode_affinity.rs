@@ -119,18 +119,26 @@ impl CorePlacement {
     /// closure runs at most once per process.
     pub fn from_env() -> Self {
         static V: OnceLock<CorePlacement> = OnceLock::new();
-        *V.get_or_init(
-            || match Self::parse(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref()) {
-                Ok(placement) => placement,
-                Err(message) => {
-                    eprintln!(
-                        "onnx-genai: {message}; using `{}`",
-                        Self::default().as_str()
-                    );
-                    Self::default()
-                }
-            },
-        )
+        *V.get_or_init(|| Self::from_value(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref()))
+    }
+
+    /// [`Self::from_env`] without the cache or the environment read.
+    ///
+    /// Split out because the fallback is otherwise untestable: `from_env`
+    /// memoizes process-wide, so a test driving it would fix the policy for
+    /// every other test in the binary and could still only ever observe one
+    /// value. This half is the part with a decision in it.
+    fn from_value(raw: Option<&str>) -> Self {
+        match Self::parse(raw) {
+            Ok(placement) => placement,
+            Err(message) => {
+                eprintln!(
+                    "onnx-genai: {message}; using `{}`",
+                    Self::default().as_str()
+                );
+                Self::default()
+            }
+        }
     }
 
     /// The wire/report name, so a diagnostic and a test read the same string.
@@ -1915,6 +1923,29 @@ mod tests {
                 "the rejection must list the accepted modes: {message}"
             );
         }
+    }
+
+    #[test]
+    fn an_unparseable_placement_falls_back_without_going_silent() {
+        // The fallback path, which `from_env` alone cannot exercise: it caches
+        // process-wide, so whichever value the first caller in the binary sees
+        // is the only one any test could ever observe.
+        for bad in ["Spread", "one-per-core", "1"] {
+            assert_eq!(
+                CorePlacement::from_value(Some(bad)),
+                CorePlacement::default(),
+                "an unrecognized placement must fall back to the default rather than \
+                 selecting something arbitrary"
+            );
+        }
+        // ...and the accepted values are not merely tolerated by the same path.
+        assert_eq!(
+            CorePlacement::from_value(Some("compact")),
+            CorePlacement::Compact,
+            "the fallback path swallowed a value it was supposed to honor, which would \
+             make the knob inert while looking like it parsed"
+        );
+        assert_eq!(CorePlacement::from_value(None), CorePlacement::default());
     }
 
     #[test]

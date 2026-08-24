@@ -20025,6 +20025,10 @@ mod tests {
         /// about this value, and one that does not name it is asserting a
         /// policy it never selected.
         placement_policy: String,
+        /// The cpuset the child actually measured, so the parent can predict a
+        /// layout for *that* set rather than for whatever it can see itself.
+        /// Empty when the child could not read its own affinity.
+        allowed_cpus: Vec<usize>,
         /// What the pool's workers *observed* about their own placement, as the
         /// wire code of [`crate::decode_spmd::RealizedPlacement`]. The blind-spot
         /// codes are distinct from `one-per-core`, so an unanswerable child can
@@ -20311,14 +20315,26 @@ mod tests {
         let requested: usize = requested
             .parse()
             .expect("the parent passes a decimal width");
-        let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
+        let allowed_cpus = crate::decode_affinity::allowed_cpus().unwrap_or_default();
+        let allowed = allowed_cpus.len();
+        // The set, not just its size. The parent predicts the layout a policy
+        // produces by ordering *these* CPUs, so an equal-sized but differently
+        // populated cpuset would leave it grading another machine.
+        let cpulist = if allowed_cpus.is_empty() {
+            "na".to_string()
+        } else {
+            allowed_cpus
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         // Fails closed on a supported target: silently substituting the logical
         // count for the physical one here would hand the parent an inflated
         // `cores` and make its placement expectation trivially satisfiable.
-        let cores =
-            crate::core_topology::require_host_for_placement().map_or(allowed, |topology| {
-                crate::decode_affinity::allowed_cpus()
-                    .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
+        let cores = crate::core_topology::require_host_for_placement()
+            .map_or(allowed, |topology| {
+                topology.physical_cores_within(&allowed_cpus)
             });
         let (pool_built, workers, nodes, placement, honest, fully_pinned, realized, observed_ok) =
             match crate::decode_spmd::pools() {
@@ -20353,7 +20369,7 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized} policy={}",
+             pinned={} proc={} realized={realized} policy={} cpulist={cpulist}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
@@ -20506,6 +20522,16 @@ mod tests {
             planned_distinct_cores: tri("placement"),
             realized: text("realized").to_string(),
             placement_policy: text("policy").to_string(),
+            allowed_cpus: match text("cpulist") {
+                "na" => Vec::new(),
+                list => list
+                    .split(',')
+                    .map(|cpu| {
+                        cpu.parse()
+                            .unwrap_or_else(|_| panic!("`cpulist` is not a CPU list: {report}"))
+                    })
+                    .collect(),
+            },
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             worker_masks_readable: field("proc") == 1,
@@ -20823,11 +20849,20 @@ mod tests {
             // asked for, it is asserted explicitly, by
             // `an_explicit_spread_policy_places_one_worker_per_physical_core`,
             // which selects it rather than assuming it.
-            assert!(
-                matches!(report.placement_policy.as_str(), "spread" | "compact"),
-                "width {requested}: the child reported placement policy \
-                 `{}`, which is not a policy this build can select -- the \
-                 sweep cannot say what it is measuring ({report:?})",
+            // Equality with the shipped default rather than membership in the
+            // accepted set. Membership could not fail: the child prints
+            // `CorePlacement::as_str()`, which is total over the enum, so the
+            // field is always one of them. Equality is a real claim -- this arm
+            // removes `DECODE_PLACEMENT_ENV` from the child, so it fails if an
+            // ambient value leaks in or `from_env` reads the wrong variable,
+            // and it has to be updated deliberately when #1802 flips the
+            // default, which is the discipline this test is arguing for.
+            assert_eq!(
+                report.placement_policy,
+                crate::decode_affinity::CorePlacement::default().as_str(),
+                "width {requested}: the default arm removes the placement variable from \
+                 the child, so the child must report the policy that ships -- it reported \
+                 `{}` ({report:?})",
                 report.placement_policy
             );
 
@@ -20959,6 +20994,69 @@ mod tests {
         (width >= 2).then_some((width, cores))
     }
 
+    /// A misspelled placement must fall back to the default, say so, and still
+    /// decode.
+    ///
+    /// End-to-end rather than a unit test of the parser, because the two ways
+    /// this knob can be inert are both outside the parser: reading the wrong
+    /// variable name, and swallowing the diagnostic. Either one produces a knob
+    /// a user can set with no error and no effect, which is #1792's shape and
+    /// the failure `verify_documented_env_vars.py` exists to catch statically.
+    #[test]
+    #[cfg_attr(miri, ignore = "spawns a child process")]
+    fn a_misspelled_placement_falls_back_loudly_and_still_builds_a_pool() {
+        let width = "2";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(SPMD_WIDTH_CHILD_ENV, width)
+            .env(DECODE_THREADS_ENV, width)
+            .env("RAYON_NUM_THREADS", width)
+            .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
+            .env(crate::decode_affinity::DECODE_PLACEMENT_ENV, "one-per-core")
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
+            .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
+            .env_remove(SPMD_PARITY_CHILD_ENV)
+            .env_remove(PLACEMENT_DISHONEST_ENV)
+            .output()
+            .expect("run the misspelled-placement child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Not fatal: this knob ranks a set already chosen, so refusing to
+        // decode over a misspelled tuning value would be the worse failure.
+        assert!(
+            output.status.success(),
+            "a misspelled placement aborted the child instead of falling back \
+             (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            child_status_detail(&output.status)
+        );
+        assert!(
+            stdout.contains(&format!(
+                "policy={}",
+                crate::decode_affinity::CorePlacement::default().as_str()
+            )),
+            "the child did not fall back to the default placement:\n{stdout}"
+        );
+        // ...and never silent. A fallback nobody is told about is how a user
+        // ends up believing a knob is in force for the life of a deployment.
+        assert!(
+            stderr.contains(crate::decode_affinity::DECODE_PLACEMENT_ENV)
+                && stderr.contains("one-per-core"),
+            "the fallback was silent -- stderr must name the variable and the value it \
+             rejected:\nstderr:\n{stderr}"
+        );
+    }
+
+    /// The code returned when no layout can be predicted at all.
+    ///
+    /// Deliberately not one of the real codes: a degenerate input must not
+    /// return the value that happens to make a caller's assertion pass, which
+    /// is the false-oracle shape this change exists to remove.
+    const UNPREDICTABLE_PLACEMENT: &str = "unpredictable";
+
     /// The placement the named policy predicts for a `workers`-wide pool on
     /// `allowed`, expressed in the same wire codes the child reports.
     ///
@@ -20982,7 +21080,7 @@ mod tests {
         let ordered =
             crate::decode_affinity::order_pin_targets_for(allowed, Some(topology), policy);
         if ordered.is_empty() || workers == 0 {
-            return "one-per-core";
+            return UNPREDICTABLE_PLACEMENT;
         }
         let taken: Vec<usize> = (0..workers).map(|i| ordered[i % ordered.len()]).collect();
         if topology.physical_cores_within(&taken) < workers {
@@ -20992,33 +21090,38 @@ mod tests {
         }
     }
 
-    /// The parent's own cpuset, and the topology, when the child's report says
-    /// it saw the same host shape the parent sees.
+    /// The cpuset the child measured, together with the topology, when the
+    /// parent can still see the same set the child did.
     ///
     /// The child inherits this process's affinity mask, so the two agree by
     /// construction. Checking rather than assuming is the point: if they ever
     /// diverge, every layout this parent predicts is about a different machine
-    /// than the one the child measured, and a wrong prediction must announce
-    /// itself rather than quietly grade the wrong host.
+    /// than the one the child measured. The comparison is on the *set*, not on
+    /// its cardinality -- equal-sized but differently populated cpusets predict
+    /// different layouts, so a size check would not be the guard this claims to
+    /// be.
+    ///
+    /// A divergence is a skip with a printed reason rather than a failure, and
+    /// that is deliberate. A cgroup resize or a CPU hot-unplug between the
+    /// child's read and the parent's is an environmental event, not a defect in
+    /// the code under test, and a red whose cheapest resolution is to delete the
+    /// check is worse than a stated skip.
     fn parent_cpuset_matching(
         report: &RealizedWidth,
-    ) -> (Vec<usize>, &'static crate::core_topology::CoreTopology) {
-        let allowed = crate::decode_affinity::allowed_cpus()
-            .expect("a target that passed `placement_probe_width` reports its cpuset");
+    ) -> Option<(Vec<usize>, &'static crate::core_topology::CoreTopology)> {
         let topology = crate::core_topology::require_host_for_placement()
             .expect("DETECTION_SUPPORTED targets must resolve a topology or panic");
-        assert_eq!(
-            (report.allowed, report.cores),
-            (allowed.len(), topology.physical_cores_within(&allowed)),
-            "the child measured a different cpuset than this parent can see \
-             ({} CPUs / {} cores against {} / {}), so any layout predicted here is about \
-             another machine ({report:?})",
-            report.allowed,
-            report.cores,
-            allowed.len(),
-            topology.physical_cores_within(&allowed)
-        );
-        (allowed, topology)
+        let allowed = crate::decode_affinity::allowed_cpus().unwrap_or_default();
+        if allowed.is_empty() || allowed != report.allowed_cpus {
+            eprintln!(
+                "skipping the layout prediction: the child measured cpuset {:?} and this \
+                 parent now sees {allowed:?}, so the machine changed shape under the test \
+                 and any layout predicted here would describe a different one ({report:?})",
+                report.allowed_cpus
+            );
+            return None;
+        }
+        Some((allowed, topology))
     }
 
     /// With the spread policy **selected**, the workers must land one per
@@ -21031,54 +21134,79 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "spawns a child process")]
     fn an_explicit_spread_policy_places_one_worker_per_physical_core() {
-        let Some((width, cores)) = placement_probe_width() else {
+        let Some((probe, cores)) = placement_probe_width() else {
             eprintln!(
                 "skipping explicit-spread placement check: this target cannot pin, cannot \
                  read a mask back, or has fewer than 3 allowed physical cores"
             );
             return;
         };
-        let report = realized_width_report_with(
-            width,
-            false,
-            Some(crate::decode_affinity::CorePlacement::Spread),
-        );
-        assert_eq!(
-            report.placement_policy, "spread",
-            "the child did not receive the policy this test selected, so it is measuring \
-             something else ({report:?})"
-        );
-        if report.nodes > 1 {
-            eprintln!(
-                "skipping explicit-spread placement check: a NUMA-split pool rebalances \
-                 workers per node, so the single-group layout this asserts is not the one \
-                 that ran ({report:?})"
+        // Every published width the host has cores for, not one probe width.
+        // The assertions this replaces ran at every swept width, and narrowing
+        // them to a single one would leave a pool-side pinning defect that only
+        // appears past 8 workers unguarded -- placement wrong, honesty green,
+        // nothing red.
+        let mut widths: Vec<usize> = BENCHMARKED_DECODE_WIDTHS
+            .iter()
+            .copied()
+            .filter(|width| (2..=cores).contains(width))
+            .collect();
+        if !widths.contains(&probe) {
+            widths.push(probe);
+        }
+        let mut checked = 0usize;
+        for width in widths {
+            let report = realized_width_report_with(
+                width,
+                false,
+                Some(crate::decode_affinity::CorePlacement::Spread),
             );
-            return;
+            assert_eq!(
+                report.placement_policy, "spread",
+                "the child did not receive the policy this test selected, so it is \
+                 measuring something else ({report:?})"
+            );
+            if report.nodes > 1 {
+                eprintln!(
+                    "width {width}: skipping the explicit-spread check because a \
+                     NUMA-split pool rebalances workers per node, so the single-group \
+                     layout this asserts is not the one that ran ({report:?})"
+                );
+                continue;
+            }
+            assert!(
+                report.pool_built && report.workers >= 2 && report.workers <= cores,
+                "width {width} did not produce a pool inside the core budget, so the \
+                 assertion below would be about the host rather than the policy \
+                 ({report:?})"
+            );
+            assert_eq!(
+                report.realized, "one-per-core",
+                "`spread` was selected explicitly and the host has room for it at width \
+                 {width}, yet the workers observed `{}` for themselves -- the selector is \
+                 inert ({report:?})",
+                report.realized
+            );
+            assert_eq!(
+                report.planned_distinct_cores,
+                Some(true),
+                "the planner did not even intend one worker per physical core under an \
+                 explicit `spread` at width {width} ({report:?})"
+            );
+            // Honest under the policy too: a spread that is reported but not
+            // applied is the #1792 defect wearing a policy name.
+            assert_ne!(
+                report.placement_honest,
+                Some(false),
+                "width {width}: the pool reports CPUs the kernel did not enforce \
+                 ({report:?})"
+            );
+            checked += 1;
         }
         assert!(
-            report.pool_built && report.workers >= 2 && report.workers <= cores,
-            "the probe width did not produce a pool inside the core budget, so the \
-             assertion below would be about the host rather than the policy ({report:?})"
-        );
-        assert_eq!(
-            report.realized, "one-per-core",
-            "`spread` was selected explicitly and the host has room for it, yet the \
-             workers observed `{}` for themselves -- the selector is inert ({report:?})",
-            report.realized
-        );
-        assert_eq!(
-            report.planned_distinct_cores,
-            Some(true),
-            "the planner did not even intend one worker per physical core under an \
-             explicit `spread` ({report:?})"
-        );
-        // Honest under the policy too: a spread that is reported but not
-        // applied is the #1792 defect wearing a policy name.
-        assert_ne!(
-            report.placement_honest,
-            Some(false),
-            "the pool reports CPUs the kernel did not enforce ({report:?})"
+            checked > 0,
+            "every width skipped, so `spread` was never actually asserted -- the probe \
+             width said this host could realize one worker per core and then no width did"
         );
     }
 
@@ -21152,12 +21280,24 @@ mod tests {
             );
             return;
         }
-        let (allowed, topology) = parent_cpuset_matching(&report);
+        assert!(
+            report.workers >= 2,
+            "a one-worker pool cannot share a core with anything, so the layout claim \
+             below would be about the host rather than the policy ({report:?})"
+        );
+        let Some((allowed, topology)) = parent_cpuset_matching(&report) else {
+            return;
+        };
         let compact_predicted = predicted_placement_code(
             &allowed,
             topology,
             crate::decode_affinity::CorePlacement::Compact,
             report.workers,
+        );
+        assert_ne!(
+            compact_predicted, UNPREDICTABLE_PLACEMENT,
+            "no layout could be predicted for a pool this parent has already confirmed \
+             has workers and a cpuset ({report:?})"
         );
         let spread_predicted = predicted_placement_code(
             &allowed,
@@ -21216,18 +21356,24 @@ mod tests {
             );
             return;
         }
-        let (allowed, topology) = parent_cpuset_matching(&compact);
+        let Some((allowed, topology)) = parent_cpuset_matching(&compact) else {
+            return;
+        };
         // Whether a mutation exists at all is a property of *this cpuset*, not
         // of the machine: `taskset -c 0,2,4,6` on an SMT host admits no sibling
         // pair, so compact and spread are the same layout and there is nothing
         // to mutate. Keying this off whole-machine `has_smt()` would have
         // demanded a difference the cpuset cannot produce.
+        //
+        // Written as "only proceed on a positive shared-core prediction" rather
+        // than "skip on one-per-core", so the unpredictable case skips too
+        // instead of falling into the assertion.
         if predicted_placement_code(
             &allowed,
             topology,
             crate::decode_affinity::CorePlacement::Compact,
             compact.workers,
-        ) == "one-per-core"
+        ) != "shared-core"
         {
             eprintln!(
                 "skipping spread-assertion mutation: this {}-CPU / {}-core cpuset has no \
