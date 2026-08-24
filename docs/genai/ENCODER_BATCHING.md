@@ -1375,8 +1375,11 @@ claim; it is a mechanism, and it lands in P1 **before** any new field is emitted
   **MUST NOT** stamp it otherwise. Packages that do not declare `batch_capacity`
   keep their current bytes exactly — an absent `schema_version` stays absent, a
   `"v1"` stays `"v1"`, a `'1.0'` stays `'1.0'` — and keep loading on every
-  existing runtime. No migration pass rewrites existing packages, since all three
-  spellings already normalize to v1.0 and rewriting them would change the
+  existing runtime. **That claim is about additive fields and only about them.**
+  It is true because an old runtime never sees a field it does not know; it is
+  not a statement about a spelling that was retired, which no version number
+  rescues (the bullet below). No migration pass rewrites existing packages, since
+  all three spellings already normalize to v1.0 and rewriting them would change the
   documents' semantic identity
   ([§4.4](INFERENCE_METADATA_DECISIONS.md#44-semantic-identity)) for no gain.
   The new minimum applies to the packages that actually need the new surface, and
@@ -1413,6 +1416,42 @@ claim; it is a mechanism, and it lands in P1 **before** any new field is emitted
   changes where the alternative is a permanent second spelling; that is the trade
   taken here, and it is stated so that a later reader does not restore the flat
   form in the name of compatibility it never had.
+- **A retired spelling is a third kind of change, and a version number arbitrates
+  none of it.** Two kinds of change are version questions. An *additive* field is
+  one: a document that uses it declares a higher minor, and a runtime that does
+  not know it refuses on the version rather than on the field. A rule demanding
+  that a document *state* something newly ambiguous is the second, and it is
+  version-scoped for the reason in the next bullet. A **retired spelling is
+  neither.** Both the flat pair and `levels` belong to the same version line; the
+  stale document is well-formed, declares a version this runtime supports, and
+  says something the reader no longer has a meaning for. No comparison of version
+  numbers can detect that, so the refusal **MUST** be *shape recognition* — the
+  reader recognizes the retired shape by name and refuses it — and it cannot be
+  folded into the gate.
+
+  **Shape recognition runs after the version gate, not before.** A retired-shape
+  message asserts what a spelling *means*, and that assertion is scoped to one
+  vocabulary. A document declaring `v2.0` has not established that it belongs to
+  the line in which the flat pair was retired, so telling its author to rewrite
+  it into v1's `levels` claims knowledge of v2 this build does not have — it
+  should be refused for declaring a version this runtime cannot read, and told
+  nothing further. Order therefore is: normalize and gate the version, then
+  recognize retired shapes within the vocabulary the gate admitted. The same
+  reasoning applies to any recognizer whose message asserts what a spelling
+  means; where an existing one runs before the gate, aligning it is a separate
+  change with its own evidence and is not this design's to make.
+
+  **The message is the deliverable.** A `deny_unknown_fields` failure here reads
+  as an unknown-field error naming `offsets`, with the path stopping at the
+  contract rather than at the layout — which reads like a typo and sends a reader
+  hunting for a misspelling that does not exist. The refusal **MUST** instead
+  name the containing path down to the layout, give the exact replacement, and say that
+  **no document is converted**, so that an author who wants the old meaning
+  writes it in the new spelling deliberately rather than discovering later that
+  something was rewritten for them. The published JSON schema is generated from
+  the same types and closes its objects, so a producer validating against the
+  schema alone reaches the same verdict as the loader; that agreement is worth a
+  test rather than a coincidence.
 - **A version may gate what a document must *say*; it never gates what a document
   may say *wrongly*.** The gate above decides which vocabulary a document may use.
   A second, subtler use follows from it: when a new field makes an existing
@@ -1788,7 +1827,7 @@ no downloaded weights, no sample media, and no network in the test path.
 | 19 | **Budgets bind materialized footprint.** Groups that hit the item budget with few frames; groups that hit the packed budget with few items (one long clip); a group whose *valid* padded extents would fit but whose materialized rectangle does not; and two groups of a resolution-**pinned** encoder that pin different `patches` values, only one of which fits the composed entry. | Each bound is enforced separately, none inferred from another; the padded dimension is charged `count × padded_extent`, not the sum of valid lengths; a composed path multiplies outermost-first, including pinned symbols — the larger-resolution group is refused while the smaller is admitted, which a budget on the item symbol could not have distinguished; a decode-side row bound is never used as an item bound. | P6 |
 | 20 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
 | 21 | **Unproven backend declines, per triple, and says so.** Native reports grouped execution unsupported for the CNN encoder while ORT groups the same workload; a second component with a different operator class is evaluated independently. | Outputs are identical between the two paths; native never receives a group for an unproven triple; one triple passing never flips another; the decline is counted and attributable, not silent; no attempted grouped invocation on the unproven path. The real-model guard in `batch_vision_crash.rs` runs and fails the job if its model is missing. | P5 |
-| 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged **unless it spells the replaced flat `token_packed` form**, which is refused with a message naming the removed spelling and the one-level `levels` rewrite — not an unknown-field error, and not a silent acceptance. | P1 |
+| 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged **unless it spells the replaced flat `token_packed` form**, which is refused with a message naming the removed spelling and the one-level `levels` rewrite — not an unknown-field error, and not a silent acceptance. A `2.0` document carrying the same flat pair is refused **on its version only** and never receives the migration message, proving the gate runs first and that a retired-shape claim is scoped to the vocabulary the gate admitted. | P1 |
 | 23 | **Conditional emission, and no rewriting of what exists.** Every existing in-tree document round-tripped through the writer, and a new document that declares `batch_capacity`. | For the existing documents the **bytes and the version strings are unchanged** — `v1` stays `v1`, `1.0` stays `1.0`, absent stays absent, and no field of this design is emitted — so no existing runtime's minimum moves and no semantic identity changes. The new document **MUST** stamp `v1.1`. | P1 |
 | 24 | **Every output level declares its producer.** A mixed-chain output (inner level `extent: produced` with component-output companions, outer level `extent: preserved` reusing the input's clip pair) exercised end to end; a token-merging graph whose output length differs from its input's; and three negative cases — a level omitting `extent`, a `produced` level naming an input companion, and a `preserved` level naming a companion of a different extent. | The mixed chain validates per level and splits at the graph's own inner boundaries while reusing the outer mapping; the negatives are rejected at load naming the value, the level, and both facts; no path ever splits a produced level with input offsets. | P2, P4 |
 | 25 | **Serving admits companions, and only companions.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a padded value *without* them; and one emitting an unrelated `shared` rank-1 value. | The first two validate — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items; the third is rejected for withholding the only account of its padding; the fourth is still rejected with the existing message. | P2, P6 |
