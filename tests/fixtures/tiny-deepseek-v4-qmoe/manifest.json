@@ -1,6 +1,6 @@
 {
   "generator": "tests/fixtures/tiny-deepseek-v4-qmoe/generate.py",
-  "mobius_commit": "7003bc73524a240de5741766e9838c40936b6da9",
+  "mobius_commit": "cec78d2d17a8bea9e9edf9d1f0aa405120c2ccc3",
   "seed": 0,
   "architecture": "deepseek_v4",
   "compress_ratios": null,
@@ -44,8 +44,8 @@
     123
   ],
   "files": {
-    "model.onnx.textproto": 1047171,
-    "inference_metadata.yaml": 38045,
+    "model.onnx.textproto": 1047333,
+    "inference_metadata.yaml": 14748,
     "tokenizer.json": 4680
   }
 }
