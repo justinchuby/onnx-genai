@@ -2102,13 +2102,29 @@ time. That figure is now stale; the re-measurement replaces it.
 > smaller — null-immune but narrow, since a pure load-balance change like the
 > +23% steal-tiles candidate moves wall and `sys` while leaving user CPU flat,
 > making it that candidate's *control* rather than its score. **The +23%
-> candidate remains blocked** on a mode-stratified re-test against its own
-> unmodified rule. Full records:
+> candidate has now been re-tested and is CLOSED.** 24 launches with the
+> unmodified rule: **ratio 0.9883, sign 38%**; stratified to the fast mode the
+> A/A half-width collapses **0.1478 → 0.0323**, an instrument 4.6x sharper that
+> would resolve anything above +9.7%, and the effect is **−0.0111**. The
+> original +23% is accounted for: its control arm drew the slow mode in 4 of 8
+> launches against the test arm's 1 of 8, and at the 1.687x mode ratio that
+> imbalance alone manufactures up to **+0.2576** — more than the +0.2327
+> observed. Its `sys_frac` "mechanism confirmation" inverts at n=24 (+0.0111,
+> 46% sign), because the slow mode is the high-`sys` mode and the mechanism was
+> downstream of the same nuisance variable. **A directionally-correct mechanism
+> reading corroborates nothing if it is not independent of the confound.**
+> Stratification is nonetheless validated as a method here (4.6x sharper null,
+> paired-imbalance gate passing at 8.3%) and costs ~3x the launches, since each
+> launch runs three independent width-16 processes that each draw the mode. The
+> 22.2-point straggler wait remains the open target; what is closed is the claim
+> that spare tiles collect it. Full records:
+
 > [`docs/benchmarks/2026-08-23-acc0-gap-at-width-16.md`](../benchmarks/2026-08-23-acc0-gap-at-width-16.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-cpu-attribution.md),
 > [`docs/benchmarks/2026-08-23-acc0-width-16-worker-attribution.md`](../benchmarks/2026-08-23-acc0-width-16-worker-attribution.md),
 > [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
-> [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md).
+> [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
+> [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone

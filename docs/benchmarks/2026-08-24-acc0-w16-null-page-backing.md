@@ -321,6 +321,17 @@ the pool:
 **Neither of these is a claim that the +23% candidate is real.** It remains
 blocked on a mode-stratified re-test against its own unmodified rule.
 
+> **Update, same day: the re-test has been run and the candidate is CLOSED.**
+> 24 launches, unmodified rule, ratio **0.9883**; stratified to the fast mode the
+> A/A half-width collapses **0.1478 → 0.0323** — the 4.6x sharpening this
+> section predicted — and the effect is **−0.0111**. The original +23% was its
+> control arm drawing the slow mode 4 times in 8 against the test arm's 1, which
+> at 1.687x manufactures up to +0.2576 on its own. Consequence (1) above is
+> therefore **validated as a method and reported as costing ~3x the launches**;
+> consequence (2)'s control held on both runs (user CPU per token flat to
+> 1.12x). See
+> [`2026-08-24-acc0-steal-tiles-retest.md`](2026-08-24-acc0-steal-tiles-retest.md).
+
 Note what this does *not* rescue: the mechanism being internal means the block
 on the steal-tiles candidate is a measurement problem to be solved by
 stratification, not a pool defect to be fixed.
