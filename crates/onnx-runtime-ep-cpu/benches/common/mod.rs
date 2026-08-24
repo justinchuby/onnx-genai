@@ -419,3 +419,43 @@ pub fn report_dispatcher_cpu() {
         moves.map_or("none".to_string(), |v| v.to_string()),
     );
 }
+
+/// Open the measurement window for the advisory host lock.
+///
+/// Call this first thing in `main`, before warmup and before any model is
+/// built. The window has to cover everything a co-tenant could have perturbed,
+/// not just the timed region: a warmup that shares cores with somebody else's
+/// `cargo test` leaves caches and frequency in a state the timed region then
+/// inherits.
+///
+/// Pair it with [`report_host_lock`]. The window reads the lock again on close,
+/// and the two readings are what make `changed` reportable -- a single
+/// end-of-run read names a credible holder for a run that changed hands, which
+/// is worse than saying nothing because it convinces.
+pub fn open_host_lock_window() -> onnx_runtime_hostmon::window::Window {
+    onnx_runtime_hostmon::window::Window::open()
+}
+
+/// Report what the advisory lock said about the whole run.
+///
+/// The `foreign_%` and `sib_%` columns measure what the host *did*; this
+/// reports what anyone *declared* they were doing to it, from
+/// `scripts/hostlock.sh`. Different questions, and a run wants both: contention
+/// sampling reads instants and can miss a co-tenant that starts and finishes
+/// between two snapshots, while a declaration covers the whole window and
+/// proves nothing about load.
+///
+/// Reports rather than aborts, for the same reason [`report_decode_width`]
+/// does. Refusing to print a matrix because nobody took a lock would mostly
+/// teach people to stop taking the lock, and an unlocked run on a genuinely
+/// idle box is fine. What is not fine is a row that cannot be told apart from
+/// one taken beside somebody else's benchmark.
+pub fn report_host_lock(window: onnx_runtime_hostmon::window::Window) {
+    let report = window.close();
+    println!("{report}");
+    if let Some(warning) = report.warning() {
+        // stderr, and loud, because the failure this guards against is a row
+        // that looks entirely normal.
+        eprintln!("{warning}");
+    }
+}

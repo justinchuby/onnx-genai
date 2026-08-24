@@ -661,7 +661,7 @@ fn main() {
     // credible holder for a run that changed hands partway through -- the same
     // stale-snapshot error as checking `ps` once before starting, moved into the
     // output where it is harder to notice.
-    let lock_before = host_contention::hostlock::read();
+    let host_lock = common::open_host_lock_window();
 
     println!(
         "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd} warmup={warmup} reps={reps} dist={}",
@@ -1035,27 +1035,8 @@ fn main() {
     // covers the whole window but proves nothing about load. An unlocked run on
     // a genuinely idle box is fine; a locked run beside somebody's unannounced
     // `cargo test` is not.
-    // One reading, used for both fields. Reading twice here would let the
-    // printed reason describe a different lock than the printed verdict --
-    // `host_lock=changed lock_reason=acc0` names a holder for a window the
-    // field itself says had none, which invites a reader to dismiss the
-    // `changed`.
-    let lock_after = host_contention::hostlock::read();
-    let lock = host_contention::hostlock::field_from_env(&lock_before, &lock_after);
-    match host_contention::hostlock::reason(&lock_before, &lock_after) {
-        Some(reason) => println!("host_lock={lock} lock_reason={reason}"),
-        None => println!("host_lock={lock}"),
-    }
-    if !lock.is_protected() {
-        // Loud, and on stderr, because the failure this guards against is a row
-        // that looks entirely normal. Not fatal: refusing to print a matrix
-        // because nobody took a lock would mostly teach people to stop taking
-        // the lock.
-        eprintln!(
-            "UNPROTECTED host_lock={lock} -- this matrix was not covered end-to-end by a lock \
-             held by this process (HOSTLOCK_OWNER={}). Take one with `scripts/hostlock.sh run` \
-             before publishing these numbers.",
-            std::env::var("HOSTLOCK_OWNER").unwrap_or_else(|_| "unset".into())
-        );
-    }
+    // The row text, the `changed` rule and the warning all live in
+    // `common::report_host_lock` now, so this matrix and the nine other
+    // benches cannot drift into two vocabularies for one field.
+    common::report_host_lock(host_lock);
 }

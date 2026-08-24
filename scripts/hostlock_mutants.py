@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mutation harness for `crates/onnx-runtime-hostmon/src/hostlock.rs`.
+"""Mutation harness for the host-lock reader and the measurement window.
 
 Run: `python3 scripts/hostlock_mutants.py`
 
@@ -41,98 +41,120 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "crates/onnx-runtime-hostmon/src/hostlock.rs"
+HOSTLOCK = ROOT / "crates/onnx-runtime-hostmon/src/hostlock.rs"
+WINDOW = ROOT / "crates/onnx-runtime-hostmon/src/window.rs"
 
-# (name, text to replace, replacement). The text must match the source exactly;
-# a mutant whose anchor has drifted is reported rather than skipped, because a
-# mutant that never applied is indistinguishable from one that was killed.
+# (file, name, text to replace, replacement). The text must match the source
+# exactly; a mutant whose anchor has drifted is reported rather than skipped,
+# because a mutant that never applied is indistinguishable from one that was
+# killed.
 MUTANTS = [
     # --- owner strings are untrusted input, and end up in a `key=value` row ---
-    ("owner-passthrough",
+    (HOSTLOCK, "owner-passthrough",
      "            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {",
      "            if true {"),
-    ("owner-unbounded",
+    (HOSTLOCK, "owner-unbounded",
      "        .take(MAX_OWNER_LEN)\n",
      ""),
-    ("owner-empty-blank",
+    (HOSTLOCK, "owner-empty-blank",
      '        "?".to_string()',
      '        String::new()'),
 
     # --- the metadata file must be read the way the script writes it ---
-    ("meta-key-substring",
+    (HOSTLOCK, "meta-key-substring",
      "        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))",
      "        .find_map(|line| line.split_once('=').filter(|(k, _)| k.contains(key)).map(|(_, v)| v))"),
-    ("meta-last-wins",
+    (HOSTLOCK, "meta-last-wins",
      "    meta.lines()\n        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))",
      "    meta.lines()\n        .filter_map(|line| line.strip_prefix(key)?.strip_prefix('='))\n        .last()"),
 
     # --- liveness, which must agree with hostlock.sh line for line ---
-    ("no-pid-is-alive",
+    (HOSTLOCK, "no-pid-is-alive",
      "    let Some(pid) = holder.anchor_pid else {\n        return Liveness::Unprovable;\n    };",
      "    let Some(pid) = holder.anchor_pid else {\n        return Liveness::Alive;\n    };"),
-    ("zombie-ignored",
+    (HOSTLOCK, "zombie-ignored",
      "    if info.state == 'Z' && info.threads.is_some_and(|t| t <= 1) {\n        return Liveness::Dead;\n    }\n",
      ""),
-    ("zombie-leader-reaped",
+    (HOSTLOCK, "zombie-leader-reaped",
      "    if info.state == 'Z' && info.threads.is_some_and(|t| t <= 1) {",
      "    if info.state == 'Z' {"),
-    ("start-time-ignored",
+    (HOSTLOCK, "start-time-ignored",
      "        Some(recorded) if recorded != info.start_time => Liveness::Dead,",
      "        Some(_recorded) if false => Liveness::Dead,"),
-    ("missing-start-is-alive",
+    (HOSTLOCK, "missing-start-is-alive",
      "        None => Liveness::Unprovable,\n    }\n}",
      "        None => Liveness::Alive,\n    }\n}"),
-    ("departed-pid-is-alive",
+    (HOSTLOCK, "departed-pid-is-alive",
      "        // No `/proc` entry at all is the one unambiguous death.\n        return Liveness::Dead;",
      "        return Liveness::Alive;"),
 
     # --- what the field is allowed to claim ---
-    ("no-two-ended-read",
+    (HOSTLOCK, "no-two-ended-read",
      "    if before != after {\n        return LockField::Changed;\n    }",
      ""),
-    ("foreign-is-mine",
+    (HOSTLOCK, "foreign-is-mine",
      "            Some(_) => LockField::Foreign(holder.owner.clone()),",
      "            Some(_) => LockField::Mine(holder.owner.clone()),"),
-    ("unattributed-is-mine",
+    (HOSTLOCK, "unattributed-is-mine",
      "            None => LockField::Held(holder.owner.clone()),",
      "            None => LockField::Mine(holder.owner.clone()),"),
-    ("held-protects",
+    (HOSTLOCK, "held-protects",
      "        matches!(self, LockField::Mine(_))",
      "        matches!(self, LockField::Mine(_) | LockField::Held(_))"),
-    ("unverified-protects",
+    (HOSTLOCK, "unverified-protects",
      "        matches!(self, LockField::Mine(_))",
      "        matches!(self, LockField::Mine(_) | LockField::Unverified(_))"),
-    ("stale-protects",
+    (HOSTLOCK, "stale-protects",
      "        matches!(self, LockField::Mine(_))",
      "        matches!(self, LockField::Mine(_) | LockField::Stale(_))"),
-    ("unprovable-is-held-and-stale-is-free",
+    (HOSTLOCK, "unprovable-is-held-and-stale-is-free",
      "        Liveness::Unprovable => LockState::Unverified(holder),",
      "        Liveness::Unprovable => LockState::Held(holder),"),
-    ("unparseable-is-free",
+    (HOSTLOCK, "unparseable-is-free",
      "    let Some(holder) = parse_meta(meta) else {\n        return LockState::Unknown;\n    };",
      "    let Some(holder) = parse_meta(meta) else {\n        return LockState::Free;\n    };"),
-    ("io-error-is-free",
+    (HOSTLOCK, "io-error-is-free",
      "        Err(std::io::ErrorKind::NotFound) => LockState::Free,\n        Err(_) => LockState::Unknown,",
      "        Err(_) => LockState::Free,"),
 
     # --- attribution: the only value that certifies a row is `mine` ---
-    ("attribute-on-sanitised",
+    (HOSTLOCK, "attribute-on-sanitised",
      "            Some(mine) if mine == holder.owner_raw => LockField::Mine(holder.owner.clone()),",
      "            Some(mine) if sanitise_owner(mine) == holder.owner => LockField::Mine(holder.owner.clone()),"),
-    ("owner-raw-sanitised",
+    (HOSTLOCK, "owner-raw-sanitised",
      "        owner_raw: owner.trim().to_string(),",
      "        owner_raw: sanitise_owner(owner),"),
-    ("blank-owners-match",
+    (HOSTLOCK, "blank-owners-match",
      "            Some(mine) if mine.is_empty() || holder.owner_raw.is_empty() => {\n                LockField::Foreign(holder.owner.clone())\n            }\n",
      ""),
-    ("stale-is-free",
+    (HOSTLOCK, "stale-is-free",
      "        Liveness::Dead => LockState::Stale(holder),",
      "        Liveness::Dead => LockState::Free,"),
 
     # --- the reader must look where the script writes ---
-    ("default-dir-drift",
+    (HOSTLOCK, "default-dir-drift",
      'pub const DEFAULT_LOCK_DIR: &str = "/tmp/onnx-genai-hostlock";',
      'pub const DEFAULT_LOCK_DIR: &str = "/tmp/onnx-genai-hostlock-moved";'),
+
+    # --- the window: a claim about a span, not an instant ---
+    (WINDOW, "window-one-ended",
+     "            field: hostlock::field_from_env(&self.before, &after),",
+     "            field: hostlock::field_from_env(&after, &after),"),
+    (WINDOW, "window-reason-from-second-read",
+     "            reason: hostlock::reason(&self.before, &after),",
+     "            reason: hostlock::reason(&after, &after),"),
+    (WINDOW, "window-close-ignores-the-second-read",
+     "        let after = read_after();",
+     "        let after = self.before.clone();\n        let _ = read_after;"),
+    (WINDOW, "window-warns-on-everything",
+     "        if self.is_protected() {\n            return None;\n        }",
+     ""),
+    (WINDOW, "window-never-warns",
+     "        if self.is_protected() {\n            return None;\n        }",
+     "        return None;"),
+    (WINDOW, "window-drops-the-reason",
+     "            Some(reason) => write!(f, \"host_lock={} lock_reason={reason}\", self.field),",
+     "            Some(_) => write!(f, \"host_lock={}\", self.field),"),
 ]
 
 
@@ -154,13 +176,14 @@ def run_tests():
 
 
 def main():
-    original = SRC.read_text()
+    originals = {path: path.read_text() for path in (HOSTLOCK, WINDOW)}
     restored = False
 
     def restore(*_):
         nonlocal restored
         if not restored:
-            SRC.write_text(original)
+            for path, text in originals.items():
+                path.write_text(text)
             restored = True
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -178,16 +201,18 @@ def main():
 
     survivors = []
     try:
-        for name, old, new in MUTANTS:
+        for path, name, old, new in MUTANTS:
+            original = originals[path]
             if old not in original:
                 # Not a pass. `cargo fmt` reflowing an anchor has silently
                 # un-applied a mutant here before, and an un-applied mutant is
                 # indistinguishable from a killed one in the exit code.
-                print(f"  !! {name}: anchor text not found -- mutant never applied")
+                print(f"  !! {path.name}:{name}: anchor text not found -- mutant never applied")
                 survivors.append(name + " (unapplied)")
                 continue
-            SRC.write_text(original.replace(old, new, 1))
+            path.write_text(original.replace(old, new, 1))
             verdict, detail = run_tests()
+            path.write_text(original)
             if verdict in ("killed", "survived"):
                 counts, info = detail
                 if counts != baseline_counts:
@@ -202,7 +227,7 @@ def main():
     finally:
         restore()
 
-    if SRC.read_text() != original:
+    if any(path.read_text() != text for path, text in originals.items()):
         print("\n!! source not restored -- check `git diff` before doing anything else")
         return 2
     if survivors:

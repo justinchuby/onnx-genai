@@ -98,6 +98,10 @@ fn build_kernel(
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
     common::init_decode_topology();
+    // Opened before anything else runs, so the window covers warmup too: a
+    // warmup that shared cores with somebody else's run leaves caches and
+    // frequency in a state the timed region inherits.
+    let host_lock = common::open_host_lock_window();
 
     // `PROBE_BLOCK` exists because `int4_prefill_gebp_min_rows` returns a
     // *different* threshold for weights whose block size the column-blocked
@@ -194,4 +198,7 @@ fn main() {
             println!("{k:>6} {n:>6} {m:>5} {cold:>12.3} {steady:>12.3} {gflops:>12.2}");
         }
     }
+
+    // Last, so the second reading covers everything above it.
+    common::report_host_lock(host_lock);
 }

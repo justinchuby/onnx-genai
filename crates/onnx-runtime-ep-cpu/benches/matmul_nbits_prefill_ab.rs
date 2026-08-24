@@ -134,6 +134,10 @@ fn median(mut samples: Vec<f64>) -> f64 {
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
     common::init_decode_topology();
+    // Opened before anything else runs, so the window covers warmup too: a
+    // warmup that shared cores with somebody else's run leaves caches and
+    // frequency in a state the timed region inherits.
+    let host_lock = common::open_host_lock_window();
 
     let cases = [
         Case {
@@ -255,4 +259,7 @@ fn main() {
             );
         }
     }
+
+    // Last, so the second reading covers everything above it.
+    common::report_host_lock(host_lock);
 }

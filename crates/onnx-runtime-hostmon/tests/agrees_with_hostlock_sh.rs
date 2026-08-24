@@ -538,3 +538,84 @@ fn neither_implementation_falls_back_when_the_config_is_unusable() {
         assert_eq!(err.value, value);
     }
 }
+
+/// A window that the script took a lock inside of is reported as `changed`,
+/// not as a holder.
+///
+/// The unit tests for this hand `Window` two states I wrote by hand, so they
+/// prove the rule and prove nothing about whether either state can arise from
+/// the real script. Here both readings come from `hostlock.sh` -- the first
+/// from a directory it has not touched, the second from one it has just
+/// acquired -- which is the shape of the error the two-ended read exists to
+/// catch: a benchmark that starts on a free host and finishes on a claimed one.
+#[test]
+fn a_window_the_script_claimed_midway_is_reported_as_changed() {
+    let dir = lock_dir("window-changed");
+    let _cleanup = ScratchLock(dir.clone());
+    let mut anchor = Anchor::spawn();
+
+    let before = read_at(&dir);
+    assert_eq!(
+        before,
+        onnx_runtime_hostmon::hostlock::LockState::Free,
+        "the scratch directory must start unlocked, or this test proves nothing"
+    );
+
+    let (ok, out) = hostlock(
+        &dir,
+        &[
+            "acquire",
+            "--owner",
+            "someone-else",
+            "--reason",
+            "mid-window claim",
+            "--pid",
+            &anchor.pid().to_string(),
+        ],
+    );
+    assert!(ok, "acquire failed: {out}");
+
+    let after = read_at(&dir);
+    let report = onnx_runtime_hostmon::window::Window::opened_at(before).closed_at(after.clone());
+    assert_eq!(
+        report.field,
+        onnx_runtime_hostmon::hostlock::LockField::Changed
+    );
+    assert_eq!(
+        report.to_string(),
+        "host_lock=changed",
+        "a changed window must not carry the late holder's reason: naming one invites a reader to \
+         treat the window as covered after all"
+    );
+    assert!(!report.is_protected());
+    assert!(
+        report
+            .warning()
+            .is_some_and(|w| w.starts_with("UNPROTECTED")),
+        "a window that changed hands must complain"
+    );
+
+    // The steady case, from the same real lock: both ends agree, so the
+    // holder's own reason survives into the row.
+    let steady =
+        onnx_runtime_hostmon::window::Window::opened_at(after.clone()).closed_at(after.clone());
+    // The reason was written with a space in it and comes back with an
+    // underscore: the row is a `key=value` list, so a reason that kept its
+    // spaces would add fields to it. Asserted against a reason the *script*
+    // wrote, not one built in-process, because that is the path an injected
+    // reason would actually travel.
+    assert_eq!(
+        steady.to_string(),
+        "host_lock=held:someone-else lock_reason=mid-window_claim",
+        "with HOSTLOCK_OWNER unset there is nothing to attribute the lock against, so `held:` is \
+         the honest answer and it is unprotected either way"
+    );
+    assert_eq!(
+        steady.to_string().split_whitespace().count(),
+        2,
+        "a holder's reason must not be able to add fields to a result row"
+    );
+    assert!(!steady.is_protected());
+
+    anchor.retire();
+}
