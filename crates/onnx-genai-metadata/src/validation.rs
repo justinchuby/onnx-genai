@@ -4830,25 +4830,49 @@ fn validate_compaction_derivability(
                 ));
             }
             // The carve-out is deliberately narrow: a `shared` emitted value is
-            // admitted only when it is one of the int64 rank-1 vectors some
-            // other emitted value's contract names as the description of its own
-            // shape — an ownership offsets or owner map, or the valid_lengths of
-            // a padded dimension. All of those are decidable from the declared
-            // outputs alone. Anything else `shared` and rank > 0 is still a
-            // per-request result with no way back to a request.
+            // admitted only when it is one of the int64 vectors some other
+            // emitted value's contract names as the description of its own shape
+            // — an ownership offsets or owner map, or the valid_lengths of a
+            // padded dimension — and only at the rank that naming requires of
+            // it. All of that is decidable from the declared outputs alone.
+            // Anything else `shared` and rank > 0 is still a per-request result
+            // with no way back to a request.
+            let expectations = output_companions(workflow);
+            let claimed = expectations.get(output.as_str());
             let is_shape_companion = contract.dtype == "int64"
-                && contract.rank == 1
-                && output_companions(workflow).contains(output.as_str());
+                && claimed.is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank)));
             if contract.rank > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
                 && !is_shape_companion
             {
-                errors.push(format!(
-                    "{path} emits per-request value '{value}' without a declared batch_layout; a \
-                     serving workflow must declare request_aligned or token_packed so the runtime \
-                     can associate result rows with requests"
-                ));
+                // A value that is named as a companion but does not have a
+                // companion's shape gets the reason it was not admitted. The
+                // generic message would tell its author to declare a row axis,
+                // which is precisely what a companion must not do.
+                if let Some(roles) = claimed {
+                    let expected = roles
+                        .iter()
+                        .map(|role| match role.rank {
+                            Some(rank) => format!("{} at rank {rank}", role.role.describe()),
+                            None => role.role.describe().to_string(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    errors.push(format!(
+                        "{path} emits '{value}' into output '{output}', which another declared \
+                         output names as {expected}, but it is {} at rank {}; a companion is \
+                         admitted into a serving workflow only at the shape the declaration \
+                         naming it requires",
+                        contract.dtype, contract.rank
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{path} emits per-request value '{value}' without a declared \
+                         batch_layout; a serving workflow must declare request_aligned or \
+                         token_packed so the runtime can associate result rows with requests"
+                    ));
+                }
             }
         }
         WorkflowNode::Invoke { .. }
@@ -4857,9 +4881,54 @@ fn validate_compaction_derivability(
     }
 }
 
+/// What some declared output's contract claims about a value it names as the
+/// description of its own shape.
+///
+/// The three companion kinds do not have the same shape, and a carve-out keyed
+/// on the name alone cannot tell them apart. Offsets and owner maps are always
+/// rank one: one entry per parent boundary and one per child. A validity length
+/// has one entry per position of the axes *outer* to the dimension it bounds, so
+/// its rank is that dimension's axis index — rank one for a padded axis 1, rank
+/// two for a padded axis 2, and so on. Carrying the expectation beside the name
+/// is what lets the carve-out admit each of them at its own shape instead of at
+/// whichever shape happened to be written down first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct CompanionExpectation {
+    role: CompanionRole,
+    /// Rank the naming declaration requires, when the declaration determines it.
+    ///
+    /// `None` where the bounded value's shape does not resolve the padded
+    /// dimension to an axis. That is itself an error, reported against the
+    /// padding declaration; the carve-out must not add a second, misleading
+    /// complaint about a rank nothing was able to compute.
+    rank: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CompanionRole {
+    Offsets,
+    Owner,
+    ValidLengths,
+}
+
+impl CompanionRole {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Offsets => "an ownership level's offsets",
+            Self::Owner => "an ownership level's owner map",
+            Self::ValidLengths => "a padded dimension's valid_lengths",
+        }
+    }
+}
+
+impl CompanionExpectation {
+    fn admits(self, rank: usize) -> bool {
+        self.rank.is_none_or(|expected| expected == rank)
+    }
+}
+
 /// Every value a declared output's contract names as a description of its own
-/// shape: an ownership level's offsets or owner map, or a padded dimension's
-/// valid_lengths.
+/// shape, with the shape that naming requires of it.
 ///
 /// These are `shared` by construction — a prefix-offset vector describes a whole
 /// packing, and a length vector describes one entry per position outside the
@@ -4867,25 +4936,42 @@ fn validate_compaction_derivability(
 /// rule above would otherwise reject. Publishing them is what makes a packed or
 /// padded result readable, so the rule that demands a row correspondence has to
 /// know which values are the mechanism by which that correspondence is stated.
-fn output_companions(workflow: &WorkflowSpec) -> BTreeSet<&str> {
-    workflow
-        .outputs
-        .values()
-        .map(|output| &output.contract)
-        .flat_map(|contract| {
-            contract
-                .batch_layout
-                .companions()
-                .into_iter()
-                .map(|(_, _, companion)| companion)
-                .chain(
-                    contract
-                        .padding
-                        .iter()
-                        .map(|entry| entry.valid_lengths.as_str()),
-                )
-        })
-        .collect()
+///
+/// A name can be claimed by more than one declaration — one length vector may
+/// bound the same dimension of two outputs — so the expectations are collected
+/// rather than overwritten, and a value satisfies the carve-out by matching any
+/// one of them. Two declarations that demand different ranks of one value are a
+/// contradiction, but it is `validate_padding`'s to report against the
+/// declaration that is wrong, not this rule's to report as a missing row axis.
+fn output_companions(workflow: &WorkflowSpec) -> BTreeMap<&str, BTreeSet<CompanionExpectation>> {
+    let mut companions: BTreeMap<&str, BTreeSet<CompanionExpectation>> = BTreeMap::new();
+    for output in workflow.outputs.values() {
+        let contract = &output.contract;
+        for (_, role, companion) in contract.batch_layout.companions() {
+            let role = if role == "offsets" {
+                CompanionRole::Offsets
+            } else {
+                CompanionRole::Owner
+            };
+            companions
+                .entry(companion)
+                .or_default()
+                .insert(CompanionExpectation {
+                    role,
+                    rank: Some(1),
+                });
+        }
+        for entry in &contract.padding {
+            companions
+                .entry(entry.valid_lengths.as_str())
+                .or_default()
+                .insert(CompanionExpectation {
+                    role: CompanionRole::ValidLengths,
+                    rank: axis_of_symbol(contract, &entry.dimension),
+                });
+        }
+    }
+    companions
 }
 
 /// A packed result is only usable by whoever receives it if the companions that
@@ -4905,16 +4991,25 @@ fn validate_packed_emit_companions(
     workflow: &WorkflowSpec,
     errors: &mut Vec<String>,
 ) {
+    let emitted = emitted_outputs(workflow);
     for (level, role, companion) in declared.contract.batch_layout.companions() {
-        if workflow.outputs.contains_key(companion) {
+        if !workflow.outputs.contains_key(companion) {
+            errors.push(format!(
+                "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
+                 {role} '{companion}' is not itself a declared workflow output; a caller can only \
+                 split a packed result with the companions that describe it, so a packed emit \
+                 publishes every level of them"
+            ));
             continue;
         }
-        errors.push(format!(
-            "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
-             {role} '{companion}' is not itself a declared workflow output; a caller can only \
-             split a packed result with the companions that describe it, so a packed emit \
-             publishes every level of them"
-        ));
+        if !emitted.contains(companion) {
+            errors.push(format!(
+                "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
+                 {role} '{companion}' is declared as a workflow output but never emitted; a \
+                 declared output no step writes is delivered empty, so a caller would receive the \
+                 packed result and nothing to split it with"
+            ));
+        }
     }
 }
 
@@ -4935,18 +5030,74 @@ fn validate_padded_emit_companions(
     workflow: &WorkflowSpec,
     errors: &mut Vec<String>,
 ) {
+    let emitted = emitted_outputs(workflow);
     for entry in &declared.contract.padding {
-        if workflow.outputs.contains_key(&entry.valid_lengths) {
+        if !workflow.outputs.contains_key(&entry.valid_lengths) {
+            errors.push(format!(
+                "{path} emits '{value}' into output '{output}', which declares padding on \
+                 dimension '{}' whose valid_lengths '{}' is not itself a declared workflow \
+                 output; a caller can only tell a padded result's real entries from its padding \
+                 with the lengths that bound them, so a padded emit publishes them",
+                entry.dimension, entry.valid_lengths
+            ));
             continue;
         }
-        errors.push(format!(
-            "{path} emits '{value}' into output '{output}', which declares padding on dimension \
-             '{}' whose valid_lengths '{}' is not itself a declared workflow output; a caller can \
-             only tell a padded result's real entries from its padding with the lengths that \
-             bound them, so a padded emit publishes them",
-            entry.dimension, entry.valid_lengths
-        ));
+        if !emitted.contains(entry.valid_lengths.as_str()) {
+            errors.push(format!(
+                "{path} emits '{value}' into output '{output}', which declares padding on \
+                 dimension '{}' whose valid_lengths '{}' is declared as a workflow output but \
+                 never emitted; a declared output no step writes is delivered empty, so a caller \
+                 would receive the padded result and no account of its padding",
+                entry.dimension, entry.valid_lengths
+            ));
+        }
     }
+}
+
+/// Outputs some step of the workflow actually writes.
+///
+/// Declaring an output and never emitting into it are different facts, and only
+/// the second one delivers anything. A companion obligation satisfied by the
+/// declaration alone would be satisfied by a package that hands its caller a
+/// ragged payload and an empty vector, which is the failure the obligation
+/// exists to prevent.
+///
+/// This is deliberately the whole workflow rather than the path the payload's
+/// own emit sits on. Whether two emits reach the caller together depends on a
+/// branch predicate, and this crate does not evaluate predicates, so a
+/// path-sensitive rule would either reject correct packages whose companion is
+/// written in a sibling branch or pretend to a precision it does not have.
+/// "Somewhere" is what can be decided soundly from the declared steps, and it
+/// catches the case that actually occurs: a companion declared to satisfy the
+/// contract and then never produced.
+fn emitted_outputs(workflow: &WorkflowSpec) -> BTreeSet<&str> {
+    fn walk<'a>(steps: &'a [crate::schema::WorkflowStep], emitted: &mut BTreeSet<&'a str>) {
+        for step in steps {
+            match step {
+                crate::schema::WorkflowStep::Emit { output, .. } => {
+                    emitted.insert(output.as_str());
+                }
+                crate::schema::WorkflowStep::Sequence { steps } => walk(steps, emitted),
+                crate::schema::WorkflowStep::Loop { setup, steps, .. } => {
+                    walk(setup, emitted);
+                    walk(steps, emitted);
+                }
+                crate::schema::WorkflowStep::Branch { cases, default, .. } => {
+                    for case in cases.values() {
+                        walk(std::slice::from_ref(case), emitted);
+                    }
+                    if let Some(default) = default {
+                        walk(std::slice::from_ref(default), emitted);
+                    }
+                }
+                crate::schema::WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    let mut emitted = BTreeSet::new();
+    walk(&workflow.steps, &mut emitted);
+    emitted
 }
 
 #[allow(clippy::too_many_arguments)]
