@@ -238,8 +238,13 @@ impl Value {
     /// steps and eliminates the per-step host<->device copies that the default
     /// CPU allocator would incur under an accelerator EP. The contents are
     /// uninitialized; callers must ensure unwritten regions are masked out.
-    pub fn empty_in(shape: &[i64], dtype: DataType, allocator: &crate::Allocator) -> Result<Self> {
+    pub fn empty_in(
+        shape: &[i64],
+        dtype: DataType,
+        allocator: &crate::Allocator<'_>,
+    ) -> Result<Self> {
         validate_shape(shape, None)?;
+        let _access = allocator.enter("allocate tensor")?;
         let mut ptr = std::ptr::null_mut();
         let api = crate::error::api()?;
         let create = api
@@ -2375,6 +2380,7 @@ mod cuda_device_write_tests {
     use super::{DataType, Value};
     use crate::{Allocator, Environment, Session, SessionOptions, ep_selection};
     use std::path::Path;
+    use std::sync::Arc;
 
     const TINY_LLM: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2388,15 +2394,17 @@ mod cuda_device_write_tests {
     /// The `Environment` is returned (not dropped here) on purpose: ORT requires
     /// the `OrtEnv` to outlive every `OrtSession`. Releasing the session after
     /// its environment is a use-after-free that crashes with STATUS_ACCESS_VIOLATION
-    /// at `ReleaseSession`. Keeping the env in the returned tuple lets the caller
-    /// release everything in the correct order (value -> allocator -> session ->
-    /// environment).
-    fn cuda_device_allocator() -> Option<(Environment, Session, Allocator, i32)> {
+    /// at `ReleaseSession`.
+    ///
+    /// The session comes back as an `Arc` because the allocator co-owns it:
+    /// that is what guarantees `ReleaseAllocator` precedes `ReleaseSession`
+    /// no matter what order the caller drops the tuple in.
+    fn cuda_device_allocator() -> Option<(Environment, Arc<Session>, Allocator<'static>, i32)> {
         let env = Environment::new("cuda-device-write-test").expect("env");
         let options =
             SessionOptions::with_execution_provider(ep_selection("cuda")).with_intra_op_threads(1);
         let session = match Session::new(&env, Path::new(TINY_LLM), options) {
-            Ok(session) => session,
+            Ok(session) => Arc::new(session),
             Err(error) => {
                 eprintln!("cuda session build failed: {error}");
                 return None;
@@ -2406,7 +2414,7 @@ mod cuda_device_write_tests {
             eprintln!("cuda_device_id() is None (CUDA EP not attached?)");
             return None;
         };
-        match session.device_kv_allocator() {
+        match Session::shared_device_allocator(&session) {
             Ok(Some(allocator)) => Some((env, session, allocator, device_id)),
             Ok(None) => {
                 eprintln!(
@@ -2438,18 +2446,6 @@ mod cuda_device_write_tests {
     /// `OrtEnv` outlive every `OrtSession`; releasing them out of order (e.g.
     /// dropping the environment first) is a use-after-free that crashes with
     /// STATUS_ACCESS_VIOLATION. Dropping in this order releases cleanly.
-    fn release_cuda_resources_in_order(
-        tensor: Value,
-        allocator: Allocator,
-        session: Session,
-        env: Environment,
-    ) {
-        drop(tensor);
-        drop(allocator);
-        drop(session);
-        drop(env);
-    }
-
     #[test]
     #[ignore = "requires a CUDA GPU + CUDA-enabled ONNX Runtime"]
     fn cuda_device_write_prefix_round_trips_through_device_memory() {
@@ -2474,7 +2470,10 @@ mod cuda_device_write_tests {
         assert_eq!(&read_back[..prefix.len()], &prefix);
         assert_eq!(&read_back[prefix.len()..], &[-1_i64, -1]);
 
-        release_cuda_resources_in_order(tensor, allocator, session, env);
+        // Scope-end drops run in reverse declaration order (tensor, allocator,
+        // session, env), and the allocator's `Arc<Session>` makes the
+        // allocator-before-session half of that a guarantee rather than a habit.
+        drop((tensor, allocator, session, env));
     }
 
     #[test]
@@ -2537,7 +2536,7 @@ mod cuda_device_write_tests {
         let read_back = read_device_i64(&mask, capacity);
         assert_eq!(read_back, vec![1, 1, 1, 1, 1, 0, 0, 0]);
 
-        release_cuda_resources_in_order(mask, allocator, session, env);
+        drop((mask, allocator, session, env));
     }
 }
 

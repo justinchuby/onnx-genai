@@ -80,7 +80,7 @@ struct Eagle3KvPair {
 /// Stateful runner for one EAGLE-3 draft-head forward at a time.
 pub struct Eagle3DecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: Eagle3HeadSignature,
     mode: Eagle3DraftKvMode,
     batch_size: i64,

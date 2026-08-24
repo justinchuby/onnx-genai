@@ -176,7 +176,7 @@ pub(crate) struct WorkflowRuntime {
     device_bridge_components: HashSet<String>,
     component_bindings:
         RefCell<HashMap<workflow::ComponentBindingKey, workflow::StableComponentBinding>>,
-    component_allocators: RefCell<HashMap<String, Arc<onnx_genai_ort::Allocator>>>,
+    component_allocators: RefCell<HashMap<String, Arc<onnx_genai_ort::Allocator<'static>>>>,
     component_outputs: RefCell<HashMap<workflow::ComponentOutputKey, Arc<onnx_genai_ort::Value>>>,
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
@@ -267,6 +267,14 @@ pub(crate) struct WorkflowRuntime {
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
+/// Release ORT state that outranks its owner's field order.
+///
+/// Bindings and session-derived allocators now co-own their `Arc<Session>`, so
+/// they can no longer outlive the session whatever order the fields drop in.
+/// A `Value` cannot: it is a bare `OrtValue` handle with no back-reference to
+/// the allocator whose memory it holds, so ORT still requires every value to be
+/// released before that allocator. Nothing in the type system says so, which is
+/// exactly why it is done here explicitly instead of left to the field list.
 impl Drop for WorkflowRuntime {
     fn drop(&mut self) {
         for island in &mut self.execution_islands {

@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -71,12 +72,20 @@ pub(crate) struct ExecutionIsland {
     shared_buffer_inputs: HashMap<String, String>,
     immutable_inputs: HashSet<String>,
     fallback: WorkflowNode,
-    session: Session,
+    /// The island's ORT session, co-owned with everything derived from it.
+    ///
+    /// ORT frees an `IoBinding`'s bound state and a `CreateAllocator`
+    /// allocator's memory through the session that produced them, so
+    /// `ReleaseSession` must come last. Field declaration order alone cannot
+    /// promise that — it silently reverses the moment a field is moved during a
+    /// refactor — so `bindings` and `device_allocator` below each hold their own
+    /// `Arc<Session>` and the refcount, not the field list, decides.
+    session: Arc<Session>,
     capture_eligible: bool,
     capture_disabled: Cell<bool>,
     device: String,
     bindings: RefCell<HashMap<IslandBindingKey, StableIslandBinding>>,
-    device_allocator: Option<Allocator>,
+    device_allocator: Option<Allocator<'static>>,
     linked_node_count: usize,
     external_initializer_bytes: u64,
     initializer_bytes: u64,
@@ -106,7 +115,8 @@ pub(crate) struct ExecutionIsland {
 }
 
 struct StableIslandBinding {
-    binding: IoBinding,
+    /// Co-owns the session it was created from (see [`ExecutionIsland::session`]).
+    binding: IoBinding<'static>,
     inputs: Vec<(String, Value)>,
     outputs: Vec<(String, Value)>,
     captured: bool,
@@ -454,7 +464,7 @@ impl ExecutionIsland {
                     self.id
                 )
             })?;
-            let mut binding = IoBinding::new(&self.session)?;
+            let mut binding = IoBinding::for_shared_session(Arc::clone(&self.session))?;
             let mut stable_inputs = Vec::new();
             for (name, source) in &resolved {
                 let stable = if source.numel() == 0 {
@@ -593,7 +603,7 @@ impl ExecutionIsland {
         self.eager_runs.set(self.eager_runs.get() + 1);
         self.session_runs.set(self.session_runs.get() + 1);
         let produced = self.session.run(&resolved)?;
-        let mut binding = IoBinding::new(&self.session)?;
+        let mut binding = IoBinding::for_shared_session(Arc::clone(&self.session))?;
         let mut stable_inputs = Vec::new();
         for (name, source) in &resolved {
             let stable =
@@ -1497,9 +1507,11 @@ fn build_execution_island(
         }
         Err(error) => return Err(error.into()),
     };
+    // The allocator co-owns the session so it cannot outlive it, whatever the
+    // island's field order ends up being.
+    let session = Arc::new(session);
     let device_allocator = if device.starts_with("cuda:") {
-        session
-            .device_allocator()
+        Session::shared_device_allocator(&session)
             .with_context(|| format!("execution island {id} could not acquire CUDA allocator"))?
     } else {
         None
