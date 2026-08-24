@@ -319,6 +319,14 @@ required 检查全绿;唯一变红的是 advisory 的 `CLI ORT`。当时
   `cargo test`/`cargo llvm-cov`,不认 `cargo build` 与 `cargo clippy --all-targets`
   ——后两者会编译同一批测试目标却不执行任何断言。
 
+该门判断的是"这条命令**会不会真的跑**",而不只是"文件里有没有这条命令"。
+所以它不认以下几种写法:带 `if:`(除 `success()`/`always()` 等恒真形式外)的
+步骤——它可能被跳过;带 `continue-on-error: true` 的步骤或 job——它可以红着而
+检查照样报绿,跑了也拦不住合并。无法判定的表达式一律**不计入**并在 stderr 点名,
+即只会让门更严格。三处曾经的漏判(引号/尾注释的 job key、`if:`、
+`continue-on-error`)都属于同一类:门读的是 workflow 的**文本**,而不是 GitHub
+真正会**执行**的东西。
+
 两个门都属于"看不见东西就通过"的那一类,所以
 `workspace_test_packages.py self-test` 会要求它们按需失败,并且**核对它们点名
 的包,而不是只看退出码**:`python` 不存在时退出 127,而该脚本里每个
