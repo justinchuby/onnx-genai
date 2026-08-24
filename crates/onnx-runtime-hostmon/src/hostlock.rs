@@ -405,6 +405,13 @@ pub fn field(before: &LockState, after: &LockState, self_owner: Option<&str>) ->
         LockState::Stale(holder) => LockField::Stale(holder.owner.clone()),
         LockState::Unverified(holder) => LockField::Unverified(holder.owner.clone()),
         LockState::Held(holder) => match self_owner.map(str::trim) {
+            // An empty name on either side is the absence of an attribution,
+            // not an attribution to nobody. Without this guard a holder whose
+            // owner is blank and a `HOSTLOCK_OWNER` that is blank compare equal
+            // and certify the row -- two unnamed parties matching each other.
+            Some(mine) if mine.is_empty() || holder.owner_raw.is_empty() => {
+                LockField::Foreign(holder.owner.clone())
+            }
             Some(mine) if mine == holder.owner_raw => LockField::Mine(holder.owner.clone()),
             Some(_) => LockField::Foreign(holder.owner.clone()),
             None => LockField::Held(holder.owner.clone()),
@@ -413,6 +420,15 @@ pub fn field(before: &LockState, after: &LockState, self_owner: Option<&str>) ->
 }
 
 /// [`field`], with `HOSTLOCK_OWNER` read from the environment.
+///
+/// There is deliberately **no fallback to `$USER`**, even though
+/// `hostlock.sh`'s `--owner` has one. Every agent on this host runs as the same
+/// user, so `$USER` cannot distinguish one declaration from another, and
+/// defaulting to it would report `mine:` for a co-tenant's lock -- the one
+/// direction this module exists to prevent. Note also that `hostlock.sh run`
+/// does not export `--owner`, so passing the flag alone leaves a child unable
+/// to recognise its own parent's lock; that reports [`Held`](LockField::Held),
+/// which is unattributed and unprotected, and is the honest answer.
 pub fn field_from_env(before: &LockState, after: &LockState) -> LockField {
     let owner = std::env::var("HOSTLOCK_OWNER").ok();
     field(before, after, owner.as_deref())
@@ -706,6 +722,23 @@ mod tests {
             "truncation must not make two distinct owners the same owner"
         );
         assert!(field(&state, &state, Some(&long)).is_protected());
+    }
+
+    /// Every agent on this host runs as the same user, so a `$USER` fallback
+    /// would hand one agent another's declaration. Absent attribution has to
+    /// stay absent.
+    #[test]
+    fn an_absent_owner_is_never_filled_in_from_somewhere_else() {
+        let f = field(&held("roy"), &held("roy"), None);
+        assert!(!f.is_protected());
+        assert_eq!(f, LockField::Held("roy".into()));
+        // An empty or whitespace-only HOSTLOCK_OWNER is not an attribution
+        // either, and must not match a holder whose owner sanitises to "?".
+        let blank = LockState::Held(parse_meta(&meta("   ", "1")).expect("present"));
+        assert!(
+            !field(&blank, &blank, Some("   ")).is_protected(),
+            "two unnamed parties are not the same party"
+        );
     }
 
     /// A non-numeric anchor must not fall back to a PID that happens to exist.
