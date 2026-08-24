@@ -2551,7 +2551,9 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .try_acquire_owned()
         .unwrap();
     driver
-        .commands
+        .workers
+        .primary_sender()
+        .expect("driver worker is running")
         .send(DriverCommand::Generate {
             input: None,
             session_id: None,

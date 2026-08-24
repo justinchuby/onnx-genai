@@ -12,8 +12,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
 };
 use onnx_genai::{
-    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, SessionId,
-    StopSequence,
+    FinishReason, GenerateOptions, GeneratePrompt, GenerateRequest, GenerateResult, StopSequence,
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
@@ -48,6 +47,7 @@ use crate::{
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
         ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
+    worker::SessionPlacement,
 };
 
 mod admin;
@@ -694,7 +694,7 @@ fn audio_decoder_prompt(
 
 async fn close_evicted_session(
     engine: &EngineDriver,
-    evicted: Option<SessionId>,
+    evicted: Option<SessionPlacement>,
 ) -> Result<(), ApiError> {
     if let Some(evicted) = evicted {
         engine
