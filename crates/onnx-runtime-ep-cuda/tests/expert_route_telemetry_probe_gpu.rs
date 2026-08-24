@@ -106,103 +106,11 @@ fn print_platform_conditions() {
 
 const MODULE: &str = "expert_route_telemetry_probe";
 
-// Header word indices (u32 each), device-resident. request/device/epoch fit in
-// u32 for the probe; the design specifies u64 epoch/request in production.
-const H_EPOCH: usize = 0;
-const H_REQUEST: usize = 1;
-const H_DEVICE: usize = 2;
-const H_OVERFLOW: usize = 3;
-const H_POISON: usize = 4;
-const H_COUNT: usize = 5;
-const HEADER_LEN: usize = 6;
-
-fn words_for(num_experts: i32) -> usize {
-    (num_experts as usize).div_ceil(32)
-}
-
-// ---------------------------------------------------------------------------
-// CPU oracle (§7). Pure Rust, no GPU. The ground truth for every device test.
-// ---------------------------------------------------------------------------
-
-/// Reference bitmap: bit `e` set iff expert `e` is routed at least once. Returns
-/// `(bitmap_words, poison)` where poison is true iff any id is out of range.
-fn cpu_bitmap(routes: &[i32], num_experts: i32) -> (Vec<u32>, bool) {
-    let mut bits = vec![0u32; words_for(num_experts)];
-    let mut poison = false;
-    for &e in routes {
-        if e < 0 || e >= num_experts {
-            poison = true;
-            continue;
-        }
-        let e = e as usize;
-        bits[e >> 5] |= 1u32 << (e & 31);
-    }
-    (bits, poison)
-}
-
-/// Reference dedup: the distinct routed set (in first-seen order) and whether it
-/// would overflow a queue of `capacity`.
-fn cpu_dedup(routes: &[i32], num_experts: i32, capacity: usize) -> (Vec<i32>, bool, bool) {
-    let mut seen = HashSet::new();
-    let mut distinct = Vec::new();
-    let mut poison = false;
-    for &e in routes {
-        if e < 0 || e >= num_experts {
-            poison = true;
-            continue;
-        }
-        if seen.insert(e) {
-            distinct.push(e);
-        }
-    }
-    let overflow = distinct.len() > capacity;
-    (distinct, overflow, poison)
-}
-
-/// The §3 boundary consumer/validator. Runs on the host, at a safe boundary,
-/// against a record already copied back. Any failure → whole-bank (fail closed).
-#[derive(Debug, PartialEq, Eq)]
-enum Decision {
-    /// Trustworthy: the hot-set is the routed bitmap words.
-    HotSet(Vec<u32>),
-    /// Fail closed to the whole-bank proof, carrying the reason (design §3 /
-    /// design-discipline "carry the reason").
-    WholeBank(String),
-}
-
-fn consume_and_validate(
-    header: &[u32],
-    bitmap: &[u32],
-    expected_epoch: u32,
-    expected_request: u32,
-    expected_device: u32,
-) -> Decision {
-    if header[H_POISON] != 0 {
-        return Decision::WholeBank("poison: out-of-range expert id observed".into());
-    }
-    if header[H_OVERFLOW] != 0 {
-        return Decision::WholeBank("overflow: distinct routes exceeded queue capacity".into());
-    }
-    if header[H_DEVICE] != expected_device {
-        return Decision::WholeBank(format!(
-            "device mismatch: record dev={} expected {expected_device}",
-            header[H_DEVICE]
-        ));
-    }
-    if header[H_REQUEST] != expected_request {
-        return Decision::WholeBank(format!(
-            "request mismatch: record req={} expected {expected_request}",
-            header[H_REQUEST]
-        ));
-    }
-    if header[H_EPOCH] < expected_epoch {
-        return Decision::WholeBank(format!(
-            "stale epoch: record epoch={} < boundary epoch {expected_epoch}",
-            header[H_EPOCH]
-        ));
-    }
-    Decision::HotSet(bitmap.to_vec())
-}
+mod expert_route_oracle;
+use expert_route_oracle::{
+    Decision, H_COUNT, H_EPOCH, H_OVERFLOW, H_POISON, HEADER_LEN, consume_and_validate, cpu_bitmap,
+    cpu_dedup, synth_routes, words_for,
+};
 
 // ---------------------------------------------------------------------------
 // Device kernels (NVRTC). Only integer atomics — no fp16 headers needed.
@@ -406,94 +314,9 @@ fn produce_record(
     (bitmap_h, header_h, queue_h)
 }
 
-/// A deterministic decode-shaped route vector: `rows` tokens × `top_k` experts,
-/// values drawn with a cheap LCG, per row distinct (like a real router row).
-fn synth_routes(rows: usize, top_k: usize, num_experts: i32, seed: u64) -> Vec<i32> {
-    let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
-    let mut out = Vec::with_capacity(rows * top_k);
-    for _ in 0..rows {
-        let mut picked = HashSet::new();
-        while picked.len() < top_k.min(num_experts as usize) {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            let e = ((state >> 33) as i32).rem_euclid(num_experts);
-            picked.insert(e);
-        }
-        out.extend(picked);
-    }
-    out
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
-
-/// CPU-only: the oracle and the boundary validator are self-consistent. Runs
-/// without a GPU so the reference cannot silently rot.
-#[test]
-fn cpu_oracle_and_validator_self_consistent() {
-    let num_experts = 256;
-    let routes = synth_routes(1, 8, num_experts, 42);
-    let (bits, poison) = cpu_bitmap(&routes, num_experts);
-    assert!(!poison);
-    let set_from_bits: HashSet<i32> = (0..num_experts)
-        .filter(|&e| bits[e as usize >> 5] & (1 << (e & 31)) != 0)
-        .collect();
-    let (distinct, overflow, poison2) = cpu_dedup(&routes, num_experts, num_experts as usize);
-    assert!(!overflow && !poison2);
-    let distinct_set: HashSet<i32> = distinct.iter().copied().collect();
-    assert_eq!(
-        set_from_bits, distinct_set,
-        "bitmap and dedup must agree on the set"
-    );
-
-    // Validator: clean record accepts; each defect fails closed.
-    let mut header = vec![0u32; HEADER_LEN];
-    header[H_EPOCH] = 5;
-    header[H_REQUEST] = 7;
-    header[H_DEVICE] = 3;
-    assert!(matches!(
-        consume_and_validate(&header, &bits, 5, 7, 3),
-        Decision::HotSet(_)
-    ));
-    for (idx, val, label) in [(H_POISON, 1, "poison"), (H_OVERFLOW, 1, "overflow")] {
-        let mut bad = header.clone();
-        bad[idx] = val;
-        assert!(
-            matches!(
-                consume_and_validate(&bad, &bits, 5, 7, 3),
-                Decision::WholeBank(_)
-            ),
-            "{label} must fail closed"
-        );
-    }
-    assert!(
-        matches!(
-            consume_and_validate(&header, &bits, 5, 999, 3),
-            Decision::WholeBank(_)
-        ),
-        "request mismatch"
-    );
-    assert!(
-        matches!(
-            consume_and_validate(&header, &bits, 5, 7, 999),
-            Decision::WholeBank(_)
-        ),
-        "device mismatch"
-    );
-    assert!(
-        matches!(
-            consume_and_validate(&header, &bits, 6, 7, 3),
-            Decision::WholeBank(_)
-        ),
-        "stale epoch"
-    );
-    println!(
-        "cpu_oracle_and_validator_self_consistent: OK ({} distinct experts)",
-        distinct.len()
-    );
-}
 
 #[test]
 #[ignore = "requires an idle GPU; run with --features gpu-tests -- --ignored"]
