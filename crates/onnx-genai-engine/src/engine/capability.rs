@@ -43,9 +43,9 @@ pub enum PackageCapabilityError {
     /// exclusive. Running both would let one read a conversation the other is
     /// about to replace.
     #[error(
-        "session {session} already has a turn in flight, and its workflow declares the \
-         conversation an exclusive lease; run the turns one after another so neither reads a \
-         conversation the other is about to replace"
+        "session {session} already has a turn in flight, and this package's session state is \
+         held exclusively; run the turns one after another so neither reads a conversation the \
+         other is about to replace"
     )]
     ExclusiveLeaseConflict {
         /// The session whose exclusive lease is already held.
@@ -70,17 +70,4 @@ pub fn package_capability_error(error: &anyhow::Error) -> Option<PackageCapabili
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<PackageCapabilityError>().cloned())
-}
-
-/// What a session already holds in front of the next turn's prompt.
-///
-/// `attended` contributes to context admission and usage. `reprefilled`
-/// contributes to work metrics. They differ for an ORT decode core, whose
-/// retained sequence is attended from KV without being recomputed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SessionPrefillCarry {
-    /// Tokens the model holds in front of this turn's prompt.
-    pub attended: usize,
-    /// Of those tokens, how many this turn will prefill again.
-    pub reprefilled: usize,
 }

@@ -1355,8 +1355,19 @@ impl<'a> WorkflowExecutionPlan<'a> {
         // package the ability to answer one question.
         let session_state = onnx_genai_metadata::classify_session_state(workflow);
         // Taken before the lease is read and released when the pass ends,
-        // whichever way it ends.
-        let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
+        // whichever way it ends — and only for a package that declares the
+        // conversation exclusive. `copy_on_write` says concurrent turns are
+        // legal, and refusing one anyway would enforce a policy the document did
+        // not state while claiming it had.
+        let exclusive = self.session_id.is_some()
+            && session_state.carried().any(|(cell, _)| {
+                workflow.state.get(cell).is_some_and(|state| {
+                    state.session.as_ref().is_none_or(|lease| {
+                        lease.policy == onnx_genai_metadata::SessionMutationPolicy::Exclusive
+                    })
+                })
+            });
+        let _session_lease = match (self.session_id.as_deref(), exclusive) {
             (Some(session_id), true) => {
                 match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
                     Ok(guard) => Some(guard),

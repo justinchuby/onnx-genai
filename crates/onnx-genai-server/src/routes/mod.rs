@@ -17,8 +17,8 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     DryConfig, EmbeddingOptions, EngineGovernorError, GenerateConstraint, GovernorSnapshot,
-    MirostatConfig, MirostatVersion, ResourceLimit, SamplingOverrides, TokenLogprob, XtcConfig,
-    parse_resource_limit,
+    MirostatConfig, MirostatVersion, PackageCapabilityError, ResourceLimit, SamplingOverrides,
+    TokenLogprob, XtcConfig, parse_resource_limit,
 };
 use onnx_genai_metadata::GenerationDefaults;
 use onnx_genai_ort::{ChatMessage as TemplateChatMessage, ChatTemplate, Tokenizer};
@@ -528,17 +528,23 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // and the caller can shorten; a busy session is a conflict that the same
         // request succeeds at once the turn in flight finishes. Both are read
         // off the engine's own type, so neither status depends on wording.
-        DriverFailureKind::PackageCapability(capability) => {
-            if capability.is_retryable() {
-                // An exclusive lease already held: the same request succeeds
-                // once the turn in flight finishes.
-                ApiError::conflict(capability.to_string())
-            } else {
-                // A conversation past the bound its package declares: the
-                // caller shortens the turn or starts a new session.
+        // Matched per variant rather than through a boolean, so a variant added
+        // later has to state its own status instead of defaulting to one.
+        DriverFailureKind::PackageCapability(capability) => match capability {
+            // A package that will never serve this: a conflict between the
+            // request and what is loaded, and the same answer on every path.
+            PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
+            // A conversation past the bound its package declares: the caller
+            // shortens the turn or starts a new session.
+            PackageCapabilityError::ConversationOverBound { .. } => {
                 ApiError::invalid_request(capability.to_string())
             }
-        }
+            // An exclusive lease already held: the same request succeeds once
+            // the turn in flight finishes.
+            PackageCapabilityError::ExclusiveLeaseConflict { .. } => {
+                ApiError::conflict(capability.to_string())
+            }
+        },
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }

@@ -1061,6 +1061,9 @@ impl WorkflowRuntime {
         self.workflow_session_state
             .borrow()
             .get(&(session_id.to_string(), cell.to_string()))
+            // A cell whose value cannot be read as tokens is reported as
+            // holding none, and the pass that tries to use it says so by name.
+            // Both readers agree that an unreadable lease carries nothing.
             .and_then(|value| value.to_vec_i64().ok())
             .map(|tokens| tokens.len())
             .unwrap_or(0)

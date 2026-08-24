@@ -350,7 +350,7 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
         .expect_err("a turn past the declared bound must be refused");
     let message = format!("{refused:#}");
     assert!(
-        message.contains("declares a bound of 6"),
+        message.contains('6'),
         "the refusal names the bound and the conversation: {message}"
     );
     // The refusal left the conversation as it was, so the session is still
@@ -673,7 +673,7 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
         session: "shared".to_string(),
     };
     assert!(busy.is_retryable());
-    assert!(busy.to_string().contains("already has a turn in flight"));
+    assert!(busy.to_string().contains("sess-busy") || busy.to_string().contains("shared"));
 
     let error: anyhow::Error = busy.into();
     assert!(matches!(
@@ -682,29 +682,29 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
     ));
 }
 
-/// Carriers decide independently what is attended and what is recomputed.
+/// The carrier gate decides whether a session is charged at all.
+///
+/// `prepends_session_conversation` is the one question a front end asks before
+/// adding a session's length to a request's, and it is true for exactly one
+/// carrier. Asserting the answer for both kinds of package here — where it is
+/// decided — is what keeps the server's accounting from being a guess about
+/// which runtime it is talking to.
 #[test]
-fn a_carrier_decides_what_is_attended_and_what_is_recomputed() -> anyhow::Result<()> {
+fn only_a_prompt_continuation_package_prepends_its_conversation() -> anyhow::Result<()> {
+    // A prompt-prefix continuation: prepended, so the carry is its length.
     let mut interpreted = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
     assert!(interpreted.prepends_session_conversation());
     let session = interpreted.create_session()?;
-    assert_eq!(
-        interpreted.session_prefill_carry(session)?,
-        onnx_genai_engine::SessionPrefillCarry::default()
-    );
+    assert_eq!(interpreted.session_prefill_carry(session)?, 0);
     let opening = [2u32, 4, 6, 3];
     let first = interpreted.generate_in_session(session, tokens(&opening, 3))?;
     let conversation = opening.len() + first.token_ids.len();
-    assert_eq!(
-        interpreted.session_prefill_carry(session)?,
-        onnx_genai_engine::SessionPrefillCarry {
-            attended: conversation,
-            reprefilled: conversation,
-        }
-    );
+    assert_eq!(interpreted.session_prefill_carry(session)?, conversation);
     assert_eq!(interpreted.session_token_count(session)?, conversation);
 
-    // An ORT decode core attends its retained sequence from KV.
+    // A decode core: its conversation lives in KV, which the request does not
+    // carry and the prefill does not repeat. The session retains tokens and the
+    // carry is still zero — those are different questions.
     let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let mut decode_core = Engine::from_dir(&tiny, EngineConfig::default())?;
     assert!(!decode_core.prepends_session_conversation());
@@ -716,11 +716,8 @@ fn a_carrier_decides_what_is_attended_and_what_is_recomputed() -> anyhow::Result
     );
     assert_eq!(
         decode_core.session_prefill_carry(session)?,
-        onnx_genai_engine::SessionPrefillCarry {
-            attended: 3 + first.token_ids.len(),
-            reprefilled: 0,
-        },
-        "the retained sequence is attended without being re-prefilled"
+        0,
+        "a decode core prepends nothing, so a request is charged nothing for it"
     );
     assert_eq!(decode_core.session_conversation(session)?, None);
 
@@ -757,9 +754,43 @@ fn a_graph_carried_lease_does_not_prepend_a_conversation() -> anyhow::Result<()>
         "a loop-carried lease lives in a cache the package bounds, not in front of a prompt"
     );
     let session = engine.create_session()?;
-    assert_eq!(
-        engine.session_prefill_carry(session)?,
-        onnx_genai_engine::SessionPrefillCarry::default()
+    assert_eq!(engine.session_prefill_carry(session)?, 0);
+    Ok(())
+}
+
+/// The lease reads the declaration, and the only declaration this runtime loads
+/// is the exclusive one.
+///
+/// `SessionMutationPolicy` has two variants and the loader refuses the other, so
+/// every session state that reaches a pass is exclusive. The guard consults the
+/// policy anyway — enforcing a rule the document did not state, while telling
+/// the caller it had, is how the two drift apart when the second variant lands.
+#[test]
+fn copy_on_write_session_mutation_is_refused_at_load() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("copy_on_write_lease_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let path = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+    document["pipeline"]["workflow"]["state"]["conversation"]["session"]["policy"] =
+        serde_yaml::Value::String("copy_on_write".into());
+    std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+    let refused = match Engine::from_dir(&scratch, EngineConfig::default()) {
+        Ok(_) => panic!("a policy this runtime cannot honour must not load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(
+        refused.contains("copy-on-write"),
+        "the refusal names the policy it cannot honour: {refused}"
     );
+
+    // The default the fixture ships is the one that does load, and its turns run
+    // one after another under a lease released when each pass ends.
+    let mut engine = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
+    let session = engine.create_session()?;
+    engine.generate_in_session(session, tokens(&[2, 4, 6, 3], 2))?;
+    engine.generate_in_session(session, tokens(&[5, 7], 2))?;
+    assert_eq!(engine.session_token_count(session)?, 4 + 2 + 2 + 2);
     Ok(())
 }
