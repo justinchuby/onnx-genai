@@ -5939,7 +5939,7 @@ pub(crate) struct WorkflowLoopPlan<'n> {
     pub(crate) continue_when: &'n str,
     pub(crate) max_iterations: &'n str,
     pub(crate) termination: &'n onnx_genai_metadata::WorkflowLoopTermination,
-    pub(crate) iteration: &'n Option<onnx_genai_metadata::WorkflowLoopIteration>,
+    pub(crate) iteration: &'n Option<Box<onnx_genai_metadata::WorkflowLoopIteration>>,
     pub(crate) carried: &'n [onnx_genai_metadata::WorkflowLoopCarry],
 }
 

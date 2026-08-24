@@ -1120,10 +1120,15 @@ fn every_row_scoped_carrier_survives_batch_compaction() {
             offsets,
             owner,
             axis,
+            owner_span,
         } => {
             assert_eq!(offsets, "image_offsets");
             assert_eq!(owner, "image_owner");
             assert_eq!(*axis, 0);
+            assert_eq!(
+                owner_span, &None,
+                "a packing with no enclosing span owns straight into request rows"
+            );
         }
         other => panic!("packed encoder value must declare its owner mapping: {other:?}"),
     }

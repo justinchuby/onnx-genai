@@ -46,7 +46,7 @@ pipeline:
           rank: 4
           shape: [batch, max_tiles, height, width]
           batch_layout: { kind: request_aligned, axis: 0 }
-          pad_mask: pixel_mask
+          pad_mask: { value: pixel_mask, axis: 1 }
         role: { kind: opaque }
         source: { kind: application, name: pixel_values }
       pixel_mask:
@@ -73,7 +73,7 @@ pipeline:
               rank: 4
               shape: [batch, max_tiles, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
-              pad_mask: mask
+              pad_mask: { value: mask, axis: 1 }
             mask: { dtype: bool, rank: 2, shape: [batch, max_tiles], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             embeddings: { dtype: float32, rank: 3, shape: [batch, max_tiles, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -226,10 +226,13 @@ fn a_padded_encoder_declares_its_capacity_and_its_mask() {
             uniform_axes: vec![2, 3],
         })
     );
-    assert_eq!(
-        workflow.inputs["pixel_values"].contract.pad_mask.as_deref(),
-        Some("pixel_mask")
-    );
+    let mask = workflow.inputs["pixel_values"]
+        .contract
+        .pad_mask
+        .as_ref()
+        .expect("the padded input names its mask");
+    assert_eq!(mask.value, "pixel_mask");
+    assert_eq!(mask.axis, 1);
 
     let round_trip =
         serde_yaml::to_string(&workflow.components["vision"]).expect("component serializes");
@@ -360,7 +363,10 @@ fn a_packed_value_cannot_pack_on_an_axis_it_does_not_have() {
 
 #[test]
 fn a_pad_mask_must_name_a_declared_value() {
-    let document = PADDED_VISION_ENCODER.replace("pad_mask: pixel_mask", "pad_mask: tile_mask");
+    let document = PADDED_VISION_ENCODER.replace(
+        "pad_mask: { value: pixel_mask, axis: 1 }",
+        "pad_mask: { value: tile_mask, axis: 1 }",
+    );
     assert_reports(
         &document,
         "pad_mask references 'tile_mask', which this workflow does not declare",
@@ -397,7 +403,7 @@ fn a_pad_mask_moves_with_the_rows_it_describes() {
 fn a_packed_value_has_no_padding_to_mask() {
     let document = PACKED_VISION_ENCODER.replace(
         "          batch_layout: { kind: token_packed, offsets: image_offsets, owner: image_owner, axis: 0 }\n        role: { kind: opaque }\n        source: { kind: application, name: image_pixels }",
-        "          batch_layout: { kind: token_packed, offsets: image_offsets, owner: image_owner, axis: 0 }\n          pad_mask: image_owner\n        role: { kind: opaque }\n        source: { kind: application, name: image_pixels }",
+        "          batch_layout: { kind: token_packed, offsets: image_offsets, owner: image_owner, axis: 0 }\n          pad_mask: { value: image_owner, axis: 0 }\n        role: { kind: opaque }\n        source: { kind: application, name: image_pixels }",
     );
     assert_reports(
         &document,
@@ -413,7 +419,7 @@ fn a_capacity_batches_the_axis_its_ports_batch() {
     );
     assert_reports(
         &document,
-        "workflow component 'vision' input port 'mask' batches on axis 0 but the component \
+        "workflow component 'vision' input port 'mask' batches rows on axis 0, but the component \
          declares batch_capacity axis 1",
     );
 }
@@ -568,10 +574,13 @@ fn a_contract_without_a_pad_mask_stays_free_of_one() {
         contract
     );
 
-    let masked: TensorContract =
-        serde_yaml::from_str("dtype: float32\nrank: 2\npad_mask: valid_entries\n")
-            .expect("masked contract parses");
-    assert_eq!(masked.pad_mask.as_deref(), Some("valid_entries"));
+    let masked: TensorContract = serde_yaml::from_str(
+        "dtype: float32\nrank: 2\npad_mask: { value: valid_entries, axis: 1 }\n",
+    )
+    .expect("masked contract parses");
+    let mask = masked.pad_mask.expect("the masked contract keeps its mask");
+    assert_eq!(mask.value, "valid_entries");
+    assert_eq!(mask.axis, 1);
 }
 
 /// Every packing role a pixel program can emit, at each granularity a packed
@@ -625,7 +634,9 @@ fn pixel_programs_can_emit_the_offsets_and_owner_of_a_packed_batch() {
 /// most `frames` frames, and `video.frame_mask` says which of those frames are
 /// real rather than sampled-out or padded. The declaration is the same one a
 /// still-image encoder makes — a temporal axis is an axis, and the mask that
-/// describes it is an ordinary pad mask.
+/// describes it is an ordinary pad mask. Its capacity requires uniformity on the
+/// temporal axis and on both spatial axes, which is one list, not two kinds of
+/// rule.
 const PADDED_VIDEO_ENCODER: &str = r#"
 schema_version: v1
 preprocessing:
@@ -666,7 +677,7 @@ preprocessing:
           rank: 5
           shape: [batch, frames, channels, height, width]
           batch_layout: { kind: request_aligned, axis: 0 }
-          pad_mask: video.frame_mask
+          pad_mask: { value: video.frame_mask, axis: 1 }
       - name: video.frame_mask
         source: video.frame_validity
         content: validity_mask
@@ -703,11 +714,11 @@ pipeline:
               rank: 5
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
-              pad_mask: video.frame_mask
+              pad_mask: { value: video.frame_mask, axis: 1 }
             frame_mask: { dtype: bool, rank: 2, shape: [batch, frames], batch_layout: { kind: request_aligned, axis: 0 } }
       video_encoder:
         implementation: { kind: onnx, artifact: video_encoder.onnx }
-        batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [3, 4] }
+        batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [1, 3, 4] }
         ports:
           inputs:
             frames:
@@ -715,7 +726,7 @@ pipeline:
               rank: 5
               shape: [batch, frames, channels, height, width]
               batch_layout: { kind: request_aligned, axis: 0 }
-              pad_mask: mask
+              pad_mask: { value: mask, axis: 1 }
             mask: { dtype: bool, rank: 2, shape: [batch, frames], batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             embeddings: { dtype: float32, rank: 3, shape: [batch, video_tokens, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -922,13 +933,15 @@ fn a_clip_pads_in_time_and_names_the_mask_that_says_which_frames_are_real() {
     // it is named by the padded value's own contract.
     let pixels = &program.outputs[0];
     assert_eq!(pixels.content, "pixels");
-    assert_eq!(
-        pixels
-            .contract
-            .as_ref()
-            .and_then(|contract| contract.pad_mask.as_deref()),
-        Some("video.frame_mask")
-    );
+    let frame_mask = pixels
+        .contract
+        .as_ref()
+        .and_then(|contract| contract.pad_mask.as_ref())
+        .expect("the padded clip names its temporal mask");
+    assert_eq!(frame_mask.value, "video.frame_mask");
+    // Axis 1 of [batch, frames, channels, height, width]: the mask marks frames,
+    // not the spatial extents the final axes carry.
+    assert_eq!(frame_mask.axis, 1);
     assert_eq!(
         metadata
             .pipeline
@@ -940,7 +953,7 @@ fn a_clip_pads_in_time_and_names_the_mask_that_says_which_frames_are_real() {
         Some(ComponentBatchCapacity {
             axis: 0,
             max_rows: Some(4),
-            uniform_axes: vec![3, 4],
+            uniform_axes: vec![1, 3, 4],
         })
     );
 }
@@ -1063,5 +1076,386 @@ fn a_frame_owner_map_belongs_to_the_frame_packing_it_names() {
         &document,
         "token_packed owner map 'video.item_owner' is packed against offsets \
          'video.item_offsets', not the 'video.frame_offsets' this value is packed against",
+    );
+}
+
+/// Clips packed into request rows, and frames packed into those clips: the same
+/// `token_packed` contract at two levels, composed by naming the coarser packing
+/// as the span the finer one's owner indices point into.
+///
+/// `video.clip_offsets` is request-aligned — one prefix offset per row — so
+/// `video.clip_owner` maps clips back to requests. `video.frame_offsets` holds
+/// one prefix offset per *clip*, which is why it is itself packed the way clips
+/// are, and `video.frame_owner` names `video.clip_owner` as the span it owns
+/// into. Two hops resolve a frame to the request that asked for it, and the
+/// document says so rather than leaving the reading to a convention.
+const NESTED_VIDEO_ENCODER: &str = r#"
+schema_version: v1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      video.frames:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [frames, channels, height, width]
+          batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner }
+        role: { kind: opaque }
+        source: { kind: application, name: video_frames }
+      video.clip_offsets:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: clip_offsets }
+      video.clip_owner:
+        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: clip_owner }
+      video.frame_offsets:
+        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: frame_offsets }
+      video.frame_owner:
+        contract: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner } }
+        role: { kind: opaque }
+        source: { kind: application, name: frame_owner }
+      prompt:
+        contract: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: prompt }
+    outputs:
+      tokens:
+        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: tokens
+        stage: pre_adapter
+    components:
+      video_encoder:
+        implementation: { kind: onnx, artifact: video_encoder.onnx }
+        batch_capacity: { axis: 0, uniform_axes: [2, 3] }
+        ports:
+          inputs:
+            frames:
+              dtype: float32
+              rank: 4
+              shape: [frames, channels, height, width]
+              batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner }
+          outputs:
+            features:
+              dtype: float32
+              rank: 2
+              shape: [frames, hidden]
+              batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner }
+      splice:
+        implementation: { kind: onnx, artifact: splice.onnx }
+        ports:
+          inputs:
+            prompt: { dtype: int64, rank: 2, shape: [batch, sequence], batch_layout: { kind: request_aligned, axis: 0 } }
+            features:
+              dtype: float32
+              rank: 2
+              shape: [frames, hidden]
+              batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner }
+          outputs:
+            token: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }
+    steps:
+      - kind: invoke
+        component: video_encoder
+        inputs: { frames: video.frames }
+        outputs: { features: video.features }
+      - kind: invoke
+        component: splice
+        inputs: { prompt: prompt, features: video.features }
+        outputs: { token: raw }
+      - kind: emit
+        value: raw
+        output: tokens
+        mode: replace
+"#;
+
+#[test]
+fn a_packing_may_nest_inside_a_coarser_packing() {
+    validate_metadata(&parse(NESTED_VIDEO_ENCODER)).expect("nested packings are describable");
+
+    let metadata = parse(NESTED_VIDEO_ENCODER);
+    let workflow = &metadata
+        .pipeline
+        .as_ref()
+        .expect("fixture has a pipeline")
+        .workflow;
+    let frames = &workflow.components["video_encoder"].ports.inputs["frames"];
+    assert_eq!(frames.batch_layout.owner_span(), Some("video.clip_owner"));
+    assert_eq!(frames.batch_layout.packed_axis(), Some(0));
+    // Nesting does not change what a packed value is: every frame is still
+    // attributable to the request that asked for it, two hops out.
+    assert!(frames.batch_layout.is_row_scoped());
+
+    let clips = &workflow.inputs["video.clip_owner"].contract;
+    assert_eq!(
+        clips.batch_layout.owner_span(),
+        None,
+        "the outermost packing owns straight into request rows"
+    );
+}
+
+#[test]
+fn an_absent_owner_span_is_not_spelled_out() {
+    let terminal: TensorContract = serde_yaml::from_str(
+        "dtype: float32\nrank: 2\nbatch_layout: { kind: token_packed, offsets: o, owner: w, axis: 0 }\n",
+    )
+    .expect("terminal packing parses");
+    assert_eq!(terminal.batch_layout.owner_span(), None);
+
+    let round_trip = serde_yaml::to_string(&terminal).expect("contract serializes");
+    assert!(
+        !round_trip.contains("owner_span"),
+        "a packing that owns into request rows must not spell out an absent span: {round_trip}"
+    );
+    assert_eq!(
+        serde_yaml::from_str::<TensorContract>(&round_trip).expect("contract round-trips"),
+        terminal
+    );
+
+    let nested: TensorContract = serde_yaml::from_str(
+        "dtype: float32\nrank: 2\nbatch_layout: { kind: token_packed, offsets: o, owner: w, axis: 0, owner_span: s }\n",
+    )
+    .expect("nested packing parses");
+    assert_eq!(nested.batch_layout.owner_span(), Some("s"));
+    assert_eq!(
+        serde_yaml::from_str::<TensorContract>(
+            &serde_yaml::to_string(&nested).expect("contract serializes")
+        )
+        .expect("contract round-trips"),
+        nested
+    );
+}
+
+#[test]
+fn an_owner_span_must_name_a_declared_packing() {
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "owner_span: video.clip_owner",
+        "owner_span: video.shot_owner",
+    );
+    assert_reports(
+        &document,
+        "owner_span references 'video.shot_owner', which this workflow does not declare",
+    );
+}
+
+#[test]
+fn an_owner_span_must_itself_be_packed() {
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "owner_span: video.clip_owner",
+        "owner_span: video.clip_offsets",
+    );
+    assert_reports(
+        &document,
+        "owner_span 'video.clip_offsets' declares a request_aligned batch_layout; its owner \
+         indices name the items of 'video.clip_offsets', so 'video.clip_offsets' is itself \
+         token_packed",
+    );
+}
+
+#[test]
+fn nested_offsets_are_counted_per_span_not_per_request_row() {
+    // One offset per clip is what makes the packing nested. Declaring the frame
+    // offsets request-aligned would silently say there is one clip per request.
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "        contract: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: frame_offsets }",
+        "        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: frame_offsets }",
+    );
+    assert_reports(
+        &document,
+        "packs items inside the spans of 'video.clip_owner', so its offsets \
+         'video.frame_offsets' must themselves be token_packed on axis 0 against offsets \
+         'video.clip_offsets' and owner map 'video.clip_owner'",
+    );
+}
+
+#[test]
+fn an_owner_map_sits_at_the_level_of_the_items_it_indexes() {
+    // The frames are declared to sit inside clips while their own owner map is
+    // declared to own straight into request rows: one of the two readings has to
+    // be wrong, and neither can be repaired by guessing.
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "shape: [frames], batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0, owner_span: video.clip_owner } }",
+        "shape: [frames], batch_layout: { kind: token_packed, offsets: video.frame_offsets, owner: video.frame_owner, axis: 0 } }",
+    );
+    assert_reports(
+        &document,
+        "token_packed owner map 'video.frame_owner' owns into request rows but the value it owns \
+         owns into the items of 'video.clip_owner'",
+    );
+}
+
+#[test]
+fn ownership_composes_only_so_far() {
+    // A third level — frames inside clips inside shots inside rows — is past the
+    // point where an item is resolved against the request that asked for it.
+    let document = NESTED_VIDEO_ENCODER
+        .replace(
+            "      video.clip_offsets:",
+            "      video.shot_offsets:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: shot_offsets }\n      video.shot_owner:\n        contract: { dtype: int64, rank: 1, shape: [shots], batch_layout: { kind: token_packed, offsets: video.shot_offsets, owner: video.shot_owner, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: shot_owner }\n      video.clip_offsets:",
+        )
+        .replace(
+            "        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_offsets }",
+            "        contract: { dtype: int64, rank: 1, shape: [shots], batch_layout: { kind: token_packed, offsets: video.shot_offsets, owner: video.shot_owner, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_offsets }",
+        )
+        .replace(
+            "shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_owner }",
+            "shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0, owner_span: video.shot_owner } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_owner }",
+        );
+    assert_reports(
+        &document,
+        "nests 3 packings deep through 'video.clip_owner', past the limit of 2",
+    );
+}
+
+#[test]
+fn ownership_cannot_loop_back_on_itself() {
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0 } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_owner }",
+        "shape: [clips], batch_layout: { kind: token_packed, offsets: video.clip_offsets, owner: video.clip_owner, axis: 0, owner_span: video.frame_owner } }\n        role: { kind: opaque }\n        source: { kind: application, name: clip_owner }",
+    );
+    assert_reports(
+        &document,
+        "nests inside 'video.clip_owner', whose enclosing spans loop back to 'video.frame_owner'",
+    );
+}
+
+#[test]
+fn a_packed_capacity_batches_the_axis_its_items_land_on() {
+    let document = NESTED_VIDEO_ENCODER.replace(
+        "        batch_capacity: { axis: 0, uniform_axes: [2, 3] }",
+        "        batch_capacity: { axis: 1, uniform_axes: [2, 3] }",
+    );
+    assert_reports(
+        &document,
+        "workflow component 'video_encoder' input port 'frames' packs the items of its rows on \
+         axis 0, which is where an invocation's rows land, but the component declares \
+         batch_capacity axis 1",
+    );
+}
+
+#[test]
+fn a_pad_mask_marks_an_axis_the_value_has() {
+    let document = PADDED_VIDEO_ENCODER.replace(
+        "          pad_mask: { value: video.frame_mask, axis: 1 }",
+        "          pad_mask: { value: video.frame_mask, axis: 6 }",
+    );
+    assert_reports(
+        &document,
+        "declares pad_mask 'video.frame_mask' on axis 6, outside rank 5",
+    );
+}
+
+#[test]
+fn a_pad_mask_never_marks_the_axis_rows_stack_on() {
+    let document = PADDED_VIDEO_ENCODER.replace(
+        "          pad_mask: { value: video.frame_mask, axis: 1 }",
+        "          pad_mask: { value: video.frame_mask, axis: 0 }",
+    );
+    assert_reports(
+        &document,
+        "declares pad_mask 'video.frame_mask' on axis 0, which is the axis its request rows stack \
+         along",
+    );
+}
+
+#[test]
+fn a_pad_mask_names_the_axis_it_marks() {
+    let bare = serde_yaml::from_str::<TensorContract>(
+        "dtype: float32\nrank: 4\npad_mask: video.frame_mask\n",
+    );
+    assert!(
+        bare.is_err(),
+        "a mask that does not name its axis must not parse: {bare:?}"
+    );
+}
+
+#[test]
+fn a_row_scoped_mask_spans_the_rows_and_the_axis_it_marks() {
+    // The program output, the preprocessing port and the encoder port all state
+    // this contract, and they must keep agreeing for the mask rule to be what
+    // the document fails on.
+    let document = PADDED_VIDEO_ENCODER.replace(
+        "{ dtype: bool, rank: 2, shape: [batch, frames], batch_layout: { kind: request_aligned, axis: 0 } }",
+        "{ dtype: bool, rank: 1, shape: [frames], batch_layout: { kind: request_aligned, axis: 0 } }",
+    );
+    assert_reports(
+        &document,
+        "pad_mask 'video.frame_mask' has rank 1, but the value it masks is request-scoped",
+    );
+}
+
+#[test]
+fn a_media_shaped_append_names_the_axis_it_grows() {
+    let document = PADDED_VIDEO_ENCODER
+        .replace(
+            "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tokens\n        stage: pre_adapter",
+            "      tokens:\n        contract: { dtype: int64, rank: 2, shape: [batch, generated], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: tokens\n        stage: pre_adapter\n      clip:\n        contract: { dtype: float32, rank: 5, shape: [batch, frames, channels, height, width], batch_layout: { kind: request_aligned, axis: 0 } }\n        role: video\n        stage: pre_adapter",
+        )
+        .replace(
+            "      - kind: emit\n        value: raw\n        output: tokens\n        mode: replace",
+            "      - kind: emit\n        value: raw\n        output: tokens\n        mode: replace\n      - kind: emit\n        value: video.pixel_values\n        output: clip\n        mode: append",
+        );
+    assert_reports(
+        &document,
+        "grows a rank-5 output but names no axis; the default final axis is a spatial extent for \
+         a value of this rank",
+    );
+
+    // Naming the temporal axis is all it takes: the emit is then unambiguous.
+    let named = document.replace(
+        "        value: video.pixel_values\n        output: clip\n        mode: append",
+        "        value: video.pixel_values\n        output: clip\n        mode: append\n        axis: 1",
+    );
+    validate_metadata(&parse(&named)).expect("a named growth axis is describable");
+}
+
+#[test]
+fn an_emit_axis_must_be_an_axis_the_value_has() {
+    let document = PADDED_VIDEO_ENCODER.replace(
+        "      - kind: emit\n        value: raw\n        output: tokens\n        mode: replace",
+        "      - kind: emit\n        value: raw\n        output: tokens\n        mode: replace\n        axis: 4",
+    );
+    assert_reports(
+        &document,
+        ".axis is 4, outside the rank 2 of value it emits",
+    );
+}
+
+#[test]
+fn uniformity_is_required_of_temporal_and_spatial_axes_alike() {
+    // `[1, 3, 4]` over `[batch, frames, channels, height, width]` groups rows
+    // that agree on clip length and on both spatial extents. There is no
+    // temporal rule and no spatial rule — an axis is an axis.
+    let capacity = &parse(PADDED_VIDEO_ENCODER)
+        .pipeline
+        .expect("fixture has a pipeline")
+        .workflow
+        .components["video_encoder"]
+        .batch_capacity
+        .clone()
+        .expect("the clip encoder declares its capacity");
+    assert_eq!(capacity.uniform_axes, vec![1, 3, 4]);
+
+    // Dropping the temporal axis is a different, weaker claim, and just as
+    // describable: the encoder then batches clips of differing length.
+    let spatial_only = PADDED_VIDEO_ENCODER.replace(
+        "batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [1, 3, 4] }",
+        "batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [3, 4] }",
+    );
+    validate_metadata(&parse(&spatial_only)).expect("spatial-only uniformity is describable");
+
+    // A temporal axis the ports do not have is not a grouping key.
+    let out_of_range = PADDED_VIDEO_ENCODER.replace(
+        "batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [1, 3, 4] }",
+        "batch_capacity: { axis: 0, max_rows: 4, uniform_axes: [1, 3, 5] }",
+    );
+    assert_reports(
+        &out_of_range,
+        "workflow component 'video_encoder' declares batch_capacity uniform axis 5 but its widest \
+         request-scoped port has rank 5",
     );
 }
