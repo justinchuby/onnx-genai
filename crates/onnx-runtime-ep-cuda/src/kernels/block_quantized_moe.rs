@@ -1705,3 +1705,106 @@ mod workspace_tests {
         assert!(error.to_string().contains("exceeds usize limits"));
     }
 }
+
+#[cfg(test)]
+mod claim_gate_tests {
+    use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId};
+
+    /// Build a minimal `BlockQuantizedMoE` node carrying only the attributes the
+    /// claim gate reads. `fc3` set means the `fc3_experts_weights` input (index
+    /// 6) is wired and an `fc3_format` attribute is emitted. These nodes are not
+    /// executable — they exist purely to exercise `unsupported_reason` /
+    /// `claim_projection_formats`, which are pure functions over node metadata
+    /// and never touch a CUDA device, so this runs on a host without a GPU.
+    fn claim_node(fc1: &str, fc2: &str, fc3: Option<&str>) -> Node {
+        let mut inputs: Vec<Option<ValueId>> = (0..6).map(|i| Some(ValueId(i as u32))).collect();
+        if fc3.is_some() {
+            // Indices 6..=8: fc3 weights wired, then two optional trailing slots.
+            inputs.push(Some(ValueId(6)));
+        }
+        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![ValueId(100)]);
+        node.attributes.insert(
+            "fc1_format".into(),
+            Attribute::String(fc1.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc2_format".into(),
+            Attribute::String(fc2.as_bytes().to_vec()),
+        );
+        if let Some(fc3) = fc3 {
+            node.attributes.insert(
+                "fc3_format".into(),
+                Attribute::String(fc3.as_bytes().to_vec()),
+            );
+        }
+        node
+    }
+
+    #[test]
+    fn mixed_fc1_fc2_formats_are_typed_rejected_without_a_success_claim() {
+        // The real GLM-5.2 UD-IQ1_S combo: gate/up IQ1_S, down IQ3_XXS.
+        let node = claim_node("iq1_s", "iq3_xxs", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("mixed per-projection formats must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn mixed_fc3_gate_format_is_typed_rejected() {
+        // Unfused gate carried at a different qtype than fc1/fc2.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq2_xxs"));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("a mismatched fc3_format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn uniform_projection_formats_remain_claimable() {
+        // Uniform format across every projection stays claimable by the device
+        // kernel — the mixed-rejection must not over-reject the supported case.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq1_s"));
+        assert!(
+            unsupported_reason(&node, &[], &[]).is_none(),
+            "uniform-format node must not be declined by the CUDA claim gate"
+        );
+        let fused = claim_node("iq4_nl", "iq4_nl", None);
+        assert!(
+            unsupported_reason(&fused, &[], &[]).is_none(),
+            "uniform fused-projection node must not be declined by the CUDA claim gate"
+        );
+    }
+
+    #[test]
+    fn unsupported_native_format_is_typed_rejected_at_the_claim_gate() {
+        // A native GGUF qtype outside BlockFormat (e.g. Q2_K) is declined, not
+        // dequantized or dense-fallback executed.
+        let node = claim_node("q2_k", "q2_k", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("an unsupported native format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("q2_k"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn fc3_format_without_wired_gate_is_typed_rejected() {
+        // fc3_format present but the fc3 weights input is not wired: reject.
+        let mut node = claim_node("iq1_s", "iq1_s", None);
+        node.attributes
+            .insert("fc3_format".into(), Attribute::String(b"iq1_s".to_vec()));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("fc3_format without a wired gate must be declined");
+        assert!(
+            reason.contains("fc3_format is only valid when fc3_experts_weights is wired"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+}
