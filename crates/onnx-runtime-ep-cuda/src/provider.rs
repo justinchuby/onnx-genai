@@ -4789,28 +4789,39 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         );
     }
 
-    // `is_available` must answer from the runtime, not report a compile-time
-    // constant. The discriminating input is a device ordinal that cannot exist:
-    // an implementation that reports availability without probing accepts every
-    // ordinal, while a real probe fails to select the device. Verified by
-    // falsification — replacing the body with `true` fails this test; the
-    // opposite error (always reporting unavailable) is already caught by the
-    // several hundred tests in this crate that construct a real provider.
+    // A device ordinal that cannot exist must be reported unavailable. This
+    // pins one specific regression: an `is_available` that answers without
+    // probing at all, such as a stub returning `true`. Verified by
+    // falsification — replacing the body with `true` fails this test.
     //
-    // This deliberately replaces an assertion that `is_available(0)` equalled
-    // `initialized(0).is_ok()`. `is_available` is *defined* as that expression,
-    // so the assertion was true of every possible implementation and pinned
-    // nothing. Its only observable effect was building two complete providers
-    // (VMM arena plus cuBLASLt handle) back to back; each reserves a 64 GiB
-    // virtual address range, so on a small card the first provider's deferred
-    // release had not always finished before the second reserved, and a test
-    // that proved nothing still failed intermittently.
+    // Be precise about what this does NOT pin. It distinguishes "accepts every
+    // ordinal" from "rejects some ordinal", which is strictly weaker than the
+    // doc comment's claim that availability is probed against the driver,
+    // libraries, device and thread binding. A hardcoded ceiling such as
+    // `ordinal < 64` passes this test while still reporting `CUDA:0` usable on
+    // a machine with no GPU. Closing that would mean asserting the positive
+    // half (`is_available(0) == true`), which constructs a full provider —
+    // deliberately avoided here, because that construction is what made the
+    // previous version of this test flaky. The positive half is covered instead
+    // by the several hundred tests in this crate that build a real provider and
+    // fail loudly if construction stops working.
+    //
+    // This replaces an assertion that `is_available(0)` equalled
+    // `initialized(0).is_ok()`. Since `is_available` is defined as exactly that
+    // expression, the two sides could disagree only under a refactor that made
+    // it diverge from `initialized` — memoizing in a `OnceLock`, say, while
+    // `initialized` kept probing. Within a single run on a working GPU both
+    // sides simply returned `true`, so it caught nothing in practice while
+    // building two complete providers back to back. Each reserves a 64 GiB
+    // virtual address range for the VMM arena, so on a small card the first
+    // provider's deferred release had not always finished before the second
+    // reserved, and the test failed intermittently.
     #[test]
-    fn availability_is_probed_at_runtime_not_compiled_in() {
+    fn availability_rejects_a_device_that_cannot_exist() {
         const IMPOSSIBLE_ORDINAL: u32 = u32::MAX;
         assert!(
             !CudaExecutionProvider::is_available(IMPOSSIBLE_ORDINAL),
-            "is_available must probe the device; it reported CUDA:{IMPOSSIBLE_ORDINAL} usable"
+            "is_available accepted CUDA:{IMPOSSIBLE_ORDINAL}, so it is not probing the device at all"
         );
     }
 
