@@ -70,6 +70,22 @@
 #   --ttl S           hard expiry: a lock older than this is reapable by the
 #                     next acquirer, which prints a loud warning naming you.
 #                     Default 3600 for `acquire`, 0 (never) for `run`.
+#                     REFUSED on `run` when finite (exit 1); `--ttl 0` is the
+#                     `run` default and is accepted, because 0 means "never
+#                     expires" and so arms no takeover at all. A TTL does not mean "release
+#                     this if I abandon it" -- it means "release this on the
+#                     clock, whether or not I am still running", and the
+#                     takeover path fires on a holder that is verifiably alive.
+#                     So a finite TTL on a long job hands the host to a second
+#                     measurer mid-run and contaminates BOTH sets of numbers.
+#                     `run` cannot leak a lock in the first place: it anchors
+#                     to its own pid and start time, which die on every exit
+#                     path, and a zombie anchor is caught by `pid_is_live`.
+#                     To bound the JOB rather than the CLAIM, bound the
+#                     process tree -- setsid + process group + a hard
+#                     `timeout` + a verified reap (`pgrep -g`). A lock TTL
+#                     bounds neither: it would relabel the host as free while
+#                     the runaway kept burning cores.
 #   --pid N           liveness anchor; defaults to the invoking shell ($PPID)
 #
 # Options for run:
@@ -1368,6 +1384,21 @@ require_name "owner" "$OWNER"
 # shell, which can outlive the benchmark by days, so it gets a default TTL.
 if [ "$SUB" = run ]; then
     : "${ANCHOR_PID:=$$}"
+    # Refused, not warned about, for the same reason `--on-gate-timeout`
+    # defaults to `fail`: a warning that proceeds still produces rows, and
+    # those rows are indistinguishable from clean ones later. The takeover
+    # path this would arm prints "still alive ... both sets of numbers are
+    # now suspect" and removes the lock anyway, so the damage is to a run
+    # already in flight -- and `--strict-reap` protects the acquirer, never
+    # the victim. There is nothing for a TTL to fix here: `run`'s anchor is
+    # its own pid plus start time, so an abandoned lock cannot outlive the
+    # command on any exit path.
+    if [ -n "$TTL" ] && [ "$TTL" -gt 0 ]; then
+        die "run --ttl ${TTL} is refused: TTL expiry takes the lock from a holder that is STILL RUNNING, contaminating both that run and the one that reaps it.
+       \`run\` anchors to its own pid and start time, so it cannot leak a lock -- it needs no expiry.
+       To bound the job rather than the claim, bound the process tree: setsid + process group + hard timeout + verified reap (pgrep -g).
+       \`--ttl\` is for \`acquire\`, whose anchor is a shell that can outlive the benchmark by days."
+    fi
     : "${TTL:=0}"
     # A threshold with no denominator cannot be evaluated, and defaulting the
     # denominator to 1 would pass every multi-threaded run. Fail at parse time
