@@ -2458,3 +2458,20 @@ fn offsets_stay_suppliable_because_a_request_can_state_its_own() {
     );
     validate_metadata(&parse(&document)).expect("offsets may be supplied");
 }
+
+#[test]
+fn a_length_needs_no_rebasing_and_so_is_the_plainest_companion_of_the_three() {
+    // The three companions differ in what a request may say and receive, and
+    // the difference follows from what each one measures. An owner map is
+    // invocation-global and is never delivered. Offsets are per-request but
+    // group-relative, so they are delivered rebased to the request's own start.
+    // A length is already relative to the item it measures and means the same
+    // number in any group, so a request states its own and receives back the
+    // slice that indexes its own items — nothing to rebase, nothing to derive,
+    // and no group position to leak.
+    let document = PADDED_VISION_ENCODER.replace(
+        "        source: { kind: application, name: tile_lengths }",
+        "        source: { kind: application, name: tile_lengths }\n        externally_suppliable: true",
+    );
+    validate_metadata(&parse(&document)).expect("lengths may be supplied");
+}
