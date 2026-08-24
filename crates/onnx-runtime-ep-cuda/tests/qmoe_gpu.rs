@@ -3685,3 +3685,1109 @@ fn qmoe_grouped_drop_kernel_after_capture_replay_leaves_runtime_usable() {
     let actual = run_gpu(&ep, case, &inputs, dtype).unwrap();
     assert_conforms(&actual, &expected, case, dtype);
 }
+
+// ---------------------------------------------------------------------------
+// Fused, inert route-telemetry coverage (issue #1810 Slice 7A).
+//
+// These exercise the producer-only telemetry fused into `qmoe_route`: default
+// disabled, byte-identical outputs off vs on, a device bitmap that matches a CPU
+// oracle, epoch/reset semantics that stay correct across consecutive eager calls
+// and >=3 graph replays with a stable pointer, typed fail-closed rejection on a
+// device mismatch, and inert behavior (no inference failure) on a capacity
+// mismatch. The raw device atomic/poison/overflow semantics are covered by the
+// approved #1884 probe harness (`expert_route_telemetry_probe_gpu.rs`), which is
+// left untouched; the production route kernel cannot emit an out-of-range id by
+// construction (selection is bounded to `[0, experts)`), so device poison is
+// structurally unreachable through the fused path and is asserted at the host
+// contract level instead.
+mod route_telemetry {
+    use super::*;
+    use onnx_runtime_ep_api::Kernel;
+    use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
+        H_DEVICE, H_REQUEST, RouteTelemetryConfig, TelemetryUnsupported, cpu_bitmap,
+    };
+    use onnx_runtime_ep_cuda::kernels::qmoe::{QMoEFactory, QMoEKernel};
+
+    fn telemetry_case(rows: usize) -> Case {
+        Case {
+            experts: 8,
+            rows,
+            hidden: 16,
+            inter: 16,
+            bits: 4,
+            top_k: 2,
+            activation: "silu",
+            swiglu_fusion: 0,
+            affine: true,
+            fc3: false,
+            biases: false,
+            normalize: false,
+            router_weights: false,
+        }
+    }
+
+    /// A router whose per-row top-`k` selection is unambiguous: row `r` gives the
+    /// experts `(r + i) % experts` strictly descending values, so its selected
+    /// set is `{(r+0)%E .. (r+k-1)%E}`. Distinct values within a row remove any
+    /// tie-break dependence, so the CPU oracle matches the kernel exactly.
+    fn rotated_router(case: Case) -> HostTensor {
+        let mut values = vec![0f32; case.rows * case.experts];
+        for row in 0..case.rows {
+            for rank in 0..case.experts {
+                let expert = (row + rank) % case.experts;
+                values[row * case.experts + expert] = (case.experts - rank) as f32;
+            }
+        }
+        HostTensor::f32(&[case.rows, case.experts], &values)
+    }
+
+    /// CPU oracle bitmap for the fused route kernel: the union over rows of each
+    /// row's deterministic top-`k` selection.
+    fn oracle_bitmap(router: &HostTensor, case: Case) -> Vec<u32> {
+        let values: Vec<f32> = router
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        let mut routes = Vec::new();
+        for row in 0..case.rows {
+            let logits = &values[row * case.experts..(row + 1) * case.experts];
+            let mut order: Vec<usize> = (0..case.experts).collect();
+            order.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap().then(a.cmp(&b)));
+            for &expert in order.iter().take(case.top_k) {
+                routes.push(expert as i32);
+            }
+        }
+        cpu_bitmap(&routes, case.experts).0
+    }
+
+    /// CPU oracle for a coarse-boundary *window*: the union of every call's /
+    /// replay's route bitmap accumulated with no reset in between.
+    fn oracle_union(routers: &[HostTensor], case: Case) -> Vec<u32> {
+        let mut acc = vec![0u32; case.experts.div_ceil(32)];
+        for router in routers {
+            for (word, bit) in acc.iter_mut().zip(oracle_bitmap(router, case)) {
+                *word |= bit;
+            }
+        }
+        acc
+    }
+
+    fn build_kernel(
+        ep: &CudaExecutionProvider,
+        inputs: &[Option<HostTensor>],
+        case: Case,
+    ) -> QMoEKernel {
+        let output_shape = [case.rows, case.hidden];
+        let (graph, node) = model_node(inputs, DataType::Float32, &output_shape, case);
+        let model = Model::new(&graph);
+        let concrete_shapes: Vec<_> = inputs
+            .iter()
+            .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+            .collect();
+        let factory = QMoEFactory {
+            runtime: ep.runtime().clone(),
+        };
+        factory
+            .create_kernel(model.graph.node(node), &concrete_shapes)
+            .expect("concrete QMoE kernel")
+    }
+
+    fn upload_inputs(
+        ep: &CudaExecutionProvider,
+        inputs: &[Option<HostTensor>],
+    ) -> onnx_runtime_ep_api::Result<Vec<Option<DeviceBuffer>>> {
+        let runtime = ep.runtime();
+        let mut buffers = Vec::<Option<DeviceBuffer>>::new();
+        for input in inputs {
+            if let Some(input) = input {
+                let buffer = ep.allocate(input.bytes.len(), 256)?;
+                // SAFETY: allocation size equals the source tensor byte length.
+                unsafe { runtime.htod(&input.bytes, cuptr(buffer.as_ptr()))? };
+                buffers.push(Some(buffer));
+            } else {
+                buffers.push(None);
+            }
+        }
+        Ok(buffers)
+    }
+
+    fn views<'a>(
+        inputs: &'a [Option<HostTensor>],
+        buffers: &'a [Option<DeviceBuffer>],
+        strides: &'a [Option<Vec<i64>>],
+        device: DeviceId,
+    ) -> Vec<TensorView<'a>> {
+        inputs
+            .iter()
+            .zip(buffers)
+            .zip(strides)
+            .enumerate()
+            .map(
+                |(index, ((input, buffer), strides))| match (input, buffer, strides) {
+                    (Some(input), Some(buffer), Some(strides)) => TensorView::new(
+                        DevicePtr(buffer.as_ptr()),
+                        input.dtype,
+                        &input.shape,
+                        strides,
+                        device,
+                    ),
+                    _ => TensorView::absent(absent_dtype(index, DataType::Float32)),
+                },
+            )
+            .collect()
+    }
+
+    /// Execute the concrete kernel eagerly once and return the raw output bytes.
+    fn exec_eager(
+        ep: &CudaExecutionProvider,
+        kernel: &QMoEKernel,
+        inputs: &[Option<HostTensor>],
+        case: Case,
+    ) -> onnx_runtime_ep_api::Result<Vec<u8>> {
+        let runtime = ep.runtime();
+        let buffers = upload_inputs(ep, inputs)?;
+        let strides: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map(|input| compute_contiguous_strides(&input.shape))
+            })
+            .collect();
+        let views = views(inputs, &buffers, &strides, ep.device_id());
+        let output_shape = [case.rows, case.hidden];
+        let output_bytes = case.rows * case.hidden * 4;
+        let mut output_buffer = ep.allocate(output_bytes, 256)?;
+        let output_strides = compute_contiguous_strides(&output_shape);
+        kernel.execute(
+            &views,
+            &mut [TensorMut::new(
+                DevicePtrMut(output_buffer.as_mut_ptr()),
+                DataType::Float32,
+                &output_shape,
+                &output_strides,
+                ep.device_id(),
+            )],
+        )?;
+        runtime.synchronize()?;
+        let mut bytes = vec![0u8; output_bytes];
+        // SAFETY: output allocation contains exactly the requested output tensor.
+        unsafe { runtime.dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))? };
+        drop(views);
+        for buffer in buffers.into_iter().flatten() {
+            ep.deallocate(buffer)?;
+        }
+        ep.deallocate(output_buffer)?;
+        Ok(bytes)
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_off_on_output_is_byte_identical() {
+        let ep = require_cuda();
+        for rows in [1usize, 5] {
+            let case = telemetry_case(rows);
+            let mut inputs = case_inputs(case, DataType::Float32);
+            inputs[1] = Some(rotated_router(case));
+
+            let kernel = build_kernel(&ep, &inputs, case);
+            let off = exec_eager(&ep, &kernel, &inputs, case).unwrap();
+            assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 42,
+                    device_id: ep.runtime().ordinal(),
+                    num_experts: case.experts,
+                })
+                .expect("arm telemetry");
+            let on = exec_eager(&ep, &kernel, &inputs, case).unwrap();
+
+            assert_eq!(
+                off, on,
+                "route outputs must be byte-identical with telemetry off vs on (rows={rows})"
+            );
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_bitmap_matches_cpu_oracle_decode_and_prefill() {
+        let ep = require_cuda();
+        for rows in [1usize, 6] {
+            let case = telemetry_case(rows);
+            let mut inputs = case_inputs(case, DataType::Float32);
+            let router = rotated_router(case);
+            inputs[1] = Some(router.clone());
+
+            let kernel = build_kernel(&ep, &inputs, case);
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 7,
+                    device_id: ep.runtime().ordinal(),
+                    num_experts: case.experts,
+                })
+                .expect("arm telemetry");
+            exec_eager(&ep, &kernel, &inputs, case).unwrap();
+
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(snapshot.header[H_DEVICE], ep.runtime().ordinal());
+            assert_eq!(snapshot.header[H_REQUEST], 7);
+            assert_eq!(snapshot.epoch(), 1, "first armed launch stamps epoch 1");
+            assert!(!snapshot.poison());
+            assert!(!snapshot.overflow());
+            assert_eq!(snapshot.count() as usize, case.rows * case.top_k);
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_bitmap(&router, case),
+                "device bitmap must match CPU oracle (rows={rows})"
+            );
+        }
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_eager_calls_accumulate_union_within_window() {
+        let ep = require_cuda();
+        let case = telemetry_case(4);
+        let mut inputs = case_inputs(case, DataType::Float32);
+        let kernel = build_kernel(&ep, &inputs, case);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 3,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .expect("arm telemetry");
+
+        // Multiple eager calls with *different* deterministic routes and NO
+        // reset in between: the record accumulates the route union and the count
+        // over the whole window, and the epoch stays FIXED (the window advances
+        // only at an explicit coarse boundary — Roy Cycle22).
+        let routers: Vec<HostTensor> = (0..3usize)
+            .map(|shift| shifted_router(case, shift))
+            .collect();
+        let mut expected_count = 0u32;
+        for (index, router) in routers.iter().enumerate() {
+            inputs[1] = Some(router.clone());
+            exec_eager(&ep, &kernel, &inputs, case).unwrap();
+            expected_count += (case.rows * case.top_k) as u32;
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(
+                snapshot.epoch(),
+                1,
+                "epoch is fixed within a window (call {index})"
+            );
+            assert_eq!(
+                snapshot.count(),
+                expected_count,
+                "count accumulates across calls with no per-call reset (call {index})"
+            );
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_union(&routers[..=index], case),
+                "bitmap accumulates the routed union across calls (call {index})"
+            );
+            assert!(!snapshot.poison());
+            assert!(!snapshot.overflow());
+        }
+
+        // An explicit coarse boundary opens a fresh, empty window at a new epoch.
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let after = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(after.epoch(), 2, "boundary reset increments the epoch");
+        assert_eq!(after.count(), 0, "next window starts empty");
+        assert!(
+            after.bitmap.iter().all(|&word| word == 0),
+            "next window bitmap starts empty (no stale carryover)"
+        );
+
+        // The next window accumulates only its own routes.
+        let router = shifted_router(case, 5);
+        inputs[1] = Some(router.clone());
+        exec_eager(&ep, &kernel, &inputs, case).unwrap();
+        let window2 = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(window2.epoch(), 2, "still window 2");
+        assert_eq!(window2.count(), (case.rows * case.top_k) as u32);
+        assert_eq!(
+            window2.bitmap,
+            oracle_bitmap(&router, case),
+            "window 2 records only its own routes, with no window-1 carryover"
+        );
+    }
+
+    /// Row `r` selects experts `{(r + shift + i) % E}` for `i in 0..k`.
+    fn shifted_router(case: Case, shift: usize) -> HostTensor {
+        let mut values = vec![0f32; case.rows * case.experts];
+        for row in 0..case.rows {
+            for rank in 0..case.experts {
+                let expert = (row + shift + rank) % case.experts;
+                values[row * case.experts + expert] = (case.experts - rank) as f32;
+            }
+        }
+        HostTensor::f32(&[case.rows, case.experts], &values)
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_capture_replay_accumulates_union_fixed_epoch() {
+        let ep = require_cuda();
+        let case = telemetry_case(1); // decode
+        let mut inputs = case_inputs(case, DataType::Float32);
+        inputs[1] = Some(shifted_router(case, 0));
+        let kernel = build_kernel(&ep, &inputs, case);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 11,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .expect("arm telemetry");
+
+        let runtime = ep.runtime();
+        let buffers = upload_inputs(&ep, &inputs).unwrap();
+        let strides: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map(|input| compute_contiguous_strides(&input.shape))
+            })
+            .collect();
+        let output_shape = [case.rows, case.hidden];
+        let output_bytes = case.rows * case.hidden * 4;
+        let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
+        let output_strides = compute_contiguous_strides(&output_shape);
+
+        let run_once = |output_buffer: &mut DeviceBuffer| {
+            let views = views(&inputs, &buffers, &strides, ep.device_id());
+            kernel
+                .execute(
+                    &views,
+                    &mut [TensorMut::new(
+                        DevicePtrMut(output_buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        &output_shape,
+                        &output_strides,
+                        ep.device_id(),
+                    )],
+                )
+                .expect("execute");
+            drop(views);
+        };
+
+        // Warmup eager execute so the kernel's capture workspace is armed.
+        run_once(&mut output_buffer);
+        runtime.synchronize().unwrap();
+        assert!(
+            kernel.capture_support().is_supported(),
+            "armed QMoE must still warm its capture workspace"
+        );
+        let armed_ptr = kernel
+            .route_telemetry_bitmap_addr()
+            .expect("telemetry armed");
+
+        // Exactly ONE explicit coarse-boundary reset opens the capture window at
+        // a fixed epoch. This is the *only* reset for the whole capture/replay
+        // sequence (Roy Cycle22: no per-replay reset).
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let base = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        let window_epoch = base.epoch();
+        let base_count = base.count();
+        let base_bitmap = base.bitmap.clone();
+
+        // Capture the route-only kernel into the graph (no reset kernel baked in;
+        // the fused marks are the only telemetry work recorded).
+        runtime
+            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .unwrap();
+        run_once(&mut output_buffer);
+        runtime.end_graph_capture().unwrap();
+        assert_eq!(
+            kernel.route_telemetry_bitmap_addr(),
+            Some(armed_ptr),
+            "telemetry pointer must not move across capture (no host realloc)"
+        );
+
+        // Replay >=3 times with genuinely different routes. Every replay
+        // accumulates its routes into the SAME window: the epoch stays fixed, the
+        // count grows monotonically, and the bitmap is the running union at the
+        // same stable device pointer. Nothing resets between replays.
+        let mut seen: Vec<HostTensor> = Vec::new();
+        for shift in 1..=3usize {
+            let router = shifted_router(case, shift);
+            let router_buffer = buffers[1].as_ref().unwrap();
+            // SAFETY: router shape is unchanged; byte length matches allocation.
+            unsafe {
+                runtime
+                    .htod(&router.bytes, cuptr(router_buffer.as_ptr()))
+                    .unwrap()
+            };
+            // SAFETY: output allocation is exactly `output_bytes`.
+            unsafe {
+                runtime
+                    .htod(&vec![0u8; output_bytes], cuptr(output_buffer.as_ptr()))
+                    .unwrap()
+            };
+            runtime.replay_graph().unwrap();
+            runtime.synchronize().unwrap();
+            seen.push(router);
+
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(
+                snapshot.epoch(),
+                window_epoch,
+                "replay {shift} must NOT advance the epoch (no per-replay reset)"
+            );
+            assert_eq!(
+                snapshot.count(),
+                base_count + (seen.len() * case.rows * case.top_k) as u32,
+                "replay {shift} must accumulate the route count monotonically"
+            );
+            let mut expected = base_bitmap.clone();
+            for (word, bit) in expected.iter_mut().zip(oracle_union(&seen, case)) {
+                *word |= bit;
+            }
+            assert_eq!(
+                snapshot.bitmap, expected,
+                "replay {shift} must accumulate the routed union (no per-replay reset)"
+            );
+            assert_eq!(
+                kernel.route_telemetry_bitmap_addr(),
+                Some(armed_ptr),
+                "telemetry pointer must stay stable across replay {shift}"
+            );
+        }
+
+        runtime.reset_graph().unwrap();
+        drop(strides);
+        for buffer in buffers.into_iter().flatten() {
+            ep.deallocate(buffer).unwrap();
+        }
+        ep.deallocate(output_buffer).unwrap();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_boundary_reset_rejected_during_capture() {
+        let ep = require_cuda();
+        let case = telemetry_case(1);
+        let mut inputs = case_inputs(case, DataType::Float32);
+        inputs[1] = Some(shifted_router(case, 0));
+        let kernel = build_kernel(&ep, &inputs, case);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 77,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .expect("arm telemetry");
+
+        let runtime = ep.runtime();
+        let buffers = upload_inputs(&ep, &inputs).unwrap();
+        let strides: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                input
+                    .as_ref()
+                    .map(|input| compute_contiguous_strides(&input.shape))
+            })
+            .collect();
+        let output_shape = [case.rows, case.hidden];
+        let output_bytes = case.rows * case.hidden * 4;
+        let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
+        let output_strides = compute_contiguous_strides(&output_shape);
+
+        let run_once = |output_buffer: &mut DeviceBuffer| {
+            let views = views(&inputs, &buffers, &strides, ep.device_id());
+            kernel
+                .execute(
+                    &views,
+                    &mut [TensorMut::new(
+                        DevicePtrMut(output_buffer.as_mut_ptr()),
+                        DataType::Float32,
+                        &output_shape,
+                        &output_strides,
+                        ep.device_id(),
+                    )],
+                )
+                .expect("execute");
+            drop(views);
+        };
+
+        // Warmup so the capture workspace is armed.
+        run_once(&mut output_buffer);
+        runtime.synchronize().unwrap();
+        let epoch_before = kernel.route_telemetry_snapshot().unwrap().unwrap().epoch();
+
+        // A window reset is a coarse-boundary-only operation: attempting it while
+        // a capture is in flight must be rejected, and must not advance the epoch
+        // or otherwise disturb the armed record.
+        runtime
+            .begin_graph_capture(&[&kernel as &dyn Kernel])
+            .unwrap();
+        let rejected = kernel.reset_route_telemetry_boundary();
+        assert!(
+            rejected.is_err(),
+            "boundary reset must be rejected during an active capture"
+        );
+        // Finish the capture cleanly so the runtime is left idle.
+        run_once(&mut output_buffer);
+        runtime.end_graph_capture().unwrap();
+        runtime.reset_graph().unwrap();
+
+        let epoch_after = kernel.route_telemetry_snapshot().unwrap().unwrap().epoch();
+        assert_eq!(
+            epoch_before, epoch_after,
+            "a rejected reset must not advance the window epoch"
+        );
+
+        drop(strides);
+        for buffer in buffers.into_iter().flatten() {
+            ep.deallocate(buffer).unwrap();
+        }
+        ep.deallocate(output_buffer).unwrap();
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_device_mismatch_fails_closed_without_failing_inference() {
+        let ep = require_cuda();
+        let case = telemetry_case(2);
+        let inputs = case_inputs(case, DataType::Float32);
+        let kernel = build_kernel(&ep, &inputs, case);
+
+        let wrong_device = ep.runtime().ordinal().wrapping_add(1);
+        let error = kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 1,
+                device_id: wrong_device,
+                num_experts: case.experts,
+            })
+            .expect_err("device mismatch must be rejected");
+        assert!(matches!(error, TelemetryUnsupported::DeviceMismatch { .. }));
+
+        // Inference still works and telemetry stays disabled (inert).
+        assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+        let out = exec_eager(&ep, &kernel, &inputs, case).unwrap();
+        assert_eq!(out.len(), case.rows * case.hidden * 4);
+        assert!(kernel.route_telemetry_snapshot().unwrap().is_none());
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_capacity_mismatch_is_inert_and_never_fails_inference() {
+        let ep = require_cuda();
+        let case = telemetry_case(2);
+        let mut inputs = case_inputs(case, DataType::Float32);
+        inputs[1] = Some(rotated_router(case));
+        let kernel = build_kernel(&ep, &inputs, case);
+
+        // Arm with a *different* expert capacity than the model executes.
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 5,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts + 4,
+            })
+            .expect("arming with any positive capacity succeeds");
+
+        // The mismatched capacity means this call records nothing: inference
+        // succeeds, and although `arm` opened window 1 (epoch 1), the mismatched
+        // execute contributes no routes and no count.
+        let out = exec_eager(&ep, &kernel, &inputs, case).unwrap();
+        assert_eq!(out.len(), case.rows * case.hidden * 4);
+        let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(snapshot.epoch(), 1, "arm opened window 1; execute is inert");
+        assert_eq!(snapshot.count(), 0);
+        assert!(snapshot.bitmap.iter().all(|&word| word == 0));
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_multi_instance_request_isolation_and_accounting() {
+        let ep = require_cuda();
+        let case = telemetry_case(3);
+        let mut inputs = case_inputs(case, DataType::Float32);
+        inputs[1] = Some(rotated_router(case));
+
+        let kernel_a = build_kernel(&ep, &inputs, case);
+        let kernel_b = build_kernel(&ep, &inputs, case);
+        kernel_a
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 100,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .unwrap();
+        kernel_b
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 200,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .unwrap();
+
+        // Distinct armed records occupy distinct device buffers.
+        assert_ne!(
+            kernel_a.route_telemetry_bitmap_addr(),
+            kernel_b.route_telemetry_bitmap_addr()
+        );
+        let footprint = 4 * (case.experts.div_ceil(32)) + 6 * 4;
+        assert_eq!(kernel_a.route_telemetry_footprint_bytes(), footprint);
+
+        exec_eager(&ep, &kernel_a, &inputs, case).unwrap();
+        exec_eager(&ep, &kernel_b, &inputs, case).unwrap();
+
+        let snap_a = kernel_a.route_telemetry_snapshot().unwrap().unwrap();
+        let snap_b = kernel_b.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(snap_a.header[H_REQUEST], 100);
+        assert_eq!(snap_b.header[H_REQUEST], 200);
+        assert_eq!(snap_a.header[H_DEVICE], ep.runtime().ordinal());
+        assert_eq!(snap_b.header[H_DEVICE], ep.runtime().ordinal());
+
+        // Teardown/accounting: disarm frees the record and zeroes the footprint.
+        kernel_a.disarm_route_telemetry();
+        assert_eq!(kernel_a.route_telemetry_footprint_bytes(), 0);
+        assert!(kernel_a.route_telemetry_snapshot().unwrap().is_none());
+        // Inference still works after disarm.
+        let out = exec_eager(&ep, &kernel_a, &inputs, case).unwrap();
+        assert_eq!(out.len(), case.rows * case.hidden * 4);
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_boundary_reset_increments_epoch_and_starts_empty_window() {
+        let ep = require_cuda();
+        let case = telemetry_case(4);
+        let mut inputs = case_inputs(case, DataType::Float32);
+        inputs[1] = Some(rotated_router(case));
+        let kernel = build_kernel(&ep, &inputs, case);
+        kernel
+            .arm_route_telemetry(RouteTelemetryConfig {
+                request_id: 9,
+                device_id: ep.runtime().ordinal(),
+                num_experts: case.experts,
+            })
+            .expect("arm telemetry");
+
+        // Accumulate some routes into window 1.
+        exec_eager(&ep, &kernel, &inputs, case).unwrap();
+        let before = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(before.epoch(), 1);
+        assert!(before.count() > 0, "window 1 recorded routes");
+        assert!(before.bitmap.iter().any(|&word| word != 0));
+
+        // Snapshot-then-reset at an explicit coarse boundary: the epoch advances
+        // by exactly one and the next window starts completely empty. The device
+        // identity is preserved across the window boundary.
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let after = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(
+            after.epoch(),
+            before.epoch() + 1,
+            "reset bumps epoch by one"
+        );
+        assert_eq!(after.count(), 0, "next window starts with a zero count");
+        assert!(
+            after.bitmap.iter().all(|&word| word == 0),
+            "next window starts with an empty bitmap (no stale carryover)"
+        );
+        assert_eq!(after.header[H_REQUEST], 9, "request identity is preserved");
+        assert_eq!(
+            after.header[H_DEVICE],
+            ep.runtime().ordinal(),
+            "device identity is preserved"
+        );
+        assert!(!after.poison());
+        assert!(!after.overflow());
+
+        // A second boundary with no work in between still advances the epoch and
+        // stays empty.
+        kernel.reset_route_telemetry_boundary().unwrap();
+        let after2 = kernel.route_telemetry_snapshot().unwrap().unwrap();
+        assert_eq!(after2.epoch(), after.epoch() + 1);
+        assert_eq!(after2.count(), 0);
+    }
+
+    #[cfg_attr(
+        not(feature = "gpu-tests"),
+        ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+    )]
+    #[test]
+    fn telemetry_qmoe_route_matches_oracle_for_m_1_2_4_8() {
+        // QMoE decode/prefill token counts M in {1,2,4,8} (issue #1810 §5): the
+        // fused route bitmap and count must match the CPU oracle at every M.
+        let ep = require_cuda();
+        for rows in [1usize, 2, 4, 8] {
+            let case = telemetry_case(rows);
+            let mut inputs = case_inputs(case, DataType::Float32);
+            let router = rotated_router(case);
+            inputs[1] = Some(router.clone());
+
+            let kernel = build_kernel(&ep, &inputs, case);
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id: 300 + rows as u32,
+                    device_id: ep.runtime().ordinal(),
+                    num_experts: case.experts,
+                })
+                .expect("arm telemetry");
+            exec_eager(&ep, &kernel, &inputs, case).unwrap();
+
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            assert_eq!(snapshot.epoch(), 1, "M={rows}: arm opened window 1");
+            assert_eq!(
+                snapshot.count() as usize,
+                case.rows * case.top_k,
+                "M={rows}: count must equal rows*top_k"
+            );
+            assert_eq!(
+                snapshot.bitmap,
+                oracle_bitmap(&router, case),
+                "M={rows}: bitmap must match the CPU oracle"
+            );
+            assert!(!snapshot.poison(), "M={rows}: in-range routes never poison");
+            assert!(!snapshot.overflow(), "M={rows}: count never overflows");
+        }
+    }
+
+    /// Slice 7A G1 perf gate (issue #1810 §8). Measures the fused route-
+    /// telemetry overhead on a decode shape and decides GO/NO-GO for offering
+    /// production activation. Telemetry is default-OFF regardless of the
+    /// outcome; a NO-GO simply means the fused path is too expensive to ever
+    /// arm in production, so it is reported (not a hard failure) while the
+    /// correctness invariants (byte-identical output, fixed epoch within the
+    /// window) are asserted hard.
+    ///
+    /// Methodology mirrors the approved probe harness and cuda-perf-measurement:
+    ///   * The whole QMoE layer is CUDA-graph captured and measured via
+    ///     `replay_graph`, so host-enqueue gaps never leak into the GPU-event
+    ///     delta. The expert GEMMs are byte-identical off/on and cancel, so the
+    ///     off/on delta isolates the fused mark atomics ONLY (there is no reset
+    ///     kernel in the captured graph after the Cycle-22 revision).
+    ///   * BATCH=512 replays bracketed by CUDA events, >=3 runs, median.
+    ///   * ~8s clock ramp before timing, then a first-shape recheck at the end.
+    ///   * GPU-event time and host-enqueue time reported SEPARATELY (Trap 4).
+    ///
+    /// The 2% ratio is judged on a REALISTIC decode layer built from a real
+    /// model config (DeepSeek-V2-Lite: 64 experts, hidden=2048, top_k=6,
+    /// fast-filled weights) — measurement-discipline / requirement #8 forbid
+    /// drawing the ratio conclusion from tiny synthetic data. The tiny synthetic
+    /// shape is reported too, but only as an informational data point. No tok/s
+    /// or speedup is claimed.
+    #[test]
+    #[ignore = "Slice 7A G1 perf gate; requires a dedicated idle A100"]
+    fn microbench_fused_route_telemetry_g1_gate() {
+        struct G1 {
+            off_gpu: f64,
+            off_host: f64,
+            on_gpu: f64,
+            on_host: f64,
+            off_recheck: f64,
+            epoch: u32,
+            routed: usize,
+            count: u32,
+            poison: bool,
+            overflow: bool,
+            bitmap_bytes: usize,
+        }
+
+        /// Capture the whole QMoE layer OFF then ON and return the measured
+        /// deltas. Asserts the hard correctness invariants (byte-identical
+        /// output, fresh epoch, in-range routed set) itself.
+        fn measure(
+            ep: &CudaExecutionProvider,
+            inputs: &[Option<HostTensor>],
+            case: Case,
+            out_dtype: DataType,
+            out_elem_bytes: usize,
+            request_id: u32,
+            label: &str,
+        ) -> G1 {
+            const BATCH: usize = 512;
+            const RUNS: usize = 5;
+            let runtime = ep.runtime().clone();
+
+            // Concrete kernel (the arming API lives on `QMoEKernel`, not the
+            // boxed `dyn Kernel`).
+            let output_shape = [case.rows, case.hidden];
+            let (graph, node) = model_node(inputs, out_dtype, &output_shape, case);
+            let model = Model::new(&graph);
+            let concrete_shapes: Vec<_> = inputs
+                .iter()
+                .filter_map(|input| input.as_ref().map(|input| input.shape.clone()))
+                .collect();
+            let factory = QMoEFactory {
+                runtime: ep.runtime().clone(),
+            };
+            let kernel = factory
+                .create_kernel(model.graph.node(node), &concrete_shapes)
+                .expect("concrete QMoE kernel");
+
+            let buffers = upload_inputs(ep, inputs).unwrap();
+            let strides: Vec<_> = inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .as_ref()
+                        .map(|input| compute_contiguous_strides(&input.shape))
+                })
+                .collect();
+            let output_bytes = case.rows * case.hidden * out_elem_bytes;
+            let mut output_buffer = ep.allocate(output_bytes, 256).unwrap();
+            let output_strides = compute_contiguous_strides(&output_shape);
+
+            let run_once = |output_buffer: &mut DeviceBuffer| {
+                let views = views(inputs, &buffers, &strides, ep.device_id());
+                kernel
+                    .execute(
+                        &views,
+                        &mut [TensorMut::new(
+                            DevicePtrMut(output_buffer.as_mut_ptr()),
+                            out_dtype,
+                            &output_shape,
+                            &output_strides,
+                            ep.device_id(),
+                        )],
+                    )
+                    .expect("execute");
+                drop(views);
+            };
+            let dump_output = |output_buffer: &DeviceBuffer| -> Vec<u8> {
+                let mut bytes = vec![0u8; output_bytes];
+                // SAFETY: `output_buffer` was sized exactly `output_bytes`.
+                unsafe {
+                    runtime
+                        .dtoh(&mut bytes, cuptr(output_buffer.as_ptr()))
+                        .unwrap()
+                };
+                bytes
+            };
+
+            // --- Phase OFF: capture the disarmed layer, ramp, measure. ---
+            run_once(&mut output_buffer);
+            runtime.synchronize().unwrap();
+            assert!(
+                kernel.capture_support().is_supported(),
+                "{label} decode QMoE must warm its capture workspace before the perf gate"
+            );
+            runtime
+                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .unwrap();
+            run_once(&mut output_buffer);
+            runtime.end_graph_capture().unwrap();
+
+            let ramp_start = std::time::Instant::now();
+            while ramp_start.elapsed().as_secs_f64() < 8.0 {
+                for _ in 0..BATCH {
+                    runtime.replay_graph().unwrap();
+                }
+                runtime.synchronize().unwrap();
+            }
+            println!(
+                "clock ramp ({label} replay, telemetry off): {:.1}s",
+                ramp_start.elapsed().as_secs_f64()
+            );
+            let (off_gpu, off_host, _) = median_replay_us(&runtime, RUNS, BATCH);
+            let off_out = dump_output(&output_buffer);
+            runtime.reset_graph().unwrap();
+
+            // --- Phase ON: arm, re-warm + re-capture. After the Cycle-22
+            // revision the captured graph contains ONLY the fused route marks
+            // (no reset/epoch kernel), so the off/on delta isolates the mark
+            // atomics. ---
+            kernel
+                .arm_route_telemetry(RouteTelemetryConfig {
+                    request_id,
+                    device_id: runtime.ordinal(),
+                    num_experts: case.experts,
+                })
+                .expect("arm telemetry");
+            run_once(&mut output_buffer);
+            runtime.synchronize().unwrap();
+            let armed_ptr = kernel
+                .route_telemetry_bitmap_addr()
+                .expect("telemetry armed");
+            runtime
+                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .unwrap();
+            run_once(&mut output_buffer);
+            runtime.end_graph_capture().unwrap();
+            assert_eq!(
+                kernel.route_telemetry_bitmap_addr(),
+                Some(armed_ptr),
+                "{label}: telemetry pointer must not move across capture (no host realloc)"
+            );
+            let (on_gpu, on_host, _) = median_replay_us(&runtime, RUNS, BATCH);
+            let on_out = dump_output(&output_buffer);
+            let snapshot = kernel.route_telemetry_snapshot().unwrap().unwrap();
+            runtime.reset_graph().unwrap();
+
+            // First-shape recheck: disarm to a true OFF baseline, re-capture,
+            // re-measure to confirm the clock did not drift between phases.
+            kernel.disarm_route_telemetry();
+            run_once(&mut output_buffer);
+            runtime.synchronize().unwrap();
+            runtime
+                .begin_graph_capture(&[&kernel as &dyn Kernel])
+                .unwrap();
+            run_once(&mut output_buffer);
+            runtime.end_graph_capture().unwrap();
+            let (off_recheck, _, _) = median_replay_us(&runtime, RUNS, BATCH);
+            runtime.reset_graph().unwrap();
+
+            // Hard correctness invariants.
+            assert_eq!(
+                on_out, off_out,
+                "{label}: route outputs must be byte-identical with telemetry off vs on"
+            );
+            assert!(
+                snapshot.epoch() == 1,
+                "{label}: the epoch must stay FIXED at 1 across the whole \
+                 BATCH×RUNS replay window — a moving epoch would prove a \
+                 forbidden per-replay reset survived, got {}",
+                snapshot.epoch()
+            );
+            let routed = snapshot.routed_experts();
+            assert!(
+                !routed.is_empty() && routed.len() <= case.experts,
+                "{label}: armed replay must record an in-range routed set, got {routed:?}"
+            );
+
+            // Cleanup.
+            drop(strides);
+            for buffer in buffers.into_iter().flatten() {
+                ep.deallocate(buffer).unwrap();
+            }
+            ep.deallocate(output_buffer).unwrap();
+
+            G1 {
+                off_gpu,
+                off_host,
+                on_gpu,
+                on_host,
+                off_recheck,
+                epoch: snapshot.epoch(),
+                routed: routed.len(),
+                count: snapshot.count(),
+                poison: snapshot.poison(),
+                overflow: snapshot.overflow(),
+                bitmap_bytes: snapshot.bitmap.len() * 4,
+            }
+        }
+
+        fn report(label: &str, case: Case, m: &G1) -> bool {
+            let overhead_gpu = m.on_gpu - m.off_gpu;
+            let overhead_host = m.on_host - m.off_host;
+            let layer = m.off_gpu; // route + QMoE layer time (denominator)
+            let overhead_pct = if layer > 0.0 {
+                100.0 * overhead_gpu / layer
+            } else {
+                f64::INFINITY
+            };
+            let per_row = overhead_gpu / case.rows as f64;
+            let per_selected_expert = overhead_gpu / (case.rows * case.top_k) as f64;
+            let drift_pct = 100.0 * (m.off_recheck - m.off_gpu) / m.off_gpu;
+            let go = overhead_gpu <= 2.0 && overhead_pct <= 2.0;
+            println!(
+                "G1[{label} rows={} experts={} top_k={}]: \
+                 layer(off) GPU={:.3}us host={:.3}us | on GPU={:.3}us host={:.3}us | \
+                 OVERHEAD gpu={:.3}us ({:.2}% of layer) host-enqueue={:.3}us | \
+                 per-row={:.4}us per-selected-expert={:.4}us | \
+                 off-recheck GPU={:.3}us (clock drift {:.2}%) | \
+                 capture: epoch={} routed_experts={} count={} poison={} overflow={} bitmap_bytes={} | \
+                 output-identical=yes | GATE(<=2us AND <=2%): {}",
+                case.rows,
+                case.experts,
+                case.top_k,
+                m.off_gpu,
+                m.off_host,
+                m.on_gpu,
+                m.on_host,
+                overhead_gpu,
+                overhead_pct,
+                overhead_host,
+                per_row,
+                per_selected_expert,
+                m.off_recheck,
+                drift_pct,
+                m.epoch,
+                m.routed,
+                m.count,
+                m.poison,
+                m.overflow,
+                m.bitmap_bytes,
+                if go { "GO" } else { "NO-GO" },
+            );
+            go
+        }
+
+        let ep = require_cuda();
+
+        // (1) Tiny synthetic decode — informational only.
+        let tiny = telemetry_case(1);
+        let mut tiny_inputs = case_inputs(tiny, DataType::Float32);
+        tiny_inputs[1] = Some(rotated_router(tiny));
+        let tiny_m = measure(
+            &ep,
+            &tiny_inputs,
+            tiny,
+            DataType::Float32,
+            4,
+            7,
+            "tiny-synthetic",
+        );
+        let _ = report("tiny-synthetic (informational)", tiny, &tiny_m);
+
+        // (2) Realistic decode from a real model config — the GATE denominator.
+        let real = moe_bench_case(DEEPSEEK_V2_LITE_MOE, 1);
+        let real_inputs = fast_case_inputs(real, DataType::Float16);
+        let real_m = measure(
+            &ep,
+            &real_inputs,
+            real,
+            DataType::Float16,
+            2,
+            9,
+            "deepseek-v2-lite",
+        );
+        let go = report("deepseek-v2-lite decode (GATE)", real, &real_m);
+
+        println!(
+            "G1 DECISION: {} — fused route telemetry {} the decode gate on a realistic layer; \
+             telemetry remains default-OFF and crate-internal regardless (no public activation seam). \
+             No tok/s/speedup claimed (synthetic weights, single-layer microbench).",
+            if go { "GO" } else { "NO-GO" },
+            if go { "PASSES" } else { "FAILS" },
+        );
+    }
+}

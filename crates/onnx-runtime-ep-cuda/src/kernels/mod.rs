@@ -45,6 +45,7 @@ pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dropout;
 pub mod elementwise;
+pub mod expert_route_telemetry;
 mod flash_attention;
 pub mod fused_gelu;
 pub mod fused_gemm;
