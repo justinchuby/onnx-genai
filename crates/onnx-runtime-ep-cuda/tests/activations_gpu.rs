@@ -272,6 +272,10 @@ fn clip_optional_bounds_match_cpu_reference() {
 /// returns NaN, where the correct answer converges to x. The CPU kernel uses the
 /// overflow-stable form and the CUDA one must agree — a test that only probed
 /// small inputs would pass against the broken spelling.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn mish_matches_cpu_including_the_saturating_tail() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
