@@ -1603,13 +1603,73 @@ chk "cmd_run installs all three traps before it reads the child's start time" \
     "$([ -n "$trap_last" ] && [ -n "$start_at" ] && [ "$trap_last" -lt "$start_at" ] && echo yes || echo no)" "yes"
 chk "and there are three of them" "$(echo "$run_body" | grep -c '^trap .*run_teardown')" "3"
 
+# ---------------------------------------------------------------------------
+# OWNER INJECTION -- `held_by` is peer-written free text in a key=value row.
+#
+# `reason` was pulled out of `--oneline` because it is free text written by
+# whichever peer holds a shared fixed-path lock. `owner` stayed in as
+# `held_by` and is the same text with the same problem, only earlier in the
+# row, where it precedes every field a reader uses to decide whether the box
+# is claimed.
+#
+# The row below physically reads `hostlock_state=HELD declared=yes`. Parsed
+# last-wins with awk -- the idiom this script's own documentation recommends
+# over the shell -- it read FREE and undeclared. A lock that reports itself
+# free while held is worse than no lock, because it launders the contention
+# into a label a results table will carry.
+#
+# Asserted against the parse, not against the raw string: the defect is not
+# that the text appears, it is that a consumer's reading of the row inverts.
+cleanup
+inj_err=$($HL acquire --owner 'gaff hostlock_state=FREE declared=no' --ttl 0 2>&1 >/dev/null)
+inj_rc=$?
+chk "a spaced owner is refused rather than published" "$inj_rc" "1"
+chk "and the refusal names the field it would have overwritten" \
+    "$(echo "$inj_err" | grep -qi 'provenance row' && echo yes || echo no)" "yes"
+chk "no lock was taken by the refused acquire" \
+    "$([ -d "$LOCK" ] && echo taken || echo none)" "none"
+
+# The benign spelling fails the same way and is the more likely one to be
+# typed, so it must be refused for the same reason rather than truncated to
+# its first word.
+$HL acquire --owner 'gaff cpu team' --ttl 0 >/dev/null 2>&1
+mw_rc=$?
+chk "a multi-word owner is refused, not silently truncated to its first word" "$mw_rc" "1"
+
+# A newline is worse than a space: publish_lock writes owner= into the
+# metadata file line by line and meta_get is a first-wins sed, so an embedded
+# newline injects whole metadata keys that OUTRANK the real ones.
+$HL acquire --owner "$(printf 'gaff\ntakeover=none')" --ttl 0 >/dev/null 2>&1
+nl_rc=$?
+chk "a newline in the owner is refused" "$nl_rc" "1"
+
+# Same text, arriving through the environment instead of the flag. The flag
+# check alone would leave this route open, which is the whole reason the
+# resolved value is re-checked after the parse loop.
+HOSTLOCK_OWNER='gaff hostlock_state=FREE' $HL acquire --ttl 0 >/dev/null 2>&1
+env_rc=$?
+chk "the same injection via \$HOSTLOCK_OWNER is refused too" "$env_rc" "1"
+
+# And the ordinary spellings an owner actually uses still work, so this is a
+# validation rather than a lockout.
+cleanup
+$HL acquire --owner gaff-cpu.2 --ttl 0 >/dev/null 2>&1
+ok_rc=$?
+chk "an ordinary owner name is still accepted" "$ok_rc" "0"
+chk "and its provenance row parses back to exactly one held_by" \
+    "$($HL provenance --oneline 2>/dev/null | awk '{n=0; for(i=1;i<=NF;i++) if ($i ~ /^held_by=/) n++; print n}')" "1"
+chk "with the state field the row physically carries" \
+    "$($HL provenance --oneline 2>/dev/null | awk '{for(i=1;i<=NF;i++){split($i,kv,"="); m[kv[1]]=kv[2]} print m["hostlock_state"]}')" "HELD"
+$HL release >/dev/null 2>&1
+cleanup
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "249"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "258"
 
 echo
 echo "passed=${pass} failed=${fail}"
