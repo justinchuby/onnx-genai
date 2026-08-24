@@ -2454,6 +2454,7 @@ dependencies = [
  "half",
  "libloading 0.8.9",
  "onnx-genai-cuda-version-guard",
+ "onnx-genai-paged-attention",
  "onnx-runtime-cuda-memory",
  "onnx-runtime-ep-api",
  "onnx-runtime-ep-cpu",

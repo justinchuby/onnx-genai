@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
 
@@ -115,6 +115,46 @@ def is_cuda_test_target(target: str) -> bool:
         target not in ALWAYS_RUN
         and (target.endswith("_gpu") or target in CUDA_TARGETS_WITHOUT_SUFFIX)
     )
+
+
+@lru_cache(maxsize=1)
+def policed_cuda_targets_by_dir() -> dict[Path, tuple[Path, ...]]:
+    """The policed CUDA test targets, kept separated by the directory they came from.
+
+    The census needs per-directory counts, not a total. These crates have
+    split before -- the GPU tests moved out of the execution provider into
+    `onnx-runtime-cuda-memory`, which is why TEST_DIRS names two directories
+    -- and a total cannot distinguish "both present" from "one emptied and the
+    other still large enough to look healthy".
+
+    Cached, so the scans and the census read one enumeration rather than three
+    of their own. They already shared the filter, which is what stops the
+    census certifying a set the scans do not police; enumerating once makes
+    that true of the run and not only of the logic. Tuples because a cached
+    mutable result is a caller's mistake waiting to happen.
+    """
+    return {
+        test_dir: tuple(
+            path
+            for path in sorted(test_dir.glob("*.rs"))
+            if is_cuda_test_target(path.stem)
+        )
+        for test_dir in TEST_DIRS
+    }
+
+
+def policed_cuda_targets() -> list[Path]:
+    """Every CUDA test target the source scan is responsible for.
+
+    Both scans and the census enumerate through here rather than each globbing
+    for themselves. A census that walked its own copy of this loop could
+    disagree with the scans about what is in scope, and would then be
+    reporting on a set nobody checks -- so the enumeration is shared to make
+    that divergence unrepresentable rather than merely unlikely.
+    """
+    return [
+        path for targets in policed_cuda_targets_by_dir().values() for path in targets
+    ]
 
 
 # `ignore` as an attribute token, not as English. The first version of this
@@ -482,18 +522,15 @@ def scan_source_for_missing_ignores() -> list[str]:
     catches one specific recurring omission early.
     """
     errors: list[str] = []
-    for test_dir in TEST_DIRS:
-        for path in sorted(test_dir.glob("*.rs")):
-            if not is_cuda_test_target(path.stem):
-                continue
-            source = path.read_text(encoding="utf-8")
-            for line_number, name in un_ignored_tests(source):
-                errors.append(
-                    f"{path.relative_to(ROOT)}:{line_number}: {name} "
-                    "has no ignore attribute. Every test in a CUDA target must be ignored "
-                    "when gpu-tests is off, or it runs on a machine with no device: add "
-                    '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]'
-                )
+    for path in policed_cuda_targets():
+        source = path.read_text(encoding="utf-8")
+        for line_number, name in un_ignored_tests(source):
+            errors.append(
+                f"{path.relative_to(ROOT)}:{line_number}: {name} "
+                "has no ignore attribute. Every test in a CUDA target must be ignored "
+                "when gpu-tests is off, or it runs on a machine with no device: add "
+                '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")]'
+            )
     return errors
 
 
@@ -632,49 +669,81 @@ def scan_source_for_inventory_drift() -> list[str]:
     and all three are visible in the source.
     """
     errors: list[str] = []
-    for test_dir in TEST_DIRS:
-        for path in sorted(test_dir.glob("*.rs")):
-            if not is_cuda_test_target(path.stem):
+    for path in policed_cuda_targets():
+        relative = path.relative_to(ROOT)
+        source = path.read_text(encoding="utf-8")
+        gate = target_level_feature_gate(source)
+        if gate is not None:
+            errors.append(
+                f'{relative}:{gate}: the whole target is gated on feature "{GPU_TESTS_FEATURE}". '
+                "With the feature off the target holds no tests at all, so it cannot disagree "
+                "with the device suite and cannot go red. Gate the item that needs the feature "
+                "-- a two-arm shim over the gated helper keeps every test in both inventories."
+            )
+        for line_number in gpu_tests_gated_modules(source):
+            errors.append(
+                f'{relative}:{line_number}: this module is gated on feature "{GPU_TESTS_FEATURE}" '
+                "and contains tests, so those tests are absent from the inventory when the "
+                "feature is off. Gate the helper the module exists for, not the tests."
+            )
+        for item in test_items(source):
+            if not item.aligned:
+                # Masking is column-exact, so this cannot happen; if it
+                # ever does, report rather than trust a span mapping that
+                # has drifted -- the same disposition as `un_ignored_tests`.
+                errors.append(
+                    f"{relative}:{item.line}: {item.name} could not be parsed reliably "
+                    "(masked and raw text disagree in length); refusing to clear it."
+                )
                 continue
-            relative = path.relative_to(ROOT)
-            source = path.read_text(encoding="utf-8")
-            gate = target_level_feature_gate(source)
-            if gate is not None:
-                errors.append(
-                    f'{relative}:{gate}: the whole target is gated on feature "{GPU_TESTS_FEATURE}". '
-                    "With the feature off the target holds no tests at all, so it cannot disagree "
-                    "with the device suite and cannot go red. Gate the item that needs the feature "
-                    "-- a two-arm shim over the gated helper keeps every test in both inventories."
-                )
-            for line_number in gpu_tests_gated_modules(source):
-                errors.append(
-                    f'{relative}:{line_number}: this module is gated on feature "{GPU_TESTS_FEATURE}" '
-                    "and contains tests, so those tests are absent from the inventory when the "
-                    "feature is off. Gate the helper the module exists for, not the tests."
-                )
-            for item in test_items(source):
-                if not item.aligned:
-                    # Masking is column-exact, so this cannot happen; if it
-                    # ever does, report rather than trust a span mapping that
-                    # has drifted -- the same disposition as `un_ignored_tests`.
-                    errors.append(
-                        f"{relative}:{item.line}: {item.name} could not be parsed reliably "
-                        "(masked and raw text disagree in length); refusing to clear it."
-                    )
-                    continue
-                if not feature_gated_attribute(item.masked_head, item.raw_head):
-                    continue
-                errors.append(
-                    f'{relative}:{item.line}: {item.name} is gated on feature "{GPU_TESTS_FEATURE}", '
-                    "so it is absent from the inventory when the feature is off. Use "
-                    '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")] '
-                    "to keep the test present and skipped rather than deleted."
-                )
+            if not feature_gated_attribute(item.masked_head, item.raw_head):
+                continue
+            errors.append(
+                f'{relative}:{item.line}: {item.name} is gated on feature "{GPU_TESTS_FEATURE}", '
+                "so it is absent from the inventory when the feature is off. Use "
+                '#[cfg_attr(not(feature = "gpu-tests"), ignore = "requires CUDA device")] '
+                "to keep the test present and skipped rather than deleted."
+            )
     for manifest_path, target in targets_with_required_features():
         errors.append(
             f"{manifest_path.relative_to(ROOT)}: test target {target} sets required-features, "
             "so it is not built at all in the base configuration and its tests are missing from "
             "that inventory. Build the target unconditionally and ignore its tests instead."
+        )
+    return errors
+
+
+def census_errors(by_dir: Mapping[Path, Sequence[Path]]) -> list[str]:
+    """Every policed directory must have contributed something to scan.
+
+    Both source scans report per-target, so a directory with no targets
+    produces no findings and reads as clean -- which is the second shape of
+    the #1875 defect (tests leave the inventory, the lane goes green because
+    the tests are not there) at directory granularity. A guard keyed on the
+    scans' findings cannot see it, because the fault removes the things the
+    guard reads.
+
+    The check is per-directory rather than on the total. An aggregate
+    non-empty test only defends the all-or-nothing case: with 61 targets in
+    one directory and 21 in the other, deleting the larger leaves the total
+    comfortably non-zero and the gate reports a confident pass over the
+    remainder. The crates have already split once for exactly this kind of
+    reason, so a move that lands one directory somewhere TEST_DIRS does not
+    point at is the realistic version of this fault, not the exotic one.
+
+    A missing directory contributes nothing and so fails here too, which is
+    the intent: TEST_DIRS is a constant in this file and the crate layout
+    around it is not, so the constant going stale must be loud.
+    """
+    errors: list[str] = []
+    for test_dir, targets in by_dir.items():
+        if targets:
+            continue
+        errors.append(
+            f"{test_dir.relative_to(ROOT)} contributed no CUDA test targets to the scan. "
+            "Either it was deleted, or the crate layout moved and TEST_DIRS in this script "
+            "is now pointing at nothing. Every per-target check is vacuous for this "
+            "directory until that is resolved."
         )
     return errors
 
@@ -1237,6 +1306,30 @@ def self_test() -> None:
     if not any("passed with gpu-tests" in error for error in validate_active_no_cuda_result(silent_with_feature)):
         raise AssertionError("gpu-tests-enabled silent pass should fail")
 
+    # Census fixtures. The two scans above are per-target and report nothing
+    # when there are no targets, so `--source-scan` used to exit 0 with the
+    # CUDA tests directory deleted -- reporting success for the inventory
+    # disappearance it is partly there to catch.
+    #
+    # These are pure: they pass literal mappings rather than reading the tree,
+    # so `--self-test` stays hermetic and the partial case below is expressible
+    # at all. It is not otherwise, since it needs one directory populated and
+    # one empty at the same instant.
+    ep_dir, memory_dir = TEST_DIRS
+    healthy = {ep_dir: [ep_dir / "matmul_gpu.rs"], memory_dir: [memory_dir / "pool_gpu.rs"]}
+    if census_errors(healthy):
+        raise AssertionError("a populated census is the healthy case and must not be flagged")
+    if len(census_errors({ep_dir: [], memory_dir: []})) != 2:
+        raise AssertionError("a wholly empty census must fail once per policed directory")
+    # The case an aggregate non-empty check cannot see: one directory emptied
+    # while the other still holds enough targets to look healthy. This is the
+    # realistic shape -- these crates have split once already.
+    partial = census_errors({ep_dir: [ep_dir / "matmul_gpu.rs"], memory_dir: []})
+    if len(partial) != 1 or str(memory_dir.relative_to(ROOT)) not in partial[0]:
+        raise AssertionError(
+            "one emptied directory must fail and must name itself, even while the other is full"
+        )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -1254,19 +1347,34 @@ def main() -> int:
         return 0
 
     if args.source_scan:
-        source_errors = scan_source_for_missing_ignores() + scan_source_for_inventory_drift()
+        by_dir = policed_cuda_targets_by_dir()
+        policed = [path for targets in by_dir.values() for path in targets]
+        source_errors = (
+            scan_source_for_missing_ignores()
+            + scan_source_for_inventory_drift()
+            + census_errors(by_dir)
+        )
         if source_errors:
             print("CUDA test source scan failed:", file=sys.stderr)
             for error in source_errors:
                 print(f"  - {error}", file=sys.stderr)
             return 1
         print(
-            "CUDA test source scan passed: every test in a CUDA target carries an ignore "
-            "and is present with gpu-tests off"
+            f"CUDA test source scan passed over {len(policed)} CUDA test targets: "
+            "every test carries an ignore and is present with gpu-tests off"
         )
         return 0
 
-    errors: list[str] = scan_source_for_missing_ignores() + scan_source_for_inventory_drift()
+    # The census runs here too, not just under --source-scan. The inventory
+    # guard below keys on what Cargo reported; this one keys on what this
+    # script's own TEST_DIRS found. A crate layout that moved out from under
+    # TEST_DIRS leaves Cargo reporting tests normally while both source scans
+    # silently examine nothing, and only this catches that.
+    errors: list[str] = (
+        scan_source_for_missing_ignores()
+        + scan_source_for_inventory_drift()
+        + census_errors(policed_cuda_targets_by_dir())
+    )
     for crate in CUDA_CRATES:
         manifest = (crate / "Cargo.toml").read_text(encoding="utf-8")
         if not declares_gpu_tests_feature(manifest):

@@ -79,6 +79,7 @@ pub mod normalization;
 pub mod onehot;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub mod paged_attention;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;
@@ -210,6 +211,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Attention",
     "GroupQueryAttention",
     "MultiHeadAttention",
+    "PagedAttention",
     "RotaryEmbedding",
     "Softmax",
     "LayerNormalization",
@@ -503,6 +505,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("Attention", _)
         | ("GroupQueryAttention", _)
         | ("MultiHeadAttention", _)
+        | ("PagedAttention", _)
         | ("PackedVarlenAttention", _)
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
@@ -1299,6 +1302,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("PagedAttention", "com.microsoft", 1),
+        Box::new(paged_attention::PagedAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
