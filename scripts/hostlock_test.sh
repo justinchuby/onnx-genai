@@ -315,11 +315,11 @@ chk "takeover of a live holder warns loudly" "$(echo "$out" | grep -c 'WARNING')
 cleanup
 
 echo "== run: releases on every exit path =="
-$HL run --owner leon -- true >/dev/null 2>&1
+$HL run --owner leon --reason "run releases" -- true >/dev/null 2>&1
 chk "released after success" "$(st state)" "FREE"
 
 rc=0
-$HL run --owner leon -- bash -c 'exit 42' >/dev/null 2>&1 || rc=$?
+$HL run --owner leon --reason "run propagates status" -- bash -c 'exit 42' >/dev/null 2>&1 || rc=$?
 chk "propagates the command's exit code" "$rc" "42"
 chk "released after failure" "$(st state)" "FREE"
 
@@ -369,7 +369,7 @@ echo "== run does not clobber a successor's lock =="
 # legitimately took over, finishing the command deleted THEIR live lock and
 # the next acquirer was handed a host two people were already using.
 cleanup
-$HL run --owner leon --ttl 2 -- sleep 8 >/dev/null 2>&1 &
+$HL run --owner leon --reason "ttl holder" --ttl 2 -- sleep 8 >/dev/null 2>&1 &
 runner=$!
 sleep 4
 $HL acquire --owner roy --ttl 600 >/dev/null 2>&1
@@ -1099,7 +1099,7 @@ chk "wait expiry on acquire fails closed (3)" \
 chk "and the incumbent still holds it" "$(st owner)" "alice"
 chk "and is genuinely still alive, not merely named" "$(st state)" "HELD"
 chk "run inherits the same failure, it does not run the command" \
-    "$($HL run --owner leon --timeout 6 -- bash -c 'echo RAN' 2>/dev/null | grep -c RAN)" "0"
+    "$($HL run --owner leon --reason "blocked run" --timeout 6 -- bash -c 'echo RAN' 2>/dev/null | grep -c RAN)" "0"
 sig "$h" 9
 wait "$h" 2>/dev/null
 cleanup
@@ -1429,7 +1429,7 @@ while time.time() - t < 1.5:
 # Measure first, judge second. `run` without a threshold still emits the
 # number, which is what makes this possible at all.
 out=$($HL run --owner leon --reason "cpu probe" --expect-cores 1 -- python3 -c "$busy1s" 2>&1)
-eff_user=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+eff_user=$(echo "$out" | sed -n 's/.*efficiency_frac=\([0-9.]*\).*/\1/p' | head -1)
 chk "the efficiency of a real run is measured, not labelled" \
     "$(awk -v e="${eff_user:-0}" 'BEGIN { print (e > 0 && e <= 1.05) ? "plausible" : "implausible" }')" \
     "plausible"
@@ -1467,7 +1467,7 @@ while time.time() - t < 1.5:
 # survives a busy box while still collapsing to ~0.23 the moment kernel time
 # stops being counted.
 out=$($HL run --owner leon --reason "cpu sys" --expect-cores 1 -- python3 -c "$syscall1s" 2>&1)
-eff_sys=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+eff_sys=$(echo "$out" | sed -n 's/.*efficiency_frac=\([0-9.]*\).*/\1/p' | head -1)
 chk "a run whose time is mostly kernel time still counts as using its core" \
     "$(awk -v s="${eff_sys:-0}" -v u="${eff_user:-1}" 'BEGIN { print (u > 0 && s / u >= 0.7) ? "counted" : "under-measured" }')" \
     "counted"
@@ -1521,6 +1521,116 @@ chk "--expect-cores is refused outside run" "$rc" "1"
 out=$($HL acquire --owner leon --min-efficiency 0.5 --expect-cores 1 2>&1); rc=$?
 chk "--min-efficiency is refused outside run" "$rc" "1"
 chk "and refusing it did not leave a lock" "$(st state)" "FREE"
+cleanup
+
+echo "-- R2c: the measurement names its unit, and a bound inside the command is not a ceiling --"
+# Three properties, each of which was believed to hold and did not.
+#
+# (a) `efficiency` was one field name for two quantities: CPU-seconds per wall
+#     second without a denominator, and the fraction of --expect-cores held
+#     with one. They differ by a factor of N for the SAME run, so a log mixing
+#     both is not comparable to itself, and neither reading announces which it
+#     is. The field now names its unit.
+#
+# (b) CPU accounting covers this shell's whole child tree, so a `taskset`
+#     applied INSIDE the wrapped command bounds only its own descendants
+#     while everything else in the tree is still counted. The measurement is
+#     then a superset of what the bound constrains and legitimately exceeds
+#     it. This is asserted rather than documented alone because the figure it
+#     produces invites the conclusion "affinity leaked" -- an alarm actually
+#     raised, and retracted, on this host.
+#
+# (c) `run` accepted a missing or whitespace-only --reason silently. It works
+#     perfectly for the person who started it and tells whoever it blocks
+#     nothing, which is the failure mode that does not announce itself.
+cleanup
+# (a) needs no bound at all: which name is printed is a function of whether a
+# denominator was given, not of the value or of how the work was placed. So
+# assert the naming unguarded, and spend the taskset-dependent budget on (b).
+spin2='for i in 1 2; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
+out=$($HL run --owner leon --reason "unit naming, undenominated" -- bash -c "$spin2" 2>&1)
+chk "without --expect-cores the field is named in cores" \
+    "$(echo "$out" | grep -c 'efficiency_cores=')" "1"
+# The denominator changes the quantity, not merely its scale -- the same run
+# reads N times larger undenominated -- so the two forms must not share a name,
+# and the unused one must be absent rather than also printed.
+out=$($HL run --owner leon --reason "unit naming, denominated" --expect-cores 1 -- \
+    bash -c "$spin2" 2>&1)
+chk "with --expect-cores the field is named as a fraction" \
+    "$(echo "$out" | grep -c 'efficiency_frac=')" "1"
+chk "and the cores-form field is then absent, so neither can be misread" \
+    "$(echo "$out" | grep -c 'efficiency_cores=')" "0"
+
+# (b) needs a real bound. Bind to a cpu this process is actually ALLOWED to
+# use, read from the kernel rather than assumed: `taskset -c 0` fails outright
+# when the suite is itself run under an outer bind (`taskset -c 16-23 ...`),
+# which is exactly the placement this PR's docs now tell people to use. A
+# hardcoded cpu would make the recommended invocation the one that breaks.
+bind_cpu=$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status 2>/dev/null \
+    | tr ',' '\n' | head -1 | cut -d- -f1)
+if ! command -v taskset >/dev/null 2>&1 || [ -z "$bind_cpu" ]; then
+    echo "  SKIP  taskset or Cpus_allowed_list unavailable; cannot place a bounded probe"
+    # A SKIP must not silently reduce the assertion count -- the pinned total
+    # at the end of this file is only as strong as the invariance of that
+    # total. Assert the weaker structural things that hold with no bound
+    # available, so the count is the same on both branches.
+    out=$($HL run --owner leon --reason "unbounded fallback" -- bash -c "$spin2" 2>&1)
+    chk "the cores-form field is still a number when no bound can be applied" \
+        "$(echo "$out" | grep -c 'efficiency_cores=[0-9]')" "1"
+    chk "and the run still reports the wall and cpu the figure came from" \
+        "$(echo "$out" | grep -c 'wall=[0-9].*cpu=[0-9]')" "1"
+else
+    # Two spinners under a 1-cpu bound, applied OUTERMOST so it covers every
+    # process the accounting can see. The figure then cannot exceed 1 core no
+    # matter what else is on this box: that is a physical ceiling, not a
+    # quiet-host assumption, which is what makes it safe to assert here.
+    out=$($HL run --owner leon --reason "bound outermost" -- \
+        taskset -c "$bind_cpu" bash -c "$spin2" 2>&1)
+    outer=$(echo "$out" | sed -n 's/.*efficiency_cores=\([0-9.]*\).*/\1/p' | head -1)
+    chk "and a bound applied outermost cannot exceed its bound" \
+        "$(awk -v e="${outer:-99}" 'BEGIN { print (e <= 1.05) ? "yes" : "no" }')" "yes"
+
+    # Same bound, same spinners, but the taskset is applied INSIDE, with four
+    # more spinners outside it in the same tree. If the accounting covered only
+    # the bounded set this would also report <= ~1 core; it does not, because
+    # it covers the tree. The direction is what is asserted, not a magnitude.
+    #
+    # The 1.05 floor is not a quiet-host assumption: six runnable spinners on
+    # this host are granted 6/R of its cpus under CFS, so this fails only if R
+    # exceeds roughly 6*ncpu/1.05 -- a load average in the hundreds. It is
+    # stated that way rather than as "the host was quiet", which is a claim
+    # nobody here can make: an unannounceable co-tenant is always possible.
+    inside='taskset -c '"$bind_cpu"' bash -c '"'"'for i in 1 2; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'"'"' & for i in 1 2 3 4; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
+    out=$($HL run --owner leon --reason "bound inside" -- bash -c "$inside" 2>&1)
+    inner=$(echo "$out" | sed -n 's/.*efficiency_cores=\([0-9.]*\).*/\1/p' | head -1)
+    chk "but a bound applied inside the command does not cap the measurement" \
+        "$(awk -v e="${inner:-0}" 'BEGIN { print (e > 1.05) ? "yes" : "no" }')" "yes"
+fi
+cleanup
+
+# A `run` holds the host while its owner is elsewhere. The reason is the only
+# thing the lock can tell whoever it blocks, and unlike an announcement it
+# survives the announcer's death -- so an empty one must fail, not default.
+rm -f "$LOCK.ran"
+out=$($HL run --owner leon -- touch "$LOCK.ran" 2>&1); rc=$?
+chk "a run with no reason is a usage error" "$rc" "1"
+chk "and that run's command never ran" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
+chk "and no lock was left behind" "$(st state)" "FREE"
+rm -f "$LOCK.ran"
+out=$($HL run --owner leon --reason "   " -- touch "$LOCK.ran" 2>&1); rc=$?
+chk "a whitespace-only reason is refused too, not treated as text" "$rc" "1"
+chk "and that command never ran either" "$([ -e "$LOCK.ran" ] && echo ran || echo no)" "no"
+# ...but it must remain settable out of band, or automation cannot comply.
+out=$(HOSTLOCK_REASON="from the environment" $HL run --owner leon -- true 2>&1); rc=$?
+chk "\$HOSTLOCK_REASON satisfies the requirement" "$rc" "0"
+chk "and is the text that gets published to whoever is blocked" \
+    "$(echo "$out" | grep -c 'from the environment')" "1"
+# `acquire` is deliberately NOT covered by this: it is the half of the
+# acquire/release pair, and requiring it there would break every caller that
+# brackets its own command without changing what a blocked reader can see.
+out=$($HL acquire --owner leon 2>&1); rc=$?
+chk "acquire still does not require a reason" "$rc" "0"
+$HL release --owner leon >/dev/null 2>&1
 cleanup
 
 echo "-- R7: the lock never kills anything it did not start --"
@@ -1663,13 +1773,13 @@ chk "with the state field the row physically carries" \
 $HL release >/dev/null 2>&1
 cleanup
 
-# Finally, pin the assertion count itself. Two of the checks in this file sit
-# behind environment probes, and an assertion that quietly stops running is
+# Finally, pin the assertion count itself. Several of the checks in this file
+# sit behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
-# Both probe branches now assert something, so the total is invariant across
+# Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "258"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "271"
 
 echo
 echo "passed=${pass} failed=${fail}"
