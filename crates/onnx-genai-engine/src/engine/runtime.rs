@@ -3220,24 +3220,36 @@ mod tests {
         Ok(())
     }
 
-    /// The accept-direction control for the tensor-binding branch, which had
-    /// neither direction under test.
+    /// The accept direction for a tensor-bound request: it is admitted, and it
+    /// signals admission exactly once.
     ///
-    /// `on_admitted` carries two different contracts at that call site, and
-    /// this is where they came apart. To the engine it means "the scheduler
-    /// admitted this" -- which is false there, because the branch takes no
-    /// reservation and calls no `complete()`. To the server it means "you may
-    /// begin streaming": `run_generation`'s success arm never touches the
-    /// admission sender (only its error arm does), so this callback is the
-    /// *only* thing that ever resolves that oneshot with `Ok` on a request
-    /// that succeeds. Drop the call and every successful tensor-bound request
-    /// becomes a 500 at the awaiting end while the generation itself completes
-    /// perfectly.
+    /// `on_admitted` carries two contracts at that call site. To the server it
+    /// means "you may begin streaming": `run_generation`'s success arm never
+    /// touches the admission sender (only its error arm does), so this callback
+    /// is the *only* thing that ever resolves that oneshot with `Ok` on a
+    /// request that succeeds. Drop the call and every successful tensor-bound
+    /// request becomes a 500 at the awaiting end while the generation itself
+    /// completes perfectly. To the engine it means "the scheduler admitted
+    /// this".
     ///
-    /// That asymmetry is why the obvious falsifier is the wrong one. Asserting
-    /// `!admitted` here encodes the engine contract, passes under the change
-    /// that deletes the call, and therefore goes green exactly when serving
-    /// breaks. This asserts the contract a mutation can actually violate.
+    /// #1964 added this test when those two had come apart: the branch fired
+    /// the callback without taking a reservation, so the engine contract was
+    /// false and only the server one held. #1891 closed that, and the test is
+    /// kept because it now pins *both* -- which is strictly more than it could
+    /// pin before, and it is the only guard on the server-facing half.
+    ///
+    /// The asymmetry #1964 identified is why the obvious falsifier is still the
+    /// wrong one. Asserting `!admitted` passes under the change that deletes
+    /// the call, and therefore goes green exactly when serving breaks. This
+    /// asserts the contract a mutation can actually violate.
+    ///
+    /// The budget is the load-bearing number: it must leave room, or the
+    /// request is now refused and never reaches the callback at all. That is
+    /// itself the discriminator between the two behaviours -- shrink it to `1`
+    /// and this test passes on the pre-#1891 branch and fails after it, which
+    /// is how the fix was verified rather than assumed. Its sibling
+    /// [`a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission`]
+    /// owns the refuse direction.
     ///
     /// Limitation, stated rather than implied: this fixture's interpreted
     /// decoder cannot complete a generation, so what is pinned is that the
@@ -3247,8 +3259,10 @@ mod tests {
     /// interpreter can finish, and that fixture does not exist yet.
     #[cfg(feature = "native-backend")]
     #[test]
-    fn a_tensor_bound_request_signals_admission_even_though_it_takes_no_reservation()
-    -> anyhow::Result<()> {
+    fn a_tensor_bound_request_signals_admission_exactly_once() -> anyhow::Result<()> {
+        // Room for the request: after #1891 a tensor-bound request takes a real
+        // reservation, so a budget that refuses it would never reach the
+        // callback this test exists to pin.
         let mut engine = interpreted_engine_with_byte_budget(20)?;
         assert!(!engine.holds_decode_core());
 
