@@ -9,6 +9,7 @@ members = [
     "crates/onnx-genai-comfyui-config",
     "crates/onnx-genai-runtime-config",
     "crates/onnx-genai-kv",
+    "crates/onnx-genai-paged-attention",
     "crates/onnx-genai-scheduler",
     "crates/onnx-genai-engine",
     "crates/onnx-genai-ort",

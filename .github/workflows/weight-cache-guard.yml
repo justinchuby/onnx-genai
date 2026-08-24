@@ -65,6 +65,23 @@ name: Weight cache guard
 #
 # `OnceLock<Instant>` and `OnceLock<()>`, also added by #1132, are correctly not
 # matched: the patterns require an owned growable payload.
+#
+# 2026-08-24: a fourth instance, and this one is in the plumbing rather than the
+# pattern. Both jobs ended their pipeline with `|| true`, which is genuinely
+# required -- `grep` exits 1 when nothing matches, and nothing matching is the
+# success case. But `|| true` does not distinguish "the matcher found nothing"
+# from "the producer never ran": a `git diff` that cannot resolve BASE_SHA exits
+# 128, `set -o pipefail` faithfully reports it, and `|| true` then discards it.
+# The job prints "No new ungoverned long-lived buffers." and goes green.
+# Verified by substituting a bogus base SHA -- the guard passes.
+#
+# This is the same shape as the three failures above, one layer down. Each time
+# the guard reported zero findings, and each time zero meant "I could not see",
+# not "there is nothing there". A guard whose silence is indistinguishable from
+# its success has no negative control, so the diff is now resolved on its own
+# and its status is allowed to stand: `git diff` exits 0 whether or not there
+# are differences and non-zero only on error, so the two cases separate cleanly
+# without changing which lines the guard flags.
 
 on:
   pull_request:
@@ -100,9 +117,16 @@ jobs:
           # `OnceLock<Mutex<Vec<Observation>>>` in `src/dispatch_ledger.rs` and
           # this job reported success because the file sat one directory outside
           # the old filter.
-          added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
-                    -- crates/onnx-runtime-ep-cpu/src \
-                    ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
+          if ! diff_out=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
+                            -- crates/onnx-runtime-ep-cpu/src \
+                            ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs'); then
+            echo "::error::Could not diff $BASE_SHA..$HEAD_SHA over crates/onnx-runtime-ep-cpu/src."
+            echo "::error::The guard cannot report on a diff it did not produce. Failing"
+            echo "::error::rather than reporting the empty result as 'no findings'."
+            exit 1
+          fi
+
+          added=$(printf '%s\n' "$diff_out" \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
                   | grep -E 'OnceLock *<.*(Vec|Arc|Packed|Cache|Shard)|OnceCell *<.*(Vec|Arc|Packed|Cache|Shard)|LazyLock *< *.*Cache' \
@@ -162,9 +186,16 @@ jobs:
           # (3 occurrences at the time of writing), so flagging it is cheap.
           # Scoped to the whole crate `src` for the same reason as the job above:
           # a retained buffer is no less retained for living outside `kernels/`.
-          added=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
-                    -- crates/onnx-runtime-ep-cpu/src \
-                    ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs' \
+          if ! diff_out=$(git diff --unified=0 "$BASE_SHA" "$HEAD_SHA" \
+                            -- crates/onnx-runtime-ep-cpu/src \
+                            ':(exclude)crates/onnx-runtime-ep-cpu/src/kernels/governed_weight_cache.rs'); then
+            echo "::error::Could not diff $BASE_SHA..$HEAD_SHA over crates/onnx-runtime-ep-cpu/src."
+            echo "::error::The guard cannot report on a diff it did not produce. Failing"
+            echo "::error::rather than reporting the empty result as 'no findings'."
+            exit 1
+          fi
+
+          added=$(printf '%s\n' "$diff_out" \
                   | grep -E '^\+' \
                   | grep -vE '^\+\+\+' \
                   | grep -E '(RefCell|Cell) *< *(Vec|Box|Arc)' \

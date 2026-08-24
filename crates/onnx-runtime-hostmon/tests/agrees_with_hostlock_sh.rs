@@ -298,3 +298,47 @@ fn the_reader_and_the_script_agree_that_a_zombie_anchor_is_dead() {
 
     corpse.wait().expect("reap");
 }
+
+/// The two implementations must look in the same place.
+///
+/// Every other test in this file overrides `HOSTLOCK_DIR`, because a test that
+/// could release a colleague's lock is worse than no test -- which means the
+/// default path, the one every real run uses, is the single value that all the
+/// other agreement checks are structurally unable to see. If the script's
+/// default moved and the reader's did not, the reader would find no metadata
+/// file, report `free`, and every row would carry a confident `host_lock=free`
+/// on a locked host. That failure is silent in the direction that permits a
+/// run, so it is asserted here from the script's own text rather than trusted.
+#[test]
+fn the_default_lock_dir_matches_the_script() {
+    let text = std::fs::read_to_string(script()).expect("read hostlock.sh");
+    let assignments: Vec<&str> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("LOCK_DIR="))
+        .collect();
+    // Exactly one, not "the first one". Shell takes the last assignment that
+    // executes; this test takes the first that appears. Where those differ the
+    // test would read a decoy and pass while the two implementations disagreed
+    // -- checking nothing, and reporting it as agreement. Rather than model
+    // shell control flow, refuse to answer when the question is ambiguous.
+    let n = assignments.len();
+    assert_eq!(
+        n, 1,
+        "hostlock.sh must assign LOCK_DIR exactly once, found {n}: {assignments:?}. More than one \
+         assignment means this test cannot tell which default is the effective one, and guessing \
+         would let it pass while the reader looked somewhere the script never writes",
+    );
+    let line = assignments[0];
+    let default = line
+        .split_once(":-")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(value, _)| value.to_string())
+        .expect("LOCK_DIR must have a `${HOSTLOCK_DIR:-<default>}` shape");
+
+    assert_eq!(
+        default,
+        onnx_runtime_hostmon::hostlock::DEFAULT_LOCK_DIR,
+        "the reader looks in a different directory than the script writes to, so it would report \
+         `free` on a held host"
+    );
+}

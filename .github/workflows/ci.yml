@@ -352,6 +352,23 @@ jobs:
       - name: Check documented environment variables are implemented
         run: python3 .github/scripts/verify_documented_env_vars.py
 
+      # A `#[test]` added to a CUDA target without an ignore runs on every
+      # machine that has no GPU. The authoritative check for this is
+      # verify_cuda_test_honesty.py, but it needs two full CUDA test builds and
+      # so runs only on the CUDA lane -- which means an author learns about it
+      # after merge, and only if that lane is green enough to be believed. It
+      # was not: five such tests landed in three days (#1875, #1881, #1911,
+      # #1909), each one reported by a lane already red for another reason.
+      # This is the same rule read off the source in under a second, with no
+      # CUDA toolchain, so every pull request gets the signal. It supplements
+      # the inventory check and does not replace it -- it cannot see
+      # macro-expanded tests, nor inventory parity between feature configs.
+      - name: Check CUDA test source scan can still detect (self-test)
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
+
+      - name: Check every CUDA test carries an ignore
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.

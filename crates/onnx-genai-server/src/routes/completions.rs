@@ -152,22 +152,17 @@ async fn run_completion(
     let requested_logprobs = request.logprobs;
     let tokenizer = handle.tokenizer.clone();
     let prepared = prepare_completion(&request, &handle)?;
-    enforce_context_cap(
-        prepared.prompt_tokens,
-        request.max_tokens,
-        handle.model_max_context,
-    )?;
-    let generation = submit_completion(
-        &handle,
-        &state.sessions,
-        prepared.generation,
-        client_session_id.as_deref(),
-    )
-    .await?;
+    let conversational =
+        conversational_session_id(&prepared.generation, client_session_id.as_deref());
+    let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
+    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
+    let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     let result = collect_generation_result(generation.events)
         .await
         .map_err(generation_failure)?;
-    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
         .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
@@ -184,9 +179,9 @@ async fn run_completion(
             logprobs,
         }],
         usage: Usage {
-            prompt_tokens: prepared.prompt_tokens,
+            prompt_tokens,
             completion_tokens,
-            total_tokens: prepared.prompt_tokens + completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
         },
     })
 }
@@ -208,21 +203,16 @@ async fn stream_completion(
         .map(StopInput::into_texts)
         .unwrap_or_default();
     let prepared = prepare_completion(&request, &handle)?;
-    enforce_context_cap(
-        prepared.prompt_tokens,
-        request.max_tokens,
-        handle.model_max_context,
-    )?;
-    let generation = submit_completion(
-        &handle,
-        &state.sessions,
-        prepared.generation,
-        client_session_id.as_deref(),
-    )
-    .await?;
+    let conversational =
+        conversational_session_id(&prepared.generation, client_session_id.as_deref());
+    let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
+    enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
+    let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
+    let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
     tokio::spawn(async move {
@@ -416,21 +406,25 @@ async fn run_chat_completion(
     } else {
         None
     };
+    // The conversation is counted before admission, because the tokens this
+    // turn is prefilled with are the conversation plus the request. The session
+    // itself is opened after, so a rejected request neither strands one nor
+    // evicts somebody else's on its way in.
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
-        prepared.prompt_tokens,
+        prompt_tokens,
         output_budget,
         handle.model_max_context,
     )?;
-    let prompt_tokens = prepared.prompt_tokens;
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
-    let session_lookup = if let Some(id) = client_session_id.as_deref() {
-        Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
-    } else {
-        None
-    };
+    let session_lookup =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
 
     let session_for_count = session_lookup;
     let wants_constrained_json = request.wants_constrained_json();
@@ -444,7 +438,7 @@ async fn run_chat_completion(
     let result = collect_generation_result(generation.events)
         .await
         .map_err(generation_failure);
-    crate::metrics::add_prompt_tokens(prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
         Some(
@@ -583,9 +577,12 @@ async fn stream_chat_completion(
     } else {
         None
     };
+    let carried_tokens =
+        carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
-        prepared.prompt_tokens,
+        prompt_tokens,
         output_budget,
         handle.model_max_context,
     )?;
@@ -594,11 +591,9 @@ async fn stream_chat_completion(
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
-    let session_lookup = if let Some(id) = client_session_id.as_deref() {
-        Some(get_or_create_session(&handle.engine, &state.sessions, id).await?)
-    } else {
-        None
-    };
+    let session_lookup =
+        open_session_after_admission(&handle, &state.sessions, client_session_id.as_deref())
+            .await?;
     // One submission. The driver resolves how to execute it from the runtime it
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
@@ -608,7 +603,7 @@ async fn stream_chat_completion(
         .map_err(map_generate_submit_error)?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(prepared.prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
@@ -1252,6 +1247,65 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
+/// What the session contributes to context accounting and prefill work, without
+/// opening a session.
+///
+/// A session is deliberately *not* created here. A request that then fails
+/// admission would leave an engine session nobody uses, and — once the registry
+/// is full — would evict and close another client's live conversation on its way
+/// in. The session is opened after admission, by the submit path.
+async fn carried_session_tokens(
+    handle: &ModelHandle,
+    sessions: &SessionRegistry,
+    client_session_id: Option<&str>,
+) -> Result<onnx_genai_engine::SessionPrefillCarry, ApiError> {
+    let Some(client_id) = client_session_id else {
+        return Ok(onnx_genai_engine::SessionPrefillCarry::default());
+    };
+    let Some(session_id) = sessions
+        .get(client_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
+    else {
+        return Ok(onnx_genai_engine::SessionPrefillCarry::default());
+    };
+    handle
+        .engine
+        .session_prefill_carry(session_id)
+        .await
+        .map_err(|err| ApiError::internal(format!("session prefill carry failed: {err}")))
+}
+
+/// Open the client's session once the request has been admitted.
+async fn open_session_after_admission(
+    handle: &ModelHandle,
+    sessions: &SessionRegistry,
+    client_session_id: Option<&str>,
+) -> Result<Option<SessionId>, ApiError> {
+    match client_session_id {
+        Some(client_id) => get_or_create_session(&handle.engine, sessions, client_id)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The session id a completion should be accounted and submitted under.
+///
+/// A fill-in-the-middle completion is not a turn in a conversation: the FIM
+/// submit path takes no session at all. Opening one for it would claim an LRU
+/// slot — closing another client's live conversation once the registry is full —
+/// for a request that never touches it, and would charge that conversation's
+/// tokens to a prefill FIM does not perform.
+fn conversational_session_id<'a>(
+    generation: &CompletionGeneration,
+    client_session_id: Option<&'a str>,
+) -> Option<&'a str> {
+    match generation {
+        CompletionGeneration::Plain(_) => client_session_id,
+        CompletionGeneration::Fim { .. } => None,
+    }
+}
+
 async fn get_or_create_session(
     engine: &EngineDriver,
     sessions: &SessionRegistry,
@@ -1267,12 +1321,22 @@ async fn get_or_create_session(
     let engine_session_id = engine
         .create_session()
         .await
-        .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
-    let evicted = sessions
-        .insert(client_id.to_string(), engine_session_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?;
-    close_evicted_session(engine, evicted).await?;
-    Ok(engine_session_id)
+        .map_err(session_create_failure)?;
+    // Claim decides; a caller that lost the race closes the session it opened
+    // rather than leaving it to accumulate a conversation nobody will read.
+    match sessions
+        .claim(client_id.to_string(), engine_session_id)
+        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
+    {
+        crate::session::SessionClaim::Existing(existing) => {
+            close_evicted_session(engine, Some(engine_session_id)).await?;
+            Ok(existing)
+        }
+        crate::session::SessionClaim::Claimed { evicted } => {
+            close_evicted_session(engine, evicted).await?;
+            Ok(engine_session_id)
+        }
+    }
 }
 
 /// Builds a generation request without a server in hand, so an unspecified
@@ -1329,23 +1393,15 @@ pub(crate) fn prepare_completion(
 
 async fn submit_completion(
     handle: &ModelHandle,
-    sessions: &SessionRegistry,
     generation: CompletionGeneration,
-    client_session_id: Option<&str>,
+    session_id: Option<SessionId>,
 ) -> Result<DriverGeneration, ApiError> {
     match generation {
-        CompletionGeneration::Plain(request) => {
-            let session_id = if let Some(id) = client_session_id {
-                Some(get_or_create_session(&handle.engine, sessions, id).await?)
-            } else {
-                None
-            };
-            handle
-                .engine
-                .generate(session_id, request, None)
-                .await
-                .map_err(map_generate_submit_error)
-        }
+        CompletionGeneration::Plain(request) => handle
+            .engine
+            .generate(session_id, request, None)
+            .await
+            .map_err(map_generate_submit_error),
         CompletionGeneration::Fim {
             prefix,
             suffix,

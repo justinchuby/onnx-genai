@@ -45,7 +45,7 @@ pub use onnx_genai_metadata::WorkflowOutputRole;
 pub use row_state::{RowScopedState, RowTable, check_selection, gather_rows};
 pub use workflow::{
     MISSING_REQUIRED_INPUT, WorkflowExecutionPlan, WorkflowPerformanceDiagnostic,
-    is_missing_required_input,
+    is_missing_required_input, workflow_carries_session_state,
 };
 pub(crate) use workflow::{WorkflowGenerationCursor, WorkflowNodeHost, WorkflowNodeRequest};
 
@@ -181,6 +181,14 @@ pub(crate) struct WorkflowRuntime {
     workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
     workflow_execution_generation: Cell<u64>,
     workflow_session_state: RefCell<HashMap<(String, String), Value>>,
+    /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
+    ///
+    /// Two turns of one conversation that both read the history before either
+    /// writes it produce a last-write-wins conversation: the first turn's
+    /// prompt and generation vanish. The declaration says the lease is
+    /// exclusive, so this is what makes that true rather than assumed — a
+    /// second concurrent turn is refused with a name, not silently lost.
+    workflow_session_leases: RefCell<std::collections::HashSet<String>>,
     /// Device→host materializations this runtime performed.
     ///
     /// A proposal chain's whole point is that its per-token work stays on the
@@ -434,6 +442,7 @@ impl WorkflowRuntime {
             workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
             workflow_execution_generation: Cell::new(0),
             workflow_session_state: RefCell::new(HashMap::new()),
+            workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
             host_staging_count: std::cell::Cell::new(0),
             device_readback_bytes: std::cell::Cell::new(0),
             embedding_tables: RefCell::new(HashMap::new()),
@@ -787,6 +796,7 @@ impl WorkflowRuntime {
                 workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
                 workflow_execution_generation: Cell::new(0),
                 workflow_session_state: RefCell::new(HashMap::new()),
+                workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
                 host_staging_count: std::cell::Cell::new(0),
                 device_readback_bytes: std::cell::Cell::new(0),
                 embedding_tables: RefCell::new(HashMap::new()),
@@ -1005,6 +1015,71 @@ impl WorkflowRuntime {
         self.workflow_session_state
             .borrow_mut()
             .retain(|(session, _), _| session != session_id);
+    }
+
+    /// Length of the conversation this session has accumulated, when the
+    /// package declares one.
+    ///
+    /// `None` means the package declares no prompt continuation, so there is no
+    /// conversation length to report and the caller keeps its own count.
+    pub(crate) fn session_conversation_len(&self, session_id: &str) -> Option<usize> {
+        self.session_conversation(session_id)
+            .map(|conversation| conversation.len())
+    }
+
+    /// Whether this package continues a conversation by putting it in front of
+    /// the next turn's prompt.
+    ///
+    /// True only for `SessionStateCarrier::PromptContinuation`, read from the
+    /// shared classifier. Every other carrier hands its lease back inside the
+    /// graph or inside a decode core's own state, so nothing is prepended and a
+    /// request must not be charged for it.
+    pub(crate) fn prepends_session_conversation(&self) -> bool {
+        onnx_genai_metadata::classify_session_state(self.workflow_spec())
+            .prompt_continuation()
+            .is_some()
+    }
+
+    /// Tokens this runtime will put in front of the next turn's prompt.
+    ///
+    /// Only a `prompt_prefix` continuation prepends anything: it is the one
+    /// carrier whose mechanism *is* the prompt binding, so the tokens it holds
+    /// are prefilled again on every turn and are part of what the next request
+    /// costs. A loop carry or a state service group hands its lease back inside
+    /// the graph — the tokens it represents live in a cache the package bounds
+    /// itself, not in front of a prompt — so nothing is prepended and this is
+    /// zero.
+    ///
+    /// Answered from the typed classification rather than from "does this
+    /// session hold a conversation", because those are different questions and
+    /// only this one is a length a caller's request will be charged for.
+    pub(crate) fn session_prepended_prompt_len(&self, session_id: &str) -> usize {
+        let facts = onnx_genai_metadata::classify_session_state(self.workflow_spec());
+        let Some(cell) = facts.prompt_continuation() else {
+            return 0;
+        };
+        self.workflow_session_state
+            .borrow()
+            .get(&(session_id.to_string(), cell.to_string()))
+            .and_then(|value| value.to_vec_i64().ok())
+            .map(|tokens| tokens.len())
+            .unwrap_or(0)
+    }
+
+    /// The tokens a session's declared conversation holds, oldest first.
+    ///
+    /// This is the value the next turn's prompt input is built from, so it is
+    /// also the answer to "what has this session heard" — reported from the
+    /// lease itself rather than from a count kept beside it.
+    pub(crate) fn session_conversation(&self, session_id: &str) -> Option<Vec<i64>> {
+        let (cell, _, _, _) = workflow::workflow_prompt_continuation(self.workflow_spec())?;
+        Some(
+            self.workflow_session_state
+                .borrow()
+                .get(&(session_id.to_string(), cell.to_string()))
+                .map(|value| value.to_vec_i64().unwrap_or_default())
+                .unwrap_or_default(),
+        )
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {

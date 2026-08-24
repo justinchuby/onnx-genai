@@ -103,6 +103,12 @@ pub(crate) enum DriverCommand {
         session_id: SessionId,
         response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
     },
+    /// Tokens this session will put in front of the next turn's prompt.
+    SessionPrefillCarry {
+        session_id: SessionId,
+        response:
+            tokio::sync::oneshot::Sender<anyhow::Result<onnx_genai_engine::SessionPrefillCarry>>,
+    },
     /// Generate, from whatever the request carried.
     ///
     /// One command, because there is one runtime beneath it. A session id is
@@ -161,10 +167,14 @@ pub(crate) enum DriverEvent {
     Error(DriverFailure),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverFailureKind {
     Internal,
     MemoryOverload,
+    /// The caller asked the loaded package for something it cannot serve as
+    /// asked. Carried as the engine's own type so a status code never depends
+    /// on the wording of a message.
+    PackageCapability(onnx_genai_engine::PackageCapabilityError),
 }
 
 #[derive(Debug, Clone)]
@@ -205,16 +215,23 @@ impl DriverFailure {
                 )
             )
         });
+        let capability = onnx_genai_engine::package_capability_error(error);
         Self {
             // Anyhow's Display shows only the outermost context, which for a
             // decode failure is the generic "forward pass failed" wrapper. The
             // alternate form keeps the whole chain, and this message is the
             // only thing the client ever sees.
-            message: format!("{error:#}"),
-            kind: if memory_overload {
-                DriverFailureKind::MemoryOverload
-            } else {
-                DriverFailureKind::Internal
+            message: match &capability {
+                // A capability refusal already says exactly what happened; the
+                // chain would add the interpreter frames it happened in, which
+                // are not the caller's business.
+                Some(capability) => capability.to_string(),
+                None => format!("{error:#}"),
+            },
+            kind: match (capability, memory_overload) {
+                (Some(capability), _) => DriverFailureKind::PackageCapability(capability),
+                (None, true) => DriverFailureKind::MemoryOverload,
+                (None, false) => DriverFailureKind::Internal,
             },
         }
     }
@@ -360,6 +377,23 @@ impl EngineDriver {
         let (response, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::CloseSession {
+                session_id,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    /// Tokens attended ahead of the prompt and the subset re-prefilled.
+    pub(crate) async fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<onnx_genai_engine::SessionPrefillCarry> {
+        let (response, rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::SessionPrefillCarry {
                 session_id,
                 response,
             })
@@ -1021,7 +1055,7 @@ fn run_static_batch_until_idle(
                 }
                 let _ = route.events.try_send(DriverEvent::Error(DriverFailure {
                     message: failure.message.clone(),
-                    kind: failure.kind,
+                    kind: failure.kind.clone(),
                 }));
             }
             reported_occupancy = publish_batch_occupancy(manager.occupancy(), reported_occupancy);
@@ -1337,6 +1371,12 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             response,
         } => {
             let _ = response.send(engine.session_token_count(session_id));
+        }
+        DriverCommand::SessionPrefillCarry {
+            session_id,
+            response,
+        } => {
+            let _ = response.send(engine.session_prefill_carry(session_id));
         }
         DriverCommand::Generate {
             session_id,

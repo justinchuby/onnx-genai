@@ -46,7 +46,13 @@ use std::fmt;
 /// Where the lock lives. Matches `scripts/hostlock.sh`, which must stay the
 /// single source of truth for the path: a reader that looked somewhere else
 /// would report `free` forever and do so convincingly.
-const DEFAULT_LOCK_DIR: &str = "/tmp/onnx-genai-hostlock";
+///
+/// Public so the agreement test can assert it against the script's own
+/// default rather than against a second copy of the string. A divergence here
+/// is silent in the direction that permits a run, so it is asserted rather
+/// than reviewed.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_LOCK_DIR: &str = "/tmp/onnx-genai-hostlock";
 
 /// Longest owner name that will be printed. Long enough for a name, short
 /// enough that a pathological one cannot dominate a result row.
@@ -55,7 +61,7 @@ const MAX_OWNER_LEN: usize = 32;
 /// Who claims the host, as recorded in the lock's metadata file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockHolder {
-    /// Sanitised for printing; see [`sanitise_owner`].
+    /// Sanitised for printing; see `sanitise_owner`.
     pub owner: String,
     /// The owner exactly as written, minus surrounding whitespace.
     ///
@@ -329,11 +335,6 @@ pub fn proc_info(pid: u32) -> Option<ProcInfo> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn proc_info(_pid: u32) -> Option<ProcInfo> {
-    None
-}
-
 /// Classifies already-read metadata. Split from the filesystem so the decision
 /// table can be tested without a lock on the box, and so a test can never leave
 /// one behind.
@@ -356,16 +357,30 @@ pub fn classify(meta: Option<&str>, probe: impl Fn(u32) -> Option<ProcInfo>) -> 
 ///
 /// Honours `HOSTLOCK_DIR` so a test can point somewhere harmless, exactly as
 /// `hostlock.sh` does.
+#[cfg(target_os = "linux")]
 pub fn read() -> LockState {
-    if !cfg!(target_os = "linux") {
-        return LockState::Unknown;
-    }
     let dir = std::env::var("HOSTLOCK_DIR").unwrap_or_else(|_| DEFAULT_LOCK_DIR.to_string());
     let meta_path = std::path::Path::new(&dir).join("meta");
     classify_io(
         std::fs::read_to_string(&meta_path).map_err(|err| err.kind()),
         proc_info,
     )
+}
+
+/// Nothing to read: liveness here depends on `/proc`, and there is no
+/// equivalent to fall back on.
+///
+/// `proc_info` deliberately **does not exist** off Linux rather than returning
+/// `None`, which [`liveness`] would read as an unambiguous death and report
+/// every live lock as `stale` -- the reaper-shaped error, and one that would
+/// have compiled silently. A caller that needs it on another platform gets a
+/// compile error instead of a plausible wrong answer.
+///
+/// It is spelled without an intra-doc link on purpose: a link would name a
+/// symbol that, by the whole point of this change, is absent here.
+#[cfg(not(target_os = "linux"))]
+pub fn read() -> LockState {
+    LockState::Unknown
 }
 
 /// Turns the result of reading the metadata file into a state.

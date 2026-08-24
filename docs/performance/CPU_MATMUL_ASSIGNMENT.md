@@ -1968,6 +1968,22 @@ time. That figure is now stale; the re-measurement replaces it.
 > **not** the host bandwidth knee (`2026-08-22-decode-width-scaling.md`): a DRAM
 > ceiling is a property of the host and would have flattened both arms, and ORT
 > scales 1.76x across the same doubling on the same host in the same launch.
+> **What `t=8` and `t=16` physically are has since been read out of `/proc`**
+> (`benches/decode_placement_census.sh`, a `Cpus_allowed_list` census on
+> `0a668d54b` — categorical, not a timing). Every configuration places **one
+> worker per physical core** with the reserved dispatcher CPU left clear: the
+> default unpinned launch and `THREADS=16` both put 15 workers on `0,2,…,28`
+> across both L3 instances, and `THREADS=8` confines the process to
+> `[0,2,4,6,8,10,12,14]` and runs 7 workers on `0,2,…,12` — **entirely inside
+> one 32 MiB L3**. So the `t=8 -> t=16` doubling on this host doubles cache and
+> memory-controller reach as well as cores. It is **not** a confound: `ort()`
+> defaults its pin to `native_pin(threads)`, so both arms get the same CPUs at
+> each width, and both figures post-date that fix (`4b4dacc7e`). It does make
+> the 2.0x ideal a conservative reference for both arms, so the finding is if
+> anything understated. The same census refutes a cross-agent report of two
+> workers per core on a single L3: that is what a **pre-#1729** build does, and
+> #1729 (`6e8c31ebd`) and the related width-halving fix #1794 (`0652fdd2e`) are
+> both ancestors of main.
 > **The wall has since been split.** CPU-seconds attribution on both arms
 > (`acc0_w8_w16_cpu_split.py`, identity-checked per cell) finds it is **two
 > causes, not one**: at t=16 native burns **~30% more CPU per token** than at
@@ -2753,7 +2769,19 @@ ratios on this host are not reproducible, whichever arm they favour.
   both `=2` workers **99% busy**, not parked. The "71% of one core" figure came
   from `/usr/bin/time`'s `Percent of CPU`, which is `(user+sys)/wall` and so is
   wall-derived: under contention it degrades exactly like the wall time it was
-  being used to corroborate, rather than independently confirming it. The
+  being used to corroborate, rather than independently confirming it. **There is
+  a second, independent reason not to read it as utilisation on an SMT host**,
+  found 2026-08-24 while checking a cross-agent report of a permanent competitor
+  on cpu 0: a logical CPU whose sibling is busy is granted a full 100% *share*
+  while delivering roughly half the *work*, and no CPU-time instrument can see
+  that — the scheduler really is handing over the CPU; the contention is in
+  hardware, below its view. Only a work-completed probe distinguishes them
+  (`benches/cpu_work_probe.py`: iterations against `CLOCK_THREAD_CPUTIME_ID`). The
+  competitor itself did **not** reproduce on a quiet host — cpu 0 reads
+  `cpu_share` 0.999–1.000 at 9429/9482/9489 iterations, inside the 8744–9499
+  band spanned by ten other CPUs, with one transient outlier that two re-probes
+  cleared — so on a host shared by several agents, "permanent" was load rather
+  than topology. The instrument point is the durable part. The
   strongest clue that this was harness-side was arithmetic — 23.529 vs 23.527
   agree to four significant figures, and contention is random. Full curve,
   method and the categorical non-vacuity check:
