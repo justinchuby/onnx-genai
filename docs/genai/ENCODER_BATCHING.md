@@ -738,6 +738,21 @@ Two content roles, not four: `pack_offsets` and `pack_owner` are level-agnostic,
 and which level a value serves is stated by the `levels` list that references it,
 not by its role.
 
+**The role is required here, and not required for `padding` — deliberately.** A
+preprocessing-program output named as a level companion **MUST** carry
+`pack_offsets` or `pack_owner` as appropriate ([§4](#4-strict-token_packed-validation)
+rule 4). The asymmetry with [§3.2](#32-tensorcontractpadding), where the
+referenced length value is resolved **by name** and its role is descriptive, is
+not an inconsistency but a consequence of history: length vectors already have
+established modality spellings (`frame_lengths`, `sample_lengths`) that a program
+legitimately emits, so no single role can be demanded without breaking programs
+that predate this design. The companion roles are **new** in this design and have
+no legacy spellings to accommodate, so requiring them rejects nothing that exists
+and buys a real check — a program that wires `grid_dimensions` into a `levels`
+entry is caught at load instead of shipping a plausible `int64` rank-1 vector
+that means something else entirely. Both rules resolve the *reference* by name;
+this one additionally constrains what the referenced declaration may claim to be.
+
 **`valid_lengths` is a third, and it is new.** The audio vocabulary today is
 `waveform`, `features`, `audio_features`, `valid_frames`, `valid_samples`,
 `sample_lengths`, `frame_lengths`, `validity_mask`
@@ -928,8 +943,8 @@ profile and are listed separately for that reason.
 1. **Names resolve.** Every level's `offsets` and `owner` **MUST** name values
    declared in the same scope as the packed value. A dangling name is rejected,
    naming the packed value, the level, and the missing name.
-2. **The packed axis is axis 0.** For any packed value consumed or produced by a
-   component that declares `batch_capacity`, `axis` **MUST** be `0`. The reason is
+2. **The packed axis is axis 0 — for every packed value, not only a grouped
+   one.** `axis` **MUST** be `0` wherever `token_packed` appears. The reason is
    mechanical, not stylistic: a no-copy view is a contiguous element window over
    the owner's allocation, and the aliasing API says so outright — "a slice along
    an inner axis is not a contiguous range, and asking for one here would silently
@@ -941,6 +956,17 @@ profile and are listed separately for that reason.
    every invocation — which is the cost grouping exists to avoid. A package that
    needs an inner packed axis is rejected at load with that explanation, rather
    than silently paying it.
+
+   An earlier revision scoped this rule to values a `batch_capacity` component
+   consumes or produces, and that scope was too narrow. The runtime splits a
+   packed value per request whenever it hands one back — rule 8's emit path
+   rebases `offsets` and derives per-request owners with no capacity declaration
+   anywhere in sight — and that split wants the same contiguity for the same
+   reason. Scoping the rule to capacity components would have made a strided
+   packed emit legal precisely where nothing had declared that it could pay for
+   one. The wider rule also costs nothing to adopt: no fixture in the tree
+   declares a non-zero packed axis, so widening rejects no package that exists
+   and forecloses a shape no producer has asked for.
 3. **Levels are ordered, non-empty, and at most two.** `levels` **MUST** contain
    one or two entries, ordered innermost first
    ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)).
@@ -951,8 +977,15 @@ profile and are listed separately for that reason.
    stated rather than left implicit so that a third level is a deliberate schema
    change with its own design, not something a package can assert into existence.
    A three-level declaration is rejected at load, naming the value and the levels.
-4. **Companion contracts are exact.** Every `offsets` and `owner` **MUST** be
-   `int64`, rank 1, and `batch_layout: { kind: shared }`. Their declared extent
+4. **Companion contracts are exact, and a declared program's companions carry
+   the companion roles.** Every `offsets` and `owner` **MUST** be `int64`, rank 1,
+   and `batch_layout: { kind: shared }`. When the companion is an output of a
+   declared **preprocessing program** — that is, a value whose declaration carries
+   a `content` role at all — that role **MUST** be `pack_offsets` for an `offsets`
+   and `pack_owner` for an `owner`
+   ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)).
+   Companions produced by a component's graph are ONNX output ports and carry no
+   content role; the rule does not reach them. Their declared extent
    symbols **MUST** follow [§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce):
    level `k`'s `owner` carries the count of level `k` units (the packed extent
    symbol at level 0), and level `k`'s `offsets` carries a distinct symbol that
@@ -1520,7 +1553,7 @@ P1 schema surface + version gate ┬─────────────► P
      │                           │                   image + video encoder
      ▼                           │                          │
 P2 validation                    │                          │
-  §3.1 rules 1-7, §4 rules 1-8   │                          │
+  §3.1 rules 1-9, §4 rules 1-8   │                          │
      └──────────────┬────────────┘                          │
                     └──────────────────┬───────────────────┘
                                        ▼
@@ -1565,7 +1598,8 @@ P2 validation                    │                          │
 - **P2 — validation.** Implement [§3.1](#31-workflowcomponentbatch_capacity)
   rules 1–9 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
   negative fixture asserting the exact message — including a three-level packing
-  declaration, an inner packed axis, an output level that omits `extent`, an
+  declaration, an inner packed axis on a component with no `batch_capacity`, a
+  companion carrying the wrong content role, an output level that omits `extent`, an
   `extent: produced` level that reuses an input companion, `uniform_dimensions`
   naming a packed or unit-count symbol, a singleton budget on a pinned symbol,
   and a `shared` rank-1 emit that is *not* a referenced companion and therefore
@@ -1667,7 +1701,7 @@ no downloaded weights, no sample media, and no network in the test path.
 | 14 | **Nested ownership corruption.** The inner level's `offsets` and `owner` corrupted in turn: an owner outside its clip, a non-monotonic inner offset, an inner total disagreeing with the outer level's unit count. | Each case is a loud error naming value, level, index, and the two disagreeing facts — never a clamp or a partial split. | P4 |
 | 15 | **Mixed-modality serving.** Image items and video clips in flight for the same engine. | Grouping is per component, not per request; an image group and a video group are formed by the same code with no modality branch; per-row equality against solo. | P6 |
 | 16 | **A third modality reuses the path.** An audio (or text-segment) encoder declaring `batch_capacity` plus windows-in-rows ownership. | It batches with no new interpreter or scheduler code — the acceptance is that the diff is a fixture and a vocabulary, not a branch. | P6 |
-| 17 | **Structural bounds at load.** A three-level `levels` chain; a packed value on an inner axis; a `batch_capacity` naming an unknown symbol; `uniform_dimensions` naming a packed symbol or a level's unit-count symbol; a singleton budget whose only symbol is per-item rather than group-rooted; a dimension both padded and pinned; a free dimension with neither padding nor packing. | Each rejected at load with its own message naming the component, the value, and the symbol or level at fault; the valid two-level, axis-0 path is unaffected. | P2 |
+| 17 | **Structural bounds at load.** A three-level `levels` chain; a packed value on an inner axis **in a component that declares no `batch_capacity`**; a preprocessing-program companion declared with some other content role; a `batch_capacity` naming an unknown symbol; `uniform_dimensions` naming a packed symbol or a level's unit-count symbol; a singleton budget whose only symbol is per-item rather than group-rooted; a dimension both padded and pinned; a free dimension with neither padding nor packing. | Each rejected at load with its own message naming the component, the value, and the symbol or level at fault; the valid two-level, axis-0 path is unaffected; the axis rejection does not depend on the component declaring a capacity. | P2 |
 | 18 | **Right-padding enforced.** A `valid_lengths` entry exceeding the padded extent, and a producer that left-pads. | Both rejected before the invocation, naming the item, the dimension, and the offending value; length arithmetic is done on host-resident companions with no device read. | P4 |
 | 19 | **Budgets bind materialized footprint.** Groups that hit the item budget with few frames; groups that hit the packed budget with few items (one long clip); a group whose *valid* padded extents would fit but whose materialized rectangle does not; and two groups of a resolution-**pinned** encoder that pin different `patches` values, only one of which fits the composed entry. | Each bound is enforced separately, none inferred from another; the padded dimension is charged `count × padded_extent`, not the sum of valid lengths; a composed path multiplies outermost-first, including pinned symbols — the larger-resolution group is refused while the smaller is admitted, which a budget on the item symbol could not have distinguished; a decode-side row bound is never used as an item bound. | P6 |
 | 20 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
