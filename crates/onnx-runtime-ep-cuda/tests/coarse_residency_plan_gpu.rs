@@ -72,6 +72,20 @@
 //!     the *later*-ordered member's first driver call proves the *earlier*
 //!     member's already-committed ranges are still fully and cleanly rolled
 //!     back, using the existing (item 1) range-level rollback machinery.
+//! 14. `expert_group_mixed_decision_shape_rejects_whole_group_with_zero_side_effects`
+//!     — an independent review of this fix (tests 9-13) found that the
+//!     agreement check above only ever compares members that *both* receive
+//!     a `PerExpertCandidate` decision: a present group member that is
+//!     `WholeBankResident` (default policy, a capability/validation
+//!     fallback, or simply absent from the residency profile entirely)
+//!     never enters that comparison at all, so a `PerExpertCandidate`
+//!     sibling could transition alone -- reproducing Roy's exact "partial
+//!     tiering of one logical expert" gap through a decision-*shape*
+//!     mismatch rather than a hot-set-*value* mismatch. This test proves the
+//!     fix for that: one member has an explicit hot-expert profile entry
+//!     (`PerExpertCandidate`) while its present group-mate has none (falls
+//!     back to `WholeBankResident`) -- the whole group is rejected before
+//!     any mutation, exactly like tests 10/11/12.
 
 #![cfg(feature = "gpu-tests")]
 #![allow(
@@ -2313,5 +2327,210 @@ fn expert_group_successful_transition_then_later_member_fault_causes_full_group_
     println!(
         "test13 PASSED: successful group transition, then a later member's fault, causes a \
          full and clean group rollback ✓"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: a present group member with NO `PerExpertCandidate` decision
+// (falls back to `WholeBankResident` because it has no profile entry) next
+// to a member that DOES have one rejects the whole group -- a
+// decision-*shape* mismatch, distinct from tests 10/11's hot-set/domain
+// *value* mismatches, but the same underlying risk: an unchecked sibling
+// would let one logical expert bank end up partially tiered.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn expert_group_mixed_decision_shape_rejects_whole_group_with_zero_side_effects() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!(
+        "\n=== test14: expert_group_mixed_decision_shape_rejects_whole_group_with_zero_side_effects ==="
+    );
+
+    let provider = match provider_or_skip("test14") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+
+    let cap = match host_numa_capability(0) {
+        Ok(c) => c,
+        Err(CapabilityGateFailure::Unsupported(r)) => {
+            println!("SKIP test14: HOST_NUMA not supported: {r}");
+            return;
+        }
+    };
+    let gran = cap.granularity;
+
+    let n_experts = 4_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(140),
+    );
+    let pattern_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc1, base_fc1).expect("htod fc1");
+    }
+    let (fc1_committed_before, _) = allocator_fc1.committed_and_reserved();
+
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        &provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(141),
+    );
+    let pattern_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 3) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pattern_fc2, base_fc2).expect("htod fc2");
+    }
+    let (fc2_committed_before, _) = allocator_fc2.committed_and_reserved();
+
+    let value_fc1 = ValueId(1400);
+    let catalog_fc1 = make_aligned_catalog(n_experts, gran, 0);
+    assert!(catalog_fc1.is_pageable());
+
+    let value_fc2 = ValueId(1401);
+    let catalog_fc2 = make_aligned_catalog(n_experts, gran, total_bytes);
+    assert!(catalog_fc2.is_pageable());
+
+    // fc1 has an explicit hot-expert profile entry -> PerExpertCandidate.
+    // fc2 has NO entry at all -> StaticProfileResidencyPolicy falls back to
+    // WholeBankResident. Both are individually valid/aligned/pageable; the
+    // only thing wrong is that they disagree on decision *shape*.
+    let mut profile: HashMap<ValueId, Vec<usize>> = HashMap::new();
+    profile.insert(value_fc1, vec![0, 2]);
+    let policy = StaticProfileResidencyPolicy::new(profile);
+    let candidates = vec![
+        (value_fc1, LazyWeightBoundary::QMoe, &catalog_fc1),
+        (value_fc2, LazyWeightBoundary::QMoe, &catalog_fc2),
+    ];
+    let plan = plan_residency(candidates, &policy, None);
+    assert!(
+        matches!(
+            plan.decision(value_fc1),
+            Some(onnx_runtime_ep_api::ResidencyDecision::PerExpertCandidate { .. })
+        ),
+        "fc1 must be a PerExpertCandidate for this test to be meaningful"
+    );
+    assert!(
+        matches!(
+            plan.decision(value_fc2),
+            Some(onnx_runtime_ep_api::ResidencyDecision::WholeBankResident { .. })
+        ),
+        "fc2 must fall back to WholeBankResident (no profile entry) for this test to be meaningful"
+    );
+
+    let residency = CudaWeightResidency::new(Arc::clone(runtime), pool_bytes as u64);
+    let mut catalogs = HashMap::new();
+    catalogs.insert(value_fc1, catalog_fc1);
+    catalogs.insert(value_fc2, catalog_fc2);
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(value_fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(value_fc2, Arc::clone(&allocator_fc2));
+
+    let groups = vec![ExpertWeightGroup {
+        node: NodeId(0),
+        boundary: LazyWeightBoundary::QMoe,
+        members: vec![value_fc1, value_fc2],
+    }];
+
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    unsafe { std::env::set_var(COARSE_RESIDENCY_ENABLE_ENV, "1") };
+    let outcome = apply_residency_plan_at_boundary(
+        runtime,
+        &residency,
+        &plan,
+        &catalogs,
+        &allocators,
+        &pools.device_pool,
+        &pools.host_pool,
+        1,
+        0,
+        &groups,
+    );
+    unsafe { std::env::remove_var(COARSE_RESIDENCY_ENABLE_ENV) };
+
+    println!("outcome: {outcome:#?}");
+
+    assert_eq!(
+        outcome.values_touched, 0,
+        "fc1 may NOT transition alone when its present group-mate has no \
+         per-expert decision at all, got values_touched={}",
+        outcome.values_touched
+    );
+    assert!(
+        outcome.committed_values.is_empty(),
+        "no member may commit, got: {:?}",
+        outcome.committed_values
+    );
+
+    let fc1_fallback = outcome
+        .per_value_fallbacks
+        .iter()
+        .find(|(v, _)| *v == value_fc1);
+    assert!(
+        fc1_fallback.is_some(),
+        "fc1 (the only member that would otherwise have transitioned) must appear in \
+         per_value_fallbacks, got: {:?}",
+        outcome.per_value_fallbacks
+    );
+    let (_, reason) = fc1_fallback.unwrap();
+    let reason_lower = reason.to_ascii_lowercase();
+    assert!(
+        reason_lower.contains("decision shape") && reason_lower.contains("wholebankresident"),
+        "fc1's fallback reason should name the decision-shape disagreement, got: {reason}"
+    );
+    // fc2 was never a transition candidate in the first place (it has no
+    // PerExpertCandidate decision), so it is not expected to appear in
+    // per_value_fallbacks -- there was nothing to fall back FROM for fc2.
+    assert!(
+        !outcome
+            .per_value_fallbacks
+            .iter()
+            .any(|(v, _)| *v == value_fc2),
+        "fc2 was never a transition candidate and should not appear in per_value_fallbacks, \
+         got: {:?}",
+        outcome.per_value_fallbacks
+    );
+
+    let (fc1_committed_after, _) = allocator_fc1.committed_and_reserved();
+    let (fc2_committed_after, _) = allocator_fc2.committed_and_reserved();
+    assert_eq!(
+        fc1_committed_before, fc1_committed_after,
+        "fc1 committed bytes must be unchanged"
+    );
+    assert_eq!(
+        fc2_committed_before, fc2_committed_after,
+        "fc2 committed bytes must be unchanged"
+    );
+
+    let mut readback_fc1 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc1, base_fc1).expect("dtoh fc1");
+    }
+    assert_eq!(pattern_fc1, readback_fc1, "fc1 bytes must be untouched");
+    let mut readback_fc2 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut readback_fc2, base_fc2).expect("dtoh fc2");
+    }
+    assert_eq!(pattern_fc2, readback_fc2, "fc2 bytes must be untouched");
+
+    println!(
+        "test14 PASSED: a PerExpertCandidate member next to a present WholeBankResident/absent \
+         member blocks the WHOLE group, zero side effects ✓"
     );
 }

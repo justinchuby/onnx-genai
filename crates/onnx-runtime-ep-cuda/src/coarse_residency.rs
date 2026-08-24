@@ -484,6 +484,8 @@ fn apply_residency_plan_at_boundary_inner(
     // Map value -> group index, for values that belong to a multi-member
     // group. Values with no group (or a singleton group) are unaffected.
     let mut value_to_group: HashMap<ValueId, usize> = HashMap::new();
+    let mut group_failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut group_fail_reason: HashMap<usize, String> = HashMap::new();
     for (idx, group) in expert_groups.iter().enumerate() {
         let present: Vec<ValueId> = group
             .members
@@ -494,8 +496,39 @@ fn apply_residency_plan_at_boundary_inner(
         if present.len() < 2 {
             continue;
         }
-        for value in present {
+        for &value in &present {
             value_to_group.insert(value, idx);
+        }
+
+        // 3a. Group decision-shape agreement (Cycle-19 fix, part 1): every
+        // present member must be a `PerExpertCandidate`, or none of them may
+        // be. A member that is `WholeBankResident` (default policy, a
+        // capability/validation fallback, or simply absent from this plan
+        // entirely) never proposes a hot-expert set at all, so it can never
+        // be compared against a `PerExpertCandidate` sibling by the 4a pass
+        // below — left unchecked, that sibling would transition its cold
+        // experts to Host while this member stays fully Device-resident for
+        // the very same expert indices, which is exactly the "partial
+        // tiering of one logical expert" Roy's Cycle-19 finding described.
+        // A group where every present member is `WholeBankResident` is not
+        // a problem: none of them propose a partition, so there is nothing
+        // to disagree about, and per-value processing proceeds unaffected.
+        let mut has_per_expert = false;
+        let mut has_non_per_expert = false;
+        for &value in &present {
+            match plan.decision(value) {
+                Some(ResidencyDecision::PerExpertCandidate { .. }) => has_per_expert = true,
+                _ => has_non_per_expert = true,
+            }
+        }
+        if has_per_expert && has_non_per_expert {
+            group_failed.insert(idx);
+            group_fail_reason.entry(idx).or_insert_with(|| {
+                "expert-group members disagree on decision shape: at least one present member \
+                 is PerExpertCandidate while another present member is WholeBankResident or \
+                 absent from this plan"
+                    .to_string()
+            });
         }
     }
 
@@ -523,8 +556,6 @@ fn apply_residency_plan_at_boundary_inner(
     }
 
     let mut eligible: Vec<Eligible> = Vec::new();
-    let mut group_failed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut group_fail_reason: HashMap<usize, String> = HashMap::new();
     let mut per_value_precheck: Vec<(ValueId, Result<Eligible, String>)> = Vec::new();
 
     for value in plan.ordered_values() {
