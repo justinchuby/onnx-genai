@@ -124,6 +124,13 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      # This lane runs `onnx-runtime-ep-cpu`'s placement falsifiers, so the
+      # absence of what they need -- two physical cores, and a kernel that
+      # accepts `sched_setaffinity` -- is a defect here rather than a fact about
+      # somebody's laptop. Same shape as `NXRT_REQUIRE_ORT_TESTS` on `cli-ort`.
+      # Deliberately unset elsewhere, so a contributor inside a 1-core container
+      # still gets a stated skip instead of a red suite.
+      NXRT_REQUIRE_PLACEMENT_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
@@ -549,14 +556,22 @@ jobs:
         include:
           - name: Linux x86_64
             os: ubuntu-latest
+            require_placement: "1"
           - name: Windows x86_64
             os: windows-latest
+            require_placement: "1"
           - name: macOS arm64
             os: macos-latest
+            # macOS has no thread-to-core affinity API, so placement is
+            # unanswerable there by construction. Requiring it could only ever
+            # produce a false failure, which is why the guard asserts the
+            # affinity backend exists before asserting anything about cores.
+            require_placement: ""
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
+      NXRT_REQUIRE_PLACEMENT_TESTS: ${{ matrix.require_placement }}
 
     steps:
       - uses: actions/checkout@v5
@@ -665,6 +680,9 @@ jobs:
       CARGO_TERM_COLOR: always
       RUSTFLAGS: "-D warnings"
       CMAKE_GENERATOR: "Visual Studio 17 2022"
+      # ARM64 Windows has the affinity backend, so the placement falsifiers are
+      # answerable here and their silence would be a defect, not a platform fact.
+      NXRT_REQUIRE_PLACEMENT_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v5
