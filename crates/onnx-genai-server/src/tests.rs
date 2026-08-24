@@ -4506,9 +4506,16 @@ async fn a_decode_core_session_is_charged_only_its_request_prompt() {
 
 /// And its context and budget are not halved by the session either.
 ///
-/// Two turns each a bit under half the model's window: together they exceed it,
-/// which is exactly what the double count would have added up before refusing
-/// the second.
+/// Two turns whose prompts each fit the window with room for the budget, and
+/// which together exceed it. Charging the session's retained count would make
+/// the second turn's admission `retained + prompt + max_tokens`, over the limit,
+/// and it would be refused 400 — so the second turn's 200 is the discriminating
+/// assertion. The first turn's full generation is what makes "budget" more than
+/// a word: a budget silently reduced to nothing still answers 200 with an empty
+/// completion.
+///
+/// What the *engine* does once its own sequence outgrows the window is a
+/// separate, pre-existing matter and not what a request is charged.
 #[tokio::test]
 async fn a_decode_core_session_does_not_halve_the_context_or_the_budget() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
@@ -4521,25 +4528,51 @@ async fn a_decode_core_session_does_not_halve_the_context_or_the_budget() {
     let context = handle
         .model_max_context
         .expect("the fixture declares a context limit");
+    let tokenizer = handle.tokenizer.clone();
     drop(handle);
     let router = app(state);
     let session = "sess-decode-core-budget";
 
-    let prompt = "hello world ".repeat(context / 4);
-    for turn in 0..2 {
-        let (status, body) =
-            completion_turn(router.clone(), "tiny-llm", Some(session), prompt.trim()).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "turn {} must be admitted on its own length: {body}",
-            turn + 1
-        );
-        assert!(
-            body["choices"][0]["text"].is_string(),
-            "and the budget it was admitted with is its own: {body}"
-        );
-    }
+    const BUDGET: u64 = 2;
+    let prompt = "hello ".repeat(context - usize::try_from(BUDGET).expect("small") - 5);
+    let prompt = prompt.trim();
+    let length = tokenizer.encode(prompt).expect("encode").len() as u64;
+    assert!(
+        length + BUDGET <= context as u64,
+        "each turn must fit on its own ({length} + {BUDGET} against {context})"
+    );
+    assert!(
+        length * 2 > context as u64,
+        "and the two together must not, or the double count would have admitted them anyway"
+    );
+
+    let (status, first) = completion_turn(router.clone(), "tiny-llm", Some(session), prompt).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(
+        first["usage"]["prompt_tokens"].as_u64().expect("prompt"),
+        length,
+        "{first}"
+    );
+    assert_eq!(
+        first["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated"),
+        BUDGET,
+        "the budget a turn asks for is the budget it gets: {first}"
+    );
+
+    let (status, second) = completion_turn(router, "tiny-llm", Some(session), prompt).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the second turn is admitted on its own length, not on the conversation it is not \
+         charged for: {second}"
+    );
+    assert_eq!(
+        second["usage"]["prompt_tokens"].as_u64().expect("prompt"),
+        length,
+        "and is charged the same: {second}"
+    );
 }
 
 /// A lease the graph carries is not in front of the prompt, so it is not
@@ -4722,13 +4755,9 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
         Some("invalid_request_error"),
         "{second}"
     );
-    assert!(
-        second["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains('6'),
-        "the refusal names the bound: {second}"
-    );
+    // What the message says is asserted against the typed variant in
+    // `capability_refusals_map_to_the_status_their_variant_means`; here the
+    // contract is the status and the kind a client branches on.
 }
 
 /// A busy exclusive session is a 409 a client can retry; an over-bound
@@ -4762,7 +4791,17 @@ fn capability_refusals_map_to_the_status_their_variant_means() {
     let response = crate::routes::generation_failure(over_bound);
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     assert_eq!(response.kind, "invalid_request_error");
-    assert!(response.message.contains('6'));
+    // The variant's own fields reach the caller: the length it would have
+    // reached and the bound it would have crossed, each named as itself.
+    assert_eq!(
+        response.message,
+        PackageCapabilityError::ConversationOverBound {
+            cell: "conversation".to_string(),
+            requested: 12,
+            bound: 6,
+        }
+        .to_string()
+    );
 
     // An ordinary failure is still a server error, so the new kind cannot
     // swallow a real fault.
@@ -4904,11 +4943,19 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         Some("invalid_request_error"),
         "{second}"
     );
-    assert!(
-        second["error"]["message"]
+    // The body carries the variant's own rendering, fields and all — asserted
+    // against the type rather than against a sentence.
+    assert_eq!(
+        second["error"]["message"].as_str(),
+        Some(
+            onnx_genai_engine::PackageCapabilityError::ConversationOverBound {
+                cell: "conversation".to_string(),
+                requested: 12,
+                bound: 6,
+            }
+            .to_string()
             .as_str()
-            .unwrap_or_default()
-            .contains('6'),
+        ),
         "{second}"
     );
 

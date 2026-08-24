@@ -348,11 +348,25 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
     let refused = engine
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
-    let message = format!("{refused:#}");
-    assert!(
-        message.contains('6'),
-        "the refusal names the bound and the conversation: {message}"
-    );
+    // The typed variant, not the sentence: the bound and the length it would
+    // have reached are fields, and a status is chosen from them.
+    let capability =
+        onnx_genai_engine::package_capability_error(&refused).expect("the refusal is typed");
+    match capability {
+        onnx_genai_engine::PackageCapabilityError::ConversationOverBound {
+            cell,
+            requested,
+            bound,
+        } => {
+            assert_eq!(cell, "conversation");
+            assert_eq!(bound, 6);
+            assert!(
+                requested > bound,
+                "requested {requested} against bound {bound}"
+            );
+        }
+        other => panic!("expected a conversation-over-bound refusal, got {other:?}"),
+    }
     // The refusal left the conversation as it was, so the session is still
     // usable once it is reset.
     assert_eq!(engine.session_token_count(session)?, 6);
@@ -673,7 +687,10 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
         session: "shared".to_string(),
     };
     assert!(busy.is_retryable());
-    assert!(busy.to_string().contains("sess-busy") || busy.to_string().contains("shared"));
+    assert!(
+        busy.to_string().contains("shared"),
+        "the message names the session"
+    );
 
     let error: anyhow::Error = busy.into();
     assert!(matches!(
