@@ -76,6 +76,23 @@ impl InferenceRegistry {
         self.handlers.values().map(Vec::len).sum()
     }
 
+    /// Every registered `(domain, operator)` key, sorted.
+    ///
+    /// `operator_count` alone cannot distinguish a registration that moved from
+    /// one that was *renamed*: dropping one key and adding another leaves the
+    /// count identical, while every model using the dropped key silently falls
+    /// into the permissive "leave it unknown" path in [`Self::infer_node`].
+    /// Callers pinning the catalog should pin this, not the length of it.
+    pub fn operator_keys(&self) -> Vec<(&str, &str)> {
+        let mut keys: Vec<(&str, &str)> = self
+            .handlers
+            .keys()
+            .map(|(domain, op)| (domain.as_str(), op.as_str()))
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
     /// Infer a single node's outputs.
     ///
     /// Returns one [`NodeIo`] per output slot. An unregistered op (or one whose

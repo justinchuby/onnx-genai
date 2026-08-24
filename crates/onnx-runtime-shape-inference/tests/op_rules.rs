@@ -6370,3 +6370,286 @@ fn tensor_scatter_rejects_an_axis_that_selects_the_batch_dimension() {
         "must not select the batch dimension",
     );
 }
+
+/// Every `(domain, operator)` the shape-inference registry claims, sorted.
+///
+/// This is the catalog pin proper. `expanded_registry_catalog_count_is_pinned`
+/// pins the *size* of this set, which is the cheaper and more readable signal
+/// but is satisfied by any change that adds one key and drops another --
+/// a renamed or typo'd registration being the obvious case. A dropped key is
+/// not a loud failure anywhere else either: `infer_node` treats an unregistered
+/// op permissively and simply leaves its outputs unknown, so the model still
+/// runs and merely loses shape inference. Pinning the set is what turns that
+/// into a test failure that names the operator.
+const PINNED_CATALOG: &[(&str, &str)] = &[
+    ("", "Abs"),
+    ("", "Acos"),
+    ("", "Acosh"),
+    ("", "Add"),
+    ("", "AffineGrid"),
+    ("", "And"),
+    ("", "ArgMax"),
+    ("", "ArgMin"),
+    ("", "Asin"),
+    ("", "Asinh"),
+    ("", "Atan"),
+    ("", "Atanh"),
+    ("", "Attention"),
+    ("", "AveragePool"),
+    ("", "BatchNormalization"),
+    ("", "Bernoulli"),
+    ("", "BitShift"),
+    ("", "BitwiseAnd"),
+    ("", "BitwiseNot"),
+    ("", "BitwiseOr"),
+    ("", "BitwiseXor"),
+    ("", "BlackmanWindow"),
+    ("", "Cast"),
+    ("", "CastLike"),
+    ("", "CausalConvWithState"),
+    ("", "Ceil"),
+    ("", "Celu"),
+    ("", "CenterCropPad"),
+    ("", "Clip"),
+    ("", "Col2Im"),
+    ("", "Compress"),
+    ("", "Concat"),
+    ("", "ConcatFromSequence"),
+    ("", "Constant"),
+    ("", "ConstantOfShape"),
+    ("", "Conv"),
+    ("", "ConvTranspose"),
+    ("", "Cos"),
+    ("", "Cosh"),
+    ("", "CumSum"),
+    ("", "DFT"),
+    ("", "DepthToSpace"),
+    ("", "DequantizeLinear"),
+    ("", "Det"),
+    ("", "Div"),
+    ("", "Dropout"),
+    ("", "DynamicQuantizeLinear"),
+    ("", "Einsum"),
+    ("", "Elu"),
+    ("", "Equal"),
+    ("", "Erf"),
+    ("", "Exp"),
+    ("", "Expand"),
+    ("", "EyeLike"),
+    ("", "Flatten"),
+    ("", "Floor"),
+    ("", "GRU"),
+    ("", "Gather"),
+    ("", "GatherElements"),
+    ("", "GatherND"),
+    ("", "Gelu"),
+    ("", "Gemm"),
+    ("", "GlobalAveragePool"),
+    ("", "GlobalLpPool"),
+    ("", "GlobalMaxPool"),
+    ("", "Greater"),
+    ("", "GreaterOrEqual"),
+    ("", "GridSample"),
+    ("", "GroupNormalization"),
+    ("", "HammingWindow"),
+    ("", "HannWindow"),
+    ("", "HardSigmoid"),
+    ("", "HardSwish"),
+    ("", "Hardmax"),
+    ("", "Identity"),
+    ("", "InstanceNormalization"),
+    ("", "IsInf"),
+    ("", "IsNaN"),
+    ("", "LRN"),
+    ("", "LSTM"),
+    ("", "LayerNormalization"),
+    ("", "LeakyRelu"),
+    ("", "Less"),
+    ("", "LessOrEqual"),
+    ("", "LinearAttention"),
+    ("", "Log"),
+    ("", "LogSoftmax"),
+    ("", "LpNormalization"),
+    ("", "LpPool"),
+    ("", "MatMul"),
+    ("", "Max"),
+    ("", "MaxPool"),
+    ("", "MaxUnpool"),
+    ("", "Mean"),
+    ("", "MeanVarianceNormalization"),
+    ("", "MelWeightMatrix"),
+    ("", "Min"),
+    ("", "Mish"),
+    ("", "Mod"),
+    ("", "Mul"),
+    ("", "Multinomial"),
+    ("", "Neg"),
+    ("", "NegativeLogLikelihoodLoss"),
+    ("", "NonMaxSuppression"),
+    ("", "NonZero"),
+    ("", "Not"),
+    ("", "OneHot"),
+    ("", "Or"),
+    ("", "PRelu"),
+    ("", "Pad"),
+    ("", "Pow"),
+    ("", "QLinearMatMul"),
+    ("", "QuantizeLinear"),
+    ("", "RMSNormalization"),
+    ("", "RNN"),
+    ("", "RandomNormal"),
+    ("", "RandomNormalLike"),
+    ("", "RandomUniform"),
+    ("", "RandomUniformLike"),
+    ("", "Range"),
+    ("", "Reciprocal"),
+    ("", "ReduceL1"),
+    ("", "ReduceL2"),
+    ("", "ReduceLogSum"),
+    ("", "ReduceLogSumExp"),
+    ("", "ReduceMax"),
+    ("", "ReduceMean"),
+    ("", "ReduceMin"),
+    ("", "ReduceProd"),
+    ("", "ReduceSum"),
+    ("", "ReduceSumSquare"),
+    ("", "Relu"),
+    ("", "Reshape"),
+    ("", "Resize"),
+    ("", "ReverseSequence"),
+    ("", "RotaryEmbedding"),
+    ("", "Round"),
+    ("", "STFT"),
+    ("", "Scatter"),
+    ("", "ScatterElements"),
+    ("", "ScatterND"),
+    ("", "Selu"),
+    ("", "SequenceAt"),
+    ("", "SequenceConstruct"),
+    ("", "SequenceEmpty"),
+    ("", "SequenceErase"),
+    ("", "SequenceInsert"),
+    ("", "SequenceLength"),
+    ("", "Shape"),
+    ("", "Shrink"),
+    ("", "Sigmoid"),
+    ("", "Sign"),
+    ("", "SimplifiedLayerNormalization"),
+    ("", "Sin"),
+    ("", "Sinh"),
+    ("", "Size"),
+    ("", "Slice"),
+    ("", "Softmax"),
+    ("", "SoftmaxCrossEntropyLoss"),
+    ("", "Softplus"),
+    ("", "Softsign"),
+    ("", "SpaceToDepth"),
+    ("", "Split"),
+    ("", "SplitToSequence"),
+    ("", "Sqrt"),
+    ("", "Squeeze"),
+    ("", "StringNormalizer"),
+    ("", "Sub"),
+    ("", "Sum"),
+    ("", "Swish"),
+    ("", "Tan"),
+    ("", "Tanh"),
+    ("", "TensorScatter"),
+    ("", "TfIdfVectorizer"),
+    ("", "ThresholdedRelu"),
+    ("", "Tile"),
+    ("", "TopK"),
+    ("", "Transpose"),
+    ("", "Trilu"),
+    ("", "Unique"),
+    ("", "Unsqueeze"),
+    ("", "Where"),
+    ("", "Xor"),
+    ("ai.onnx.ml", "ArrayFeatureExtractor"),
+    ("ai.onnx.ml", "Binarizer"),
+    ("ai.onnx.ml", "CategoryMapper"),
+    ("ai.onnx.ml", "Imputer"),
+    ("ai.onnx.ml", "LabelEncoder"),
+    ("ai.onnx.ml", "Normalizer"),
+    ("ai.onnx.ml", "Scaler"),
+    ("com.microsoft", "Attention"),
+    ("com.microsoft", "BiasGelu"),
+    ("com.microsoft", "CausalConvWithState"),
+    ("com.microsoft", "CompressedSparseAttention"),
+    ("com.microsoft", "FastGelu"),
+    ("com.microsoft", "FusedAttention"),
+    ("com.microsoft", "FusedGemm"),
+    ("com.microsoft", "FusedMatMul"),
+    ("com.microsoft", "FusedMatMulBias"),
+    ("com.microsoft", "GatherBlockQuantized"),
+    ("com.microsoft", "Gelu"),
+    ("com.microsoft", "GroupQueryAttention"),
+    ("com.microsoft", "LayerNormalization"),
+    ("com.microsoft", "LinearAttention"),
+    ("com.microsoft", "MatMulNBits"),
+    ("com.microsoft", "MoE"),
+    ("com.microsoft", "MultiHeadAttention"),
+    ("com.microsoft", "QMoE"),
+    ("com.microsoft", "QuickGelu"),
+    ("com.microsoft", "RotaryEmbedding"),
+    ("com.microsoft", "Silu"),
+    ("com.microsoft", "SimplifiedLayerNormalization"),
+    ("com.microsoft", "SkipLayerNormalization"),
+    ("com.microsoft", "SkipSimplifiedLayerNormalization"),
+    ("pkg.nxrt", "BlockQuantizedMatMul"),
+    ("pkg.nxrt", "BlockQuantizedMoE"),
+    ("pkg.nxrt", "CompressedSparseAttention"),
+    ("pkg.nxrt", "IndexShare"),
+    ("pkg.nxrt", "KvCacheCapacityAppend"),
+    ("pkg.nxrt", "SparseKvGather"),
+    ("pkg.nxrt", "VarlenAttention"),
+];
+
+#[test]
+fn expanded_registry_catalog_set_is_pinned() {
+    // The pin has to be sorted and duplicate-free for the comparison below to
+    // mean anything; a mis-sorted literal would report spurious adds/removes.
+    let mut sorted = PINNED_CATALOG.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.as_slice(),
+        PINNED_CATALOG,
+        "PINNED_CATALOG must be sorted and free of duplicates: `left` is the corrected form, \
+         `right` is the literal as written."
+    );
+
+    let registry = InferenceRegistry::default_registry();
+    let live = registry.operator_keys();
+
+    let added: Vec<_> = live
+        .iter()
+        .filter(|k| PINNED_CATALOG.binary_search(k).is_err())
+        .map(|(d, o)| format!("{}::{o}", if d.is_empty() { "ai.onnx" } else { d }))
+        .collect();
+    let removed: Vec<_> = PINNED_CATALOG
+        .iter()
+        .filter(|k| live.binary_search(k).is_err())
+        .map(|(d, o)| format!("{}::{o}", if d.is_empty() { "ai.onnx" } else { d }))
+        .collect();
+
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "shape-inference operator catalog moved.\n  registered but not pinned: {}\n  pinned \
+         but not registered: {}\nIf you added or removed a handler, update PINNED_CATALOG and \
+         the counts in the same commit and cover the rule with a test (RULES.md section 8). A key \
+         in `pinned but not registered` is the dangerous direction: nothing else in this suite \
+         fails when an operator loses its handler, because unregistered ops are inferred \
+         permissively rather than rejected.",
+        if added.is_empty() {
+            "(none)".to_string()
+        } else {
+            added.join(", ")
+        },
+        if removed.is_empty() {
+            "(none)".to_string()
+        } else {
+            removed.join(", ")
+        },
+    );
+}
