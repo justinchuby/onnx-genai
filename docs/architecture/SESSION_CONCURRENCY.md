@@ -35,35 +35,63 @@ Send` looks like the concurrency story. It is not. The concurrency story is that
 there is exactly one thread.
 
 The server makes that explicit. `EngineOwner(Box<Engine>)` carries a second
-`unsafe impl Send` (`crates/onnx-genai-server/src/driver.rs:275-278`) whose
+`unsafe impl Send` (`crates/onnx-genai-server/src/driver.rs:278-281`) whose
 safety comment is a promise about scheduling rather than about the type:
 
 > The engine is moved exactly once into the dedicated driver thread. All ORT
 > runners, sessions, KV state, and the continuous batch manager stay owned by
 > that thread and are accessed only by processing channel commands.
 
-`EngineDriver::start` spawns one OS thread named `onnx-genai-batch-driver` and
-moves the owner into it (`driver.rs:318-330`). Every request arrives as a
-`DriverCommand` over a `tokio::sync::mpsc` channel and is executed by
-`run_engine_driver` (`driver.rs:690-722`), which picks one of two serial loops:
-`run_static_engine_driver` when the decode path can advance several rows per
-forward pass, and `run_fallback_engine_driver` — a bare
-`while let Some(command) = rx.blocking_recv()` — otherwise (`driver.rs:725-733`).
+`EngineDriver::start` spawns one OS thread and moves the owner into it. Since
+[#2012](https://github.com/justinchuby/onnx-genai/pull/2012) (merged as
+`1bf87c86`) that spawn goes through a worker abstraction rather than a bare
+channel: `WorkerHandle::spawn` names the thread `onnx-genai-batch-driver-{id}`
+and keeps both the command sender and the `JoinHandle`
+(`crates/onnx-genai-server/src/worker.rs:137-156`, `driver.rs:327-330`). Every
+request arrives as a `DriverCommand` over a `tokio::sync::mpsc` channel and is
+executed by `run_engine_driver` (`driver.rs:760-763`), which picks one of two
+serial loops: `run_static_engine_driver` when the decode path can advance
+several rows per forward pass (`driver.rs:806-810`), and
+`run_fallback_engine_driver` — a bare `while let Some(command) =
+rx.blocking_recv()` — otherwise (`driver.rs:795-803`).
+
+**#2012 already built part of §4, and this document is written on top of it.**
+It is worth being precise about what it did and did not settle, because it
+changes what remains:
+
+| #2012 introduced | Citation | What it settles |
+|---|---|---|
+| `WorkerId(usize)` newtype | `worker.rs:34-50` | a worker index can never be confused with a `SessionId` |
+| `SessionPlacement { session, worker }` | `worker.rs:66-85` | an engine session id travels with the worker that issued it |
+| `WorkerHandle` with sender **and** `JoinHandle` | `worker.rs:118-236` | shutdown is observable: `shutdown()` closes the channel and joins, so the engine is provably gone |
+| `WorkerPool` holding exactly one worker | `worker.rs:255-323` | routing is by `WorkerId`, and a placement naming an unknown worker is refused (`WorkerUnavailable`, `worker.rs:87-110`) |
+| `Drop for WorkerHandle` closes without joining | `worker.rs:217-236` | ordering is promised only by an explicit `shutdown()`, never by drop |
+
+So the addressing model, the shutdown contract, and the id hygiene that §4
+depends on are **already merged**. `WorkerPool::single` is a pool of one
+(`worker.rs:261-265`), and `placement_worker` hands out the only id there is
+(`worker.rs:276-279`). What remains is `W > 1`, the state split that makes it
+sound, and — separately and more urgently — a lease that actually refuses.
+
+`EngineOwner`'s `unsafe impl Send` survived #2012 deliberately: the engine is
+still thread-affine and still moved exactly once
+(`driver.rs:278-281`). §10 removes it; #2012 did not.
 
 The Python binding reaches the same conclusion by a different route: it holds
-`inner: Mutex<RustEngine>` and refuses contention outright rather than blocking,
-raising `PyRuntimeError` with the message *"engine is in use by another thread —
-onnx_genai Engine is not re-entrant; serialize calls or use one Engine per
-thread"* (`crates/onnx-genai-python/src/lib.rs:173-186`).
+`inner: Mutex<RustEngine>` (`crates/onnx-genai-python/src/lib.rs:187-188`) and
+refuses contention outright rather than blocking, raising `PyRuntimeError` with
+the message *"engine is in use by another thread — onnx_genai Engine is not
+re-entrant; serialize calls or use one Engine per thread"*
+(`python/src/lib.rs:173-184`).
 
 So today's answer to "are sessions thread-safe?" is: the question does not
-arise, because there is one thread. That is a defensible position for a single
+arise, because there is one worker. That is a defensible position for a single
 GPU serving one decode core. It is not a defensible position for a public API,
 because callers cannot tell from the type system that it is true — `Engine` is
 `Send`, so it compiles inside an `Arc<Mutex<_>>`, and a caller who does that
 gets whole-engine serialization they did not ask for and cannot see.
 
-### 1.2 The exclusive lease is already typed — and already unreachable
+### 1.2 The exclusive lease is typed, unreachable, and narrower than it looks
 
 The metadata contract already declares this. A session-scoped state cell carries
 a `SessionLeaseContract` whose `policy` defaults to `exclusive`
@@ -73,7 +101,7 @@ specification states the consequence:
 > A lease declared `policy: exclusive` is single-flight: a second turn that
 > starts while one is in flight is refused by name rather than allowed to read a
 > conversation the first is about to replace.
-> — [`../genai/INFERENCE_METADATA_DECISIONS.md`](../genai/INFERENCE_METADATA_DECISIONS.md):1103
+> — [`../genai/INFERENCE_METADATA_DECISIONS.md`](../genai/INFERENCE_METADATA_DECISIONS.md):1103-1105
 
 The runtime implements that refusal. `SessionLeaseGuard::acquire` inserts into
 the lease set or returns
@@ -85,21 +113,80 @@ the entry so a pass that fails or panics does not strand the session
 it to HTTP 409 by matching the variant rather than the wording
 (`crates/onnx-genai-server/src/routes/mod.rs:523-525`).
 
-Every piece is in place except the ability to reach it. The server's own test
-says so:
+**Two separate facts stop that from being Decision 3, and the second is the one
+that is easy to miss.**
+
+**First, it cannot be reached.** The server's own test says so:
 
 > `// 3. ExclusiveLeaseConflict — the driver serializes passes, so this is`
 > `//    raised where it is decided and mapped where it is answered.`
-> — `crates/onnx-genai-server/src/tests.rs:4856-4857`
+> — `crates/onnx-genai-server/src/tests.rs:4858-4859`
 
 The test constructs the error by hand and checks the mapping, because no HTTP
 request sequence can produce it. A `RefCell<HashSet<String>>` on a
-single-threaded driver cannot observe two turns in flight.
+single-worker driver cannot observe two turns in flight.
 
-This document's central claim follows directly: **the design work is not
-inventing a conflict error, it is making the existing one reachable and
-correct.** The refusal contract is settled. What is unsettled is the execution
-model underneath it.
+**Second — and this is the part the citation trail does not advertise — the
+lease does not cover most sessions.** `workflow_session_leases` is read at
+exactly one place, and only under two conditions:
+
+```rust
+let session_state = onnx_genai_metadata::classify_session_state(workflow);
+let _session_lease = match (self.session_id.as_deref(), session_state.carries_any()) {
+    (Some(session_id), true) => {
+        match SessionLeaseGuard::acquire(&engine.workflow_session_leases, session_id) {
+```
+— `crates/onnx-genai-engine/src/pipeline/workflow.rs:1356-1363`
+
+The guard is taken only when the *interpreted workflow* declares session-scoped
+cells that carry. That path is reached only when the engine does **not** hold a
+decode core:
+
+```rust
+if !self.holds_decode_core() {
+    ...
+    return self.generate_in_workflow_session(
+```
+— `crates/onnx-genai-engine/src/engine/runtime.rs:1231-1237`
+
+A decode-core package — the ordinary LLM case — takes the other branch, keeps
+its conversation in `Engine::sessions: HashMap<SessionId, EngineSession>`
+(`engine/model.rs:55-56`), and **acquires no lease of any kind**. There is no
+`SessionLeaseGuard` on that path; `workflow_session_leases` has exactly four
+references in the entire workspace, all of them in the interpreter
+(`pipeline/mod.rs:191`, `:445`, `:799`, `workflow.rs:1363`).
+
+The two even use different identifier types. The interpreter's lease set is
+keyed by `String` (`pipeline/mod.rs:191`, and `session_id: Option<String>` at
+`workflow.rs:258`); the decode core is keyed by
+`SessionId = SequenceId = u64` (`config.rs:389`, `onnx-genai-kv/src/lib.rs:61`).
+The interpreter is handed a stringified copy of the numeric id at the boundary
+(`engine/runtime.rs:780`), so the two spaces agree by convention, not by type.
+
+So the honest summary is:
+
+| Path | Conversation state | Lease today | Refuses a concurrent second turn? |
+|---|---|---|---|
+| Interpreted workflow (`!holds_decode_core`) | interpreter session cells | `workflow_session_leases`, keyed by `String` | would, if two could be in flight |
+| Decode core (ORT) | `Engine::sessions`, keyed by `SessionId` | none | no |
+| Decode core (native) | `Engine::native_sessions` (`engine/model.rs:78-100`) | none | no |
+
+This changes what §2's Decision 3 asks for. It is **not** "make the existing
+lease reachable". It is:
+
+> **A new lease is required at the routing layer, keyed by the typed public
+> session identity (`SessionPlacement`, not a `String`), covering the decode-core
+> and interpreted paths alike.** The interpreter's existing per-pass guard stays
+> as a deeper, package-declared invariant; it is not promoted into the public
+> concurrency contract, because it does not cover the majority of sessions and
+> is keyed by the wrong thing.
+
+What *is* settled by the existing code is the refusal's **vocabulary**: the
+error type, its retryable classification, its 409 mapping, and the normative
+sentence in the metadata spec. §4.2 reuses all four. What is unsettled is where
+the lease lives, what it is keyed by, and when it is taken — which is §4.2 and
+§4.2.1.
+
 
 ### 1.3 Which backend handles are thread-affine
 
@@ -141,15 +228,15 @@ and thread-affine**, and the `Sync` impl on `Session` does not reach it.
 
 | Handle | Location | Claim |
 |---|---|---|
-| `CudnnBackend` | `crates/onnx-runtime-ep-cuda/src/cudnn/mod.rs:1129-1132` | "cudarc deliberately keeps `Cudnn` !Send/!Sync because a handle must not be used concurrently … `with_handle` binds the owning CUDA context to the calling thread first" |
-| `RawReduceHandle` | `.../cudnn/mod.rs:961-963` | "runs on the thread bound to the owning CUDA context" |
-| `CudnnReduceCache` | `.../cudnn/mod.rs:1099-1101` | same |
+| `CudnnBackend` | `crates/onnx-runtime-ep-cuda/src/cudnn/mod.rs:1128-1132` | "cudarc deliberately keeps `Cudnn` !Send/!Sync because a handle must not be used concurrently … `with_handle` binds the owning CUDA context to the calling thread first" |
+| `RawReduceHandle` | `.../cudnn/mod.rs:960-963` | "runs on the thread bound to the owning CUDA context" |
+| `CudnnReduceCache` | `.../cudnn/mod.rs:1098-1101` | same |
 | `CudaGraphLifecycle` | `crates/onnx-runtime-ep-cuda/src/graph.rs:130-135` | every segment launches on its single owning stream |
 | `CudaReservation` | `crates/onnx-runtime-cuda-memory/src/virtual_memory.rs:2749-2752` | "thread-affine, and every driver call through the backing binds the context first" |
 
 **CUDA graph capture is thread-local, and the repo already knows it.** Capture
 begins with `CU_STREAM_CAPTURE_MODE_THREAD_LOCAL` (`graph.rs:177`), must end on
-the thread that began it (`graph.rs:184-193`), must abort on that same thread
+the thread that began it (`graph.rs:186-195`), must abort on that same thread
 (`graph.rs:274-285`), and the allocator's capture gate is a `thread_local!`
 depth counter (`crates/onnx-runtime-cuda-memory/src/capture_gate.rs:93-100`).
 
@@ -274,7 +361,7 @@ rule that prevents its return is structural (§3.4), not another convention.
 - **Continuous batching does not carry sessions.** `run_static_engine_driver`
   states plainly that *"The current `ContinuousBatchManager` API accepts
   `GenerateRequest` only. `X-Session-Id` requests keep using the driver's
-  per-request engine path"* (`driver.rs:744-747`). Sessionful traffic is on the
+  per-request engine path"* (`driver.rs:814-817`). Sessionful traffic is on the
   serial path by construction.
 - **Fork is declared and disabled.** `session_fork_capability` returns `None`
   unconditionally and `fork_session` bails with a message naming the missing
@@ -298,14 +385,19 @@ These are the commitments this document makes. Sections 3–13 derive from them.
    default, and any serialization is a named, attributable decision.
 3. **The same session under an exclusive lease refuses, by type.** A second turn
    on a session whose lease is `policy: exclusive` returns
-   `PackageCapabilityError::ExclusiveLeaseConflict`. It does not queue silently,
-   it does not interleave, and it does not lose an update.
+   `PackageCapabilityError::ExclusiveLeaseConflict`. It does not queue silently
+   and it does not interleave: the refusal is the contract, not a fallback. The
+   lease also spans the whole read→write commit, which is what rules out a lost
+   update — §11.1 is careful about the difference between those two properties.
+   This requires a **new** lease at the routing layer; §1.2 shows why the
+   existing one does not qualify.
 4. **Backend handles stay thread-affine and are not made `Sync` by wrapping raw
    handles in locks.** Where a handle names a bound context or an owning stream,
-   the design supplies a thread, not a mutex. Affinity is recorded and asserted
-   (`OwnerThread`), and a resource derived from a session owns that session
-   (`Arc<Session>`) rather than pointing at it — §3.4. Both are structural
-   because §1.4 shows a convention already failed here.
+   the design supplies a thread, not a mutex. Affinity is enforced structurally
+   where the type allows it (a worker-owned resource that is not `Send` cannot be
+   moved at all) and by typed errors otherwise, and a resource derived from a
+   session owns that session (`Arc<Session>`) rather than pointing at it — §3.4.
+   Both are structural because §1.4 shows a convention already failed here.
 5. **Execution uses a bounded pool of session workers with deterministic session
    ownership and stateless load distribution.** A session belongs to exactly one
    worker for its entire life; the routing decision is a pure function of the
@@ -324,11 +416,11 @@ time, and the outcome is one of
 - the operation completes, or
 - the operation is refused with a typed error naming why,
 
-with no undefined behaviour, no torn state, no lost update, and no silent
-reordering of two turns on one session. It is explicitly **not** a promise that
-concurrent calls on one session both succeed. Decision 3 says the opposite, on
-purpose: silently serializing two writers to one conversation is how a caller
-loses a turn without being told.
+with no undefined behaviour, no torn state, and no silent reordering of two turns
+on one session. It is explicitly **not** a promise that concurrent calls on one
+session both succeed. Decision 3 says the opposite, on purpose: a caller that
+asked to take a busy session is told so, rather than being parked behind a
+decode that may run for thousands of tokens with no way to see the wait.
 
 ---
 
@@ -427,73 +519,201 @@ That means:
 - `Session::device_allocator` (`session/mod.rs:1168-1175`) is therefore callable
   only on an `Arc<Session>`, not on a bare `Session`.
 
-`Arc<Session>` is not a new idea in this codebase — it is already how the engine
-holds its session (`engine/model.rs:245`), how MTP holds its draft and target
-sessions (`crates/onnx-genai-ort/src/mtp.rs:122`, `:166`), and how the
-speculative decoder holds its sessions (`speculative/mod.rs:1056`). The gap is
-narrow and specific: the edge from a session to the resources *derived* from it
-is the one edge that was left as a raw pointer.
+`Arc<Session>` is a partial precedent in this codebase, and it is worth being
+accurate about how partial, because the change is larger than "one more `Arc`".
+Today:
+
+| Holder | Type | Citation |
+|---|---|---|
+| `Engine::session` | `Option<Box<Session>>` | `engine/model.rs:68` |
+| `Eagle3Model::session` | `Box<Session>` | `engine/model.rs:255` |
+| `DraftModel::session` | `Box<Session>` | `crates/onnx-genai-engine/src/session.rs:50` |
+| `MtpModel::session` | `Arc<Session>` | `engine/model.rs:245` |
+| `MtpSession::Owned` | `Arc<Session>` | `crates/onnx-genai-ort/src/mtp.rs:122`, `:166` |
+| speculative head | `Arc<Session>` | `speculative/mod.rs:1056` |
+
+So only the MTP and speculative paths use `Arc` today; the engine's own session
+and both draft-model sessions are `Box`. `Box<Session>` is deliberate — it is
+what gives the ORT decode runners the stable address their self-references need,
+which `Engine`'s safety comment states explicitly: *"Self-references in ORT
+decode runners point into boxed `Session` allocations, whose addresses remain
+stable when the owning `Engine` moves"* (`engine/model.rs:225-226`). `Arc`
+preserves that stable address, so the conversion is sound, but it is a
+conversion, not an extension of an existing pattern.
+
+**Therefore Rule A's scope is stated explicitly rather than left implied.** Every
+holder that can hand out a session-derived `IoBinding`, `Allocator` or `Value`
+must move from `Box<Session>` to `Arc<Session>` in the same phase that adds the
+ownership edge — that is `Engine::session`, `Eagle3Model::session` and
+`DraftModel::session`, together with the already-`Arc` MTP and speculative
+holders. §13 Phase 1 lists them. If a future holder cannot be converted, the rule
+narrows to the holders that can, and the resources derived from an unconverted
+holder keep their current ordering discipline and keep the compensating `Drop`
+that goes with it — but it is not permitted to convert *some* holders, delete the
+compensating teardown, and leave the rest relying on an invariant that no longer
+has a keeper.
 
 The payoff is that teardown order stops being a property of source-file layout.
 `ExecutionIsland`'s field declaration order (`pipeline/islands.rs:74`, `:78`,
 `:79`) becomes irrelevant — the session cannot be released while a binding,
 allocator or value still refers to it, because the refcount says so. And
 `WorkflowRuntime::drop`'s manual `clear_bindings`-then-clear-maps sequence
-(`pipeline/mod.rs:270-279`) stops being load-bearing. §13 Phase 1 removes it in
-the same change that adds the `Arc`, rather than leaving a correct-but-redundant
-cleanup path for a future reader to mistake for a live invariant (RULES.md
-Rule 3).
+(`pipeline/mod.rs:270-279`) stops being load-bearing. §13 Phase 1 removes it only
+after the ownership edge exists for every holder that feeds it, per §3.5's
+sequencing rule — never before.
 
-**Rule B — thread identity, checked.** Every per-worker backend handle records
-the `ThreadId` it was constructed on, and asserts it on use and on drop.
+### 3.5 What Rule A does *not* fix: the environment above the session
+
+Rule A ties a session to the resources below it. It says nothing about the
+handle above it, and that gap has to be stated or the "no field-order
+dependencies" rule in §10 would be claiming more than it delivers.
+
+**ORT requires the environment to outlive every session, and nothing in this
+repository structurally enforces that.** The requirement is written down:
+
+> ORT requires the `OrtEnv` to outlive every `OrtSession`. Releasing the session
+> after its environment is a use-after-free…
+> — `crates/onnx-genai-ort/src/value.rs:2388-2393` (and again at `:2435-2440`)
+
+And `Environment`'s own SAFETY comment describes the discipline it depends on:
+it *"releases it once from `Drop` after owning structs have dropped their
+sessions"* (`env.rs:326-331`). But `Session` holds no environment handle at all —
+its fields are the ORT pointer, names, I/O metadata and EP bookkeeping
+(`session/mod.rs:477-499`), and it merely borrows `&Environment` during
+construction (`session/mod.rs:508-523`). The environment lives in a process-wide
+`OnceLock<Mutex<EnvironmentLifecycle>>` (`env.rs:45-48`), and EP plugin
+registration is likewise ambient — *"ORT plugin registration is process-global"*
+(`crates/onnx-genai-ort/src/session/plugin.rs:120-123`), serialized through a
+global registry (`env.rs:50-55`, `:255-257`).
+
+So session → environment is exactly the same category of defect as §1.4's
+session → binding, one level up, and it is **out of scope for this document to
+fix**. Two options exist and the choice is deferred to the implementation, not
+elided:
+
+- **Structural:** `Session` gains an `Arc<Environment>`, and the environment
+  becomes un-droppable while any session lives. This is the honest fix and would
+  let §10's rule apply without exception. It touches every session constructor
+  and the plugin registry's lifetime story, which is why it is not folded into
+  Phase 1.
+- **Scoped:** the environment stays ambient and process-lifetime, and the §10
+  rule is explicitly scoped to *session-derived* resources, with this section as
+  the written record of why the outer edge is still controlled by discipline.
+
+Until one is chosen, two things follow, and both are normative:
+
+1. **§10's no-field-order rule is scoped to resources derived from a `Session`.**
+   It does not yet claim anything about `Environment`, providers or plugins.
+2. **No compensating teardown may be deleted before the structural lifetime that
+   replaces it exists.** This applies to `WorkflowRuntime::drop`
+   (`pipeline/mod.rs:270-279`) and to `Environment::drop`'s ordering discipline
+   (`env.rs:308-321`) alike. Deleting a manual teardown is the *last* step of a
+   conversion, never the first, and §13 Phase 1 sequences it that way.
+
+**Rule B — thread affinity, structural first, then typed, never a panic in
+`Drop`.** Affinity is enforced in three layers, in order of preference.
+
+**B.1 — Make the type structurally `!Send`.** The strongest enforcement is the
+one the compiler performs. A per-worker backend handle should not be movable
+across threads at all, and the workspace already does this: `CapturedGraph` is
+*"intentionally neither `Send` nor `Sync`"* (`crates/onnx-runtime-ep-cuda/src/graph.rs:103-108`).
+Per-worker handles follow that precedent — no `unsafe impl Send`, no
+`unsafe impl Sync`, and where a wrapper would otherwise be auto-`Send`, an
+explicit `PhantomData<*const ()>` marker to remove it. No such marker exists in
+the workspace today (grepping for `PhantomData<*`, `PhantomData<Rc`, `NotSend`
+returns nothing), so this is new, and it is where the design puts its weight: a
+handle that cannot be moved to the wrong thread does not need to be checked for
+being on the wrong thread.
+
+Structural `!Send` is not always achievable — the ORT `Session` is `Send + Sync`
+today (§1.3), and some handles must be constructed in one place and installed in
+another. Where it is achievable it is mandatory; where it is not, B.2 and B.3
+apply.
+
+**B.2 — Normal operations return a typed affinity error.** For anything that is
+already fallible, a wrong-thread use is an ordinary error value, not a panic.
+This is exactly what the CUDA graph code already does:
 
 ```rust
-/// The thread a backend handle was constructed on and must be used and
-/// dropped on. Recorded at construction; asserted, never inferred.
-pub(crate) struct OwnerThread(std::thread::ThreadId);
-
-impl OwnerThread {
-    pub(crate) fn current() -> Self {
-        Self(std::thread::current().id())
-    }
-
-    #[track_caller]
-    pub(crate) fn assert_owned(&self, what: &'static str) {
-        let now = std::thread::current().id();
-        assert_eq!(
-            self.0, now,
-            "{what} is thread-affine: constructed on {:?}, used on {now:?}",
-            self.0
-        );
-    }
-}
+CaptureState::Capturing(owner) if owner == std::thread::current().id() => {}
+CaptureState::Capturing(_) => {
+    return Err(EpError::KernelFailed(
+        "cuda_ep: CUDA graph capture must end on the thread that began the \
+         thread-local capture"
 ```
+— `crates/onnx-runtime-ep-cuda/src/graph.rs:188-195`, and the same shape for
+`abort` at `:277-283`
 
-No such concept exists today. Grepping `onnx-genai-ort` and `onnx-genai-engine`
-for a thread-identity check returns nothing; affinity is documented in SAFETY
-comments (§1.3) and enforced by the fact that there is currently one thread.
-Once there are `W`, the documentation is all that remains, and documentation
-does not fail a test.
+So the precedent is established and this design extends it rather than inventing
+a policy: a `ThreadId` recorded at construction, compared on use, and reported as
+a typed error naming the handle, the owning thread and the calling thread —
+actionable per RULES.md Rule 1. The routing layer converts it into a 500 with the
+worker named, because a caller cannot fix it and an operator can.
 
-Three properties of Rule B are deliberate:
+**B.3 — Teardown never panics.** `Drop` is the one place where an assertion is
+actively harmful: a `Drop` running during unwind that panics aborts the process,
+so a wrong-thread teardown reached from an existing panic would turn a
+recoverable worker failure into a hard abort, and §7's "degrade to `W-1`" promise
+would be a lie. A design cannot both panic in `Drop` and claim graceful
+degradation.
 
-1. **It is always on, not `debug_assertions`-only.** The bug it catches is a
-   CUDA context bound to the wrong thread or a handle released off its owning
-   thread. That is silent undefined behaviour, not a wrong number — it will not
-   reproduce under a debug build on demand, and a release build is exactly where
-   it will be met. The cost is one `ThreadId` comparison against operations that
-   already cost a device round trip.
-2. **It asserts on `Drop`, not only on use.** §1.4's defect is a teardown bug.
-   A check that only fires on use would not have caught it.
-3. **It panics rather than returning an error.** A handle used from the wrong
-   thread means the ownership routing in §4 is broken; there is no caller-level
-   recovery, and §7's worker-failure path already converts a worker panic into a
-   typed, actionable refusal for every affected request. This is the one place
-   this design prefers a panic to a typed error, and it is because a wrong-thread
-   handle has already violated the precondition that made the surrounding code
-   sound.
+The workspace has already solved this, and the solution is richer than anything
+this document would invent. `onnx-runtime-memory-api` defines a vocabulary for
+*"what is true after a release partially fails"*
+(`crates/onnx-runtime-memory-api/src/deferred.rs:5-6`):
 
-Which handles carry an `OwnerThread`: the native decode session, the CUDA
+- `AllocationReleaseState::Quarantined` — *"Ownership is retained deliberately
+  because releasing it would be unsafe or dishonest"* (`deferred.rs:70-73`).
+- `QuarantineReason`, whose variants already include `OwnerDropped`,
+  `MechanismTerminated`, `DeviceLost`, `EnqueueRejected` and `StatePoisoned`
+  (`deferred.rs:153-174`).
+- `DeferredReleaseQueue: Send + Sync + Debug` with
+  `fn enqueue(&self, request: PreparedAllocationRelease) -> Result<(), DeferredEnqueueError>`
+  (`deferred.rs:427-435`), returning `DeferredReleaseDisposition::{Queued, Quarantined}`
+  (`deferred.rs:440-449`).
+- `Drop for PreparedAllocationRelease`, which quarantines an abandoned request
+  and — the sentence that settles this — *"never frees, never blocks, and never
+  loses metadata"* (`deferred.rs:25-27`, impl at `:787-805`).
+- `ProviderContextPin` / `ProviderContextPinSource`, whose module doc states the
+  principle directly: *"A pin does not ask a context to stay alive; it makes
+  teardown observe the outstanding work"* (`context_pin.rs:15-19`).
+
+The same shape already appears outside the memory API: `Drop for CapturedGraph`
+records the error through the context and destroys what it can, without panicking
+(`graph.rs:82-99`); `Drop for OwningAllocation` quarantines rather than freeing
+(`crates/onnx-runtime-memory-api/src/binding.rs:2102-2119`); and
+`Drop for PooledStaging` degrades to *"Leak-safe fallback only: free the buffer,
+never return it to the pool"* (`crates/onnx-runtime-ep-cuda/src/pinned_pool.rs:273-279`).
+
+**So the normative teardown rule is:** a per-worker resource dropped on a thread
+that is not its owner must, in this order,
+
+1. emit telemetry naming the resource, its owner thread and the dropping thread —
+   never `panic!`, and never conditioned on `std::thread::panicking()`, which
+   appears nowhere in the workspace today and would make the behaviour depend on
+   whether a panic happened to be in progress;
+2. hand the release to the owning worker's deferred-release queue if that worker
+   is still alive, which is the `DeferredReleaseDisposition::Queued` case; and
+3. quarantine the ownership if it is not, with `QuarantineReason::OwnerDropped`
+   for a dead owner or `MechanismTerminated` for a torn-down context —
+   deliberately retaining memory rather than making a driver call from the wrong
+   thread.
+
+Quarantine leaks device memory, and that is the point: leaking a reservation is
+a bounded, observable, reportable cost, and freeing it from the wrong context is
+undefined behaviour. RULES.md Rule 9's "never silently OOM" is satisfied because
+quarantine is neither silent nor unaccounted — it flows through the same ledger
+the governor already reads (§8).
+
+**The one permitted abort.** If a violation is detected where neither deferral
+nor quarantine can express the outcome — a partially-released allocation whose
+ownership can no longer be described — the process aborts against a **named fatal
+invariant**, logged as such. In that case §7 must not claim `W-1` degradation,
+and it does not: §7's degradation promise is explicitly scoped to worker panics
+and construction failures, both of which unwind normally and release through the
+paths above.
+
+Which handles carry an owner-thread record: the native decode session, the CUDA
 context binding, `CudnnBackend` and its reduce cache, `CudaGraphLifecycle`,
 `CudaReservation`, the paged KV cache, and every session-derived `IoBinding`,
 `Allocator` and `Value`. ORT's `Session` does not need one for `Run` (it is
@@ -569,32 +789,115 @@ refuses `create_session` with a typed error naming the shard and the bound,
 rather than migrating (impossible) or over-subscribing (which converts a refusal
 into a latency cliff).
 
-### 4.2 The lease registry
+### 4.2 The routing lease
 
-`workflow_session_leases: RefCell<HashSet<String>>` (`pipeline/mod.rs:191`) is
-replaced. The replacement is **not** a `Mutex<HashSet<...>>` in the same place.
+This is the section the whole document turns on, because §1.2 established that
+the lease Decision 3 needs **does not exist today** — the interpreter's
+`workflow_session_leases` covers interpreted workflow sessions only, is keyed by
+`String`, and is absent from every decode-core path.
 
-Because a session is owned by exactly one worker (§4.1), all turns on one
-session are already serialized onto one thread. The lease set is therefore
-*per-worker*, holds only that worker's sessions, and needs no cross-thread
-synchronization at all — it can stay a plain `HashSet` behind the worker's
-`&mut`. A global lock here would be a lock that never contends usefully, taken
-on every turn, protecting an invariant that ownership already provides.
+**A new lease is introduced at the routing layer.** It is keyed by the typed
+public session identity — the `SessionPlacement` that #2012 already threads
+through the driver, the session registry and the routes (`worker.rs:66-85`) —
+and it applies to every session-bearing turn regardless of which execution path
+serves it. Decode-core ORT sessions, decode-core native sessions, and
+interpreted workflow sessions are all covered by one lease, because a caller
+holding one session id should get one answer about what a concurrent second turn
+does.
 
-`SessionLeaseGuard`'s existing shape is kept verbatim in spirit: acquire inserts
-or returns `ExclusiveLeaseConflict`, and `Drop` removes
-(`pipeline/workflow.rs:598-633`). The reason its doc comment already gives — *"a
-pass that fails or panics does not strand the session"* — is exactly the property
-§6 needs, so the guard is the mechanism and not a new one.
+The interpreter's existing `SessionLeaseGuard` (`pipeline/workflow.rs:598-633`)
+is **kept, not replaced, and not promoted.** It remains a package-declared
+invariant one level down: it protects the interpreter's own session cells during
+a pass, which is a narrower and different claim than the public concurrency
+contract. Two guards at two layers is the correct shape here, not duplication —
+the routing lease answers "may this turn start?", the interpreter guard answers
+"is this pass the only one touching these cells?".
 
-**What changes is reachability.** With one worker serving many sessions and many
-in-flight turns, a second turn arriving for a session whose lease is held is now
-an ordinary event rather than an unconstructible one, and the 409 at
-`routes/mod.rs:523-525` becomes a status an integration test can produce over
-HTTP. The server test's parenthetical — *"the driver serializes passes, so this
-is raised where it is decided and mapped where it is answered"*
-(`server/src/tests.rs:4856-4857`) — is deleted in the same change, and replaced
-by the real test in §12.1.
+What the routing lease reuses verbatim is the existing **vocabulary**:
+`PackageCapabilityError::ExclusiveLeaseConflict { session }`
+(`engine/capability.rs:50-53`), its retryable classification
+(`capability.rs:57-61`), the chain-walking extractor (`capability.rs:64-72`),
+and the 409 mapping that matches on the variant rather than the wording
+(`routes/mod.rs:517-527`). None of those change. Only the place the error is
+raised, and the key it is raised against, are new.
+
+Where the lease state lives is a consequence of §4.1, not a free choice. Since
+routing is a pure function of the session id and a session belongs to exactly
+one worker for its whole life, contention on the lease map is contention between
+*request-handling* tasks, not between workers. It is therefore one map in the
+routing façade, sharded by `WorkerId` to keep the critical section short, holding
+`SessionPlacement → LeaseState`. It is *not* a `Mutex<HashSet<String>>` dropped
+into `WorkflowRuntime` where the old one was, and it is *not* per-worker state —
+a per-worker map cannot be consulted before the command reaches the worker, and
+§4.2.1 explains why that timing is the whole point.
+
+#### 4.2.1 The lease is acquired before enqueue, not inside the worker loop
+
+This is normative and it is the single easiest thing to get wrong.
+
+If the lease were acquired where the old one is — inside the pass, on the worker
+thread — then a second turn on a busy session would be **accepted, queued behind
+the first, and eventually succeed**. It would not be refused. The caller would
+see a slow 200, not a 409, and Decision 3 would be violated in exactly the way
+Decision 3 exists to prevent, while every test that only checks "the error type
+exists and maps to 409" would still pass.
+
+So:
+
+**Acquisition happens in the routing façade / session registry, on the calling
+task, before the `DriverCommand` is constructed and before it is enqueued to the
+worker channel and before any admission or queue-depth accounting is charged.**
+A turn that cannot take the lease never becomes a command, never occupies a
+queue slot, never consumes an admission permit, and is answered with 409 from
+the same task that tried to take it.
+
+The ordering is:
+
+```
+route handler
+  ├─ resolve SessionPlacement          (session registry, #2012)
+  ├─ ACQUIRE routing lease  ─────────► on failure: ExclusiveLeaseConflict → 409, stop here
+  ├─ charge admission / queue depth
+  ├─ build DriverCommand, MOVING the lease guard into it
+  ├─ send to WorkerHandle::sender()   ─► on send failure: guard drops here, lease released
+  └─ await completion                 ─► guard travels with the command and is
+                                          released when the turn ends, however it ends
+```
+
+**The guard travels with the command.** It is owned by the `DriverCommand`, so
+its release is a `Drop` obligation rather than a cleanup path someone has to
+remember on each exit. That matters because there are five distinct ways a turn
+can end and all five must release:
+
+| Ending | Where the guard is dropped |
+|---|---|
+| normal completion | worker drops the command after emitting the final event |
+| error during the pass | same — the guard is in the command, the command is dropped |
+| client cancellation / abandoned route | worker's abandoned-route handling drops the command (`driver.rs:1394-1403`, `:1418-1421`) |
+| channel send failure (`DriverStopped`) | the guard is still on the sending task and drops when the send returns `Err` (`driver.rs:502-506`, `:510-523`) |
+| worker panic or shutdown | the channel closes, queued commands drop, §7 releases the rest |
+
+The send-failure row is the one that is easy to miss. `EngineDriver`'s submit
+paths already convert a closed channel into `GenerateSubmitError::DriverStopped`
+(`driver.rs:502-506`, `:519-523`); because the guard is moved into the command
+and the command is moved into `send`, a failed send returns ownership and the
+guard drops on the spot. No explicit release call exists, and none should — an
+explicit release is a line someone can forget to add to a sixth exit path.
+
+**Consequence for phasing and testing.** Acquisition before enqueue is what
+makes the 409 reachable, and it does not require `W > 1` and does not require
+intra-worker multiplexing. One worker serving two concurrent HTTP requests for
+one session is enough: the second request's acquisition fails on its own task
+while the first is still in flight. §13 therefore lands the routing lease in
+**Phase 2**, at `W = 1`, and §12.1's tests 2–7 gate that phase rather than the
+`W > 1` phase.
+
+**What changes about reachability.** The server test's parenthetical — *"the
+driver serializes passes, so this is raised where it is decided and mapped where
+it is answered"* (`server/src/tests.rs:4858-4859`) — is deleted in Phase 2 and
+replaced by the real over-HTTP test in §12.1, because from that phase on the
+statement is simply false.
+
 
 ### 4.3 What must be constructed and dropped on a worker thread
 
@@ -604,11 +907,11 @@ This is the part that is easy to get wrong quietly, so it is normative.
 
 - the CUDA context binding, and everything created under it;
 - the cuDNN handle and its descriptor caches, because `with_handle` binds the
-  owning context to the calling thread (`cudnn/mod.rs:1129-1132`);
+  owning context to the calling thread (`cudnn/mod.rs:1128-1132`);
 - any `CudaReservation`, which its own comment calls thread-affine
   (`virtual_memory.rs:2749-2752`);
 - the CUDA graph capture: begin, end, and abort must all be the same thread
-  (`graph.rs:177,184-193,274-285`);
+  (`graph.rs:177,186-195,274-285`);
 - the native decode session and the per-worker `PagedKvCache`, so their
   allocations are charged under the right context;
 - every session-derived `IoBinding`, `Allocator` and `Value` (§3.4), which today
@@ -656,12 +959,12 @@ than leaving a pool with a hole in it.
 
 `W` is bounded by three independent limits, and the effective value is the
 minimum, reported once at startup the way batching capability already is
-(`driver.rs:297-303`):
+(`driver.rs:300-306`):
 
 1. **Backend capability.** A backend that cannot hold more than one decode
    session gives `W = 1`. The native path is already documented this way — *"the
    native single-session backend does not support {feature}; use independent
-   serialized requests"* (`engine/runtime.rs:653-658`).
+   serialized requests"* (`engine/runtime.rs:655-659`).
 2. **Device memory.** Each worker owns a KV cache and its own capture and
    staging buffers. `W` is chosen against the same governor that already refuses
    over-admission, and a `W` the device cannot fund is a load-time refusal, not
@@ -670,7 +973,32 @@ minimum, reported once at startup the way batching capability already is
 
 `W = 1` must remain a fully supported configuration, and must be
 behaviour-identical to today's single driver thread. That is what makes the
-migration in §13 safe.
+migration in §13 safe. It is also not hypothetical: it is what ships today, since
+PR #2012 already reduced the pool to exactly one (`worker.rs:261-265`).
+
+**A per-shard session bound is not a load bound, and the document should not
+pretend otherwise.** §4.1 places a session by a stateless function of its id and
+never migrates it, so the *count* of sessions per shard is roughly even by
+construction while the *work* per shard is not. Sessions are wildly unequal: an
+idle session costs its KV pages and nothing else, while an active one occupies a
+decode row every step. A shard can therefore sit at its session bound while
+mostly idle, and another shard under its bound can be saturated by a handful of
+long generations. Three consequences:
+
+- **The two limits are separate and are reported separately.** A shard refuses a
+  new session when it hits its session bound, and refuses admission when it hits
+  its memory ceiling or its decode-row width. Conflating them produces the worst
+  diagnostic in the class — a capacity error that names the wrong resource.
+- **Skew is measured, not assumed away.** §12.3 makes per-shard occupancy and
+  per-shard queue depth reported metrics, because "the hash is uniform" is a
+  statement about ids, not about load.
+- **The response to skew is placement, not migration.** Once a session's pages
+  are in one worker's `PageTable`, moving it is a copy, and a design that
+  migrates under load pays that copy exactly when it is least affordable. If
+  measured skew is bad enough to matter, the fix is a better placement function
+  — for example one that consults live shard depth at *create* time, when the
+  session has no pages yet and placement is still free — and that choice is
+  §14's open question, deliberately left to measurement.
 
 ---
 
@@ -685,7 +1013,8 @@ migration in §13 safe.
 | `close_session` | `session.shard` | Mutating: takes the lease. Closing under a live turn is a conflict; the caller cancels first (§6) then closes |
 | `fork_session` | Source `session.shard`, and the fork **stays on that shard** | Forced: a fork shares paged-KV pages copy-on-write with its source, and pages live in one worker's `PageTable` |
 | `checkpoint_session` | `session.shard`, read-only | Takes no exclusive lease; a checkpoint concurrent with a turn is refused rather than allowed to capture a half-written conversation |
-| `restore_session` | Shard chosen for the restored id | Mutating |
+| `restore_session` | `checkpoint.session_id`'s **existing** shard | Mutating: takes the lease. Restore is a rewind of a live session, not a create — see below |
+| `rewind_session_by`, `rewind_session_to` | `session.shard` | Mutating: take the lease. Both are `&mut self` (`engine/runtime.rs:1590-1594`, `:1608-1612`) and truncate the session's KV |
 | `session_token_count`, `session_prefill_carry` | `session.shard`, read-only | These are `&self` today (`engine/runtime.rs:1742,1788`) and remain read-only queries |
 
 Three routing rules deserve their reasons stated.
@@ -693,10 +1022,12 @@ Three routing rules deserve their reasons stated.
 **Reset and close take the lease.** They are mutations of the conversation, and
 `reset_session`'s own comment describes exactly the state a concurrent turn
 would corrupt: *"the id stays usable and everything the conversation accumulated
-is gone"* (`engine/runtime.rs:1662-1665`). A reset that lands between a turn's
-read of the conversation and its write-back would be silently undone by the
-write-back — a lost update of the whole conversation. Refusing is the only answer
-that does not lie.
+is gone"* (`engine/runtime.rs:1662-1665`). This is the one place in this design
+where a genuine lost update is on the table, and it is worth being exact about
+why: a reset is a *separate operation* from the turn, so unless it takes the same
+lease that spans the turn's read → write commit, it can land between them and be
+silently undone by the write-back. That is the narrow condition §11.1 identifies
+as the real lost-update case, and taking the lease is what excludes it.
 
 **Fork cannot cross shards, and today cannot happen at all.**
 `session_fork_capability` returns `None` and `fork_session` bails naming the
@@ -712,17 +1043,69 @@ duration in a way that would make checkpointing block generation; it fails fast
 if the lease is held, matching the retryable contract
 (`capability.rs:57-61`).
 
+**Restore routes by the checkpoint's own session id, and checkpoints are not
+portable across worker counts.** `SessionCheckpoint` is deliberately small — it
+is `{ session_id: SessionId, position: SessionPosition }` (`config.rs:433-438`) —
+and `restore_session` is a thin wrapper that forwards to the rewind machinery for
+*that* session:
+
+```rust
+pub fn restore_session(&mut self, checkpoint: SessionCheckpoint) -> anyhow::Result<()> {
+    self.rewind_session_to(checkpoint.session_id, checkpoint.position)
+}
+```
+— `engine/runtime.rs:1580-1582`
+
+So restore is not "create a session from a snapshot". It is a rewind of a session
+that is still alive, whose KV pages and prefix-cache references still exist on
+one worker, and whose own doc comment says as much: restoring *"uses the same
+rewind machinery as speculative decoding and keeps prefix-cache page ownership
+intact"* (`engine/runtime.rs:1564-1569`). Routing it anywhere but
+`checkpoint.session_id`'s existing shard would target a page table that does not
+contain the session at all.
+
+Three consequences follow, and all three are normative:
+
+1. **Restore takes the exclusive lease**, because it mutates the conversation's
+   logical length exactly as `rewind_session_to` does.
+2. **A checkpoint is only meaningful while its session is live.** The doc comment
+   already says *"Checkpoints are invalid after the session is closed or reset"*
+   (`engine/runtime.rs:1568-1569`); the shard model adds that it is also invalid
+   after its owning worker is lost (§7), and that case returns the same typed
+   worker-failure error rather than a confusing "session not found".
+3. **Checkpoints are not portable across worker counts, and must not be made to
+   look portable.** A `SessionCheckpoint` carries a `SessionId`, and once
+   `SessionId` encodes a `ShardIndex` (§4.1) a checkpoint minted under `W = 4`
+   names a shard that may not exist under `W = 2`. Because the type is public,
+   this must be a typed refusal — a checkpoint whose shard is out of range for
+   the current pool is rejected naming the checkpoint's shard and the current
+   `W`, never silently remapped onto a different worker. Remapping would attach a
+   conversation's logical position to a page table that never held it. If
+   cross-`W` portability is wanted later it needs a real serialized snapshot of
+   the KV state, which is a different feature with a different cost, and §14
+   records it as an open question rather than implying this design provides it.
+
 ### 5.1 Server-side identity is unaffected
 
-The server maps client `X-Session-Id` strings to engine `SessionId`s through
+The server maps client `X-Session-Id` strings to conversations through
 `SessionRegistry`, an `Arc<Mutex<SessionRegistryInner>>` with its own LRU
-(`crates/onnx-genai-server/src/session.rs:9-34`,
-`routes/completions.rs:1309-1340`). That map is already thread-safe and already
-handles the create race explicitly with
-`SessionClaim::{Existing, Claimed}` (`session.rs:22-29`). It is untouched:
-`SessionId` becoming a newtype is invisible to it because it only stores and
-returns the value. Callers therefore continue to see opaque session handles, and
-the shard field is an implementation detail they never parse.
+(`crates/onnx-genai-server/src/session.rs:11-20`,
+`routes/completions.rs:1310-1340`). That map is already thread-safe and already
+handles the create race explicitly with `SessionClaim::{Existing, Claimed}`, a
+loser closing the session it opened rather than leaking it
+(`session.rs:22-29`, `routes/completions.rs:1325-1338`).
+
+PR #2012 already did half of this section's work. `SessionEntry` no longer stores
+a bare engine session id; it stores a `SessionPlacement`, with the reason written
+into the type: *"Stored as a pair because a later turn has to be routed back to
+that worker, and an engine session id alone cannot say which one it is"*
+(`session.rs:32-41`). That is precisely the routing key §4.1 needs, already
+threaded through the create path (`routes/completions.rs:1313`, `:1331-1338`).
+
+So the registry is untouched by this design. It stores and returns an opaque
+placement; whether the shard lives in a side field or is encoded in the id is
+invisible to it, and clients continue to see an opaque `X-Session-Id` they never
+parse.
 
 ---
 
@@ -743,8 +1126,9 @@ launched CUDA graph mid-capture or mid-replay, and pretending otherwise is how a
 context ends up in an undefined state.
 
 Today cancellation is implicit: the driver detects an abandoned route when
-delivering output fails and drops it (`driver.rs:959-1013`), and submission
-failure surfaces as `GenerateSubmitError::DriverStopped` (`driver.rs:249-251,455-463`).
+delivering output fails and drops it (`driver.rs:1394-1403`, `:1418-1421`), and
+submission failure surfaces as `GenerateSubmitError::DriverStopped`
+(`driver.rs:252-256`, `:502-506`).
 Under a worker pool that is not enough, because a cancelled turn must release its
 lease promptly or the next turn on that session sees a spurious 409. So
 cancellation becomes explicit: a typed command, observed at a token boundary,
@@ -776,7 +1160,7 @@ variant rather than on wording is already the rule there and stays the rule.
 
 1. The coordinator stops accepting new work and closes each worker's command
    channel. Today's shutdown is exactly this — `blocking_recv()` returns `None`
-   and the loop exits (`driver.rs:725-733`) — and it generalizes to `W` channels.
+   and the loop exits (`driver.rs:800-803`) — and it generalizes to `W` channels.
 2. Each worker drains its in-flight turns to a token boundary, releasing leases
    as the per-turn state drops.
 3. Each worker drops its own category-3.2 state **on its own thread**: captured
@@ -790,8 +1174,9 @@ Step 3 before step 4 is the load-bearing part, and it is why `join`-then-drop is
 forbidden: a coordinator that joined first and then dropped a handle it had
 retained would be making context-bound driver calls from the wrong thread. The
 current design already gets this right for the single-thread case by construction
-— the engine is dropped on the driver thread when `run_engine_driver` returns
-(`driver.rs:690-722`) — and the worker model must preserve it deliberately rather
+— the engine is dropped on the driver thread when `run_engine_driver` returns,
+because it owns the unboxed `Engine` local for the whole call
+(`driver.rs:760-767`) — and the worker model must preserve it deliberately rather
 than by accident.
 
 **Worker failure.** A worker that panics or whose backend construction fails is
@@ -799,13 +1184,36 @@ removed from the routable set. Its sessions are **lost, not migrated** — their
 state was category 3.2 and thread-affine, and there is nothing to move. Every
 subsequent call naming a session on a dead shard receives a typed error saying
 the worker failed, which session was lost, and that the session must be
-recreated. Silently recreating it would be a lost conversation reported as
-success, which is the same class of failure as the lost update in Decision 3.
+recreated. Silently recreating it would report a lost conversation as a success,
+which is the same class of dishonesty as answering a busy session with a slow
+200 instead of a 409.
+
+Any `SessionCheckpoint` naming a session on the dead shard becomes invalid with
+it, and is refused by the same typed worker-failure error rather than by a
+"session not found" that would suggest the id was never real (§5).
 
 Whether the pool degrades to `W-1` or the engine fails as a whole is an operator
 policy with a stated default: **degrade**, because a serving process that keeps
 `W-1` shards answering is strictly better than one that stops, and the failure is
 already visible in the typed errors and in the startup-style capability log.
+
+**That promise is only honest because teardown never panics.** A worker panic
+unwinds, and the per-worker resources it drops on the way out follow §3.4's
+Rule B.3 — telemetry, deferred release, quarantine — none of which can panic, so
+none of which can turn the unwind into an abort. The single exception B.3 permits
+is a named fatal invariant covering an outcome that cannot be described at all;
+that path is deliberately outside this promise, and it is not reachable from an
+ordinary worker panic or a failed backend construction. If an implementation ever
+widens the abort case, this paragraph must be narrowed with it.
+
+**Shutdown is explicit, never a drop.** #2012 settled this and the pool model
+keeps it: `WorkerHandle::shutdown` closes the channel and joins
+(`worker.rs:198-208`), while `Drop for WorkerHandle` deliberately closes
+*without* joining, on the grounds that a blocking join in `Drop` is a worse
+failure than an unjoined thread (`worker.rs:217-236`). So the ordering above is
+supplied by an explicit shutdown call on every worker, and a `WorkerPool` that is
+merely dropped promises nothing about step 3 — which is exactly why step 3 is
+written as a shutdown obligation rather than a teardown side effect.
 
 ---
 
@@ -869,12 +1277,27 @@ such loops; it does not change any one of them.
 **Sessionful requests can join a batch, and this is the change that makes the
 pool worth building.** Today they cannot: *"The current `ContinuousBatchManager`
 API accepts `GenerateRequest` only. `X-Session-Id` requests keep using the
-driver's per-request engine path"* (`driver.rs:744-747`). Under the worker model
+driver's per-request engine path so persistent engine KV/session semantics are
+preserved until the manager grows a `SessionId`-aware submit API"*
+(`driver.rs:814-817`). Under the worker model
 a session's turn is pinned to a known worker, so its KV sequence is in that
 worker's page table and its row can be admitted alongside other sessions' rows in
 the same forward pass. A batch may mix rows from different sessions; it may
 **never** hold two rows from the same session, which is Decision 3 restated at
-the row level and is enforced by the lease rather than by a batching check.
+the row level.
+
+**That row-level exclusion is enforced before enqueue, not inside the batch
+loop.** This is where §1.2's finding bites. It would be natural to assume the
+existing `workflow_session_leases` already prevents a second row for a session,
+but it does not: that guard is acquired inside the interpreted workflow path
+(`workflow.rs:1356-1363`) and the decode core — the path continuous batching runs
+on — never reaches it. Adding a check inside the batch admission loop would also
+be too late by then, because the request would already have been admitted and
+queued, which §4.2.1 rejects. So the guarantee comes from the routing lease taken
+in the façade before the command is sent: a second turn for a live session never
+becomes a row at all, and `ContinuousBatchManager` needs no same-session check to
+stay correct. The batch loop is a beneficiary of the invariant, not its
+enforcer.
 
 Two consequences that follow, and are not optional:
 
@@ -882,7 +1305,7 @@ Two consequences that follow, and are not optional:
   configures `W` and `max_batch` independently can request more concurrent rows
   than the device can fund. The effective values are resolved together and
   reported once, in the same way `BatchingReport` already clamps a requested
-  width to what the decode path can honour (`driver.rs:289-296`).
+  width to what the decode path can honour (`driver.rs:292-298`).
 - **Sessionless requests go to any worker.** They own no state, so stateless
   distribution (§4.1) applies directly, and a sessionless request should prefer
   the shard with the shallowest queue for the same reason a sessionful one
@@ -903,7 +1326,7 @@ Both hand-written impls exist to paper over the gap between "this type is not
 provably `Send`" and "we know it never leaves its thread". The worker model
 closes that gap structurally, so both are removed rather than re-justified.
 
-**`unsafe impl Send for EngineOwner` (`driver.rs:275-278`) is deleted.** Its
+**`unsafe impl Send for EngineOwner` (`driver.rs:278-281`) is deleted.** Its
 entire safety argument is *"The engine is moved exactly once into the dedicated
 driver thread"*. Under §4.3 the backend state is constructed on the worker thread
 and never moves, so there is no cross-thread move to justify. The wrapper type
@@ -932,21 +1355,31 @@ are out of scope and unchanged: they are narrow claims about specific handles,
 each with its own audited justification, and this document neither relies on nor
 weakens them.
 
-**A second, structural rule lands with it:** *no type that owns a backend handle
-may depend on field declaration order for teardown correctness, and no such
-dependency may be discharged by a `Drop` impl one level up.* Ownership is
-expressed with `Arc` (§3.4, Rule A) so that the refcount, not the source-file
-layout, decides release order; thread affinity is expressed with `OwnerThread`
-(§3.4, Rule B) so that the assertion, not the reviewer, decides who may release
-it. §1.4 is the worked example of what the absence of both rules already costs
-at `W = 1`, and the cost is not linear in `W` — it is the difference between one
-thread reliably reproducing a bug and `W` threads producing it intermittently.
+**A second, structural rule lands with it, and it is deliberately scoped:** *no
+type that owns a **session-derived** backend handle may depend on field
+declaration order for teardown correctness, and no such dependency may be
+discharged by a `Drop` impl one level up.* Ownership is expressed with `Arc`
+(§3.4, Rule A) so that the refcount, not the source-file layout, decides release
+order; thread affinity is expressed structurally where possible and reported as a
+typed error otherwise (§3.4, Rule B). §1.4 is the worked example of what the
+absence of both rules already costs at `W = 1`, and the cost is not linear in
+`W` — it is the difference between one thread reliably reproducing a bug and `W`
+threads producing it intermittently.
+
+The scoping is not a hedge; it is §3.5. The `Session → Environment` edge has the
+same defect and is **not** fixed here, because `Session` holds no environment
+handle (`session/mod.rs:477-499`) and the environment is a process-global
+`OnceLock` (`env.rs:45-48`). Claiming the rule for that edge without doing the
+work would make the rule decorative. Until §3.5's structural option is taken, the
+environment's ordering remains discipline-enforced, and — the part that matters
+for review — **no compensating teardown is deleted before the structural
+lifetime that replaces it exists.**
 
 The three rules are one rule seen from three sides. A `Send` claim asserts a
 handle may cross threads; `Arc` ownership asserts a handle outlives its
-dependents; `OwnerThread` asserts a handle is touched only by its owner. Each
-replaces a comment that a human has to keep true with a fact the compiler or the
-runtime keeps true.
+dependents; owner-thread recording asserts a handle is touched only by its owner.
+Each replaces a comment that a human has to keep true with a fact the compiler or
+the runtime keeps true.
 
 ---
 
@@ -962,26 +1395,60 @@ sufficient.
    blocks every other session's. The API would be thread-*safe* and entirely
    non-concurrent — the Python binding's current behaviour, generalized, which is
    honest precisely because it refuses rather than pretends
-   (`python/src/lib.rs:173-179`).
-2. **It converts Decision 3 into the bug Decision 3 exists to prevent.** Under a
-   mutex, a second turn on a busy session *blocks and then runs*. It reads the
-   conversation the first turn just replaced, and nothing reports it. That is
-   exactly the lost update `SessionLeaseGuard`'s comment names: *"Two turns that
-   both read the conversation before either writes it would leave the loser's
-   prompt and generation nowhere, and nothing would report that they were lost"*
-   (`pipeline/workflow.rs:600-604`). Silent serialization is not a weaker form of
-   safety here; it is a different and worse outcome than a 409.
+   (`python/src/lib.rs:173-184`).
+2. **It violates Decision 3's refusal policy, though not by losing an update.**
+   Under a whole-turn mutex a second turn on a busy session *blocks and then
+   runs*, and because the lock spans the entire turn — read of the conversation
+   through write-back — the two turns are sequentially consistent. The second
+   turn reads the conversation the first turn *finished* writing, and appends to
+   it. That is a correct serialization, and it is worth stating plainly rather
+   than overclaiming: **a whole-turn mutex or a per-session queue does not lose
+   an update.**
+
+   What it does instead is substitute an unbounded, unattributable wait for a
+   fast, typed refusal. The caller asked whether it could take the session; it
+   was told neither yes nor no, and instead waits for a decode that may run for
+   thousands of tokens. The latency is invisible in the response, the queue is
+   invisible in the metrics, and a client that would have retried elsewhere or
+   surfaced a conflict to its user cannot. The lease contract already chose the
+   other answer — *"a second turn that starts while one is in flight is refused
+   by name"* ([`../genai/INFERENCE_METADATA_DECISIONS.md`](../genai/INFERENCE_METADATA_DECISIONS.md):1103-1105) —
+   and silent queueing is a policy violation, not a correctness one.
+
+   A genuine lost update requires something narrower and worse: a lock or lease
+   that does **not** span read → write commit. If a turn reads the conversation,
+   releases, computes, and then writes back, two turns interleave and the loser's
+   prompt and generation land nowhere. That is the failure
+   `SessionLeaseGuard`'s comment names — *"Two turns that both read the
+   conversation before either writes it would leave the loser's prompt and
+   generation nowhere, and nothing would report that they were lost"*
+   (`pipeline/workflow.rs:600-604`) — and it is why §4.2's routing lease is held
+   for the whole turn (§4.2.1) rather than only across the read. The lost-update
+   risk is real, but it is a risk of *this design being implemented wrong*, not
+   an argument against the global mutex.
 3. **It does not make thread-affine handles correct.** A mutex supplies mutual
    exclusion. cuDNN's handle, a `CudaReservation`, and CUDA graph capture require
-   *thread identity* (§1.3). A `RwLock` is worse still: it would let two readers
-   touch a context-bound handle from two threads simultaneously, which the
-   handles' own safety comments forbid.
-4. **`RwLock` in particular is unsound for this type.** Almost every session
-   operation is `&mut self` today — `create_session`, `reset_session`,
-   `close_session`, `rewind_session_*`, `restore_session`, `fork_session`
-   (`engine/runtime.rs:1501-1724`). A read lock buys nothing for those, and the
-   `&self` methods that remain still reach the interpreter's `RefCell`
-   (`pipeline/mod.rs:191`), which is `!Sync`.
+   *thread identity* (§1.3). Serializing a context-bound handle across two
+   threads satisfies the exclusion half of its contract and violates the affinity
+   half, silently.
+4. **The two wrappers fail differently, and the difference matters.**
+   `Mutex<Engine>` **compiles today** — `Engine` is `Send`, so
+   `Arc<Mutex<Engine>>` is `Send + Sync` — and that is precisely the trap: it
+   type-checks, it is safe, and it silently serializes every session against
+   every other. A caller can do this right now without being warned (§13's
+   compatibility note).
+
+   `RwLock<Engine>` does **not** work, and not merely because it is a bad idea.
+   `RwLock<T>: Sync` requires `T: Send + Sync`, and `Engine` is structurally
+   `!Sync`: the interpreter holds `RefCell<HashSet<String>>`
+   (`pipeline/mod.rs:191`). So `Arc<RwLock<Engine>>` is not `Sync` and cannot be
+   shared across threads at all. Even if that were fixed, a read lock would buy
+   nothing: almost every session operation takes `&mut self` —
+   `create_session` (`engine/runtime.rs:1501`), `reset_session` (`:1662`),
+   `close_session` (`:1716`), `rewind_session_by` (`:1590`), `rewind_session_to`
+   (`:1608`), `restore_session` (`:1580`), `fork_session` (`:1638`), and
+   `generate_in_session` (`:1138-1139`) — so they would all need the write lock
+   regardless.
 
 **The condition for revisiting.** This rejection is contingent, and the condition
 is precise: if every handle a session transitively owns proves `Send + Sync`
@@ -994,8 +1461,9 @@ that condition is not met, and the evidence is in the table in §1.3.
 ### 11.2 A per-session `Mutex` — rejected
 
 Finer-grained, and fixes ground 1. It does not fix grounds 2, 3, or 4: it still
-blocks-then-runs a second turn (losing the update), and it still supplies
-exclusion where affinity is required. It also cannot express what a session
+blocks-then-runs a second turn where the contract says refuse it — the same
+policy violation as the global lock, at session granularity — and it still
+supplies exclusion where affinity is required. It also cannot express what a session
 shares with its neighbours — one KV page table, one prefix cache, one capture
 buffer — so the per-session lock would have to be accompanied by locks on all of
 those, which is the global lock again with more places to deadlock.
@@ -1015,7 +1483,7 @@ Stated separately because it is the tempting local fix. Adding
 without changing anything about the thread that ends up calling the driver. The
 existing safety comments are careful to say both halves — *"every access is
 serialized by `handle`, **and** `with_handle` binds the owning CUDA context to
-the calling thread first"* (`cudnn/mod.rs:1129-1132`) — and a design that supplies
+the calling thread first"* (`cudnn/mod.rs:1128-1132`) — and a design that supplies
 only the first half is quoting half a contract. Decision 4 forbids it.
 
 ---
@@ -1039,48 +1507,80 @@ reclaim thread, asserts the waiter wakes), and
 **Not acceptable as evidence:** a single-threaded test that interleaves two
 sessions by calling them alternately. That is what today's test does when it
 constructs `ExclusiveLeaseConflict` by hand
-(`server/src/tests.rs:4856-4867`), and it proves the mapping, not the
+(`server/src/tests.rs:4858-4870`), and it proves the mapping, not the
 concurrency. Every test below spawns real OS threads and synchronizes on a
 `Barrier` so the operations genuinely overlap.
 
 1. **Different sessions run concurrently.** `N` threads, `N` sessions, one
-   barrier. Assert all complete, outputs are byte-identical to the same prompts
-   run serially, and wall time is materially below `N ×` the serial time — the
-   last clause is what distinguishes concurrency from a mutex, and per
-   [`../README.md`](../README.md)'s standing rule it is reported with its
-   conditions or not at all.
+   barrier. Assert all complete, each output matches the same prompt run under
+   the fixed-composition replay of §12.2 rather than under "run serially" — free
+   composition legitimately changes batch shape, so a naive serial comparison
+   would make this test flaky for the wrong reason — and that wall time is
+   materially below `N ×` the serial time. The last clause is what distinguishes
+   concurrency from a mutex, and per [`../README.md`](../README.md)'s standing
+   rule it is reported with its conditions or not at all.
 2. **Same session, overlapping turns, exclusive lease → 409.** Two threads, one
    session, barrier-synchronized submit. Assert exactly one succeeds and the
    other returns `PackageCapabilityError::ExclusiveLeaseConflict` naming that
    session, and — this is the part the current test cannot do — assert it over
-   HTTP as a real 409 with `kind == "conflict_error"`.
-3. **No lost update.** The counterpart to test 2 and the reason it exists. After
-   a refused concurrent turn, assert the session's token count equals what the
-   *winning* turn left, and that a subsequent turn continues from it. A design
-   that silently serialized would pass test 2's status check by queueing and fail
-   this one.
-4. **Cancellation releases the lease.** Start a turn, cancel it, assert the next
+   HTTP as a real 409 with `kind == "conflict_error"`. **This test runs at
+   `W = 1`** (§13, Phase 2): pre-enqueue acquisition (§4.2.1) makes the refusal
+   reachable with one worker, so it does not wait for `W > 1`.
+3. **The refusal is a refusal, not a queue.** The counterpart to test 2 and the
+   reason it exists. Assert that the losing request's 409 arrives *while the
+   winner is still generating* — bound its latency well below the winner's
+   completion — and that the loser performed no work: no admission permit
+   charged, no queue slot occupied, no tokens emitted. An implementation that
+   acquired the lease inside the worker loop instead of before enqueue would
+   still return 409 eventually and would fail this test, which is the whole
+   point of writing it separately.
+4. **The winner's conversation is intact.** After the refused turn, assert the
+   session's token count equals what the winning turn left and that a subsequent
+   turn continues from it. This is a sequential-correctness check, not a
+   lost-update check: per §11.1 a whole-turn lease cannot lose an update, and the
+   test exists to catch a lease that is released too early — before the write
+   commit — which can.
+5. **Reset racing a turn is refused, and does not vanish.** Barrier-synchronized
+   `reset_session` against a live turn on the same session. Assert the reset is
+   refused rather than silently undone by the turn's write-back — the one genuine
+   lost-update path §5 identifies.
+6. **Cancellation releases the lease.** Start a turn, cancel it, assert the next
    turn on that session is admitted rather than 409'd, and that the cancelled
    turn's reservations returned to the budget.
-5. **Panic containment.** Inject a panic on a worker; assert the lease is
+7. **Send failure releases the lease.** Shut the worker channel so submission
+   fails with `GenerateSubmitError::DriverStopped` (`driver.rs:502-506`), then
+   assert the session is immediately leasable again. This is the exit path §4.2.1
+   flags as easiest to miss, and the only one where the guard is released on the
+   *submitting* task rather than the worker.
+8. **Panic containment.** Inject a panic on a worker; assert the lease is
    released, the shard is quarantined, other shards keep serving, and calls
    naming a lost session get the typed worker-failure error rather than a
    silently fresh session.
-6. **Shutdown under load.** Shut down with turns in flight on every worker;
+9. **Shutdown under load.** Shut down with turns in flight on every worker;
    assert every worker drops its own backend state on its own thread (asserted by
-   recording the dropping thread id), that join follows drop, and that the
-   process exits without a CUDA teardown error.
-7. **Routing is total and stable.** Property test: for any sequence of
-   create/close, every operation on a live session reaches the shard encoded in
-   its id, and no session is ever observed on two shards.
-8. **Admission does not convoy.** `AdmissionCeiling::ceiling_bytes` is
-   documented as non-blocking (`byte_budget.rs:113-118`); assert under `W`-way
-   concurrent admission that no caller blocks on it, since the worker pool is
-   what turns that comment into a load-bearing property.
-9. **Shard exhaustion refuses.** Fill a shard past its bound and assert
-   `create_session` returns the typed refusal naming the shard and the bound,
-   rather than over-subscribing.
-10. **Session-derived resources keep the session alive.** Build an `IoBinding`
+   recording the dropping thread id), that `shutdown()` joins before the handle
+   is released — the contract `WorkerHandle::shutdown` already provides
+   (`worker.rs:198-208`) — and that the process exits without a CUDA teardown
+   error.
+10. **Routing is total and stable.** Property test: for any sequence of
+    create/close, every operation on a live session reaches the shard encoded in
+    its id, and no session is ever observed on two shards. #2012's
+    `a_pool_of_one_routes_by_worker_id` is the `W = 1` seed of this: it already
+    asserts that a placement naming a worker outside the pool is refused with
+    `WorkerUnavailable::Unknown` rather than falling back to the primary
+    (`worker.rs:414-437`).
+11. **Admission does not convoy.** `AdmissionCeiling::ceiling_bytes` is
+    documented as non-blocking (`byte_budget.rs:113-118`); assert under `W`-way
+    concurrent admission that no caller blocks on it, since the worker pool is
+    what turns that comment into a load-bearing property.
+12. **Session bounds refuse, and skew is visible.** Fill a shard past its bound
+    and assert `create_session` returns the typed refusal naming the shard and
+    the bound, rather than over-subscribing. Separately assert the two limits are
+    not conflated: a shard at its *session* bound refuses new sessions even when
+    idle, and a shard under its session bound but at its *memory* ceiling refuses
+    with the memory error instead — see §4.4 on why session count and active load
+    are different quantities.
+13. **Session-derived resources keep the session alive.** Build an `IoBinding`
     and a device `Allocator` from a session, allocate a `Value` from that
     allocator, then drop the caller's `Session` handle *first* and assert the
     binding, allocator and value tear down cleanly afterwards. This test fails
@@ -1089,42 +1589,86 @@ concurrency. Every test below spawns real OS threads and synchronizes on a
     is written before the fix. A companion test asserts that a struct owning a
     session and a binding tears down correctly under *both* field declaration
     orders, so the property is ownership rather than layout.
-11. **Wrong-thread use and teardown are refused, not tolerated.** Construct a
-    per-worker handle on thread A, move it to thread B, and assert
-    `OwnerThread::assert_owned` fires — once for use and once, separately, for
-    drop, because §1.4 was a teardown bug and a use-only check would have missed
-    it. Run it against a release build too: §3.4 specifies the check is always
-    on, and a test that only proves it under `debug_assertions` proves the wrong
-    thing.
+14. **Wrong-thread use returns a typed error.** Construct a per-worker handle on
+    thread A, use it from thread B, and assert it returns the typed affinity
+    error naming both threads — not a panic, matching the precedent the CUDA
+    graph code already sets (`graph.rs:188-195`). Where §3.4's Rule B.1 applies,
+    the stronger test is that the code *does not compile*: a
+    `trybuild`-style compile-fail case asserting the handle is not `Send` is
+    better evidence than any runtime check.
+15. **Wrong-thread teardown degrades, and does not abort.** Drop a per-worker
+    resource on a foreign thread and assert three things: the process does not
+    abort, telemetry names the resource and both threads, and the ownership is
+    accounted — either queued to the owner's deferred-release queue
+    (`DeferredReleaseDisposition::Queued`) or quarantined with
+    `QuarantineReason::OwnerDropped` (`deferred.rs:440-449`, `:153-174`). Run the
+    same case *during an unwind*, from a `Drop` reached by an in-flight panic,
+    and assert it still does not abort — that is the case a `panic!` in `Drop`
+    would turn into a process abort, and it is why §3.4 forbids one.
 
-Tests 1–5, 7 and 9–11 must run on CPU without a model where possible, so they
-gate every PR rather than only CUDA runs. Tests 6 and 8 need the real backend.
+Tests 2–8, 10 and 12–15 must run on CPU without a model where possible, so they
+gate every PR rather than only CUDA runs. Tests 1, 9 and 11 need the real
+backend, because throughput, teardown ordering and admission behaviour are only
+meaningful against real device work.
+
+The phase each test gates is §13's, restated here so the two cannot drift: tests
+2–7 gate Phase 2 (the routing lease, at `W = 1`); tests 13–15 gate Phase 1 (the
+ownership and affinity rules); tests 1, 8 and 10–12 gate Phase 3 (`W > 1`); test
+9 gates whichever phase first spawns more than one worker.
 
 ### 12.2 ORT / native parity
 
-Concurrency must not change results. The existing parity harness is the
-instrument: `tests/parity/README.md` drives
-`scripts/check_native_ort_parity.py` against a `profile_native` build, and the
-Qwen oracle requires the exact token to match at fixed divergence indices
-(`tests/parity/README.md:15-31`).
+Concurrency must not change results *that it has no right to change*. Stating
+the gate carelessly would make it unmeetable, so state it precisely.
 
-The gates:
+The existing parity harness is the instrument: `tests/parity/README.md` drives
+`scripts/check_native_ort_parity.py` against a `profile_native` build, and it is
+already scoped rather than absolute — its conclusions are pinned to *observed
+first-divergence steps*, generated-token index 22 for Qwen2.5-1.5B and index 19
+for Qwen2.5-7B, where it requires native's token to equal the committed exact-Q4
+float32 oracle token (`tests/parity/README.md:28-31`). That scoping is the model
+to copy, not an embarrassment to fix.
 
-- **Serial-vs-concurrent identity, per backend.** The same prompts through `W=1`
-  and through `W>1` produce byte-identical tokens. Determinism must not be a
-  casualty of concurrency; per-turn RNG counter state is category 3.3 precisely
-  so that it is not.
-- **ORT-vs-native identity under concurrency.** The existing parity comparison
-  is re-run with `W>1` on both sides and must not loosen its tolerance. If it
-  has to loosen, the design is wrong and the document is wrong with it.
-- **`W=1` is bit-identical to the pre-migration driver**, which is the gate that
-  makes the phased rollout in §13 reversible.
+**Why unconditional byte identity is the wrong gate.** Under continuous batching
+the batch a session is decoded in depends on what else arrived, so `W = 1` and
+`W > 1` will generally form *different batches* for the same prompt. Different
+batch composition means different reduction shapes and can mean different kernel
+selection; the numerics are then legitimately different in the last bits, and a
+gate demanding byte identity across `W` would either fail honestly or be quietly
+weakened until it proved nothing. It would also be measuring the wrong property:
+the risk this design introduces is a session reading another session's state, not
+a change in floating-point associativity.
+
+The gates, stated so they are both meetable and meaningful:
+
+- **Byte identity at fixed batch composition.** Replay a recorded batch
+  composition — same sessions, same step boundaries, same batch widths — through
+  `W = 1` and through `W > 1` and require byte-identical tokens. Holding
+  composition fixed removes the only legitimate source of divergence, so any
+  remaining difference is cross-session contamination, which is exactly what must
+  fail the build. This is the load-bearing gate.
+- **Oracle-anchored identity at free composition.** With composition left free,
+  the weaker but still exact gate applies: at the harness's pinned divergence
+  indices, the emitted token must equal the oracle token under both `W = 1` and
+  `W > 1`. This catches a real behavioural change without pretending bit-level
+  reproducibility across differing batch shapes.
+- **Sampling determinism is unconditional.** Given a fixed seed and a fixed
+  accepted-token sequence, the sampler must produce the same draws at any `W`.
+  Per-turn RNG counter state is category 3.3 precisely so that this holds; unlike
+  batch numerics, there is no legitimate reason for it to vary, so it is gated
+  without a composition escape hatch.
+- **ORT-vs-native parity does not loosen.** The existing comparison is re-run
+  with `W > 1` on both sides at its existing tolerance. If it has to loosen, the
+  design is wrong and this document is wrong with it.
+- **`W = 1` is bit-identical to the pre-migration driver.** At `W = 1` there is
+  no composition difference to appeal to, so this one *is* unconditional, and it
+  is the gate that makes the phased rollout in §13 reversible.
 
 Both backends are selected as CI already selects them:
 `cargo test --locked -p onnx-genai-engine --features native-backend --
 --test-threads=1` for native, and the ORT-backed package set likewise with
-`--test-threads=1` (`.github/workflows/ci.yml:931-950`). Note the irony and
-handle it explicitly: the harness pins `--test-threads=1` so that tests do not
+`--test-threads=1` (`.github/workflows/ci.yml:960-968` and `:949-953`
+respectively). Note the irony and handle it explicitly: the harness pins `--test-threads=1` so that tests do not
 contend for the device, which means the concurrency tests in §12.1 must create
 their own threads inside a single test binary rather than rely on the test
 runner. They are written that way.
@@ -1183,45 +1727,94 @@ tests in the same change.
 `SequenceId` (`config.rs:389`, `onnx-genai-kv/src/lib.rs:61`), carrying a shard
 field that is always `0`. Behaviour is unchanged; this is Rule 5 cleanup that
 happens to be a prerequisite. Callers that treat the id as opaque — including
-`SessionRegistry` (`server/src/session.rs:31-34`) — need no logic change.
+`SessionRegistry` (`server/src/session.rs:11-20`) — need no logic change.
 
 **Phase 1 — split the state, and fix the lifecycle defect first.** This phase
 begins with §1.4, because it is a live bug at `W = 1` and it is far cheaper to
 fix before a pool exists than after. Give `IoBinding` and session-derived
 `Allocator`s an `Arc<Session>` (§3.4, Rule A), replacing the non-owning
 `*const Session` (`binding.rs:12-15`) and the untied allocator
-(`allocator.rs:205-209`); land tests 10 and 11 from §12.1 with it; then delete
-the compensating manual clears in `WorkflowRuntime::drop`
-(`pipeline/mod.rs:270-279`), because leaving a redundant cleanup path next to a
-now-structural invariant is exactly the kind of shim RULES.md Rule 3 forbids —
-the next reader cannot tell whether it is load-bearing.
+(`allocator.rs:205-209`), and land tests 13–15 from §12.1 with it.
+
+The `Arc` conversion is not confined to the two call sites above, and the phase
+is not done until every holder in §3.4's table is converted or the rule is
+narrowed in writing. Today the holders are mixed: `Engine::session` is
+`Option<Box<Session>>` (`engine/model.rs:68`), `Eagle3Model::session` and
+`DraftModel::session` are `Box<Session>` (`engine/model.rs:255`,
+`engine/session.rs:50`), and only `MtpModel::session` is already `Arc<Session>`
+(`engine/model.rs:245`). The `Box` choices are deliberate — self-referential
+runners point into the boxed allocation for a stable address
+(`engine/model.rs:225-226`) — and `Arc` preserves that property, so the
+conversion is mechanical but must be exhaustive: a session-derived binding whose
+parent is still a `Box` on some other path reintroduces exactly the defect this
+phase exists to remove. If some holder cannot be converted, §3.4 Rule A is
+amended to name that holder as out of scope rather than left implying coverage it
+does not have.
+
+**What this phase must not do is delete the compensating teardown before the
+structural replacement exists.** The manual map clears in `WorkflowRuntime::drop`
+(`pipeline/mod.rs:270-279`) may be removed *in this phase, after* the `Arc` edge
+lands and the tests prove ordering is no longer load-bearing — that is Rule 3
+cleanup. The `Drop for Environment` teardown (`env.rs:308-321`) may **not**:
+§3.5 shows nothing structurally keeps the environment alive behind a session, so
+that `Drop` is the only thing enforcing an ORT lifetime requirement, and deleting
+it before the structural lifetime exists trades a correct-by-convention teardown
+for an unsound one. It is removed only in whichever later phase adopts §3.5's
+structural option, and only together with it.
 
 The rest of the phase is the state split proper: extract the immutable package
 and compiled workflow plan (§3.1) behind `Arc`; separate per-execution turn state
-(§3.3) from the interpreter; move `workflow_session_leases` out of `RefCell` and
-into per-turn-owned worker state (§4.2); introduce `OwnerThread` (§3.4, Rule B)
-on the per-worker handles listed in §4.3, where at `W = 1` every assertion passes
+(§3.3) from the interpreter; move the interpreter's `workflow_session_leases` out
+of `RefCell` and into per-turn-owned worker state, where it stays as the
+inner-layer invariant §4.2 describes. Introduce the per-worker affinity marking
+(§3.4, Rule B) on the handles listed in §4.3 — structural `!Send` where the type
+allows it, typed affinity errors otherwise — where at `W = 1` every check passes
 trivially and therefore establishes the baseline rather than chasing a
 regression. Still one thread, still one worker. This is the largest refactor and
 the one that carries no concurrency risk, which is why it is isolated.
 
-**Phase 2 — introduce the worker as a structure of one.** Build the worker
-thread, the routing façade, and the command protocol, with `W` hard-pinned to 1.
-The `EngineOwner` wrapper and its `unsafe impl Send` are deleted here
-(`driver.rs:246,275-278`), because the engine is now constructed on the worker
-thread rather than moved to it. The gate is §12.2's bit-identity requirement
-against the pre-migration driver.
+**Phase 2 — the routing lease, on the worker pool of one that already exists.**
+PR #2012 (merged as `1bf87c86`) already built the worker thread, the
+`WorkerId`/`SessionPlacement` types, the `WorkerHandle` and a `WorkerPool` of one
+(`worker.rs:34-50`, `:66-85`, `:118-236`, `:255-323`), so this phase does not
+rebuild them. What it adds is the piece #2012 deliberately did not: the
+**routing-layer exclusive lease** of §4.2, keyed by `SessionId`, acquired in the
+routing façade **before enqueue or admission** per §4.2.1, with the guard
+travelling alongside the command and released on every completion, error,
+cancellation, send-failure and worker-loss path.
 
-**Phase 3 — `W > 1`.** Enable the pool, per-worker backend construction, the
-stateless distributor and the shard-encoded ids. `Engine`'s `unsafe impl Send`
-(`engine/model.rs:229`) is deleted here. All of §12.1's concurrency tests land in
-this phase, and the §12.3 gates are established against Phase 2's numbers.
+This is the phase where `ExclusiveLeaseConflict` stops being unreachable. Because
+acquisition happens before enqueue rather than inside the serial worker loop, the
+refusal is reachable at `W = 1` — a second overlapping turn for a live session is
+refused immediately rather than queued behind the first — so §12.1's tests 2–7 — every
+test whose subject is the lease rather than the pool — gate *this* phase and do
+not wait for `W > 1`. If acquisition were deferred
+into the worker loop, those tests could not be written until Phase 4, and the
+refusal contract would ship untested; that ordering constraint is the reason this
+phase exists separately at all.
+
+The `EngineOwner` wrapper and its `unsafe impl Send` are deleted here
+(`driver.rs:249`, `:278-281`). #2012 kept them because it moved the engine into
+the worker thread; this phase constructs the engine *on* the worker thread
+(§4.3), which removes the cross-thread move the SAFETY comment is arguing about.
+The gate is §12.2's `W = 1` bit-identity requirement against the pre-migration
+driver, which is unconditional at `W = 1` and therefore a real gate.
+
+**Phase 3 — `W > 1`.** Grow `WorkerPool::single` (`worker.rs:261-265`) into a
+real pool: per-worker backend construction, the stateless distributor, and the
+shard-encoded ids. `Engine`'s `unsafe impl Send` (`engine/model.rs:221-229`) is
+deleted here. The remaining §12.1 tests — 1, 8 and 10–12 — land in this phase,
+and the §12.3 gates are established against Phase 2's numbers. Checkpoints minted
+before `W` changed become refusable here, so §5's typed cross-`W` refusal ships
+with the pool rather than after it.
 
 **Phase 4 — sessionful continuous batching.** Admit sessionful turns into the
-per-worker batch loop and delete the deferral comment at `driver.rs:744-747`.
+per-worker batch loop and delete the deferral comment at `driver.rs:814-817`.
 This is the phase that delivers the throughput case in §12.3 and is deliberately
 last, because it is the only phase whose failure mode is a correctness bug in
-batching rather than in concurrency.
+batching rather than in concurrency. It needs no same-session check of its own:
+per §9 the routing lease from Phase 2 already guarantees a session never has two
+rows in flight.
 
 **Compatibility.**
 
@@ -1231,14 +1824,16 @@ batching rather than in concurrency.
   compiles and now merely over-synchronizes, which the release notes must call
   out — that is the one silent-pessimization path this change creates.
 - The Python binding's `Mutex<RustEngine>` and its `ENGINE_IN_USE` refusal
-  (`python/src/lib.rs:173-186`) are removed in Phase 3. That is a
+  (`python/src/lib.rs:173-184`, `:187-188`) are removed in Phase 3. That is a
   *loosening* — calls that previously raised now succeed — so no caller breaks,
   and free-threaded wheels (RULES.md Rule 7, `abi3t`) get real parallelism
   instead of a refusal.
 - The C ABI exposes no session lifecycle today
-  (`crates/onnx-genai-capi/src/lib.rs:79-423`), so it gains a thread-safety
+  (its entire exported surface runs from `oge_last_error` to `oge_string_free`,
+  `crates/onnx-genai-capi/src/lib.rs:79-423`, with no `oge_session_*` entry
+  point), so it gains a thread-safety
   guarantee and loses nothing. Its thread-local `oge_last_error`
-  (`capi/src/lib.rs:57-75`) is already correct for a multi-threaded caller.
+  (`capi/src/lib.rs:54-68`) is already correct for a multi-threaded caller.
 - HTTP behaviour changes in exactly one visible way: a 409 with
   `kind == "conflict_error"` becomes reachable for overlapping turns on one
   session (`routes/mod.rs:523-525`). It is already documented, already typed and
@@ -1258,10 +1853,27 @@ batching rather than in concurrency.
 2. **Sessionless request placement.** §9 says "shallowest queue". Whether that
    reads a per-shard atomic depth or stays pure round-robin should be decided by
    measurement, not by argument.
-3. **Shard skew.** §4.1 refuses rather than rebalances. If real workloads skew
-   badly, the answer is a better *placement* function, not migration, and the
-   evidence for choosing one belongs in [`../genai/SCHEDULING.md`](../genai/SCHEDULING.md).
+3. **Shard skew, and whether placement should read live load.** §4.1 places by a
+   stateless function of the session id and §4.4 explains why an even *session
+   count* is not an even *load*. The unresolved question is whether placement at
+   `create_session` should consult live shard depth — which is cheap, because a
+   new session owns no pages yet — or stay purely stateless for reproducibility.
+   Either way §4.1 refuses rather than migrates; the evidence for choosing
+   belongs in [`../genai/SCHEDULING.md`](../genai/SCHEDULING.md).
 4. **Cross-shard prefix sharing.** §9 accepts up to `W` copies of a shared
    prefix. A host-side shared prefix store that each worker materializes from is
    possible and is out of scope here; §12.3's measurement is what would justify
    it.
+5. **Checkpoint portability across worker counts.** §5 refuses a checkpoint whose
+   shard does not exist under the current `W`, because `SessionCheckpoint` carries
+   only `{ session_id, position }` (`config.rs:433-438`) and restore is a rewind
+   of a live session rather than a reconstruction. Making checkpoints portable
+   would require serializing KV state, which is a different feature with a
+   different cost; whether it is wanted is open, but this design does not
+   silently approximate it.
+6. **§3.5's environment lifetime option.** Whether `Session` grows a structural
+   `Arc<Environment>` or the process-global `OnceLock` stays with a documented
+   scope rule is left to implementation, because the answer depends on how much
+   of the EP plugin registry moves with it. What is *not* open is the ordering:
+   the compensating `Drop for Environment` (`env.rs:308-321`) is not removed
+   before whichever option is chosen actually lands.
