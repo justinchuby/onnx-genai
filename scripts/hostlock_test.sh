@@ -1598,13 +1598,28 @@ $HL acquire --owner pris --ttl 600 >/dev/null 2>&1
 chk "acquire --ttl is still accepted" "$(st ttl)" "600"
 $HL release >/dev/null 2>&1
 
+# The boundary the help text claims. `--ttl 0` is the `run` default and means
+# "never expires", so it arms no takeover and must NOT be refused -- refusing it
+# would break every caller that passes the default through explicitly. Pinning
+# it here keeps the documented rule ("refused when finite") honest: a guard
+# widened to `-ge 0` fails this, and a guard narrowed away fails the three
+# assertions above.
+out=$($HL run --ttl 0 -- true 2>&1)
+rc=$?
+chk "run --ttl 0 is accepted, because 0 arms no takeover" "$rc" "0"
+case $out in
+*"--ttl"*) ttl0_msg=complained ;;
+*) ttl0_msg=quiet ;;
+esac
+chk "and it is accepted quietly, not with a refusal it then ignores" "$ttl0_msg" "quiet"
+
 # Finally, pin the assertion count itself. Two of the checks in this file sit
 # behind environment probes, and an assertion that quietly stops running is
 # indistinguishable from one that passes -- which is the same failure mode as
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "252"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "254"
 
 echo
 echo "passed=${pass} failed=${fail}"

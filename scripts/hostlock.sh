@@ -70,7 +70,9 @@
 #   --ttl S           hard expiry: a lock older than this is reapable by the
 #                     next acquirer, which prints a loud warning naming you.
 #                     Default 3600 for `acquire`, 0 (never) for `run`.
-#                     REFUSED on `run` (exit 1). A TTL does not mean "release
+#                     REFUSED on `run` when finite (exit 1); `--ttl 0` is the
+#                     `run` default and is accepted, because 0 means "never
+#                     expires" and so arms no takeover at all. A TTL does not mean "release
 #                     this if I abandon it" -- it means "release this on the
 #                     clock, whether or not I am still running", and the
 #                     takeover path fires on a holder that is verifiably alive.
