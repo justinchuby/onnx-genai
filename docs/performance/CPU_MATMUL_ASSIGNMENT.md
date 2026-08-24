@@ -2142,7 +2142,24 @@ time. That figure is now stale; the re-measurement replaces it.
 > [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
 > [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
 > [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md),
-> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md).
+> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md),
+> [`docs/benchmarks/2026-08-24-acc0-lowwidth-smt.md`](../benchmarks/2026-08-24-acc0-lowwidth-smt.md).
+>
+> **The t=2 `Percent of CPU` anomaly is retired (2026-08-24).** The old
+> 98 / 71 / 186 table at widths 1/2/4 had a t=2 cell below one core. Forcing
+> two workers onto one physical core was tested directly and costs 1.86x
+> throughput while leaving CPU-time at **200.0%** (vs 196.5% on two cores), so
+> SMT co-location cannot produce a sub-one-core reading -- it steals throughput
+> without stealing CPU-time, and the work-completed ratio 0.550 replicates an
+> independent scalar probe's 0.5505. Re-pointing the *retired instrument
+> itself* at current main reads **99 / 196 / 372**, with w=1 reproducing
+> exactly, so the anomaly was a property of an older tree, not of the
+> instrument. Neither the original wake-latency attribution nor the SMT
+> hypothesis survives; there is no anomaly left on this tree.
+>
+> Also recorded there: **decode width `w` builds `w - 1` `onnx-genai-spmd`
+> threads and runs the w-th lane on the dispatcher thread**, so any instrument
+> counting named worker threads is off by one.
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
