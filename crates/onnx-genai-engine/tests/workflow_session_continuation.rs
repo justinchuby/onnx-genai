@@ -348,11 +348,20 @@ fn a_conversation_is_refused_past_the_bound_it_declares() -> anyhow::Result<()> 
     let refused = engine
         .generate_in_session(session, tokens(&[5, 7], 2))
         .expect_err("a turn past the declared bound must be refused");
-    let message = format!("{refused:#}");
-    assert!(
-        message.contains("declares a bound of 6"),
-        "the refusal names the bound and the conversation: {message}"
-    );
+    let capability =
+        onnx_genai_engine::package_capability_error(&refused).expect("the refusal is typed");
+    match capability {
+        onnx_genai_engine::PackageCapabilityError::ConversationOverBound {
+            cell,
+            requested,
+            bound,
+        } => {
+            assert_eq!(cell, "conversation");
+            assert_eq!(bound, 6);
+            assert!(requested > bound);
+        }
+        other => panic!("unexpected capability refusal: {other:?}"),
+    }
     // The refusal left the conversation as it was, so the session is still
     // usable once it is reset.
     assert_eq!(engine.session_token_count(session)?, 6);
@@ -680,6 +689,25 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
         onnx_genai_engine::package_capability_error(&error),
         Some(onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict { .. })
     ));
+}
+
+#[test]
+fn copy_on_write_session_mutation_is_refused_at_load() -> anyhow::Result<()> {
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("copy_on_write_lease_package");
+    let _ = std::fs::remove_dir_all(&scratch);
+    copy_package(&scratch)?;
+    let path = scratch.join("inference_metadata.yaml");
+    let mut document: serde_yaml::Value = serde_yaml::from_str(&std::fs::read_to_string(&path)?)?;
+    document["pipeline"]["workflow"]["state"]["conversation"]["session"]["policy"] =
+        serde_yaml::Value::String("copy_on_write".into());
+    std::fs::write(&path, serde_yaml::to_string(&document)?)?;
+
+    let refused = match Engine::from_dir(&scratch, EngineConfig::default()) {
+        Ok(_) => panic!("an unsupported mutation policy must not load"),
+        Err(error) => format!("{error:#}"),
+    };
+    assert!(refused.contains("copy-on-write"), "{refused}");
+    Ok(())
 }
 
 /// Carriers decide independently what is attended and what is recomputed.
