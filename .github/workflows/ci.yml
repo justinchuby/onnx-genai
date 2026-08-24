@@ -464,10 +464,20 @@ jobs:
       # is on. Without this step a refactor can leave it uncompilable while
       # every other job still passes -- which is exactly what happened when
       # native_decode.rs and engine.rs were split into module trees.
+      #
+      # onnx-genai-server was added after the same thing happened to it: a
+      # `#[cfg(feature = "native-backend")]` test in `onnx-genai-server/src/tests.rs`
+      # called `EngineDriver::generate` with the arity it had before a third
+      # parameter was added, and `main` sat uncompilable under this feature while
+      # Fast, Rust quality and every coverage lane stayed green (#1944). This
+      # step covered only the engine crate, so the one place that would have
+      # noticed did not look. The only job that did compile it is `CLI ORT`,
+      # which is slow and has been red for unrelated reasons.
       - name: Check the native backend compiles
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-engine --features native-backend
+          -p onnx-genai-engine -p onnx-genai-server
+          --features onnx-genai-engine/native-backend,onnx-genai-server/native-backend
           -- -D warnings
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
