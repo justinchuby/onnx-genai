@@ -806,14 +806,21 @@ declared on its own dimension and they never compete for one.
   a component padding-invariant — that remains the profile's `batch_invariance`
   declaration.
 - **Ownership is an ordered chain of levels over one physically packed axis.**
-  `TokenPacked` declares `axis` — which **MUST** be `0` for a batchable component
-  — and `levels`, one or two `{ offsets, owner }` pairs, innermost first. Level 0
+  `TokenPacked` declares `axis` — which **MUST** be `0` wherever `token_packed`
+  appears, not only on a component that declares a capacity, because the runtime
+  splits any packed value per request and every such split wants a contiguous
+  span — and `levels`, one or two `{ offsets, owner }` pairs, innermost first. Level 0
   maps packed positions to their parent unit, the last level maps units to
   request rows, and composing them gives each row a single contiguous span. There
   is no second physical packed axis: frames are flattened across clips and across
   requests, and the frame→clip and clip→row maps are bookkeeping over that one
   axis. Two content roles, `pack_offsets` and `pack_owner`, join the preprocessing
-  vocabularies so a declared program can produce them at any level. A third role,
+  vocabularies so a declared program can produce them at any level, and a
+  preprocessing-program value named as a level companion **MUST** carry the
+  matching one. That is stricter than the `padding` reference, which resolves by
+  name and treats the length role as descriptive, and deliberately so: length
+  vectors have established modality spellings that predate this design, while the
+  companion roles are new and have nothing to accommodate. A third role,
   `valid_lengths`, is **new**: no such role exists today — the audio vocabulary
   offers `valid_frames`, `valid_samples`, `sample_lengths`, `frame_lengths`, and
   `validity_mask` (`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`) — and
@@ -912,8 +919,10 @@ In summary, a `token_packed` value's companions are checked at **load**: every
 level's `offsets` and `owner` **MUST** resolve to declared values; each is
 `shared`, `int64`, rank 1, with level `k`'s `owner` carrying that level's unit
 count and its `offsets` carrying the parent count plus one; `axis` **MUST** be
-`0` for a component that declares `batch_capacity`; `levels` holds one or two
-entries, innermost first; every port naming a given `{ offsets, owner }` pair
+`0` for every packed value, whether or not the component declares
+`batch_capacity`; a companion that is a preprocessing-program output carries
+`pack_offsets` or `pack_owner`; `levels` holds one or two entries, innermost
+first; every port naming a given `{ offsets, owner }` pair
 agrees on that pair's extent symbols — consistency is keyed on **pair identity,
 not on level index**, because a pair legitimately sits at level 1 of an input and
 level 0 of an output that pooled the inner level away; a packed value declares no
