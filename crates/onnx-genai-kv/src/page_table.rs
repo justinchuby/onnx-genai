@@ -20,11 +20,18 @@ pub type PageId = u32;
 ///
 /// The pointer is never dereferenced by `onnx-genai-kv`; it is only a stable
 /// handle that a backend can pass to its kernels together with the byte range
-/// occupied by this logical page. A future `CudaPageStore` backed by the VMM
-/// arena would reserve a stable virtual range, map committed granules behind it,
-/// and return a span inside that range. Prefix sharing would map the same
-/// physical handles into multiple virtual ranges, and CoW would copy/remap at
-/// the VMM granule boundary described in issue #721.
+/// occupied by this logical page.
+///
+/// This span is **not** a staging post for a CUDA store inside this crate.
+/// #721 stage 3 (`CudaPageStore` backed by the VMM arena) is superseded: on
+/// native CUDA, device KV paging is owned by the VMM layer -- `CudaVmmAllocator`
+/// with its physical-handle pool (#740), committed-granule admission (#745) and
+/// growth grants (#748) -- which already reserves a stable virtual range and
+/// maps committed granules behind it. Building a second page allocator here
+/// would duplicate that ownership, not complete it. The span stays because the
+/// trait boundary is what lets a third party supply a device store without
+/// patching this crate, and because it is the reason `head_token_row()` is not
+/// on the store contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DevicePageSpan {
     pub device: Device,
@@ -85,8 +92,11 @@ impl PageStoreLayout {
 
 /// Creates an empty target store for a transactional page migration.
 ///
-/// Cache callers depend only on this contract. Stage 3 can supply a factory
-/// that creates `CudaPageStore` for GPU locations without changing them.
+/// Cache callers depend only on this contract, which is why a third-party or
+/// out-of-tree store can be supplied without changing them. It is not a hook
+/// waiting for an in-crate CUDA store: #721 stage 3 is superseded, and device
+/// KV paging on native CUDA belongs to the VMM layer (`CudaVmmAllocator`,
+/// #740/#745/#748) rather than to this crate.
 pub trait KvPageStoreFactory: fmt::Debug + Send + Sync {
     /// Maximum bytes allocated by `create` for this layout and residency.
     ///

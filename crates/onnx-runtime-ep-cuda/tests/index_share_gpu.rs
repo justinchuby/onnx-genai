@@ -338,10 +338,10 @@ fn run_cpu(
     Ok(out_bufs)
 }
 
-fn workspace_view_for<'a>(
+fn workspace_view_for(
     kernel: &dyn onnx_runtime_ep_api::Kernel,
     input_views: &[TensorView],
-    buffer: &'a mut Option<DeviceBuffer>,
+    buffer: &mut Option<DeviceBuffer>,
     ep: &CudaExecutionProvider,
 ) -> onnx_runtime_ep_api::Result<Option<WorkspaceView>> {
     let metadata = input_views

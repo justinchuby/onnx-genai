@@ -202,6 +202,19 @@ impl PagedKvCache {
         id
     }
 
+    /// Emit the token-major PagedAttention index tensors for `requests`.
+    ///
+    /// A read-only view over this cache's page authority; it never allocates,
+    /// frees, or mutates pages. See [`crate::PagedIndexPlan::build`] for the
+    /// exact contract and typed rejections. The caller must have appended the
+    /// query tokens (allocating their pages) before emitting their slots.
+    pub fn emit_paged_index_plan(
+        &self,
+        requests: &[crate::PagedRequest],
+    ) -> Result<crate::PagedIndexPlan, KvError> {
+        crate::PagedIndexPlan::build(&self.page_table, requests)
+    }
+
     /// Append one token of per-layer K/V tensors at the sequence tail.
     pub fn append_token_kv(
         &mut self,
@@ -655,7 +668,10 @@ impl PagedKvCache {
     /// store transactionally, so [`restore_sequence`](Self::restore_sequence)
     /// brings back byte-identical KV and a preempted-then-restored sequence
     /// decodes the same tokens as if it had never been preempted. Both stores
-    /// remain host-backed emulation until Stage 3. Returns pages demoted.
+    /// are host-backed: "hot" and "cold" are declared residencies, not devices,
+    /// and they stay that way -- #721 stage 3 is superseded, so no in-crate CUDA
+    /// store is coming to make the hot tier device-resident. Returns pages
+    /// demoted.
     pub fn preempt_sequence(&mut self, seq: SequenceId) -> Result<usize, KvError> {
         // Validate the sequence exists so a bogus id surfaces as an error
         // rather than a silent no-op.

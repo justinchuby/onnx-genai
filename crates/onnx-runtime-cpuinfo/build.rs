@@ -1,6 +1,11 @@
 use std::env;
 use std::path::PathBuf;
 
+// `vendor_tree_problem` and the constants it reads. Shared with
+// `tests/vendor_submodule_guard.rs` so the message a broken checkout produces
+// is covered by a test instead of only by a failed build.
+include!("build_support.rs");
+
 /// Locate `ninja.exe` on `PATH`. Inside a Visual Studio developer environment
 /// Ninja is on `PATH` (it is bundled under `CommonExtensions\Microsoft\CMake`),
 /// so this succeeds exactly when a Ninja-driven build is viable.
@@ -19,8 +24,17 @@ fn main() {
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     let wrappers = out_path.join("cpuinfo_static_wrappers");
 
+    println!("cargo:rerun-if-changed=build_support.rs");
     println!("cargo:rerun-if-changed=vendor/cpuinfo/CMakeLists.txt");
     println!("cargo:rerun-if-changed=vendor/cpuinfo/include/cpuinfo.h");
+
+    // Check the vendored tree before handing it to cmake. cmake's own error
+    // names a missing CMakeLists.txt inside a third-party directory and never
+    // mentions submodules, so it reads as a code or toolchain break; this one
+    // names the cause and the command that fixes it. See #1816.
+    if let Some(problem) = vendor_tree_problem(&cpuinfo) {
+        panic!("{problem}");
+    }
 
     // Build cpuinfo via cmake
     let mut config = cmake::Config::new(&cpuinfo);

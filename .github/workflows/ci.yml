@@ -352,6 +352,30 @@ jobs:
       - name: Check documented environment variables are implemented
         run: python3 .github/scripts/verify_documented_env_vars.py
 
+      # A `#[test]` added to a CUDA target without an ignore runs on every
+      # machine that has no GPU. The authoritative check for this is
+      # verify_cuda_test_honesty.py, but it needs two full CUDA test builds and
+      # so runs only on the CUDA lane -- which means an author learns about it
+      # after merge, and only if that lane is green enough to be believed. It
+      # was not: five such tests landed in three days (#1875, #1881, #1911,
+      # #1909), each one reported by a lane already red for another reason.
+      # This is the same rule read off the source in under a second, with no
+      # CUDA toolchain, so every pull request gets the signal. It supplements
+      # the inventory check and does not replace it -- it cannot see
+      # macro-expanded tests, nor inventory parity between feature configs.
+      #
+      # The scan covers both halves of the class. The half above is loud: the
+      # test runs and the lane reds. The other half is silent -- a `cfg` on
+      # `gpu-tests` (on the test, on its `mod`, on the whole target, or as
+      # manifest `required-features`) deletes the test from the base-config
+      # inventory, so the lane is green because the tests are not there. #1927
+      # lost thirteen that way and nothing reported it.
+      - name: Check CUDA test source scan can still detect (self-test)
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --self-test
+
+      - name: Check CUDA tests are ignored, not deleted by a cfg
+        run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
+
       # Rust warnings are errors: clippy is blocking for every pure/offline crate.
       # To add a crate, first confirm its normal+dev dependency tree contains no
       # ort-sys/CUDA dependency, then add it here and to the portable test lane.
@@ -440,6 +464,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+      # The gate's submodule precondition, tested against fixture repository
+      # roots with cargo/rustup shimmed -- about a second, and it is the only
+      # thing that proves the check refuses BEFORE spending a clippy run rather
+      # than after one. One of its cells runs the gate against this checkout,
+      # so a precondition that started rejecting correct trees fails here
+      # instead of on every developer's box. #1816.
+      - name: Cross-compile gate preconditions (self-test)
+        run: |
+          shellcheck scripts/check_cross_compile.sh scripts/check_cross_compile_test.sh
+          bash scripts/check_cross_compile_test.sh
       - name: Cross-target compile check (catches os- and arch-gating errors)
         run: bash scripts/check_cross_compile.sh
 
@@ -447,10 +481,20 @@ jobs:
       # is on. Without this step a refactor can leave it uncompilable while
       # every other job still passes -- which is exactly what happened when
       # native_decode.rs and engine.rs were split into module trees.
+      #
+      # onnx-genai-server was added after the same thing happened to it: a
+      # `#[cfg(feature = "native-backend")]` test in `onnx-genai-server/src/tests.rs`
+      # called `EngineDriver::generate` with the arity it had before a third
+      # parameter was added, and `main` sat uncompilable under this feature while
+      # Fast, Rust quality and every coverage lane stayed green (#1944). This
+      # step covered only the engine crate, so the one place that would have
+      # noticed did not look. The only job that did compile it is `CLI ORT`,
+      # which is slow and has been red for unrelated reasons.
       - name: Check the native backend compiles
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-engine --features native-backend
+          -p onnx-genai-engine -p onnx-genai-server
+          --features onnx-genai-engine/native-backend,onnx-genai-server/native-backend
           -- -D warnings
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
@@ -1025,11 +1069,23 @@ jobs:
       - name: Verify expert route telemetry CPU oracle
         run: cargo test --locked -p onnx-runtime-ep-cuda --features cuda --test expert_route_telemetry_probe
 
+      # `--all-targets` and `gpu-tests` are both load-bearing. Without them
+      # clippy sees only the library's non-test code: every `#[cfg(test)]`
+      # module and all 58 `*_gpu.rs` targets go unlinted, and a lint error can
+      # sit on `main` indefinitely because no job ever parses those blocks. One
+      # did -- an `approx_constant` error in `optimizer.rs`'s test module,
+      # invisible to this step for as long as it omitted the flags.
+      #
+      # This costs an extra pass: clippy-driver caches separately from `cargo
+      # test`, so the honesty check's `cuda,gpu-tests` build above is not
+      # reused for this crate (its dependency builds are). The Windows CUDA
+      # lane deliberately keeps the narrower invocation -- it does not build
+      # the gpu-tests binaries at all, so the same change there would be a
+      # full extra build for lints this Linux step already covers.
       - name: Clippy CUDA execution provider
-        run: cargo clippy -p onnx-runtime-ep-cuda --features cuda -- -D warnings
-
-      # `onnx-genai-engine`'s CUDA integration layer is gated on `native-cuda`,
-      # and until this step existed no job in any workflow enabled that feature
+        run: >-
+          cargo clippy -p onnx-runtime-ep-cuda
+          --all-targets --features cuda,gpu-tests -- -D warnings
       # (it appeared in ci.yml only inside a comment). That left ~167 cfg sites
       # -- native_decode/{mod,load,cuda,tensor}.rs, memory_authority.rs,
       # pipeline/* -- never type-checked, linted, or tested, so a change could

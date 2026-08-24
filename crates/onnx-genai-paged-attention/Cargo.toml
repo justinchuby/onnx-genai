@@ -1,0 +1,15 @@
+[package]
+name = "onnx-genai-paged-attention"
+description = "Typed schema validator and CPU reference oracle for com.microsoft::PagedAttention v1 (ORT 1.29.0)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["llm", "inference", "attention", "paged", "mla"]
+categories = ["science"]
+
+[dependencies]
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

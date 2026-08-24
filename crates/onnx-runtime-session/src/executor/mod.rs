@@ -102,18 +102,49 @@ mod phase_profile {
     use std::sync::{Mutex, OnceLock};
     use std::time::Instant;
 
-    static STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    pub(super) const UNKNOWN: u8 = 0;
+    pub(super) const OFF: u8 = 1;
+    pub(super) const ON: u8 = 2;
+
+    static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
     static PRINTED: AtomicBool = AtomicBool::new(false);
+
+    /// Publish an environment-derived gate value without overwriting a decision
+    /// that is already in force, and report the value that actually is.
+    ///
+    /// The lazy initialiser below is a *writer*, not just a reader, and it runs
+    /// on whatever thread first reaches the gate while holding no lock -
+    /// `run.rs` consults the planner gate on every executor run, so under the
+    /// parallel test runner that is any thread at all. Its load / read-env /
+    /// store is not atomic: an unconditional `store` can land *after* a
+    /// `force_*` call that did take [`globals_lock`], silently reverting it.
+    /// That is not hypothetical - it is how
+    /// `activation_memory_planner_reports_static_decode_graph_savings` failed
+    /// on `Rust coverage (Windows x86_64)`: the gate it forced on was reset to
+    /// `OFF` between the force and the run, so the run published no stats and
+    /// the `expect` on them panicked.
+    ///
+    /// [`globals_lock`] cannot fix that, because the losing writer is a plain
+    /// reader that must not be made to take a lock on the hot path. A
+    /// `compare_exchange` from [`UNKNOWN`] fixes it instead, by making the
+    /// initialiser lose the race rather than win it: it publishes only when
+    /// nothing else has, and otherwise reports what is in force.
+    pub(super) fn publish_env_derived(gate: &AtomicU8, on: bool) -> bool {
+        let desired = if on { ON } else { OFF };
+        match gate.compare_exchange(UNKNOWN, desired, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => on,
+            Err(in_force) => in_force == ON,
+        }
+    }
 
     pub fn enabled() -> bool {
         match STATE.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
+            OFF => false,
+            ON => true,
             _ => {
                 let on = std::env::var("NXRT_EXEC_PHASE_PROFILE")
                     .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-                STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
+                publish_env_derived(&STATE, on)
             }
         }
     }
@@ -121,10 +152,10 @@ mod phase_profile {
     /// Test-only override of the env-derived enable state.
     #[cfg(test)]
     pub(super) fn force_enabled(on: bool) {
-        STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+        STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
     }
 
-    static PLAN_STATE: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = off, 2 = on
+    static PLAN_STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
 
     /// Whether to run the activation-memory *planner* during a run.
     ///
@@ -144,16 +175,15 @@ mod phase_profile {
     /// path to these stats - keeps getting them.
     pub fn activation_plan_enabled() -> bool {
         match PLAN_STATE.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
+            OFF => false,
+            ON => true,
             _ => {
                 let on = ["NXRT_ACTIVATION_MEMORY_PLAN", "NXRT_EXEC_PHASE_PROFILE"]
                     .iter()
                     .any(|key| {
                         std::env::var(key).is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                     });
-                PLAN_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-                on
+                publish_env_derived(&PLAN_STATE, on)
             }
         }
     }
@@ -161,13 +191,20 @@ mod phase_profile {
     /// Opt a process into activation-memory planning without turning on phase
     /// profiling, for callers that want the stats and are willing to pay.
     pub fn enable_activation_plan_for_process() {
-        PLAN_STATE.store(2, Ordering::Relaxed);
+        PLAN_STATE.store(ON, Ordering::Relaxed);
     }
 
     /// Test-only override of the env-derived planner state.
     #[cfg(test)]
     pub(super) fn force_activation_plan_enabled(on: bool) {
-        PLAN_STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+        PLAN_STATE.store(if on { ON } else { OFF }, Ordering::Relaxed);
+    }
+
+    /// The live planner gate, so a test can drive the real one rather than a
+    /// copy of it.
+    #[cfg(test)]
+    pub(super) fn activation_plan_gate() -> &'static AtomicU8 {
+        &PLAN_STATE
     }
 
     /// Holds the planner on for one test and clears it on drop, so a leaked
@@ -199,6 +236,13 @@ mod phase_profile {
     /// Both are plain atomics with no per-test isolation, so without this the
     /// parallel runner lets one test's `enable`/`force` land inside another
     /// test's assertion window.
+    ///
+    /// It does **not** serialise every writer, and cannot: the lazy
+    /// initialiser in `enabled`/`activation_plan_enabled` also writes, from any
+    /// thread that reaches a gate first, and making a hot-path reader take a
+    /// mutex is not an option. Holding this lock is therefore *not* sufficient
+    /// to own a gate - see [`publish_env_derived`], which is what keeps that
+    /// third writer from reverting a forced value.
     #[cfg(test)]
     pub(super) fn globals_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
@@ -206,7 +250,7 @@ mod phase_profile {
     }
 
     pub fn enable_for_process() {
-        STATE.store(2, Ordering::Relaxed);
+        STATE.store(ON, Ordering::Relaxed);
     }
 
     /// Test-only snapshot of a phase's accumulated `(total_ns, count)`.

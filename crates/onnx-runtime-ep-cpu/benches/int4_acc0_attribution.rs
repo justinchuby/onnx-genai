@@ -211,6 +211,10 @@ fn bench(label: &str, reps: usize, mut f: impl FnMut()) -> f64 {
 fn main() {
     // Match the decode thread topology a served session runs in (#1749).
     common::init_decode_topology();
+    // Opened before anything else runs, so the window covers warmup too: a
+    // warmup that shared cores with somebody else's run leaves caches and
+    // frequency in a state the timed region inherits.
+    let host_lock = common::open_host_lock_window();
 
     let reps: usize = std::env::var("REPS")
         .ok()
@@ -287,4 +291,7 @@ fn main() {
             packed_bytes / t_pk_acc16 / 1e9,
         );
     }
+
+    // Last, so the second reading covers everything above it.
+    common::report_host_lock(host_lock);
 }

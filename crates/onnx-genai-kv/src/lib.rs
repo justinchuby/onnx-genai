@@ -27,6 +27,7 @@ pub mod fp8;
 pub mod local_tiered;
 pub mod page_table;
 pub mod paged_cache;
+pub mod paged_index;
 pub mod prefix_cache;
 pub mod telemetry;
 pub mod tiered;
@@ -48,6 +49,11 @@ pub use page_table::{
     SequenceUsage,
 };
 pub use paged_cache::{LayerKv, MaterializedKv, MaterializedLayerKv, PagedKvCache};
+pub use paged_index::{
+    LatentCacheGeometry, MIN_PAGED_BLOCK_SIZE, PAGED_BLOCK_TABLE_PAD, PAGED_SLOT_EMPTY,
+    PagedIndexPlan, PagedKvLayout, PagedRequest, is_valid_paged_block_size, latent_element_offset,
+    token_major_element_offset,
+};
 pub use prefix_cache::PrefixCache;
 pub use telemetry::{Applicability, KvNotApplicable, KvTelemetry, KvTelemetrySnapshot};
 
@@ -333,6 +339,63 @@ pub enum KvError {
     InvalidQuantizationConfig(String),
     #[error("Page {0} not found")]
     PageNotFound(PageId),
+    /// The KV `page_size` cannot serve as a PagedAttention `block_size`.
+    ///
+    /// `com.microsoft::PagedAttention` requires `block_size` to be a power of
+    /// two and at least 16 (`check_kv_cache`). Refused rather than emitting an
+    /// index plan a conforming kernel would reject.
+    #[error(
+        "page_size {block_size} cannot be a PagedAttention block_size (need power of two >= 16)"
+    )]
+    PagedInvalidBlockSize { block_size: usize },
+    /// A windowed / attention-sink sequence was asked to emit a paged plan.
+    ///
+    /// The token-major slot mapping in this slice assumes contiguous positions
+    /// from zero. Sink-pinned or slid sequences store a disjoint
+    /// `[0, sink) ∪ [start, len)` span, so their absolute positions do not map
+    /// linearly onto blocks. Refused with the offending bookkeeping rather than
+    /// emitting slots that silently address the wrong tokens.
+    #[error(
+        "sequence {seq} is not contiguous (start {start}, sink_len {sink_len}); paged index \
+         emission for windowed/attention-sink sequences is not implemented in this slice"
+    )]
+    PagedNonContiguousSequence {
+        seq: SequenceId,
+        start: usize,
+        sink_len: usize,
+    },
+    /// More query tokens were requested than the sequence currently holds.
+    #[error(
+        "sequence {seq} query_len {query_len} exceeds its context length {context_len}; append \
+         the tokens before emitting their slots"
+    )]
+    PagedQueryExceedsContext {
+        seq: SequenceId,
+        query_len: usize,
+        context_len: usize,
+    },
+    /// The sequence's context needs more pages than are allocated.
+    ///
+    /// The plan is read-only and never allocates; the caller must reserve the
+    /// pages (via append) before the plan can address their slots.
+    #[error(
+        "sequence {seq} needs {need_pages} pages for its context but only {have_pages} are \
+         allocated; emission never allocates, so append the tokens first"
+    )]
+    PagedMissingPages {
+        seq: SequenceId,
+        need_pages: usize,
+        have_pages: usize,
+    },
+    /// A physical page id does not fit in the op's int32 `block_table`.
+    #[error("page id {page_id} does not fit in an int32 block_table entry")]
+    PagedBlockIdOverflow { page_id: PageId },
+    /// A physical slot (or a length) does not fit in an int32 index tensor.
+    #[error("paged index value {slot} does not fit in an int32 index tensor")]
+    PagedSlotOverflow { slot: i64 },
+    /// A LATENT cache geometry is internally inconsistent.
+    #[error("invalid LATENT cache geometry: {0}")]
+    LatentGeometryInvalid(String),
 }
 
 #[cfg(test)]

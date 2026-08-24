@@ -834,9 +834,26 @@ fn report_native_width(requested: Option<usize>) -> String {
 /// motivates carrying that distinction: it runs an ORT session whose intra-op
 /// threads need not share the native EP's confinement, so `BOUNDED` is an
 /// expected outcome here rather than a pathology.
-fn host_fields(host: &onnx_runtime_hostmon::Contention) -> String {
+/// The host columns of a result row: what the machine actually did, and what
+/// anybody said they were doing to it.
+///
+/// `host_lock` is not a second opinion on contention, it is a different
+/// question. The contention figures measure load; the lock records *declared
+/// intent*. Neither implies the other -- an unlocked run on a genuinely idle
+/// box is fine, and a locked run alongside a co-tenant's unannounced `cargo
+/// test` is not -- so a row that means anything later needs both.
+///
+/// It is printed on the unmeasured path too. That is the path where it matters
+/// most: when contention could not be measured at all, the declaration is the
+/// only evidence the row has about the conditions it was taken under, and
+/// dropping the field exactly there would leave the least trustworthy rows
+/// looking the least suspicious.
+fn host_fields(
+    host: &onnx_runtime_hostmon::Contention,
+    lock: &onnx_runtime_hostmon::hostlock::LockField,
+) -> String {
     let verdict = if !host.measured {
-        return "host_foreign=n/a host=unmeasured".to_string();
+        return format!("host_foreign=n/a host_lock={lock} host=unmeasured");
     } else if host.is_contended() {
         "CONTENDED"
     } else if host.is_clean() {
@@ -845,7 +862,7 @@ fn host_fields(host: &onnx_runtime_hostmon::Contention) -> String {
         "BOUNDED"
     };
     format!(
-        "host_foreign={} host_sib={} host_busy={:.1} host={verdict}",
+        "host_foreign={} host_sib={} host_busy={:.1} host_lock={lock} host={verdict}",
         onnx_runtime_hostmon::foreign_column(std::slice::from_ref(host)),
         onnx_runtime_hostmon::sibling_column(std::slice::from_ref(host)),
         host.total_pct,
@@ -1307,6 +1324,11 @@ fn main() -> Result<()> {
         eprintln!("{warning}");
     }
     let host_before = onnx_runtime_hostmon::snapshot();
+    // Read at both ends. A single reading after the runs would report one
+    // credible holder for a window that changed hands halfway through, which is
+    // the same stale-snapshot error as checking `ps` once before starting --
+    // only now baked into the row.
+    let lock_before = onnx_runtime_hostmon::hostlock::read();
     for run in 0..args.runs {
         let mut measure_native = || -> Result<f64> {
             let start = Instant::now();
@@ -1333,8 +1355,10 @@ fn main() -> Result<()> {
         }
     }
     let host_after = onnx_runtime_hostmon::snapshot();
+    let lock_after = onnx_runtime_hostmon::hostlock::read();
 
     let host = onnx_runtime_hostmon::contention(host_before.as_ref(), host_after.as_ref());
+    let lock = onnx_runtime_hostmon::hostlock::field_from_env(&lock_before, &lock_after);
 
     let native = Stats::from(native_samples);
     if args.native_only {
@@ -1348,7 +1372,7 @@ fn main() -> Result<()> {
             native.min,
             native.spread(),
             report_native_width(requested_width),
-            host_fields(&host),
+            host_fields(&host, &lock),
             build_arm(),
             if parity_pass { "PASS" } else { "FAIL" }
         );
@@ -1375,7 +1399,7 @@ fn main() -> Result<()> {
         native.spread(),
         ort.spread(),
         report_native_width(requested_width),
-        host_fields(&host),
+        host_fields(&host, &lock),
         ort_width_source(args.ort_intra_threads.is_some(), ort_width_note.is_some()),
         build_arm(),
         if parity_pass { "PASS" } else { "FAIL" }
@@ -1667,6 +1691,13 @@ mod width_report_tests {
 mod host_fields_tests {
     use super::*;
     use onnx_runtime_hostmon::Contention;
+    use onnx_runtime_hostmon::hostlock::LockField;
+
+    /// The lock reading every pre-existing test in this module implicitly
+    /// assumed: nobody declared the host.
+    fn unlocked() -> LockField {
+        LockField::Free
+    }
 
     /// A reading on the `foreign_pct` axis, with the sibling axis pinned quiet
     /// and known so that each test moves one variable.
@@ -1683,7 +1714,7 @@ mod host_fields_tests {
 
     #[test]
     fn an_unmeasured_window_says_so_instead_of_printing_a_zero() {
-        let cell = host_fields(&Contention::default());
+        let cell = host_fields(&Contention::default(), &unlocked());
         assert!(cell.contains("host=unmeasured"), "{cell}");
         assert!(
             !cell.contains("0.0"),
@@ -1693,7 +1724,7 @@ mod host_fields_tests {
 
     #[test]
     fn a_quiet_window_with_a_complete_subtraction_is_the_only_clean_verdict() {
-        let cell = host_fields(&reading(0.4, true));
+        let cell = host_fields(&reading(0.4, true), &unlocked());
         assert!(cell.contains("host=CLEAN"), "{cell}");
         assert!(cell.contains("host_foreign=0.4"), "{cell}");
         assert!(
@@ -1704,7 +1735,7 @@ mod host_fields_tests {
 
     #[test]
     fn a_quiet_looking_lower_bound_is_never_reported_as_clean() {
-        let cell = host_fields(&reading(0.4, false));
+        let cell = host_fields(&reading(0.4, false), &unlocked());
         assert!(
             cell.contains("host=BOUNDED"),
             "an incomplete own-time subtraction under-reports, so a low figure \
@@ -1717,7 +1748,7 @@ mod host_fields_tests {
     /// certify quiet, but it can still condemn a row.
     #[test]
     fn a_lower_bound_above_the_threshold_still_condemns_the_row() {
-        let cell = host_fields(&reading(60.0, false));
+        let cell = host_fields(&reading(60.0, false), &unlocked());
         assert!(cell.contains("host=CONTENDED"), "{cell}");
         assert!(cell.contains("host_foreign=60.0!"), "{cell}");
     }
@@ -1725,7 +1756,7 @@ mod host_fields_tests {
     #[test]
     fn a_contended_window_is_flagged_regardless_of_completeness() {
         for complete in [true, false] {
-            let cell = host_fields(&reading(60.0, complete));
+            let cell = host_fields(&reading(60.0, complete), &unlocked());
             assert!(
                 cell.contains("host=CONTENDED"),
                 "complete={complete}: {cell}"
@@ -1741,10 +1772,13 @@ mod host_fields_tests {
     /// dispatch pays it. Without the sibling term this row reads `CLEAN`.
     #[test]
     fn a_busy_sibling_condemns_a_row_whose_own_cores_are_quiet() {
-        let cell = host_fields(&Contention {
-            sibling_peak_pct: 97.0,
-            ..reading(0.0, true)
-        });
+        let cell = host_fields(
+            &Contention {
+                sibling_peak_pct: 97.0,
+                ..reading(0.0, true)
+            },
+            &unlocked(),
+        );
         assert!(
             cell.contains("host=CONTENDED"),
             "a saturated sibling is contention even at foreign_pct 0: {cell}"
@@ -1762,10 +1796,13 @@ mod host_fields_tests {
     /// verdict looks like a bug.
     #[test]
     fn unknown_topology_shows_the_missing_term_rather_than_an_unexplained_verdict() {
-        let cell = host_fields(&Contention {
-            siblings_known: false,
-            ..reading(0.4, true)
-        });
+        let cell = host_fields(
+            &Contention {
+                siblings_known: false,
+                ..reading(0.4, true)
+            },
+            &unlocked(),
+        );
         assert!(cell.contains("host=BOUNDED"), "{cell}");
         assert!(
             cell.contains("host_sib=n/a"),
@@ -1774,6 +1811,76 @@ mod host_fields_tests {
         assert!(
             !cell.contains("host_sib=0.0"),
             "an unread sibling set must never print as a quiet zero: {cell}"
+        );
+    }
+
+    /// The declaration has to survive the path where contention could not be
+    /// measured, because that is the row with the least other evidence about the
+    /// conditions it was taken under.
+    #[test]
+    fn an_unmeasured_window_still_reports_what_was_declared() {
+        let cell = host_fields(&Contention::default(), &LockField::Foreign("roy".into()));
+        assert!(cell.contains("host=unmeasured"), "{cell}");
+        assert!(
+            cell.contains("host_lock=foreign:roy"),
+            "the declaration is the only evidence an unmeasured row has: {cell}"
+        );
+    }
+
+    /// A measured-quiet window and a declared-quiet window are different
+    /// claims, and a row has to carry both rather than letting one stand in for
+    /// the other.
+    #[test]
+    fn the_lock_column_is_independent_of_the_contention_verdict() {
+        let clean_but_unlocked = host_fields(&reading(0.4, true), &LockField::Free);
+        assert!(
+            clean_but_unlocked.contains("host=CLEAN"),
+            "{clean_but_unlocked}"
+        );
+        assert!(
+            clean_but_unlocked.contains("host_lock=free"),
+            "{clean_but_unlocked}"
+        );
+
+        let locked_but_contended =
+            host_fields(&reading(60.0, true), &LockField::Mine("sebastian".into()));
+        assert!(
+            locked_but_contended.contains("host=CONTENDED"),
+            "{locked_but_contended}"
+        );
+        assert!(
+            locked_but_contended.contains("host_lock=mine:sebastian"),
+            "holding the lock does not make a contended window quiet: {locked_but_contended}"
+        );
+    }
+
+    /// A row is a whitespace-separated `key=value` list, so an owner that
+    /// smuggles a space or an `=` through would forge a field. `hostlock.sh`
+    /// documents this hazard against its own provenance line; the row inherits
+    /// it, and the field count is what proves the sanitiser is actually on the
+    /// path a published row takes.
+    #[test]
+    fn a_hostile_owner_cannot_forge_a_field_in_the_row() {
+        let holder = onnx_runtime_hostmon::hostlock::parse_meta(
+            "owner=gaff host_lock=free host=CLEAN\nanchor_pid=1\nstart_time=1\n",
+        )
+        .expect("owner is present");
+        let state = onnx_runtime_hostmon::hostlock::LockState::Held(holder);
+        let lock = onnx_runtime_hostmon::hostlock::field(&state, &state, Some("gaff"));
+        let cell = host_fields(&reading(60.0, true), &lock);
+        assert_eq!(
+            cell.matches("host_lock=").count(),
+            1,
+            "an owner must not be able to splice a second lock field into a row: {cell}"
+        );
+        assert_eq!(
+            cell.matches("host=").count(),
+            1,
+            "...nor a second verdict: {cell}"
+        );
+        assert!(
+            cell.contains("host=CONTENDED"),
+            "the real verdict must win: {cell}"
         );
     }
 }

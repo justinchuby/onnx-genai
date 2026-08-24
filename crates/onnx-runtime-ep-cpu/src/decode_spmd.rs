@@ -195,6 +195,18 @@ thread_local! {
     /// is what makes "slow is not the same as broken" an actual assertion.
     static DELAY_WORKER_BEFORE_READY_MS: Cell<u64> = const { Cell::new(0) };
 
+    /// Test injection of a *contended* yield, in microseconds; `0` means "yield
+    /// normally". The readiness backstop's stride defect is invisible when
+    /// yields are cheap: an uncontended `yield_now` costs ~1.2us, so a stride of
+    /// 64 moves the deadline by ~78us and no assertion against a millisecond
+    /// deadline can see it. The production measurement that found it recorded
+    /// ~7ms per yield on a contended pair of CPUs -- three orders of magnitude
+    /// larger -- which is what turns the stride into a 3x deadline overrun.
+    /// Manufacturing real contention in a unit test is exactly the kind of
+    /// load-dependent arrangement that flakes; injecting the yield *cost* makes
+    /// the same regime deterministic.
+    static SLOW_YIELD_US: Cell<u64> = const { Cell::new(0) };
+
     /// Test override for [`WORKER_PROFILE_ENV`]: `Some(v)` forces the per-worker
     /// timing gate to `v` for pools built on this thread. Thread-scoped for the
     /// same reason as the knobs above, and additionally because the alternative
@@ -1400,6 +1412,13 @@ impl SpmdDecodePools {
                 std::hint::spin_loop();
             } else {
                 thread::yield_now();
+                #[cfg(test)]
+                {
+                    let slow = SLOW_YIELD_US.with(Cell::get);
+                    if slow != 0 {
+                        thread::sleep(Duration::from_micros(slow));
+                    }
+                }
                 // Check the clock on *every* yield, not on a stride. The stride
                 // is right for the spin phase, where an iteration costs
                 // nanoseconds and `Instant::now()` would dominate; it is wrong
@@ -1599,8 +1618,16 @@ impl SpmdDecodePools {
 
     /// Record the calling thread's current CPU as the dispatcher's placement,
     /// and count the sample as a change if it moved since the last one.
+    ///
+    /// Inert under Miri. Miri has no `sched_getcpu` shim, and the module's
+    /// panic-safety test dispatches on a real pool under it, so an
+    /// unconditional call aborts that test with an unsupported-operation
+    /// error. Nothing is lost: a CPU-placement sample is meaningless under an
+    /// interpreter that does not model CPUs, and the thing Miri is here to
+    /// check -- that the unsafe blocks around it are sound -- is unaffected by
+    /// not taking the sample.
     fn sample_dispatcher_cpu(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(miri)))]
         {
             // SAFETY: `sched_getcpu` takes no arguments and only reads the
             // calling thread's current CPU.
@@ -1841,6 +1868,13 @@ impl SpmdDecodePools {
             if recorded {
                 self.sample_dispatcher_cpu();
             }
+            return;
+        }
+        // Miri has no `sched_setaffinity` shim either, and a pin is not a
+        // property Miri can check. Refuse rather than abort, so that setting
+        // the knob in a Miri environment degrades to "not pinned" instead of
+        // failing an unrelated test.
+        if cfg!(miri) {
             return;
         }
         match crate::decode_affinity::pin_current_thread_to_cpu(cpu) {
@@ -3417,15 +3451,21 @@ fn reserve_split_headroom(shards: &mut [NodeShard]) {
 /// stable per-thread id. Linux only in practice: this exists so a harness can
 /// find the dispatcher's `/proc/self/task/<tid>` entry, which has no
 /// counterpart elsewhere.
+///
+/// `None` under Miri as well, for the same reason
+/// [`SpmdDecodePools::sample_dispatcher_cpu`] is inert there: there is no
+/// `/proc` to look the id up in, so recording one buys nothing and calling the
+/// shim risks an unsupported-operation abort in a test that is running for a
+/// different reason entirely.
 fn current_thread_os_id() -> Option<i64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(miri)))]
     {
         // SAFETY: `gettid` takes no arguments, cannot fail, and returns the
         // calling thread's kernel id.
         let tid = unsafe { libc::gettid() };
         (tid > 0).then_some(i64::from(tid))
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(all(target_os = "linux", not(miri))))]
     {
         None
     }
@@ -3898,8 +3938,12 @@ mod tests {
              worker doubles up on an SMT sibling: {ordered:?}"
         );
 
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping sibling-doubling check: {reason}");
+                return;
+            }
         };
         for shard in node_shards(4) {
             if shard.cpus.is_empty() {
@@ -4329,7 +4373,14 @@ mod tests {
         // must land on *distinct physical cores*, so the first workers never
         // share a front end. Dropping the spread from this arm fails here on
         // any host with core topology.
-        if let Some(cores) = crate::core_topology::host() {
+        let detected = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => Some(cores),
+            Err(reason) => {
+                eprintln!("skipping planned-affinity spread check: {reason}");
+                None
+            }
+        };
+        if let Some(cores) = detected {
             let core_count = cores.leaders_within(&planned).len();
             let mut seen_cores = std::collections::BTreeSet::new();
             for &cpu in &shards[0].cpus[..core_count] {
@@ -4859,6 +4910,98 @@ mod tests {
         pools.shutdown();
     }
 
+    /// The backstop must fire *within* its deadline, not a stride of yields
+    /// later.
+    ///
+    /// This is the assertion #1825 and #1868 were both missing. Both fixed a
+    /// deadline that was evaluated on a `spins.is_multiple_of(64)` stride in a
+    /// *yield* phase that began at `SPIN_LOOP_BUDGET` -- itself a multiple of
+    /// 64 -- so the clock was read once, on the first yield, and then not for
+    /// 64 more. Reverting either fix leaves the whole crate green, so nothing
+    /// stops a third reintroduction.
+    ///
+    /// The observable here is deliberately *binary* rather than a duration.
+    /// Overshoot bounds are the natural way to test a granularity defect and
+    /// they are flaky by construction: the margin that makes them stable on a
+    /// loaded runner is wider than the defect. Choosing a deadline the pool is
+    /// guaranteed to exceed converts the same defect into panic-versus-success
+    /// -- with the stride, the deadline is consulted once while it is still
+    /// unexpired and the build reports success having blown its budget 3x,
+    /// which is exactly the measurement recorded at the production site. Load
+    /// can only make the injected delay longer, so this cannot flake toward a
+    /// false failure.
+    #[test]
+    fn the_readiness_backstop_fires_within_its_deadline_not_a_stride_later() {
+        assert_eq!(
+            FAIL_WORKER_BEFORE_READY.with(Cell::get),
+            usize::MAX,
+            "no fault may be injected; the workers here are slow, not broken"
+        );
+        // Sized so the two behaviours are separated by a wide margin rather
+        // than a granularity: the deadline expires on the yield path at
+        // ~DEADLINE_MS, while a stride of 64 injected yields would not consult
+        // it again until 64 * SLOW_US = 1280ms -- long after the workers
+        // announce at DELAY_MS and the loop has already exited. Fires-late
+        // becomes never-fires, which is an outcome rather than a duration.
+        //
+        // The 8x gap between when the barrier should give up (~100ms) and when
+        // it would be let off the hook (800ms) is deliberate headroom for a
+        // loaded runner: this test may only fail because the deadline was not
+        // consulted, never because the builder thread was descheduled.
+        const DELAY_MS: u64 = 800;
+        const DEADLINE_MS: u64 = 100;
+        const SLOW_US: u64 = 20_000;
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
+        SLOW_YIELD_US.with(|slot| slot.set(SLOW_US));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(|| {
+            SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 2,
+                }],
+                DecodeSchedule::Fixed,
+                false,
+            )
+        });
+        let elapsed = started.elapsed();
+
+        std::panic::set_hook(previous);
+        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
+        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+        SLOW_YIELD_US.with(|slot| slot.set(0));
+
+        let panic = outcome.err().unwrap_or_else(|| {
+            panic!(
+                "the pool exceeded its {DEADLINE_MS}ms deadline by design and the \
+                 barrier reported success after {elapsed:?}: the deadline was \
+                 consulted once, before it expired, and never again"
+            )
+        });
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("never became ready"),
+            "the build must say why it gave up, got: {message}"
+        );
+        // Pins the granularity itself: the barrier may overrun its deadline by
+        // the cost of one yield, never by the injected delay that a strided
+        // check would have slept through.
+        assert!(
+            elapsed < Duration::from_millis(DELAY_MS),
+            "the barrier gave up only after {elapsed:?}, past the {DELAY_MS}ms \
+             delay it was supposed to abandon at {DEADLINE_MS}ms"
+        );
+    }
+
     /// A pool that reports its width honestly must also *place* honestly.
     ///
     /// #1792's lesson: `decode_width()` said `realized=16 as_requested` while
@@ -4866,16 +5009,25 @@ mod tests {
     /// never the thing that was wrong. This asserts the half that was missing.
     #[test]
     fn a_pinned_pool_places_one_worker_per_physical_core() {
-        let cpus: Vec<usize> = match crate::core_topology::host() {
-            // Two full physical cores' worth of CPUs, spread the way the
-            // placement policy spreads them.
-            Some(cores) if cores.core_count() >= 2 => crate::decode_affinity::order_pin_targets(
-                &(0..cores.logical_count()).collect::<Vec<_>>(),
-                Some(cores),
-            ),
-            _ => return,
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping pinned-pool placement check: {reason}");
+                return;
+            }
         };
-        let cores = crate::core_topology::host().expect("checked above");
+        // A single-core budget cannot express "one worker per core" as a
+        // distinguishable claim. That is a host fact and a legitimate skip;
+        // an unanswerable topology is not, and panics above.
+        if cores.core_count() < 2 {
+            return;
+        }
+        // Two full physical cores' worth of CPUs, spread the way the placement
+        // policy spreads them.
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+            &(0..cores.logical_count()).collect::<Vec<_>>(),
+            Some(cores),
+        );
         let workers = cores.core_count().min(4);
         if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
             return;
@@ -4906,8 +5058,16 @@ mod tests {
     /// The same predicate must be able to say *no*, or it is decoration.
     #[test]
     fn placement_reports_a_shared_core_as_a_defect() {
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        // Fails closed. Under the mutation battery this test -- the negative
+        // control, the one whose whole job is to prove the detector detects --
+        // passed vacuously with detection forced to `None`. A control that
+        // survives the removal of the thing it controls for is not a control.
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping shared-core control: {reason}");
+                return;
+            }
         };
         // Find one physical core with at least two siblings, and pin two
         // workers onto it -- exactly the layout #1729 removed.
@@ -4935,6 +5095,213 @@ mod tests {
         pools.shutdown();
     }
 
+    /// Read the calling *thread's* actual affinity mask from `/proc`.
+    ///
+    /// `/proc/thread-self` is the calling thread's own task directory -- i.e.
+    /// `/proc/self/task/<tid>` -- so this is per-TID kernel state, not the
+    /// process-wide mask in `/proc/self/status`. The distinction is the whole
+    /// point of this control and is asserted below rather than assumed.
+    #[cfg(target_os = "linux")]
+    fn actual_mask_of_calling_thread() -> Option<(String, Vec<usize>)> {
+        let tid = std::fs::read_link("/proc/thread-self")
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        let status = std::fs::read_to_string("/proc/thread-self/status").ok()?;
+        let list = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+        Some((tid, onnx_runtime_hostmon::parse_cpu_list(list)?))
+    }
+
+    /// Pin one real thread per CPU and return what the kernel says each one is
+    /// actually confined to.
+    #[cfg(target_os = "linux")]
+    fn actual_masks_of_threads_pinned_to(cpus: &[usize]) -> Option<Vec<(String, Vec<usize>)>> {
+        let handles: Vec<_> = cpus
+            .iter()
+            .map(|&cpu| {
+                thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).ok()?;
+                    actual_mask_of_calling_thread()
+                })
+            })
+            .collect();
+        let mut observed = Vec::with_capacity(cpus.len());
+        for handle in handles {
+            observed.push(handle.join().ok()??);
+        }
+        Some(observed)
+    }
+
+    /// The distinct-physical-core predicate, evaluated over masks the kernel
+    /// reports rather than over what a pool claims. Mirrors
+    /// `placement_is_one_worker_per_physical_core`, which reads `worker_cpus`.
+    #[cfg(target_os = "linux")]
+    fn distinct_cores_from_actual_masks(
+        masks: &[(String, Vec<usize>)],
+        cores: &crate::core_topology::CoreTopology,
+    ) -> Option<bool> {
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, mask) in masks {
+            // A pinned thread is confined to exactly one CPU. Anything wider
+            // means the pin did not take, and the question is unanswerable.
+            let [cpu] = mask.as_slice() else {
+                return None;
+            };
+            let core: Vec<usize> = cores
+                .siblings_of(*cpu)
+                .map_or_else(|| vec![*cpu], <[usize]>::to_vec);
+            if !seen.insert(core) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Negative control against **actual TID masks**, not reported ones.
+    ///
+    /// `placement_reports_a_shared_core_as_a_defect` above builds a pool and
+    /// asks it about `worker_cpus` -- the pool's own claim. That is the exact
+    /// quantity #1792 showed can be wrong: the EP printed
+    /// `requested=16 realized=16 as_requested` while running 16 workers on 8
+    /// physical cores, because the count was honest and placement was never
+    /// reported at all. A control built on the claim cannot catch a wrong claim.
+    ///
+    /// This one pins real threads and reads what the kernel says about each
+    /// TID, then runs the same distinct-core predicate over that. Both arms are
+    /// present deliberately: the shared-core arm must report a defect, and the
+    /// distinct-core arm must not, so a predicate that simply always answers
+    /// `Some(false)` fails here rather than looking like a working detector.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn actual_thread_masks_sharing_one_core_are_reported_as_a_defect() {
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping actual-mask control: {reason}");
+                return;
+            }
+        };
+
+        // Pick the sibling pair out of the CPUs this process may actually run
+        // on. Taking `cores()[0]` blindly picks CPUs the host has but a
+        // `taskset`ed or containerised runner cannot use, `environment_can_pin`
+        // then refuses, and the control skips -- on the *most common* way this
+        // suite is run. A skip that is invisible and environment-triggered is
+        // the same fail-open shape this change exists to remove.
+        let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
+            .unwrap_or_else(|| (0..cores.logical_count()).collect())
+            .into_iter()
+            .collect();
+        let shared = cores.cores().iter().find_map(|group| {
+            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
+            match (inside.next(), inside.next()) {
+                (Some(first), Some(second)) => Some([first, second]),
+                _ => None,
+            }
+        });
+        let Some(shared) = shared else {
+            eprintln!(
+                "skipping actual-mask control: no physical core has two SMT siblings inside \
+                 this process's allowed set {allowed:?}, so the bad layout is unrepresentable \
+                 here"
+            );
+            return;
+        };
+        if !environment_can_pin(&shared) {
+            eprintln!(
+                "skipping actual-mask control: this environment refuses to pin to {shared:?}"
+            );
+            return;
+        }
+
+        let observed = match actual_masks_of_threads_pinned_to(&shared) {
+            Some(observed) => observed,
+            // A refused pin is an environment fact, not a defect. It cannot be
+            // silently tolerated further down, because an unpinned thread has a
+            // wide mask and would answer `None`, so state it here.
+            None => {
+                eprintln!("skipping actual-mask control: threads could not be pinned");
+                return;
+            }
+        };
+
+        // This must be per-thread state. If `/proc/thread-self` were resolving
+        // to process-wide data, every mask would equal the process mask and the
+        // control would be measuring nothing -- the same "reading the wrong
+        // thing" failure the control exists to catch, one level down.
+        let process_mask = crate::decode_affinity::allowed_cpus().unwrap_or_default();
+        for (tid, mask) in &observed {
+            assert_eq!(
+                mask.len(),
+                1,
+                "thread {tid} was pinned to a single CPU but the kernel reports mask {mask:?}"
+            );
+            assert_ne!(
+                mask, &process_mask,
+                "thread {tid} reports the process-wide mask, so this control is reading \
+                 `/proc/self/status`-equivalent data and is not a per-TID check at all"
+            );
+        }
+
+        assert_eq!(
+            distinct_cores_from_actual_masks(&observed, cores),
+            Some(false),
+            "threads whose kernel-reported masks are {observed:?} occupy the SMT siblings \
+             of one physical core, and the placement predicate must call that a defect"
+        );
+
+        // Positive arm: two genuinely distinct cores must not be reported as a
+        // defect, otherwise the assertion above is satisfied by a predicate
+        // that is simply always false.
+        let distinct: Vec<usize> = cores
+            .cores()
+            .iter()
+            .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
+            .take(2)
+            .collect();
+        if distinct.len() < 2 || !environment_can_pin(&distinct) {
+            eprintln!(
+                "skipping the positive arm of the actual-mask control: two distinct physical \
+                 cores are not pinnable inside {allowed:?}"
+            );
+            return;
+        }
+        let Some(observed) = actual_masks_of_threads_pinned_to(&distinct) else {
+            eprintln!(
+                "skipping the positive arm of the actual-mask control: threads could not be \
+                 pinned to {distinct:?}"
+            );
+            return;
+        };
+        assert_eq!(
+            distinct_cores_from_actual_masks(&observed, cores),
+            Some(true),
+            "threads on distinct physical cores {distinct:?} were reported as sharing \
+             one, so the predicate answers `false` regardless of input and the negative \
+             arm above proves nothing"
+        );
+
+        // Say what was actually checked. Under `--nocapture` -- or in the
+        // captured output libtest replays for a *failing* test -- every exit
+        // from this test is either this line or an explicit skip line, so a run
+        // with neither did not execute.
+        //
+        // Under CI's default capture a passing test prints nothing either way,
+        // so this does **not** distinguish "ran" from "skipped" in a green CI
+        // log. Nothing can: the only capture-proof anti-vacuity signal is a
+        // failure, which is why the *topology* branch panics instead of
+        // printing. The two skips left here are genuinely environmental -- no
+        // SMT sibling inside the allowed set, or a sandbox that refuses
+        // `sched_setaffinity` -- and are stated rather than silent so they are
+        // recoverable from a local `--nocapture` run.
+        eprintln!(
+            "actual-mask control ran: shared-core arm on {shared:?}, distinct-core arm on \
+             {distinct:?}"
+        );
+    }
+
     /// A pool that pinned only half its workers has not placed one worker per
     /// core, and must not be scored on the half it did pin.
     ///
@@ -4943,8 +5310,12 @@ mod tests {
     /// count honest, placement unexamined, the exact shape of #1729.
     #[test]
     fn a_partially_pinned_pool_is_not_scored_on_its_pinned_half() {
-        let Some(cores) = crate::core_topology::host() else {
-            return;
+        let cores = match crate::core_topology::require_host_for_placement() {
+            Ok(cores) => cores,
+            Err(reason) => {
+                eprintln!("skipping partial-pin scoring check: {reason}");
+                return;
+            }
         };
         if cores.core_count() < 2 {
             return;

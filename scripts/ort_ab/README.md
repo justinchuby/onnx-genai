@@ -238,6 +238,40 @@ leave that requires a human with `rm -rf`. If you want to see it before
 trusting it: `hostlock.sh status` distinguishes FREE / HELD / STALE /
 EXPIRED, and `provenance` prints who holds it and since when.
 
+### Where the lock lives
+
+`/tmp/onnx-genai-hostlock`, and **everyone on the box must resolve the same
+path** or the lock coordinates nothing. If your host cannot use `/tmp` (it is
+unwritable, `noexec`, or per-service under systemd `PrivateTmp=`), move it with
+a machine-local config, which every invocation by every agent reads:
+
+```sh
+mkdir -p ~/.config/onnx-genai
+echo 'lock_dir=/var/lib/onnx-genai/hostlock' > ~/.config/onnx-genai/hostlock.conf
+```
+
+`$HOSTLOCK_DIR` also moves the path and is **not** the same thing: it is set per
+process, so it does not move your peers with you. It is a **private** lock. It
+acquires instantly every time, collides with nobody, and — before this was
+fixed — reported `FREE` in bytes identical to a genuinely free shared host
+while a peer held the real one. Every invocation now says so on stderr unless
+`HOSTLOCK_PRIVATE_OK=1` acknowledges it, and `status --porcelain` and
+`provenance` carry `lock_dir=` / `lock_scope=` / `lock_dir_source=` into the
+row, so a recorded measurement says which lock its `declared=yes` is a claim
+about. Use it for tests, not for measurements you intend to publish.
+
+While a config is in effect, `acquire` and `run` also consult the old `/tmp`
+path **read-only** and refuse (exit 2) while a live holder is there: a peer who
+has not re-read the config cannot see the new lock, and taking it would put two
+benchmarks on the box. That consult never reaps or writes the old path — it is
+liveness-checked by pid **and** start time, so a crashed holder or a recycled
+pid does not block the migration.
+
+The Rust reader (`onnx_runtime_hostmon::hostlock`) resolves the path by the
+same rule, and `tests/agrees_with_hostlock_sh.rs` holds both sides to it. A
+reader that looked somewhere else would report `free` on a declared host,
+convincingly, forever.
+
 The lock and the gate decide whether to **start**. They cannot tell you
 afterwards whether the numbers are any good, because they sample instants: a
 gate sampled either side of a 2 s arm reported "runnable 2-4, clean" for runs
@@ -268,6 +302,45 @@ Gate on that runnable count (`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`), not
 on the 1-minute load average: `loadavg` is an exponential moving average, so it
 stays high for a minute after a heavy run has ended and reads low while a burst
 is still in flight. It misleads in both directions.
+
+The Rust benchmarks read the lock and put the answer in the row. `bench_generic`
+and the `decode_gap_park_ab` matrix emit a `host_lock=` field covering the
+**whole measured window** -- read before the first run and again after the last,
+so a run that changed hands halfway through prints `changed` rather than naming
+whichever holder happened to be there at the end:
+
+| value | meaning |
+|---|---|
+| `mine:<owner>` | held throughout by a live anchor matching `HOSTLOCK_OWNER` -- the only value that certifies the row |
+| `foreign:<owner>` / `held:<owner>` | held by someone else, or by an owner that cannot be attributed because `HOSTLOCK_OWNER` was unset |
+| `unverified:<owner>` / `stale:<owner>` | held by an anchor whose liveness is unprovable, or provably gone |
+| `changed` | the window spans a change of custody; no single holder describes it |
+| `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
+
+`run --owner leon -- ...` is enough: since #1929 `run` exports the declared
+owner into the wrapped command, so the obvious invocation is also the one that
+certifies. Before that fix the flag was only a shell variable, the child
+inherited nothing, and every row of an otherwise correctly locked matrix read
+`held:leon` instead of `mine:leon` -- honest, but not certifying. Setting
+`HOSTLOCK_OWNER=leon` in the environment still works and is equivalent, since
+`--owner` defaults to it.
+
+The export is deliberately **not** applied to an owner the script defaulted
+from `$USER`. Every agent on this host runs as the same unix user, so a
+`$USER`-derived owner cannot distinguish one declaration from another --
+exporting it would make every agent's lock read `mine:` to every other agent,
+which is the one direction this field exists to prevent. So the lock file still
+records that defaulted owner (it is the best available answer to "who?"), but
+nothing downstream is told to treat it as *its own*: an undeclared run reports
+`held:` and says so. Declaring an owner is what makes a row attributable.
+
+This is orthogonal to the `foreign_%` / `sib_%` columns beside it and does not
+replace them: those measure what the host *did*, `host_lock` records what
+somebody *said they were doing*. Contention sampling reads instants and can
+miss a co-tenant that starts and finishes between two snapshots; a declaration
+covers the whole window but proves nothing about load. An unlocked run on a
+genuinely idle box is fine, and a locked run beside somebody's unannounced
+`cargo test` is not.
 
 The lock is advisory. It cannot stop anyone from using the cores and does not
 try to; it makes "is somebody benchmarking right now, and who?" cheap enough to

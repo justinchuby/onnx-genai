@@ -11,6 +11,7 @@ pipeline:
       - loop_induction_values
       - serving_service_contract
       - bounded_state_recurrence
+      - session_state_lease
     inputs:
       request.input_ids:
         contract:
@@ -1188,6 +1189,31 @@ pipeline:
         service_group: decoder_cache
         management: runtime
         release_boundary: invocation
+      conversation:
+        contract:
+          dtype: int64
+          rank: 2
+          shape:
+          - batch
+          - conversation_length
+          batch_layout:
+            kind: request_aligned
+            axis: 0
+        class: semantic
+        scope: session
+        initializer: request.input_ids
+        recurrence:
+          kind: bounded
+          axis: 1
+          max: package.max_context
+        management: runtime
+        release_boundary: session
+        session:
+          policy: exclusive
+          continuation:
+            kind: prompt_prefix
+            prompt_input: request.input_ids
+            tokens_output: tokens
     serving:
       active: active
       done: done

@@ -4808,7 +4808,7 @@ mod tests {
         let _env = EnvVarGuard::without_var(CONST_CAST_FOLD_DISABLE_ENV);
         // f32 → bf16 narrowing must match the kernel's round-to-nearest-even
         // (`half::bf16::from_f32`).
-        let values = [0.0f32, 1.0, 1.5, -2.75, 3.141_592_7, 65_504.0];
+        let values = [0.0f32, 1.0, 1.5, -2.75, std::f32::consts::PI, 65_504.0];
         let mut bytes = Vec::new();
         for v in values {
             bytes.extend_from_slice(&v.to_le_bytes());

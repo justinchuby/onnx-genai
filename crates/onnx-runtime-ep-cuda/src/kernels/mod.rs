@@ -45,6 +45,7 @@ pub(crate) mod device_argmax;
 pub(crate) mod device_token_writer;
 pub mod dropout;
 pub mod elementwise;
+pub mod expert_route_telemetry;
 mod flash_attention;
 pub mod fused_gelu;
 pub mod fused_gemm;
@@ -71,6 +72,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod mod_op;
 pub mod movement;
+pub mod multi_head_attention;
 pub mod nary;
 pub mod nonzero;
 pub mod normalization;
@@ -207,6 +209,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Max",
     "Attention",
     "GroupQueryAttention",
+    "MultiHeadAttention",
     "RotaryEmbedding",
     "Softmax",
     "LayerNormalization",
@@ -491,10 +494,15 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("GatherBlockQuantized", _) => CUDA_GATHER_QUANT_DTYPES,
 
         // Attention family: f16/bf16 Q/K/V + Int32 seqlens.
+        // `PackedMultiHeadAttention` is deliberately absent — see the non-gap
+        // note in `docs/execution/CUDA_COVERAGE.md`. It had an arm here while
+        // having no factory and no `CUDA_COVERED_OPS` entry, which is the
+        // five-place registration contract half-wired: harmless today because
+        // this function is only reached for ops the EP actually claims, but it
+        // would let a future kernel look more registered than it is.
         ("Attention", _)
         | ("GroupQueryAttention", _)
         | ("MultiHeadAttention", _)
-        | ("PackedMultiHeadAttention", _)
         | ("PackedVarlenAttention", _)
         | ("VarlenAttention", _)
         | ("CompressedSparseAttention", _)
@@ -1294,6 +1302,12 @@ pub fn build_cuda_registry_with_metrics(
             runtime: runtime.clone(),
         }),
     );
+    reg.register(
+        OpKey::new("MultiHeadAttention", "com.microsoft", 1),
+        Box::new(multi_head_attention::MultiHeadAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
 
     // ── CUDA Wave 2 — transformer-critical ops (see docs/execution/CUDA_COVERAGE.md) ──
 
@@ -1620,7 +1634,82 @@ pub fn build_cuda_registry_with_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::CUDA_COVERED_OPS;
+    use super::{CUDA_COVERED_OPS, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op};
+
+    /// Every operator the CPU EP registers but CUDA does not must be named in
+    /// the coverage document.
+    ///
+    /// This is a **set** check, not a count check, for the reason recorded in
+    /// #1923: a count detects that a number changed, and nothing else. It does
+    /// not detect a rename, and — the failure that produced this test — it does
+    /// not detect a *new* gap arriving while some other number happens to stay
+    /// plausible. `ai.onnx::DFT` sat in exactly that blind spot: registered on
+    /// CPU, absent from CUDA, mentioned nowhere in the document, while the
+    /// document simultaneously asserted "the 2 remaining CPU `ai.onnx` gaps are
+    /// `NonMaxSuppression` and `Unique`". Both the omission and the false claim
+    /// survived because the numbers beside them were hand-maintained prose.
+    ///
+    /// A gap is allowed to exist. What is not allowed is a gap nobody wrote
+    /// down, because that is indistinguishable from an oversight and gets
+    /// rediscovered by whoever next audits the registries.
+    ///
+    /// Two ways this could pass while proving nothing, both closed below:
+    ///
+    /// * **A bare substring match.** `DOC.contains("Pad")` is satisfied 32 times
+    ///   over by the word "padding", so a future gap with a short or common name
+    ///   would be waved through. The match is therefore delimited: the name must
+    ///   appear as `` `Name` `` or `` `domain::Name` ``, which is how this
+    ///   document writes operators.
+    /// * **An empty registry.** If `build_cpu_registry` ever returned nothing,
+    ///   the difference would be empty and this test would go green having
+    ///   checked nothing. A floor guards that.
+    ///
+    /// Deliberately GPU-free: it reads `CUDA_COVERED_OPS`, which is a const, and
+    /// builds only the CPU registry, so it runs on every lane rather than the
+    /// CUDA ones alone. Note the limit of that choice — no test anywhere
+    /// compares `CUDA_COVERED_OPS` against the real factory table built by
+    /// `build_cuda_registry`, so if the const ever *overstated* coverage, this
+    /// test would treat the named op as covered and never demand it be
+    /// documented. Closing that needs a GPU-lane test and is left for one.
+    #[test]
+    fn every_cpu_only_op_is_named_in_the_coverage_doc() {
+        const DOC: &str = include_str!("../../../../docs/execution/CUDA_COVERAGE.md");
+        // The CPU EP registers well over a hundred operators; anything near zero
+        // means the registry failed to build rather than that the gap closed.
+        const MIN_PLAUSIBLE_CPU_OPS: usize = 100;
+
+        let cpu_registry = onnx_runtime_ep_cpu::kernels::build_cpu_registry();
+        let mut cpu_ops: Vec<String> = cpu_registry.keys().map(|key| key.op_type.clone()).collect();
+        cpu_ops.sort();
+        cpu_ops.dedup();
+        assert!(
+            cpu_ops.len() >= MIN_PLAUSIBLE_CPU_OPS,
+            "CPU registry has only {} operators, which means it failed to build: \
+             this test would otherwise pass by comparing an empty set",
+            cpu_ops.len()
+        );
+
+        // Delimited, not substring: this document writes operators as `Name` or
+        // `domain::Name`, and a bare `contains` would let "Pad" be satisfied by
+        // "padding".
+        let documented =
+            |op: &str| DOC.contains(&format!("`{op}`")) || DOC.contains(&format!("::{op}`"));
+
+        let undocumented: Vec<&String> = cpu_ops
+            .iter()
+            .filter(|op| !CUDA_COVERED_OPS.contains(&op.as_str()))
+            .filter(|op| !documented(op))
+            .collect();
+
+        assert!(
+            undocumented.is_empty(),
+            "these operators are registered on CPU, absent from CUDA, and named \
+             nowhere in docs/execution/CUDA_COVERAGE.md: {undocumented:?}\n\
+             Either implement them on CUDA, or document why the gap is deliberate \
+             (see the MoE and PackedMultiHeadAttention entries for the shape of \
+             that write-up). A gap is fine; an undocumented one is not."
+        );
+    }
 
     #[test]
     fn wave2_ops_are_listed_in_coverage() {
@@ -1683,6 +1772,87 @@ mod tests {
             CUDA_COVERED_OPS.len(),
             unique_ops.len(),
             "CUDA_COVERED_OPS contains duplicate entries"
+        );
+    }
+
+    /// `com.microsoft::PackedMultiHeadAttention` is a *documented non-gap*, not
+    /// an oversight — this test pins that decision so nobody re-opens it.
+    ///
+    /// Upstream emits it only from ORT's **opt-in packing-mode conversion**
+    /// (`python/tools/transformers/convert_to_packing_mode.py`), a separate
+    /// tool a user runs deliberately — not part of default graph optimization,
+    /// so it cannot arrive through ordinary export. It never appears on the
+    /// decoder-only LLM path this project targets (which uses `Attention` /
+    /// `MultiHeadAttention` / `GroupQueryAttention`, plus the runtime-invented
+    /// `pkg.nxrt::PackedVarlenAttention` for packed sequences). The real
+    /// Qwen3.5-0.8B hybrid decode graph places on CUDA with zero declines, and
+    /// the only producer anywhere in the repo is a synthetic CPU-EP fixture.
+    /// See the non-gap write-up in `docs/execution/CUDA_COVERAGE.md`, which
+    /// records the exact condition that would flip this decision.
+    ///
+    /// This checks both halves of the registration state, because half-wiring
+    /// is the failure this file is prone to: an op present in one of the five
+    /// registration places and absent from the others is silently declined at
+    /// runtime rather than reported.
+    ///
+    /// If a real target model ever emits this op, implement it as an adapter
+    /// over the packed varlen SDPA core (`packed_varlen_attention.rs`), add it
+    /// to the five-place registration contract, and delete this test.
+    #[test]
+    fn packed_multi_head_attention_is_a_documented_non_gap() {
+        assert!(
+            !CUDA_COVERED_OPS.contains(&"PackedMultiHeadAttention"),
+            "PackedMultiHeadAttention was added to CUDA_COVERED_OPS: if this is a \
+             real implementation, remove this non-gap test and update \
+             docs/execution/CUDA_COVERAGE.md; if it is accidental, revert it"
+        );
+        assert_eq!(
+            cuda_supported_dtypes_for_op("PackedMultiHeadAttention", "com.microsoft"),
+            CUDA_FLOAT_DTYPES,
+            "PackedMultiHeadAttention gained an attention-family dtype arm without a \
+             kernel: that is the registration contract half-wired, and it makes an \
+             unregistered op look registered"
+        );
+    }
+
+    /// `ai.onnx::DFT` (opset 17) is a *documented non-gap*, not an oversight —
+    /// this test pins that decision so nobody re-opens it.
+    ///
+    /// No in-scope CUDA target model computes a Fourier transform inside its
+    /// graph. Whisper does its STFT / log-mel feature extraction on the **host**
+    /// (`crates/onnx-genai-preprocess/src/audio.rs`, `rustfft`) and feeds the
+    /// model a precomputed `[1, n_mels, n_frames]` tensor, so no `DFT`/`STFT`
+    /// node ever reaches the EP. The only in-graph `DFT` producer in the repo is
+    /// the CPU-EP Perch bioacoustics model (`tests/perch_dft.rs`), which is not a
+    /// CUDA decode target. `DFT` also has a complete CPU kernel in both this repo
+    /// (`onnx-runtime-ep-cpu/src/kernels/dft.rs`) and upstream ORT (which ships
+    /// **no** CUDA DFT kernel — ORT issue #21164), so a CUDA decline degrades to
+    /// an always-present CPU DFT rather than failing. See the non-gap write-up in
+    /// `docs/execution/CUDA_COVERAGE.md`, which records the exact condition that
+    /// would flip this decision.
+    ///
+    /// This checks both halves of the registration state, because half-wiring is
+    /// the failure this file is prone to: an op present in one of the five
+    /// registration places and absent from the others is silently declined at
+    /// runtime rather than reported.
+    ///
+    /// If an in-scope model ever emits `DFT` in-graph on a CUDA-placed workload,
+    /// implement a cuFFT-backed kernel mirroring `dft.rs`'s parameter surface,
+    /// wire it through the five-place registration contract, and delete this test.
+    #[test]
+    fn dft_is_a_documented_non_gap() {
+        assert!(
+            !CUDA_COVERED_OPS.contains(&"DFT"),
+            "DFT was added to CUDA_COVERED_OPS: if this is a real implementation, \
+             remove this non-gap test and update docs/execution/CUDA_COVERAGE.md; \
+             if it is accidental, revert it"
+        );
+        assert_eq!(
+            cuda_supported_dtypes_for_op("DFT", ""),
+            CUDA_FLOAT_DTYPES,
+            "DFT gained a dedicated dtype arm without a kernel: that is the \
+             registration contract half-wired, and it makes an unregistered op \
+             look registered"
         );
     }
 

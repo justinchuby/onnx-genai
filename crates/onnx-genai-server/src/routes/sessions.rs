@@ -16,7 +16,7 @@ pub(crate) async fn create_session(
         .engine
         .create_session()
         .await
-        .map_err(|err| ApiError::internal(format!("session create failed: {err}")))?;
+        .map_err(session_create_failure)?;
 
     let evicted = state
         .sessions

@@ -524,6 +524,7 @@ fn linear_attention_state_carry_matches_chained() {
             dtype: t.dtype,
             shape: vec![t.shape[0], len, per],
             bytes,
+            absent: false,
         }
     };
 
@@ -561,6 +562,7 @@ fn linear_attention_state_carry_matches_chained() {
             dtype,
             shape: vec![batch, heads, d_k, d_v],
             bytes: first[1].clone(),
+            absent: false,
         });
         v.push(slice_seq(&full_inputs[4], split_at, 6 - split_at));
         v.push(slice_seq(&full_inputs[5], split_at, 6 - split_at));

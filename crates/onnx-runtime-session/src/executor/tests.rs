@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use onnx_runtime_ep_api::{
     CaptureSupport, Cost, EpConfig, EpError, ExecutionProviderCapabilities, Fence, Kernel,
@@ -264,6 +264,70 @@ fn device_validation_reset_failure_is_not_ignored_after_a_run() {
     );
     assert_eq!(ep.executions.load(Ordering::Relaxed), 1);
     assert_eq!(ep.resets.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn a_late_lazy_gate_initialisation_cannot_revert_a_forced_gate() {
+    // Regression test for an intermittent failure of
+    // `activation_memory_planner_reports_static_decode_graph_savings` on
+    // `Rust coverage (Windows x86_64)`: it forced the planner gate on, and the
+    // run that followed published no stats, so the `expect` on them panicked.
+    //
+    // The third writer is the cause. `globals_lock` serialises the *tests* that
+    // force these gates, but `activation_plan_enabled` also writes, from any
+    // thread, without the lock - `run.rs` consults it on every executor run, so
+    // under the parallel runner a sibling test is a writer too. Its
+    // load / read-env / store is not atomic, so with an unconditional `store`
+    // its answer could land after a forced value and revert it.
+    //
+    // Driven through the real gate and the real publish path rather than a
+    // copy, so the test cannot pass against a seam that has drifted from the
+    // code it stands in for.
+    let _globals = phase_profile::globals_lock();
+
+    // The interleaving that failed: a reader entered the initialiser, was
+    // descheduled while reading the environment, and published `off` after the
+    // force. Both env answers, because the defect is in publishing at all.
+    for env_says in [false, true] {
+        phase_profile::force_activation_plan_enabled(true);
+        assert!(
+            phase_profile::publish_env_derived(phase_profile::activation_plan_gate(), env_says),
+            "a late initialiser must report the value in force, not its own"
+        );
+        assert!(
+            phase_profile::activation_plan_enabled(),
+            "a lazy initialisation that lands after a force (env_says={env_says}) \
+             reverted it; the forcing test then runs with the planner off and \
+             fails on stats it correctly asked for"
+        );
+    }
+
+    // Non-vacuity: the initialiser must still publish when nothing is in force,
+    // or the assertions above would hold for a `publish` that never stores.
+    // On a scratch gate, so an unowned process-global is never left `UNKNOWN`
+    // for a concurrent reader to re-derive.
+    for env_says in [false, true] {
+        let unowned = AtomicU8::new(phase_profile::UNKNOWN);
+        assert_eq!(
+            phase_profile::publish_env_derived(&unowned, env_says),
+            env_says,
+            "an uncontended initialiser must report its own env-derived answer"
+        );
+        let expected = if env_says {
+            phase_profile::ON
+        } else {
+            phase_profile::OFF
+        };
+        assert_eq!(
+            unowned.load(Ordering::Relaxed),
+            expected,
+            "an uncontended initialiser must publish, or every later reader \
+             pays the environment read again"
+        );
+    }
+
+    // Leave the planner off, as every other test in this file expects.
+    phase_profile::force_activation_plan_enabled(false);
 }
 
 #[test]

@@ -477,7 +477,7 @@ pipeline:
             kind: full_attention
             sequence_axis: 2
             layout: head_major_bnsh
-            aliasing: forbidden
+            aliasing: permitted
             reuse:
               prefix_reusable: true
               evictable_prefix: true

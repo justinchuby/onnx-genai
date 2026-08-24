@@ -781,8 +781,28 @@ impl Engine {
             on_admitted,
             callback,
         )?;
+        // A package that declares its conversation knows how long it is; asking
+        // it is what keeps `session_token_count` the same number a decode-core
+        // session reports — prompt and generated tokens both — rather than the
+        // generated ones alone.
+        //
+        // The cost of that conversation is stated rather than hidden: a package
+        // whose lease is a prompt prefix re-prefills every earlier turn on each
+        // new one, because its invocation-scoped cache is released when the
+        // invocation ends. Over a conversation of N tokens that is O(N²) prefill
+        // work, against O(N) for a decode core whose paged KV survives the turn.
+        // It is the cost of continuing a conversation a package can express
+        // rather than one it cannot, and a package that wants the linear cost
+        // declares its cache session-scoped and is executed by a core that keeps
+        // it.
+        let declared = self
+            .workflow
+            .session_conversation_len(&session_id.to_string());
         if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
-            *count += result.token_ids.len();
+            match declared {
+                Some(length) => *count = length,
+                None => *count += result.token_ids.len(),
+            }
         }
         Ok(result)
     }
@@ -807,18 +827,18 @@ impl Engine {
         )
     }
 
-    /// Admit a prompt-only request through the scheduler for a package this
-    /// runtime has no decode core for.
+    /// Admit a workflow-driven request through the scheduler.
     ///
-    /// A no-decode-core request still shares this runtime's scheduler, and —
+    /// A workflow-driven request still shares this runtime's scheduler, and —
     /// when the process configured one — its KV byte budget: components own
     /// their own caches, but the byte accounting a shared budget protects is
     /// shared regardless of which executor a step names. Called from
     /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
-    /// no-decode-core branch — the one place every prompt-only request for
-    /// such a package passes through, whether it arrived cold
-    /// ([`Self::generate_interpreted`]) or through a continuing workflow
-    /// session ([`Self::generate_in_workflow_session`]) — this gives the path
+    /// workflow branch — the one place every request that runs the declared
+    /// workflow passes through, whether it arrived cold
+    /// ([`Self::generate_interpreted`]), through a continuing workflow session
+    /// ([`Self::generate_in_workflow_session`]), or carrying tensors no prompt
+    /// can express — this gives the path
     /// the same "reject at the door" guarantee
     /// [`Self::generate_native_cold_with_callback`] already has instead of
     /// letting the request fail deep inside node execution once a value the
@@ -829,7 +849,17 @@ impl Engine {
         prompt: &GeneratePrompt,
         max_new_tokens: usize,
     ) -> anyhow::Result<(Option<GenerationBudgetCap>, usize)> {
-        let prompt_tokens = self.interpreted_prompt_token_count(prompt)?;
+        // What this request costs is its prompt plus whatever the runtime will
+        // put in front of it, which for a package continuing its conversation by
+        // prepending is every earlier turn. Admitting on the request alone
+        // under-reserves for exactly the turns that need the most.
+        let carried = if self.workflow_sessions.contains_key(&session_id) {
+            self.workflow
+                .session_prepended_prompt_len(&session_id.to_string())
+        } else {
+            0
+        };
+        let prompt_tokens = self.interpreted_prompt_token_count(prompt)? + carried;
         let scheduled = self.admit_generate_request_with_scheduler(
             session_id,
             prompt_tokens,
@@ -842,8 +872,8 @@ impl Engine {
         ))
     }
 
-    /// Prompt length for scheduler admission before a no-decode-core request's
-    /// workflow has bound any input.
+    /// Prompt length for scheduler admission before a workflow-driven
+    /// request has bound any input.
     ///
     /// The interpreter tokenizes a text prompt itself once the workflow runs
     /// (from the package's own tokenizer, since this engine owns none for a
@@ -861,6 +891,13 @@ impl Engine {
             GeneratePrompt::TokenRows(rows) => {
                 Ok(rows.iter().map(Vec::len).max().unwrap_or(0) * rows.len())
             }
+            // The package's tokenizer and no other, because it is the one
+            // `run_declared_workflow_generation` will encode with: a count
+            // taken from a different vocabulary would gate the run on a length
+            // the run never produces. It is also why a package that ships none
+            // is refused here rather than admitted and failed at encode two
+            // frames later -- the two sites agree on when a text prompt is
+            // encodable, so the gate is the first thing to say so.
             GeneratePrompt::Text(text) => {
                 let tokenizer = self.workflow.package_tokenizer().context(
                     "this package declares a prompt_tokens input but ships no tokenizer, so a \
@@ -1468,6 +1505,26 @@ impl Engine {
         // Refusing here would have made "sessions" a property of which executor
         // runs the decode step, which is not what a caller is asking about.
         if !self.holds_decode_core() {
+            // What a caller opening a session asks for is that the next turn
+            // continue this one. A package that publishes a token stream is one
+            // whose turns are a conversation, so a session over it that carries
+            // nothing would silently restart every turn — a wrong answer that
+            // reads like a forgetful model. Say so instead, and name what the
+            // package has to declare. A package that publishes no tokens has no
+            // conversation to lose, and its session is an ordinary handle.
+            let workflow = self.workflow.workflow_spec();
+            let publishes_tokens = workflow
+                .outputs
+                .values()
+                .any(|output| output.role == onnx_genai_metadata::WorkflowOutputRole::Tokens);
+            if publishes_tokens && !crate::pipeline::workflow_carries_session_state(workflow) {
+                // A typed refusal, not a formatted string: what a front end has
+                // to decide is whether the caller asked for something this
+                // package cannot do, or whether the server failed. Matching on
+                // prose would make that a guess, and it was being reported as a
+                // 500 for a package that is simply stateless.
+                return Err(PackageCapabilityError::NoSessionState.into());
+            }
             self.workflow_session_counter += 1;
             let id = self.workflow_session_counter;
             self.workflow_sessions.insert(id, 0);
@@ -1603,6 +1660,21 @@ impl Engine {
 
     /// Reset a persistent session, freeing its current state while keeping the id usable.
     pub fn reset_session(&mut self, session_id: SessionId) -> anyhow::Result<()> {
+        // Resetting is the same promise for every package: the id stays usable
+        // and everything the conversation accumulated is gone. For an
+        // interpreted package that is exactly its session-scoped cells, so the
+        // lease is dropped and the token count returns to zero.
+        if !self.holds_decode_core() {
+            anyhow::ensure!(
+                self.workflow_sessions.contains_key(&session_id),
+                "session {session_id} not found"
+            );
+            self.workflow.forget_session(&session_id.to_string());
+            if let Some(count) = self.workflow_sessions.get_mut(&session_id) {
+                *count = 0;
+            }
+            return Ok(());
+        }
         #[cfg(feature = "native-backend")]
         if self.decode_backend == EngineDecodeBackend::Native {
             return session_state::reset(&mut NativeSessions(self), session_id);
@@ -1658,7 +1730,15 @@ impl Engine {
         session_state::close(&mut OrtSessions(self), session_id)
     }
 
-    /// Number of logical tokens retained in a persistent session.
+    /// Logical tokens this session's conversation holds — prompts and
+    /// generations alike, oldest turn first.
+    ///
+    /// One meaning for every backend. A decode core reports the tokens its KV
+    /// sequence covers; an interpreted package reports the length of the
+    /// conversation its workflow declares, or, for a package whose session state
+    /// is not a token conversation, the tokens its turns have generated. In
+    /// every case it is "how much has this session heard", never "how much did
+    /// the last turn produce".
     pub fn session_token_count(&self, session_id: SessionId) -> anyhow::Result<usize> {
         if !self.holds_decode_core() {
             return self
@@ -1673,6 +1753,96 @@ impl Engine {
         }
         self.require_ort_backend("persistent sessions")?;
         session_state::token_count(&OrtSessionsRef(self), session_id)
+    }
+
+    /// Whether the loaded package continues a conversation by putting it in
+    /// front of the next turn's prompt.
+    ///
+    /// This answers only whether the authored workflow explicitly prepends a
+    /// token conversation. It is **false** for everything else:
+    ///
+    /// * a **decode core** keeps its conversation in KV, which the request does
+    ///   not carry and the prefill does not repeat;
+    /// * a **loop-carried** or **group-held** lease is handed back inside the
+    ///   graph, so the tokens it stands for live in a cache the package bounds
+    ///   itself rather than in front of a prompt;
+    /// * a package with no session state has no conversation at all.
+    ///
+    /// Answered from the shared classifier, never from "does this session hold
+    /// state": those are different questions with the same shape.
+    pub fn prepends_session_conversation(&self) -> bool {
+        if self.holds_decode_core() {
+            return false;
+        }
+        self.workflow.prepends_session_conversation()
+    }
+
+    /// What this session contributes ahead of the next prompt.
+    ///
+    /// ORT decode-core sessions append a turn to their retained sequence, so
+    /// that sequence is attended but served from KV rather than re-prefilled.
+    /// Native decode-core sessions replace their cached prefix with the
+    /// incoming prompt, so their retained tokens contribute neither value.
+    /// Prompt continuation contributes both; graph-carried state contributes
+    /// neither because the package bounds that cache itself.
+    pub fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<SessionPrefillCarry> {
+        if self.holds_decode_core() {
+            let retained = self.session_token_count(session_id)?;
+            #[cfg(feature = "native-backend")]
+            if self.decode_backend == EngineDecodeBackend::Native {
+                return Ok(SessionPrefillCarry::default());
+            }
+            return Ok(SessionPrefillCarry {
+                attended: retained,
+                reprefilled: 0,
+            });
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        let prepended = self
+            .workflow
+            .session_prepended_prompt_len(&session_id.to_string());
+        Ok(SessionPrefillCarry {
+            attended: prepended,
+            reprefilled: prepended,
+        })
+    }
+
+    /// The tokens a session's conversation holds, oldest first.
+    ///
+    /// `None` when the package carries its conversation somewhere a token list
+    /// cannot describe — a decode core's KV sequence, or a workflow whose
+    /// session state is not a declared prompt continuation. A caller reads this
+    /// to see what a session has heard without keeping a second copy of it,
+    /// which is the copy that drifts.
+    pub fn session_conversation(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<Option<Vec<TokenId>>> {
+        if self.holds_decode_core() {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.workflow_sessions.contains_key(&session_id),
+            "session {session_id} not found"
+        );
+        self.workflow
+            .session_conversation(&session_id.to_string())
+            .map(|conversation| {
+                conversation
+                    .into_iter()
+                    .map(|token| {
+                        TokenId::try_from(token)
+                            .context("a conversation token id does not fit the token type")
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()
+            })
+            .transpose()
     }
 
     /// Get the loaded metadata.
@@ -2809,6 +2979,23 @@ mod tests {
     /// a fixture that is copied is a fixture that drifts.
     #[cfg(feature = "native-backend")]
     fn interpreted_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(budget_bytes, false)
+    }
+
+    /// The same fixture over a package that declares session-scoped state.
+    ///
+    /// `create_session` refuses a package that publishes tokens and declares no
+    /// conversation, so a test that opens a session needs one that does. Kept
+    /// as a separate constructor rather than a flag on every call site: the
+    /// stateless fixture is the right one everywhere a session is not opened,
+    /// and the two differ in exactly one declared property.
+    #[cfg(feature = "native-backend")]
+    fn interpreted_session_engine_with_byte_budget(budget_bytes: u64) -> anyhow::Result<Engine> {
+        interpreted_engine_inner(budget_bytes, true)
+    }
+
+    #[cfg(feature = "native-backend")]
+    fn interpreted_engine_inner(budget_bytes: u64, session_scoped: bool) -> anyhow::Result<Engine> {
         let tokenizer_path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm/tokenizer.json")
             .canonicalize()?;
@@ -2825,7 +3012,11 @@ mod tests {
             0,
         )?;
         Ok(Engine {
-            workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
+            workflow: Box::new(if session_scoped {
+                crate::pipeline::generation::test_session_decoder_runtime()?
+            } else {
+                crate::pipeline::generation::test_decoder_runtime()?
+            }),
             workflow_sessions: HashMap::new(),
             workflow_session_counter: 0,
             decode_backend: EngineDecodeBackend::Native,
@@ -2893,6 +3084,36 @@ mod tests {
         Ok(())
     }
 
+    /// The reject direction for the fixture the test below accepts.
+    ///
+    /// That test needs a package declaring `scope: session` state, so it uses a
+    /// fixture built to have some. A fixture that grants what it is meant to
+    /// test is worth exactly nothing unless the ungranted case is shown to be
+    /// refused, and both fixtures come from one builder differing in one flag —
+    /// so this pins that the flag is what the refusal turns on.
+    ///
+    /// It is also the only unit test of the refusal itself. #1892 added the
+    /// gate; how it was discovered to be load-bearing is that it silently broke
+    /// a test written for something else, which is a slower way to find out.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn create_session_refuses_a_package_that_declares_no_conversation() -> anyhow::Result<()> {
+        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        assert!(!engine.holds_decode_core());
+
+        let error = engine
+            .create_session()
+            .expect_err("a package publishing tokens with no session state cannot hold a session");
+
+        assert_eq!(
+            crate::engine::package_capability_error(&error),
+            Some(PackageCapabilityError::NoSessionState),
+            "the refusal must be the typed one a front end reads for its status code, \
+             not prose that happens to say something similar: {error}"
+        );
+        Ok(())
+    }
+
     /// The cold-call test above exercises `generate_interpreted`; a
     /// continuing workflow session reaches the exact same no-decode-core
     /// branch through [`Engine::generate_in_workflow_session`] instead (the
@@ -2902,7 +3123,7 @@ mod tests {
     #[cfg(feature = "native-backend")]
     #[test]
     fn native_generate_in_workflow_session_rejects_over_kv_byte_budget() -> anyhow::Result<()> {
-        let mut engine = interpreted_engine_with_byte_budget(10)?;
+        let mut engine = interpreted_session_engine_with_byte_budget(10)?;
 
         // No decode core: this engine's sessions are workflow sessions,
         // opened through the same public `create_session` a real caller
@@ -2996,6 +3217,193 @@ mod tests {
             0,
             "no sequence may still be running once every request has finished"
         );
+        Ok(())
+    }
+
+    /// The accept direction for a tensor-bound request: it is admitted, and it
+    /// signals admission exactly once.
+    ///
+    /// `on_admitted` carries two contracts at that call site. To the server it
+    /// means "you may begin streaming": `run_generation`'s success arm never
+    /// touches the admission sender (only its error arm does), so this callback
+    /// is the *only* thing that ever resolves that oneshot with `Ok` on a
+    /// request that succeeds. Drop the call and every successful tensor-bound
+    /// request becomes a 500 at the awaiting end while the generation itself
+    /// completes perfectly. To the engine it means "the scheduler admitted
+    /// this".
+    ///
+    /// #1964 added this test when those two had come apart: the branch fired
+    /// the callback without taking a reservation, so the engine contract was
+    /// false and only the server one held. #1891 closed that, and the test is
+    /// kept because it now pins *both* -- which is strictly more than it could
+    /// pin before, and it is the only guard on the server-facing half.
+    ///
+    /// The asymmetry #1964 identified is why the obvious falsifier is still the
+    /// wrong one. Asserting `!admitted` passes under the change that deletes
+    /// the call, and therefore goes green exactly when serving breaks. This
+    /// asserts the contract a mutation can actually violate.
+    ///
+    /// The budget is the load-bearing number: it must leave room, or the
+    /// request is now refused and never reaches the callback at all. That is
+    /// itself the discriminator between the two behaviours -- shrink it to `1`
+    /// and this test passes on the pre-#1891 branch and fails after it, which
+    /// is how the fix was verified rather than assumed. Its sibling
+    /// [`a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission`]
+    /// owns the refuse direction.
+    ///
+    /// Limitation, stated rather than implied: this fixture's interpreted
+    /// decoder cannot complete a generation, so what is pinned is that the
+    /// branch signals admission, not that it does so on a run returning `Ok`.
+    /// The signal is unconditional and precedes the work, so it is the same
+    /// line either way -- but an end-to-end version needs a package the
+    /// interpreter can finish, and that fixture does not exist yet.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_tensor_bound_request_signals_admission_exactly_once() -> anyhow::Result<()> {
+        // Room for the request: after #1891 a tensor-bound request takes a real
+        // reservation, so a budget that refuses it would never reach the
+        // callback this test exists to pin.
+        let mut engine = interpreted_engine_with_byte_budget(20)?;
+        assert!(!engine.holds_decode_core());
+
+        let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+            GeneratePrompt::TokenIds(vec![1]),
+        ));
+        request.request.options.max_new_tokens = 1;
+        request.request.options.stop_on_eos = false;
+        let request = request.with_input(
+            "pixel_values",
+            onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?,
+        );
+
+        // Assert the precondition rather than trusting the test's name: a
+        // request that lost its inputs takes the prompt path instead, where a
+        // different call site signals admission, and this test would then pass
+        // for a reason that has nothing to do with binding tensors.
+        assert!(
+            !request.inputs.is_empty(),
+            "this test is only about the branch a tensor-carrying request takes"
+        );
+
+        let mut admissions = 0usize;
+        {
+            let mut on_admitted = || admissions += 1;
+            let _ = engine.generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None);
+        }
+
+        assert_eq!(
+            admissions, 1,
+            "a tensor-bound request must signal admission exactly once: the server's \
+             admission oneshot has no other resolver on a successful generation"
+        );
+        Ok(())
+    }
+
+    /// #1891's residual, and the one case none of the three tests above can
+    /// reach: a request that binds a tensor.
+    ///
+    /// Every admission test written for #1900/#1904 sends a *prompt*, and
+    /// `generate_with_pipeline_callbacks` splits on exactly that -- a request
+    /// carrying inputs or component overrides is not prompt-only, takes the
+    /// `!prompt_only` branch, and that branch fires `on_admitted()` and runs
+    /// the workflow without ever consulting the scheduler. So the byte budget
+    /// #1900 wired in is enforced for `generate("hello")` and not for the same
+    /// engine, same budget, same prompt plus one bound tensor.
+    ///
+    /// The control is the point: both arms use one engine constructor and one
+    /// budget, and differ only by the tensor. If the fixture simply failed for
+    /// its own reasons, or the budget refused everything, both arms would read
+    /// the same. They do not, and the arm that differs is the one that skipped
+    /// admission.
+    ///
+    /// The second assertion is the one that cannot be satisfied by a symptom
+    /// fix: `on_admitted()` firing when nothing admitted is a lie to whatever
+    /// is on the other end of it -- for the server driver that callback is a
+    /// oneshot that tells a waiting client "you are in", so it must not be sent
+    /// by a path that made no such decision.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission() -> anyhow::Result<()> {
+        // Same shape as `native_generate_rejects_over_kv_byte_budget_before_backend_run`:
+        // one prompt token plus one new token at 10 bytes each needs 20, and
+        // this engine has 10. Every arm below is over budget by construction.
+        fn over_budget_request() -> crate::pipeline::PipelineGenerateRequest {
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+            request
+        }
+
+        // Both ways a request stops being prompt-only, because a fix that
+        // admits bound tensors and forgets overrides leaves the same hole open
+        // through the other door. The last arm is the other polarity: three
+        // refusals are equally consistent with a path that admits correctly and
+        // with one that refuses everything it cannot recognise, and only an arm
+        // that must be *accepted* tells those apart.
+        fn bound_tensor() -> anyhow::Result<onnx_genai_ort::Value> {
+            Ok(onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?)
+        }
+        let arms = vec![
+            ("prompt-only (control)", 10u64, true, over_budget_request()),
+            (
+                "one bound tensor",
+                10,
+                true,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
+            ),
+            (
+                "one component override",
+                10,
+                true,
+                over_budget_request().with_component_override("decoder", "decoder"),
+            ),
+            (
+                "one bound tensor, inside budget",
+                10_000,
+                false,
+                over_budget_request().with_input("pixel_values", bound_tensor()?),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, budget, refuse, request) in arms {
+            let mut engine = interpreted_engine_with_byte_budget(budget)?;
+            assert!(!engine.holds_decode_core());
+            let mut admitted = false;
+            let mut on_admitted = || admitted = true;
+            let error = engine
+                .generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            let refused = error.contains("scheduler admission failed: KV byte budget");
+            match (refuse, refused) {
+                (true, false) => wrong.push(format!(
+                    "{label}: over-budget request was not refused at the door; got: {error}"
+                )),
+                (false, true) => wrong.push(format!(
+                    "{label}: a request the budget has room for was refused: {error}"
+                )),
+                _ => {}
+            }
+            // The callback reports the decision the scheduler made, so it fires
+            // exactly when the request was admitted -- never on a refusal, and
+            // never on a path that reached the workflow without asking.
+            if admitted == refuse {
+                wrong.push(format!(
+                    "{label}: on_admitted() {} the scheduler {} this request",
+                    if admitted {
+                        "fired although"
+                    } else {
+                        "stayed silent although"
+                    },
+                    if refuse { "refused" } else { "admitted" }
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         Ok(())
     }
 

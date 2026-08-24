@@ -72,6 +72,12 @@ PR*.md
 .issue-*.md
 # Scratch buffers used when moving a block of code between files.
 .block.txt
+# Test/build output teed to a file while investigating. Root-level only, so a
+# fixture or a crate that legitimately tracks a .log is unaffected. Added after
+# a 1364-line `cargo test` transcript reached main in #1951: the file was named
+# outside every pattern above, and `git add -A` does not care what a file is
+# for.
+/*.log
 
 # seq-major microbenchmark scratch crate
 /bench-seqmajor/target/
@@ -104,3 +110,4 @@ roy_validate.log
 # hostlock self-test scratch (scripts/hostlock_test.sh writes these into the repo
 # root deliberately -- /tmp is off-limits here -- and an aborted run leaves them)
 .hostlock-selftest*
+.scratch-paged/

@@ -29,6 +29,23 @@
 //! native-only op dependency at all -- mirroring
 //! `glm_tiny_full_attention_e2e.rs`'s stock-ORT proof for GLM-5.2).
 //!
+//! Attention itself (Mobius PR #585): this fixture builds with
+//! `execution_provider="cpu"`, which Mobius's EP-capability gate
+//! (`DeepSeekV4Attention._use_fused_gqa()`) matches against `"cpu"`'s
+//! `gqa_dtypes={FLOAT}`, so the *dense* CSA attention this fixture targets
+//! is exported as one fused `com.microsoft::GroupQueryAttention` node per
+//! decoder layer rather than the decomposed manual
+//! `MatMul`/`Add`/`Softmax`/`Concat` chain the doc comment on
+//! `deepseek_v4_tiny_native_cuda_matches_cpu` below describes historically.
+//! DeepSeek-V4's learned per-head attention sink folds into GQA's
+//! `head_sink` input (the CPU kernel gained this in onnx-genai#1956);
+//! `attention_bias` is intentionally left unset, matching every other
+//! direct-GQA model in this codebase. EPs that must stay
+//! `com.microsoft`-free (`"default"`, `"onnx-standard"`, `"qnn"`,
+//! `"openvino"`) still fall back to the original decomposed path -- this
+//! fixture does not exercise that branch, since it is built exclusively
+//! under `"cpu"`.
+//!
 //! This native-CUDA build requires both `cuda` and `native-backend`:
 //!
 //! ```bash
@@ -126,16 +143,23 @@ fn generate(engine: &mut Engine) -> anyhow::Result<Vec<u32>> {
 /// Structural gate: no native-only `pkg.nxrt::*` op may appear (this
 /// fixture's entire claim to stock-ORT executability depends on it), while
 /// routed experts must be fused into one `com.microsoft::QMoE` per MoE layer
-/// (mobius#550's export, not a per-expert dense loop).
+/// (mobius#550's export, not a per-expert dense loop), and attention must be
+/// fused into one `com.microsoft::GroupQueryAttention` node per decoder
+/// layer (mobius#585's export, not the decomposed manual
+/// `MatMul`/`Add`/`Softmax`/`Concat` chain the older DeepSeek-V4 export
+/// used) -- proven here by requiring the GQA node count to match the QMoE
+/// node count (both equal the decoder layer count for this fixture) rather
+/// than a hardcoded layer number, so this gate does not silently stop
+/// meaning anything if the tiny config's layer count ever changes.
 ///
 /// Note: `onnx_runtime_loader::load_model` function-inlines `MatMulNBits`
 /// into its primitive decomposition (`BitwiseAnd`/`BitShift` unpack +
 /// `DequantizeLinear` + `MatMul`) at load time -- confirmed empirically: the
 /// *loaded* graph has zero `MatMulNBits` nodes of any domain even though the
 /// committed `model.onnx.textproto` file contains 18 of them, while
-/// `com.microsoft::QMoE` is left untouched (2 nodes, matching layer count).
-/// So the dense-per-expert-loop check below reads the raw textproto text
-/// directly for the routed-expert weight-naming pattern
+/// `com.microsoft::QMoE` and `com.microsoft::GroupQueryAttention` are left
+/// untouched. So the dense-per-expert-loop check below reads the raw
+/// textproto text directly for the routed-expert weight-naming pattern
 /// (`mlp.moe.experts.`) instead of asserting on loaded-graph node domains,
 /// which would not distinguish the two cases post-inlining.
 fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
@@ -153,12 +177,43 @@ fn assert_current_emission(dir: &Path) -> anyhow::Result<()> {
          pkg.nxrt::* nodes",
         model.display(),
     );
+    let qmoe_count = graph
+        .nodes
+        .values()
+        .filter(|node| node.domain == "com.microsoft" && node.op_type == "QMoE")
+        .count();
     assert!(
+        qmoe_count > 0,
+        "{} does not contain fused QMoE",
+        model.display()
+    );
+    let gqa_nodes: Vec<_> = graph
+        .nodes
+        .values()
+        .filter(|node| node.op_type == "GroupQueryAttention")
+        .collect();
+    assert_eq!(
+        gqa_nodes.len(),
+        qmoe_count,
+        "{} must emit exactly one fused GroupQueryAttention node per decoder \
+         layer (mobius#585), matching the {} QMoE nodes (one per layer); got {}",
+        model.display(),
+        qmoe_count,
+        gqa_nodes.len(),
+    );
+    assert!(
+        gqa_nodes.iter().all(|node| node.domain == "com.microsoft"),
+        "{} GroupQueryAttention node(s) must be the com.microsoft contrib op",
+        model.display()
+    );
+    assert_eq!(
         graph
             .nodes
             .values()
-            .any(|node| node.domain == "com.microsoft" && node.op_type == "QMoE"),
-        "{} does not contain fused QMoE",
+            .filter(|node| node.op_type == "Attention")
+            .count(),
+        0,
+        "{} must not contain an unfused com.microsoft::Attention node alongside GQA",
         model.display()
     );
     if model.extension().and_then(|ext| ext.to_str()) == Some("textproto") {
@@ -199,12 +254,26 @@ fn deepseek_v4_tiny_native_cpu_eager_decode_locks_anchor_ids() -> anyhow::Result
     Ok(())
 }
 
-/// Native CUDA decode for DeepSeek-V4's decomposed (non-fused-`Attention`)
-/// attention export. Previously a real, reproduced runtime gap; now fixed by
-/// generalizing the capacity-substitution invariant instead of adding a
-/// DeepSeek-specific allowlist branch. History kept below for context.
+/// Native CUDA decode for this fixture. As of Mobius PR #585 the dense CSA
+/// attention path this fixture targets is exported as one fused
+/// `com.microsoft::GroupQueryAttention` node per layer (see the module doc
+/// comment above), so capture here now goes through the same
+/// physical-capacity-aware fused-`Attention`/`GroupQueryAttention` kernel
+/// path GLM-5.2 full-attention and DeepSeek-V2/V3-Lite already used --
+/// `captures > 0` is the ordinary case for a fused-attention graph, not
+/// evidence of the generalized decomposed-attention mechanism below firing.
 ///
-/// Root cause: DeepSeek-V4's smallest (dense CSA) config exports fully
+/// The history kept below predates #585 and describes a real, reproduced
+/// runtime gap in DeepSeek-V4's **previous** decomposed (non-fused-
+/// `Attention`) attention export, and the general (non-DeepSeek-specific)
+/// capacity-substitution fix that closed it. That generalized mechanism
+/// remains load-bearing for the EPs DeepSeek-V4 still exports decomposed
+/// attention for (`"default"`, `"onnx-standard"`, `"qnn"`, `"openvino"` --
+/// see `_use_fused_gqa()` in `mobius/models/deepseek_v4.py`) and for
+/// GLM-5.2's own decomposed fallback path; it is kept here for that reason,
+/// not because this fixture exercises it anymore.
+///
+/// Root cause (historical): DeepSeek-V4's smallest (dense CSA) config exported fully
 /// **decomposed/manual** attention -- plain `MatMul`/`Softmax`/`Concat`/
 /// `Unsqueeze`/`Expand`, no fused `Attention`/`GroupQueryAttention` op and no
 /// native-only kernel (confirmed: `model.onnx.textproto` has zero `Attention`-

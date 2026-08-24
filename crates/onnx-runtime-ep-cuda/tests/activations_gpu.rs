@@ -333,6 +333,10 @@ fn mish_matches_cpu_including_the_saturating_tail() {
 ///    against a kernel that ignored the attribute entirely (because Celu(x,1)
 ///    and Elu(x,1) are numerically close for small |x|). We therefore run
 ///    `alpha = 2.0` and `alpha = 0.5` as well.
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
 #[test]
 fn celu_matches_cpu_including_nan_and_alpha_variants() {
     let ep = match std::panic::catch_unwind(CudaExecutionProvider::new_default) {

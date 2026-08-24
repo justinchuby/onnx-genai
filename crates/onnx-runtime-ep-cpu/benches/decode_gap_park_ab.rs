@@ -656,6 +656,13 @@ fn main() {
         }
     }
 
+    // Read before the first cell and again after the last, so the field
+    // describes the whole matrix. A single reading at the end would report one
+    // credible holder for a run that changed hands partway through -- the same
+    // stale-snapshot error as checking `ps` once before starting, moved into the
+    // output where it is harder to notice.
+    let host_lock = common::open_host_lock_window();
+
     println!(
         "model={} block_size={block_size} accuracy={accuracy} sessions={sessions} tokens={tokens} layers={layers} spmd={spmd} warmup={warmup} reps={reps} dist={}",
         std::env::var("PROBE_MODEL").unwrap_or_else(|_| "llama".into()),
@@ -1017,4 +1024,19 @@ fn main() {
                 .join(", ")
         );
     }
+
+    // Control 4: the conditions the matrix was taken under.
+    //
+    // The `foreign_%` and `sib_%` columns measure what the host did; this
+    // reports what anyone *declared* they were doing to it, from the advisory
+    // lock in `scripts/hostlock.sh`. They are different questions and the run
+    // needs both: contention sampling reads instants and can miss a co-tenant
+    // that starts and finishes between two snapshots, while a declaration
+    // covers the whole window but proves nothing about load. An unlocked run on
+    // a genuinely idle box is fine; a locked run beside somebody's unannounced
+    // `cargo test` is not.
+    // The row text, the `changed` rule and the warning all live in
+    // `common::report_host_lock` now, so this matrix and the nine other
+    // benches cannot drift into two vocabularies for one field.
+    common::report_host_lock(host_lock);
 }

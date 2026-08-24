@@ -2308,6 +2308,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "MultiHeadAttention"
+            && op.domain == "com.microsoft"
+            && let Some(reason) =
+                crate::kernels::multi_head_attention::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "GatherBlockQuantized"
             && op.domain == "com.microsoft"
             && let Some(reason) =
@@ -4789,11 +4796,40 @@ extern "C" __global__ void write_after_delay(unsigned int* out, long long spin) 
         );
     }
 
+    // A device ordinal that cannot exist must be reported unavailable. This
+    // pins one specific regression: an `is_available` that answers without
+    // probing at all, such as a stub returning `true`. Verified by
+    // falsification — replacing the body with `true` fails this test.
+    //
+    // Be precise about what this does NOT pin. It distinguishes "accepts every
+    // ordinal" from "rejects some ordinal", which is strictly weaker than the
+    // doc comment's claim that availability is probed against the driver,
+    // libraries, device and thread binding. A hardcoded ceiling such as
+    // `ordinal < 64` passes this test while still reporting `CUDA:0` usable on
+    // a machine with no GPU. Closing that would mean asserting the positive
+    // half (`is_available(0) == true`), which constructs a full provider —
+    // deliberately avoided here, because that construction is what made the
+    // previous version of this test flaky. The positive half is covered instead
+    // by the several hundred tests in this crate that build a real provider and
+    // fail loudly if construction stops working.
+    //
+    // This replaces an assertion that `is_available(0)` equalled
+    // `initialized(0).is_ok()`. Since `is_available` is defined as exactly that
+    // expression, the two sides could disagree only under a refactor that made
+    // it diverge from `initialized` — memoizing in a `OnceLock`, say, while
+    // `initialized` kept probing. Within a single run on a working GPU both
+    // sides simply returned `true`, so it caught nothing in practice while
+    // building two complete providers back to back. Each reserves a 64 GiB
+    // virtual address range for the VMM arena, so on a small card the first
+    // provider's deferred release had not always finished before the second
+    // reserved, and the test failed intermittently.
     #[test]
-    fn runtime_availability_matches_constructability() {
-        let available = CudaExecutionProvider::is_available(0);
-        let constructible = CudaExecutionProvider::initialized(0).is_ok();
-        assert_eq!(available, constructible);
+    fn availability_rejects_a_device_that_cannot_exist() {
+        const IMPOSSIBLE_ORDINAL: u32 = u32::MAX;
+        assert!(
+            !CudaExecutionProvider::is_available(IMPOSSIBLE_ORDINAL),
+            "is_available accepted CUDA:{IMPOSSIBLE_ORDINAL}, so it is not probing the device at all"
+        );
     }
 
     // Phase-4 overlap through the public `ExecutionProvider` surface: a host→

@@ -96,11 +96,17 @@ pub fn execute_kernel(
 }
 
 /// A concrete input tensor: dtype, shape, and contiguous little-endian bytes.
+///
+/// An `absent` tensor models an omitted positional optional input: the harness
+/// materialises it as a null-backed [`TensorView::absent`] placeholder so a
+/// kernel's `is_absent()` checks and the EP's claim gate behave exactly as they
+/// do under ORT (which reports omitted optionals with an `Undefined` dtype).
 #[derive(Clone)]
 pub struct Tensor {
     pub dtype: DataType,
     pub shape: Vec<usize>,
     pub bytes: Vec<u8>,
+    pub absent: bool,
 }
 
 /// Reinterpret a slice of plain-old-data scalars as raw little-endian bytes.
@@ -117,6 +123,17 @@ pub fn input<T: Copy>(dtype: DataType, shape: &[usize], values: &[T]) -> Tensor 
         dtype,
         shape: shape.to_vec(),
         bytes: raw(values),
+        absent: false,
+    }
+}
+
+/// An omitted positional optional input (a null-backed placeholder).
+pub fn absent_input(dtype: DataType) -> Tensor {
+    Tensor {
+        dtype,
+        shape: Vec::new(),
+        bytes: Vec::new(),
+        absent: true,
     }
 }
 
@@ -143,6 +160,7 @@ pub fn float_input(dtype: DataType, shape: &[usize], values: &[f32]) -> Tensor {
         dtype,
         shape: shape.to_vec(),
         bytes: encode_floats(values, dtype),
+        absent: false,
     }
 }
 
@@ -197,13 +215,19 @@ pub fn build_graph(
         .iter()
         .enumerate()
         .map(|(index, tensor)| {
+            // An omitted optional is a `None` node input (no graph value), so
+            // positional arity is preserved and later present inputs are not
+            // misread as the omitted one.
+            if tensor.absent {
+                return None;
+            }
             let value = graph.create_named_value(
                 format!("input_{index}"),
                 tensor.dtype,
                 static_shape(tensor.shape.iter().copied()),
             );
             graph.add_input(value);
-            value
+            Some(value)
         })
         .collect::<Vec<_>>();
     let output_values = outputs
@@ -217,12 +241,7 @@ pub fn build_graph(
             )
         })
         .collect::<Vec<_>>();
-    let mut node = Node::new(
-        NodeId(0),
-        op,
-        input_values.into_iter().map(Some).collect(),
-        output_values.clone(),
-    );
+    let mut node = Node::new(NodeId(0), op, input_values, output_values.clone());
     node.domain = domain.to_string();
     for (name, value) in attrs {
         node.attributes.insert((*name).into(), value.clone());
@@ -257,7 +276,18 @@ pub fn run_cuda(
         .iter()
         .map(|tensor| static_shape(tensor.shape.iter().copied()))
         .collect::<Vec<_>>();
-    let claim_dtypes = inputs.iter().map(|tensor| tensor.dtype).collect::<Vec<_>>();
+    let claim_dtypes = inputs
+        .iter()
+        .map(|tensor| {
+            // ORT reports an omitted optional with an `Undefined` element type;
+            // mirror that so claim gates key off absence, not a stale dtype.
+            if tensor.absent {
+                DataType::Undefined
+            } else {
+                tensor.dtype
+            }
+        })
+        .collect::<Vec<_>>();
     let claim = ep.supports_op(
         model.graph.node(node_id),
         opset,
@@ -297,6 +327,9 @@ pub fn run_cuda(
         .zip(&input_buffers)
         .zip(&input_strides)
         .map(|((tensor, buffer), strides)| {
+            if tensor.absent {
+                return TensorView::absent(tensor.dtype);
+            }
             TensorView::new(
                 DevicePtr(buffer.as_ptr()),
                 tensor.dtype,
@@ -396,6 +429,9 @@ pub fn run_cpu(
         .iter()
         .zip(&input_strides)
         .map(|(tensor, strides)| {
+            if tensor.absent {
+                return TensorView::absent(tensor.dtype);
+            }
             TensorView::new(
                 DevicePtr(tensor.bytes.as_ptr().cast()),
                 tensor.dtype,

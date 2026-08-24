@@ -884,12 +884,24 @@ fn session_scope_and_release_boundaries_remain_normative() {
 pipeline:
   workflow:
     manifest:
-      capabilities: [workflow_ssa, session_state, session_state_lease]
+      capabilities: [workflow_ssa, session_state, session_state_lease, serving_service_contract]
     inputs:
       seed_state:
         contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
         role: { kind: opaque }
         source: { kind: application, name: seed_state }
+      active:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: active }
+      done:
+        contract: { dtype: bool, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: done }
+      accepted_len:
+        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: request_aligned, axis: 0 } }
+        role: { kind: opaque }
+        source: { kind: application, name: accepted_len }
     state:
       conversation:
         contract: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
@@ -899,13 +911,35 @@ pipeline:
         recurrence: { kind: invariant }
         management: runtime
         release_boundary: session
+        service_group: conversation_state
     components:
       decoder:
         implementation: { kind: onnx, artifact: decoder.onnx }
-        ports: {}
+        ports:
+          inputs:
+            past_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+          outputs:
+            next_state: { dtype: float32, rank: 2, shape: [batch, hidden], batch_layout: { kind: request_aligned, axis: 0 } }
+    serving:
+      active: active
+      done: done
+      accepted_len: accepted_len
+      state_service:
+        groups:
+          conversation_state:
+            kind: recurrent
+            layout: batch_hidden
+            ports:
+              decoder:
+                conversation:
+                  input: past_state
+                  output: next_state
+                  access: read_write
     steps:
       - kind: invoke
         component: decoder
+        inputs: { past_state: seed_state }
+        outputs: { next_state: decoder.next_state }
 "#;
     let metadata = parse(document);
     validate_metadata(&metadata).expect("session-scoped state is declarable");
@@ -918,6 +952,28 @@ pipeline:
     assert_eq!(
         cell.management,
         onnx_genai_metadata::StateManagement::Runtime
+    );
+
+    // A lease is only normative if something carries it. Here that is the state
+    // service group whose alias names the ports the graph reads and writes.
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
+    let facts = onnx_genai_metadata::classify_session_state(workflow);
+    assert_eq!(
+        facts.carrier("conversation"),
+        Some(onnx_genai_metadata::SessionStateCarrier::StateServiceGroup)
+    );
+    assert!(facts.carries_any());
+    assert_eq!(facts.uncarried().count(), 0);
+
+    // Drop the group and the lease has no reader: session scope alone never
+    // said how the next invocation reaches what was kept.
+    let unheld = document.replace("        service_group: conversation_state\n", "");
+    let reported = errors(&unheld);
+    assert!(
+        reported
+            .iter()
+            .any(|error| error.contains("no state service group holds it")),
+        "{reported:?}"
     );
 
     // Runtime-managed state must say when it may be released; otherwise nothing
