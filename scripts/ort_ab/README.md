@@ -212,7 +212,8 @@ looked wrong from the inside: intra-run spread stayed under 6% in some of the
 corrupted samples, because a tight spread only says the contention was steady,
 not that the host was quiet.
 
-So announce, and prefer the mechanical form:
+So announce, and take the lock. For any **saturating** run — a full benchmark
+matrix, the EP test suite, a qemu leg — it is *required*, not preferred:
 
 ```sh
 scripts/hostlock.sh status                       # is anybody benchmarking?
@@ -222,11 +223,20 @@ scripts/hostlock.sh run --owner leon \
 ```
 
 `run` is the form to use: it releases on success, on failure and on Ctrl-C.
-It is held by the harness for the whole run, so an interleaved A/B/null keeps
-the lock across every arm — sampling `ps` between two arms of someone else's
-A/B is how a host was declared free while a sweep was mid-flight.
-`--gate N` additionally waits for the *instantaneous runnable count* to fall to
-N before starting, which drains load from people who never took the lock.
+The holder must be the **outer harness**, spanning every arm of an interleaved
+A/B/null — not each benchmark child. Wrapping the children individually leaves
+a gap between arms in which the box looks idle, and that gap is not
+hypothetical: a peer ran `ps`, saw no benchmark process, and started a sweep
+*between two arms* of somebody else's A/B.
+
+That is the general rule, and it is worth stating on its own. **Never conclude
+the host is free from "nothing of mine is running", from `ps`, or from a
+point-in-time `loadavg`.** All three sample an instant, occupancy is a property
+of an interval, and the lock is the only statement about the interval — because
+it is a *declaration* rather than a measurement. `--gate N` additionally waits
+for the *instantaneous runnable count* to fall to N before starting, which
+drains load from people who never took the lock; it is a start admission
+control and nothing more.
 
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
@@ -308,10 +318,32 @@ one measurement, never a claim that the host owes you every core.
 
 That compares the CPU the command actually consumed against `N x wall` and
 exits 6 if it falls short, so an unattended harness stops instead of
-publishing. It needs no quiet host -- it tells you which reps to throw away.
-Set `F` from a measured quiet-host run of *your* workload, not from 1.0: a
-benchmark with a deliberate inter-token gap is legitimately below 1.0 and is
-not contended.
+publishing. Set `F` from a measured quiet-host run of *your* workload, not from
+1.0: a benchmark with a deliberate inter-token gap is legitimately below 1.0
+and is not contended.
+
+**Both are supplementary. Neither certifies a number, and neither replaces the
+lock.** `(utime+stime)/wall` measures how much of the wall clock your process
+spent *scheduled on a CPU*, and that is not the same as how much work it got
+done:
+
+* **An SMT sibling never deschedules you.** A competitor on the other
+  hyperthread of your core shares the front end and the execution ports. You
+  keep running, efficiency stays around 1.00, and your throughput falls anyway.
+* **Neither does a neighbour off-core.** Memory bandwidth, LLC occupancy and
+  turbo headroom are shared box-wide. A process saturating DRAM on other cores
+  slows you without ever touching your runqueue.
+
+The A/A null has the mirror-image blind spot. It is a *variance* measurement:
+it sees contention that differs between the two arms, and it is blind to
+contention that is steady across both. Both arms are depressed by the same
+factor, the null comes out small, and the ratio you publish is a ratio of two
+equally contaminated numbers — which is why a tight intra-run spread means only
+that the contention was steady, never that the host was quiet.
+
+So: the lock decides whether you may **start**, `--gate` drains stragglers who
+never took it, and efficiency and the null throw away a *subset* of the reps
+that were spoiled anyway. Only the lock says the box was yours.
 
 Gate on that runnable count (`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`), not
 on the 1-minute load average: `loadavg` is an exponential moving average, so it
