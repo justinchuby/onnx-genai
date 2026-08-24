@@ -1,9 +1,9 @@
 //! `com.microsoft::GroupQueryAttention` — optimized CPU GQA kernel.
 //!
 //! Implements unpacked Q/K/V and packed QKV inputs, BNSH KV caches, causal and
-//! local-window masking, rotary embedding, and score softcap. Packed KV,
-//! quantized caches, attention bias, smooth softmax/head sink, and QK capture
-//! are rejected.
+//! local-window masking, rotary embedding, score softcap, and the learned
+//! per-head attention sink (`head_sink`). Packed KV, quantized caches,
+//! attention bias, smooth softmax, and QK capture are rejected.
 //!
 //! ## Performance design (M=1 decode, long context)
 //!
@@ -1595,11 +1595,18 @@ impl Kernel for GroupQueryAttentionKernel {
                 "GroupQueryAttention: attention_bias is not yet supported".into(),
             ));
         }
-        if inputs.get(11).is_some_and(|v| !v.is_absent()) {
-            return Err(EpError::KernelFailed(
-                "GroupQueryAttention: head_sink is not yet supported".into(),
-            ));
-        }
+        let head_sink = match inputs.get(11) {
+            Some(view) if !view.is_absent() => {
+                if view.shape != [self.num_heads] {
+                    return Err(EpError::KernelFailed(format!(
+                        "GroupQueryAttention: head_sink must have shape [{}], got {:?}",
+                        self.num_heads, view.shape
+                    )));
+                }
+                Some(to_dense_f32_widen("GroupQueryAttention", view)?.into_owned())
+            }
+            _ => None,
+        };
         if inputs.get(12).is_some_and(|v| !v.is_absent())
             || inputs.get(13).is_some_and(|v| !v.is_absent())
         {
@@ -2023,6 +2030,7 @@ impl Kernel for GroupQueryAttentionKernel {
                 scale,
                 (self.softcap != 0.0).then_some(self.softcap),
                 SoftmaxExp::F64Intermediate,
+                head_sink.as_ref().map(|sink| sink[qh]),
                 output_row,
             );
         };
@@ -2093,6 +2101,9 @@ impl Kernel for GroupQueryAttentionKernel {
                 scale,
                 (self.softcap != 0.0).then_some(self.softcap),
                 SoftmaxExp::F64Intermediate,
+                head_sink
+                    .as_deref()
+                    .map(|sink| &sink[kvh * group..kvh * group + group]),
                 out_block,
                 scores,
             );
@@ -2183,12 +2194,47 @@ impl Kernel for GroupQueryAttentionKernel {
             });
             for row_index in 0..attention_rows {
                 let base = row_index * split_count;
-                combine_decode_partials(
-                    &partials[base..base + split_count],
-                    &partial_outputs[base * v_head_size..(base + split_count) * v_head_size],
-                    v_head_size,
-                    &mut y_bhsd[row_index * v_head_size..(row_index + 1) * v_head_size],
-                );
+                let row_in_batch = row_index % (self.num_heads * q.seq);
+                let qh = row_in_batch / q.seq;
+                let output_slot =
+                    &mut y_bhsd[row_index * v_head_size..(row_index + 1) * v_head_size];
+                match head_sink.as_ref().map(|sink| sink[qh]) {
+                    // The learned attention sink contributes no value vector,
+                    // only a softmax denominator term (see
+                    // `sdpa_decode_row_accessor`'s doc comment). Modeled here as
+                    // one extra synthetic split-K chunk whose "max" is the sink
+                    // logit, "sum" is 1 (so its rescaled contribution to the
+                    // combined denominator is exactly `exp(sink - global_max)`),
+                    // and whose value accumulator is all-zero -- `
+                    // combine_decode_partials`'s existing online-rescale formula
+                    // folds it in with no changes to that function itself.
+                    Some(sink_value) => {
+                        let mut row_partials = partials[base..base + split_count].to_vec();
+                        row_partials.push(DecodePartial {
+                            max: sink_value as f64,
+                            sum: 1.0,
+                        });
+                        let mut row_outputs = partial_outputs
+                            [base * v_head_size..(base + split_count) * v_head_size]
+                            .to_vec();
+                        row_outputs.extend(std::iter::repeat_n(0.0f64, v_head_size));
+                        combine_decode_partials(
+                            &row_partials,
+                            &row_outputs,
+                            v_head_size,
+                            output_slot,
+                        );
+                    }
+                    None => {
+                        combine_decode_partials(
+                            &partials[base..base + split_count],
+                            &partial_outputs
+                                [base * v_head_size..(base + split_count) * v_head_size],
+                            v_head_size,
+                            output_slot,
+                        );
+                    }
+                }
             }
         } else if group_fused {
             // One task per `(batch, kv_head)` group; each writes the `group`
@@ -2473,6 +2519,7 @@ mod tests {
         query_head_count: usize,
         key_value_head_count: usize,
         head_width: usize,
+        head_sink: Option<&[f32]>,
     ) -> Vec<f32> {
         let mut output = vec![0.0; query_sequence_length * query_head_count * head_width];
         for sequence_index in 0..query_sequence_length {
@@ -2493,14 +2540,25 @@ mod tests {
                         .sum::<f32>()
                         / (head_width as f32).sqrt();
                 }
-                let maximum_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let probability_sum: f32 = scores
+                let sink_logit = head_sink.map(|sink| sink[query_head_index]);
+                let maximum_score = scores
+                    .iter()
+                    .copied()
+                    .chain(sink_logit)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                // The sink contributes only to the softmax denominator (an
+                // always-attended, always-masked-in key with zero value), never
+                // to the weighted value sum below.
+                let mut probability_sum: f32 = scores
                     .iter_mut()
                     .map(|score| {
                         *score = ((*score - maximum_score) as f64).exp() as f32;
                         *score
                     })
                     .sum();
+                if let Some(sink) = sink_logit {
+                    probability_sum += ((sink - maximum_score) as f64).exp() as f32;
+                }
                 for score in &mut scores {
                     *score /= probability_sum;
                 }
@@ -2925,6 +2983,7 @@ mod tests {
             QUERY_HEAD_COUNT,
             KEY_VALUE_HEAD_COUNT,
             head_width,
+            None,
         );
 
         let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * head_width]);
@@ -3071,6 +3130,7 @@ mod tests {
                 QUERY_HEAD_COUNT,
                 KEY_VALUE_HEAD_COUNT,
                 head_width,
+                None,
             );
 
             let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * head_width]);
@@ -4153,6 +4213,7 @@ mod tests {
             QUERY_HEAD_COUNT,
             KEY_VALUE_HEAD_COUNT,
             HEAD_WIDTH,
+            None,
         );
 
         let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
@@ -4193,6 +4254,288 @@ mod tests {
                 (actual - expected).abs() <= tolerance,
                 "attention output {index}: actual {actual}, expected {expected}, difference {}, tolerance {tolerance}",
                 (actual - expected).abs()
+            );
+        }
+    }
+
+    /// `head_sink` (an always-attended, zero-value "sink" logit per query head)
+    /// must fold into the softmax denominator only -- never into the weighted
+    /// value sum -- on the plain per-row decode path (`compute_row` ->
+    /// `sdpa_decode_row`). Verified against an independent scalar reference
+    /// that models the sink the same way (see `reference_with_geometry`).
+    #[test]
+    fn head_sink_row_path_matches_independent_reference() {
+        const PAST_SEQUENCE_LENGTH: usize = 5;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 16;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xa001))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xa002))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xa003))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xa004))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xa005))
+            .collect();
+        // Deliberately not-all-equal and not-tiny so a dropped or mis-scaled
+        // sink term would move the (non-trivial) denominator enough to fail
+        // the tolerance below.
+        let head_sink: Vec<f32> = vec![1.25, -0.5, 3.0, 0.0];
+
+        let mut full_key = vec![0.0f32; KEY_VALUE_HEAD_COUNT * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH];
+        let mut full_value = full_key.clone();
+        for head_index in 0..KEY_VALUE_HEAD_COUNT {
+            let past_base = head_index * PAST_SEQUENCE_LENGTH * HEAD_WIDTH;
+            let full_base = head_index * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH;
+            full_key[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_key[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            full_value[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_value[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            for dimension_index in 0..HEAD_WIDTH {
+                full_key[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_key[head_index * HEAD_WIDTH + dimension_index];
+                full_value[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_value[head_index * HEAD_WIDTH + dimension_index];
+            }
+        }
+
+        let expected = reference_with_geometry(
+            &query,
+            &full_key,
+            &full_value,
+            1,
+            TOTAL_SEQUENCE_LENGTH,
+            PAST_SEQUENCE_LENGTH,
+            QUERY_HEAD_COUNT,
+            KEY_VALUE_HEAD_COUNT,
+            HEAD_WIDTH,
+            Some(&head_sink),
+        );
+        // Sanity: dropping the sink must actually change the answer, otherwise
+        // this test would pass vacuously regardless of whether the sink is
+        // wired through.
+        let without_sink = reference_with_geometry(
+            &query,
+            &full_key,
+            &full_value,
+            1,
+            TOTAL_SEQUENCE_LENGTH,
+            PAST_SEQUENCE_LENGTH,
+            QUERY_HEAD_COUNT,
+            KEY_VALUE_HEAD_COUNT,
+            HEAD_WIDTH,
+            None,
+        );
+        assert_ne!(
+            expected, without_sink,
+            "fixture's head_sink values have no effect on the reference -- test would be vacuous"
+        );
+
+        let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+        let mut present_key =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+        let mut present_value =
+            Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+        gqa_kernel_with_heads(QUERY_HEAD_COUNT as i64, KEY_VALUE_HEAD_COUNT as i64, &[])
+            .execute(
+                &[
+                    Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key).view(),
+                    Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value).view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                        &past_key,
+                    )
+                    .view(),
+                    Owned::f32(
+                        &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                        &past_value,
+                    )
+                    .view(),
+                    Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                    Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    absent(),
+                    Owned::f32(&[QUERY_HEAD_COUNT], &head_sink).view(),
+                ],
+                &mut [
+                    output.view_mut(),
+                    present_key.view_mut(),
+                    present_value.view_mut(),
+                ],
+            )
+            .unwrap();
+
+        for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            let tolerance = 1.0e-5 + 1.0e-5 * expected.abs();
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "attention output {index}: actual {actual}, expected {expected}, difference {}, tolerance {tolerance}",
+                (actual - expected).abs()
+            );
+        }
+    }
+
+    /// The same `head_sink` semantics on the flash-decoding split-KV path
+    /// (`sdpa_decode_partial` + `combine_decode_partials` plus the synthetic
+    /// phantom chunk injected at the call site) must match both the plain
+    /// per-row path and the independent scalar reference.
+    #[test]
+    fn head_sink_split_path_matches_row_path_and_reference() {
+        // Long enough to clear `SPLIT_MIN_KV` (1536) and wide enough that
+        // `total_sequence_length / SPLIT_MIN_CHUNK` leaves headroom for
+        // `cores_per_head` to select `split_count > 1`.
+        const PAST_SEQUENCE_LENGTH: usize = 4_095;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 32;
+        // `attention_rows == QUERY_HEAD_COUNT == 4`; an 8-worker pool leaves 2
+        // idle cores per head, opening the split gate.
+        const SPLIT_WORKERS: usize = 8;
+        const ROW_WORKERS: usize = 1;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xb001))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xb002))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xb003))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xb004))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xb005))
+            .collect();
+        let head_sink: Vec<f32> = vec![2.0, -1.0, 0.5, 4.0];
+
+        let run = |workers: usize| -> (Vec<f32>, usize) {
+            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut present_key =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let mut present_value =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let before = attention_split_count();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test decode pool")
+                .install(|| {
+                    gqa_kernel_with_heads(
+                        QUERY_HEAD_COUNT as i64,
+                        KEY_VALUE_HEAD_COUNT as i64,
+                        &[],
+                    )
+                    .execute(
+                        &[
+                            Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                            Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key)
+                                .view(),
+                            Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value)
+                                .view(),
+                            Owned::f32(
+                                &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                &past_key,
+                            )
+                            .view(),
+                            Owned::f32(
+                                &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                &past_value,
+                            )
+                            .view(),
+                            Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                            Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                            absent(),
+                            absent(),
+                            absent(),
+                            absent(),
+                            Owned::f32(&[QUERY_HEAD_COUNT], &head_sink).view(),
+                        ],
+                        &mut [
+                            output.view_mut(),
+                            present_key.view_mut(),
+                            present_value.view_mut(),
+                        ],
+                    )
+                    .unwrap();
+                });
+            (output.to_f32(), attention_split_count() - before)
+        };
+
+        let (split_output, split_count_delta) = run(SPLIT_WORKERS);
+        assert!(
+            split_count_delta > 0,
+            "split-KV path was never reached -- this test would be vacuous"
+        );
+        let (row_output, row_split_delta) = run(ROW_WORKERS);
+        assert_eq!(
+            row_split_delta, 0,
+            "control run unexpectedly took the split-KV path too"
+        );
+
+        let mut full_key = vec![0.0f32; KEY_VALUE_HEAD_COUNT * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH];
+        let mut full_value = full_key.clone();
+        for head_index in 0..KEY_VALUE_HEAD_COUNT {
+            let past_base = head_index * PAST_SEQUENCE_LENGTH * HEAD_WIDTH;
+            let full_base = head_index * TOTAL_SEQUENCE_LENGTH * HEAD_WIDTH;
+            full_key[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_key[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            full_value[full_base..full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH].copy_from_slice(
+                &past_value[past_base..past_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH],
+            );
+            for dimension_index in 0..HEAD_WIDTH {
+                full_key[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_key[head_index * HEAD_WIDTH + dimension_index];
+                full_value[full_base + PAST_SEQUENCE_LENGTH * HEAD_WIDTH + dimension_index] =
+                    current_value[head_index * HEAD_WIDTH + dimension_index];
+            }
+        }
+        let expected = reference_with_geometry(
+            &query,
+            &full_key,
+            &full_value,
+            1,
+            TOTAL_SEQUENCE_LENGTH,
+            PAST_SEQUENCE_LENGTH,
+            QUERY_HEAD_COUNT,
+            KEY_VALUE_HEAD_COUNT,
+            HEAD_WIDTH,
+            Some(&head_sink),
+        );
+
+        for (index, ((split, row), expected)) in split_output
+            .iter()
+            .zip(&row_output)
+            .zip(&expected)
+            .enumerate()
+        {
+            let tolerance = 2.0e-4 + 2.0e-4 * expected.abs();
+            assert!(
+                (split - row).abs() <= tolerance,
+                "split vs row output {index}: split {split}, row {row}, difference {}, tolerance {tolerance}",
+                (split - row).abs()
+            );
+            assert!(
+                (split - expected).abs() <= tolerance,
+                "split output {index}: actual {split}, expected {expected}, difference {}, tolerance {tolerance}",
+                (split - expected).abs()
             );
         }
     }
@@ -4308,6 +4651,103 @@ mod tests {
             fused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             per_head.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
             "KV-group fusion must not change a single bit of the decode output"
+        );
+    }
+
+    /// `head_sink` must be threaded through the KV-group-fused path
+    /// (`compute_group` -> `sdpa_decode_group`) identically to the per-head
+    /// path, mirroring `group_fused_decode_is_bit_identical_to_per_head_decode`
+    /// but with a per-head sink present.
+    #[test]
+    fn head_sink_group_fused_matches_per_head_decode() {
+        let _fusion = GroupFusionOverride::forced_on();
+        const PAST_SEQUENCE_LENGTH: usize = 8_192;
+        const TOTAL_SEQUENCE_LENGTH: usize = PAST_SEQUENCE_LENGTH + 1;
+        const QUERY_HEAD_COUNT: usize = 4;
+        const KEY_VALUE_HEAD_COUNT: usize = 2;
+        const HEAD_WIDTH: usize = 128;
+
+        let query: Vec<f32> = (0..QUERY_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xc001))
+            .collect();
+        let current_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xc002))
+            .collect();
+        let current_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xc003))
+            .collect();
+        let past_key: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xc004))
+            .collect();
+        let past_value: Vec<f32> = (0..KEY_VALUE_HEAD_COUNT * PAST_SEQUENCE_LENGTH * HEAD_WIDTH)
+            .map(|index| mixed_scale_value(index, 0xc005))
+            .collect();
+        let head_sink: Vec<f32> = vec![-2.0, 0.75, 1.5, -0.25];
+
+        let run = |workers: usize| -> Vec<f32> {
+            let mut output = Owned::zeros_f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH]);
+            let mut present_key =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            let mut present_value =
+                Owned::zeros_f32(&[1, KEY_VALUE_HEAD_COUNT, TOTAL_SEQUENCE_LENGTH, HEAD_WIDTH]);
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .build()
+                .expect("test decode pool")
+                .install(|| {
+                    gqa_kernel_with_heads(
+                        QUERY_HEAD_COUNT as i64,
+                        KEY_VALUE_HEAD_COUNT as i64,
+                        &[],
+                    )
+                    .execute(
+                        &[
+                            Owned::f32(&[1, 1, QUERY_HEAD_COUNT * HEAD_WIDTH], &query).view(),
+                            Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_key)
+                                .view(),
+                            Owned::f32(&[1, 1, KEY_VALUE_HEAD_COUNT * HEAD_WIDTH], &current_value)
+                                .view(),
+                            Owned::f32(
+                                &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                &past_key,
+                            )
+                            .view(),
+                            Owned::f32(
+                                &[1, KEY_VALUE_HEAD_COUNT, PAST_SEQUENCE_LENGTH, HEAD_WIDTH],
+                                &past_value,
+                            )
+                            .view(),
+                            Owned::i32(&[1], &[PAST_SEQUENCE_LENGTH as i32]).view(),
+                            Owned::i32(&[], &[TOTAL_SEQUENCE_LENGTH as i32]).view(),
+                            absent(),
+                            absent(),
+                            absent(),
+                            absent(),
+                            Owned::f32(&[QUERY_HEAD_COUNT], &head_sink).view(),
+                        ],
+                        &mut [
+                            output.view_mut(),
+                            present_key.view_mut(),
+                            present_value.view_mut(),
+                        ],
+                    )
+                    .unwrap();
+                });
+            output.to_f32()
+        };
+
+        let before = group_fused_count();
+        let fused = run(2);
+        assert!(
+            group_fused_count() > before,
+            "fused decode path was never reached — the A/B would be vacuous"
+        );
+        let per_head = run(KEY_VALUE_HEAD_COUNT * 2);
+
+        assert_eq!(
+            fused.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            per_head.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "KV-group fusion with head_sink present must not change a single bit of the decode output"
         );
     }
 
