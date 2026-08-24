@@ -48,7 +48,7 @@ HL=scripts/hostlock.sh
 pass=0
 fail=0
 
-cleanup() { rm -rf "$LOCK" "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran 2>/dev/null; }
+cleanup() { rm -rf "$LOCK" "$LOCK".cpuself "$LOCK".reaper "$LOCK".reaper.stage.* "$LOCK".reaper.dead.* "$LOCK".reaper.rel.* "$LOCK".dead.* "$LOCK".stage.* "$LOCK".gate "$LOCK".warn "$LOCK".zombie.* "$LOCK".zpid "$LOCK".ttlmarker "$LOCK".ran 2>/dev/null; }
 trap cleanup EXIT
 
 chk() {
@@ -1433,9 +1433,56 @@ eff_user=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
 chk "the efficiency of a real run is measured, not labelled" \
     "$(awk -v e="${eff_user:-0}" 'BEGIN { print (e > 0 && e <= 1.05) ? "plausible" : "implausible" }')" \
     "plausible"
-thr=$(awk -v e="${eff_user:-0}" 'BEGIN { t = e * 0.9; if (t < 0.05) t = 0.05; printf "%.3f", t }')
+# A threshold derived from the measurement it judges is invariant to any
+# CONSTANT scaling of that measurement -- halve every efficiency and every
+# derived-threshold cell still passes, which the fixed 0.8 would have caught.
+# Review found exactly that mutation surviving. So the number is pinned to
+# two things that do not come from this code path at all: the child's own
+# accounting of its own CPU, and the arithmetic relating the three fields
+# hostlock prints. Both hold under any load, because both compare the run
+# against itself rather than against an expectation of the host.
+selfrep='import os, sys, time
+t = time.time()
+while time.time() - t < 1.5:
+    pass
+c = os.times()
+open(sys.argv[1], "w").write("%f" % (c.user + c.system))'
+out=$($HL run --owner leon --reason "cpu selfreport" --expect-cores 1 \
+    -- python3 -c "$selfrep" "$LOCK.cpuself" 2>&1)
+hl_cpu=$(echo "$out" | sed -n 's/.*[^a-z]cpu=\([0-9.]*\)s.*/\1/p' | head -1)
+hl_wall=$(echo "$out" | sed -n 's/.*wall=\([0-9.]*\)s.*/\1/p' | head -1)
+hl_eff=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+child_cpu=$(cat "$LOCK.cpuself" 2>/dev/null)
+chk "the CPU seconds reported are the ones the child says it spent" \
+    "$(awk -v a="${hl_cpu:-0}" -v b="${child_cpu:-0}" \
+        'BEGIN { r = (b > 0) ? a / b : 0; print (r >= 0.85 && r <= 1.25) ? "agrees" : "disagrees(" r ")" }')" \
+    "agrees"
+chk "and the efficiency is those seconds over cores x wall, not a scaled copy" \
+    "$(awk -v e="${hl_eff:-0}" -v c="${hl_cpu:-0}" -v w="${hl_wall:-0}" \
+        'BEGIN { x = (w > 0) ? c / w : -1; d = e - x; if (d < 0) d = -d; print (x >= 0 && d <= 0.02) ? "consistent" : "inconsistent(" e " vs " x ")" }')" \
+    "consistent"
+rm -f "$LOCK.cpuself"
+# Slack is 0.5, not 0.9. The probe and the run it judges are two separate
+# 1.5s arms taken seconds apart, so a co-tenant that arrives in between
+# starves only the second one -- and at 0.9 that reddens the cell for a
+# reason that has nothing to do with the gate under test. This suite has to
+# pass on a co-tenanted host (#1802), and this exact pair was observed
+# failing on a busy box while every other cell held. 0.5 tolerates the judged
+# arm receiving half of what the probe got, and still leaves 2x headroom over
+# the ~0.23 that dropping kernel time from the accounting produces.
+thr=$(awk -v e="${eff_user:-0}" 'BEGIN { t = e * 0.5; if (t < 0.05) t = 0.05; printf "%.3f", t }')
 out=$($HL run --owner leon --reason "cpu ok" --expect-cores 1 --min-efficiency "$thr" \
     -- python3 -c "$busy1s" 2>&1); rc=$?
+# The load-invariant half of the requirement, which holds at ANY starvation:
+# the verdict has to follow the number printed on the same row. A gate that
+# always says ok, always says contended, or has its comparison backwards
+# fails here regardless of what the rest of the box is doing. The two cells
+# below still assert the ok branch specifically, but this one is the part
+# that cannot be made vacuous by a busy host.
+eff_j=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
+chk "the verdict follows the number printed on the same row" \
+    "$(echo "$out" | sed -n 's/.*verdict=\([a-z]*\).*/\1/p' | head -1):$rc" \
+    "$(awk -v e="${eff_j:-0}" -v t="${thr:-1}" 'BEGIN { print (e + 0 >= t + 0) ? "ok:0" : "contended:6" }')"
 chk "a run that got what this host had to give passes the gate" "$rc" "0"
 chk "and is reported as ok" "$(echo "$out" | grep -c 'verdict=ok')" "1"
 # The number has to be a MEASUREMENT, not a label: a constant 1.000 would pass
@@ -1465,11 +1512,16 @@ while time.time() - t < 1.5:
 # Compared against the user-mode probe taken moments ago on this same host,
 # not against a fixed 0.8: co-tenancy scales both down together, so the RATIO
 # survives a busy box while still collapsing to ~0.23 the moment kernel time
-# stops being counted.
+# stops being counted. Slack is 0.5 rather than 0.9 because the two arms are
+# taken seconds apart: a co-tenant arriving between them moves the ratio for
+# reasons that have nothing to do with kernel-time accounting, and a cell
+# that fails when somebody else starts a build is a cell people re-run until
+# it is green. 0.5 still leaves 2x headroom over the defect it exists to
+# catch.
 out=$($HL run --owner leon --reason "cpu sys" --expect-cores 1 -- python3 -c "$syscall1s" 2>&1)
 eff_sys=$(echo "$out" | sed -n 's/.*efficiency=\([0-9.]*\).*/\1/p' | head -1)
 chk "a run whose time is mostly kernel time still counts as using its core" \
-    "$(awk -v s="${eff_sys:-0}" -v u="${eff_user:-1}" 'BEGIN { print (u > 0 && s / u >= 0.7) ? "counted" : "under-measured" }')" \
+    "$(awk -v s="${eff_sys:-0}" -v u="${eff_user:-1}" 'BEGIN { print (u > 0 && s / u >= 0.5) ? "counted" : "under-measured" }')" \
     "counted"
 out=$($HL run --owner leon --reason "cpu sys judged" --expect-cores 1 --min-efficiency "$thr" \
     -- python3 -c "$syscall1s" 2>&1); rc=$?
@@ -1717,7 +1769,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Both probe branches now assert something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "265"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "268"
 
 echo
 echo "passed=${pass} failed=${fail}"
