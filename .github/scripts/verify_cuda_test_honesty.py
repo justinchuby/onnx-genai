@@ -117,21 +117,28 @@ def is_cuda_test_target(target: str) -> bool:
     )
 
 
-def policed_cuda_targets_by_dir() -> dict[Path, list[Path]]:
+@lru_cache(maxsize=1)
+def policed_cuda_targets_by_dir() -> dict[Path, tuple[Path, ...]]:
     """The policed CUDA test targets, kept separated by the directory they came from.
 
-    The census below needs per-directory counts, not a total. These crates
-    have split before -- the GPU tests moved out of the execution provider
-    into `onnx-runtime-cuda-memory`, which is why TEST_DIRS names two
-    directories -- and a total cannot distinguish "both present" from "one
-    emptied and the other still large enough to look healthy".
+    The census needs per-directory counts, not a total. These crates have
+    split before -- the GPU tests moved out of the execution provider into
+    `onnx-runtime-cuda-memory`, which is why TEST_DIRS names two directories
+    -- and a total cannot distinguish "both present" from "one emptied and the
+    other still large enough to look healthy".
+
+    Cached, so the scans and the census read one enumeration rather than three
+    of their own. They already shared the filter, which is what stops the
+    census certifying a set the scans do not police; enumerating once makes
+    that true of the run and not only of the logic. Tuples because a cached
+    mutable result is a caller's mistake waiting to happen.
     """
     return {
-        test_dir: [
+        test_dir: tuple(
             path
             for path in sorted(test_dir.glob("*.rs"))
             if is_cuda_test_target(path.stem)
-        ]
+        )
         for test_dir in TEST_DIRS
     }
 
