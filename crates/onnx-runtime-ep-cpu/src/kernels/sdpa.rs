@@ -551,6 +551,7 @@ pub fn sdpa_decode_row(
     scale: f32,
     softcap: Option<f32>,
     exp: SoftmaxExp,
+    head_sink: Option<f32>,
     output: &mut [f32],
 ) {
     debug_assert!(lo <= hi && hi <= kv_seq);
@@ -574,6 +575,7 @@ pub fn sdpa_decode_row(
         scale,
         softcap,
         exp,
+        head_sink,
         output,
     );
 }
@@ -591,6 +593,15 @@ pub fn sdpa_decode_row(
 /// softmax, and the `axpy_f32` value reduction are evaluated in exactly the same
 /// operations and order as [`sdpa_decode_row`], so for identical row *values*
 /// the output is **bit-for-bit identical** to the contiguous fresh-present path.
+///
+/// `head_sink`, when `Some`, is a learned per-query-head logit (`GroupQueryAttention`'s
+/// `head_sink` input, e.g. DeepSeek-V4/gpt-oss's attention sink) that folds into
+/// the softmax `max`/denominator exactly like one extra always-masked-in key
+/// with score `head_sink` and zero value contribution: it can raise the row
+/// max and always adds `exp(head_sink - max)` to the denominator, but is never
+/// multiplied into the `P·V` accumulation. `None` reproduces the pre-sink
+/// numerics bit-for-bit (matches the CUDA reference kernel's `head_sink ==
+/// nullptr` fast path).
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_decode_row_accessor<'a>(
     q: &[f32],
@@ -601,6 +612,7 @@ pub fn sdpa_decode_row_accessor<'a>(
     scale: f32,
     softcap: Option<f32>,
     exp: SoftmaxExp,
+    head_sink: Option<f32>,
     output: &mut [f32],
 ) {
     debug_assert!(lo <= hi);
@@ -615,11 +627,17 @@ pub fn sdpa_decode_row_accessor<'a>(
         scores[i] = score;
     }
 
-    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if let Some(sink) = head_sink {
+        max = max.max(sink);
+    }
     let mut sum = 0.0f32;
     for score in &mut scores {
         *score = exp.exp(*score - max);
         sum += *score;
+    }
+    if let Some(sink) = head_sink {
+        sum += exp.exp(sink - max);
     }
     if sum > 0.0 {
         for score in &mut scores {
@@ -688,6 +706,10 @@ pub fn sdpa_decode_row_accessor<'a>(
 /// the tile's K/V rows stay L1-resident across the whole group. Tiling only
 /// reorders work between independent query heads, so the bit-identity contract
 /// above is unaffected.
+/// `head_sink`, when `Some`, is one learned per-query-head logit per group
+/// member (`head_sink[g]` for query head `g`); see [`sdpa_decode_row_accessor`]'s
+/// doc for the exact softmax-only, no-value-contribution semantics. `None`
+/// reproduces the pre-sink numerics bit-for-bit.
 #[allow(clippy::too_many_arguments)]
 pub fn sdpa_decode_group(
     q: &[f32],
@@ -702,6 +724,7 @@ pub fn sdpa_decode_group(
     scale: f32,
     softcap: Option<f32>,
     exp: SoftmaxExp,
+    head_sink: Option<&[f32]>,
     out: &mut [f32],
     scores: &mut Vec<f32>,
 ) {
@@ -711,6 +734,7 @@ pub fn sdpa_decode_group(
     debug_assert_eq!(out.len(), group * v_head_size);
     debug_assert_eq!(k.len(), kv_seq * head_size);
     debug_assert_eq!(v.len(), kv_seq * v_head_size);
+    debug_assert!(head_sink.is_none_or(|sink| sink.len() == group));
 
     let window = hi - lo;
     scores.clear();
@@ -739,11 +763,17 @@ pub fn sdpa_decode_group(
     // Softmax per query head, over that head's own contiguous score slice.
     for g in 0..group {
         let row = &mut scores[g * window..(g + 1) * window];
-        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if let Some(sink) = head_sink {
+            max = max.max(sink[g]);
+        }
         let mut sum = 0.0f32;
         for score in row.iter_mut() {
             *score = exp.exp(*score - max);
             sum += *score;
+        }
+        if let Some(sink) = head_sink {
+            sum += exp.exp(sink[g] - max);
         }
         if sum > 0.0 {
             for score in row.iter_mut() {
@@ -1941,6 +1971,7 @@ mod tests {
                         scale,
                         softcap,
                         SoftmaxExp::F64Intermediate,
+                        None,
                         &mut expected[g * dv..(g + 1) * dv],
                     );
                 }
@@ -1960,6 +1991,7 @@ mod tests {
                     scale,
                     softcap,
                     SoftmaxExp::F64Intermediate,
+                    None,
                     &mut actual,
                     &mut scores,
                 );
@@ -2008,6 +2040,7 @@ mod tests {
                 scale,
                 None,
                 SoftmaxExp::F64Intermediate,
+                None,
                 &mut reused,
                 &mut scores,
             );
@@ -2024,6 +2057,7 @@ mod tests {
                 scale,
                 None,
                 SoftmaxExp::F64Intermediate,
+                None,
                 &mut fresh,
                 &mut fresh_scratch,
             );
@@ -2091,6 +2125,7 @@ mod tests {
             scale,
             Some(softcap),
             SoftmaxExp::F64Intermediate,
+            None,
             &mut actual,
         );
         assert_eq!(
@@ -2136,6 +2171,7 @@ mod tests {
                 scale,
                 softcap,
                 SoftmaxExp::F64Intermediate,
+                None,
                 &mut reference,
             );
 
