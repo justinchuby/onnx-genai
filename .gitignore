@@ -68,6 +68,12 @@ onnx-genai-session.perfetto.json
 # message file has reached a PR before.
 CM*.txt
 PR*.md
+# Extensionless variant. Removed once by 490b846c3 (as a .commitmsg/ directory)
+# and re-committed as a file by #1881, because deleting the artifact left the
+# name matching none of the patterns above and nothing stopped the next one.
+# Root-level only, per /*.log below: it is only ever created where you run
+# `git commit -F`, so a nested file of that name is somebody's, not this.
+/.commitmsg
 # Issue and review bodies staged the same way, for gh issue create --body-file.
 .issue-*.md
 # Scratch buffers used when moving a block of code between files.
