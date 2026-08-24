@@ -827,18 +827,18 @@ impl Engine {
         )
     }
 
-    /// Admit a prompt-only request through the scheduler for a package this
-    /// runtime has no decode core for.
+    /// Admit a workflow-driven request through the scheduler.
     ///
-    /// A no-decode-core request still shares this runtime's scheduler, and —
+    /// A workflow-driven request still shares this runtime's scheduler, and —
     /// when the process configured one — its KV byte budget: components own
     /// their own caches, but the byte accounting a shared budget protects is
     /// shared regardless of which executor a step names. Called from
     /// [`crate::engine::workflow_api::Engine::generate_with_pipeline_callbacks`]'s
-    /// no-decode-core branch — the one place every prompt-only request for
-    /// such a package passes through, whether it arrived cold
-    /// ([`Self::generate_interpreted`]) or through a continuing workflow
-    /// session ([`Self::generate_in_workflow_session`]) — this gives the path
+    /// workflow branch — the one place every request that runs the declared
+    /// workflow passes through, whether it arrived cold
+    /// ([`Self::generate_interpreted`]), through a continuing workflow session
+    /// ([`Self::generate_in_workflow_session`]), or carrying tensors no prompt
+    /// can express — this gives the path
     /// the same "reject at the door" guarantee
     /// [`Self::generate_native_cold_with_callback`] already has instead of
     /// letting the request fail deep inside node execution once a value the
@@ -872,8 +872,8 @@ impl Engine {
         ))
     }
 
-    /// Prompt length for scheduler admission before a no-decode-core request's
-    /// workflow has bound any input.
+    /// Prompt length for scheduler admission before a workflow-driven
+    /// request has bound any input.
     ///
     /// The interpreter tokenizes a text prompt itself once the workflow runs
     /// (from the package's own tokenizer, since this engine owns none for a
@@ -891,11 +891,23 @@ impl Engine {
             GeneratePrompt::TokenRows(rows) => {
                 Ok(rows.iter().map(Vec::len).max().unwrap_or(0) * rows.len())
             }
+            // The package's tokenizer answers first, so a no-decode-core
+            // package gets exactly the count the interpreter will later
+            // produce. The fallback is for the case this path only started
+            // serving once tensor-bound requests began admitting here: a
+            // runtime that holds a decode core owns the tokenizer while its
+            // package may ship none, and refusing to admit such a request for
+            // want of an encoder the engine is holding would be the gate
+            // declining to do the one thing it needs a tokenizer for.
             GeneratePrompt::Text(text) => {
-                let tokenizer = self.workflow.package_tokenizer().context(
-                    "this package declares a prompt_tokens input but ships no tokenizer, so a \
-                     text prompt cannot be encoded for it; supply token ids instead",
-                )?;
+                let tokenizer = self
+                    .workflow
+                    .package_tokenizer()
+                    .or(self.tokenizer.as_ref())
+                    .context(
+                        "this package declares a prompt_tokens input but ships no tokenizer, so a \
+                         text prompt cannot be encoded for it; supply token ids instead",
+                    )?;
                 tokenizer
                     .encode(text)
                     .map(|ids| ids.len())
@@ -3275,6 +3287,87 @@ mod tests {
             "a tensor-bound request must signal admission exactly once: the server's \
              admission oneshot has no other resolver on a successful generation"
         );
+        Ok(())
+    }
+
+    /// #1891's residual, and the one case none of the three tests above can
+    /// reach: a request that binds a tensor.
+    ///
+    /// Every admission test written for #1900/#1904 sends a *prompt*, and
+    /// `generate_with_pipeline_callbacks` splits on exactly that -- a request
+    /// carrying inputs or component overrides is not prompt-only, takes the
+    /// `!prompt_only` branch, and that branch fires `on_admitted()` and runs
+    /// the workflow without ever consulting the scheduler. So the byte budget
+    /// #1900 wired in is enforced for `generate("hello")` and not for the same
+    /// engine, same budget, same prompt plus one bound tensor.
+    ///
+    /// The control is the point: both arms use one engine constructor and one
+    /// budget, and differ only by the tensor. If the fixture simply failed for
+    /// its own reasons, or the budget refused everything, both arms would read
+    /// the same. They do not, and the arm that differs is the one that skipped
+    /// admission.
+    ///
+    /// The second assertion is the one that cannot be satisfied by a symptom
+    /// fix: `on_admitted()` firing when nothing admitted is a lie to whatever
+    /// is on the other end of it -- for the server driver that callback is a
+    /// oneshot that tells a waiting client "you are in", so it must not be sent
+    /// by a path that made no such decision.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_bound_tensor_does_not_exempt_a_request_from_scheduler_admission() -> anyhow::Result<()> {
+        // Same shape as `native_generate_rejects_over_kv_byte_budget_before_backend_run`:
+        // one prompt token plus one new token at 10 bytes each needs 20, and
+        // this engine has 10. Every arm below is over budget by construction.
+        fn over_budget_request() -> crate::pipeline::PipelineGenerateRequest {
+            let mut request = crate::pipeline::PipelineGenerateRequest::new(GenerateRequest::new(
+                GeneratePrompt::TokenIds(vec![1]),
+            ));
+            request.request.options.max_new_tokens = 1;
+            request.request.options.stop_on_eos = false;
+            request
+        }
+
+        // Both ways a request stops being prompt-only, because a fix that
+        // admits bound tensors and forgets overrides leaves the same hole open
+        // through the other door.
+        let arms = vec![
+            ("prompt-only (control)", over_budget_request()),
+            (
+                "one bound tensor",
+                over_budget_request().with_input(
+                    "pixel_values",
+                    onnx_genai_ort::Value::from_slice_i64(&[0], &[1])?,
+                ),
+            ),
+            (
+                "one component override",
+                over_budget_request().with_component_override("decoder", "decoder"),
+            ),
+        ];
+
+        let mut wrong = Vec::new();
+        for (label, request) in arms {
+            let mut engine = interpreted_engine_with_byte_budget(10)?;
+            assert!(!engine.holds_decode_core());
+            let mut admitted = false;
+            let mut on_admitted = || admitted = true;
+            let error = engine
+                .generate_with_pipeline_callbacks(request, Some(&mut on_admitted), None)
+                .map(|_| String::from("<generation succeeded>"))
+                .unwrap_or_else(|error| error.to_string());
+            if !error.contains("scheduler admission failed: KV byte budget") {
+                wrong.push(format!(
+                    "{label}: over-budget request was not refused at the door; got: {error}"
+                ));
+            }
+            if admitted {
+                wrong.push(format!(
+                    "{label}: on_admitted() fired with no admission decision behind it"
+                ));
+            }
+        }
+
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
         Ok(())
     }
 
