@@ -825,6 +825,13 @@ mod tests {
     /// elapsed time larger, never smaller, so it cannot flake the way the upper
     /// bound did. It stays native-only, since a virtual clock under an
     /// interpreter is not the thing it is checking.
+    ///
+    /// The trade is worth stating rather than leaving implicit: the old upper
+    /// bound also happened to cap the wall-clock time of the *whole* dispatch,
+    /// and the count does not. A timing regression elsewhere in the dispatch
+    /// path would no longer trip these two tests. That ceiling was never what
+    /// they were for, and it is precisely the machine-dependent half that
+    /// flaked -- but it is coverage given up, not coverage that was redundant.
     #[test]
     fn a_probe_stalls_once_not_once_per_index() {
         let probe = AtomicU32::new(0);
