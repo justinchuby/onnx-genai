@@ -96,7 +96,12 @@ bounded by `MAX_IMAGE_COUNT`).
 `BatchLayout::TokenPacked { offsets, owner, axis }` exists in the schema
 (`crates/onnx-genai-metadata/src/schema/ir.rs:33-59`) and is documented as the
 encoder layout in
-[§10.1](INFERENCE_METADATA_DECISIONS.md#101-independent-encoder-batching).
+[§10.1](INFERENCE_METADATA_DECISIONS.md#101-independent-encoder-batching). That
+flat single-pair shape is what
+[§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)
+replaces with an ordered `levels` chain — a replacement rather than an addition,
+and the one deliberate compatibility break in this surface
+([§6.1](#61-schema-evolution-what-actually-happens-to-an-old-runtime)).
 
 ### 2.2 Component-level batching capability does not exist
 
@@ -1376,6 +1381,38 @@ claim; it is a mechanism, and it lands in P1 **before** any new field is emitted
   ([§4.4](INFERENCE_METADATA_DECISIONS.md#44-semantic-identity)) for no gain.
   The new minimum applies to the packages that actually need the new surface, and
   to no others.
+- **One deliberate exception: the flat `token_packed` spelling is replaced, not
+  extended.** Everything else in this surface is additive, and this is not.
+  `TokenPacked` was one `axis` plus a single `offsets`/`owner` pair; it becomes
+  one `axis` plus `levels`. The pair does not survive alongside the chain, so a
+  v1.0 document that spells the flat form is **refused** by a v1.1 runtime, and
+  this section **does not promise that every v1.0 document loads unchanged** —
+  only that a document which does not use `token_packed` keeps its bytes and its
+  behavior. The refusal is a `deny_unknown_fields`-class parse failure by
+  default, so P1 owes it the same treatment as the version gate: an actionable
+  message naming the value, the removed spelling, and the rewrite.
+
+  **The migration is mechanical, and it is a migration rather than a shim.**
+  `{ offsets: X, owner: Y, axis: 0 }` becomes
+  `{ axis: 0, levels: [ { offsets: X, owner: Y } ] }` — a one-level chain means
+  exactly what the flat form meant, item-in-row ownership with no nesting, so no
+  document loses expressiveness and none needs a decision made for it. A
+  dual-accepting deserializer was considered and rejected: it would be two
+  spellings of one fact (Rule 10) carried indefinitely, and every rule in
+  [§4](#4-strict-token_packed-validation) would have to be written twice, once
+  against each shape, which is where the real cost of a shim lands.
+
+  **What makes the break affordable is that the blast radius is measurable and
+  small.** No package under `tests/fixtures/onnx_genai_workflows/` or
+  `examples/inference_metadata/` declares `token_packed` at all; the only in-repo
+  document that spells the flat form is a single metadata test
+  (`crates/onnx-genai-metadata/tests/redesign_invariants.rs:158`), which P1
+  migrates in the same change. The layout also has no runtime consumer today
+  ([§2.3](#23-token_packed-has-no-runtime)), so there is no deployed behavior to
+  preserve. This project accepts development-time breaking
+  changes where the alternative is a permanent second spelling; that is the trade
+  taken here, and it is stated so that a later reader does not restore the flat
+  form in the name of compatibility it never had.
 - **A version may gate what a document must *say*; it never gates what a document
   may say *wrongly*.** The gate above decides which vocabulary a document may use.
   A second, subtler use follows from it: when a new field makes an existing
@@ -1488,8 +1525,10 @@ provider) combination:
 **Fixtures are synthetic, tiny, and checked in.** Every acceptance row runs on a
 generated fixture in `tests/fixtures/onnx_genai_workflows/`, built by a
 `scripts/build_tiny_*.py` generator like every other fixture in the repository
-(26 such generators today, including `build_tiny_vlm.py`, feeding 19 workflow
-fixture directories, one of which is `video`). Video grouping needs a new one: a **synthetic video-encoder fixture**
+(26 such generators today, including `build_tiny_vlm.py`, feeding 17 workflow
+fixture directories — 19 entries counting `README.md` and `SOURCE_COMMIT` — one
+of which is `video`). Video grouping needs a new one: a **synthetic
+video-encoder fixture**
 with a handful of frames at a small resolution, deterministic outputs so that
 solo-versus-group equality is exact rather than approximate, and enough shape
 variety to cover the matrix — clips of differing frame counts, requests carrying
@@ -1622,13 +1661,22 @@ P2 validation                    │                          │
   `BatchLayout::TokenPacked.levels`, and the `pack_offsets` / `pack_owner` /
   `valid_lengths` content roles
   ([§3.3](#33-ownership-values-a-preprocessing-program-must-be-able-to-produce)),
-  emitted only for packages that use them. Regenerate
-  `schema/inference_metadata.schema.json` with `gen_schema`. Positive fixtures
-  only; nothing reads the fields yet. Guards: `cargo test -p onnx-genai-metadata`
-  including the committed-schema comparison, plus a test that a `v1.1` document
-  is refused by a `v1.0` runtime with the gate's message, that all three legacy
-  spellings normalize to the same version, and that every existing fixture's
-  bytes and version string are unchanged by a round trip.
+  emitted only for packages that use them. **`levels` replaces the flat
+  `offsets`/`owner` pair rather than joining it**, which is the one deliberate
+  break in this surface, so the same phase migrates the single in-repo document
+  that spells the flat form
+  (`crates/onnx-genai-metadata/tests/redesign_invariants.rs:158`) to the
+  equivalent one-level chain and gives the removed spelling a named error rather
+  than an unknown-field one
+  ([§6.1](#61-schema-evolution-what-actually-happens-to-an-old-runtime)). No shim
+  accepts both shapes. Regenerate `schema/inference_metadata.schema.json` with
+  `gen_schema`. Positive fixtures only; nothing reads the fields yet. Guards:
+  `cargo test -p onnx-genai-metadata` including the committed-schema comparison,
+  plus a test that a `v1.1` document is refused by a `v1.0` runtime with the
+  gate's message, that all three legacy spellings normalize to the same version,
+  that a flat `token_packed` document is refused with the migration message and
+  its one-level rewrite accepted, and that every existing fixture's bytes and
+  version string are unchanged by a round trip.
 - **P2 — validation.** Implement [§3.1](#31-workflowcomponentbatch_capacity)
   rules 1–9 and [§4](#4-strict-token_packed-validation) rules 1–8, each with a
   negative fixture asserting the exact message — including a three-level packing
@@ -1711,7 +1759,7 @@ Every row is an end-to-end test, not a unit assertion. "Solo" means the same
 item executed alone through the same package; per-row equality against solo is
 the correctness definition for every batching row. Rows 1–9 are modality-neutral
 and are run against both an image encoder and a video encoder; rows 10–15 pin the
-modality-specific geometry that motivated the design; rows 16–26 cover the
+modality-specific geometry that motivated the design; rows 16–27 cover the
 structural bounds, the memory path, compatibility, and backend readiness. Every
 row runs on checked-in fixtures — the synthetic ones from P3c for grouping
 behavior, plus the retained real-CNN guard for row 21's operator classes — with
@@ -1740,7 +1788,7 @@ no downloaded weights, no sample media, and no network in the test path.
 | 19 | **Budgets bind materialized footprint.** Groups that hit the item budget with few frames; groups that hit the packed budget with few items (one long clip); a group whose *valid* padded extents would fit but whose materialized rectangle does not; and two groups of a resolution-**pinned** encoder that pin different `patches` values, only one of which fits the composed entry. | Each bound is enforced separately, none inferred from another; the padded dimension is charged `count × padded_extent`, not the sum of valid lengths; a composed path multiplies outermost-first, including pinned symbols — the larger-resolution group is refused while the smaller is admitted, which a budget on the item symbol could not have distinguished; a decode-side row bound is never used as an item bound. | P6 |
 | 20 | **No hidden host round-trip.** A group assembled from device-resident items, and a packed output split back to rows. | Transfer counters show no device→host→device traffic for already-resident values; per-row splits are aliases over the packed allocation where spans are contiguous; any unavoidable copy is counted and reported. | P7 |
 | 21 | **Unproven backend declines, per triple, and says so.** Native reports grouped execution unsupported for the CNN encoder while ORT groups the same workload; a second component with a different operator class is evaluated independently. | Outputs are identical between the two paths; native never receives a group for an unproven triple; one triple passing never flips another; the decline is counted and attributable, not silent; no attempted grouped invocation on the unproven path. The real-model guard in `batch_vision_crash.rs` runs and fails the job if its model is missing. | P5 |
-| 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged. | P1 |
+| 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged **unless it spells the replaced flat `token_packed` form**, which is refused with a message naming the removed spelling and the one-level `levels` rewrite — not an unknown-field error, and not a silent acceptance. | P1 |
 | 23 | **Conditional emission, and no rewriting of what exists.** Every existing in-tree document round-tripped through the writer, and a new document that declares `batch_capacity`. | For the existing documents the **bytes and the version strings are unchanged** — `v1` stays `v1`, `1.0` stays `1.0`, absent stays absent, and no field of this design is emitted — so no existing runtime's minimum moves and no semantic identity changes. The new document **MUST** stamp `v1.1`. | P1 |
 | 24 | **Every output level declares its producer.** A mixed-chain output (inner level `extent: produced` with component-output companions, outer level `extent: preserved` reusing the input's clip pair) exercised end to end; a token-merging graph whose output length differs from its input's; and three negative cases — a level omitting `extent`, a `produced` level naming an input companion, and a `preserved` level naming a companion of a different extent. | The mixed chain validates per level and splits at the graph's own inner boundaries while reusing the outer mapping; the negatives are rejected at load naming the value, the level, and both facts; no path ever splits a produced level with input offsets. | P2, P4 |
 | 25 | **Serving admits companions, and only companions.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a padded value *without* them; and one emitting an unrelated `shared` rank-1 value. | The first two validate — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items; the third is rejected for withholding the only account of its padding; the fourth is still rejected with the existing message. | P2, P6 |
