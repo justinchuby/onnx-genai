@@ -38,6 +38,7 @@ mod speech;
 mod sse;
 mod state;
 mod types;
+mod worker;
 
 pub use cli::{ServeArgs, run_serve};
 pub use models_config::{ModelSpec, ModelsConfig, from_models_dir};
