@@ -3938,41 +3938,6 @@ fn workflow_package_without_conversation(scratch: &tempfile::TempDir) -> PathBuf
     destination
 }
 
-async fn completion_turn(
-    router: axum::Router,
-    model: &str,
-    session: Option<&str>,
-    prompt: &str,
-) -> (StatusCode, Value) {
-    let mut builder = Request::builder()
-        .method("POST")
-        .uri("/v1/completions")
-        .header(header::CONTENT_TYPE, "application/json");
-    if let Some(session) = session {
-        builder = builder.header("x-session-id", session);
-    }
-    let response = router
-        .oneshot(
-            builder
-                .body(Body::from(
-                    json!({
-                        "model": model,
-                        "prompt": prompt,
-                        "max_tokens": 2,
-                        "temperature": 0.0
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let status = response.status();
-    let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    (status, body)
-}
-
 async fn chat_turn(
     router: axum::Router,
     session: Option<&str>,
@@ -4435,108 +4400,69 @@ async fn a_fim_completion_carrying_a_session_id_opens_no_session() {
     assert_eq!(plain.status(), StatusCode::OK);
 }
 
-/// A decode-core session is charged the prompt it received, and nothing else.
-///
-/// `Engine::prepends_session_conversation` is false for it: its conversation
-/// lives in KV, which the request does not carry and which the prefill does not
-/// repeat. Adding the session's retained count would charge each turn twice —
-/// inflating `usage`, halving the usable context and refusing at roughly half
-/// the model's limit.
-///
-/// The client resends the conversation, which is what a decode-core client does
-/// on `/v1/completions`, where the prompt it sends is the prompt verbatim.
+/// An ORT decode-core session appends each request behind its retained KV.
 #[tokio::test]
-async fn a_decode_core_session_is_charged_only_its_request_prompt() {
+async fn an_ort_decode_core_session_is_charged_for_what_it_attends() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    let handle = state
-        .registry
-        .resolve("")
-        .expect("registry")
-        .expect("a model is loaded");
-    let tokenizer = handle.tokenizer.clone();
-    drop(handle);
     let router = app(state);
     let session = "sess-decode-core";
 
-    let turn_one = "hello";
-    let resent = "hello world the";
-    let expected = |text: &str| tokenizer.encode(text).expect("encode").len() as u64;
-
-    let (status, first) =
-        completion_turn(router.clone(), "tiny-llm", Some(session), turn_one).await;
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), "hello").await;
     assert_eq!(status, StatusCode::OK, "{first}");
+    let first_prompt = first["usage"]["prompt_tokens"]
+        .as_u64()
+        .expect("prompt tokens");
+    let retained = session_tokens(&first);
     assert_eq!(
-        first["usage"]["prompt_tokens"]
-            .as_u64()
-            .expect("prompt tokens"),
-        expected(turn_one),
-        "the first turn is charged its own prompt: {first}"
+        retained,
+        first_prompt
+            + first["usage"]["completion_tokens"]
+                .as_u64()
+                .expect("generated"),
+        "the session retains this turn's prompt and generation: {first}"
     );
 
-    // Turn two resends the conversation. It is charged exactly what it sent —
-    // not that plus what the session retains.
-    let (status, second) = completion_turn(router.clone(), "tiny-llm", Some(session), resent).await;
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), "hello").await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(
         second["usage"]["prompt_tokens"]
             .as_u64()
             .expect("prompt tokens"),
-        expected(resent),
-        "a decode-core turn is charged its request prompt, not its prompt plus the session's: \
-         {second}"
-    );
-
-    // The same request with no session at all is charged the same, which is what
-    // "the session did not change the accounting" means.
-    let (status, stateless) = completion_turn(router, "tiny-llm", None, resent).await;
-    assert_eq!(status, StatusCode::OK, "{stateless}");
-    assert_eq!(
-        stateless["usage"]["prompt_tokens"]
-            .as_u64()
-            .expect("prompt tokens"),
-        second["usage"]["prompt_tokens"]
-            .as_u64()
-            .expect("prompt tokens"),
+        first_prompt + retained,
+        "the continuing turn is charged the sequence it is appended to: {second}"
     );
 }
 
-/// And its context and budget are not halved by the session either.
-///
-/// Two turns each a bit under half the model's window: together they exceed it,
-/// which is exactly what the double count would have added up before refusing
-/// the second.
+/// A conversation beyond the model window is refused rather than returning an
+/// empty successful completion.
 #[tokio::test]
-async fn a_decode_core_session_does_not_halve_the_context_or_the_budget() {
+async fn a_decode_core_conversation_past_the_window_is_refused_not_answered_empty() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load(&model_dir, Some("tiny-llm".to_string())).expect("load fixture");
-    let handle = state
-        .registry
-        .resolve("")
-        .expect("registry")
-        .expect("a model is loaded");
-    let context = handle
-        .model_max_context
-        .expect("the fixture declares a context limit");
-    drop(handle);
     let router = app(state);
-    let session = "sess-decode-core-budget";
+    let session = "sess-decode-core-window";
+    let message = "the quick brown fox jumps over the lazy dog";
 
-    let prompt = "hello world ".repeat(context / 4);
-    for turn in 0..2 {
-        let (status, body) =
-            completion_turn(router.clone(), "tiny-llm", Some(session), prompt.trim()).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "turn {} must be admitted on its own length: {body}",
-            turn + 1
-        );
-        assert!(
-            body["choices"][0]["text"].is_string(),
-            "and the budget it was admitted with is its own: {body}"
-        );
-    }
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), message).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert!(
+        first["usage"]["completion_tokens"]
+            .as_u64()
+            .expect("generated")
+            > 0,
+        "the first turn generates: {first}"
+    );
+
+    let (status, second) = chat_turn_for(router, "tiny-llm", Some(session), message).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{second}");
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("context limit"),
+        "the refusal names the limit it hit: {second}"
+    );
 }
 
 /// A lease the graph carries is not in front of the prompt, so it is not

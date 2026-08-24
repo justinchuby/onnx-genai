@@ -682,29 +682,29 @@ fn a_busy_session_is_a_retryable_capability_refusal() {
     ));
 }
 
-/// The carrier gate decides whether a session is charged at all.
-///
-/// `prepends_session_conversation` is the one question a front end asks before
-/// adding a session's length to a request's, and it is true for exactly one
-/// carrier. Asserting the answer for both kinds of package here — where it is
-/// decided — is what keeps the server's accounting from being a guess about
-/// which runtime it is talking to.
+/// Carriers decide independently what is attended and what is recomputed.
 #[test]
-fn only_a_prompt_continuation_package_prepends_its_conversation() -> anyhow::Result<()> {
-    // A prompt-prefix continuation: prepended, so the carry is its length.
+fn a_carrier_decides_what_is_attended_and_what_is_recomputed() -> anyhow::Result<()> {
     let mut interpreted = Engine::from_dir(&decoder_package(), EngineConfig::default())?;
     assert!(interpreted.prepends_session_conversation());
     let session = interpreted.create_session()?;
-    assert_eq!(interpreted.session_prefill_carry(session)?, 0);
+    assert_eq!(
+        interpreted.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry::default()
+    );
     let opening = [2u32, 4, 6, 3];
     let first = interpreted.generate_in_session(session, tokens(&opening, 3))?;
     let conversation = opening.len() + first.token_ids.len();
-    assert_eq!(interpreted.session_prefill_carry(session)?, conversation);
+    assert_eq!(
+        interpreted.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry {
+            attended: conversation,
+            reprefilled: conversation,
+        }
+    );
     assert_eq!(interpreted.session_token_count(session)?, conversation);
 
-    // A decode core: its conversation lives in KV, which the request does not
-    // carry and the prefill does not repeat. The session retains tokens and the
-    // carry is still zero — those are different questions.
+    // An ORT decode core attends its retained sequence from KV.
     let tiny = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let mut decode_core = Engine::from_dir(&tiny, EngineConfig::default())?;
     assert!(!decode_core.prepends_session_conversation());
@@ -716,8 +716,11 @@ fn only_a_prompt_continuation_package_prepends_its_conversation() -> anyhow::Res
     );
     assert_eq!(
         decode_core.session_prefill_carry(session)?,
-        0,
-        "a decode core prepends nothing, so a request is charged nothing for it"
+        onnx_genai_engine::SessionPrefillCarry {
+            attended: 3 + first.token_ids.len(),
+            reprefilled: 0,
+        },
+        "the retained sequence is attended without being re-prefilled"
     );
     assert_eq!(decode_core.session_conversation(session)?, None);
 
@@ -754,6 +757,9 @@ fn a_graph_carried_lease_does_not_prepend_a_conversation() -> anyhow::Result<()>
         "a loop-carried lease lives in a cache the package bounds, not in front of a prompt"
     );
     let session = engine.create_session()?;
-    assert_eq!(engine.session_prefill_carry(session)?, 0);
+    assert_eq!(
+        engine.session_prefill_carry(session)?,
+        onnx_genai_engine::SessionPrefillCarry::default()
+    );
     Ok(())
 }

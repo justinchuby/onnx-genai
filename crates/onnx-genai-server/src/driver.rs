@@ -106,7 +106,8 @@ pub(crate) enum DriverCommand {
     /// Tokens this session will put in front of the next turn's prompt.
     SessionPrefillCarry {
         session_id: SessionId,
-        response: tokio::sync::oneshot::Sender<anyhow::Result<usize>>,
+        response:
+            tokio::sync::oneshot::Sender<anyhow::Result<onnx_genai_engine::SessionPrefillCarry>>,
     },
     /// Generate, from whatever the request carried.
     ///
@@ -385,15 +386,11 @@ impl EngineDriver {
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
     }
 
-    /// Tokens this session will put in front of the next turn's prompt.
-    ///
-    /// Zero unless the loaded package continues its conversation by prepending
-    /// it, which is what a front end must add to a request's own prompt length
-    /// before enforcing a context limit or reporting `usage`.
+    /// Tokens attended ahead of the prompt and the subset re-prefilled.
     pub(crate) async fn session_prefill_carry(
         &self,
         session_id: SessionId,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<onnx_genai_engine::SessionPrefillCarry> {
         let (response, rx) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::SessionPrefillCarry {

@@ -71,3 +71,16 @@ pub fn package_capability_error(error: &anyhow::Error) -> Option<PackageCapabili
         .chain()
         .find_map(|cause| cause.downcast_ref::<PackageCapabilityError>().cloned())
 }
+
+/// What a session already holds in front of the next turn's prompt.
+///
+/// `attended` contributes to context admission and usage. `reprefilled`
+/// contributes to work metrics. They differ for an ORT decode core, whose
+/// retained sequence is attended from KV without being recomputed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionPrefillCarry {
+    /// Tokens the model holds in front of this turn's prompt.
+    pub attended: usize,
+    /// Of those tokens, how many this turn will prefill again.
+    pub reprefilled: usize,
+}

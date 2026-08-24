@@ -1751,12 +1751,8 @@ impl Engine {
     /// Whether the loaded package continues a conversation by putting it in
     /// front of the next turn's prompt.
     ///
-    /// This is the gate on charging a request for a session: only a package
-    /// whose carrier is `SessionStateCarrier::PromptContinuation` prepends the
-    /// conversation, so only for that one is the session's retained length part
-    /// of what the turn is prefilled with.
-    ///
-    /// It is **false** for everything else, and each for its own reason:
+    /// This answers only whether the authored workflow explicitly prepends a
+    /// token conversation. It is **false** for everything else:
     ///
     /// * a **decode core** keeps its conversation in KV, which the request does
     ///   not carry and the prefill does not repeat;
@@ -1764,10 +1760,6 @@ impl Engine {
     ///   graph, so the tokens it stands for live in a cache the package bounds
     ///   itself rather than in front of a prompt;
     /// * a package with no session state has no conversation at all.
-    ///
-    /// Adding a session's retained count for any of those charges a turn twice
-    /// — inflating `usage`, halving the usable context, and refusing requests at
-    /// roughly half the model's limit.
     ///
     /// Answered from the shared classifier, never from "does this session hold
     /// state": those are different questions with the same shape.
@@ -1778,24 +1770,40 @@ impl Engine {
         self.workflow.prepends_session_conversation()
     }
 
-    /// Tokens this session already holds in front of the next turn's prompt.
+    /// What this session contributes ahead of the next prompt.
     ///
-    /// Zero unless [`Self::prepends_session_conversation`] — the carrier gate —
-    /// is true. See it for why every other carrier contributes nothing.
-    pub fn session_prefill_carry(&self, session_id: SessionId) -> anyhow::Result<usize> {
-        if !self.prepends_session_conversation() {
-            // Resolved through the same accessor a caller would use, so an
-            // unknown id is reported as one rather than answered with a zero.
-            self.session_token_count(session_id)?;
-            return Ok(0);
+    /// ORT decode-core sessions append a turn to their retained sequence, so
+    /// that sequence is attended but served from KV rather than re-prefilled.
+    /// Native decode-core sessions replace their cached prefix with the
+    /// incoming prompt, so their retained tokens contribute neither value.
+    /// Prompt continuation contributes both; graph-carried state contributes
+    /// neither because the package bounds that cache itself.
+    pub fn session_prefill_carry(
+        &self,
+        session_id: SessionId,
+    ) -> anyhow::Result<SessionPrefillCarry> {
+        if self.holds_decode_core() {
+            let retained = self.session_token_count(session_id)?;
+            #[cfg(feature = "native-backend")]
+            if self.decode_backend == EngineDecodeBackend::Native {
+                return Ok(SessionPrefillCarry::default());
+            }
+            return Ok(SessionPrefillCarry {
+                attended: retained,
+                reprefilled: 0,
+            });
         }
         anyhow::ensure!(
             self.workflow_sessions.contains_key(&session_id),
             "session {session_id} not found"
         );
-        Ok(self
+        let prepended = self
             .workflow
-            .session_prepended_prompt_len(&session_id.to_string()))
+            .session_prepended_prompt_len(&session_id.to_string());
+        Ok(SessionPrefillCarry {
+            attended: prepended,
+            reprefilled: prepended,
+        })
     }
 
     /// The tokens a session's conversation holds, oldest first.

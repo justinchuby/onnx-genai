@@ -82,7 +82,7 @@ pub(crate) use runtime::apply_eos_policy;
 pub(crate) mod session_state;
 mod speculative_load;
 mod workflow_api;
-pub use capability::{PackageCapabilityError, package_capability_error};
+pub use capability::{PackageCapabilityError, SessionPrefillCarry, package_capability_error};
 pub use metadata::graph_port_contracts;
 
 pub(crate) use decode_backend::*;

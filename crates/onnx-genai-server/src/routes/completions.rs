@@ -155,14 +155,14 @@ async fn run_completion(
     let conversational =
         conversational_session_id(&prepared.generation, client_session_id.as_deref());
     let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
-    let prompt_tokens = carried_tokens + prepared.prompt_tokens;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
     let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     let result = collect_generation_result(generation.events)
         .await
         .map_err(generation_failure)?;
-    crate::metrics::add_prompt_tokens(prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let completion_tokens = result.token_ids.len();
     let logprobs = completion_logprobs(&result, &tokenizer, requested_logprobs)
         .map_err(|err| ApiError::internal(format!("logprobs conversion failed: {err}")))?;
@@ -206,13 +206,13 @@ async fn stream_completion(
     let conversational =
         conversational_session_id(&prepared.generation, client_session_id.as_deref());
     let carried_tokens = carried_session_tokens(&handle, &state.sessions, conversational).await?;
-    let prompt_tokens = carried_tokens + prepared.prompt_tokens;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
     let session_id = open_session_after_admission(&handle, &state.sessions, conversational).await?;
     let generation = submit_completion(&handle, prepared.generation, session_id).await?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
     let (tx, rx) = mpsc::channel(16);
 
     tokio::spawn(async move {
@@ -412,7 +412,7 @@ async fn run_chat_completion(
     // evicts somebody else's on its way in.
     let carried_tokens =
         carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
-    let prompt_tokens = carried_tokens + prepared.prompt_tokens;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
         prompt_tokens,
@@ -438,7 +438,7 @@ async fn run_chat_completion(
     let result = collect_generation_result(generation.events)
         .await
         .map_err(generation_failure);
-    crate::metrics::add_prompt_tokens(prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     let session_token_count = if let Some(engine_session_id) = session_for_count {
         Some(
@@ -579,7 +579,7 @@ async fn stream_chat_completion(
     };
     let carried_tokens =
         carried_session_tokens(&handle, &state.sessions, client_session_id.as_deref()).await?;
-    let prompt_tokens = carried_tokens + prepared.prompt_tokens;
+    let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     let output_budget = admit_output_budget(
         &request,
         prompt_tokens,
@@ -603,7 +603,7 @@ async fn stream_chat_completion(
         .map_err(map_generate_submit_error)?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
-    crate::metrics::add_prompt_tokens(prompt_tokens);
+    crate::metrics::add_prompt_tokens(carried_tokens.reprefilled + prepared.prompt_tokens);
 
     tokio::spawn(async move {
         send_stream_chunk(&tx, role_chunk(&id, created, &model)).await?;
@@ -1247,17 +1247,8 @@ fn session_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, ApiErr
     Ok(Some(session_id.to_string()))
 }
 
-/// Tokens the loaded package will put in front of this turn's prompt, without
+/// What the session contributes to context accounting and prefill work, without
 /// opening a session.
-///
-/// Gated on `Engine::prepends_session_conversation`, the shared carrier
-/// classification: a request is charged for a session **only** when the package
-/// continues its conversation by prepending it, which is
-/// `SessionStateCarrier::PromptContinuation` and nothing else. A decode core
-/// keeps its conversation in KV, and a loop-carried or group-held lease lives in
-/// a cache the package bounds itself; charging either would count each turn
-/// twice, inflating `usage`, halving the usable context and refusing requests at
-/// roughly half the model's limit.
 ///
 /// A session is deliberately *not* created here. A request that then fails
 /// admission would leave an engine session nobody uses, and — once the registry
@@ -1267,15 +1258,15 @@ async fn carried_session_tokens(
     handle: &ModelHandle,
     sessions: &SessionRegistry,
     client_session_id: Option<&str>,
-) -> Result<usize, ApiError> {
+) -> Result<onnx_genai_engine::SessionPrefillCarry, ApiError> {
     let Some(client_id) = client_session_id else {
-        return Ok(0);
+        return Ok(onnx_genai_engine::SessionPrefillCarry::default());
     };
     let Some(session_id) = sessions
         .get(client_id)
         .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
     else {
-        return Ok(0);
+        return Ok(onnx_genai_engine::SessionPrefillCarry::default());
     };
     handle
         .engine
