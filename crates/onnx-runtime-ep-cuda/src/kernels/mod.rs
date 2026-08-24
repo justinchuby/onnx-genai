@@ -71,6 +71,7 @@ pub mod matmul;
 pub mod matmul_nbits;
 pub mod mod_op;
 pub mod movement;
+pub mod multi_head_attention;
 pub mod nary;
 pub mod nonzero;
 pub mod normalization;
@@ -207,6 +208,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "Max",
     "Attention",
     "GroupQueryAttention",
+    "MultiHeadAttention",
     "RotaryEmbedding",
     "Softmax",
     "LayerNormalization",
@@ -1291,6 +1293,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("GroupQueryAttention", "com.microsoft", 1),
         Box::new(group_query_attention::GroupQueryAttentionFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("MultiHeadAttention", "com.microsoft", 1),
+        Box::new(multi_head_attention::MultiHeadAttentionFactory {
             runtime: runtime.clone(),
         }),
     );
