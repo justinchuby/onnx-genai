@@ -5479,8 +5479,10 @@ fn dft_v20_axis_input_default_and_unknown() {
 fn stft_frame_length_window_and_onesided_default() {
     // frame_length = 16, frame_step = 4, signal_length = 64, onesided default 1
     // -> frames = (64-16)/4 + 1 = 13, bins = 16/2 + 1 = 9.
+    let mut frame_length_node = node("STFT", 4, 1);
+    frame_length_node.inputs[2] = None;
     let with_frame_length = run(
-        &node("STFT", 4, 1),
+        &frame_length_node,
         vec![
             f32in(vec![c(2), c(64), c(1)]),
             i64_scalar(4),
@@ -5492,8 +5494,10 @@ fn stft_frame_length_window_and_onesided_default() {
     assert_eq!(out_shape(&with_frame_length), vec![c(2), c(13), c(9), c(2)]);
 
     // Two-sided: bins == frame_length.
+    let mut two_sided_node = with_attr(node("STFT", 4, 1), "onesided", Attribute::Int(0));
+    two_sided_node.inputs[2] = None;
     let two_sided = run(
-        &with_attr(node("STFT", 4, 1), "onesided", Attribute::Int(0)),
+        &two_sided_node,
         vec![
             f32in(vec![c(2), c(64), c(1)]),
             i64_scalar(4),
@@ -5526,8 +5530,10 @@ fn stft_frame_length_window_and_onesided_default() {
 fn stft_symbolic_signal_degrades_frame_count() {
     // Unknown signal length -> unknown frame count (fresh), but batch/bins/2
     // stay resolved.
+    let mut stft = node("STFT", 4, 1);
+    stft.inputs[2] = None;
     let symbolic = run(
-        &node("STFT", 4, 1),
+        &stft,
         vec![
             tin(DataType::Float32, vec![sym(3), sym(4), c(1)]),
             i64_scalar(4),
@@ -5545,7 +5551,7 @@ fn stft_symbolic_signal_degrades_frame_count() {
     // since_version boundary: opset 16 is unresolved.
     assert!(
         run(
-            &node("STFT", 4, 1),
+            &stft,
             vec![
                 f32in(vec![c(2), c(64), c(1)]),
                 i64_scalar(4),
@@ -5557,6 +5563,68 @@ fn stft_symbolic_signal_degrades_frame_count() {
         .type_info
         .is_none()
     );
+}
+
+#[test]
+fn stft_rejects_invalid_static_contracts() {
+    let mut frame_length_node = node("STFT", 4, 1);
+    frame_length_node.inputs[2] = None;
+
+    let zero_step = try_run(
+        &frame_length_node,
+        vec![
+            f32in(vec![c(1), c(8), c(1)]),
+            i64_scalar(0),
+            NodeIo::default(),
+            i64_scalar(4),
+        ],
+        17,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(zero_step.contains("frame_step must be greater than zero"));
+
+    let short = try_run(
+        &frame_length_node,
+        vec![
+            f32in(vec![c(1), c(3), c(1)]),
+            i64_scalar(1),
+            NodeIo::default(),
+            i64_scalar(4),
+        ],
+        17,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(short.contains("complete unpadded frames"));
+
+    let complex_onesided = try_run(
+        &frame_length_node,
+        vec![
+            f32in(vec![c(1), c(8), c(2)]),
+            i64_scalar(2),
+            NodeIo::default(),
+            i64_scalar(4),
+        ],
+        17,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(complex_onesided.contains("onesided=1 requires a real signal"));
+
+    let mismatched = try_run(
+        &node("STFT", 4, 1),
+        vec![
+            f32in(vec![c(1), c(8), c(1)]),
+            i64_scalar(2),
+            f32in(vec![c(3)]),
+            i64_scalar(4),
+        ],
+        17,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(mismatched.contains("window length 3 must equal frame_length 4"));
 }
 
 #[test]

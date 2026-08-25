@@ -221,7 +221,7 @@ fn constant_of_shape_agrees() {
 
 #[test]
 fn migrated_shared_rules_agree() {
-    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "Expand", "Tile"];
+    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "Expand", "STFT", "Tile"];
     let rules = onnx_runtime_ep_plugin::compute::shared_native_rule_names_for_test();
     assert_eq!(
         rules, EXPECTED_RULES,
@@ -232,6 +232,7 @@ fn migrated_shared_rules_agree() {
         match rule {
             "ConstantOfShape" => constant_of_shape_agrees(),
             "Expand" => expand_agrees_on_bidirectional_broadcast(),
+            "STFT" => stft_agrees_on_overlapping_frames_and_onesided_bins(),
             "Tile" => tile_agrees(),
             other => panic!("shared rule {other} has no agreement fixture"),
         }
@@ -291,11 +292,50 @@ fn migrated_shared_rules_agree_on_edge_extents() {
     );
 }
 
+fn stft_agrees_on_overlapping_frames_and_onesided_bins() {
+    let signal_buf = [0.0f32; 128];
+    let signal = view(
+        DataType::Float32,
+        &[2, 64, 1],
+        &[64, 1, 1],
+        signal_buf.as_ptr().cast(),
+    );
+    let step_value = [4i64];
+    let step = view(DataType::Int64, &[], &[], step_value.as_ptr().cast());
+    let frame_value = [16i64];
+    let frame = view(DataType::Int64, &[], &[], frame_value.as_ptr().cast());
+    let absent_window = TensorView::absent(DataType::Float32);
+    let mut stft = node("STFT", 4, &[], 17);
+    stft.inputs[2] = None;
+
+    let plugin_inputs = [signal, step, absent_window, frame];
+    let native_inputs = vec![
+        typed(DataType::Float32, &[2, 64, 1]),
+        typed_with_values(&[], &step_value),
+        NodeIo::default(),
+        typed_with_values(&[], &frame_value),
+    ];
+    let native_dims = native_static(&native(&stft, native_inputs, 17))
+        .expect("STFT native rule must resolve concrete dimensions");
+    let strategy = ShapeInference::for_node(
+        &stft,
+        vec![vec![Some(2), Some(64), Some(1)], vec![], vec![], vec![]].as_slice(),
+        1,
+    );
+    assert!(
+        matches!(&strategy, ShapeInference::SharedNative { .. }),
+        "STFT must use the shared native shape adapter"
+    );
+    let plugin = onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&strategy, &plugin_inputs)
+        .expect("STFT shared plugin shape inference");
+    assert_eq!(plugin, vec![native_dims]);
+}
+
 // ── Sweep ────────────────────────────────────────────────────────────────────
 
 /// Every plain shape-preserving op added by #2049 must agree.
 ///
-/// The three cases above are hand-built because they need *values*. These do
+/// The four cases above are hand-built because they need *values*. These do
 /// not: one input, output shape equals it. Sweeping them costs nothing and
 /// catches the case where one table quietly stops preserving the shape — a
 /// `DequantizeLinear` that started broadcasting against its scale, say.
