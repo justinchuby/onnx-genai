@@ -750,6 +750,12 @@ impl Drop for Executor {
                  dispatch_elided={dispatch_elided}"
             );
         }
+        // Drain any installed route-residency boundary before the executor's
+        // buffers/kernels are torn down (issue #1810 Slice 7E goal 3). Default-off
+        // and when nothing was installed this is a cheap no-op; when enabled it
+        // releases the boundary, EP-owned telemetry producer sources and retained
+        // per-bank artifacts on the concrete EP.
+        self.ep.drain_route_residency_boundary_on_teardown();
         // Evict the global weight-transpose cache to prevent address-reuse
         // staleness: if a subsequently loaded model's mmap recycles a virtual
         // address, the cache must not serve the old model's transposed weights.

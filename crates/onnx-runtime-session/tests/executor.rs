@@ -109,6 +109,9 @@ fn i64_tensor(shape: &[usize], data: &[i64]) -> Tensor {
 struct HostDownloadCountingEp {
     cpu: CpuExecutionProvider,
     host_downloads: Arc<AtomicUsize>,
+    route_installs: Arc<AtomicUsize>,
+    route_drains: Arc<AtomicUsize>,
+    route_install_graph_nodes: Arc<AtomicUsize>,
 }
 
 impl HostDownloadCountingEp {
@@ -118,13 +121,44 @@ impl HostDownloadCountingEp {
         Self {
             cpu,
             host_downloads,
+            route_installs: Arc::new(AtomicUsize::new(0)),
+            route_drains: Arc::new(AtomicUsize::new(0)),
+            route_install_graph_nodes: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// Counter incremented once every time the production build path invokes
+    /// [`ExecutionProvider::install_route_residency_boundary_after_build`].
+    fn route_installs(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.route_installs)
+    }
+
+    /// Counter incremented once every time executor teardown invokes
+    /// [`ExecutionProvider::drain_route_residency_boundary_on_teardown`].
+    fn route_drains(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.route_drains)
+    }
+
+    /// Node count of the graph the last install hook received — proves the hook
+    /// is handed the finalized production graph, not an empty placeholder.
+    fn route_install_graph_nodes(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.route_install_graph_nodes)
     }
 }
 
 impl ExecutionProvider for HostDownloadCountingEp {
     fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
         Ok(())
+    }
+
+    fn install_route_residency_boundary_after_build(&self, graph: &Graph) {
+        self.route_installs.fetch_add(1, Ordering::Relaxed);
+        self.route_install_graph_nodes
+            .store(graph.num_nodes(), Ordering::Relaxed);
+    }
+
+    fn drain_route_residency_boundary_on_teardown(&self) {
+        self.route_drains.fetch_add(1, Ordering::Relaxed);
     }
 
     fn name(&self) -> &str {
@@ -1653,4 +1687,77 @@ fn from_graph_rejects_initializer_reused_as_node_output() {
     assert!(message.contains("weight"), "{message}");
     assert!(message.contains("overwrites_weight"), "{message}");
     assert!(message.contains("initializer"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// #1810 Slice 7E — the route-residency install/drain lifecycle hooks are
+// reachable from the REAL production build/teardown path, not a direct helper.
+//
+// `Executor::build_with_cuda_requirement` calls
+// `ExecutionProvider::install_route_residency_boundary_after_build` once, after
+// the static graph's kernels are compiled and buffers sized but before any
+// decode, handing the finalized graph to the EP. `Drop for Executor` calls
+// `drain_route_residency_boundary_on_teardown` on teardown. These tests drive a
+// real session build/drop and assert both hooks fire through the production
+// caller (the recording EP counts them); they never invoke the hooks directly.
+// ---------------------------------------------------------------------------
+
+fn static_gelu_model() -> Vec<u8> {
+    encode_model(&Model::new(&standard_gelu_graph(20))).expect("encode static Gelu model")
+}
+
+#[test]
+fn build_installs_route_residency_boundary_once_via_production_path() {
+    let downloads = Arc::new(AtomicUsize::new(0));
+    let ep = HostDownloadCountingEp::new(Arc::clone(&downloads));
+    let installs = ep.route_installs();
+    let drains = ep.route_drains();
+    let install_nodes = ep.route_install_graph_nodes();
+    let ep = Arc::new(ep);
+
+    let model = static_gelu_model();
+    let mut session = InferenceSession::builder()
+        .model_bytes(&model)
+        .execution_provider(ep)
+        .build()
+        .expect("build static Gelu session");
+
+    // A static graph materializes its executor during `build`, so the install
+    // hook fires before any run — exactly once, on the production build path.
+    assert_eq!(
+        installs.load(Ordering::Relaxed),
+        1,
+        "install_route_residency_boundary_after_build must fire once during build"
+    );
+    assert_eq!(
+        install_nodes.load(Ordering::Relaxed),
+        1,
+        "install hook must receive the finalized graph (1 Gelu node), not an empty placeholder"
+    );
+    assert_eq!(
+        drains.load(Ordering::Relaxed),
+        0,
+        "no drain before teardown"
+    );
+
+    // Running does not re-install: install is a once-per-build lifecycle event.
+    let x = Tensor::from_f32(&[2], &[-1.0, 1.0]).unwrap();
+    session.run(&[("x", &x)]).expect("run static Gelu");
+    assert_eq!(
+        installs.load(Ordering::Relaxed),
+        1,
+        "install must not repeat on run"
+    );
+
+    drop(session);
+    assert_eq!(
+        drains.load(Ordering::Relaxed),
+        1,
+        "drain_route_residency_boundary_on_teardown must fire once on executor teardown"
+    );
+    assert_eq!(
+        installs.load(Ordering::Relaxed),
+        1,
+        "teardown must not install"
+    );
 }

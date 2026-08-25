@@ -74,6 +74,14 @@ impl ExecutionProvider for PluginExecutionProvider {
         self.cpu.consume_route_residency_at_boundary()
     }
 
+    fn install_route_residency_boundary_after_build(&self, graph: &Graph) {
+        self.cpu.install_route_residency_boundary_after_build(graph)
+    }
+
+    fn drain_route_residency_boundary_on_teardown(&self) {
+        self.cpu.drain_route_residency_boundary_on_teardown()
+    }
+
     fn name(&self) -> &str {
         &self.provider_name
     }
