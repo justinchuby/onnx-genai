@@ -3,7 +3,7 @@
 use super::*;
 use crate::engine::memory_plan::{Holder, ModelMemoryPlan};
 use crate::memory_authority::{
-    DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryGovernor,
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryAccounting, EngineMemoryGovernor,
     SharedMemoryAuthorityProvider,
 };
 
@@ -594,6 +594,11 @@ impl EngineResourceGovernor {
 
     pub fn device_authority(&self) -> DeviceMemoryAuthority {
         self.memory.device_authority()
+    }
+
+    /// Read-only live accounting shared by every worker for this model.
+    pub fn memory_accounting(&self) -> EngineMemoryAccounting {
+        EngineMemoryAccounting::new(self.memory.clone())
     }
 
     pub fn process_memory_manager(&self) -> onnx_runtime_memory_governor::ProcessMemoryManager {

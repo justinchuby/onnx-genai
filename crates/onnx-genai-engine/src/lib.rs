@@ -64,7 +64,8 @@ pub use logits::{
     ProcessorChainBuilder, ProcessorContext, ProcessorSignal, StopSequence, TokenId,
 };
 pub use memory_authority::{
-    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, EngineMemoryAccounting,
+    MemoryAuthorityProvider,
 };
 #[cfg(feature = "native-backend")]
 pub use native_decode::{

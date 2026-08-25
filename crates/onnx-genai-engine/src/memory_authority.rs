@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use onnx_genai_scheduler::ResourceLimit;
+use onnx_genai_scheduler::{GovernorSnapshot, ResourceLimit, TierSnapshot};
 use onnx_runtime_memory_governor::{
     DeviceKey, HolderId, LeaseLedger, LedgerGovernor, MappedAllowance, MappedGrowthGrant,
     MappedGrowthMetrics, MappedHolderRegistration, MemoryAuthorityId, MemoryError, MemoryGovernor,
@@ -266,6 +266,63 @@ impl EngineMemoryGovernor {
             Tier::Host | Tier::Disk => &self.local,
         }
     }
+
+    fn limit(&self, tier: Tier) -> u64 {
+        match tier {
+            Tier::Device => self.device.limit_bytes(),
+            Tier::Host | Tier::Disk => self.local.ledger().limit(tier),
+        }
+    }
+}
+
+/// Read-only live view of the shared memory ledgers used by all model workers.
+///
+/// Cloning this handle does not create a budget. It keeps the same device,
+/// host, and disk authorities reachable so server snapshots can report worker
+/// allocation and release without asking any particular worker to execute.
+#[derive(Debug, Clone)]
+pub struct EngineMemoryAccounting {
+    memory: EngineMemoryGovernor,
+}
+
+impl EngineMemoryAccounting {
+    pub(crate) fn new(memory: EngineMemoryGovernor) -> Self {
+        Self { memory }
+    }
+
+    /// Replace the tier usage in a governor snapshot with current shared-ledger
+    /// values. Configuration and derived-policy fields remain the worker-0
+    /// baseline because they are identical across the supported worker pool.
+    pub fn refresh_snapshot(&self, snapshot: &mut GovernorSnapshot) {
+        snapshot.vram = self.tier_snapshot(Tier::Device);
+        snapshot.host_ram = self.tier_snapshot(Tier::Host);
+        if let Some(disk) = snapshot.disk_spill.as_mut() {
+            *disk = self.tier_snapshot(Tier::Disk);
+        }
+        if snapshot.resolved_limits.vram_bytes.is_some() {
+            snapshot.resolved_limits.vram_bytes = Some(snapshot.vram.limit);
+        }
+    }
+
+    /// Current aggregate device-tier usage for this authority.
+    pub fn device_snapshot(&self) -> TierSnapshot {
+        self.tier_snapshot(Tier::Device)
+    }
+
+    /// Stable identity of the shared device authority.
+    pub fn device_authority_id(&self) -> MemoryAuthorityId {
+        self.memory.device_authority().authority_id()
+    }
+
+    fn tier_snapshot(&self, tier: Tier) -> TierSnapshot {
+        let used = self.memory.used(tier);
+        let limit = self.memory.limit(tier);
+        TierSnapshot {
+            used,
+            limit,
+            headroom: limit.saturating_sub(used),
+        }
+    }
 }
 
 impl MemoryGovernor for EngineMemoryGovernor {
@@ -374,7 +431,11 @@ mod tests {
             80,
         );
         let second = first.clone();
+        let accounting = EngineMemoryAccounting::new(first.clone());
 
+        let device = second
+            .reserve(Tier::Device, 20, MemoryRole::Weights, HolderId::new(0))
+            .unwrap();
         let host = first
             .reserve(Tier::Host, 60, MemoryRole::KvCache, HolderId::new(1))
             .unwrap();
@@ -393,9 +454,14 @@ mod tests {
                 .is_err(),
             "workers must not each receive the full disk-spill budget"
         );
+        assert_eq!(accounting.tier_snapshot(Tier::Device).used, 20);
+        assert_eq!(accounting.tier_snapshot(Tier::Host).used, 60);
+        assert_eq!(accounting.tier_snapshot(Tier::Disk).used, 50);
 
+        drop(device);
         drop(host);
         drop(disk);
+        assert_eq!(accounting.tier_snapshot(Tier::Device).used, 0);
         assert_eq!(first.used(Tier::Host), 0);
         assert_eq!(second.used(Tier::Disk), 0);
     }
