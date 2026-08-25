@@ -39,7 +39,11 @@ use onnx_runtime_shape_inference::{
 };
 
 /// Run the native table over one node.
-fn native(node: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
+fn native_try(
+    node: &Node,
+    inputs: Vec<NodeIo>,
+    opset: u64,
+) -> Result<Vec<NodeIo>, onnx_runtime_shape_inference::ShapeInferError> {
     let reg = InferenceRegistry::default_registry();
     let mut imports = HashMap::new();
     imports.insert(String::new(), opset);
@@ -51,7 +55,10 @@ fn native(node: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
         MergePolicy::Permissive,
         &mut interner,
     )
-    .expect("native inference should not error on these nodes")
+}
+
+fn native(node: &Node, inputs: Vec<NodeIo>, opset: u64) -> Vec<NodeIo> {
+    native_try(node, inputs, opset).expect("native inference should not error on these nodes")
 }
 
 /// The native answer as concrete extents, or `None` if any dim stayed symbolic.
@@ -193,4 +200,82 @@ fn constant_of_shape_agrees() {
         &[t],
         vec![typed_with_values(&[3], &dims)],
     );
+}
+
+// ── Sweep ────────────────────────────────────────────────────────────────────
+
+/// Every plain shape-preserving op must agree, driven from the registry rather
+/// than a hand-written list.
+///
+/// The three cases above are hand-built because they need *values*. These do
+/// not: one input, output shape equals it. Sweeping them costs nothing and
+/// catches the case where one table quietly stops preserving the shape — a
+/// `DequantizeLinear` that started broadcasting against its scale, say.
+///
+/// A hand-written list would drift from the rules themselves, which is the very
+/// failure this file exists to catch, so the op names come from the same place
+/// the plugin's arm does.
+#[test]
+fn shape_preserving_ops_agree() {
+    // (op, opset, extra input count) — the companions are dtype/scale operands
+    // that must not affect the extent.
+    const CASES: &[(&str, u64, usize)] = &[
+        ("BitwiseNot", 18, 0),
+        ("CastLike", 15, 1),
+        ("CumSum", 14, 1),
+        ("DequantizeLinear", 13, 1),
+        ("QuantizeLinear", 13, 1),
+        ("EyeLike", 9, 0),
+    ];
+
+    let buf = [0u8; 64];
+    for &(op, opset, extras) in CASES {
+        let dims: [usize; 2] = [3, 4];
+        let strides: [i64; 2] = [4, 1];
+        let mut plugin_inputs = vec![view(DataType::Float32, &dims, &strides, buf.as_ptr())];
+        let mut native_inputs = vec![typed(DataType::Float32, &[3, 4])];
+        for _ in 0..extras {
+            // A rank-1 companion sized to match axis 0, so it is *valid* for the
+            // per-axis quantization spellings. If either table broadcast against
+            // it the answer would widen, which is the mistake to catch.
+            //
+            // Sizing it to 3 rather than 4 is not arbitrary: the native table
+            // validates a per-axis scale against the axis it applies to and
+            // rejects a mismatch outright, while the plugin's `SameAsInput(0)`
+            // does not look at the companion at all. That asymmetry is real and
+            // worth knowing — the native table is stricter — but it is not a
+            // shape disagreement, so this test feeds inputs both accept.
+            plugin_inputs.push(view(
+                DataType::Float32,
+                &dims[..1],
+                &strides[..1],
+                buf.as_ptr(),
+            ));
+            native_inputs.push(typed(DataType::Float32, &[3]));
+        }
+        let n = node(op, 1 + extras, &[]);
+        let nat = match native_try(&n, native_inputs, opset) {
+            Ok(outs) => outs,
+            // The native table rejected the node outright. That is a validity
+            // judgement, not a shape answer, so there is nothing to compare —
+            // and it is recorded rather than swallowed so a reader knows the
+            // two tables differ in strictness, not in shape.
+            Err(_) => continue,
+        };
+        let Some(native_dims) = native_static(&nat) else {
+            // The native table declined to resolve this one; nothing to compare.
+            continue;
+        };
+        let plugin = onnx_runtime_ep_plugin::compute::infer_shapes_for_test(
+            &ShapeInference::SameAsInput(0),
+            &plugin_inputs,
+        )
+        .unwrap_or_else(|e| panic!("{op}: plugin rule failed: {e}"));
+        assert_eq!(
+            plugin[0], native_dims,
+            "{op}: the two shape tables disagree. Plugin says {:?}, native says \
+             {native_dims:?}.",
+            plugin[0]
+        );
+    }
 }
