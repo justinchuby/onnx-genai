@@ -541,7 +541,10 @@ false positive is a silent pass with no ledger line:
   text is a thoroughly plausible thing for a bench script to print, and
   `echo "run this under: scripts/hostlock.sh run -- $0"` certified a file that
   called nothing. `${x#-}`, `$#` and `a#b` survive, because a `#` only opens a
-  comment at the start of a word.
+  comment at the start of a word. A heredoc terminator has to be the delimiter
+  *alone* on its line (`<<-` allows leading tabs, nothing allows spaces), and
+  a `<<` whose delimiter never arrives blanks nothing — `$(( 1 << k ))` and a
+  `<<<` herestring must not swallow a real acquisition below them.
 - The match must be in **command position** — start of line or after
   `;`, `|`, `&`, `(`, `)`, `{`, `}`, past any `VAR=` assignments and any of
   `exec`, `env`, `sudo`, `then`, `do`. Single-line quoted regions are kept
@@ -553,16 +556,26 @@ What none of it sees is deliberate indirection — `eval`, the subcommand held
 in a variable, a `$LOCK` alias. That edge stays fail-open and cannot be closed
 by reading source; it is the same edge the Python side documents for
 `getattr(subprocess, "run")`, and it is why the ledger is a reviewed file and
-not only a program.
+not only a program. Two narrower edges are written down in
+`strip_shell_comments` alongside it, because a documented weakness with no
+cell behind it is one that comes back: a heredoc whose delimiter never
+arrives (fail-open, on a script the shell would reject), and a `<<` that is
+not a heredoc whose right-hand word later appears alone on a line
+(fail-closed, costing a ledger line). Review of the first version found two
+more — a multi-line quoted argument, and a heredoc ended early by an indented
+delimiter-lookalike — and both are now cells rather than caveats.
 
-Both properties came from real files. `decode_placement_census.sh` carried the
-sentence *"it still runs under the hostlock as a courtesy to whoever is
-measuring"* in its own header while containing no call to `scripts/hostlock.sh`
-at all — a declaration with nothing behind it, which is the failure the ledger
-was built to end, one file extension out of reach. It now takes the lock once,
-by re-executing under `hostlock.sh run`, so the holder is the outer process
-spanning all three of its pool launches rather than one per arm. And the first
-run of the new check found a second file nobody had listed,
+Both properties came from real files. `decode_placement_census.sh` now **takes
+the lock** once for the whole census, by re-executing under `hostlock.sh run`,
+so the holder is the outer process spanning all three of its pool launches
+rather than one per arm — and it decides whether to do so by reading *custody*
+(the holder pid from the lock, walked against its own ancestry) rather than an
+exported sentinel, which any unrelated parent could have set. Before that it
+carried the sentence *"it still runs under the hostlock as a courtesy to
+whoever is measuring"* in its own header while containing no call to
+`scripts/hostlock.sh` at all: a declaration with nothing behind it, which is
+the failure the ledger was built to end, one file extension out of reach. And
+the first run of the new check found a second file nobody had listed,
 `int4_modulo_arms.sh`, which builds three release arms on every core; it is
 recorded as a `known-gap:` for its owner.
 
