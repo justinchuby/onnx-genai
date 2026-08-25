@@ -46,6 +46,12 @@ permissions:
 jobs:
   miri:
     name: Miri unsafe-crate soundness
+    # 90min hard bound: ~3x the slowest of the last 12 green runs
+    # (25.0min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
