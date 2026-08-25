@@ -38,7 +38,7 @@ onnx-runtime-shape-inference = { workspace = true }
 onnx-runtime-ort-testkit = { workspace = true }
 libloading = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
-onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
+onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5", features = ["testutil"] }
 onnx-runtime-ep-cpu = { workspace = true }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }

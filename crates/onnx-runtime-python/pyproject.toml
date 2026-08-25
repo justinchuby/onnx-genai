@@ -36,6 +36,8 @@ bfloat16 = ["ml_dtypes"]
 cuda = [
     "nvidia-cuda-runtime>=13",
     "nvidia-cublas>=13", # provides libcublas + libcublasLt (cuBLASLt MatMul)
+    "nvidia-cufft>=12,<13", # cuFFT 12.x shipped with the CUDA 13 line
+    "nvidia-nvjitlink>=13,<14", # cuFFT JIT dependency
     "nvidia-cuda-nvrtc>=13", # runtime NVRTC compilation of fused/pointwise kernels
     "nvidia-cuda-cupti>=13", # GPU kernel tracing (tracer cupti feature)
 ]

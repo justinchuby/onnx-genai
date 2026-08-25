@@ -5964,6 +5964,31 @@ fn dynamic_output_shapes_compress_boundary_counts() {
     assert_eq!(count(vec![1, 1, 1, 1], 4), Some(vec![vec![4]]));
 }
 
+#[test]
+fn dynamic_output_shapes_stft_reads_runtime_step_and_frame_length() {
+    let node = Node::new(
+        NodeId(0),
+        "STFT",
+        vec![Some(ValueId(0)), Some(ValueId(1)), None, Some(ValueId(3))],
+        vec![ValueId(4)],
+    );
+    let input_shapes = vec![vec![2, 16, 1], vec![], vec![], vec![]];
+    let input_dtypes = vec![
+        DataType::Float32,
+        DataType::Int64,
+        DataType::Undefined,
+        DataType::Int64,
+    ];
+
+    for (step, expected_frames) in [(2, 5), (4, 3)] {
+        let input_values = vec![None, Some(vec![step]), None, Some(vec![8])];
+        assert_eq!(
+            dynamic_output_shapes(&node, &input_shapes, &input_dtypes, &input_values, &[], 17,),
+            Some(vec![vec![2, expected_frames, 5, 2]])
+        );
+    }
+}
+
 /// The data-dependent shape sizer must return exactly one shape per output
 /// so the run loop's `out_shapes[oi]` indexing can never misindex. Slice is
 /// single-output, so it returns a 1-element Vec; the run loop additionally

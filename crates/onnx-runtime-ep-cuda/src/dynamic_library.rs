@@ -14,6 +14,7 @@ pub(crate) enum CudaLibrary {
     #[allow(dead_code)]
     Cublas,
     CublasLt,
+    Cufft,
     Cudnn,
     Nvrtc,
     // Kept for the crate-local loader surface; CUPTI loading currently lives in the tracer crate.
@@ -102,6 +103,9 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         (TargetOs::Linux, CudaLibrary::CublasLt) => {
             &["libcublasLt.so.13", "libcublasLt.so.12", "libcublasLt.so"]
         }
+        (TargetOs::Linux, CudaLibrary::Cufft) => {
+            &["libcufft.so.12", "libcufft.so.11", "libcufft.so"]
+        }
         (TargetOs::Linux, CudaLibrary::Cudnn) => &["libcudnn.so.9", "libcudnn.so"],
         (TargetOs::Linux, CudaLibrary::Nvrtc) => {
             &["libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so"]
@@ -113,6 +117,7 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         (TargetOs::Macos, CudaLibrary::Driver) => &["libcuda.dylib"],
         (TargetOs::Macos, CudaLibrary::Cublas) => &["libcublas.dylib"],
         (TargetOs::Macos, CudaLibrary::CublasLt) => &["libcublasLt.dylib"],
+        (TargetOs::Macos, CudaLibrary::Cufft) => &["libcufft.dylib"],
         (TargetOs::Macos, CudaLibrary::Cudnn) => &["libcudnn.dylib"],
         (TargetOs::Macos, CudaLibrary::Nvrtc) => &["libnvrtc.dylib"],
         (TargetOs::Macos, CudaLibrary::Cupti) => &["libcupti.dylib"],
@@ -123,6 +128,9 @@ fn candidates_for(os: TargetOs, library: CudaLibrary) -> &'static [&'static str]
         }
         (TargetOs::Windows, CudaLibrary::CublasLt) => {
             &["cublasLt64_13.dll", "cublasLt64_12.dll", "cublasLt.dll"]
+        }
+        (TargetOs::Windows, CudaLibrary::Cufft) => {
+            &["cufft64_12.dll", "cufft64_11.dll", "cufft.dll"]
         }
         (TargetOs::Windows, CudaLibrary::Cudnn) => &["cudnn64_9.dll", "cudnn64_8.dll", "cudnn.dll"],
         (TargetOs::Windows, CudaLibrary::Nvrtc) => &[
@@ -145,6 +153,7 @@ fn nvidia_component(library: CudaLibrary) -> Option<&'static str> {
         CudaLibrary::Driver => None,
         CudaLibrary::Runtime => Some("cuda_runtime"),
         CudaLibrary::Cublas | CudaLibrary::CublasLt => Some("cublas"),
+        CudaLibrary::Cufft => Some("cufft"),
         CudaLibrary::Cudnn => Some("cudnn"),
         CudaLibrary::Nvrtc => Some("cuda_nvrtc"),
         CudaLibrary::Cupti => Some("cuda_cupti"),
@@ -468,6 +477,31 @@ pub(crate) fn require(library: CudaLibrary) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolve one function from a library loaded through the canonical CUDA wheel
+/// search path. The copied function pointer remains valid because `require`
+/// retains the owning [`Library`] for the process lifetime.
+pub(crate) fn symbol<T: Copy>(library: CudaLibrary, name: &[u8]) -> Result<T, String> {
+    require(library)?;
+    let loaded = loaded_libraries()
+        .lock()
+        .expect("CUDA loaded-library lock poisoned");
+    let handle = loaded
+        .iter()
+        .find_map(|(loaded_library, handle)| (*loaded_library == library).then_some(handle))
+        .ok_or_else(|| format!("CUDA {library:?} library was not retained after loading"))?;
+    // SAFETY: callers request a symbol using its exact vendor ABI type. The
+    // returned function pointer is copied while the owning library remains
+    // retained in `loaded_libraries`.
+    unsafe { handle.get::<T>(name) }
+        .map(|function| *function)
+        .map_err(|error| {
+            format!(
+                "CUDA {library:?} symbol {:?} was not found: {error}",
+                String::from_utf8_lossy(name)
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +515,10 @@ mod tests {
         assert_eq!(
             candidates_for(TargetOs::Linux, CudaLibrary::Cupti),
             ["libcupti.so.13", "libcupti.so.12", "libcupti.so"]
+        );
+        assert_eq!(
+            candidates_for(TargetOs::Linux, CudaLibrary::Cufft),
+            ["libcufft.so.12", "libcufft.so.11", "libcufft.so"]
         );
     }
 
@@ -507,6 +545,7 @@ mod tests {
             candidates_for(TargetOs::Windows, CudaLibrary::Nvrtc).contains(&"nvrtc64_130_0.dll")
         );
         assert!(candidates_for(TargetOs::Windows, CudaLibrary::Cupti).contains(&"cupti64_13.dll"));
+        assert!(candidates_for(TargetOs::Windows, CudaLibrary::Cufft).contains(&"cufft64_12.dll"));
     }
 
     #[test]
@@ -530,6 +569,10 @@ mod tests {
         assert!(windows.contains(&root.join("nvidia/cu13/bin/x86_64/nvrtc64_130_0.dll")));
         // ...and the older layout is still reachable.
         assert!(windows.contains(&root.join("nvidia/cuda_nvrtc/bin/nvrtc64_120_0.dll")));
+
+        let cufft = wheel_candidates_for(&root, TargetOs::Windows, CudaLibrary::Cufft);
+        assert!(cufft.contains(&root.join("nvidia/cu13/bin/x86_64/cufft64_12.dll")));
+        assert!(cufft.contains(&root.join("nvidia/cufft/bin/cufft64_12.dll")));
     }
 
     #[test]

@@ -3,7 +3,7 @@ name: "measurement-discipline"
 description: "Make a performance or memory number trustworthy before you report it — or believe it"
 domain: "quality"
 confidence: "high"
-source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption)"
+source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption, #1619/#1982 selector vacuity)"
 ---
 
 # Measurement discipline
@@ -103,6 +103,49 @@ per loop. A window that is clear when you begin is not evidence it stayed clear.
 **Check:** a RED under contention is invalid evidence — re-run solo before
 calling it a regression. A GREEN under contention is weak evidence too.
 
+**On a shared host, verifying is not enough — you must also claim.** Checking
+that the box is idle is a *pre*-check, and a pre-check cannot see a competitor
+that starts after you do. Several agents share this machine and used to
+coordinate by announcing runs to each other. That protocol has a delivery step,
+and the delivery step failed: messages arrived four times over via three
+different agents, replies landed in uninvolved sessions, and both parties ended
+up idling on each other while behaving correctly. A release that is never
+received is indistinguishable from one that was never sent.
+
+**Rule: any saturating benchmark or full EP test matrix must hold the host lock
+for its whole duration.** "Saturating" means it takes cores or a GPU that
+another agent's measurement would notice — every `benches/acc0_*.py` sweep, any
+`--steady` decode loop, and the full EP conformance matrix all qualify.
+
+```sh
+scripts/hostlock.sh run --owner <you> --reason "what you are running" -- <cmd>
+```
+
+`run` is the form to prefer: it anchors liveness to its own pid, releases on
+every exit path including signals, and needs no expiry. If you must use
+`acquire`/`release` directly, pass `--ttl 0` and `--pid $$`, because the default
+anchor is the invoking shell and the default TTL is one hour — a TTL means
+"release this on the clock whether or not I am still running", so on a
+multi-hour sweep the default hands the host to a second measurer mid-run and
+contaminates *both* sets of numbers while every log line still reads as held.
+
+Take it for the **whole sweep**, not per cell: a per-cell acquire hands the box
+back between cells and lets a competitor land inside a matrix whose cells are
+only comparable to each other if they all saw the same machine.
+
+Hold it **and** keep the after-the-fact check. They answer different questions —
+the lock stops a competitor landing, the load watch notices one that landed
+anyway (a co-tenant outside the protocol, or a build nobody announced). Record
+`scripts/hostlock.sh provenance` *with* the numbers rather than asserting a quiet
+host beside them, so a row taken on a shared box stays identifiable after the
+scrollback is gone. The row names the lock directory too, because a private lock
+(`HOSTLOCK_DIR` set) coordinates with nobody while producing rows otherwise
+byte-identical to real ones.
+
+This is not theoretical: the first two sweeps run after the harnesses started
+taking the lock were both refused, against two different agents, at moments when
+the host had been announced as free.
+
 ### 6. Wall-clock on a box that pages your own memory
 
 Identical configurations here have ranged **3.9–28 tok/s**, and #863 showed the
@@ -134,6 +177,86 @@ it.
 
 **Check:** if your test needs a condition, **construct** it, and assert
 non-vacuously that it held.
+
+### 9. A selector that selected nothing, reporting as success
+
+`cargo test --lib <name> -- --exact` with a **bare** test name matches nothing
+when the test lives in a module. It prints `running 0 tests`, `test result: ok`,
+and **exits 0**. To a script reading the exit code that is indistinguishable from
+the test passing — and inside a mutation battery it is indistinguishable from
+*the mutant surviving*, which is the dangerous direction: every arm reports "your
+test does not cover this", so you go and write coverage you already have, or
+conclude a guard is unreachable and delete it.
+
+```
+cargo test -q --lib a_continuing_turn_is_admitted -- --exact
+  running 0 tests
+  test result: ok. 0 passed; 0 failed; 0 ignored; 2 filtered out      exit 0
+
+cargo test -q --lib tests::a_continuing_turn_is_admitted -- --exact
+  running 1 test
+  test result: ok. 1 passed; 0 failed; 0 ignored; 1 filtered out      exit 0
+```
+
+Two properties make it silent rather than noisy. **A renamed test and a test that
+never existed produce byte-identical output**, so the battery repeats its verdict
+forever after a rename. And **whether a bare name matches depends only on module
+nesting** — a `#[test]` at crate root *is* its own full path and matches; the same
+name inside `mod tests` does not — so one battery can hold working arms and
+vacuous arms at once, which reads as partial coverage rather than a broken
+instrument.
+
+Found independently at least three times here: guarded in code with a comment
+saying why (`agrees_with_hostlock_sh.rs`, #1950), recorded as a harness bug after
+it reported seven of seven mutations as undetected (#1619), and paid for in full
+again in #1982.
+
+**Check:** prove the selector resolved, and prefer a count to a string. `--list`
+enumerates matches without running them, so the precheck is separable from the
+result:
+
+```sh
+n=$(cargo test -q --lib "$FILTER" -- --exact --list 2>/dev/null | grep -c ': test$')
+[ "$n" -eq 1 ] || { echo "FILTER-DRIFT: '$FILTER' selected $n, expected 1"; exit 2; }
+```
+
+Asserting `1 passed` in the run output is the same idea and is what
+`agrees_with_hostlock_sh.rs` does, but on its own it is a substring match on a
+*result*, and it fails in the direction this whole section is about. Measured:
+
+```
+filter selects 11 passing tests -> "11 passed; 0 failed"   contains "1 passed" -> accepted
+filter selects 2, one failing   -> "1 passed; 1 failed"    contains "1 passed" -> accepted
+```
+
+Both are false greens: the first accepts a filter that resolved to eleven tests
+instead of one, the second accepts a run containing a genuine failure. It is
+sound in `agrees_with_hostlock_sh.rs` only because that child selects exactly one
+test by construction — `window_probe_child` is a `#[test]` at the integration
+crate's root.
+
+So the two checks **compose**, and neither is sufficient alone: the listing pins
+the selection to exactly one, which is what makes the substring reading of the
+run output trustworthy afterwards. Pin the count first, then read the result.
+
+One residual gap in the count, also measured: `--list` prints an `#[ignore]`d
+test with the same `: test` suffix, so a test that gets ignored still resolves to
+`n = 1` while the run executes nothing (`0 passed; 0 failed; 1 ignored`). The
+listing proves the *name* resolves, never that the arm *ran* — which is why the
+run-output half is not optional.
+
+**Check:** every battery carries a **vacuity arm** — a mutation so destructive
+that survival is impossible (refuse every request; empty the function body). Its
+expected result is the one you know independently of the code under test, so it
+is the only arm that can report that the apparatus itself is lying.
+
+**Check:** cite the commit that *introduced* a claim, not the last one to touch
+the file. Review of this section caught two wrong PR numbers in it, both produced
+by `git log -1 -- <file>`, which resolves to the file's most recent commit and
+answers a question nobody asked. `git log -S '<the exact line>' -- <file>` finds
+the change that made the claim. Same failure as the rest of §9, one level up: the
+command returned a real, correct, confidently-formatted answer to the wrong
+query.
 
 ## Reporting rules
 
