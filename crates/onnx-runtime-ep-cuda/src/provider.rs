@@ -43,8 +43,8 @@ use std::sync::{Arc, Mutex};
 
 use onnx_runtime_ep_api::{
     BoundBufferOwnership, Cost, DeviceBuffer, DeviceGraphSlot, EpConfig, EpError,
-    ExecutionProvider, ExecutionProviderCapabilities, Fence, HostToDeviceCopier, Kernel,
-    KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
+    ExecutionProvider, ExecutionProviderCapabilities, ExpertWeightGroup, Fence, HostToDeviceCopier,
+    Kernel, KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
     structural_input_bytes,
 };
 use onnx_runtime_ir::{
@@ -65,8 +65,8 @@ use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
 use crate::route_residency::{
-    RouteResidencyBoundary, RouteResidencyDiagnostics, RouteResidencyInstallOutcome,
-    build_route_residency_boundary,
+    RouteResidencyBindingReject, RouteResidencyBoundary, RouteResidencyDiagnostics,
+    RouteResidencyInstallOutcome, build_route_residency_boundary,
 };
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy, PrefillRoute};
@@ -780,6 +780,21 @@ pub struct CudaExecutionProvider {
     /// `route_diag` carries the typed outcome of every boundary.
     route_boundary: Mutex<Option<Arc<RouteResidencyBoundary>>>,
     route_diag: Arc<RouteResidencyDiagnostics>,
+    /// EP-owned registry of live `QMoE` route-telemetry producer sources,
+    /// keyed by call-site `NodeId` (issue #1810 Slice 7E). Shared with the
+    /// `QMoEFactory` this EP built: every executing `QMoEKernel` registers here,
+    /// so [`Self::try_install_route_residency_binding`] can bind the real
+    /// producer instances instead of a controllable test double. Empty until a
+    /// model with `QMoE` nodes is compiled; drained at teardown.
+    route_telemetry_registry: Arc<crate::kernels::qmoe::RouteTelemetrySourceRegistry>,
+    /// Per-bank stable expert artifacts retained after the model's weights are
+    /// finalized (issue #1810 Slice 7E goal 1): the property-discovered
+    /// [`ExpertWeightGroup`]s (bank node identity + member `ValueId` ranges) the
+    /// build-time install seam bound against. `Some` only after a successful
+    /// discovery on the enabled path; `None` on the shipped default-off path
+    /// (nothing is retained). Read by diagnostics/tests to prove the EP retains
+    /// real bank metadata; cleared at teardown.
+    retained_route_artifacts: Mutex<Option<Arc<Vec<ExpertWeightGroup>>>>,
 }
 
 impl std::fmt::Debug for CudaExecutionProvider {
@@ -854,7 +869,13 @@ impl CudaExecutionProvider {
             Some(governor) => CsaMetrics::with_governor(Arc::clone(governor)),
             None => CsaMetrics::default(),
         });
-        let registry = build_cuda_registry_with_metrics(runtime.clone(), csa_metrics.clone());
+        let route_telemetry_registry =
+            Arc::new(crate::kernels::qmoe::RouteTelemetrySourceRegistry::default());
+        let registry = build_cuda_registry_with_metrics(
+            runtime.clone(),
+            csa_metrics.clone(),
+            Arc::clone(&route_telemetry_registry),
+        );
         let auto_dynamic_lending = auto_dynamic_lending_for(
             governor.is_some(),
             &offload_policy,
@@ -1030,6 +1051,8 @@ impl CudaExecutionProvider {
             release_queue,
             route_boundary: Mutex::new(None),
             route_diag: Arc::new(RouteResidencyDiagnostics::default()),
+            route_telemetry_registry,
+            retained_route_artifacts: Mutex::new(None),
         };
         if let Some(residency) = provider.residency.as_ref() {
             residency
@@ -1628,6 +1651,152 @@ impl CudaExecutionProvider {
         &self.route_diag
     }
 
+    /// The EP-owned live route-telemetry producer sources for the currently
+    /// compiled model, keyed by call-site `NodeId` (issue #1810 Slice 7E).
+    ///
+    /// These are the *actual executing* [`QMoEKernel`](crate::kernels::qmoe::QMoEKernel)
+    /// instances the session's `KernelCache` runs — populated as those kernels
+    /// are created (the eager `compile_all` pre-warm registers them before decode
+    /// capture) — exposed as [`RouteTelemetrySource`] trait objects. This is the
+    /// real producer half the route-residency binding builder needs: it removes
+    /// the Slice-7D limitation that route telemetry sources were session/cache
+    /// owned rather than EP owned. Empty for a model with no `QMoE` nodes and on
+    /// the default-off path (nothing is armed until a binding installs).
+    ///
+    /// [`RouteTelemetrySource`]: crate::route_residency::RouteTelemetrySource
+    pub fn route_telemetry_sources(
+        &self,
+    ) -> std::collections::HashMap<NodeId, Arc<dyn crate::route_residency::RouteTelemetrySource>>
+    {
+        self.route_telemetry_registry.sources()
+    }
+
+    /// The concrete registered `QMoE` producer for `node_id`, if any. Test and
+    /// arming access: the coarse install seam arms these before the first
+    /// boundary so the real producer accumulates the routes the consumer reads.
+    pub fn route_telemetry_producer(
+        &self,
+        node_id: NodeId,
+    ) -> Option<Arc<crate::kernels::qmoe::QMoEKernel>> {
+        self.route_telemetry_registry.kernel(node_id)
+    }
+
+    /// The per-bank expert artifacts this EP retained after the current model's
+    /// weights were finalized (issue #1810 Slice 7E goal 1), or `None` on the
+    /// default-off path (nothing retained). Read by diagnostics/tests to prove
+    /// the EP holds real property-discovered bank metadata (group node identity
+    /// + member `ValueId` ranges) rather than deriving it ad hoc per boundary.
+    pub fn retained_route_residency_artifacts(&self) -> Option<Arc<Vec<ExpertWeightGroup>>> {
+        self.retained_route_artifacts
+            .lock()
+            .expect("cuda_ep retained route artifacts poisoned")
+            .clone()
+    }
+
+    /// The real production model-build install seam (issue #1810 Slice 7E goal
+    /// 3): construct and install a [`RouteResidencyBoundary`] from the loaded
+    /// `graph`'s expert banks, binding this EP's **own** live route-telemetry
+    /// producer sources ([`Self::route_telemetry_sources`]) — no controllable
+    /// test double. Called once from the executor after weights/catalog are
+    /// finalized and before decode capture, via
+    /// [`ExecutionProvider::install_route_residency_boundary_after_build`].
+    ///
+    /// Fail-closed and default-off at every step, recording the typed outcome in
+    /// [`Self::route_residency_diagnostics`]:
+    ///
+    /// * Gate off → [`RouteResidencyInstallOutcome::GateDisabled`]. Retains and
+    ///   installs nothing; no telemetry/policy overhead. The shipped default.
+    /// * No coarse-residency authority (offload disabled) →
+    ///   [`RouteResidencyInstallOutcome::OffloadDisabled`]. Nothing retained.
+    /// * Property discovery fail-closes (no/many banks, no producer source) →
+    ///   [`RouteResidencyInstallOutcome::Rejected`] with the typed reason.
+    /// * The single discovered bank is structurally bindable and its members
+    ///   have live producer sources, but the shipped residency exposes no
+    ///   per-bank dedicated VMM reservation to remap →
+    ///   [`RouteResidencyInstallOutcome::Rejected`] carrying
+    ///   [`RouteResidencyBindingReject::NoPerBankReservation`]. Real bank
+    ///   artifacts are retained (goal 1) and the real producer sources are
+    ///   bound-ready (goal 2), but no physical binding is installed. This is the
+    ///   shipped enabled-path outcome today; the per-bank-reservation bridge is
+    ///   the disclosed residual, after which this same seam installs for real.
+    /// * Otherwise (a residency that provides per-bank reservations) a real
+    ///   binding is installed and [`RouteResidencyInstallOutcome::Installed`]
+    ///   returned.
+    pub fn install_route_residency_after_build(
+        &self,
+        graph: &Graph,
+    ) -> RouteResidencyInstallOutcome {
+        // Default-off gate first. This is the shipped path, so it must be truly
+        // inert: no discovery, no retention, no telemetry, and no diagnostics
+        // bookkeeping — a pure early return that touches no shared state.
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            return RouteResidencyInstallOutcome::GateDisabled;
+        }
+        let Some(residency) = self.residency.as_ref() else {
+            self.route_diag
+                .record_decline("weight offload/coarse residency disabled");
+            return RouteResidencyInstallOutcome::OffloadDisabled;
+        };
+
+        // Real producer sources this EP owns (Slice 7E goal 2): the actual
+        // executing `QMoEKernel` instances, not a test double.
+        let sources = self.route_telemetry_sources();
+
+        // Property-based structural validation over the real graph + real
+        // sources: surfaces NoExpertGroups / MultipleBanksUnsupported /
+        // NoTelemetrySource honestly. Catalog/allocator presence is not the
+        // gate here (the physical prerequisite is checked next), so both
+        // predicates are satisfied for the structural pass.
+        let group = match crate::route_residency::validate_route_residency_binding(
+            graph,
+            |node| sources.contains_key(&node),
+            |_value| true,
+            |_value| true,
+        ) {
+            Ok(group) => group,
+            Err(reject) => {
+                self.route_diag.record_decline(&reject.reason());
+                return RouteResidencyInstallOutcome::Rejected(reject);
+            }
+        };
+
+        // Retain the real per-bank expert artifacts now that discovery
+        // succeeded over the finalized graph (goal 1): bank node identity +
+        // member `ValueId` ranges, held in the EP after weights are finalized.
+        *self
+            .retained_route_artifacts
+            .lock()
+            .expect("cuda_ep retained route artifacts poisoned") =
+            Some(Arc::new(vec![group.clone()]));
+
+        // Physical prerequisite: the coarse plan remaps each bank at
+        // catalog-relative offsets, which needs a per-bank *dedicated* VMM
+        // reservation. The shipped residency packs banks into one shared
+        // reservation, so this fail-closes with the precise typed reason rather
+        // than binding against bytes the plan would misaddress. This is the
+        // shipped enabled-path terminal outcome; the per-bank-reservation
+        // bridge (plus per-bank catalog/pool retention) is the disclosed
+        // residual, after which this same seam constructs and installs a real
+        // binding from the retained artifacts + bound producer sources.
+        for member in &group.members {
+            if residency.coarse_route_bank_reservation(*member).is_none() {
+                let reject = RouteResidencyBindingReject::NoPerBankReservation { value: *member };
+                self.route_diag.record_decline(&reject.reason());
+                return RouteResidencyInstallOutcome::Rejected(reject);
+            }
+        }
+
+        // A residency that provides per-bank reservations (a later slice) reaches
+        // here with the retained artifacts + real producer sources already
+        // validated. Unreachable on the shipped shared-reservation layout; the
+        // remaining per-bank catalog/pool retention is bound at that point.
+        let reject = RouteResidencyBindingReject::NoPerBankReservation {
+            value: group.members[0],
+        };
+        self.route_diag.record_decline(&reject.reason());
+        RouteResidencyInstallOutcome::Rejected(reject)
+    }
+
     /// Construct and install a production [`RouteResidencyBoundary`] from a
     /// loaded model graph's expert banks, if — and only if — this EP is a valid
     /// single binding authority for one.
@@ -1724,6 +1893,19 @@ impl CudaExecutionProvider {
             .route_boundary
             .lock()
             .expect("cuda_ep route-residency boundary poisoned") = None;
+        // Drop the EP-owned producer source `Arc`s too (issue #1810 Slice 7E):
+        // they mirror the session `KernelCache`'s kernels, so retaining them
+        // past teardown would keep those instances (and their scratch/telemetry
+        // device memory) alive after the cache that owns the executing copy is
+        // gone. Clearing here keeps drain-on-teardown leak-free and returns the
+        // registry to its inert default-off state.
+        self.route_telemetry_registry.clear();
+        // Release the retained per-bank artifacts (goal 1) too, so teardown
+        // returns the EP to its inert default-off state with nothing retained.
+        *self
+            .retained_route_artifacts
+            .lock()
+            .expect("cuda_ep retained route artifacts poisoned") = None;
     }
 
     /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
@@ -3579,6 +3761,20 @@ impl ExecutionProvider for CudaExecutionProvider {
             }
         };
         crate::route_residency::run_route_residency_boundary(&boundary, &self.route_diag)
+    }
+
+    fn install_route_residency_boundary_after_build(&self, graph: &Graph) {
+        // Real Slice-7E model-build install seam: bind this EP's own live
+        // producer sources over the finalized graph's expert banks. Fail-closed,
+        // default-off, typed outcome recorded in `route_residency_diagnostics`.
+        let _ = self.install_route_residency_after_build(graph);
+    }
+
+    fn drain_route_residency_boundary_on_teardown(&self) {
+        // `&self` teardown path (the shared `Arc<dyn ExecutionProvider>` cannot
+        // reach `&mut self` `shutdown`): drop the installed boundary, the
+        // EP-owned producer sources, and the retained per-bank artifacts.
+        self.drain_route_residency_boundary();
     }
 
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
-use onnx_runtime_ir::{DataType, Node};
+use onnx_runtime_ir::{DataType, Node, NodeId};
 
 use crate::error::driver_err;
 use crate::kernels::expert_route_telemetry::{
@@ -1232,13 +1232,129 @@ impl FloatDtype {
     }
 }
 
+/// EP-owned registry of live route-telemetry producer sources, keyed by the
+/// graph `NodeId` of the `QMoE` call site that owns each source (issue #1810
+/// Slice 7E). Populated as the session's `KernelCache` creates the *executing*
+/// [`QMoEKernel`] for a node — including the eager `compile_all` pre-warm that
+/// runs before decode capture — so the route-residency boundary install seam
+/// can bind the real producer instance instead of a controllable test double.
+///
+/// Default-off: registration only clones an `Arc`; nothing here arms telemetry,
+/// allocates device memory, or reads a window until the coarse-residency gate
+/// installs a binding. Drained at request/model teardown via [`Self::clear`].
+#[derive(Default)]
+pub struct RouteTelemetrySourceRegistry {
+    sources: Mutex<HashMap<NodeId, Arc<QMoEKernel>>>,
+}
+
+impl RouteTelemetrySourceRegistry {
+    /// Register (or replace) the executing producer for `node_id`. The cache and
+    /// this registry then share one `Arc<QMoEKernel>`, so arming/snapshotting
+    /// through the registry observes exactly the routes the cache's dispatch of
+    /// that instance accumulated.
+    pub(crate) fn register(&self, node_id: NodeId, kernel: Arc<QMoEKernel>) {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .insert(node_id, kernel);
+    }
+
+    /// Snapshot of every registered producer as a trait-object source map for
+    /// the route-residency binding builder. Clones `Arc`s only; no device work.
+    pub fn sources(&self) -> HashMap<NodeId, Arc<dyn RouteTelemetrySource>> {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .iter()
+            .map(|(id, kernel)| (*id, Arc::clone(kernel) as Arc<dyn RouteTelemetrySource>))
+            .collect()
+    }
+
+    /// The concrete producer registered for `node_id`, if any. Test/arming
+    /// access: the coarse install seam arms these before the first boundary.
+    pub fn kernel(&self, node_id: NodeId) -> Option<Arc<QMoEKernel>> {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .get(&node_id)
+            .map(Arc::clone)
+    }
+
+    /// Number of registered producers.
+    pub fn len(&self) -> usize {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .len()
+    }
+
+    /// Whether no producer is registered (the default-off / no-QMoE case).
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drop every registered producer source (request/model teardown). After
+    /// this the registry is inert again until new kernels are created.
+    pub(crate) fn clear(&self) {
+        self.sources
+            .lock()
+            .expect("cuda_ep route-telemetry registry poisoned")
+            .clear();
+    }
+}
+
+/// Trait-object kernel that shares one `Arc<QMoEKernel>` between the session's
+/// `KernelCache` (which executes it) and the EP's
+/// [`RouteTelemetrySourceRegistry`] (which reads its route window at the coarse
+/// boundary) — issue #1810 Slice 7E.
+///
+/// `QMoEKernel`'s route telemetry uses interior mutability and its `Kernel`
+/// impl is `&self`, so the executing instance and the registered producer are
+/// the *same object*: a dispatch through the cache accumulates into the very
+/// record the registry later snapshots. This wrapper forwards exactly the three
+/// methods `QMoEKernel` overrides; every other `Kernel` method resolves to the
+/// same trait default `QMoEKernel` itself uses, so behaviour is byte-identical
+/// to boxing the kernel directly.
+struct SharedQMoEKernel(Arc<QMoEKernel>);
+
+impl Kernel for SharedQMoEKernel {
+    fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
+        self.0.execute(inputs, outputs)
+    }
+
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        self.0.supports_strided_input(input_idx)
+    }
+
+    fn capture_support(&self) -> onnx_runtime_ep_api::CaptureSupport {
+        self.0.capture_support()
+    }
+}
+
 pub struct QMoEFactory {
     pub runtime: Arc<CudaRuntime>,
+    /// EP-owned registry of live route-telemetry producer sources (issue #1810
+    /// Slice 7E). Every `QMoEKernel` this factory creates is registered here,
+    /// keyed by its call-site `NodeId`, so the coarse route-residency boundary
+    /// install seam can bind the *actual executing* producer instance rather
+    /// than a controllable test double. The session's `KernelCache` and this
+    /// registry share the same `Arc<QMoEKernel>`; the cache executes it and the
+    /// registry reads its route window at the safe boundary. Default-off:
+    /// registration allocates nothing and arms no telemetry.
+    pub telemetry_registry: Arc<RouteTelemetrySourceRegistry>,
 }
 
 impl KernelFactory for QMoEFactory {
     fn create(&self, node: &Node, input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
-        Ok(Box::new(self.create_kernel(node, input_shapes)?))
+        let kernel = Arc::new(self.create_kernel(node, input_shapes)?);
+        // Register the *executing* instance (the same `Arc` the cache will run)
+        // so the EP owns a real producer source for this call site. This runs
+        // during the eager `compile_all` pre-warm as well as any later cache
+        // miss; the last writer for a `NodeId` wins, which is the instance the
+        // static-shape decode graph actually dispatches.
+        self.telemetry_registry
+            .register(node.id, Arc::clone(&kernel));
+        Ok(Box::new(SharedQMoEKernel(kernel)))
     }
 }
 

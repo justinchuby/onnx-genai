@@ -1367,6 +1367,35 @@ pub trait ExecutionProvider: Send + Sync {
     /// diagnostics rather than failing silently.
     fn consume_route_residency_at_boundary(&self) -> Result<()>;
 
+    /// Install a route-residency boundary from the fully-loaded model `graph`,
+    /// after the model's weights/catalog are finalized and **before** decode
+    /// capture (issue #1810 Slice 7E). This is the production model-build seam
+    /// the coarse route-residency consumer
+    /// ([`Self::consume_route_residency_at_boundary`]) was waiting for: it lets
+    /// a participating EP bind its live route-telemetry producer sources to the
+    /// boundary once, so the consumer has a real binding to drive when the
+    /// default-off feature is enabled.
+    ///
+    /// The default is a no-op: every stock EP, and the CUDA EP whenever weight
+    /// offload or the coarse-residency profile is disabled (the shipped
+    /// default), installs nothing, retains nothing, and creates no telemetry or
+    /// policy overhead here. A participating EP must remain fail-closed, must
+    /// perform no mapping change (it only *binds* existing authorities, it maps
+    /// nothing), and must surface a typed outcome to its own diagnostics rather
+    /// than failing silently. Called exactly once per model build, on the
+    /// concrete EP (never per token or per request).
+    fn install_route_residency_boundary_after_build(&self, _graph: &Graph) {}
+
+    /// Drain any route-residency boundary and EP-owned producer sources this EP
+    /// installed for the current model, at request/model teardown (issue #1810
+    /// Slice 7E). Mirrors [`Self::install_route_residency_boundary_after_build`]
+    /// and is idempotent: the default and every never-installed EP do nothing.
+    /// Called through `&self` from executor teardown (the shared `Arc<dyn
+    /// ExecutionProvider>` cannot take the `&mut self` `shutdown` path), so the
+    /// producer/boundary handles are released deterministically rather than only
+    /// when the last `Arc` drops.
+    fn drain_route_residency_boundary_on_teardown(&self) {}
+
     /// Explicit device allocation/free counters, when the EP exposes them.
     fn device_allocation_counts(&self) -> Option<(u64, u64)> {
         None

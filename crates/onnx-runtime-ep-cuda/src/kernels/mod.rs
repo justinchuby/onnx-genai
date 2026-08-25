@@ -660,17 +660,25 @@ pub fn build_cuda_registry_descriptors(runtime: Arc<CudaRuntime>) -> Vec<CudaOpD
 /// The shared [`CudaRuntime`] (context + stream + cuBLASLt handle) is threaded
 /// into every factory so kernels submit onto the EP's single stream.
 pub fn build_cuda_registry(runtime: Arc<CudaRuntime>) -> OpRegistry {
-    build_cuda_registry_with_metrics(runtime, Arc::new(csa_checkpoint::CsaMetrics::default()))
+    build_cuda_registry_with_metrics(
+        runtime,
+        Arc::new(csa_checkpoint::CsaMetrics::default()),
+        Arc::new(qmoe::RouteTelemetrySourceRegistry::default()),
+    )
 }
 
 /// Like [`build_cuda_registry`] but threads a shared [`CsaMetrics`] telemetry
 /// surface (§8) into the CSA factory so the owning EP can read per-layer CSA
-/// observability after execution.
+/// observability after execution, and a shared
+/// [`RouteTelemetrySourceRegistry`](qmoe::RouteTelemetrySourceRegistry) into the
+/// `QMoE` factory so the EP owns the live route-telemetry producer sources for
+/// the route-residency boundary install seam (issue #1810 Slice 7E).
 ///
 /// [`CsaMetrics`]: csa_checkpoint::CsaMetrics
 pub fn build_cuda_registry_with_metrics(
     runtime: Arc<CudaRuntime>,
     csa_metrics: Arc<csa_checkpoint::CsaMetrics>,
+    telemetry_registry: Arc<qmoe::RouteTelemetrySourceRegistry>,
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
@@ -1116,6 +1124,7 @@ pub fn build_cuda_registry_with_metrics(
         OpKey::new("QMoE", "com.microsoft", 1),
         Box::new(qmoe::QMoEFactory {
             runtime: runtime.clone(),
+            telemetry_registry: Arc::clone(&telemetry_registry),
         }),
     );
     reg.register(
