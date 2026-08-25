@@ -1310,6 +1310,18 @@ what is closed are the same binding by construction, on the engine that owns it
 rather than on the default model. LRU eviction removes its victim under the same
 lock and the same rule.
 
+**And the count of live conversations is reported by the map, not by the
+callers.** `active_sessions` is a gauge, so it has to track what the `HashMap`
+did rather than how many times a route asked for a session: an increment in
+`insert` cannot see whether making room evicted somebody, so LRU churn at the
+bound reports growth on a registry whose size never changed, and the gauge climbs
+for as long as the process runs. The two mutation sites own the accounting
+instead — a `HashMap::insert` that displaced nothing is an addition, a
+`HashMap::remove` that removed something is a departure — so an eviction followed
+by an insertion nets to zero, an insertion below the bound counts one, an
+explicit close counts one departure exactly once, and a refusal, which mutates
+nothing, counts nothing.
+
 Three routing rules deserve their reasons stated.
 
 **Reset and close take the lease.** They are mutations of the conversation, and
@@ -2026,6 +2038,17 @@ grows (`server/src/tests.rs`, `session.rs`). Two thread-and-barrier regressions
 cover the close race directly: racing deletes unbind exactly one binding once,
 and a delete racing a rebind never leaves an orphan — every conversation ends
 either bound or closed, never both and never neither.
+
+A fourth group pins the `active_sessions` accounting of §5: sixty-four rounds of
+eviction-and-insertion at `max_sessions = 1` leave both the registry length and
+the count at one, an insertion below the bound counts one, a capacity refusal and
+a refused close count nothing, a close counts one departure and a second close of
+the same id counts none, and eight threads churning the bound leave the count
+equal to the map. These read a counter the test owns rather than the process-wide
+gauge, because every other test in the binary moves that gauge while they run, so
+an exact assertion against it would be a race rather than a measurement; one
+further test asserts the production registry still reports to the real gauge,
+which is the one thing a local counter cannot see.
 
 ### 12.2 ORT / native parity
 

@@ -31,6 +31,47 @@ pub(crate) struct SessionRegistry {
     /// only map any of them consults.
     leases: Arc<SessionLeases>,
     max_sessions: usize,
+    /// Where the size of the map is reported. Bound once at construction so
+    /// that no mutation site can pick a different destination.
+    gauge: SessionGauge,
+}
+
+/// Where the registry reports that the number of live conversations changed.
+///
+/// Production reports to the process-global `active_sessions` gauge. Tests
+/// point a registry at a counter of their own, because the global one cannot be
+/// asserted on exactly: every other test in this binary that opens or closes a
+/// session moves the same counter, so a baseline-and-delta assertion against it
+/// races the rest of the suite rather than measuring this registry. The
+/// arithmetic under test is identical either way — only the destination differs.
+#[derive(Debug, Clone)]
+pub(crate) enum SessionGauge {
+    /// The process-global gauge served by `/metrics` and the admin snapshot.
+    Global,
+    #[cfg(test)]
+    Local(Arc<std::sync::atomic::AtomicI64>),
+}
+
+impl SessionGauge {
+    fn added(&self, count: usize) {
+        match self {
+            Self::Global => crate::metrics::active_sessions_added(count),
+            #[cfg(test)]
+            Self::Local(counter) => {
+                counter.fetch_add(count as i64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn removed(&self, count: usize) {
+        match self {
+            Self::Global => crate::metrics::active_sessions_removed(count),
+            #[cfg(test)]
+            Self::Local(counter) => {
+                counter.fetch_sub(count as i64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -128,6 +169,10 @@ struct SessionEntry {
 
 impl SessionRegistry {
     pub(crate) fn new(max_sessions: usize) -> Self {
+        Self::with_gauge(max_sessions, SessionGauge::Global)
+    }
+
+    fn with_gauge(max_sessions: usize, gauge: SessionGauge) -> Self {
         Self {
             inner: Arc::new(Mutex::new(SessionRegistryInner {
                 sessions: HashMap::new(),
@@ -135,7 +180,17 @@ impl SessionRegistry {
             })),
             leases: SessionLeases::new(),
             max_sessions,
+            gauge,
         }
+    }
+
+    /// A registry that reports its size changes to a counter the caller owns.
+    #[cfg(test)]
+    pub(crate) fn with_local_gauge(
+        max_sessions: usize,
+        counter: &Arc<std::sync::atomic::AtomicI64>,
+    ) -> Self {
+        Self::with_gauge(max_sessions, SessionGauge::Local(Arc::clone(counter)))
     }
 
     /// The one lease map every route and every registry decision consults.
@@ -183,8 +238,7 @@ impl SessionRegistry {
             return Err(SessionRegistryError::AlreadyBound);
         }
         let evicted = self.make_room(&mut inner)?;
-        inner.bind(client_id, binding);
-        crate::metrics::active_sessions_added(1);
+        inner.bind(client_id, binding, &self.gauge);
         Ok(evicted)
     }
 
@@ -206,8 +260,7 @@ impl SessionRegistry {
             return Ok(SessionClaim::Existing(existing));
         }
         let evicted = self.make_room(&mut inner)?;
-        inner.bind(client_id, binding);
-        crate::metrics::active_sessions_added(1);
+        inner.bind(client_id, binding, &self.gauge);
         Ok(SessionClaim::Claimed { evicted })
     }
 
@@ -247,14 +300,12 @@ impl SessionRegistry {
             .acquire(binding.clone(), client_id)
             .map_err(SessionCloseError::Busy)?;
         let removed = inner
-            .sessions
-            .remove(client_id)
+            .unbind(client_id, &self.gauge)
             .expect("entry read under the same lock");
         debug_assert_eq!(
             removed.binding, binding,
             "the binding removed must be the binding leased",
         );
-        crate::metrics::active_sessions_removed(1);
         Ok(guard)
     }
 
@@ -304,7 +355,7 @@ impl SessionRegistry {
         if inner.sessions.len() < self.max_sessions {
             return Ok(None);
         }
-        evict_lru(inner, &self.leases).map(Some)
+        evict_lru(inner, &self.leases, &self.gauge).map(Some)
     }
 }
 
@@ -325,16 +376,41 @@ impl SessionRegistryInner {
     }
 
     /// Bind a client id that is known not to be bound yet.
-    fn bind(&mut self, client_id: String, binding: ModelSessionPlacement) {
+    ///
+    /// **The gauge moves here, at the mutation, and only here.** Reporting from
+    /// the callers instead is how the count and the map drift apart: `insert`
+    /// and `claim` cannot see whether `make_room` evicted somebody, so an
+    /// unconditional increment in either of them counts a replacement as a new
+    /// conversation and the gauge climbs forever under LRU churn. Reporting
+    /// from the `HashMap` call itself makes the gauge a function of what the map
+    /// actually did — a rebind that displaces an entry is a replacement, not an
+    /// addition, and is reported as neither.
+    fn bind(&mut self, client_id: String, binding: ModelSessionPlacement, gauge: &SessionGauge) {
         self.access_clock = self.access_clock.saturating_add(1);
         let last_access = self.access_clock;
-        self.sessions.insert(
+        let displaced = self.sessions.insert(
             client_id,
             SessionEntry {
                 binding,
                 last_access,
             },
         );
+        if displaced.is_none() {
+            gauge.added(1);
+        }
+    }
+
+    /// Drop a binding and report it, or report nothing if it was not bound.
+    ///
+    /// The counterpart of [`SessionRegistryInner::bind`], and the only place an
+    /// entry leaves the map while the registry is alive: eviction and close
+    /// both go through it, so neither can decrement twice or forget to.
+    fn unbind(&mut self, client_id: &str, gauge: &SessionGauge) -> Option<SessionEntry> {
+        let removed = self.sessions.remove(client_id);
+        if removed.is_some() {
+            gauge.removed(1);
+        }
+        removed
     }
 }
 
@@ -343,7 +419,7 @@ impl Drop for SessionRegistry {
         if Arc::strong_count(&self.inner) == 1
             && let Ok(inner) = self.inner.lock()
         {
-            crate::metrics::active_sessions_removed(inner.sessions.len());
+            self.gauge.removed(inner.sessions.len());
         }
     }
 }
@@ -369,9 +445,14 @@ impl Drop for SessionRegistry {
 /// sized for *n* conversations could be pushed to hold *n + k* of them and stay
 /// there. The refusal is transient by construction: it clears the moment any
 /// turn in flight ends.
+///
+/// The victim leaves through [`SessionRegistryInner::unbind`], so the gauge is
+/// decremented here and the replacement increments it in `bind`: an eviction
+/// followed by an insertion nets to zero, which is what the map does.
 fn evict_lru(
     inner: &mut SessionRegistryInner,
     leases: &Arc<SessionLeases>,
+    gauge: &SessionGauge,
 ) -> Result<SessionLeaseGuard, SessionRegistryError> {
     let mut candidates: Vec<(u64, &str, ModelSessionPlacement)> = inner
         .sessions
@@ -395,8 +476,7 @@ fn evict_lru(
         return Err(SessionRegistryError::AtCapacity { bound });
     };
     let removed = inner
-        .sessions
-        .remove(&client_id)
+        .unbind(&client_id, gauge)
         .expect("victim read under the same lock");
     debug_assert_eq!(
         &removed.binding,
@@ -944,5 +1024,298 @@ mod tests {
         assert!(bound.load(Ordering::SeqCst) >= 1, "at least one bound");
         assert_eq!(registry.len(), 1, "the bound holds under contention");
         assert_eq!(registry.leases().held(), 0, "no eviction lease leaked");
+    }
+
+    /// The `active_sessions` gauge counts conversations, so it must track what
+    /// the map does rather than how many times a route asked for a session.
+    ///
+    /// These read a counter of their own rather than the process-global gauge
+    /// (see [`SessionGauge`]): the rest of this binary opens and closes sessions
+    /// while they run, so an exact assertion against the global counter would be
+    /// a race. The arithmetic they exercise is the same arithmetic production
+    /// runs — the destination is the only difference — and
+    /// [`the_registry_reports_its_size_to_the_process_global_gauge`] pins that
+    /// the production destination is still wired up.
+    mod gauge {
+        use super::*;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        fn counter() -> Arc<AtomicI64> {
+            Arc::new(AtomicI64::new(0))
+        }
+
+        fn live(counter: &Arc<AtomicI64>) -> i64 {
+            counter.load(Ordering::SeqCst)
+        }
+
+        /// Churn at the bound is a replacement, not growth.
+        ///
+        /// The regression this pins had `insert` increment unconditionally while
+        /// eviction removed its victim silently, so every round of LRU churn
+        /// added one to a gauge whose map never grew. Sixty-four rounds make the
+        /// difference between "off by a constant" and "climbs forever"
+        /// unmistakable: the buggy arithmetic reports sixty-five conversations
+        /// on a registry holding one.
+        #[test]
+        fn evicting_to_make_room_leaves_the_count_where_it_was() {
+            const ROUNDS: u64 = 64;
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(1, &counter);
+
+            registry
+                .insert("sess-a".to_string(), binding(1))
+                .expect("first insert fits under the bound");
+            assert_eq!(live(&counter), 1, "the first conversation is counted once");
+
+            for round in 0..ROUNDS {
+                let evicted = registry
+                    .insert(format!("sess-{round}"), binding(round + 2))
+                    .expect("an idle victim is always available");
+                assert!(evicted.is_some(), "round {round}: somebody was evicted");
+                drop(evicted);
+
+                assert_eq!(
+                    registry.len(),
+                    1,
+                    "round {round}: the registry still holds one conversation",
+                );
+                assert_eq!(
+                    live(&counter),
+                    1,
+                    "round {round}: an eviction plus an insertion is a replacement",
+                );
+            }
+        }
+
+        /// The same, through `claim`, which makes the same eviction decision.
+        #[test]
+        fn claiming_over_a_full_registry_leaves_the_count_where_it_was() {
+            const ROUNDS: u64 = 64;
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(1, &counter);
+
+            for round in 0..ROUNDS {
+                let claim = registry
+                    .claim(format!("sess-{round}"), binding(round))
+                    .expect("an idle victim is always available");
+                match claim {
+                    SessionClaim::Claimed { evicted } => drop(evicted),
+                    SessionClaim::Existing(_) => panic!("round {round}: id is fresh"),
+                }
+                assert_eq!(registry.len(), 1, "round {round}: one conversation");
+                assert_eq!(live(&counter), 1, "round {round}: one counted");
+            }
+        }
+
+        /// Below the bound there is nothing to replace, so an insertion is
+        /// growth and is counted as growth.
+        #[test]
+        fn an_insertion_that_evicts_nobody_counts_a_new_conversation() {
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(4, &counter);
+
+            for index in 0..4_u64 {
+                registry
+                    .insert(format!("sess-{index}"), binding(index))
+                    .expect("under the bound");
+                let bound = i64::from(u32::try_from(index).unwrap()) + 1;
+                assert_eq!(
+                    live(&counter),
+                    bound,
+                    "{bound} conversations, {bound} counted"
+                );
+                assert_eq!(registry.len(), usize::try_from(bound).unwrap());
+            }
+        }
+
+        /// A refusal mutates nothing, so it reports nothing.
+        #[test]
+        fn refusing_at_capacity_leaves_the_count_untouched() {
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(1, &counter);
+            registry
+                .insert("sess-busy".to_string(), binding(1))
+                .expect("first insert fits");
+            let busy = registry
+                .acquire(binding(1), "sess-busy")
+                .expect("the only conversation takes its lease");
+
+            let refused = registry.insert("sess-new".to_string(), binding(2));
+            assert!(
+                matches!(refused, Err(SessionRegistryError::AtCapacity { bound: 1 })),
+                "a full registry of busy conversations refuses, {refused:?}",
+            );
+            assert_eq!(registry.len(), 1, "the refusal bound nothing");
+            assert_eq!(live(&counter), 1, "the refusal counted nothing");
+
+            let refused = registry.claim("sess-new".to_string(), binding(2));
+            assert!(
+                matches!(refused, Err(SessionRegistryError::AtCapacity { bound: 1 })),
+                "claim refuses on the same terms, {refused:?}",
+            );
+            assert_eq!(live(&counter), 1, "the refused claim counted nothing");
+
+            // And the refusal is transient: releasing the turn makes the next
+            // insertion a replacement rather than growth.
+            drop(busy);
+            let evicted = registry
+                .insert("sess-new".to_string(), binding(2))
+                .expect("the freed conversation is now evictable");
+            assert!(evicted.is_some(), "the idle conversation was the victim");
+            drop(evicted);
+            assert_eq!(registry.len(), 1, "still one conversation");
+            assert_eq!(live(&counter), 1, "still one counted");
+        }
+
+        /// A rebind of an id already bound is refused, so it cannot be counted
+        /// twice — and if `bind` is ever reached with a bound id anyway, the
+        /// `HashMap` displacement is reported as the replacement it is.
+        #[test]
+        fn binding_over_an_existing_id_is_refused_and_counts_nothing() {
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(4, &counter);
+            registry
+                .insert("sess-a".to_string(), binding(1))
+                .expect("first insert");
+
+            let again = registry.insert("sess-a".to_string(), binding(2));
+            assert!(
+                matches!(again, Err(SessionRegistryError::AlreadyBound)),
+                "an id that is already bound is refused, {again:?}",
+            );
+            assert_eq!(live(&counter), 1, "the refusal counted nothing");
+
+            // The mutation site is what reports, so a displacement reported
+            // through it is a replacement even if a caller ever reaches it.
+            {
+                let mut inner = registry.lock().expect("registry lock");
+                inner.bind("sess-a".to_string(), binding(3), &registry.gauge);
+            }
+            assert_eq!(live(&counter), 1, "a displacement is not an addition");
+            assert_eq!(registry.len(), 1, "and the map did not grow either");
+        }
+
+        /// An explicit close decrements exactly once, and only for a binding it
+        /// actually removed.
+        #[test]
+        fn taking_a_session_for_close_decrements_once() {
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(4, &counter);
+            registry
+                .insert("sess-a".to_string(), binding(1))
+                .expect("first insert");
+            registry
+                .insert("sess-b".to_string(), binding(2))
+                .expect("second insert");
+            assert_eq!(live(&counter), 2, "two conversations");
+
+            let closed = registry
+                .take_for_close("sess-a")
+                .expect("idle, so closable");
+            assert_eq!(live(&counter), 1, "the close counted exactly one departure");
+            assert_eq!(registry.len(), 1);
+            drop(closed);
+
+            // The id is gone, so a second close removes nothing and reports
+            // nothing — the double-decrement this arrangement has to exclude.
+            let again = registry.take_for_close("sess-a");
+            assert!(
+                matches!(again, Err(SessionCloseError::NotFound)),
+                "closing a closed session is not found, {again:?}",
+            );
+            assert_eq!(live(&counter), 1, "and it did not decrement again");
+
+            // A refused close is not a close either.
+            let busy = registry
+                .acquire(binding(2), "sess-b")
+                .expect("sess-b takes its lease");
+            let refused = registry.take_for_close("sess-b");
+            assert!(
+                matches!(refused, Err(SessionCloseError::Busy(_))),
+                "a session mid-turn is not closable, {refused:?}",
+            );
+            assert_eq!(live(&counter), 1, "a refused close counted nothing");
+            assert_eq!(registry.len(), 1, "and unbound nothing");
+            drop(busy);
+        }
+
+        /// Dropping the registry returns the count to where it started, so a
+        /// test that opens sessions does not leave the gauge raised forever.
+        #[test]
+        fn dropping_the_registry_returns_the_count_to_zero() {
+            let counter = counter();
+            {
+                let registry = SessionRegistry::with_local_gauge(4, &counter);
+                for index in 0..3_u64 {
+                    registry
+                        .insert(format!("sess-{index}"), binding(index))
+                        .expect("under the bound");
+                }
+                assert_eq!(live(&counter), 3, "three conversations");
+            }
+            assert_eq!(live(&counter), 0, "the registry took its count with it");
+        }
+
+        /// Churn under contention does not accumulate either. Eight threads
+        /// race to bind fresh ids against a bound of one; whatever order they
+        /// land in, the count must equal the number of bindings left.
+        #[test]
+        fn racing_churn_leaves_the_count_equal_to_the_map() {
+            use std::sync::Barrier;
+
+            const THREADS: usize = 8;
+            const ROUNDS: u64 = 16;
+            let counter = counter();
+            let registry = SessionRegistry::with_local_gauge(1, &counter);
+            let barrier = Arc::new(Barrier::new(THREADS));
+
+            std::thread::scope(|scope| {
+                for thread in 0..THREADS {
+                    let registry = registry.clone();
+                    let barrier = Arc::clone(&barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for round in 0..ROUNDS {
+                            let id = format!("sess-{thread}-{round}");
+                            if let Ok(evicted) = registry.insert(id, binding(round)) {
+                                drop(evicted);
+                            }
+                        }
+                    });
+                }
+            });
+
+            assert_eq!(registry.len(), 1, "the bound held");
+            assert_eq!(
+                live(&counter),
+                1,
+                "{} rounds of churn counted one conversation, not the churn",
+                THREADS as u64 * ROUNDS,
+            );
+            assert_eq!(registry.leases().held(), 0, "no eviction lease leaked");
+        }
+    }
+
+    /// The production registry reports to the process-global gauge.
+    ///
+    /// [`mod gauge`] asserts the arithmetic against a counter of its own; this
+    /// asserts the wire is still attached, which is the one thing a local
+    /// counter cannot see. It measures a delta rather than an absolute, because
+    /// the rest of this binary is moving the same gauge, and it asserts only a
+    /// lower bound on that delta for the same reason — anything exact would be
+    /// asserting that no other test opened a session at the same instant.
+    #[test]
+    fn the_registry_reports_its_size_to_the_process_global_gauge() {
+        let before = crate::metrics::snapshot().active_sessions;
+        let registry = SessionRegistry::new(4);
+        registry
+            .insert("sess-global".to_string(), binding(1))
+            .expect("under the bound");
+        let after = crate::metrics::snapshot().active_sessions;
+        assert!(
+            after > before,
+            "binding a conversation must reach the global gauge ({before} -> {after})",
+        );
+        drop(registry);
     }
 }
