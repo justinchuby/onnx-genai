@@ -284,8 +284,9 @@ The metadata crate currently rejects:
 - a free input dimension with neither packing, padding, nor uniformity;
 - an invalid packed axis or more than two ownership levels;
 - missing, aliased, mis-typed, mis-ranked, or inconsistently shaped companions;
-- missing or contradictory CTC frame lengths when logits pad the decoded time
-  axis (the decoder role must resolve to that padding entry's exact companion);
+- a CTC profile without the canonical `outputs.logits` role, or missing or
+  contradictory CTC frame lengths when logits pad the decoded time axis (the
+  decoder role must resolve to that padding entry's exact companion);
 - a packed axis that is also padded;
 - a padded dimension with two validity truths;
 - a packed output level with missing or contradictory `extent`;

@@ -820,7 +820,7 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
             ));
         }
         if decoding.kind == "ctc" {
-            validate_ctc_padding_lengths(metadata, name, profile, decoding, errors);
+            validate_ctc_logits_contract(metadata, name, profile, decoding, errors);
         }
         if let Some(vocabulary) = &decoding.vocabulary {
             if vocabulary.source == "inline" && vocabulary.tokens.is_empty() {
@@ -873,27 +873,33 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
     }
 }
 
-/// Bind padded CTC time logits to the padding contract's one validity truth.
+/// Resolve CTC through its canonical logits role and bind padded time logits
+/// to the padding contract's one validity truth.
 ///
 /// `TensorContract::padding` already validates the companion's int64 dtype,
 /// shared layout, and exact outer-axis rank/shape. This cross-layer rule makes
 /// the CTC decoder consume that same value by name rather than permitting a
 /// missing or second, contradictory frame-count source.
-fn validate_ctc_padding_lengths(
+fn validate_ctc_logits_contract(
     metadata: &InferenceMetadata,
     profile_name: &str,
     profile: &crate::schema::TaskProfile,
     decoding: &crate::schema::SequenceDecodingSpec,
     errors: &mut Vec<String>,
 ) {
+    let Some(logits_output) = profile.outputs.get("logits") else {
+        errors.push(format!(
+            "profiles.{profile_name}.outputs.logits is required because CTC decoding reads the \
+             canonical 'logits' role; map that role to the workflow output containing the \
+             frame-by-class logits tensor"
+        ));
+        return;
+    };
     let Some(workflow) = metadata
         .pipeline
         .as_ref()
         .map(|pipeline| &pipeline.workflow)
     else {
-        return;
-    };
-    let Some(logits_output) = profile.outputs.get("logits") else {
         return;
     };
     let Some(logits) = workflow.outputs.get(logits_output) else {

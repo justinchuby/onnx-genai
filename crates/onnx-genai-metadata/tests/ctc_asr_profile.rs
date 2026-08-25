@@ -149,19 +149,18 @@ fn ctc_asr_document_validates() {
     assert_eq!(decoding.blank_id, Some(0));
     assert!(decoding.collapse_repeats);
     assert_eq!(decoding.lengths.as_deref(), Some("frame_lengths"));
+    let logits_output = profile
+        .outputs
+        .get("logits")
+        .expect("CTC profile exposes the canonical logits role");
+    assert_eq!(logits_output, "logits");
     let lengths_role = decoding
         .lengths
         .as_deref()
         .expect("padded CTC lengths role");
     let lengths_output = &profile.outputs[lengths_role];
-    let padding = &metadata
-        .pipeline
-        .as_ref()
-        .expect("pipeline")
-        .workflow
-        .outputs["logits"]
-        .contract
-        .padding[0];
+    let workflow = &metadata.pipeline.as_ref().expect("pipeline").workflow;
+    let padding = &workflow.outputs[logits_output].contract.padding[0];
     assert_eq!(
         lengths_output, &padding.valid_lengths,
         "CTC decoding and the padded time axis use one length source"
@@ -500,6 +499,25 @@ fn padded_ctc_without_lengths_binding_is_rejected() {
         reported.iter().any(|error| error.contains(
             "profiles.transcription.decoding.lengths is required because workflow output \
              'logits' pads decoded time axis 1 ('frames') with valid_lengths 'frame_lengths'"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn ctc_cannot_alias_away_the_canonical_logits_role() {
+    let document = CTC_ASR_DOCUMENT
+        .replace(
+            "    outputs: { logits: logits, frame_lengths: frame_lengths }",
+            "    outputs: { emissions: logits, frame_lengths: frame_lengths }",
+        )
+        .replace("      lengths: frame_lengths", "      lengths: emissions");
+    let reported = errors(&document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.outputs.logits is required because CTC decoding reads the \
+             canonical 'logits' role; map that role to the workflow output containing the \
+             frame-by-class logits tensor"
         )),
         "{reported:?}"
     );
