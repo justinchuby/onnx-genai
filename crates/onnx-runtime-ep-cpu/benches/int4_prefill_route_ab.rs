@@ -92,6 +92,25 @@ fn median(mut samples: Vec<f64>) -> f64 {
 fn checksum(out: &Tensor) -> (f64, u64) {
     let view = out.view();
     let len: usize = view.shape.iter().product();
+    // `from_raw_parts` below trusts that `len` elements are contiguous behind
+    // the pointer. That holds for a freshly allocated kernel output and fails
+    // for a strided or sliced view, and the failure is a read past the
+    // allocation rather than a wrong number, so it is checked rather than
+    // assumed. Row-major contiguity is exactly `strides[i] == product of the
+    // dimensions after i`.
+    let mut want = 1i64;
+    for (dim, stride) in view.shape.iter().zip(view.strides.iter()).rev() {
+        assert_eq!(
+            *stride, want,
+            "checksum needs a contiguous f32 output; shape {:?} strides {:?} are not row-major",
+            view.shape, view.strides
+        );
+        want *= *dim as i64;
+    }
+    assert_eq!(
+        view.byte_offset, 0,
+        "checksum does not handle a byte offset"
+    );
     let values = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
     let sum = values.iter().map(|v| f64::from(*v)).sum();
     let mut fnv = 0xcbf2_9ce4_8422_2325u64;

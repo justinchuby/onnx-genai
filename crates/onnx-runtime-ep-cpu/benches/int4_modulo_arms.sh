@@ -72,6 +72,26 @@ build_arm poison "$POISON"
 cp "$OUT/prefill_after" "$OUT/prefill_aa"
 cp "$OUT/decode_after" "$OUT/decode_aa"
 
-echo "--- built arms (distinct binaries are the first check that the patch took)"
+echo "--- built arms"
 sha256sum "$OUT"/prefill_* "$OUT"/decode_*
+
+# Hard gate, not a printout to eyeball. Two arms with the same bytes is the
+# worst outcome this script has: the matrix still runs, every row still reports
+# a number, and the number is a null that means nothing because both sides were
+# the same binary. It is reachable without anyone doing anything wrong -- the
+# first arm patches the source to the line that is already on `main`, so if
+# cargo ever decides that write was a no-op (mtime granularity, a cached
+# fingerprint) it will skip the rebuild and `newest_exe` will hand back the
+# previous arm. `aa` is excluded because it is a deliberate copy of `after`.
+for kind in prefill decode; do
+    dupes=$(sha256sum "$OUT/${kind}_before" "$OUT/${kind}_after" "$OUT/${kind}_poison" \
+        | awk '{print $1}' | sort | uniq -d)
+    if [ -n "$dupes" ]; then
+        echo "FAILED: two $kind arms are byte-identical, so at least one did not" \
+             "rebuild. Any matrix taken from these is a null between a binary" \
+             "and itself. Try \`cargo clean -p onnx-runtime-ep-cpu\`." >&2
+        exit 1
+    fi
+done
+echo "--- all three arms are distinct binaries"
 echo "--- now: int4_modulo_matrix.py --rounds 61"

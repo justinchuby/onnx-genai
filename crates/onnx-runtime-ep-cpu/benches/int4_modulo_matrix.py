@@ -37,6 +37,7 @@ landed in.
 import argparse
 import json
 import os
+import random
 import resource
 import statistics
 import subprocess
@@ -113,13 +114,62 @@ def decode_launch(binary, env_extra, timeout=1800):
     return rec, (cpu / wall if wall > 0 else 0.0)
 
 
+#: Fixed so the published intervals are reproducible rather than merely
+#: recomputable to something similar.
+BOOTSTRAP_SEED = 20260825
+BOOTSTRAP_RESAMPLES = 20000
+
+
+def bootstrap_ratio(before_vals, after_vals, resamples=BOOTSTRAP_RESAMPLES):
+    """Percentile bootstrap interval for `median(before) / median(after)`.
+
+    The point estimate on its own is not reportable on this host. The
+    launch-to-launch spread reaches 100% while the median A/A null is 0.14%, so
+    a ratio of medians is stable and a ratio of any single pairing is not -- and
+    only the interval says which of those the reader is looking at.
+
+    Launches are resampled, not individual timings: the launch is the unit that
+    varies (placement, page backing, which decode mode the process landed in),
+    and resampling below it would understate the spread it is there to capture.
+
+    Percentile rather than BCa. The estimator is a smooth ratio of medians on
+    50+ independent samples per arm and the intervals here are wide relative to
+    the bias a BCa correction would remove, so the extra machinery would buy
+    precision the measurement does not have.
+    """
+    if not before_vals or not after_vals:
+        return (float("nan"), float("nan"))
+    rng = random.Random(BOOTSTRAP_SEED)
+    out = []
+    for _ in range(resamples):
+        ra = [rng.choice(before_vals) for _ in before_vals]
+        rb = [rng.choice(after_vals) for _ in after_vals]
+        mb = statistics.median(rb)
+        out.append(statistics.median(ra) / mb if mb else float("nan"))
+    out.sort()
+    return (out[int(0.025 * resamples)], out[int(0.975 * resamples)])
+
+
+def verdict(lo, hi):
+    """What the interval permits you to say, rather than what the point says."""
+    if lo > 1.0:
+        return "gain"
+    if hi < 1.0:
+        return "loss"
+    return "null"
+
+
 def ratio_stats(before_vals, after_vals):
     """Medians over independent launches, and the median ratio.
 
     Reported as `before / after`, so > 1.000 means `after` is faster.
     """
     mb, ma = statistics.median(before_vals), statistics.median(after_vals)
+    lo, hi = bootstrap_ratio(before_vals, after_vals)
     return {
+        "ci_lo": lo,
+        "ci_hi": hi,
+        "verdict": verdict(lo, hi),
         "before_median_ms": mb,
         "after_median_ms": ma,
         "speedup": mb / ma if ma else float("nan"),
@@ -162,6 +212,12 @@ def prefill_matrix(rounds, block, shape, m_list):
         row.update(ratio_stats(samples["before"][m], samples["after"][m]))
         aa = ratio_stats(samples["aa"][m], samples["after"][m])
         row["aa_null_pct"] = abs(aa["speedup"] - 1.0) * 100
+        row["aa_speedup"] = aa["speedup"]
+        row["aa_ci_lo"], row["aa_ci_hi"] = aa["ci_lo"], aa["ci_hi"]
+        # The null has to be shown to contain 1.000, not assumed to. An A/A arm
+        # whose own interval excludes 1.000 says the instrument is biased at
+        # this row, and every verdict in the row is then unreadable.
+        row["aa_brackets_unity"] = aa["ci_lo"] <= 1.0 <= aa["ci_hi"]
         row["cold_speedup"] = (
             statistics.median(cold["before"][m]) / statistics.median(cold["after"][m])
         )
@@ -208,6 +264,8 @@ def decode_matrix(rounds, block, tokens):
     out.update(ratio_stats(samples["before"], samples["after"]))
     aa = ratio_stats(samples["aa"], samples["after"])
     out["aa_null_pct"] = abs(aa["speedup"] - 1.0) * 100
+    out["aa_ci_lo"], out["aa_ci_hi"] = aa["ci_lo"], aa["ci_hi"]
+    out["aa_brackets_unity"] = aa["ci_lo"] <= 1.0 <= aa["ci_hi"]
     out["checksums"] = {a: sorted(checks[a]) for a in arms}
     out["bit_identical"] = len(checks["before"] | checks["after"] | checks["aa"]) == 1
     out["samples"] = samples
@@ -228,6 +286,14 @@ def route_proof(m_list, shape):
       poison == after   on block 32, m = 1 -- the built-in control, because
                         that row takes the N-blocked decode kernel and never
                         calls the pack at all
+
+    That last expectation is hardcoded from `int4_prefill_gebp_min_rows`'s gate
+    rather than derived, which makes it a **tripwire as well as a control**: if
+    the dispatch ever changes so that block 32 at m = 1 does reach the pack, or
+    some other row stops reaching it, this reports FAIL. Read such a failure as
+    "the routing moved" first and "the kernel broke" second -- `before ==
+    after`, which is checked on every row independently, is the half that speaks
+    to correctness.
     """
     arms = ["before", "after", "poison"]
     rows = {}
@@ -313,17 +379,28 @@ def main():
     print(f"\npin=cpu{PIN}  cpu_eff floor={CPU_EFF_FLOOR}  "
           f"discarded={result['prefill_discarded_launches']}")
     print(f"\nprefill block {args.block} ({args.shape}), {args.rounds} independent launches per arm")
-    print(f"{'m':>5} {'before ms':>11} {'after ms':>11} {'speedup':>9} "
-          f"{'A/A null':>9} {'cold sp':>9} {'bit-id':>7}")
+    print(f"{'m':>5} {'before ms':>10} {'after ms':>10} {'speedup':>8} {'95% CI':>18} "
+          f"{'verdict':>8} {'A/A':>7} {'A/A 95% CI':>18} {'A/A ok':>7} {'bit-id':>7}")
     for row in table:
-        print(f"{row['m']:>5} {row['before_median_ms']:>11.3f} {row['after_median_ms']:>11.3f} "
-              f"{row['speedup']:>9.4f} {row['aa_null_pct']:>8.2f}% {row['cold_speedup']:>9.4f} "
-              f"{str(row['bit_identical']):>7}")
+        print(f"{row['m']:>5} {row['before_median_ms']:>10.3f} {row['after_median_ms']:>10.3f} "
+              f"{row['speedup']:>8.4f} [{row['ci_lo']:.4f}, {row['ci_hi']:.4f}] "
+              f"{row['verdict']:>8} {row['aa_speedup']:>7.4f} "
+              f"[{row['aa_ci_lo']:.4f}, {row['aa_ci_hi']:.4f}] "
+              f"{str(row['aa_brackets_unity']):>7} {str(row['bit_identical']):>7}")
+    print(f"\nIntervals: percentile bootstrap over launches, "
+          f"{BOOTSTRAP_RESAMPLES} resamples, seed {BOOTSTRAP_SEED}.")
+    if not all(r["aa_brackets_unity"] for r in table):
+        print("WARNING: an A/A interval excludes 1.000 -- the instrument is biased "
+              "at that row and its verdict is not readable.")
+    if not all(r["bit_identical"] for r in table):
+        print("WARNING: an arm produced different output bytes -- this A/B is not "
+              "measuring an exact transformation.")
     if not args.skip_decode and "error" not in result["decode"]:
         d = result["decode"]
         print(f"\ndecode block 16, {args.decode_rounds} independent launches per arm")
         print(f"  before {d['before_median_ms']:.3f}  after {d['after_median_ms']:.3f}  "
-              f"speedup {d['speedup']:.4f}  A/A null {d['aa_null_pct']:.2f}%  "
+              f"speedup {d['speedup']:.4f} [{d['ci_lo']:.4f}, {d['ci_hi']:.4f}] {d['verdict']}  "
+              f"A/A null {d['aa_null_pct']:.2f}% [{d['aa_ci_lo']:.4f}, {d['aa_ci_hi']:.4f}]  "
               f"bit-identical {d['bit_identical']}")
     print(f"\nwrote {args.out}")
 
