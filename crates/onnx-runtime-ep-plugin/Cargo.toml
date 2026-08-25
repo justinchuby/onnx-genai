@@ -18,6 +18,7 @@ dispatch_probe = []
 [dependencies]
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+onnx-runtime-shape-inference = { workspace = true }
 onnx-genai-ort-sys = { workspace = true }
 
 # `pin.rs` takes one never-released reference to this library's own module so

@@ -8,12 +8,10 @@
 //! an error naming the op and domain. This surfaces at Compute time — never
 //! silently producing a wrong-shape tensor.
 //!
-//! [`ShapeInference::for_node`] is the single source of truth: it takes the
-//! compiled IR `Node`, its input shapes and its output count, and resolves the
-//! rule — reading attributes where the shape depends on them (Reshape, Conv,
-//! reductions, the LayerNorm family, …). There is deliberately no op-name-only
-//! entry point; every caller has a `Node` at capability and compile time, so a
-//! second, attribute-blind table would only be a place for rules to drift.
+//! [`ShapeInference::for_node`] is the single dispatch point: it takes the
+//! compiled IR `Node`, its input shapes and its output count, and selects either
+//! the shared native registry adapter or a plugin-only rule. There is
+//! deliberately no attribute-blind op-name entry point.
 
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -29,6 +27,7 @@ use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView
 use onnx_runtime_ir::{DataType, DeviceId, Node};
 
 use crate::kernel_ctx::{allocate_output, read_inputs_into};
+use crate::shared_shapes::{SharedNativeShapeRule, SharedShapeResult, infer_shared_node};
 use crate::status::{fail_status, ok_status};
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -52,6 +51,13 @@ pub struct ConvSpatialAxis {
 /// How to infer output shapes at runtime from the concrete input shapes.
 #[derive(Clone, Debug)]
 pub enum ShapeInference {
+    /// Ask the native symbolic registry first, then preserve the existing
+    /// plugin rule as a fallback when values remain unavailable or the native
+    /// rule is stricter than the historical plugin contract.
+    SharedNative {
+        node: Box<Node>,
+        fallback: Box<ShapeInference>,
+    },
     /// numpy-style broadcast of all inputs → one output.
     ElementwiseBroadcast,
     /// Output shape == input[idx].shape.
@@ -275,6 +281,18 @@ impl ShapeInference {
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
         let opset = node.version.unwrap_or(0);
+
+        if let Some(rule) = SharedNativeShapeRule::for_node(node) {
+            let fallback = match rule {
+                SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
+                SharedNativeShapeRule::Expand => Self::Expand,
+                SharedNativeShapeRule::Tile => Self::Tile,
+            };
+            return Self::SharedNative {
+                node: Box::new(node.clone()),
+                fallback: Box::new(fallback),
+            };
+        }
 
         let int_attr = |name: &str| -> Option<i64> { node.attr(name)?.as_int() };
         let ints_attr =
@@ -592,13 +610,9 @@ impl ShapeInference {
             | "QuantizeLinear" => Self::SameAsInput(0),
 
             // ── Shapes carried in input values ────────────────────────────
-            // Each of these is data-dependent, and each is *cheap*: the extent
-            // is a handful of int64s, not a computation over the payload. That
-            // is what separates them from `Unique` / `NonMaxSuppression`, where
-            // the extent is the whole algorithm.
-            "ConstantOfShape" => Self::ConstantOfShape,
-            "Expand" => Self::Expand,
-            "Tile" => Self::Tile,
+            // The shared native adapter owns ConstantOfShape/Expand/Tile above;
+            // their local variants remain as compatibility fallbacks. Window
+            // sizing is the next cheap value-carried rule still local here.
             "HannWindow" | "HammingWindow" | "BlackmanWindow" => Self::Window,
 
             // ── DFT ───────────────────────────────────────────────────────
@@ -1947,6 +1961,7 @@ unsafe fn mem_info_is_device(api: &ort::OrtApi, mem_info: *const ort::OrtMemoryI
 /// operand that crossed a CPU→device boundary and must be staged (#982).
 fn host_operand_indices(strategy: &ShapeInference) -> &'static [usize] {
     match strategy {
+        ShapeInference::SharedNative { fallback, .. } => host_operand_indices(fallback),
         ShapeInference::ReshapeData { .. } => &[1],
         ShapeInference::SliceData => &[1, 2, 3, 4],
         ShapeInference::ReductionFromInput { .. } => &[1],
@@ -3650,7 +3665,7 @@ fn read_i64_vec(t: &TensorView<'_>, what: &str) -> Result<Vec<i64>, String> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    let base = t.data.as_ptr() as *const u8;
+    let base = t.data.as_ptr::<u8>();
     if base.is_null() {
         return Err(format!("{what} has a null data pointer"));
     }
@@ -3688,7 +3703,7 @@ fn read_scalar_i64(t: &TensorView<'_>, what: &str) -> Result<i64, String> {
             t.device
         ));
     }
-    let base = t.data.as_ptr() as *const u8;
+    let base = t.data.as_ptr::<u8>();
     if base.is_null() {
         return Err(format!("{what} has a null data pointer"));
     }
@@ -3746,7 +3761,7 @@ fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
 
     let len = condition.shape.first().copied().unwrap_or(0);
     let stride = condition.strides.first().copied().unwrap_or(1);
-    let base = condition.data.as_ptr() as *const u8;
+    let base = condition.data.as_ptr::<u8>();
     if base.is_null() {
         return Err("Compress: condition has a null data pointer".into());
     }
@@ -3767,12 +3782,10 @@ fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
 
 /// Test-only entry point to [`infer_shapes`].
 ///
-/// Exposed so `shape_tables_agree` in `onnx-runtime-ep-cpu-plugin` can drive
-/// this table and the native `onnx-runtime-shape-inference` one over the same
-/// node and compare them. Two independent encodings of one ONNX specification
-/// drift, and the drift is silent — the two paths simply disagree about the same
-/// graph. Keeping the function itself private preserves the invariant that
-/// production callers reach it only through the Compute path.
+/// Exposed so `shape_tables_agree` in `onnx-runtime-ep-cpu-plugin` can compare
+/// the compatibility fallback with the native registry and exercise the
+/// production shared route. Keeping the function itself private preserves the
+/// invariant that production callers reach it only through the Compute path.
 pub fn infer_shapes_for_test(
     strategy: &ShapeInference,
     inputs: &[TensorView<'_>],
@@ -3786,6 +3799,15 @@ fn infer_shapes(
     inputs: &[TensorView<'_>],
 ) -> Result<Vec<Vec<usize>>, String> {
     match strategy {
+        ShapeInference::SharedNative { node, fallback } => match infer_shared_node(node, inputs) {
+            SharedShapeResult::Resolved(shapes) => Ok(shapes),
+            // Preserve the plugin's established permissiveness. In particular,
+            // native validation can reject malformed companion operands that a
+            // shape-only plugin rule historically ignored.
+            SharedShapeResult::SymbolicOrUnknown | SharedShapeResult::Rejected(_) => {
+                infer_shapes(fallback, inputs)
+            }
+        },
         ShapeInference::ElementwiseBroadcast => {
             if inputs.is_empty() {
                 return Err("ElementwiseBroadcast: no inputs".into());
@@ -5164,6 +5186,36 @@ fn after() {}
             err.contains("rank"),
             "error should name the mismatch: {err}"
         );
+    }
+
+    #[test]
+    fn shared_rule_rejection_preserves_the_existing_plugin_fallback() {
+        let buf = vec![0.0f32; 6];
+        let data = f32_data(&[2, 3], &[3, 1], &buf);
+        let reps = [3i64, 2];
+        // The native rule correctly rejects this malformed rank-2 `repeats`
+        // tensor. The historical plugin rule only reads its two values and
+        // sizes the output, so the first migration slice deliberately retains
+        // that permissive behavior.
+        let r = i64_scalar(&reps, &[2, 1], &[1, 1]);
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Tile",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                Some(onnx_runtime_ir::ValueId(1)),
+            ],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(13);
+        assert!(matches!(
+            infer_shared_node(&node, &[data, r]),
+            SharedShapeResult::Rejected(reason) if reason.contains("invalid rank 2")
+        ));
+
+        let strategy =
+            ShapeInference::for_node(&node, &[vec![Some(2), Some(3)], vec![Some(2), Some(1)]], 1);
+        assert_eq!(infer(&strategy, &[data, r]).unwrap(), vec![vec![6, 6]]);
     }
 
     #[test]

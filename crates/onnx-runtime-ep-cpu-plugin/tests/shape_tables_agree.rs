@@ -33,6 +33,9 @@ use std::collections::HashMap;
 
 use onnx_runtime_ep_api::{DevicePtr, TensorView};
 use onnx_runtime_ep_plugin::compute::ShapeInference;
+use onnx_runtime_ep_plugin::shared_shapes::{
+    SharedNativeShapeRule, SharedShapeResult, infer_shared_node,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
@@ -90,9 +93,10 @@ fn typed_with_values(dims: &[i64], values: &[i64]) -> NodeIo {
     io
 }
 
-fn node(op: &str, n_inputs: usize, attrs: &[(&str, i64)]) -> Node {
+fn node(op: &str, n_inputs: usize, attrs: &[(&str, i64)], opset: u64) -> Node {
     let inputs: Vec<Option<ValueId>> = (0..n_inputs).map(|i| Some(ValueId(i as u32))).collect();
     let mut n = Node::new(NodeId(0), op, inputs, vec![ValueId(100)]);
+    n.version = Some(opset as i64);
     for (k, v) in attrs {
         n.attributes.insert((*k).to_string(), Attribute::Int(*v));
     }
@@ -146,9 +150,29 @@ fn assert_agree(
          whichever path a user exercised would look correct.",
         plugin[0]
     );
+
+    let shared = infer_shared_node(node, plugin_inputs);
+    assert_eq!(
+        shared,
+        SharedShapeResult::Resolved(vec![native_dims.clone()]),
+        "{what}: the production adapter did not expose the native concrete answer"
+    );
+
+    let input_shapes: Vec<Vec<Option<usize>>> = plugin_inputs
+        .iter()
+        .map(|input| input.shape.iter().copied().map(Some).collect())
+        .collect();
+    let strategy = ShapeInference::for_node(node, &input_shapes, node.outputs.len());
+    assert!(
+        matches!(strategy, ShapeInference::SharedNative { .. }),
+        "{what}: the production registry stopped routing this op through the shared adapter"
+    );
+    let production =
+        onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&strategy, plugin_inputs)
+            .unwrap_or_else(|e| panic!("{what}: production shared rule failed: {e}"));
+    assert_eq!(production, vec![native_dims]);
 }
 
-#[test]
 fn tile_agrees() {
     let buf = [0u8; 24];
     let data = view(DataType::Float32, &[2, 3], &[3, 1], buf.as_ptr());
@@ -156,7 +180,7 @@ fn tile_agrees() {
     let r = view(DataType::Int64, &[2], &[1], reps.as_ptr().cast());
     assert_agree(
         "Tile",
-        &node("Tile", 2, &[]),
+        &node("Tile", 2, &[], 13),
         13,
         ShapeInference::Tile,
         &[data, r],
@@ -167,7 +191,6 @@ fn tile_agrees() {
     );
 }
 
-#[test]
 fn expand_agrees_on_bidirectional_broadcast() {
     // The case a "just take the target" implementation gets wrong. If the two
     // tables ever diverge, this is where it shows.
@@ -177,7 +200,7 @@ fn expand_agrees_on_bidirectional_broadcast() {
     let s = view(DataType::Int64, &[2], &[1], want.as_ptr().cast());
     assert_agree(
         "Expand",
-        &node("Expand", 2, &[]),
+        &node("Expand", 2, &[], 13),
         13,
         ShapeInference::Expand,
         &[data, s],
@@ -188,18 +211,33 @@ fn expand_agrees_on_bidirectional_broadcast() {
     );
 }
 
-#[test]
 fn constant_of_shape_agrees() {
     let dims: [i64; 3] = [2, 3, 4];
     let t = view(DataType::Int64, &[3], &[1], dims.as_ptr().cast());
     assert_agree(
         "ConstantOfShape",
-        &node("ConstantOfShape", 1, &[]),
+        &node("ConstantOfShape", 1, &[], 9),
         9,
         ShapeInference::ConstantOfShape,
         &[t],
         vec![typed_with_values(&[3], &dims)],
     );
+}
+
+#[test]
+fn migrated_shared_rules_agree() {
+    let rules = SharedNativeShapeRule::all();
+    assert!(
+        !rules.is_empty(),
+        "the shared-rule agreement test must not pass vacuously"
+    );
+    for rule in rules {
+        match rule {
+            SharedNativeShapeRule::ConstantOfShape => constant_of_shape_agrees(),
+            SharedNativeShapeRule::Expand => expand_agrees_on_bidirectional_broadcast(),
+            SharedNativeShapeRule::Tile => tile_agrees(),
+        }
+    }
 }
 
 // ── Sweep ────────────────────────────────────────────────────────────────────
@@ -253,7 +291,7 @@ fn shape_preserving_ops_agree() {
             ));
             native_inputs.push(typed(DataType::Float32, &[3]));
         }
-        let n = node(op, 1 + extras, &[]);
+        let n = node(op, 1 + extras, &[], opset);
         let nat = match native_try(&n, native_inputs, opset) {
             Ok(outs) => outs,
             // The native table rejected the node outright. That is a validity
@@ -278,4 +316,44 @@ fn shape_preserving_ops_agree() {
             plugin[0]
         );
     }
+}
+
+#[test]
+fn malformed_dequantize_preserves_the_plugin_permissiveness_boundary() {
+    let data_buf = [0.0f32; 12];
+    let scale_buf = [1.0f32; 3];
+    let data = view(
+        DataType::Float32,
+        &[3, 4],
+        &[4, 1],
+        data_buf.as_ptr().cast(),
+    );
+    let scale = view(DataType::Float32, &[3], &[1], scale_buf.as_ptr().cast());
+    let n = node("DequantizeLinear", 2, &[], 13);
+
+    let native_error = native_try(
+        &n,
+        vec![
+            typed(DataType::Float32, &[3, 4]),
+            typed(DataType::Float32, &[3]),
+        ],
+        13,
+    )
+    .expect_err("native inference validates the per-axis scale length");
+    assert!(native_error.to_string().contains("scale length 3"));
+    assert!(matches!(
+        infer_shared_node(&n, &[data, scale]),
+        SharedShapeResult::Rejected(reason) if reason.contains("scale length 3")
+    ));
+
+    let strategy = ShapeInference::for_node(&n, &[vec![Some(3), Some(4)], vec![Some(3)]], 1);
+    assert!(
+        matches!(strategy, ShapeInference::SameAsInput(0)),
+        "DequantizeLinear is intentionally outside the first shared slice"
+    );
+    assert_eq!(
+        onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&strategy, &[data, scale]).unwrap(),
+        vec![vec![3, 4]],
+        "the plugin's pre-existing permissive sizing contract must remain unchanged"
+    );
 }
