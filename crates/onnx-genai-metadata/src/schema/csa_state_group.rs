@@ -114,6 +114,22 @@ impl CsaStateRole {
     pub fn is_index_edge(self) -> bool {
         matches!(self, Self::IndexKey | Self::IndexCarry)
     }
+
+    /// Whether this role is a **compressed-record buffer** (`compressed_kv`,
+    /// `index_key`) rather than a fixed-size accumulator carry.
+    ///
+    /// Record buffers grow along their penultimate axis on a *backend-owned
+    /// compressed-record cursor* (~tokens / ratio, block-boundary dependent),
+    /// so the runner threads them as growable `present -> past` state — never as
+    /// a fixed loop-carried wholesale-swap tensor. The carries
+    /// (`compression_carry`, `index_carry`) are the fixed-shape accumulators and
+    /// are replaced wholesale each step. This is a *property of the role*, not of
+    /// the exported tensor shape: an export may pin the record axis to a static
+    /// size in a fixture yet still advance it on the cursor, so the shape alone
+    /// cannot classify it (RULES.md §10).
+    pub fn is_record_buffer(self) -> bool {
+        matches!(self, Self::CompressedKv | Self::IndexKey)
+    }
 }
 
 impl std::fmt::Display for CsaStateRole {

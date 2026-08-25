@@ -121,11 +121,20 @@ pub struct NativeDecodeSession {
     /// asserts to catch a mis-bound cache. A CompressedSparseAttention record
     /// buffer (`compressed_kv`, `index_key`) instead grows by roughly
     /// `tokens / compression_ratio` records — a cursor the op owns and the ABI
-    /// declares is not inferable from the token count. Those present outputs are
-    /// listed here so the token-rate length check skips them; they are threaded
-    /// present->past by name like any other state pair. Empty for a model with
-    /// no CSA state, so ordinary decoders are unaffected.
-    csa_present_outputs: HashSet<String>,
+    /// declares is not inferable from the token count. These sets are classified
+    /// from the property-based [`onnx_genai_metadata::CsaStateRole`] at load time
+    /// (never from tensor shape), so a fixture that pins the record axis to a
+    /// static extent is still threaded as a growable record buffer.
+    ///
+    /// `csa_record_presents` lists the record **present** outputs so the CPU
+    /// token-rate length check skips them; `csa_record_pasts` lists the record
+    /// **past** inputs so snapshot/rollback captures them and a bare rewind
+    /// refuses them (a compressed cache cannot be token-prefix-sliced). Both are
+    /// empty for a model with no CSA record state, so ordinary decoders and the
+    /// fixed CSA carries (which thread as recurrent wholesale-swap state) are
+    /// unaffected.
+    csa_record_presents: HashSet<String>,
+    csa_record_pasts: HashSet<String>,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
     cpu_kv: Option<DecodeCpuKvState>,
@@ -459,31 +468,16 @@ impl NativeDecodeSession {
     /// Past-input names of the CSA/HCA compressed-record buffers
     /// (`past_compressed_kv.*`, `past_index_key.*`).
     ///
-    /// These are the CSA present->past targets whose growth axis is the
-    /// backend-owned compressed-record cursor (a dynamic penultimate axis),
-    /// i.e. every CSA state input that is *not* a fixed-size carry (the carries
-    /// have a static penultimate axis and are already covered by
-    /// [`Self::recurrent_past_names`]). They are append-only but advance at the
-    /// per-layer compression rate (~tokens/ratio), so they cannot be
-    /// token-prefix-sliced like a dense KV cache; a rewind restores them from a
-    /// snapshot instead. Empty for a graph with no CSA state.
+    /// Classified from the property-based [`onnx_genai_metadata::CsaStateRole`]
+    /// at load time (the `compressed_kv` / `index_key` roles), not from tensor
+    /// shape: their growth axis is the backend-owned compressed-record cursor
+    /// (~tokens/ratio), so they are append-only but cannot be token-prefix-sliced
+    /// like a dense KV cache — a rewind restores them from a snapshot instead.
+    /// The fixed-size carries are excluded (they thread as recurrent
+    /// wholesale-swap state via [`Self::recurrent_past_names`]). Empty for a
+    /// graph with no CSA record state.
     fn csa_record_past_names(&self) -> HashSet<String> {
-        let mut names = HashSet::new();
-        for present in &self.csa_present_outputs {
-            let Some(past) = self.present_to_past.get(present) else {
-                continue;
-            };
-            let is_record = self
-                .session
-                .inputs()
-                .iter()
-                .find(|meta| &meta.name == past)
-                .is_some_and(|meta| !is_recurrent_state_shape(&meta.shape));
-            if is_record {
-                names.insert(past.clone());
-            }
-        }
-        names
+        self.csa_record_pasts.clone()
     }
 
     pub(crate) fn has_recurrent_state(&self) -> bool {

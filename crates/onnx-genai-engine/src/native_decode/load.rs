@@ -614,6 +614,12 @@ impl NativeDecodeSession {
             },
             None => (Vec::new(), Vec::new()),
         };
+        // The growable dense KV pairs pair positionally (present[i] <-> past[i])
+        // and are the only entries at the head of both lists; everything appended
+        // after this point (fixed recurrent states, CSA carries, CSA record
+        // buffers) is paired explicitly by name below, so capture the dense count
+        // now, before any append disturbs it.
+        let dense_kv_count = kv_inputs.len();
 
         // Fixed loop-carried recurrent states (hybrid linear-attention
         // `conv_state` / `recurrent_state`) are declared through `io.state_pairs`
@@ -622,12 +628,8 @@ impl NativeDecodeSession {
         // past input (recurrent states are seeded at their full static extent by
         // `make_empty_input_tensor`) and copies the present output back each step
         // (`replace` semantics fall out naturally from the wholesale tensor swap).
-        // So fold the declared state pairs into the same positionally-paired
-        // lists. This is what lets hybrid SSM/attention decoders (qwen3.5) decode:
-        // their linear-attention layers carry state only through these pairs.
-        // Appending to both lists in the same order keeps the positional zip below
-        // correct; `present_to_past` also records each pair explicitly, so the
-        // recurrent tail never depends on the zip.
+        // So fold the declared state pairs into the same lists and record each
+        // pair by name in `present_to_past` below.
         let mut state_pairs: Vec<(String, String)> = Vec::new();
         if let Some(pairs) = io.and_then(|io| io.state_pairs.as_ref()) {
             for pair in pairs {
@@ -638,16 +640,33 @@ impl NativeDecodeSession {
         }
         // DeepSeek-V4 CompressedSparseAttention (CSA/HCA) threads its compressed
         // KV / carry / learned-index state as role-typed `present_* -> past_*`
-        // edges. Discover each declared group, validate every edge against the
-        // graph's real typed IO, and refuse (typed) before any buffer is
-        // reserved. Valid edges fold into the same recurrent-state lists as
-        // fixed loop-carried state: the runner then binds stable-address scratch
-        // once and rebinds present->past each step through the existing
-        // authority, so compressed state gets snapshot/rollback/fork/teardown for
-        // free. A schedule that alternates ratio-4 and ratio-128 layers declares
-        // one group per layer; absent means the graph threads no CSA state and
+        // edges. Discover each declared group and validate every edge against the
+        // graph's real typed IO, refusing (typed) before any buffer is reserved.
+        //
+        // The two roles thread through *different* state paths, decided by the
+        // property-based role — never by tensor shape (an export may pin the
+        // record axis to a static extent in a fixture yet still advance it on the
+        // cursor):
+        //
+        //  * **Record buffers** (`compressed_kv`, `index_key`) grow along their
+        //    penultimate axis on a backend-owned compressed-record cursor
+        //    (~tokens / ratio). They are threaded as *growable* `present -> past`
+        //    state, paired by name — the runner hands the whole present tensor
+        //    (whatever extent the op produced this step) back as the next past.
+        //    They are deliberately NOT added to `state_pairs`/`fixed_state_inputs`:
+        //    they are not fixed-extent, so seeding them at a static extent or
+        //    reallocating them under a wholesale swap would be wrong (and is not
+        //    CUDA-graph pointer-stable).
+        //  * **Carries** (`compression_carry`, `index_carry`) are fixed-shape
+        //    accumulators replaced wholesale each step, exactly like a recurrent
+        //    state — so they fold into `state_pairs`.
+        //
+        // A schedule that alternates ratio-4 and ratio-128 layers declares one
+        // group per layer; absent means the graph threads no CSA state and
         // ordinary inference is byte-identical.
-        let mut csa_present_outputs: HashSet<String> = HashSet::new();
+        let mut csa_record_pairs: Vec<(String, String)> = Vec::new();
+        let mut csa_record_presents: HashSet<String> = HashSet::new();
+        let mut csa_record_pasts: HashSet<String> = HashSet::new();
         if let Some(groups) = io.and_then(|io| io.csa_state_groups.as_ref()) {
             let occupied: HashSet<&str> = kv_inputs
                 .iter()
@@ -660,13 +679,30 @@ impl NativeDecodeSession {
                 groups,
                 &occupied,
             )?;
-            for (past_input, present_output) in csa_edges {
-                csa_present_outputs.insert(present_output.clone());
-                kv_inputs.push(past_input.clone());
-                present_outputs.push(present_output.clone());
-                state_pairs.push((present_output, past_input));
+            for edge in csa_edges {
+                kv_inputs.push(edge.past.clone());
+                present_outputs.push(edge.present.clone());
+                if edge.role.is_record_buffer() {
+                    csa_record_presents.insert(edge.present.clone());
+                    csa_record_pasts.insert(edge.past.clone());
+                    csa_record_pairs.push((edge.present, edge.past));
+                } else {
+                    state_pairs.push((edge.present, edge.past));
+                }
             }
         }
+        // Fail-closed: the CUDA persistent-state path cannot represent the rank-3,
+        // op-cursor-advanced record buffers yet. Refuse before any device
+        // allocation rather than mis-binding them to the fixed wholesale-swap
+        // path or dense-falling-back. The CPU path threads them correctly.
+        csa::refuse_csa_records_on_cuda(
+            !csa_record_pasts.is_empty(),
+            session.device_id().device_type == DeviceType::Cuda,
+        )?;
+        // Only the fixed carries and hybrid recurrent states are wholesale-swap
+        // "fixed" state; the growable CSA record buffers are explicitly excluded
+        // so the CUDA/accounting/growth paths treat them as growable, matching
+        // the CPU present->past handoff.
         let fixed_state_inputs = state_pairs
             .iter()
             .map(|(_, input)| input.clone())
@@ -679,16 +715,17 @@ impl NativeDecodeSession {
         }
 
         let mut present_to_past = HashMap::new();
-        // KV lists pair positionally; state pairs carry explicit names.
-        let kv_pair_count = kv_inputs.len() - state_pairs.len();
+        // Dense KV pairs pair positionally over the head of both lists; fixed
+        // state pairs and growable CSA record pairs carry explicit names.
         present_to_past.extend(
             present_outputs
                 .iter()
-                .take(kv_pair_count)
+                .take(dense_kv_count)
                 .cloned()
-                .zip(kv_inputs.iter().take(kv_pair_count).cloned()),
+                .zip(kv_inputs.iter().take(dense_kv_count).cloned()),
         );
         present_to_past.extend(state_pairs.iter().cloned());
+        present_to_past.extend(csa_record_pairs.iter().cloned());
         if present_to_past.len() != kv_inputs.len() {
             bail!(
                 "native decoder has incomplete past/present pairs; past inputs: {kv_inputs:?}, present outputs: {present_outputs:?}"
@@ -942,7 +979,8 @@ impl NativeDecodeSession {
             hidden_output,
             kv_inputs,
             present_to_past,
-            csa_present_outputs,
+            csa_record_presents,
+            csa_record_pasts,
             past: HashMap::new(),
             cuda,
             cpu_kv,

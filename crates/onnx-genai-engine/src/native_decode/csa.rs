@@ -39,8 +39,19 @@ fn expected_dtype(role: CsaStateRole, cache_format: CsaCacheFormat) -> DataType 
     }
 }
 
+/// A CSA `present -> past` edge resolved against the graph's typed IO, carrying
+/// the property-based [`CsaStateRole`] so the runner can thread record buffers
+/// (growable, backend-owned cursor) and carries (fixed, wholesale-swap) through
+/// the correct state path without re-deriving the distinction from tensor shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CsaResolvedEdge {
+    pub past: String,
+    pub present: String,
+    pub role: CsaStateRole,
+}
+
 /// Resolve a declared CSA state group against the graph's typed IO into
-/// `(past_input, present_output)` edges, refusing before any allocation.
+/// role-typed `present -> past` edges, refusing before any allocation.
 ///
 /// `occupied` names ports already claimed by KV or fixed-state pairs; a CSA edge
 /// that reuses one is refused so the compressed state threads through its own
@@ -50,7 +61,7 @@ pub(super) fn resolve_csa_state_edges(
     outputs: &[IoMeta],
     group: &CsaStateGroupAbi,
     occupied: &HashSet<&str>,
-) -> anyhow::Result<Vec<(String, String)>> {
+) -> anyhow::Result<Vec<CsaResolvedEdge>> {
     // Property-level validity first: ratio/format/recurrence/edge-set. This is
     // the typed refusal for an unknown MTP recurrence, an fp4 KV cache format,
     // a missing or duplicate edge, and an index edge on a ratio that carries no
@@ -93,7 +104,11 @@ pub(super) fn resolve_csa_state_edges(
                 output.dtype
             );
         }
-        resolved.push((past, present));
+        resolved.push(CsaResolvedEdge {
+            past,
+            present,
+            role,
+        });
     }
     Ok(resolved)
 }
@@ -101,17 +116,16 @@ pub(super) fn resolve_csa_state_edges(
 /// Resolve every declared CSA state group against the graph's typed IO,
 /// accumulating claimed ports so two groups can never bind the same port.
 ///
-/// Returns the flat `(past_input, present_output)` edge list in declaration
-/// order — a schedule that alternates ratio-4 and ratio-128 layers yields the
-/// ratio-4 layer's four edges and the ratio-128 layer's two edges, each threaded
-/// through its own ports. `already_occupied` names ports already claimed by KV
-/// or fixed-state pairs.
+/// Returns the flat role-typed edge list in declaration order — a schedule that
+/// alternates ratio-4 and ratio-128 layers yields the ratio-4 layer's four edges
+/// and the ratio-128 layer's two edges, each threaded through its own ports.
+/// `already_occupied` names ports already claimed by KV or fixed-state pairs.
 pub(super) fn resolve_csa_state_groups(
     inputs: &[IoMeta],
     outputs: &[IoMeta],
     groups: &[CsaStateGroupAbi],
     already_occupied: &HashSet<&str>,
-) -> anyhow::Result<Vec<(String, String)>> {
+) -> anyhow::Result<Vec<CsaResolvedEdge>> {
     let mut occupied: HashSet<String> = already_occupied
         .iter()
         .map(|name| name.to_string())
@@ -120,13 +134,50 @@ pub(super) fn resolve_csa_state_groups(
     for group in groups {
         let occupied_refs: HashSet<&str> = occupied.iter().map(String::as_str).collect();
         let edges = resolve_csa_state_edges(inputs, outputs, group, &occupied_refs)?;
-        for (past, present) in edges {
-            occupied.insert(past.clone());
-            occupied.insert(present.clone());
-            all.push((past, present));
+        for edge in edges {
+            occupied.insert(edge.past.clone());
+            occupied.insert(edge.present.clone());
+            all.push(edge);
         }
     }
     Ok(all)
+}
+
+/// Fail-closed guard for the CUDA native-decode path.
+///
+/// CSA/HCA compressed-**record** buffers (`compressed_kv`, `index_key`) are
+/// rank-3 tensors that grow along a *backend-owned compressed-record cursor*
+/// (~tokens / ratio) and are byte-packed (`uint8`) for a block-quantized cache.
+/// The CUDA decoder's persistent-state machinery
+/// ([`DecodeCudaState::persistent_state_shapes`] /
+/// [`DecodeCudaState::kv_bytes_per_token`]) is frozen to rank-4 `f32`/`f16`/`bf16`
+/// **BNSH** KV growing on axis 2 — it cannot represent a rank-3 `uint8` record
+/// buffer, nor advance it on the op-owned cursor instead of the token rate. A
+/// dedicated CUDA CSA record-cache slice (device cursor, capture/replay
+/// invalidation, governor accounting, device snapshot/restore) is required and
+/// is tracked separately.
+///
+/// Until it exists, a graph that declares CSA record state must be **refused
+/// before any device allocation** when the target device is CUDA — never routed
+/// through PagedAttention, never silently mis-bound to the fixed wholesale-swap
+/// path, never dense-fallback. The CPU native-decode path threads this state
+/// correctly (records grow by the op's actual present extent), so the refusal
+/// names CPU as the supported device.
+pub(super) fn refuse_csa_records_on_cuda(
+    has_csa_record_state: bool,
+    device_is_cuda: bool,
+) -> anyhow::Result<()> {
+    if has_csa_record_state && device_is_cuda {
+        bail!(
+            "DeepSeek-V4 CompressedSparseAttention compressed-record state is not yet supported on \
+             the CUDA native-decode path: its record buffers (compressed_kv / index_key) are rank-3 \
+             and advance on a backend-owned compressed-record cursor, but the CUDA persistent-state \
+             path is frozen to rank-4 f32/f16/bf16 BNSH KV. Load this model on CPU, or wait for the \
+             dedicated CUDA CSA record-cache slice. Refused before any device allocation (no \
+             PagedAttention, no fixed wholesale-swap rebind, no dense fallback)."
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -148,6 +199,14 @@ mod tests {
             role,
             past_port: past.to_string(),
             present_port: present.to_string(),
+        }
+    }
+
+    fn resolved(past: &str, present: &str, role: CsaStateRole) -> CsaResolvedEdge {
+        CsaResolvedEdge {
+            past: past.to_string(),
+            present: present.to_string(),
+            role,
         }
     }
 
@@ -206,8 +265,8 @@ mod tests {
         assert_eq!(
             edges,
             vec![
-                ("past_ckv".to_string(), "present_ckv".to_string()),
-                ("past_cc".to_string(), "present_cc".to_string()),
+                resolved("past_ckv", "present_ckv", CsaStateRole::CompressedKv),
+                resolved("past_cc", "present_cc", CsaStateRole::CompressionCarry),
             ]
         );
     }
@@ -217,8 +276,14 @@ mod tests {
         let (inp, out) = ratio4_io();
         let edges = resolve_csa_state_edges(&inp, &out, &ratio4(), &HashSet::new()).unwrap();
         assert_eq!(edges.len(), 4);
-        assert_eq!(edges[2], ("past_ik".to_string(), "present_ik".to_string()));
-        assert_eq!(edges[3], ("past_ic".to_string(), "present_ic".to_string()));
+        assert_eq!(
+            edges[2],
+            resolved("past_ik", "present_ik", CsaStateRole::IndexKey)
+        );
+        assert_eq!(
+            edges[3],
+            resolved("past_ic", "present_ic", CsaStateRole::IndexCarry)
+        );
     }
 
     #[test]
@@ -343,11 +408,18 @@ mod tests {
         let edges = resolve_csa_state_groups(&inputs, &outputs, &groups, &HashSet::new()).unwrap();
         assert_eq!(edges.len(), 6);
         // Ratio-4 layer contributes its four edges first, in role order.
-        assert_eq!(edges[0].0, "l0_past_ckv");
-        assert_eq!(edges[3].0, "l0_past_ic");
+        assert_eq!(edges[0].past, "l0_past_ckv");
+        assert_eq!(edges[0].role, CsaStateRole::CompressedKv);
+        assert_eq!(edges[3].past, "l0_past_ic");
         // Ratio-128 layer contributes its two edges next.
-        assert_eq!(edges[4].0, "l1_past_ckv");
-        assert_eq!(edges[5].1, "l1_present_cc");
+        assert_eq!(edges[4].past, "l1_past_ckv");
+        assert_eq!(edges[5].present, "l1_present_cc");
+        // The two record buffers (compressed_kv) are role-classified as growable
+        // records; the four carries are not.
+        assert_eq!(
+            edges.iter().filter(|e| e.role.is_record_buffer()).count(),
+            3 // l0 compressed_kv + l0 index_key + l1 compressed_kv
+        );
     }
 
     #[test]
@@ -393,8 +465,8 @@ mod tests {
         assert_eq!(
             edges,
             vec![
-                ("past_ckv".to_string(), "present_ckv".to_string()),
-                ("past_cc".to_string(), "present_cc".to_string()),
+                resolved("past_ckv", "present_ckv", CsaStateRole::CompressedKv),
+                resolved("past_cc", "present_cc", CsaStateRole::CompressionCarry),
             ]
         );
     }
@@ -425,5 +497,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("dtype"), "{err}");
+    }
+
+    #[test]
+    fn roles_classify_records_vs_carries() {
+        assert!(CsaStateRole::CompressedKv.is_record_buffer());
+        assert!(CsaStateRole::IndexKey.is_record_buffer());
+        assert!(!CsaStateRole::CompressionCarry.is_record_buffer());
+        assert!(!CsaStateRole::IndexCarry.is_record_buffer());
+    }
+
+    #[test]
+    fn csa_records_are_refused_on_cuda_before_allocation() {
+        // A graph that threads CSA record state cannot load on CUDA yet: the
+        // refusal must fire (fail-closed) rather than mis-binding to the fixed
+        // wholesale-swap path or falling back.
+        let err = refuse_csa_records_on_cuda(true, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CUDA"), "{err}");
+        assert!(err.contains("compressed-record"), "{err}");
+        assert!(
+            err.contains("no dense fallback") || err.contains("no PagedAttention"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn csa_records_load_on_cpu_and_absent_state_never_refused() {
+        // CPU with CSA records: allowed. CUDA without CSA records: allowed.
+        refuse_csa_records_on_cuda(true, false).unwrap();
+        refuse_csa_records_on_cuda(false, true).unwrap();
+        refuse_csa_records_on_cuda(false, false).unwrap();
     }
 }

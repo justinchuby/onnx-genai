@@ -194,14 +194,35 @@ pub struct DecoderAbi {
     /// per compressed-attention layer group.
     ///
     /// DeepSeek-V4 threads compressed KV attention state as role-typed
-    /// `present_* -> past_*` port pairs whose logical length is a backend-owned
-    /// cursor — neither a growing dense KV cache nor a fixed-shape replace
-    /// tensor. A schedule that alternates ratio-4 (query-selective CSA) and
-    /// ratio-128 (HCA) layers declares one group per layer, so this is a list.
-    /// When present, the runtime discovers each group from its declared roles,
+    /// `present_* -> past_*` port pairs. The runner threads the two roles through
+    /// *different* state paths, decided by the property-based
+    /// [`CsaStateRole`] — never by tensor shape:
+    ///
+    ///  * **Record buffers** (`compressed_kv`, `index_key`) grow along their
+    ///    penultimate axis on a backend-owned compressed-record cursor
+    ///    (~tokens / ratio, block-boundary dependent, *not* the token rate). They
+    ///    thread as *growable* `present -> past` state: the runner hands the
+    ///    whole present tensor back as the next past each step. They are **not**
+    ///    fixed loop-carried state and are never seeded at a static extent nor
+    ///    reallocated under a wholesale swap.
+    ///  * **Carries** (`compression_carry`, `index_carry`) are fixed-shape
+    ///    accumulators replaced wholesale each step — ordinary recurrent state.
+    ///
+    /// A schedule that alternates ratio-4 (query-selective CSA) and ratio-128
+    /// (HCA) layers declares one group per layer, so this is a list. When
+    /// present, the runtime discovers each group from its declared roles,
     /// validates its ports against the real graph, and refuses with a typed
     /// reason before allocating. Absent means the graph threads no CSA state and
     /// the historical behavior is preserved byte-for-byte.
+    ///
+    /// Device support: the **CPU** native-decode path threads this state
+    /// end-to-end (prefill, decode, present->past progression, snapshot/rollback,
+    /// teardown). The **CUDA** path does not yet represent the rank-3,
+    /// op-cursor-advanced record buffers — its persistent-state machinery is
+    /// frozen to rank-4 f32/f16/bf16 BNSH KV — so a graph that declares CSA
+    /// record state is refused before any device allocation on CUDA (fail-closed;
+    /// no PagedAttention, no dense fallback), pending the dedicated CUDA CSA
+    /// record-cache slice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csa_state_groups: Option<Vec<CsaStateGroupAbi>>,
 }
