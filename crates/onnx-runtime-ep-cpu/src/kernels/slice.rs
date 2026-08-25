@@ -142,6 +142,10 @@ impl KernelFactory for SliceFactory {
 }
 
 impl Kernel for SliceKernel {
+    fn may_produce_views(&self) -> bool {
+        true
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Slice", inputs, outputs, 3, 5, 1)?;
         let esize = elem_size(inputs[0].dtype)?;

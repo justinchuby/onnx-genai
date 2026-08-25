@@ -2485,6 +2485,144 @@ unsafe fn assert_output_shape(
     eprintln!("  ✓ {label}: shape={dims:?} (matches expected {expected:?})");
 }
 
+#[test]
+fn unique_kernel_sized_outputs_run_through_real_plugin() {
+    struct Case {
+        fixture: &'static str,
+        registration: &'static str,
+        input: Vec<f32>,
+        output_names: &'static [&'static str],
+        shapes: Vec<Vec<i64>>,
+        expected_bytes: Vec<Vec<u8>>,
+    }
+
+    let _lock = lock_ort_ep();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cases = [
+        Case {
+            fixture: "unique_all_outputs",
+            registration: "cpu_ep_unique_all",
+            input: vec![2., 1., 1., 3., 4., 3.],
+            output_names: &["Y", "indices", "inverse_indices", "counts"],
+            shapes: vec![vec![4], vec![4], vec![6], vec![4]],
+            expected_bytes: vec![
+                [1.0f32, 2., 3., 4.]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+                [1i64, 0, 3, 4]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+                [1i64, 0, 0, 2, 3, 2]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+                [2i64, 1, 2, 1]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+            ],
+        },
+        Case {
+            fixture: "unique_optional_subset",
+            registration: "cpu_ep_unique_subset",
+            input: vec![3., 1., 3., 2., 1.],
+            output_names: &["Y", "inverse_indices"],
+            shapes: vec![vec![3], vec![5]],
+            expected_bytes: vec![
+                [1.0f32, 2., 3.]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+                [2i64, 0, 2, 1, 0]
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect(),
+            ],
+        },
+    ];
+
+    for case in cases {
+        let model_path = manifest_dir
+            .join("tests")
+            .join("fixtures")
+            .join(case.fixture)
+            .join("model.onnx.textproto");
+        let Some((_lib, api, env, options, session)) =
+            (unsafe { conformance_setup(case.registration, &model_path, true) })
+        else {
+            eprintln!(
+                "*** SKIPPED: {}: ORT or plugin unavailable ***",
+                case.fixture
+            );
+            return;
+        };
+
+        unsafe {
+            assert_ops_assigned_to_our_ep(api, session, &["Unique"], case.fixture);
+            let mut input = case.input;
+            let input_shape = [i64::try_from(input.len()).unwrap()];
+            let input_value = make_float_tensor(api, &mut input, &input_shape);
+            let input_name = CString::new("X").unwrap();
+            let output_names_c: Vec<CString> = case
+                .output_names
+                .iter()
+                .map(|name| CString::new(*name).unwrap())
+                .collect();
+            let output_name_ptrs: Vec<*const std::os::raw::c_char> =
+                output_names_c.iter().map(|name| name.as_ptr()).collect();
+            let mut outputs = vec![ptr::null_mut(); case.output_names.len()];
+            let status = ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                [input_name.as_ptr()].as_ptr(),
+                [input_value as *const ort::OrtValue].as_ptr(),
+                1,
+                output_name_ptrs.as_ptr(),
+                output_name_ptrs.len(),
+                outputs.as_mut_ptr(),
+            );
+            check_status(api, status, &format!("Run({})", case.fixture));
+
+            for (slot, output) in outputs.iter().enumerate() {
+                assert!(
+                    !output.is_null(),
+                    "{}: output slot {slot} is null",
+                    case.fixture
+                );
+                assert_output_shape(api, *output, &case.shapes[slot], case.fixture);
+                let expected_dtype = if slot == 0 {
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+                } else {
+                    ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64
+                };
+                assert_output_dtype(api, *output, expected_dtype, case.fixture);
+                let mut data: *mut std::ffi::c_void = ptr::null_mut();
+                let status = ((*api).GetTensorMutableData.unwrap())(*output, &mut data);
+                check_status(
+                    api,
+                    status,
+                    &format!("GetTensorMutableData({})", case.fixture),
+                );
+                let actual =
+                    std::slice::from_raw_parts(data.cast::<u8>(), case.expected_bytes[slot].len());
+                assert_eq!(
+                    actual, case.expected_bytes[slot],
+                    "{}: output slot {slot} contents",
+                    case.fixture
+                );
+            }
+
+            for output in outputs {
+                ((*api).ReleaseValue.unwrap())(output);
+            }
+            ((*api).ReleaseValue.unwrap())(input_value);
+            conformance_teardown(api, env, options, session, case.registration);
+        }
+    }
+}
+
 // ─── B1 dtype: Cast (f32 → i64) ─────────────────────────────────────────────
 
 /// Cast f32 [2,3] → i64.  Output dtype must be INT64, not FLOAT.

@@ -361,6 +361,10 @@ struct ReshapeKernel {
 }
 
 impl Kernel for ReshapeKernel {
+    fn may_produce_views(&self) -> bool {
+        true
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         arity("Reshape", inputs, outputs, 1, 2, 1)?;
         require_dense("Reshape", inputs, outputs)?;

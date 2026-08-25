@@ -545,6 +545,11 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<WorkspaceRequirement> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "workspace preparation with persistent device bindings",
+            ));
+        }
         self.workspace_preparation_required = true;
         let external = self.prepare_external_bindings_mode(bindings, true)?;
         let symbols = self.bind_symbols(inputs, &external)?;
@@ -914,6 +919,11 @@ impl Executor {
     }
 
     pub(crate) fn run_outputs(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<SessionOutput>> {
+        if let Some(heterogeneous) = self.heterogeneous.as_mut() {
+            return heterogeneous
+                .run(inputs)
+                .map(|outputs| outputs.into_iter().map(SessionOutput::Tensor).collect());
+        }
         let result = self.run_scoped(inputs, &HashMap::new(), &ExternalBindings::default());
         self.release_step_workspace()?;
         result?
@@ -933,6 +943,11 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<Vec<Option<Tensor>>> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "execution with persistent device bindings/state",
+            ));
+        }
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped(inputs, &HashMap::new(), &external);
         self.release_step_workspace()?;
@@ -954,6 +969,11 @@ impl Executor {
         inputs: &[(&str, &Tensor)],
         bindings: &mut [DeviceIoBinding],
     ) -> Result<DeviceGraphCaptureResult> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "mixed-provider device-graph capture",
+            ));
+        }
         let external = self.prepare_external_bindings(bindings)?;
         let result = self.run_scoped_mode(inputs, &HashMap::new(), &external, RunMode::Capture);
         self.release_step_workspace()?;
@@ -988,6 +1008,11 @@ impl Executor {
     /// control-flow branch flip retired it mid-step (the token was still produced
     /// correctly via an eager fallback) and the caller must re-warm/re-capture.
     pub(crate) fn replay_device_graph(&mut self, bindings: &mut [DeviceIoBinding]) -> Result<bool> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "mixed-provider device-graph replay",
+            ));
+        }
         let external = self.prepare_external_bindings(bindings)?;
         let signature = Self::binding_signature(bindings);
         if self.cap().device_graph_signature.as_ref() != Some(&signature) {
@@ -1041,6 +1066,9 @@ impl Executor {
     }
 
     pub(crate) fn reset_device_graph(&mut self) -> Result<bool> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error("mixed-provider device-graph reset"));
+        }
         let cap = self.cap_mut();
         cap.device_graph_signature = None;
         cap.capture_schedule = None;

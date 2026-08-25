@@ -7,6 +7,9 @@ use onnx_genai_engine::logits::{
 use onnx_genai_engine::{ProcessorContext, TokenId};
 use tokenizers::Tokenizer;
 
+pub mod decode_gap;
+#[cfg(feature = "bench-native")]
+pub mod model_io;
 #[cfg(feature = "bench-native")]
 pub mod synthetic_decoder;
 

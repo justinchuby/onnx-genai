@@ -162,6 +162,10 @@ name = "bench_generic"
 required-features = ["bench-native"]
 
 [[bin]]
+name = "bench_decode_gap"
+required-features = ["bench-native"]
+
+[[bin]]
 name = "cuda_place"
 required-features = ["bench-native"]
 

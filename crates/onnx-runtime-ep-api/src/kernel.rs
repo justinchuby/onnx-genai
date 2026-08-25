@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 
-use onnx_runtime_ir::TensorLayout;
+use onnx_runtime_ir::{DataType, TensorLayout};
 use onnx_runtime_memory_governor::MemoryRole;
 
 use crate::error::Result;
@@ -456,6 +456,19 @@ pub struct ViewOutput {
     pub byte_offset: usize,
 }
 
+/// One data-dependent output produced in owned host memory before the host
+/// runtime allocates its final tensor.
+///
+/// This is an opt-in escape hatch for operators such as `Unique`, where
+/// discovering an output extent is the algorithm itself. The bytes own their
+/// storage and therefore cannot borrow an input or kernel temporary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelSizedOutput {
+    pub shape: Vec<usize>,
+    pub dtype: DataType,
+    pub bytes: Vec<u8>,
+}
+
 /// An executor-delivered kernel input. Existing EPs receive `Tensor` variants;
 /// an EP advertising the `nxrt` capability may receive a lazy `Weight` at the
 /// `pkg.nxrt::BlockQuantizedMoE` boundary.
@@ -575,6 +588,36 @@ pub trait Kernel: Send {
     /// Execute over device-resident inputs/outputs.
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()>;
 
+    /// Whether this kernel opts into Compute-time, kernel-sized outputs.
+    ///
+    /// The ORT plugin adapter uses this only for nodes whose shape strategy is
+    /// explicitly marked kernel-sized. Existing kernels keep the ordinary
+    /// infer-shape, allocate, execute path unchanged.
+    fn has_kernel_sized_outputs(&self) -> bool {
+        false
+    }
+
+    /// Execute once into owned host buffers and report concrete output facts.
+    ///
+    /// `requested_outputs` preserves node output-slot positions. A `false`
+    /// slot is an omitted optional output and must be returned as `None`; a
+    /// `true` slot must be returned as `Some`. The adapter validates every
+    /// dtype, checked shape byte length, and buffer length before allocating
+    /// final outputs, then performs one materialization copy per present slot.
+    ///
+    /// The first implementation is intentionally host-only. Implementations
+    /// must reject non-host-accessible inputs before reading them.
+    fn execute_kernel_sized(
+        &self,
+        inputs: &[TensorView],
+        requested_outputs: &[bool],
+    ) -> Result<Vec<Option<KernelSizedOutput>>> {
+        let _ = (inputs, requested_outputs);
+        Err(crate::EpError::KernelFailed(
+            "kernel does not implement kernel-sized outputs".into(),
+        ))
+    }
+
     /// Report exact owned scratch needed for these concrete inputs.
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
         let _ = inputs;
@@ -663,6 +706,15 @@ pub trait Kernel: Send {
     ) -> Option<Vec<ViewOutput>> {
         let _ = (inputs, output_shapes, num_outputs);
         None
+    }
+
+    /// Whether [`Self::view_outputs`] can ever return a zero-copy alias.
+    ///
+    /// Heterogeneous execution uses independently owned boundary buffers. Its
+    /// first slice rejects view-producing kernels before execution rather than
+    /// discovering an alias after an upstream partition has already run.
+    fn may_produce_views(&self) -> bool {
+        false
     }
 
     /// Whether the output may overwrite the input at `input_index`.

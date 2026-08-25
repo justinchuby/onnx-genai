@@ -839,6 +839,18 @@ fn ep_compile_inner(
                     // attributes (wired to Deckard's 22 rules).
                     let shape_inference =
                         crate::compute::ShapeInference::for_node(node, &shapes_opt, num_outputs);
+                    if matches!(
+                        &shape_inference,
+                        crate::compute::ShapeInference::KernelSizedOutputs
+                    ) && !kernel.has_kernel_sized_outputs()
+                    {
+                        cleanup_partial_infos(out_infos, i);
+                        return fail_status(&format!(
+                            "Compile: node '{}' ({}) requires kernel-sized outputs, but its \
+                             selected kernel did not opt into that contract",
+                            node.name, node.op_type
+                        ));
+                    }
 
                     // Build input_slots: maps node input position → ORT index
                     // (None for absent inputs).

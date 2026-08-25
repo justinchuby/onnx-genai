@@ -37,6 +37,7 @@
 //! unpinned (logged once).
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 /// Selects how the decode pool binds its workers to CPUs.
 ///
@@ -54,6 +55,100 @@ pub const DECODE_AFFINITY_ENV: &str = "ONNX_GENAI_CPU_DECODE_AFFINITY";
 /// The complete set of accepted affinity modes, named in every diagnostic so a
 /// rejected value always sees the full menu of valid options.
 const ACCEPTED_MODES: &str = "`off`, `compact`, `node:<index>`, `numa-split`";
+
+/// Selects how decode workers are laid out across the CPUs they are allowed.
+///
+/// Orthogonal to [`DECODE_AFFINITY_ENV`], which selects *which* CPUs the pool
+/// may use. This selects how the workers are arranged inside that set:
+///
+/// * `spread` -- worker `i` takes a distinct physical core for as long as cores
+///   last, only then doubling up on SMT siblings. Fastest on a host the process
+///   has to itself, which is what `crate::core_topology`'s module docs measure.
+/// * `compact` -- workers fill a core's SMT siblings before moving to the next
+///   core, so an N-worker pool occupies about `N / siblings` cores and leaves
+///   the rest of the machine free for a co-tenant.
+///
+/// Neither is universally better, which is exactly why it is a selector and not
+/// a constant. Measured with four DRAM-bandwidth hogs on a 16-core/32-thread
+/// host: compact 4.54 ms/token against spread 5.03-6.26. With eight hogs
+/// covering both halves the ranking inverts (compact 15.92 against spread
+/// 6.08). See [`crate::core_topology`]'s module docs for the full table.
+pub const DECODE_PLACEMENT_ENV: &str = "ONNX_GENAI_CPU_DECODE_PLACEMENT";
+
+/// The complete set of accepted placement modes.
+const ACCEPTED_PLACEMENTS: &str = "`spread`, `compact`";
+
+/// How a decode pool's workers are laid out across the CPUs it may use.
+///
+/// This is a *policy*, and the point of naming it is that it can be selected
+/// rather than assumed. A test that asserts one worker per physical core is
+/// asserting `Spread`, not correctness, and must say so -- see #1802.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CorePlacement {
+    /// One worker per physical core for as long as cores last.
+    #[default]
+    Spread,
+    /// SMT siblings filled before the next core is used.
+    Compact,
+}
+
+impl CorePlacement {
+    /// Parse a [`DECODE_PLACEMENT_ENV`] value. Absent or empty is the default.
+    pub fn parse(raw: Option<&str>) -> std::result::Result<Self, String> {
+        match raw.map(str::trim) {
+            None | Some("") => Ok(Self::default()),
+            Some("spread") => Ok(Self::Spread),
+            Some("compact") => Ok(Self::Compact),
+            Some(other) => Err(format!(
+                "{DECODE_PLACEMENT_ENV}=`{other}` is not a recognized placement mode; \
+                 accepted modes are {ACCEPTED_PLACEMENTS}"
+            )),
+        }
+    }
+
+    /// The placement selected for this process, read once.
+    ///
+    /// An unparseable value is reported once and then treated as the default.
+    /// The sibling [`DecodeAffinity`] selector rejects hard because it decides
+    /// *which* CPUs the process may touch and a wrong answer there is a
+    /// correctness question; this one decides only how workers are arranged
+    /// inside a set already chosen, so refusing to decode because a tuning knob
+    /// is misspelled would be the worse failure. It is still never silent.
+    ///
+    /// `OnceLock` makes "reported once" structural rather than a promise: the
+    /// closure runs at most once per process.
+    pub fn from_env() -> Self {
+        static V: OnceLock<CorePlacement> = OnceLock::new();
+        *V.get_or_init(|| Self::from_value(std::env::var(DECODE_PLACEMENT_ENV).ok().as_deref()))
+    }
+
+    /// [`Self::from_env`] without the cache or the environment read.
+    ///
+    /// Split out because the fallback is otherwise untestable: `from_env`
+    /// memoizes process-wide, so a test driving it would fix the policy for
+    /// every other test in the binary and could still only ever observe one
+    /// value. This half is the part with a decision in it.
+    fn from_value(raw: Option<&str>) -> Self {
+        match Self::parse(raw) {
+            Ok(placement) => placement,
+            Err(message) => {
+                eprintln!(
+                    "onnx-genai: {message}; using `{}`",
+                    Self::default().as_str()
+                );
+                Self::default()
+            }
+        }
+    }
+
+    /// The wire/report name, so a diagnostic and a test read the same string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spread => "spread",
+            Self::Compact => "compact",
+        }
+    }
+}
 
 /// Render the discovered available-node list for a diagnostic, or state plainly
 /// that topology is unavailable, so every invalid value reports the same three
@@ -534,6 +629,21 @@ pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), St
     Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
 }
 
+/// Whether [`set_current_thread_affinity`] can do anything on this target.
+///
+/// A test that narrows its own cpuset to build a controlled shape has to tell
+/// two failures apart: "this target has no process-wide masking, so the shape is
+/// unbuildable by construction" and "masking exists here and did not work".
+/// The first is a legitimate skip; the second is a defect, and reading it as the
+/// first is how a whole platform's coverage disappears without anyone noticing.
+///
+/// Derived from `cfg!` and *not* from a runtime call, for the same reason
+/// [`crate::core_topology::DETECTION_SUPPORTED`] is: a support flag computed by
+/// asking the thing whether it worked answers "unsupported" for every runtime
+/// failure, which is exactly the collapse it exists to prevent.
+#[cfg(test)]
+pub(crate) const AFFINITY_MASKING_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Whether the user explicitly requested a decode affinity via
 /// [`DECODE_AFFINITY_ENV`] (a non-empty value). When set, the automatic
 /// good-citizen process mask stands down so the user's affinity choice wins.
@@ -979,15 +1089,36 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
     Ok(DecodePlan { cpus, log })
 }
 
-/// Order a decode pool's CPU list so that worker `i` lands on a distinct
-/// physical core for as long as cores last, and only then starts doubling up on
-/// SMT siblings.
+/// Order a decode pool's CPU list according to the selected
+/// [`CorePlacement`], defaulting to whatever [`DECODE_PLACEMENT_ENV`] selects
+/// for this process.
+///
+/// See [`order_pin_targets_for`] for the ordering itself. This wrapper exists
+/// so the production call sites read the policy from one place and cannot
+/// drift apart, and so the many tests that assert the spread ordering keep
+/// working against an explicit policy rather than an ambient one.
+pub(crate) fn order_pin_targets(
+    cpus: &[usize],
+    cores: Option<&crate::core_topology::CoreTopology>,
+) -> Vec<usize> {
+    order_pin_targets_for(cpus, cores, CorePlacement::from_env())
+}
+
+/// Order a decode pool's CPU list for an explicitly named placement policy.
 ///
 /// [`crate::kernels::matmul_nbits`]'s `build_decode_pool` pins worker `i` to
-/// `cpus[i % cpus.len()]`, so the *order* of this list — not just its contents —
-/// decides whether an 8-worker pool on a 16-core/32-thread node occupies 8 cores
-/// or 4. Same set, same cpuset guarantees; only the ranking changes. With no
-/// discoverable SMT map this is the identity.
+/// `cpus[i % cpus.len()]`, so the *order* of this list — not just its contents
+/// — decides whether an 8-worker pool on a 16-core/32-thread node occupies 8
+/// cores or 4. Same set, same cpuset guarantees; only the ranking changes. With
+/// no discoverable SMT map both policies are the identity, because there is
+/// nothing to rank by.
+///
+/// The returned list is always a permutation of `cpus`: a CPU the topology does
+/// not know about keeps its place at the end rather than being dropped. The
+/// caller's set is a *permission*, and silently shrinking it would shrink the
+/// pool. (A *repeated* CPU is de-duplicated rather than repeated, under both
+/// policies and both before and after #1805's follow-up; the callers are
+/// cpusets, which cannot contain one.)
 ///
 /// # Who uses it, and a reversal
 ///
@@ -1013,18 +1144,39 @@ pub fn plan_decode_affinity(worker_count: usize) -> std::result::Result<DecodePl
 /// ([`crate::decode_numa`]), whose per-node reserve frees a logical CPU rather
 /// than a core and so does not yet give an on-node dispatcher a free core to
 /// land on.
-pub(crate) fn order_pin_targets(
+pub(crate) fn order_pin_targets_for(
     cpus: &[usize],
     cores: Option<&crate::core_topology::CoreTopology>,
+    placement: CorePlacement,
 ) -> Vec<usize> {
     let Some(cores) = cores else {
         return cpus.to_vec();
     };
-    let leaders = cores.leaders_within(cpus);
-    let leader_set: std::collections::BTreeSet<usize> = leaders.iter().copied().collect();
-    let mut ordered = leaders;
-    ordered.extend(cpus.iter().copied().filter(|cpu| !leader_set.contains(cpu)));
-    ordered
+    match placement {
+        CorePlacement::Spread => {
+            let leaders = cores.leaders_within(cpus);
+            let leader_set: std::collections::BTreeSet<usize> = leaders.iter().copied().collect();
+            let mut ordered = leaders;
+            ordered.extend(cpus.iter().copied().filter(|cpu| !leader_set.contains(cpu)));
+            ordered
+        }
+        CorePlacement::Compact => {
+            let allowed: std::collections::BTreeSet<usize> = cpus.iter().copied().collect();
+            let mut ordered = Vec::with_capacity(cpus.len());
+            let mut placed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for leader in cores.leaders_within(cpus) {
+                for sibling in cores.siblings_of(leader).unwrap_or(&[]) {
+                    if allowed.contains(sibling) && placed.insert(*sibling) {
+                        ordered.push(*sibling);
+                    }
+                }
+            }
+            // Whatever the topology could not account for keeps its original
+            // relative order at the end, so this stays a permutation.
+            ordered.extend(cpus.iter().copied().filter(|cpu| !placed.contains(cpu)));
+            ordered
+        }
+    }
 }
 
 /// Byte-level layout of the records `GetLogicalProcessorInformationEx` writes,
@@ -1321,6 +1473,38 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The support flag must not claim less than the call delivers.
+    ///
+    /// The drift that matters is one-directional. If someone implements
+    /// process-wide masking on Windows and leaves
+    /// [`AFFINITY_MASKING_SUPPORTED`] at `cfg!(target_os = "linux")`, every
+    /// caller that uses the flag to decide "unbuildable by construction, skip"
+    /// keeps skipping on a platform that could now answer -- silently, forever.
+    /// That is the fail-open direction and it is what this asserts: a call that
+    /// *succeeded* proves support, whatever the flag says.
+    ///
+    /// The converse -- flag `true`, call failed -- is deliberately **not**
+    /// asserted here. It would false-fail on a CPU hot-unplugged between
+    /// reading the mask and re-applying it, and its real failure mode is
+    /// already loud: every caller of this flag panics rather than skips when
+    /// masking is supported and does not work.
+    #[test]
+    fn a_successful_affinity_call_is_never_reported_as_an_unsupported_target() {
+        let Some(allowed) = allowed_cpus() else {
+            return;
+        };
+        // Re-applying the mask already in force: a no-op on success, and it
+        // cannot widen or narrow the thread running this test either way.
+        let succeeded = set_current_thread_affinity(&allowed).is_ok();
+        assert!(
+            !succeeded || AFFINITY_MASKING_SUPPORTED,
+            "set_current_thread_affinity succeeded on a target where \
+             AFFINITY_MASKING_SUPPORTED is false. Callers read that flag as \
+             `this shape is unbuildable here, skip`, so the flag is now \
+             disabling checks on a platform that can run them."
+        );
+    }
 
     /// Build one `RelationNumaNode` record exactly as the OS lays it out: an
     /// 8-byte header, then `NUMA_NODE_RELATIONSHIP`, then the node's
@@ -2171,10 +2355,149 @@ mod tests {
     fn pin_targets_are_ordered_one_per_core_then_siblings() {
         let smt = adjacent_smt_topology();
         let node: Vec<usize> = (0..8).collect();
+        // Names the policy it is asserting. `order_pin_targets` reads the
+        // process-wide selector, so asserting the spread ordering through the
+        // wrapper would silently be asserting "this process happens to be
+        // spread" -- the exact conflation #1802 asks to stop making.
+        let ordered = order_pin_targets_for(&node, Some(&smt), CorePlacement::Spread);
         // The pool builder pins worker `i` to `cpus[i % len]`, so the first four
         // workers of an 8-CPU node must land on four different cores.
-        let ordered = order_pin_targets(&node, Some(&smt));
         assert_eq!(ordered, vec![0, 2, 4, 6, 1, 3, 5, 7]);
-        assert_eq!(order_pin_targets(&node, None), node);
+        assert_eq!(
+            order_pin_targets_for(&node, None, CorePlacement::Spread),
+            node
+        );
+        // ...and the default really is the policy this asserts, stated
+        // separately so a changed default fails with its own name rather than
+        // looking like an ordering bug.
+        assert_eq!(CorePlacement::default(), CorePlacement::Spread);
+    }
+
+    #[test]
+    fn placement_parse_accepts_exactly_the_documented_modes() {
+        assert_eq!(CorePlacement::parse(None).unwrap(), CorePlacement::Spread);
+        assert_eq!(
+            CorePlacement::parse(Some("")).unwrap(),
+            CorePlacement::Spread
+        );
+        assert_eq!(
+            CorePlacement::parse(Some("  ")).unwrap(),
+            CorePlacement::Spread
+        );
+        assert_eq!(
+            CorePlacement::parse(Some(" spread ")).unwrap(),
+            CorePlacement::Spread
+        );
+        assert_eq!(
+            CorePlacement::parse(Some("compact")).unwrap(),
+            CorePlacement::Compact
+        );
+        // Every accepted mode round-trips through the name the report and the
+        // diagnostics use, so a test and a log line cannot drift apart.
+        for placement in [CorePlacement::Spread, CorePlacement::Compact] {
+            assert_eq!(
+                CorePlacement::parse(Some(placement.as_str())).unwrap(),
+                placement
+            );
+        }
+        // Rejected, and the rejection has to say what was wrong and what is
+        // accepted -- an unhelpful error is how a misspelled knob becomes a
+        // silent default.
+        for bad in ["Spread", "COMPACT", "sprd", "1", "true", "one-per-core"] {
+            let message = CorePlacement::parse(Some(bad))
+                .expect_err(&format!("`{bad}` must not be accepted as a placement"));
+            assert!(
+                message.contains(bad) && message.contains(DECODE_PLACEMENT_ENV),
+                "the rejection must name the variable and the offending value: {message}"
+            );
+            assert!(
+                message.contains("spread") && message.contains("compact"),
+                "the rejection must list the accepted modes: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_placement_falls_back_without_going_silent() {
+        // The fallback path, which `from_env` alone cannot exercise: it caches
+        // process-wide, so whichever value the first caller in the binary sees
+        // is the only one any test could ever observe.
+        for bad in ["Spread", "one-per-core", "1"] {
+            assert_eq!(
+                CorePlacement::from_value(Some(bad)),
+                CorePlacement::default(),
+                "an unrecognized placement must fall back to the default rather than \
+                 selecting something arbitrary"
+            );
+        }
+        // ...and the accepted values are not merely tolerated by the same path.
+        assert_eq!(
+            CorePlacement::from_value(Some("compact")),
+            CorePlacement::Compact,
+            "the fallback path swallowed a value it was supposed to honor, which would \
+             make the knob inert while looking like it parsed"
+        );
+        assert_eq!(CorePlacement::from_value(None), CorePlacement::default());
+    }
+
+    #[test]
+    fn compact_and_spread_are_permutations_that_differ_on_an_smt_host() {
+        let smt = adjacent_smt_topology();
+        let node: Vec<usize> = (0..8).collect();
+        let spread = order_pin_targets_for(&node, Some(&smt), CorePlacement::Spread);
+        let compact = order_pin_targets_for(&node, Some(&smt), CorePlacement::Compact);
+
+        // A permission set that shrinks would shrink the pool, so both policies
+        // must be permutations of their input and not merely subsets.
+        for (name, ordered) in [("spread", &spread), ("compact", &compact)] {
+            let mut sorted = (*ordered).clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, node, "`{name}` is not a permutation of its input");
+        }
+
+        assert_ne!(
+            spread, compact,
+            "the two policies produced the same ranking on an SMT host, so the \
+             selector parses and changes nothing"
+        );
+        assert_eq!(compact, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+
+        // The property the ordering exists for: `build_decode_pool` pins worker
+        // `i` to `cpus[i % len]`, so the first four entries decide how many
+        // cores a four-worker pool occupies.
+        assert_eq!(smt.physical_cores_within(&spread[..4]), 4);
+        assert_eq!(smt.physical_cores_within(&compact[..4]), 2);
+    }
+
+    #[test]
+    fn a_cpu_the_topology_does_not_know_keeps_its_place_under_either_policy() {
+        let smt = adjacent_smt_topology();
+        // 99 is outside the sibling map; 16/17 are a known-shaped pair that the
+        // 8-core map above also does not cover.
+        let node = vec![0, 1, 99, 4];
+        for placement in [CorePlacement::Spread, CorePlacement::Compact] {
+            let ordered = order_pin_targets_for(&node, Some(&smt), placement);
+            let mut sorted = ordered.clone();
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                vec![0, 1, 4, 99],
+                "`{}` dropped or duplicated a CPU it did not recognize",
+                placement.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_topology_every_policy_is_the_identity() {
+        let node = vec![7, 3, 11, 0];
+        for placement in [CorePlacement::Spread, CorePlacement::Compact] {
+            assert_eq!(
+                order_pin_targets_for(&node, None, placement),
+                node,
+                "`{}` reordered a list it has no ranking information for",
+                placement.as_str()
+            );
+        }
     }
 }

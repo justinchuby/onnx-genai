@@ -353,8 +353,11 @@ hangs — squatting on the box is the one outcome the lock exists to prevent —
 so each invocation is bounded by `--cell-timeout` (default 3600s, `0`
 disables).
 `ab.py` buffers, so it stamps the label on the rows.
-`crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are not wired up yet — see
-issue #2043 for the audit.
+`crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are mostly not wired up yet —
+of the 23 files there that start a benchmark, 3 hold the lock, 19 are recorded
+gaps under issue #2043 and 1 is an `exec` wrapper whose caller carries the
+gap. A recorded gap is one somebody can close; an absent one is one nobody can
+see.
 
 Which drivers take the lock is now checked rather than remembered.
 `scripts/ort_ab/test_gate_conformance.py` requires every `.py` in this
@@ -369,18 +372,65 @@ is not a gate call — that error would be fail-open, reporting an unprotected
 driver as protected.
 
 It detects a *literal* path under `target/`, not the spawn itself, so a driver
-misdeclared as a generator that builds its path at runtime would pass; and it
-covers this directory only. Both limits are written down at the top of the
-file. A generator that legitimately loads the runtime declares
-`loads-runtime:` and keeps its reason, the same way an ungated driver
-declares `known-gap:`.
+misdeclared as a generator that builds its path at runtime would pass. That
+limit is written down at the top of the file. A generator that legitimately
+loads the runtime declares `loads-runtime:` and keeps its reason, the same way
+an ungated driver declares `known-gap:`.
+
+The same file reads a second root, `crates/onnx-runtime-ep-cpu/benches/`, and
+reads it **by behaviour instead of by declaration**: those are somebody else's
+harnesses, and a per-file role list there would be a claim about another lane
+that would have to be kept true by hand. A file there that starts a
+benchmark — directly, or by calling a helper in a module it imports — must
+hold the lock or carry a recorded reason: `known-gap:` (saturates, not gated
+yet), `no-bench:` (starts something that is not a benchmark) or `wrapper:`
+(`exec`s what it is handed; the caller holds the lock, and taking it here
+would keep the pid and drop the release). A file that only reads JSON needs no
+entry.
+
+Resolving the delegation is what makes that root readable at all. Not one acc0
+harness contains a `target/release/` literal — they take the binary as
+`sys.argv[1]` — and seven of them do not call `subprocess` either; they call
+`acc0_gap_matrix.native`, or a wrapper around it, one or two imports away. The
+resolution runs to a fixpoint in **both** directions, across modules and
+within one: `native` itself contains no `subprocess` call, it calls the
+same-file helper `sh`. Cross-module resolution alone left `native` out of the
+table, and `acc0_w16_steal_ab.py` — four arms at width 16, calling nothing
+else — read as starting nothing and needed neither a gate nor an entry. *Importing* the harness
+library is not enough: nineteen files there import it, mostly for its parsers,
+and requiring an entry for every scorer would produce a ledger nobody
+maintains, which is how a check ends up with a blanket exemption instead of a
+line.
+
+Both lock idioms count as held: `hostlock_gate.require` here, and the
+`HostLock` context manager in `acc0_gap_matrix.py` that shells out to
+`scripts/hostlock.sh`. A checker that knew only its author's idiom would have
+reported three genuinely gated harnesses as ungated — a false alarm in
+somebody else's lane, which gets a check deleted rather than obeyed.
+
+Records are checked in **both** directions. A `known-gap:` whose file has since
+been gated fails as **stale**, and one naming a file that is gone, or that no
+longer starts anything, fails as **dead**. So closing a gap is a one-line edit
+here, and the ledger cannot decay into a description of the tree as it was —
+which matters most in the case nobody plans for, a file that stops gating and
+is then quietly covered by an exemption nobody meant to still grant.
+
+One structural property of custody is checked with it: the lock must not be
+acquired **inside** an arm loop. A lock taken per arm is released between
+arms, so each arm is protected and the comparison between them is not — which
+is precisely the gap that was sampled in when the host was read as clear
+(#1803). The run-time half of the same question is the `host_lock` column on
+every row; neither replaces the other. What none of this can see is a file
+that saturates the box *in process* without starting anything —
+`cpu_work_probe.py` is the honest example, bounded and single-threaded today.
 
 A driver may be ungated *on purpose* — `ort_cuda_decode_bench.py` is, pending
 its owner — but only as a `known-gap:` entry naming the issue. The distinction
 is the point: a gap somebody wrote down can be closed, while a gap that is
 merely absent is one nobody can see. The workflow triggers on
-`scripts/ort_ab/**` for the same reason: a filter listing today's files would
-have skipped the job for exactly the new harness the check exists to catch.
+`scripts/ort_ab/**` and `crates/onnx-runtime-ep-cpu/benches/**` for the same
+reason: a filter listing today's files would have skipped the job for exactly
+the new harness the check exists to catch.
 
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
