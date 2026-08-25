@@ -28,8 +28,8 @@
 
 use half::{bf16, f16};
 use onnx_runtime_ep_api::{
-    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, TensorMetadata, TensorMut,
-    TensorView, WorkspaceView,
+    DeviceBuffer, DevicePtr, DevicePtrMut, ExecutionProvider, KernelMatch, TensorMetadata,
+    TensorMut, TensorView, WorkspaceView,
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
@@ -1015,6 +1015,143 @@ fn unknown_attribute_is_rejected() {
     assert!(
         format!("{err}").contains("frozen v1 ABI"),
         "reject reason must cite the frozen v1 ABI, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Capability-gate (`supports_op`) tests.
+//
+// These assert the CUDA provider's `supports_op` (the partitioner's capability
+// query, the CUDA analogue of ORT `GetCapability`) actually consults the typed
+// validator: a valid node is CLAIMED and every malformed node is DECLINED **at
+// capability time**, so a bad node is never claimed-then-hard-failed at execute
+// with no fallback. The registered kernel factory is *not* enough on its own —
+// the capability query must be wired to the validator, and these tests are the
+// regression guard that it is (and stays) so.
+// ---------------------------------------------------------------------------
+
+/// Model input shapes and dtypes as the partitioner would hand them to
+/// `supports_op` (positional, absent slots reported as empty/Undefined).
+fn shapes_and_dtypes(
+    inputs: &[Option<HostTensor>],
+) -> (Vec<onnx_runtime_ir::Shape>, Vec<DataType>) {
+    let shapes = inputs
+        .iter()
+        .map(|slot| match slot {
+            Some(t) => static_shape(t.shape.iter().copied()),
+            None => static_shape([0usize; 0]),
+        })
+        .collect();
+    let dtypes = inputs
+        .iter()
+        .map(|slot| slot.as_ref().map_or(DataType::Undefined, |t| t.dtype))
+        .collect();
+    (shapes, dtypes)
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn supports_op_claims_valid_and_low_precision_storage() {
+    let ep = require_cuda();
+    let case = glm_case(4, 4);
+    let inputs = glm_inputs(case, 0x1357);
+    let (graph, node, _specs) = build_node(&inputs, case);
+    let model = Model::new(&graph);
+    let (shapes, dtypes) = shapes_and_dtypes(&inputs);
+
+    // Valid all-f32 node is claimed at capability time.
+    assert!(
+        matches!(
+            ep.supports_op(model.graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Supported { .. }
+        ),
+        "a valid DsaIndexSelect node must be claimed by supports_op"
+    );
+
+    // f16 / bf16 storage (bias stays f32) is claimed: the CUDA validator projects
+    // the query/key/weights trio to f32, so it supports the low-precision storage
+    // the f32-only CPU oracle would decline. The strict f32-only bias is retained.
+    for storage in [DataType::Float16, DataType::BFloat16] {
+        let low = vec![storage, storage, storage, DataType::Float32];
+        assert!(
+            matches!(
+                ep.supports_op(model.graph.node(node), 1, &shapes, &low, &[]),
+                KernelMatch::Supported { .. }
+            ),
+            "{storage:?} query/key/weights storage (f32 bias) must be claimed by supports_op"
+        );
+    }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn supports_op_declines_malformed_nodes_at_capability_time() {
+    let ep = require_cuda();
+    let case = glm_case(4, 4);
+    let inputs = glm_inputs(case, 0x2461);
+    let (graph, node, _specs) = build_node(&inputs, case);
+    let model = Model::new(&graph);
+    let (shapes, dtypes) = shapes_and_dtypes(&inputs);
+
+    let is_declined = |shapes: &[onnx_runtime_ir::Shape], dtypes: &[DataType]| {
+        matches!(
+            ep.supports_op(model.graph.node(node), 1, shapes, dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        )
+    };
+
+    // Non-f32 attention_bias — the exact contract that must be declined, not
+    // claimed-then-hard-failed (an f16 finfo.min would misread a masked slot).
+    let mut bias_f16 = dtypes.clone();
+    bias_f16[3] = DataType::Float16;
+    assert!(
+        is_declined(&shapes, &bias_f16),
+        "non-f32 attention_bias must be declined at capability time"
+    );
+
+    // Non-floating query dtype.
+    let mut query_int = dtypes.clone();
+    query_int[0] = DataType::Int32;
+    assert!(
+        is_declined(&shapes, &query_int),
+        "non-floating query must be declined at capability time"
+    );
+
+    // Mixed query/key storage dtype (trio must be homogeneous).
+    let mut mixed = dtypes.clone();
+    mixed[1] = DataType::Float16;
+    assert!(
+        is_declined(&shapes, &mixed),
+        "mismatched key storage dtype must be declined at capability time"
+    );
+
+    // Shape conflict: bias head axis must be 1 (head-broadcast).
+    let mut bias_head2 = shapes.clone();
+    bias_head2[3] = static_shape([case.batch, 2, case.q_seq, case.key_seq]);
+    assert!(
+        is_declined(&bias_head2, &dtypes),
+        "attention_bias head axis != 1 must be declined at capability time"
+    );
+
+    // Unknown attribute outside the frozen v1 ABI.
+    let mut bogus = graph.clone();
+    bogus
+        .node_mut(node)
+        .attributes
+        .insert("bogus".into(), Attribute::Int(1));
+    let bogus_model = Model::new(&bogus);
+    assert!(
+        matches!(
+            ep.supports_op(bogus_model.graph.node(node), 1, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "an unknown attribute must be declined at capability time"
     );
 }
 
