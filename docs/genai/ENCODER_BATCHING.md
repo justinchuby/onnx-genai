@@ -499,7 +499,8 @@ truth.
   length — which the `[frames]`-shaped companion above states exactly — not by a
   two-dimensional mask.
 - **An emitted padded value publishes its lengths.** If the padded value is a
-  workflow output, its `valid_lengths` **MUST** be a declared output too, and the
+  workflow output, its `valid_lengths` **MUST** be an emitted output too — one
+  some declared step writes, not merely one the output list names — and the
   serving rule admits it on the same terms as a packed value's companions
   ([§4](#4-strict-token_packed-validation) rule 8). Since a materialized mask is
   rejected above, the length vector is the only account of the padding in
@@ -1062,12 +1063,13 @@ profile and are listed separately for that reason.
    ([§3.1](#31-workflowcomponentbatch_capacity)).
 8. **A ragged emit publishes the account of its raggedness, and serving admits
    it.** If a workflow emits a `token_packed` output, every level's `offsets` and
-   `owner` **MUST** also be declared outputs; without them the consumer receives a
-   ragged buffer it cannot split. **The same obligation binds a padded emit**: if
-   a workflow emits a value whose contract declares `padding`, each entry's
-   `valid_lengths` **MUST** also be a declared output. The symmetry is not
-   cosmetic. [§3.2](#32-tensorcontractpadding) rejects a payload-shaped validity
-   mask precisely so that the length vector is the *only* account of the padding
+   `owner` **MUST** also be outputs, and outputs some declared step actually
+   writes; without them the consumer receives a ragged buffer it cannot split.
+   **The same obligation binds a padded emit**: if a workflow emits a value whose
+   contract declares `padding`, each entry's `valid_lengths` **MUST** likewise be
+   an emitted output. The symmetry is not cosmetic.
+   [§3.2](#32-tensorcontractpadding) rejects a payload-shaped validity mask
+   precisely so that the length vector is the *only* account of the padding
    that exists anywhere; a caller that receives the payload without it holds
    trailing entries that mean nothing and has no way to find out how many. Both
    halves state one rule — raggedness leaves the workflow together with the
@@ -1078,16 +1080,54 @@ profile and are listed separately for that reason.
    `token_packed` (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`), and
    companions are `shared` by rule 4. The **minimal coherent resolution** is a
    carve-out rather than a new layout: the serving rule admits a `shared` emitted
-   value **iff** it is `int64`, rank 1, and named as an `offsets` or `owner` of
-   some other emitted value's layout — or as the `valid_lengths` of some other
-   emitted value's `padding` entry — **in the same workflow**. No new
-   `BatchLayout` variant, no new companion kind, and the admission condition is
-   decidable from the declared outputs alone. Anything else `shared` and rank > 0
-   is still rejected with the existing message. The runtime side of the carve-out:
-   a companion is **never compacted and never split like a payload**. A
-   `valid_lengths` companion needs no rebasing — a length is already relative to
-   the item it measures — so each request receives the slice of it that indexes
-   its own items. When results are delivered per request, the runtime hands each
+   value **iff** it is `int64`, carries **the rank that reference demands**, and
+   is named as an `offsets` or `owner` of some other emitted value's layout — or
+   as the `valid_lengths` of some other emitted value's `padding` entry — **in
+   the same workflow**. No new `BatchLayout` variant, no new companion kind, and
+   the admission condition is decidable from the declared outputs alone. Anything else `shared` and rank > 0
+   is still rejected with the existing message.
+
+   **The admitted rank is the one the reference demands, not uniformly 1.** An
+   `offsets` and an `owner` are rank 1 by construction (rule 4), so for them the
+   two readings coincide. A `valid_lengths` is not:
+   [§3.2](#32-tensorcontractpadding) fixes its rank at the number of axes *outer*
+   to the padded one, so a value padded on axis 2 publishes a **rank-2** length
+   vector. Writing the carve-out as a flat "rank 1" makes two rules of this design
+   contradict each other — one requires that companion, the other refuses it — and
+   the refusal necessarily advises `request_aligned`, which is exactly what a
+   companion **MUST NOT** declare. Following the narrower reading would therefore
+   make a correct package wrong. The condition is per *reference*: collect what
+   each declaration naming the value requires of it — role, and the rank that role
+   implies at that site — and admit the value if it satisfies any one of them. A
+   name may legitimately be claimed by more than one declaration (one length
+   vector bounding the same dimension of two outputs), so expectations accumulate
+   rather than overwrite. Two declarations demanding *different* ranks of one
+   value is a genuine contradiction, but it is a defect of the `padding`
+   declarations and **MUST** be reported against the one that is wrong; raising it
+   here would name an innocent line and describe the defect as the wrong kind of
+   thing. Where a padded `dimension` does not resolve to an axis, the reference
+   carries no rank expectation at all: that declaration is already being rejected,
+   and a second complaint about a rank nothing could compute sends the reader
+   somewhere there is nothing to fix. A value named as a companion but shaped like
+   something else **MUST** be refused *as a malformed companion*, naming the role
+   and the expected rank, rather than falling through to the generic serving
+   message — the generic message advises the one layout a companion may not have.
+
+   **Declared is not published.** Both halves of this rule require the companion
+   to be **emitted** — written by some declared step — not merely to appear in the
+   output list. An output nothing writes hands the caller an empty vector beside a
+   ragged payload, which is the precise failure the rule exists to prevent wearing
+   the appearance of compliance. The check is **whole-workflow, not
+   path-sensitive**: "written by some declared step" is what is soundly decidable
+   without evaluating branch predicates, and a path-sensitive rule would reject a
+   correct package whose companion is written in a sibling branch of the emit. The
+   weaker check catches the case that occurs — a companion nothing produces — and
+   never rejects a package for a path it cannot prove is taken.
+
+   The runtime side of the carve-out: a companion is **never compacted and never
+   split like a payload**. A `valid_lengths` companion needs no rebasing — a
+   length is already relative to the item it measures — so each request receives
+   the slice of it that indexes its own items. When results are delivered per request, the runtime hands each
    request its own payload span plus **rebased** offsets for that span — level
    offsets recomputed relative to the request's own start, so a single-request
    consumer sees a well-formed chain beginning at zero.
@@ -1830,7 +1870,7 @@ no downloaded weights, no sample media, and no network in the test path.
 | 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged **unless it spells the replaced flat `token_packed` form**, which is refused with a message naming the removed spelling and the one-level `levels` rewrite — not an unknown-field error, and not a silent acceptance. A `2.0` document carrying the same flat pair is refused **on its version only** and never receives the migration message, proving the gate runs first and that a retired-shape claim is scoped to the vocabulary the gate admitted. | P1 |
 | 23 | **Conditional emission, and no rewriting of what exists.** Every existing in-tree document round-tripped through the writer, and a new document that declares `batch_capacity`. | For the existing documents the **bytes and the version strings are unchanged** — `v1` stays `v1`, `1.0` stays `1.0`, absent stays absent, and no field of this design is emitted — so no existing runtime's minimum moves and no semantic identity changes. The new document **MUST** stamp `v1.1`. | P1 |
 | 24 | **Every output level declares its producer.** A mixed-chain output (inner level `extent: produced` with component-output companions, outer level `extent: preserved` reusing the input's clip pair) exercised end to end; a token-merging graph whose output length differs from its input's; and three negative cases — a level omitting `extent`, a `produced` level naming an input companion, and a `preserved` level naming a companion of a different extent. | The mixed chain validates per level and splits at the graph's own inner boundaries while reusing the outer mapping; the negatives are rejected at load naming the value, the level, and both facts; no path ever splits a produced level with input offsets. | P2, P4 |
-| 25 | **Serving admits companions, and only companions.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a padded value *without* them; and one emitting an unrelated `shared` rank-1 value. | The first two validate — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items; the third is rejected for withholding the only account of its padding; the fourth is still rejected with the existing message. | P2, P6 |
+| 25 | **Serving admits companions, and only companions, at the rank each reference demands.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a value padded on two dimensions at once, publishing a rank-1 length for axis 1 and a **rank-2** length for axis 2; a `request_aligned` and a `token_packed` variant of that doubly-padded case; one emitting a packed value padded on the axes it does *not* pack, publishing ownership and lengths together at three different ranks; one declaring a rank-1 length for a padded axis 2; one emitting a padded value *without* its lengths; one whose companion is a declared output that no step writes; and one emitting an unrelated `shared` rank-2 value. | Every publishing case validates — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items — with rank checked *per reference*, never as a flat rank 1. The mis-ranked length is refused **as a malformed companion**, naming the role and the expected rank and never advising `request_aligned`. The withheld lengths and the declared-but-unwritten companion are both rejected for not publishing. The unrelated value is still rejected with the existing message. | P2, P6 |
 | 26 | **Companion validation causes no hidden transfer.** A group whose companions the runtime built, and a group whose companions a component produced on device. | Runtime-built companions are validated on the host at no transfer cost; produced companions are checked for dtype, rank, and extent without a device read, and the single companion-only transfer needed to split is counted and attributed — the payload never moves. | P4, P7 |
 | 27 | **`request_expanded` participates.** A component with a `request_expanded` port at factor > 1 grouped alongside packed ports. | Ownership is arithmetic — entry `i` belongs to row `i / factor` — no companions are declared or required, footprint is charged as `rows × factor`, and a declaration that is both request-expanded and packed on one axis is rejected at load. | P2, P4 |
 | 28 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed and the padding overhead paid (padded elements as a fraction of real ones). Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |
