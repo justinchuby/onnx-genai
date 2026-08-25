@@ -854,33 +854,6 @@ impl Value {
         tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
     }
 
-    /// Borrow host-resident Int64 tensor data without copying it.
-    ///
-    /// The returned slice cannot outlive this [`Value`]. Device-resident values
-    /// fail rather than exposing a device address as a host pointer.
-    pub fn as_slice_i64(&self) -> Result<&[i64]> {
-        self.ensure_host_accessible("as_slice_i64")?;
-        if self.dtype != DataType::Int64 {
-            return Err(OrtError::InvalidArgument(format!(
-                "requested borrowed i64 data from {:?} tensor",
-                self.dtype
-            )));
-        }
-        if self.numel() == 0 {
-            return Ok(&[]);
-        }
-        let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
-        if !ptr.is_aligned() {
-            return Err(OrtError::InvalidArgument(format!(
-                "cannot borrow Int64 tensor data at misaligned pointer {ptr:p}"
-            )));
-        }
-        // SAFETY: the checked host tensor contains `numel` initialized Int64
-        // elements at an aligned address and `self` keeps them alive for the
-        // returned borrow.
-        Ok(unsafe { std::slice::from_raw_parts(ptr, self.numel()) })
-    }
-
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtValue {
         self.ptr.as_ptr()
     }
@@ -3181,12 +3154,14 @@ mod alias_offset_tests {
         );
     }
 
-    /// Ownership companions are scanned in place rather than copied to a Vec.
+    /// An Int64 read is an owned snapshot, so shared in-place mutation cannot
+    /// invalidate a safe Rust borrow held by the caller.
     #[test]
-    fn an_i64_slice_borrows_the_tensor_buffer() {
+    fn an_i64_snapshot_remains_valid_across_shared_mutation() {
         let value = Value::from_slice_i64(&[0, 2, 5], &[3]).unwrap();
-        let borrowed = value.as_slice_i64().unwrap();
-        assert_eq!(borrowed, &[0, 2, 5]);
-        assert_eq!(borrowed.as_ptr() as usize, value.data_ptr_addr().unwrap());
+        let snapshot = value.to_vec_i64().unwrap();
+        value.fill_i64_range(0, 3, 9).unwrap();
+        assert_eq!(snapshot, [0, 2, 5]);
+        assert_eq!(value.to_vec_i64().unwrap(), [9, 9, 9]);
     }
 }

@@ -1081,6 +1081,9 @@ fn pure_onnx_device(
     if !is_fusible_component(&resolved) {
         return None;
     }
+    if requires_batch_admission_boundary(&resolved) {
+        return None;
+    }
     // A component that scatters into a fixed-capacity buffer keeps its own
     // invocation. Fusion would move the destinations to a value the island
     // computes internally, and the runtime cannot bounds-check a write whose
@@ -1093,6 +1096,22 @@ fn pure_onnx_device(
         Some(device) => format!("cuda:{device}"),
         None => "cpu".to_string(),
     })
+}
+
+fn requires_batch_admission_boundary(component: &WorkflowComponent) -> bool {
+    component.batch_capacity.is_some()
+        || component
+            .ports
+            .inputs
+            .values()
+            .chain(component.ports.outputs.values())
+            .any(|contract| {
+                matches!(
+                    contract.batch_layout,
+                    onnx_genai_metadata::BatchLayout::TokenPacked { .. }
+                        | onnx_genai_metadata::BatchLayout::RequestExpanded { .. }
+                )
+            })
 }
 
 fn receives_fixed_capacity_destinations(workflow: &WorkflowSpec, component: &str) -> bool {
@@ -2401,6 +2420,45 @@ mod tests {
             batch_layout: onnx_genai_metadata::BatchLayout::Shared,
             padding: Vec::new(),
         }
+    }
+
+    #[test]
+    fn batching_sensitive_components_are_never_hidden_inside_execution_islands() {
+        let mut budgeted = component(ComponentImplementation::Onnx {
+            artifact: "encoder.onnx".into(),
+        });
+        budgeted.batch_capacity = Some(onnx_genai_metadata::ComponentBatchCapacity::default());
+        assert!(requires_batch_admission_boundary(&budgeted));
+
+        let mut packed = component(ComponentImplementation::Onnx {
+            artifact: "encoder.onnx".into(),
+        });
+        packed.ports.inputs.insert(
+            "items".into(),
+            serde_yaml::from_str(
+                r#"
+dtype: float32
+rank: 2
+shape: [items, hidden]
+batch_layout:
+  kind: token_packed
+  axis: 0
+  levels:
+    - { offsets: offsets, owner: owner }
+"#,
+            )
+            .unwrap(),
+        );
+        assert!(requires_batch_admission_boundary(&packed));
+
+        let mut ordinary = component(ComponentImplementation::Onnx {
+            artifact: "decoder.onnx".into(),
+        });
+        ordinary
+            .ports
+            .inputs
+            .insert("tokens".into(), batch_tensor("int64", 2));
+        assert!(!requires_batch_admission_boundary(&ordinary));
     }
 
     #[test]

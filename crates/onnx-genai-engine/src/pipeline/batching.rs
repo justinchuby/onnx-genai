@@ -145,6 +145,12 @@ pub enum BatchContractError {
         count: usize,
     },
     #[error(
+        "component '{component}' cannot validate batching before dispatch because required \
+         batched input port '{port}' is unavailable; expose the port to the generic runtime or \
+         execute this component without a batching contract"
+    )]
+    MissingBatchInput { component: String, port: String },
+    #[error(
         "component '{component}' carries {request_count} requests but declares no batch_capacity; \
          absence permits exactly one request per invocation"
     )]
@@ -222,32 +228,25 @@ pub fn batch_contract_error(error: &anyhow::Error) -> Option<&BatchContractError
 }
 
 /// Runtime-owned companion tensors for one ownership level.
+///
+/// [`PackedOwnership`] snapshots their Int64 contents during validation because
+/// `Value` aliases permit shared in-place mutation. Payload views remain
+/// zero-copy ORT aliases; only the small ownership companions cross this copy
+/// boundary.
 pub struct OwnershipLevelValues {
-    offsets: Arc<Value>,
-    owners: Arc<Value>,
+    offsets: Value,
+    owners: Value,
 }
 
 impl OwnershipLevelValues {
-    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(offsets: Value, owners: Value) -> Self {
-        Self {
-            offsets: Arc::new(offsets),
-            owners: Arc::new(owners),
-        }
-    }
-
-    pub fn offsets(&self) -> &Value {
-        &self.offsets
-    }
-
-    pub fn owners(&self) -> &Value {
-        &self.owners
+        Self { offsets, owners }
     }
 }
 
 /// A validated, bounded ownership chain over one packed physical axis.
 pub struct PackedOwnership {
-    levels: Vec<OwnershipLevelValues>,
+    levels: Vec<OwnedOwnershipLevel>,
     packed_extent: usize,
     request_count: usize,
 }
@@ -258,26 +257,26 @@ impl PackedOwnership {
         levels: Vec<OwnershipLevelValues>,
         request_count: usize,
     ) -> Result<Self, BatchContractError> {
-        let borrowed = levels
-            .iter()
+        let snapshots = levels
+            .into_iter()
             .enumerate()
             .map(|(level, values)| {
-                Ok(BorrowedOwnershipLevel {
-                    offsets: companion_slice(
+                Ok(OwnedOwnershipLevel {
+                    offsets: companion_values(
                         "<ownership>",
                         "<packed>",
                         level,
                         "offsets",
                         "offsets",
-                        values.offsets(),
+                        &values.offsets,
                     )?,
-                    owners: companion_slice(
+                    owners: companion_values(
                         "<ownership>",
                         "<packed>",
                         level,
                         "owner",
                         "owner",
-                        values.owners(),
+                        &values.owners,
                     )?,
                 })
             })
@@ -286,11 +285,11 @@ impl PackedOwnership {
             "<ownership>",
             "<packed>",
             packed_extent,
-            &borrowed,
+            &snapshots,
             Some(request_count),
         )?;
         Ok(Self {
-            levels,
+            levels: snapshots,
             packed_extent,
             request_count,
         })
@@ -313,9 +312,9 @@ impl PackedOwnership {
         &self,
         request: usize,
     ) -> Result<PackedRequestView<'_>, BatchContractError> {
-        let slices = self.borrowed_levels()?;
-        let ranges = request_level_ranges(&slices, request, self.request_count)?;
-        let levels = slices
+        let ranges = request_level_ranges(&self.levels, request, self.request_count)?;
+        let levels = self
+            .levels
             .iter()
             .zip(&ranges)
             .map(|(level, range)| {
@@ -349,14 +348,14 @@ impl PackedOwnership {
         level: usize,
         lengths: &'a [T],
     ) -> Result<&'a [T], BatchContractError> {
-        let slices = self.borrowed_levels()?;
-        let selected = slices
+        let selected = self
+            .levels
             .get(level)
             .ok_or(BatchContractError::OwnershipDepth {
                 component: "<ownership>".into(),
                 value: "<packed>".into(),
                 depth: level + 1,
-                max_depth: slices.len(),
+                max_depth: self.levels.len(),
             })?;
         if lengths.len() != selected.owners.len() {
             return Err(BatchContractError::LengthExtent {
@@ -365,35 +364,8 @@ impl PackedOwnership {
                 expected: selected.owners.len(),
             });
         }
-        let ranges = request_level_ranges(&slices, request, self.request_count)?;
+        let ranges = request_level_ranges(&self.levels, request, self.request_count)?;
         Ok(&lengths[ranges[level].units.clone()])
-    }
-
-    fn borrowed_levels(&self) -> Result<Vec<BorrowedOwnershipLevel<'_>>, BatchContractError> {
-        self.levels
-            .iter()
-            .enumerate()
-            .map(|(level, values)| {
-                Ok(BorrowedOwnershipLevel {
-                    offsets: companion_slice(
-                        "<ownership>",
-                        "<packed>",
-                        level,
-                        "offsets",
-                        "offsets",
-                        values.offsets(),
-                    )?,
-                    owners: companion_slice(
-                        "<ownership>",
-                        "<packed>",
-                        level,
-                        "owner",
-                        "owner",
-                        values.owners(),
-                    )?,
-                })
-            })
-            .collect()
     }
 }
 
@@ -569,8 +541,7 @@ impl ComposedOwnership {
                     request_count: request.request_count(),
                 });
             }
-            let borrowed = request.borrowed_levels()?;
-            for (level_index, source) in borrowed.iter().enumerate() {
+            for (level_index, source) in request.levels.iter().enumerate() {
                 let unit_base = unit_bases[level_index];
                 let parent_base = parent_bases[level_index];
                 for offset in &source.offsets[1..] {
@@ -592,8 +563,8 @@ impl ComposedOwnership {
                             }
                         })?);
                 }
-                for owner in source.owners {
-                    let local = usize::try_from(*owner).map_err(|_| {
+                for &owner in &source.owners {
+                    let local = usize::try_from(owner).map_err(|_| {
                         BatchContractError::ArithmeticOverflow {
                             operation: "converting a local owner index",
                         }
@@ -706,9 +677,9 @@ impl ComposedOwnership {
     }
 }
 
-struct BorrowedOwnershipLevel<'a> {
-    offsets: &'a [i64],
-    owners: &'a [i64],
+struct OwnedOwnershipLevel {
+    offsets: Vec<i64>,
+    owners: Vec<i64>,
 }
 
 struct LevelRange {
@@ -717,7 +688,7 @@ struct LevelRange {
 }
 
 fn request_level_ranges(
-    levels: &[BorrowedOwnershipLevel<'_>],
+    levels: &[OwnedOwnershipLevel],
     request: usize,
     request_count: usize,
 ) -> Result<Vec<LevelRange>, BatchContractError> {
@@ -759,7 +730,7 @@ fn validate_ownership_slices(
     component: &str,
     value: &str,
     packed_extent: usize,
-    levels: &[BorrowedOwnershipLevel<'_>],
+    levels: &[OwnedOwnershipLevel],
     expected_requests: Option<usize>,
 ) -> Result<usize, BatchContractError> {
     if levels.is_empty() || levels.len() > MAX_OWNERSHIP_DEPTH {
@@ -882,14 +853,14 @@ fn validate_ownership_slices(
     Ok(expected_units)
 }
 
-fn companion_slice<'a>(
+fn companion_values(
     component: &str,
     value: &str,
     level: usize,
     kind: &'static str,
     companion: &str,
-    tensor: &'a Value,
-) -> Result<&'a [i64], BatchContractError> {
+    tensor: &Value,
+) -> Result<Vec<i64>, BatchContractError> {
     if tensor.dtype() != DataType::Int64 || tensor.shape().len() != 1 {
         return Err(BatchContractError::InvalidCompanion {
             component: component.into(),
@@ -901,7 +872,7 @@ fn companion_slice<'a>(
         });
     }
     tensor
-        .as_slice_i64()
+        .to_vec_i64()
         .map_err(|error| BatchContractError::InvalidCompanion {
             component: component.into(),
             value: value.into(),
@@ -924,30 +895,38 @@ fn axis_zero_extent(value: &Value) -> Result<usize, String> {
         })
 }
 
-pub(crate) fn validate_workflow_packed_inputs(
+pub(crate) fn validate_workflow_batch_inputs(
     workflow: &WorkflowSpec,
     values: &PipelineTensors,
-) -> Result<(), BatchContractError> {
+) -> Result<usize, BatchContractError> {
+    let mut request_count = None;
     for (name, input) in &workflow.inputs {
-        let BatchLayout::TokenPacked { axis, levels } = &input.contract.batch_layout else {
-            continue;
-        };
         let Some(payload) = values.get(name) else {
             // Hosted executors may intentionally own all uses of an input, in
             // which case the generic plan does not bind it.
             continue;
         };
-        validate_packed_contract(
-            "<workflow>",
-            name,
-            *axis,
-            levels,
-            payload,
-            |companion| values.get(companion),
-            None,
-        )?;
+        let count = match &input.contract.batch_layout {
+            BatchLayout::RequestAligned { axis } => {
+                request_axis_count("<workflow>", name, payload, *axis, 1)?
+            }
+            BatchLayout::RequestExpanded { axis, factor } => {
+                request_axis_count("<workflow>", name, payload, *axis, *factor)?
+            }
+            BatchLayout::TokenPacked { axis, levels } => validate_packed_contract(
+                "<workflow>",
+                name,
+                *axis,
+                levels,
+                payload,
+                |companion| values.get(companion),
+                None,
+            )?,
+            BatchLayout::Shared | BatchLayout::RuntimeSequenceState => continue,
+        };
+        merge_request_count("<workflow>", &mut request_count, name, count)?;
     }
-    Ok(())
+    Ok(request_count.map_or(1, |(_, count)| count))
 }
 
 fn validate_packed_contract<'a>(
@@ -995,8 +974,8 @@ fn validate_packed_contract<'a>(
                     kind: "owner",
                     companion: declaration.owner.clone(),
                 })?;
-            Ok(BorrowedOwnershipLevel {
-                offsets: companion_slice(
+            Ok(OwnedOwnershipLevel {
+                offsets: companion_values(
                     component,
                     value,
                     level,
@@ -1004,7 +983,7 @@ fn validate_packed_contract<'a>(
                     &declaration.offsets,
                     offsets,
                 )?,
-                owners: companion_slice(
+                owners: companion_values(
                     component,
                     value,
                     level,
@@ -1039,10 +1018,40 @@ pub(crate) fn validate_component_batch_before_enqueue(
     inputs: &[(&str, &Value)],
     symbols: &HashMap<String, i64>,
 ) -> Result<usize, BatchContractError> {
+    validate_component_batch_before_enqueue_impl(component, declaration, inputs, symbols, false)
+}
+
+pub(crate) fn validate_available_component_batch_before_enqueue(
+    component: &str,
+    declaration: &WorkflowComponent,
+    inputs: &[(&str, &Value)],
+    symbols: &HashMap<String, i64>,
+) -> Result<usize, BatchContractError> {
+    validate_component_batch_before_enqueue_impl(component, declaration, inputs, symbols, true)
+}
+
+fn validate_component_batch_before_enqueue_impl(
+    component: &str,
+    declaration: &WorkflowComponent,
+    inputs: &[(&str, &Value)],
+    symbols: &HashMap<String, i64>,
+    allow_runtime_owned_inputs: bool,
+) -> Result<usize, BatchContractError> {
     let by_port = inputs.iter().copied().collect::<HashMap<_, _>>();
     let mut request_count: Option<(String, usize)> = None;
     for (port, contract) in &declaration.ports.inputs {
         let Some(value) = by_port.get(port.as_str()).copied() else {
+            let requires_runtime_admission = declaration.batch_capacity.is_some()
+                || matches!(
+                    contract.batch_layout,
+                    BatchLayout::TokenPacked { .. } | BatchLayout::RequestExpanded { .. }
+                );
+            if !allow_runtime_owned_inputs && !contract.optional && requires_runtime_admission {
+                return Err(BatchContractError::MissingBatchInput {
+                    component: component.into(),
+                    port: port.clone(),
+                });
+            }
             continue;
         };
         let count = match &contract.batch_layout {
@@ -1066,32 +1075,15 @@ pub(crate) fn validate_component_batch_before_enqueue(
         merge_request_count(component, &mut request_count, port, count)?;
     }
     let count = request_count.as_ref().map_or(1, |(_, count)| *count);
-    if declaration.batch_capacity.is_none() && count > 1 {
+    if !allow_runtime_owned_inputs && declaration.batch_capacity.is_none() && count > 1 {
         return Err(BatchContractError::UndeclaredCapacity {
             component: component.into(),
             request_count: count,
         });
     }
     let policy = component_batch_policy(component, declaration)?;
-    let dimensions = policy
-        .aggregations
-        .keys()
-        .map(|symbol| {
-            let extent = symbols.get(symbol).copied().ok_or_else(|| {
-                BatchContractError::MissingCapacityDimension {
-                    component: component.into(),
-                    symbol: symbol.clone(),
-                }
-            })?;
-            let extent = usize::try_from(extent).map_err(|_| {
-                BatchContractError::MissingCapacityDimension {
-                    component: component.into(),
-                    symbol: symbol.clone(),
-                }
-            })?;
-            Ok((symbol.clone(), extent))
-        })
-        .collect::<Result<BTreeMap<_, _>, BatchContractError>>()?;
+    let dimensions =
+        component_materialized_dimensions(component, declaration, inputs, symbols, &policy)?;
     validate_materialized_footprint(&policy, &dimensions).map_err(|source| {
         BatchContractError::Admission {
             component: component.into(),
@@ -1099,6 +1091,102 @@ pub(crate) fn validate_component_batch_before_enqueue(
         }
     })?;
     Ok(count)
+}
+
+pub(crate) fn validate_component_outputs_before_publish(
+    component: &str,
+    declaration: &WorkflowComponent,
+    inputs: &[(&str, &Value)],
+    outputs: &[(&str, &Value)],
+    expected_requests: usize,
+) -> Result<(), BatchContractError> {
+    let input_by_port = inputs.iter().copied().collect::<HashMap<_, _>>();
+    let output_by_port = outputs.iter().copied().collect::<HashMap<_, _>>();
+    let mut request_count = Some(("<inputs>".to_string(), expected_requests));
+    for (port, contract) in &declaration.ports.outputs {
+        let Some(value) = output_by_port.get(port.as_str()).copied() else {
+            continue;
+        };
+        let count = match &contract.batch_layout {
+            BatchLayout::RequestAligned { axis } => {
+                request_axis_count(component, port, value, *axis, 1)?
+            }
+            BatchLayout::RequestExpanded { axis, factor } => {
+                request_axis_count(component, port, value, *axis, *factor)?
+            }
+            BatchLayout::TokenPacked { axis, levels } => validate_packed_contract(
+                component,
+                port,
+                *axis,
+                levels,
+                value,
+                |companion| {
+                    output_by_port
+                        .get(companion)
+                        .copied()
+                        .or_else(|| input_by_port.get(companion).copied())
+                },
+                Some(expected_requests),
+            )?,
+            BatchLayout::Shared | BatchLayout::RuntimeSequenceState => continue,
+        };
+        merge_request_count(component, &mut request_count, port, count)?;
+    }
+    Ok(())
+}
+
+fn component_materialized_dimensions(
+    component: &str,
+    declaration: &WorkflowComponent,
+    inputs: &[(&str, &Value)],
+    symbols: &HashMap<String, i64>,
+    policy: &BatchPolicy,
+) -> Result<BTreeMap<String, usize>, BatchContractError> {
+    let by_port = inputs.iter().copied().collect::<HashMap<_, _>>();
+    policy
+        .aggregations
+        .keys()
+        .map(|symbol| {
+            let logical = symbols.get(symbol).copied().ok_or_else(|| {
+                BatchContractError::MissingCapacityDimension {
+                    component: component.into(),
+                    symbol: symbol.clone(),
+                }
+            })?;
+            let mut materialized = usize::try_from(logical).map_err(|_| {
+                BatchContractError::MissingCapacityDimension {
+                    component: component.into(),
+                    symbol: symbol.clone(),
+                }
+            })?;
+            for (port, contract) in &declaration.ports.inputs {
+                let Some(value) = by_port.get(port.as_str()).copied() else {
+                    continue;
+                };
+                let Some(shape) = &contract.shape else {
+                    continue;
+                };
+                for (axis, dimension) in shape.iter().enumerate() {
+                    if dimension != &TensorDimension::Symbol(symbol.clone()) {
+                        continue;
+                    }
+                    let actual = value.shape().get(axis).copied().ok_or_else(|| {
+                        BatchContractError::MissingCapacityDimension {
+                            component: component.into(),
+                            symbol: symbol.clone(),
+                        }
+                    })?;
+                    materialized = materialized.max(usize::try_from(actual).map_err(|_| {
+                        BatchContractError::MissingCapacityDimension {
+                            component: component.into(),
+                            symbol: symbol.clone(),
+                        }
+                    })?);
+                }
+            }
+            Ok((symbol.clone(), materialized))
+        })
+        .collect()
 }
 
 fn request_axis_count(
@@ -1315,27 +1403,13 @@ impl WorkflowRuntime {
                 }
                 .into());
             }
-            let dimensions = policy
-                .aggregations
-                .keys()
-                .map(|symbol| {
-                    let extent = symbols.get(symbol).copied().ok_or_else(|| {
-                        BatchContractError::MissingCapacityDimension {
-                            component: component.into(),
-                            symbol: symbol.clone(),
-                        }
-                    })?;
-                    Ok((
-                        symbol.clone(),
-                        usize::try_from(extent).map_err(|_| {
-                            BatchContractError::MissingCapacityDimension {
-                                component: component.into(),
-                                symbol: symbol.clone(),
-                            }
-                        })?,
-                    ))
-                })
-                .collect::<Result<BTreeMap<_, _>, BatchContractError>>()?;
+            let dimensions = component_materialized_dimensions(
+                component,
+                declaration,
+                &resolved,
+                &symbols,
+                &policy,
+            )?;
             contributions.push(BatchContribution {
                 sequence_id: *sequence_id,
                 dimensions,
@@ -1433,6 +1507,26 @@ ports:
     frame_owner: { dtype: int64, rank: 1, shape: [frames], batch_layout: { kind: shared } }
     clip_offsets: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
     clip_owner: { dtype: int64, rank: 1, shape: [clips], batch_layout: { kind: shared } }
+  outputs: {}
+"#,
+        )
+        .unwrap()
+    }
+
+    fn expanded_component() -> WorkflowComponent {
+        serde_yaml::from_str(
+            r#"
+implementation: { kind: onnx, artifact: encoder.onnx }
+batch_capacity:
+  budgets:
+    - { dimensions: [batch], max_total: 1 }
+ports:
+  inputs:
+    rows:
+      dtype: float32
+      rank: 2
+      shape: [batch, hidden]
+      batch_layout: { kind: request_expanded, axis: 0, factor: 2 }
   outputs: {}
 "#,
         )
@@ -1705,5 +1799,103 @@ ports:
                 request_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn expanded_requests_charge_physical_rows_to_budgets() {
+        let declaration = expanded_component();
+        let rows = Value::from_slice_f32(&[0.0; 2 * 3], &[2, 3]).unwrap();
+        let symbols = HashMap::from([("batch".into(), 1), ("hidden".into(), 3)]);
+        let error = validate_component_batch_before_enqueue(
+            "encoder",
+            &declaration,
+            &[("rows", &rows)],
+            &symbols,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            BatchContractError::Admission {
+                source: BatchAdmissionError::MaterializedBudgetExceeded {
+                    materialized: 2,
+                    max_total: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn workflow_inputs_must_share_one_logical_request_cardinality() {
+        let workflow: WorkflowSpec = serde_yaml::from_str(
+            r#"
+manifest: { capabilities: [] }
+inputs:
+  packed:
+    contract:
+      dtype: float32
+      rank: 2
+      shape: [items, hidden]
+      batch_layout:
+        kind: token_packed
+        axis: 0
+        levels:
+          - { offsets: offsets, owner: owner }
+    role: { kind: opaque }
+    source: { kind: application, name: packed }
+  offsets:
+    contract: { dtype: int64, rank: 1, shape: [rows_plus_one], batch_layout: { kind: shared } }
+    role: { kind: opaque }
+    source: { kind: application, name: offsets }
+  owner:
+    contract: { dtype: int64, rank: 1, shape: [items], batch_layout: { kind: shared } }
+    role: { kind: opaque }
+    source: { kind: application, name: owner }
+  prompt:
+    contract:
+      dtype: int64
+      rank: 2
+      shape: [batch, sequence]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    role: { kind: opaque }
+    source: { kind: application, name: prompt }
+outputs: {}
+components: {}
+steps: []
+"#,
+        )
+        .unwrap();
+        let values = PipelineTensors::from([
+            (
+                "packed".into(),
+                Value::from_slice_f32(&[1.0, 2.0], &[2, 1]).unwrap(),
+            ),
+            (
+                "offsets".into(),
+                Value::from_slice_i64(&[0, 1, 2], &[3]).unwrap(),
+            ),
+            (
+                "owner".into(),
+                Value::from_slice_i64(&[0, 1], &[2]).unwrap(),
+            ),
+            (
+                "prompt".into(),
+                Value::from_slice_i64(&[7, 8], &[1, 2]).unwrap(),
+            ),
+        ]);
+        let error = validate_workflow_batch_inputs(&workflow, &values).unwrap_err();
+        assert!(matches!(
+            error,
+            BatchContractError::RequestCountMismatch {
+                first_count: 2,
+                count: 1,
+                ..
+            } | BatchContractError::RequestCountMismatch {
+                first_count: 1,
+                count: 2,
+                ..
+            }
+        ));
     }
 }
