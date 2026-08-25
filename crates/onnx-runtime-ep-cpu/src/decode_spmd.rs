@@ -8274,11 +8274,13 @@ mod tests {
         //
         // 16 is covered because it is the default physical-core budget on the
         // 16-physical / 32-logical reference host and the widest budget there
-        // that is not SMT-oversubscribed -- the one width where the headroom
-        // reservation fires under a budget somebody actually benchmarks. Widths
-        // are cheap to add here and expensive to be wrong about: each is a
-        // separate child, and an uncovered width is a `t=N` label with nothing
-        // behind it.
+        // that is not SMT-oversubscribed, so it is the width most published rows
+        // use. `matmul_nbits`'s `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+        // already sweeps 1/2/4/8/16 against the *ambient* cpuset; what is added
+        // here is that width under this crate's own confinement, where
+        // `bound_process_to_decode_budget` makes the group fully subscribed and
+        // the `allowed == budget` arm below is the assertion that fires. Widths
+        // are cheap here -- one child each -- and expensive to be wrong about.
         let budgets: Vec<usize> = [2usize, 4, 8, 16]
             .into_iter()
             .filter(|&n| n <= available)
@@ -8340,7 +8342,16 @@ mod tests {
     /// for the inline dispatcher alongside a spinning worker. That decline is
     /// the third silent-reduction path named in [`DecodeWidth`]'s doc, and the
     /// only one that changes the *path* instead of the width -- so it is exactly
-    /// what a `t=1` row would mislabel, and nothing exercised it end to end.
+    /// what a `t=1` row would mislabel.
+    ///
+    /// `matmul_nbits`'s `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+    /// also sweeps width 1, and does assert that a single-CPU cpuset builds no
+    /// pool -- but against the *ambient* cpuset, so on any CI runner with more
+    /// than one CPU that arm is skipped and never runs. Driving the confinement
+    /// from inside the process reaches it on every Linux host, and it is the
+    /// only test that asserts the `"flat"` label `report_spmd_fallback` sets:
+    /// deleting that one line leaves the label `"unresolved"` and fails here
+    /// alone.
     ///
     /// Keyed on the realized cpuset rather than on `cfg(target_os)`: only Linux
     /// implements a process-wide affinity mask, so elsewhere the confinement does
@@ -8354,18 +8365,36 @@ mod tests {
     /// before the split: one lane requested, one lane realized, on a resolved
     /// path -- never 0, never `"unresolved"`. A pool that declined must still
     /// account for the width the caller asked for.
+    ///
+    /// The non-Linux arm is an *introspection* contract and not a claim about
+    /// parallelism: a width-one pool has `total_workers() == 1` and therefore
+    /// takes the serial short-circuit on every dispatch. What it asserts is that
+    /// the read distinguishes that pool (`1` lane, `"spmd-pool"`) from the
+    /// declined one (`0` lanes, `"flat"`), which is the distinction a `t=1` row
+    /// depends on.
     #[test]
     fn a_budget_of_one_reports_one_lane_on_whichever_path_serves_it() {
+        // Structural symmetry with the sibling sweep rather than a live guard:
+        // children are spawned with `--exact ... budget_lane_child`, so this test
+        // is never selected inside one. It is kept because the failure it
+        // prevents -- a harness change that drops `--exact`, turning every child
+        // into a fork bomb -- costs more than the dead line does.
         if std::env::var_os(BUDGET_LANE_CHILD_ENV).is_some() {
             return; // The child arm runs as its own test below.
         }
         let lane = run_budget_lane_child(1, None).expect("the unconfined arm never skips");
-        if lane.nodes > 1 {
-            // A split layout reserves per node, which is not this test's case.
-            // `nodes == 0` is the declined pool and is very much the case.
-            eprintln!("budget 1: skipped, {}-node split layout", lane.nodes);
-            return;
-        }
+        // Asserted rather than skipped: `split_workers` needs two *populated*
+        // nodes, and one worker populates one, so a budget of 1 can only produce
+        // the declined pool (`nodes == 0`) or a single group. A split here would
+        // mean the shard planner handed out more groups than workers.
+        assert!(
+            lane.nodes <= 1,
+            "a budget of 1 cannot produce a {}-node split; one worker populates \
+             one node ({} allowed CPUs, path {})",
+            lane.nodes,
+            lane.allowed,
+            lane.path
+        );
         assert_eq!(
             (lane.requested, lane.realized),
             (Some(1), Some(1)),
