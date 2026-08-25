@@ -1926,7 +1926,9 @@ item executed alone through the same package; per-row equality against solo is
 the correctness definition for every batching row. Rows 1–9 are modality-neutral
 and are run against both an image encoder and a video encoder; rows 10–15 pin the
 modality-specific geometry that motivated the design; rows 16–27 cover the
-structural bounds, the memory path, compatibility, and backend readiness. Every
+structural bounds, the memory path, compatibility, and backend readiness; row 28
+is the performance comparison against sequential direct execution, which is the
+only reason to group at all. Every
 row runs on checked-in fixtures — the synthetic ones from P3c for grouping
 behavior, plus the retained real-CNN guard for row 21's operator classes — with
 no downloaded weights, no sample media, and no network in the test path.
