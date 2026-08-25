@@ -252,8 +252,71 @@ impl PlanarMoeDims {
     }
 }
 
+/// Element counts for every non-weight buffer used by one planar routed-MoE
+/// launch. Optional buffers use `None` when their matching pointer is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanarMoeBufferLengths {
+    pub input_elems: usize,
+    pub router_logits_elems: usize,
+    pub router_weights_elems: Option<usize>,
+    pub route_indices_elems: usize,
+    pub route_weights_elems: usize,
+    pub fc1_output_elems: usize,
+    pub fc3_output_elems: Option<usize>,
+    pub activated_elems: usize,
+    pub route_output_elems: usize,
+    pub output_elems: usize,
+}
+
+impl PlanarMoeBufferLengths {
+    /// Compute the exact buffer extents for `dims`, rejecting any multiplication
+    /// overflow before allocation or launch.
+    pub fn for_dims(dims: &PlanarMoeDims, has_router_weights: bool) -> Result<Self> {
+        let routes = dims
+            .rows
+            .checked_mul(dims.top_k)
+            .ok_or_else(|| kernel_err("route count overflow"))?;
+        let input_elems = dims
+            .rows
+            .checked_mul(dims.hidden)
+            .ok_or_else(|| kernel_err("input element count overflow"))?;
+        let router_elems = dims
+            .rows
+            .checked_mul(dims.experts)
+            .ok_or_else(|| kernel_err("router element count overflow"))?;
+        let fc1_out = if dims.swiglu_fusion == 0 {
+            dims.inter
+        } else {
+            dims.inter
+                .checked_mul(2)
+                .ok_or_else(|| kernel_err("fused fc1 width overflow"))?
+        };
+        let fc1_output_elems = routes
+            .checked_mul(fc1_out)
+            .ok_or_else(|| kernel_err("fc1 output element count overflow"))?;
+        let inter_elems = routes
+            .checked_mul(dims.inter)
+            .ok_or_else(|| kernel_err("activated element count overflow"))?;
+        let route_output_elems = routes
+            .checked_mul(dims.hidden)
+            .ok_or_else(|| kernel_err("route output element count overflow"))?;
+        Ok(Self {
+            input_elems,
+            router_logits_elems: router_elems,
+            router_weights_elems: has_router_weights.then_some(router_elems),
+            route_indices_elems: routes,
+            route_weights_elems: routes,
+            fc1_output_elems,
+            fc3_output_elems: dims.fc3.is_some().then_some(inter_elems),
+            activated_elems: inter_elems,
+            route_output_elems,
+            output_elems: input_elems,
+        })
+    }
+}
+
 /// Validate a planar routed MoE's geometry and every supplied bank/workspace
-/// byte length against the exact extents the kernels require. This is the
+/// byte/element length against the exact extents the kernels require. This is the
 /// host-side aux/OOB guard (ragged expert banks, wrong projection widths,
 /// truncated scales, mis-sized workspace, missing gate) that must pass before
 /// any launch. Any mismatch is a typed rejection — never a dense-expert
@@ -268,6 +331,7 @@ pub fn validate_planar_moe(
     fc2_scale_bytes: usize,
     fc2_bias_elems: Option<usize>,
     fc3_banks: Option<(usize, usize, Option<usize>)>,
+    buffers: &PlanarMoeBufferLengths,
 ) -> Result<()> {
     if dims.rows == 0 || dims.hidden == 0 || dims.inter == 0 || dims.experts == 0 {
         return Err(kernel_err(format!(
@@ -287,7 +351,7 @@ pub fn validate_planar_moe(
             dims.activation
         )));
     }
-    if dims.swiglu_fusion > 2 {
+    if !(0..=2).contains(&dims.swiglu_fusion) {
         return Err(kernel_err(format!(
             "swiglu_fusion must be 0, 1, or 2, got {}",
             dims.swiglu_fusion
@@ -397,6 +461,66 @@ pub fn validate_planar_moe(
         }
         (None, Some(_)) => {
             return Err(kernel_err("fc3 banks present but fc3 projection missing"));
+        }
+    }
+
+    let expected = PlanarMoeBufferLengths::for_dims(dims, buffers.router_weights_elems.is_some())?;
+    for (label, supplied, required) in [
+        ("input", buffers.input_elems, expected.input_elems),
+        (
+            "router_logits",
+            buffers.router_logits_elems,
+            expected.router_logits_elems,
+        ),
+        (
+            "route_indices",
+            buffers.route_indices_elems,
+            expected.route_indices_elems,
+        ),
+        (
+            "route_weights",
+            buffers.route_weights_elems,
+            expected.route_weights_elems,
+        ),
+        (
+            "fc1_output",
+            buffers.fc1_output_elems,
+            expected.fc1_output_elems,
+        ),
+        (
+            "activated",
+            buffers.activated_elems,
+            expected.activated_elems,
+        ),
+        (
+            "route_output",
+            buffers.route_output_elems,
+            expected.route_output_elems,
+        ),
+        ("output", buffers.output_elems, expected.output_elems),
+    ] {
+        if supplied != required {
+            return Err(kernel_err(format!(
+                "{label} has {supplied} elements, expected {required}"
+            )));
+        }
+    }
+    for (label, supplied, required) in [
+        (
+            "router_weights",
+            buffers.router_weights_elems,
+            expected.router_weights_elems,
+        ),
+        (
+            "fc3_output",
+            buffers.fc3_output_elems,
+            expected.fc3_output_elems,
+        ),
+    ] {
+        if supplied != required {
+            return Err(kernel_err(format!(
+                "{label} has {supplied:?} elements, expected {required:?}"
+            )));
         }
     }
     Ok(())
@@ -854,6 +978,31 @@ mod tests {
         (p * dims.experts, s * dims.experts)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn validate_planar_moe(
+        dims: &PlanarMoeDims,
+        fc1_packed_bytes: usize,
+        fc1_scale_bytes: usize,
+        fc1_bias_elems: Option<usize>,
+        fc2_packed_bytes: usize,
+        fc2_scale_bytes: usize,
+        fc2_bias_elems: Option<usize>,
+        fc3_banks: Option<(usize, usize, Option<usize>)>,
+    ) -> Result<()> {
+        let buffers = PlanarMoeBufferLengths::for_dims(dims, false)?;
+        super::validate_planar_moe(
+            dims,
+            fc1_packed_bytes,
+            fc1_scale_bytes,
+            fc1_bias_elems,
+            fc2_packed_bytes,
+            fc2_scale_bytes,
+            fc2_bias_elems,
+            fc3_banks,
+            &buffers,
+        )
+    }
+
     #[test]
     fn block_fp8_per_expert_bytes_match_layout() {
         // block_fp8: 1 byte/elem packed, ceil(out/bs0)*ceil(in/bs1) scale bytes.
@@ -909,6 +1058,19 @@ mod tests {
         let err = validate_planar_moe(&dims, fc1p + 1, fc1s, None, fc2p, fc2s, None, None)
             .expect_err("a ragged fc1 packed bank must be rejected");
         assert!(format!("{err:?}").contains("fc1 packed bank"));
+    }
+
+    #[test]
+    fn undersized_workspace_is_typed_rejected() {
+        let dims = base_dims();
+        let (fc1p, fc1s) = banks(&dims, &dims.fc1);
+        let (fc2p, fc2s) = banks(&dims, &dims.fc2);
+        let mut buffers = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
+        buffers.fc1_output_elems -= 1;
+        let err =
+            super::validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None, &buffers)
+                .expect_err("undersized fc1 workspace must be rejected");
+        assert!(format!("{err:?}").contains("fc1_output"));
     }
 
     #[test]
@@ -987,6 +1149,18 @@ mod tests {
         let err = validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None)
             .expect_err("swiglu_fusion with a non-SwiGLU activation must be rejected");
         assert!(format!("{err:?}").contains("only valid with the SwiGLU activation"));
+    }
+
+    #[test]
+    fn negative_swiglu_fusion_is_typed_rejected() {
+        let mut dims = base_dims();
+        dims.activation = 3;
+        dims.swiglu_fusion = -1;
+        let (fc1p, fc1s) = banks(&dims, &dims.fc1);
+        let (fc2p, fc2s) = banks(&dims, &dims.fc2);
+        let err = validate_planar_moe(&dims, fc1p, fc1s, None, fc2p, fc2s, None, None)
+            .expect_err("negative swiglu_fusion must be rejected");
+        assert!(format!("{err:?}").contains("must be 0, 1, or 2"));
     }
 
     #[test]

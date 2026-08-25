@@ -116,7 +116,7 @@ __device__ __forceinline__ float planar_bf8_element(
     const unsigned char* packed, const unsigned char* scale,
     int out_features, int in_features, int bs0, int bs1,
     int out_row, int in_col) {
-    const int scale_cols = (in_features + bs1 - 1) / bs1;
+    const int scale_cols = 1 + (in_features - 1) / bs1;
     const unsigned char se = scale[(long long)(out_row / bs0) * scale_cols + (in_col / bs1)];
     const unsigned char code = packed[(long long)out_row * in_features + in_col];
     return planar_e4m3(code) * planar_e8m0_scale(se);
@@ -283,6 +283,13 @@ impl PlanarLinearDims {
                         self.bs0, self.bs1
                     )));
                 }
+                for (label, value) in [("bs0", self.bs0), ("bs1", self.bs1)] {
+                    if i32::try_from(value).is_err() {
+                        return Err(kernel_err(format!(
+                            "{label}={value} exceeds the i32 kernel ABI"
+                        )));
+                    }
+                }
                 let scale_rows = self.out_features.div_ceil(self.bs0);
                 let scale_cols = self.in_features.div_ceil(self.bs1);
                 Ok(PlanarTensorLengths {
@@ -416,8 +423,16 @@ pub fn launch_planar_linear(
     let in_features = dims.in_features as i32;
     let out_features = dims.out_features as i32;
     let format = dims.format;
-    let bs0 = dims.bs0 as i32;
-    let bs1 = dims.bs1 as i32;
+    let (bs0, bs1) = if format == PLANAR_FORMAT_BLOCK_FP8 {
+        (
+            i32::try_from(dims.bs0)
+                .map_err(|_| kernel_err(format!("bs0={} exceeds the i32 kernel ABI", dims.bs0)))?,
+            i32::try_from(dims.bs1)
+                .map_err(|_| kernel_err(format!("bs1={} exceeds the i32 kernel ABI", dims.bs1)))?,
+        )
+    } else {
+        (0, 0)
+    };
 
     let stream = runtime.stream();
     let mut builder = stream.launch_builder(&function);

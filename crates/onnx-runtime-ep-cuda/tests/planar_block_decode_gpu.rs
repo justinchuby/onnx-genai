@@ -48,7 +48,7 @@ use onnx_runtime_ep_cuda::{
 // ---------------------------------------------------------------------------
 
 fn require_cuda() -> CudaExecutionProvider {
-    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+    match std::panic::catch_unwind(|| CudaExecutionProvider::new(selected_cuda_ordinal())) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => panic!(
             "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
@@ -494,6 +494,53 @@ fn exhaustive_small_codepoints() {
     }
 }
 
+#[test]
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+fn block_fp8_large_block_size_uses_overflow_free_scale_grid() {
+    let ep = require_cuda();
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 32,
+        out_features: 2,
+        bs0: 1,
+        bs1: i32::MAX as usize,
+    };
+    let activation = vec![1.0f32; dims.in_features];
+    let (a_bytes, a_deq) = quantize_activation(&activation, PlanarActivationDtype::F32);
+    let packed = vec![0x38u8; dims.out_features * dims.in_features];
+    let scale = vec![127u8, 128u8];
+
+    let got = run_planar_gpu(
+        &ep,
+        PlanarActivationDtype::F32,
+        &dims,
+        &a_bytes,
+        &packed,
+        &scale,
+    );
+    let want = cpu_oracle(
+        PlanarBlockFormat::BlockFp8,
+        dims.m_rows,
+        dims.out_features,
+        dims.in_features,
+        dims.bs0,
+        dims.bs1,
+        &a_deq,
+        &packed,
+        &scale,
+    );
+    assert_parity(
+        "block_fp8 overflow-free scale grid",
+        PlanarActivationDtype::F32,
+        &got,
+        &want,
+    );
+}
+
 /// Repeated launches with changing shapes on one device: the NVRTC cache is
 /// warmed once, every shape still lands exact, and buffers are cleanly recycled.
 #[test]
@@ -648,14 +695,47 @@ fn capability_strings_are_advertised_on_device() {
 // Measurement probe (ignored by default; run with --ignored on an idle A100)
 // ---------------------------------------------------------------------------
 
+/// Resolve the `nvidia-smi -i <target>` argument for the CUDA device this
+/// process actually pinned.
+fn resolve_smi_device(visible: Option<&str>, ordinal: usize) -> Option<String> {
+    match visible {
+        Some(list) if !list.trim().is_empty() => {
+            let mut entries = Vec::new();
+            for raw in list.split(',') {
+                let entry = raw.trim();
+                if entry.is_empty() {
+                    break;
+                }
+                entries.push(entry.to_string());
+            }
+            entries.into_iter().nth(ordinal)
+        }
+        _ => Some(ordinal.to_string()),
+    }
+}
+
+fn pinned_smi_target() -> Option<String> {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    resolve_smi_device(visible.as_deref(), selected_cuda_ordinal() as usize)
+}
+
+fn selected_cuda_ordinal() -> u32 {
+    std::env::var("ONNX_GENAI_CUDA_DEVICE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 fn gpu_is_idle() -> bool {
-    // Best-effort idle check via nvidia-smi utilization on the pinned device.
+    let Some(target) = pinned_smi_target() else {
+        return false;
+    };
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=utilization.gpu",
             "--format=csv,noheader,nounits",
             "-i",
-            "0",
+            &target,
         ])
         .output();
     match output {
@@ -666,6 +746,46 @@ fn gpu_is_idle() -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// True if another compute process is resident on the pinned device.
+fn foreign_compute_present() -> bool {
+    let mine = std::process::id();
+    let Some(target) = pinned_smi_target() else {
+        return true;
+    };
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &target,
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .any(|pid| pid != mine),
+        _ => true,
+    }
+}
+
+#[test]
+fn resolve_smi_device_maps_visible_ordinal_to_physical_target() {
+    assert_eq!(resolve_smi_device(None, 0).as_deref(), Some("0"));
+    assert_eq!(resolve_smi_device(None, 3).as_deref(), Some("3"));
+    assert_eq!(resolve_smi_device(Some(""), 2).as_deref(), Some("2"));
+    assert_eq!(resolve_smi_device(Some("2,5"), 0).as_deref(), Some("2"));
+    assert_eq!(resolve_smi_device(Some("2,5"), 1).as_deref(), Some("5"));
+    assert_eq!(resolve_smi_device(Some(" 7 , 1 "), 0).as_deref(), Some("7"));
+    assert_eq!(
+        resolve_smi_device(Some("GPU-abc123,GPU-def456"), 1).as_deref(),
+        Some("GPU-def456")
+    );
+    assert_eq!(resolve_smi_device(Some("2,5"), 2), None);
+    assert_eq!(resolve_smi_device(Some("2,,5"), 1), None);
+    assert_eq!(resolve_smi_device(Some("2,,5"), 0).as_deref(), Some("2"));
 }
 
 /// Warm-then-batch timing on the pinned device. Reports median + range of a
@@ -730,27 +850,47 @@ fn planar_matmul_measurement() {
 
     // Batched kernel window: median of n≥3 batches of `batch` launches each.
     let batch = 64usize;
-    let mut samples = Vec::new();
-    for _ in 0..5 {
-        assert!(gpu_is_idle(), "GPU became busy mid-measurement");
-        let t = Instant::now();
-        for _ in 0..batch {
-            launch_planar_linear(runtime, PlanarActivationDtype::F16, &dims, &ptrs).unwrap();
+    let sample_shape = |samples: &mut Vec<f64>| {
+        for _ in 0..5 {
+            assert!(
+                !foreign_compute_present(),
+                "a foreign compute process appeared on the pinned GPU mid-measurement"
+            );
+            let t = Instant::now();
+            for _ in 0..batch {
+                launch_planar_linear(runtime, PlanarActivationDtype::F16, &dims, &ptrs).unwrap();
+            }
+            runtime.synchronize().unwrap();
+            samples.push(t.elapsed().as_secs_f64() / batch as f64);
         }
-        runtime.synchronize().unwrap();
-        samples.push(t.elapsed().as_secs_f64() / batch as f64);
-    }
+    };
+
+    let mut samples = Vec::new();
+    sample_shape(&mut samples);
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
     let min = samples[0];
     let max = *samples.last().unwrap();
 
+    let mut recheck = Vec::new();
+    sample_shape(&mut recheck);
+    recheck.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let recheck_median = recheck[recheck.len() / 2];
+    let drift = (recheck_median - median).abs() / median;
+
     eprintln!(
-        "planar block_fp8 f16 [{m}x{in_features}->{out}] batched kernel/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}",
+        "planar block_fp8 f16 [{m}x{in_features}->{out}] batched kernel/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}; first-shape recheck median {:.1} us (drift {:.1}%)",
         median * 1e6,
         min * 1e6,
         max * 1e6,
         host_enqueue.as_secs_f64() / enqueue_n as f64 * 1e6,
+        recheck_median * 1e6,
+        drift * 100.0,
+    );
+    assert!(
+        drift < 0.05,
+        "first-shape drift {:.1}% exceeds 5%: device not in steady state, measurement is unreliable",
+        drift * 100.0
     );
 
     ep.deallocate(a_buf).unwrap();

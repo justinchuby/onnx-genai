@@ -139,7 +139,7 @@ pub use kernels::planar_block_decode::{
     validate_planar_linear, warm_planar_linear,
 };
 pub use kernels::planar_block_moe::{
-    PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe,
+    PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe,
     planar_moe_capable_formats, validate_planar_moe, warm_planar_moe,
 };
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;

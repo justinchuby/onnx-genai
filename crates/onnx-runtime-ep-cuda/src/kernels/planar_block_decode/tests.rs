@@ -364,6 +364,10 @@ fn device_source_declares_required_symbols() {
             dtype.entry()
         );
     }
+    assert!(
+        PLANAR_BLOCK_DECODE_CUH.contains("1 + (in_features - 1) / bs1"),
+        "block_fp8 scale-grid ceil division must not overflow i32"
+    );
 }
 
 /// The three precision entry points must be distinct and stable.
@@ -477,6 +481,21 @@ fn block_fp8_length_validation() {
     // Zero block size is rejected.
     let bad = PlanarLinearDims { bs1: 0, ..dims };
     assert!(bad.expected_lengths().is_err());
+
+    // Block sizes are scalar i32 kernel arguments; oversized values must be
+    // rejected instead of truncating to zero or a negative divisor.
+    for bad in [
+        PlanarLinearDims {
+            bs0: i32::MAX as usize + 1,
+            ..dims
+        },
+        PlanarLinearDims {
+            bs1: i32::MAX as usize + 1,
+            ..dims
+        },
+    ] {
+        assert!(bad.expected_lengths().is_err());
+    }
 }
 
 /// A non-128-aligned `block_fp8` scale grid is still exact via ceil-division.

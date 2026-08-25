@@ -38,9 +38,9 @@ use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
 };
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ep_cuda::{
-    CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarMoeDims,
-    PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe, planar_moe_capable_formats,
-    validate_planar_moe, warm_planar_moe,
+    CudaExecutionProvider, PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR,
+    PlanarMoeBufferLengths, PlanarMoeDims, PlanarMoeProjection, PlanarMoePtrs, launch_planar_moe,
+    planar_moe_capable_formats, validate_planar_moe, warm_planar_moe,
 };
 
 // ---------------------------------------------------------------------------
@@ -48,7 +48,7 @@ use onnx_runtime_ep_cuda::{
 // ---------------------------------------------------------------------------
 
 fn require_cuda() -> CudaExecutionProvider {
-    match std::panic::catch_unwind(CudaExecutionProvider::new_default) {
+    match std::panic::catch_unwind(|| CudaExecutionProvider::new(selected_cuda_ordinal())) {
         Ok(Ok(ep)) => ep,
         Ok(Err(error)) => panic!(
             "CUDA test requires CUDA device/runtime; CPU-only runs must leave this test ignored: {error}"
@@ -520,7 +520,13 @@ fn free_moe(ep: &CudaExecutionProvider, buffers: MoeDeviceBuffers) {
     ep.deallocate(output).unwrap();
 }
 
-fn validate(dims: &PlanarMoeDims, fc1: &Projection, fc2: &Projection, fc3: Option<&Projection>) {
+fn validate(
+    dims: &PlanarMoeDims,
+    fc1: &Projection,
+    fc2: &Projection,
+    fc3: Option<&Projection>,
+    has_router_weights: bool,
+) {
     let fc3_banks = fc3.map(|fc3| {
         (
             fc3.packed_bank.len(),
@@ -528,6 +534,7 @@ fn validate(dims: &PlanarMoeDims, fc1: &Projection, fc2: &Projection, fc3: Optio
             fc3.bias.as_ref().map(|b| b.len()),
         )
     });
+    let buffer_lengths = PlanarMoeBufferLengths::for_dims(dims, has_router_weights).unwrap();
     validate_planar_moe(
         dims,
         fc1.packed_bank.len(),
@@ -537,6 +544,7 @@ fn validate(dims: &PlanarMoeDims, fc1: &Projection, fc2: &Projection, fc3: Optio
         fc2.scale_bank.len(),
         fc2.bias.as_ref().map(|b| b.len()),
         fc3_banks,
+        &buffer_lengths,
     )
     .expect("planar MoE geometry/banks must validate");
 }
@@ -587,7 +595,7 @@ fn run_moe_case(
         fc3,
     });
 
-    validate(dims, fc1, fc2, fc3);
+    validate(dims, fc1, fc2, fc3, use_router_weights);
     let buffers = stage_moe(
         ep,
         dims,
@@ -869,6 +877,7 @@ fn invalid_geometry_is_typed_rejected() {
     let dims = dims_relu(2, hidden, inter, experts, top_k, &fc1, &fc2);
 
     // Ragged packed bank (one byte too many) → validate rejects.
+    let buffer_lengths = PlanarMoeBufferLengths::for_dims(&dims, false).unwrap();
     assert!(
         validate_planar_moe(
             &dims,
@@ -879,6 +888,7 @@ fn invalid_geometry_is_typed_rejected() {
             fc2.scale_bank.len(),
             None,
             None,
+            &buffer_lengths,
         )
         .is_err()
     );
@@ -886,6 +896,7 @@ fn invalid_geometry_is_typed_rejected() {
     // top_k > experts → validate rejects.
     let mut bad_topk = dims;
     bad_topk.top_k = experts + 1;
+    let bad_buffer_lengths = PlanarMoeBufferLengths::for_dims(&bad_topk, false).unwrap();
     assert!(
         validate_planar_moe(
             &bad_topk,
@@ -896,6 +907,25 @@ fn invalid_geometry_is_typed_rejected() {
             fc2.scale_bank.len(),
             None,
             None,
+            &bad_buffer_lengths,
+        )
+        .is_err()
+    );
+
+    // Undersized workspace → validate rejects before launch.
+    let mut short_buffers = buffer_lengths;
+    short_buffers.route_output_elems -= 1;
+    assert!(
+        validate_planar_moe(
+            &dims,
+            fc1.packed_bank.len(),
+            fc1.scale_bank.len(),
+            None,
+            fc2.packed_bank.len(),
+            fc2.scale_bank.len(),
+            None,
+            None,
+            &short_buffers,
         )
         .is_err()
     );
@@ -954,7 +984,7 @@ fn capture_replay_parity() {
         .map(|_| rng.next_f32() * 3.0)
         .collect();
 
-    validate(&dims, &fc1, &fc2, None);
+    validate(&dims, &fc1, &fc2, None, false);
     let buffers = stage_moe(&ep, &dims, &input, &logits, None, &fc1, &fc2, None);
 
     warm_planar_moe(runtime).unwrap();
@@ -1007,13 +1037,47 @@ fn capability_strings_are_advertised_on_device() {
 // Measurement probe (ignored by default; run with --ignored on an idle A100)
 // ---------------------------------------------------------------------------
 
+/// Resolve the `nvidia-smi -i <target>` argument for the CUDA device this
+/// process actually pinned.
+fn resolve_smi_device(visible: Option<&str>, ordinal: usize) -> Option<String> {
+    match visible {
+        Some(list) if !list.trim().is_empty() => {
+            let mut entries = Vec::new();
+            for raw in list.split(',') {
+                let entry = raw.trim();
+                if entry.is_empty() {
+                    break;
+                }
+                entries.push(entry.to_string());
+            }
+            entries.into_iter().nth(ordinal)
+        }
+        _ => Some(ordinal.to_string()),
+    }
+}
+
+fn pinned_smi_target() -> Option<String> {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    resolve_smi_device(visible.as_deref(), selected_cuda_ordinal() as usize)
+}
+
+fn selected_cuda_ordinal() -> u32 {
+    std::env::var("ONNX_GENAI_CUDA_DEVICE")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 fn gpu_is_idle() -> bool {
+    let Some(target) = pinned_smi_target() else {
+        return false;
+    };
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=utilization.gpu",
             "--format=csv,noheader,nounits",
             "-i",
-            "0",
+            &target,
         ])
         .output();
     match output {
@@ -1033,12 +1097,15 @@ fn gpu_is_idle() -> bool {
 /// as "busy" and trip a false positive. Foreign PIDs are the honest signal.
 fn foreign_compute_present() -> bool {
     let mine = std::process::id();
+    let Some(target) = pinned_smi_target() else {
+        return true;
+    };
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-compute-apps=pid",
             "--format=csv,noheader,nounits",
             "-i",
-            "0",
+            &target,
         ])
         .output();
     match output {
@@ -1049,6 +1116,23 @@ fn foreign_compute_present() -> bool {
         // If the query fails we cannot prove exclusivity; treat as foreign.
         _ => true,
     }
+}
+
+#[test]
+fn resolve_smi_device_maps_visible_ordinal_to_physical_target() {
+    assert_eq!(resolve_smi_device(None, 0).as_deref(), Some("0"));
+    assert_eq!(resolve_smi_device(None, 3).as_deref(), Some("3"));
+    assert_eq!(resolve_smi_device(Some(""), 2).as_deref(), Some("2"));
+    assert_eq!(resolve_smi_device(Some("2,5"), 0).as_deref(), Some("2"));
+    assert_eq!(resolve_smi_device(Some("2,5"), 1).as_deref(), Some("5"));
+    assert_eq!(resolve_smi_device(Some(" 7 , 1 "), 0).as_deref(), Some("7"));
+    assert_eq!(
+        resolve_smi_device(Some("GPU-abc123,GPU-def456"), 1).as_deref(),
+        Some("GPU-def456")
+    );
+    assert_eq!(resolve_smi_device(Some("2,5"), 2), None);
+    assert_eq!(resolve_smi_device(Some("2,,5"), 1), None);
+    assert_eq!(resolve_smi_device(Some("2,,5"), 0).as_deref(), Some("2"));
 }
 
 /// Warm-then-batch timing of the routed MoE pipeline on the pinned device.
@@ -1109,29 +1193,47 @@ fn planar_moe_measurement() {
     runtime.synchronize().unwrap();
 
     let batch = 32usize;
-    let mut samples = Vec::new();
-    for _ in 0..5 {
-        assert!(
-            !foreign_compute_present(),
-            "a foreign compute process appeared mid-measurement"
-        );
-        let t = Instant::now();
-        for _ in 0..batch {
-            launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+    let sample_shape = |samples: &mut Vec<f64>| {
+        for _ in 0..5 {
+            assert!(
+                !foreign_compute_present(),
+                "a foreign compute process appeared on the pinned GPU mid-measurement"
+            );
+            let t = Instant::now();
+            for _ in 0..batch {
+                launch_planar_moe(runtime, &dims, &buffers.ptrs).unwrap();
+            }
+            runtime.synchronize().unwrap();
+            samples.push(t.elapsed().as_secs_f64() / batch as f64);
         }
-        runtime.synchronize().unwrap();
-        samples.push(t.elapsed().as_secs_f64() / batch as f64);
-    }
+    };
+
+    let mut samples = Vec::new();
+    sample_shape(&mut samples);
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
     let min = samples[0];
     let max = *samples.last().unwrap();
+
+    let mut recheck = Vec::new();
+    sample_shape(&mut recheck);
+    recheck.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let recheck_median = recheck[recheck.len() / 2];
+    let drift = (recheck_median - median).abs() / median;
+
     eprintln!(
-        "planar routed MoE [rows={rows} hidden={hidden} inter={inter} E={experts} k={top_k}] batched pipeline/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}",
+        "planar routed MoE [rows={rows} hidden={hidden} inter={inter} E={experts} k={top_k}] batched pipeline/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}; first-shape recheck median {:.1} us (drift {:.1}%)",
         median * 1e6,
         min * 1e6,
         max * 1e6,
         host_enqueue.as_secs_f64() / enqueue_n as f64 * 1e6,
+        recheck_median * 1e6,
+        drift * 100.0,
+    );
+    assert!(
+        drift < 0.05,
+        "first-shape drift {:.1}% exceeds 5%: device not in steady state, measurement is unreliable",
+        drift * 100.0
     );
 
     free_moe(&ep, buffers);
