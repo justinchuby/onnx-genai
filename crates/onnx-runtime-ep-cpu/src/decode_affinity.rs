@@ -534,6 +534,18 @@ pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), St
     Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
 }
 
+/// Whether this target implements the process-wide affinity mask above.
+///
+/// Compile-time, and for [`core_topology::DETECTION_SUPPORTED`]'s reason: a
+/// caller that needs the mask has to be able to tell "this platform never had
+/// it" from "the call failed here", and the first answer must not depend on
+/// making the call. Only the `cfg(target_os = "linux")` implementation does
+/// anything; the other returns `Err` unconditionally, so a test whose premise
+/// is a narrowed process cpuset cannot be built anywhere else.
+///
+/// [`core_topology::DETECTION_SUPPORTED`]: crate::core_topology
+pub const PROCESS_AFFINITY_MASKING_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Whether the user explicitly requested a decode affinity via
 /// [`DECODE_AFFINITY_ENV`] (a non-empty value). When set, the automatic
 /// good-citizen process mask stands down so the user's affinity choice wins.
@@ -1321,6 +1333,38 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capability constant has to agree with the implementation that
+    /// actually compiled, or it is worse than nothing: a caller that skips on
+    /// `false` would skip on a platform that works, and one that fails closed
+    /// on `true` would fail on a platform that cannot.
+    ///
+    /// Asserted against the real call, on a spawned thread and against the mask
+    /// the process already has, so it is a no-op semantically -- setting the
+    /// current thread's mask from a test would leak into whatever test the
+    /// runner schedules on that thread next.
+    #[test]
+    fn the_masking_capability_constant_agrees_with_what_this_platform_does() {
+        let Some(allowed) = allowed_cpus() else {
+            // No readable allowed set: the call below has no valid argument to
+            // make, so the question is unanswerable rather than answered.
+            eprintln!(
+                "skipping the masking-capability check: this target cannot report its allowed \
+                 CPU set, so there is no mask to re-apply"
+            );
+            return;
+        };
+        let observed = std::thread::spawn(move || set_current_thread_affinity(&allowed).is_ok())
+            .join()
+            .expect("the masking probe thread must not panic");
+        assert_eq!(
+            observed, PROCESS_AFFINITY_MASKING_SUPPORTED,
+            "PROCESS_AFFINITY_MASKING_SUPPORTED says {PROCESS_AFFINITY_MASKING_SUPPORTED} but \
+             re-applying this process's own mask returned ok={observed}. The constant and the \
+             `cfg`-selected implementation have diverged, and every caller that branches on the \
+             constant is now deciding on a platform fact that is not true here."
+        );
+    }
 
     /// Build one `RelationNumaNode` record exactly as the OS lays it out: an
     /// 8-byte header, then `NUMA_NODE_RELATIONSHIP`, then the node's

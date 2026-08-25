@@ -20042,6 +20042,20 @@ mod tests {
         /// pinned pool and so cannot say whether the cross-check is even
         /// answerable.
         fully_pinned: bool,
+        /// Whether the child actually narrowed itself to a leader-only cpuset.
+        ///
+        /// The default-width arm's whole premise is that cpuset, and until this
+        /// field existed the parent inferred it from `allowed == cores`. That
+        /// inference is satisfied by the failure it was meant to catch: when
+        /// the topology is unreadable the child reports `cores = allowed`, so
+        /// the check passes on an *unrestricted* process and the width
+        /// assertion below it measures the full machine while claiming to
+        /// measure a reserved one. Reported by the process that did or did not
+        /// perform the narrowing instead.
+        ///
+        /// Always `false` for an explicit width: that arm never asks for the
+        /// restriction, so only the default arm may require this.
+        restricted: bool,
         /// Whether every worker could read the affinity actually in force for
         /// it.
         ///
@@ -20312,11 +20326,13 @@ mod tests {
         // `requested=0` marks the default-resolver arm in the report line: the
         // parent did not ask for a width, so there is no requested value to
         // echo and the only honest thing to print is "none".
-        let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
-            restrict_self_to_leader_cpus();
-            0
+        let (requested, restricted): (usize, bool) = if raw == SPMD_WIDTH_CHILD_DEFAULT {
+            (0, restrict_self_to_leader_cpus())
         } else {
-            raw.parse().expect("the parent passes a decimal width")
+            (
+                raw.parse().expect("the parent passes a decimal width"),
+                false,
+            )
         };
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
         // Fails closed on a supported target: silently substituting the logical
@@ -20360,13 +20376,14 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized}",
+             pinned={} proc={} restricted={} realized={realized}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
             u8::from(fully_pinned),
-            u8::from(observed_ok)
+            u8::from(observed_ok),
+            u8::from(restricted)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
@@ -20379,22 +20396,33 @@ mod tests {
     /// silently halves the pool. Doing it from inside the child keeps the test
     /// free of a `taskset` dependency and makes the mask an observable the
     /// child reports (`allowed`/`cores`) rather than an assumption.
-    fn restrict_self_to_leader_cpus() {
+    ///
+    /// Returns whether the restriction is even attemptable here.
+    /// `set_current_thread_affinity` is implemented on Linux only and returns
+    /// `Err` everywhere else *by construction*, so `expect`ing it off Linux
+    /// turned this child into an unconditional failure on both Windows lanes.
+    /// The platform fact is reported to the caller instead; the failure on a
+    /// platform that does implement it stays fatal.
+    fn restrict_self_to_leader_cpus() -> bool {
+        if !crate::decode_affinity::PROCESS_AFFINITY_MASKING_SUPPORTED {
+            return false;
+        }
         let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
-            return;
+            return false;
         };
         let Ok(topology) = crate::core_topology::require_host_for_placement() else {
-            return;
+            return false;
         };
         let leaders = topology.leaders_within(&allowed);
         if leaders.is_empty() {
-            return;
+            return false;
         }
         // A failure here is not silently tolerated: it would leave the child on
         // the full cpuset, where `workers == cores` holds for the wrong reason
         // and the assertion would pass without testing anything.
         crate::decode_affinity::set_current_thread_affinity(&leaders)
             .expect("restrict the child to leader CPUs");
+        true
     }
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
@@ -20547,6 +20575,7 @@ mod tests {
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             worker_masks_readable: field("proc") == 1,
+            restricted: field("restricted") == 1,
             attempts: attempts_used,
         };
 
@@ -20714,7 +20743,56 @@ mod tests {
     /// report in what "default" resolved to.
     #[test]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        if !crate::decode_affinity::PROCESS_AFFINITY_MASKING_SUPPORTED {
+            // The premise is a process narrowed to one CPU per physical core,
+            // and the only implementation of that narrowing is Linux's. On
+            // Windows the child stayed on the full cpuset, so `allowed` is the
+            // logical count and the restriction assertion below reported a
+            // defect that is a platform fact -- which is why this test was red
+            // on both Windows lanes from the moment it landed. Requiring it
+            // here could only ever be a false failure, the same exemption
+            // `DETECTION_SUPPORTED` draws for a target with no topology
+            // backend.
+            eprintln!(
+                "skipping the leader-cpuset width check: process-wide affinity masking is \
+                 implemented on Linux only, so a leader-only cpuset cannot be constructed in \
+                 this process"
+            );
+            return;
+        }
+
         let report = realized_default_width_report();
+
+        // The premise, from the process that either established it or did not.
+        // Checked before the escape hatches below, because both of them are
+        // reachable *because* the restriction failed: `restrict_self_to_leader_cpus`
+        // gives up when the topology is unreadable, and the child then reports
+        // `cores = allowed`, which satisfies the distinct-core check on a
+        // completely unrestricted process.
+        //
+        // Required-mode is what decides between "fail" and "skip", exactly as
+        // `require_host_for_placement` does: a host that genuinely cannot read
+        // its topology has an unanswerable question, and a false failure there
+        // gets the test deleted rather than the host fixed. Under
+        // `NXRT_REQUIRE_PLACEMENT_TESTS=1` the capability is promised, so the
+        // same state is a defect.
+        if !report.restricted {
+            assert!(
+                !crate::core_topology::placement_tests_required(),
+                "{}=1 but the child could not narrow itself to a leader-only cpuset \
+                 ({report:?}). The causes are an unreadable allowed set, an unreadable \
+                 topology, or a cpuset containing no leaders -- each contradicts the promise \
+                 that flag makes, and each would leave the width assertions below passing on \
+                 the full machine.",
+                crate::core_topology::REQUIRE_PLACEMENT_ENV
+            );
+            eprintln!(
+                "skipping the leader-cpuset width check: the child could not restrict itself to \
+                 one CPU per physical core ({report:?}), so the reserved-machine premise does \
+                 not hold in this process"
+            );
+            return;
+        }
 
         if !report.pool_built {
             // No persistent pool on this target: there is no placement to
