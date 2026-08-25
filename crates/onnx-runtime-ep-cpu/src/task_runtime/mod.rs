@@ -929,6 +929,10 @@ mod tests {
         );
     }
 
+    // Both readers of this constant are `cfg(target_os = "linux")` (the child
+    // test reads `/proc/self/task`, which only exists there). Left ungated it
+    // is dead code off-Linux, and those lanes build with `-D warnings`.
+    #[cfg(target_os = "linux")]
     const COUNTERS_OBSERVER_CHILD_ENV: &str = "ONNX_GENAI_COUNTERS_OBSERVER_CHILD";
 
     /// Child half of [`observing_the_counters_does_not_build_the_pool`].
