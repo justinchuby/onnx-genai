@@ -76,14 +76,35 @@ fn fp4_fixture(out: usize, in_features: usize, seed: u64) -> (Vec<u8>, Vec<u8>) 
 // Independent references (different derivation than the oracle)
 // ---------------------------------------------------------------------------
 
-/// Row-major `[out, in]`, built block-by-block (independent of the oracle's
-/// per-element loop). Returns the logical matrix, NOT the KN transpose.
+/// Row-major `[out, in]`, built independently of the oracle's per-element loop.
+///
+/// Two independent derivations combine here: the packed E4M3 magnitudes are
+/// decoded by **row-chunk iteration** (`chunks_exact(in)` + `enumerate`, no
+/// explicit `row*in+col` multiply — so a transposition bug in the oracle's flat
+/// index cannot be mirrored), and the UE8M0 scales are applied **block-major**
+/// (independent of the oracle's element-major `scale_index` arithmetic). Returns
+/// the logical matrix, NOT the KN transpose.
 fn reference_logical_block_fp8(layout: &PlanarLayout, packed: &[u8], scale: &[u8]) -> Vec<f32> {
     let (bs0, bs1) = layout.block_shape();
     let out = layout.out_features();
     let in_features = layout.in_features();
     let scale_cols = layout.scale_cols();
+
+    // Pass 1: decode packed magnitudes via row-chunk iteration (no flat-index
+    // multiply), giving a genuinely independent packed-weight indexing.
     let mut logical = vec![0.0f32; out * in_features];
+    for (row, (row_bytes, row_out)) in packed
+        .chunks_exact(in_features)
+        .zip(logical.chunks_exact_mut(in_features))
+        .enumerate()
+    {
+        debug_assert!(row < out);
+        for (dst, &code) in row_out.iter_mut().zip(row_bytes) {
+            *dst = decode_e4m3fn(code);
+        }
+    }
+
+    // Pass 2: apply the UE8M0 block scale, iterating block-major.
     for block_row in 0..layout.scale_rows() {
         for block_col in 0..scale_cols {
             let scale_value = decode_e8m0_scale(scale[block_row * scale_cols + block_col]);
@@ -91,8 +112,7 @@ fn reference_logical_block_fp8(layout: &PlanarLayout, packed: &[u8], scale: &[u8
             let col_start = block_col * bs1;
             for row in row_start..(row_start + bs0).min(out) {
                 for col in col_start..(col_start + bs1).min(in_features) {
-                    logical[row * in_features + col] =
-                        decode_e4m3fn(packed[row * in_features + col]) * scale_value;
+                    logical[row * in_features + col] *= scale_value;
                 }
             }
         }
