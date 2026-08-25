@@ -178,6 +178,10 @@ fn collapse(in_shape: &[usize], perm: &[usize]) -> Collapsed {
 }
 
 impl Kernel for TransposeKernel {
+    fn may_produce_views(&self) -> bool {
+        true
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Transpose", inputs, outputs, 1, 1, 1)?;
         let in_shape = inputs[0].shape.to_vec();

@@ -75,13 +75,81 @@ jobs:
           # Only an explicit, fully-classified all-docs diff flips it to true.
           docs_only=false
 
+          # A file whose bytes are compiled into an artifact is source, whatever
+          # its extension. `include_str!`/`include_bytes!` make a markdown file
+          # part of the build, so a docs-only edit to one can break `cargo test`
+          # while classifying as docs and skipping the very checks that would
+          # catch it (#2077: renaming an HTML comment marker in
+          # docs/genai/INFERENCE_METADATA_DECISIONS.md panics
+          # capability_catalogue.rs, and dropping a table row fails its
+          # assert_eq -- both are pure markdown edits).
+          #
+          # Derived by scanning rather than listed, so it cannot go stale when a
+          # third embed is added (Rule 10). The scan is whole-file, not
+          # line-oriented: rustfmt wraps any call over 100 columns onto its own
+          # line, and the two .md embeds are 87 and 86 columns, so a line-based
+          # `git grep` would stop seeing them after an unrelated reformat and
+          # silently reopen #2077. 15 of the 163 embed sites here are already in
+          # that wrapped form. Only literal-path embeds are visible; a computed
+          # path (concat!/env!) is not, and stays classified as docs.
+          embed_scan_ok=true
+          embed_hits=""
+          # Assignments inside `if` so a non-zero status cannot trip the step's
+          # `-eo pipefail` shell. A dead `changes` job would SKIP fast-linux and
+          # rust-quality, and a skipped required check satisfies the ruleset --
+          # failing here must never be quieter than failing loudly.
+          if ! embed_hits="$(
+            git ls-files -z -- '*.rs' \
+              | xargs -0 --no-run-if-empty perl -0777 -ne '
+                  while (/include_(?:str|bytes)!\s*\(\s*b?r?\#*"([^"]*)"/g) {
+                    print "$ARGV\t$1\n";
+                  }'
+          )"; then
+            embed_scan_ok=false
+          fi
+          embedded=""
+          if [ "$embed_scan_ok" = true ] && [ -n "$embed_hits" ]; then
+            if ! embedded="$(
+              printf '%s\n' "$embed_hits" | while IFS="$(printf '\t')" read -r src target; do
+                [ -z "$src" ] && continue
+                [ -z "$target" ] && continue
+                realpath -m --relative-to="$PWD" "$(dirname "$src")/$target"
+              done | LC_ALL=C sort -u
+            )"; then
+              embed_scan_ok=false
+            fi
+          fi
+
+          # A scan that found nothing and a scan that cannot find anything are
+          # the same two lines of log. If the regex, the pathspec or perl ever
+          # stops matching, `embedded` is empty, is_docs_path never blocks, and
+          # this guard is inert -- reopening #2077 behind a green run. So report
+          # the count, and treat zero as a broken instrument rather than as an
+          # answer: this repo has 149 such targets and cannot legitimately
+          # reach zero while any `include_str!` remains.
+          if [ -n "$embedded" ]; then
+            embedded_count="$(printf '%s\n' "$embedded" | wc -l)"
+          else
+            embedded_count=0
+          fi
+          echo "files embedded into Rust sources: $embedded_count"
+          if [ "$embedded_count" -eq 0 ]; then
+            echo "embed scan resolved no targets; the scan itself is broken"
+            embed_scan_ok=false
+          fi
+
           is_docs_path() {
             case "$1" in
               docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
-                return 0 ;;
+                ;;
               *)
                 return 1 ;;
             esac
+            # Compiled into an artifact => source, not docs.
+            if [ -n "$embedded" ] && printf '%s\n' "$embedded" | grep -qxF -- "$1"; then
+              return 1
+            fi
+            return 0
           }
 
           files=""
@@ -100,7 +168,10 @@ jobs:
               ;;
           esac
 
-          if [ -n "$files" ]; then
+          if [ "$embed_scan_ok" != true ]; then
+            echo "embedded-file scan failed; classifying as code (fail closed)"
+            docs_only=false
+          elif [ -n "$files" ]; then
             docs_only=true
             while IFS= read -r f; do
               [ -z "$f" ] && continue

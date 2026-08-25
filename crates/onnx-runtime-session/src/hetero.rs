@@ -25,19 +25,19 @@
 //! byte-identical to the same graph executed entirely on one reference
 //! provider. [`execute`] realizes the plan by extracting each partition as a
 //! standalone subgraph and running it on its assigned provider through the
-//! existing [`Executor`], staging boundary tensors through host memory
-//! (`docs/execution/HETEROGENEOUS_PLACEMENT.md` §5.2, the correctness-first synchronous
-//! transfer phase). Because every cross-partition value is materialized on the
-//! host between partitions, this is a faithful, if unoptimized, realization of
-//! the transfer edges the planner computes.
+//! existing [`Executor`]. Cross-provider values retain one authoritative
+//! provider-owned allocation and gain governed destination realizations only
+//! for transfer edges in the immutable plan. H2D/D2D copies use
+//! `copy_async` + `wait_fence`; D2H uses the source provider's synchronous
+//! `copy_to_host` directly into a CPU-owned `DeviceBuffer`, never an ad-hoc host
+//! vector.
 //!
 //! ## Deferred scope
 //!
-//! This slice deliberately implements the correctness-first phase only. Value
-//! residency (keeping a tensor on device across partition boundaries),
-//! asynchronous copies/fences, shape-keyed placement (`M=1` decode on CUDA vs
-//! `M>1` prefill on CPU), partition-level CUDA-graph capture, and multi-GPU peer
-//! copies are all left to later phases (see the design doc §5 and §9).
+//! This slice deliberately supports fully-static, tensor-only DAGs only.
+//! Persistent state bindings, control flow, sequences, view-producing kernels,
+//! dynamic shapes, partition-level CUDA-graph capture, and multi-GPU peer
+//! copies fail closed before execution (see the design doc §5 and §9).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -49,13 +49,14 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ir::{
     DataType, Graph, GraphViewCache, ModelFunction, ModelFunctionKey, Node, NodeId, Shape,
-    TensorLayout, ValueId,
+    TensorLayout, ValueId, as_static_shape,
 };
 use onnx_runtime_loader::WeightStore;
+use onnx_runtime_tracer::TraceContext;
 
 use crate::error::{Result, SessionError};
 use crate::executor::Executor;
-use crate::tensor::Tensor;
+use crate::tensor::{DeviceIoBinding, ExternalMemorySpec, Tensor};
 
 /// One provider participating in heterogeneous placement.
 ///
@@ -87,13 +88,19 @@ pub struct Partition {
     pub outputs: Vec<ValueId>,
 }
 
-/// A single cross-device materialization the executor must perform before the
-/// destination partition runs. Deduplicated by `(value, to)`: a value that fans
-/// out to several partitions on the same destination device is one transfer.
+/// A single cross-provider materialization the executor must perform before the
+/// destination partition runs. Deduplicated by `(value, to_ep)`: a value that
+/// fans out to several partitions on the same destination provider is one
+/// transfer. Two providers on the same physical device still require distinct
+/// owned realizations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transfer {
     /// The boundary value being moved.
     pub value: ValueId,
+    /// Provider that owns the authoritative source allocation.
+    pub from_ep: EpId,
+    /// Provider that owns the destination realization.
+    pub to_ep: EpId,
     /// Device the value is currently authoritative on (host for graph
     /// inputs/initializers).
     pub from: DeviceId,
@@ -106,7 +113,7 @@ pub struct Transfer {
 pub struct HeterogeneousPlan {
     /// Partitions in a valid topological execution order.
     pub partitions: Vec<Partition>,
-    /// Minimal, deduplicated cross-device transfers at partition boundaries.
+    /// Minimal, deduplicated cross-provider transfers at partition boundaries.
     pub transfers: Vec<Transfer>,
     /// Per-node provider assignment (stable across runs).
     pub node_placement: HashMap<NodeId, EpId>,
@@ -240,27 +247,42 @@ fn assign_nodes(graph: &Graph, providers: &[ProviderPlacement]) -> Result<HashMa
     for (node_id, node) in graph.nodes.iter() {
         let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
         let (shapes, dtypes, layouts) = node_capability_inputs(graph, node);
-        let chosen = providers.iter().find(|slot| {
-            slot.provider
-                .supports_op(node, opset, &shapes, &dtypes, &layouts)
-                .is_supported()
-        });
+        let matches = providers
+            .iter()
+            .map(|slot| {
+                (
+                    slot,
+                    slot.provider
+                        .supports_op(node, opset, &shapes, &dtypes, &layouts),
+                )
+            })
+            .collect::<Vec<_>>();
+        let chosen = matches
+            .iter()
+            .find(|(_, capability)| capability.is_supported());
         match chosen {
-            Some(slot) => {
+            Some((slot, _)) => {
                 placement.insert(node_id, slot.ep);
             }
             None => {
-                let reason = providers
+                let providers = matches
                     .iter()
-                    .map(|slot| slot.provider.name())
+                    .map(|(slot, _)| slot.provider.name())
                     .collect::<Vec<_>>()
                     .join(", ");
+                let reason = matches
+                    .iter()
+                    .map(|(slot, capability)| {
+                        format!(
+                            "{}: {}",
+                            slot.provider.name(),
+                            capability.reason().unwrap_or("supported")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(SessionError::unsupported_op(
-                    node,
-                    node_id,
-                    opset,
-                    reason,
-                    "no registered provider supports this operator at this opset/shape",
+                    node, node_id, opset, providers, reason,
                 ));
             }
         }
@@ -738,40 +760,102 @@ fn order_partitions(
         .collect())
 }
 
-/// Compute the minimal cross-device transfers at partition boundaries.
+/// Compute the minimal cross-provider transfers at partition boundaries.
 fn plan_transfers(
     partitions: &[Partition],
     value_to_partition: &HashMap<ValueId, usize>,
 ) -> Vec<Transfer> {
-    // Dedup by (value, to-device); a value fanning out to several partitions on
-    // the same device is materialized once.
-    let mut seen: HashSet<(u32, DeviceId)> = HashSet::new();
+    // Dedup by (value, destination EP); a value fanning out to several
+    // partitions on the same provider is materialized once.
+    let mut seen: HashSet<(u32, EpId)> = HashSet::new();
     let mut transfers = Vec::new();
     for part in partitions {
         for &input in &part.inputs {
-            let from = value_to_partition
-                .get(&input)
-                .map(|&i| partitions[i].device)
-                // Graph inputs and initializers originate on the host.
-                .unwrap_or_else(DeviceId::cpu);
+            let Some(&producer_index) = value_to_partition.get(&input) else {
+                // Graph inputs and initializers are staged by the assigned
+                // partition executor; transfer edges represent EP crossings
+                // only.
+                continue;
+            };
+            let producer = &partitions[producer_index];
+            let from = producer.device;
             let to = part.device;
-            if from != to && seen.insert((input.0, to)) {
+            if producer.ep != part.ep && seen.insert((input.0, part.ep)) {
                 transfers.push(Transfer {
                     value: input,
+                    from_ep: producer.ep,
+                    to_ep: part.ep,
                     from,
                     to,
                 });
             }
         }
     }
-    transfers.sort_by_key(|t| {
-        (
-            t.value.0,
-            t.to.device_type.trace_name().into_owned(),
-            t.to.index,
-        )
-    });
+    transfers.sort_by_key(|t| (t.value.0, t.to_ep.0));
     transfers
+}
+
+fn validate_execution_subset(graph: &Graph) -> Result<()> {
+    if !graph.subgraphs.is_empty() {
+        return Err(SessionError::HeterogeneousExecutionUnsupported {
+            placement_summary: format!(
+                "the graph contains {} control-flow subgraph body/bodies; the first execution \
+                 slice supports only tensor-only acyclic graphs without If/Loop/Scan. Keep \
+                 ONNX_GENAI_HETERO unset until child heterogeneous executors are implemented",
+                graph.subgraphs.len()
+            ),
+        });
+    }
+    for (node_id, node) in graph.nodes.iter() {
+        let domain = if node.domain.is_empty() {
+            "ai.onnx"
+        } else {
+            node.domain.as_str()
+        };
+        let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+        if crate::executor::is_control_flow_op(&node.op_type, &node.domain) {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "node {} ({domain}::{}@{opset}) is control flow; the first execution slice \
+                     does not build heterogeneous child executors",
+                    node_id.0, node.op_type
+                ),
+            });
+        }
+        if crate::executor::is_sequence_op(&node.op_type, &node.domain) {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "node {} ({domain}::{}@{opset}) consumes or produces a sequence; the first \
+                     execution slice supports tensor values only",
+                    node_id.0, node.op_type
+                ),
+            });
+        }
+        if onnx_runtime_loader::is_ep_context_op(&node.op_type, &node.domain) {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "node {} ({domain}::{}@{opset}) is a compiled EPContext; the first execution \
+                     slice cannot repartition an already-compiled provider context",
+                    node_id.0, node.op_type
+                ),
+            });
+        }
+    }
+    for (value_id, value) in graph.values.iter() {
+        if as_static_shape(&value.shape).is_none() {
+            return Err(SessionError::HeterogeneousExecutionUnsupported {
+                placement_summary: format!(
+                    "value {} ({}) has symbolic shape {:?}; the first execution slice requires \
+                     fully static tensor shapes so all provider kernels and governed boundary \
+                     allocations are validated before any node executes",
+                    value_id.0,
+                    value.name.as_deref().unwrap_or("<unnamed>"),
+                    value.shape
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Plan a heterogeneous execution of `graph` over `providers` (priority order).
@@ -791,6 +875,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
         false
     };
     let graph = &planned_graph;
+    validate_execution_subset(graph)?;
 
     let cache = GraphViewCache::build(graph)
         .map_err(|e| SessionError::Internal(format!("graph view: {e}")))?;
@@ -837,7 +922,7 @@ pub fn plan(graph: &Graph, providers: &[ProviderPlacement]) -> Result<Heterogene
 /// default session build path (Thread-3 Phase 3).
 #[derive(Debug)]
 pub enum PlacementDecision {
-    /// Every node is claimed by a single provider and no cross-device transfer
+    /// Every node is claimed by a single provider and no cross-provider transfer
     /// is needed: the caller keeps its existing single-EP executor unchanged
     /// (byte-identical fast path). Carries the winning [`EpId`].
     SingleProvider(EpId),
@@ -931,7 +1016,7 @@ pub fn placement_summary(
     };
 
     format!(
-        "{} partition(s) across {} device(s); {ep_counts}; {} cross-device transfer(s); \
+        "{} partition(s) across {} device(s); {ep_counts}; {} cross-provider transfer(s); \
          ops forced onto a fallback provider: {fallback}",
         plan.partitions.len(),
         per_ep.len(),
@@ -1050,12 +1135,503 @@ fn extract_subgraph(parent: &Graph, partition: &Partition) -> SubgraphExtraction
     }
 }
 
-/// Execute `graph` heterogeneously per `plan`, staging boundary tensors through
-/// host memory, and return the graph outputs in declared order.
+struct ResidentValue {
+    dtype: DataType,
+    shape: Vec<usize>,
+    owner: Arc<dyn ExecutionProvider>,
+    buffer: Option<DeviceBuffer>,
+}
+
+impl ResidentValue {
+    fn allocate(
+        _ep: EpId,
+        dtype: DataType,
+        shape: Vec<usize>,
+        owner: Arc<dyn ExecutionProvider>,
+    ) -> Result<Self> {
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |product, &extent| product.checked_mul(extent));
+        let bytes = elements
+            .and_then(|elements| dtype.checked_storage_bytes(elements))
+            .ok_or_else(|| SessionError::ShapeOverflow {
+                value: "heterogeneous boundary value".into(),
+                dims: shape.clone(),
+            })?
+            .max(1);
+        let alignment = TensorLayout::contiguous().alignment;
+        let committed = 0..bytes;
+        let buffer =
+            owner.allocate_committed(bytes, alignment, std::slice::from_ref(&committed))?;
+        Ok(Self {
+            dtype,
+            shape,
+            owner,
+            buffer: Some(buffer),
+        })
+    }
+
+    fn buffer(&self) -> &DeviceBuffer {
+        self.buffer
+            .as_ref()
+            .expect("resident buffer is taken only during Drop")
+    }
+
+    fn buffer_mut(&mut self) -> &mut DeviceBuffer {
+        self.buffer
+            .as_mut()
+            .expect("resident buffer is taken only during Drop")
+    }
+
+    fn release(mut self) -> Result<()> {
+        if let Some(buffer) = self.buffer.take() {
+            self.owner.deallocate(buffer)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ResidentValue {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.owner.deallocate(buffer);
+        }
+    }
+}
+
+struct PartitionExecutor {
+    partition: Partition,
+    input_feeds: Vec<(ValueId, String)>,
+    output_values: Vec<ValueId>,
+    executor: Executor,
+}
+
+/// Persistent executor for the opt-in, static tensor-only heterogeneous slice.
 ///
-/// `providers` must contain an entry for every [`EpId`] referenced by the plan.
-/// The result is byte-identical to executing the whole graph on a single
-/// provider (the correctness invariant this module guarantees).
+/// Every partition is an ordinary [`Executor`] on its assigned EP. Boundary
+/// storage is allocated through that EP, transferred exactly once per planned
+/// `(value, destination EP)` realization, and released by the allocating EP
+/// after the value's last consuming partition. CUDA graph capture and persistent
+/// external bindings are intentionally rejected by the parent executor.
+pub(crate) struct HeterogeneousExecutor {
+    graph: Arc<Graph>,
+    plan: HeterogeneousPlan,
+    providers: HashMap<EpId, Arc<dyn ExecutionProvider>>,
+    partitions: Vec<PartitionExecutor>,
+    placement_report: String,
+    last_transfer_count: usize,
+    last_release_counts: HashMap<(ValueId, EpId), usize>,
+}
+
+impl HeterogeneousExecutor {
+    pub(crate) fn build(
+        plan: HeterogeneousPlan,
+        graph: &Graph,
+        weights: &Arc<WeightStore>,
+        providers: &[ProviderPlacement],
+    ) -> Result<Self> {
+        let graph = plan
+            .legalized_graph
+            .clone()
+            .unwrap_or_else(|| Arc::new(graph.clone()));
+        let provider_by_ep: HashMap<EpId, Arc<dyn ExecutionProvider>> = providers
+            .iter()
+            .map(|slot| (slot.ep, Arc::clone(&slot.provider)))
+            .collect();
+
+        // Validate every concrete kernel before building or running a partition.
+        // This is also the first-slice alias gate: a kernel that may return a
+        // zero-copy view cannot target independently owned boundary storage.
+        for (&node_id, &ep) in &plan.node_placement {
+            let node = graph.node(node_id);
+            let provider = provider_by_ep.get(&ep).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "heterogeneous plan references missing EpId({})",
+                    ep.0
+                ))
+            })?;
+            let shapes = node
+                .inputs
+                .iter()
+                .map(|input| {
+                    input
+                        .map(|value| {
+                            as_static_shape(&graph.value(value).shape).ok_or_else(|| {
+                                SessionError::HeterogeneousExecutionUnsupported {
+                                    placement_summary: format!(
+                                        "node {} ({}) has a symbolic input after static-shape \
+                                         validation",
+                                        node_id.0, node.op_type
+                                    ),
+                                }
+                            })
+                        })
+                        .transpose()
+                        .map(|shape| shape.unwrap_or_default())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let opset = graph.effective_opset(node).unwrap_or(u64::MAX);
+            let kernel = provider.get_kernel(node, &shapes, opset).map_err(|error| {
+                SessionError::unsupported_op(
+                    node,
+                    node_id,
+                    opset,
+                    provider.name(),
+                    format!("capability was accepted but kernel creation failed: {error}"),
+                )
+            })?;
+            if kernel.may_produce_views() {
+                let domain = if node.domain.is_empty() {
+                    "ai.onnx"
+                } else {
+                    node.domain.as_str()
+                };
+                return Err(SessionError::HeterogeneousExecutionUnsupported {
+                    placement_summary: format!(
+                        "node {} ({domain}::{}@{opset}) may produce an aliased/view output; the \
+                         first execution slice requires independently owned contiguous boundary \
+                         buffers",
+                        node_id.0, node.op_type
+                    ),
+                });
+            }
+        }
+
+        let mut partition_executors = Vec::with_capacity(plan.partitions.len());
+        for partition in &plan.partitions {
+            let provider = provider_by_ep.get(&partition.ep).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "heterogeneous plan references missing EpId({})",
+                    partition.ep.0
+                ))
+            })?;
+            let extraction = extract_subgraph(&graph, partition);
+            let executor =
+                Executor::build(extraction.graph, Arc::clone(weights), Arc::clone(provider))?;
+            partition_executors.push(PartitionExecutor {
+                partition: partition.clone(),
+                input_feeds: extraction.input_feeds,
+                output_values: extraction.output_values,
+                executor,
+            });
+        }
+
+        Ok(Self {
+            placement_report: placement_summary(&plan, &graph, providers),
+            graph,
+            plan,
+            providers: provider_by_ep,
+            partitions: partition_executors,
+            last_transfer_count: 0,
+            last_release_counts: HashMap::new(),
+        })
+    }
+
+    pub(crate) fn placement_report(&self) -> &str {
+        &self.placement_report
+    }
+
+    pub(crate) fn primary_device(&self) -> DeviceId {
+        self.providers
+            .get(&EpId(0))
+            .map_or_else(DeviceId::cpu, |provider| provider.device_id())
+    }
+
+    pub(crate) fn set_trace_context(&mut self, trace: TraceContext) {
+        for partition in &mut self.partitions {
+            partition.executor.set_trace_context(trace.clone());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_transfer_count(&self) -> usize {
+        self.last_transfer_count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_release_count(&self, value: ValueId, ep: EpId) -> usize {
+        self.last_release_counts
+            .get(&(value, ep))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn release_value(
+        &mut self,
+        value: ValueId,
+        residents: &mut HashMap<(ValueId, EpId), ResidentValue>,
+    ) -> Result<()> {
+        let keys = residents
+            .keys()
+            .filter(|(resident_value, _)| *resident_value == value)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(resident) = residents.remove(&key) {
+                resident.release()?;
+                *self.last_release_counts.entry(key).or_default() += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_on(
+        &self,
+        value: ValueId,
+        to_ep: EpId,
+        residents: &mut HashMap<(ValueId, EpId), ResidentValue>,
+    ) -> Result<bool> {
+        if residents.contains_key(&(value, to_ep)) {
+            return Ok(false);
+        }
+        let producer = self.graph.value(value).producer.ok_or_else(|| {
+            SessionError::Internal(format!(
+                "graph source value {} must be supplied as a graph input, not transferred",
+                value.0
+            ))
+        })?;
+        let from_ep = self.plan.node_placement[&producer];
+        let transfer = self
+            .plan
+            .transfers
+            .iter()
+            .find(|transfer| {
+                transfer.value == value && transfer.from_ep == from_ep && transfer.to_ep == to_ep
+            })
+            .ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "missing planned transfer for value {} from EpId({}) to EpId({})",
+                    value.0, from_ep.0, to_ep.0
+                ))
+            })?;
+        let source = residents.get(&(value, from_ep)).ok_or_else(|| {
+            SessionError::Internal(format!(
+                "authoritative value {} on EpId({}) is not resident",
+                value.0, from_ep.0
+            ))
+        })?;
+        let owner = Arc::clone(self.providers.get(&to_ep).ok_or_else(|| {
+            SessionError::Internal(format!("missing destination EpId({})", to_ep.0))
+        })?);
+        let mut destination =
+            ResidentValue::allocate(to_ep, source.dtype, source.shape.clone(), owner)?;
+        let bytes = source.buffer().len();
+        if transfer.to.device_type == DeviceType::Cpu && transfer.from != transfer.to {
+            let dst = destination.buffer_mut();
+            // SAFETY: the destination EP allocated `dst`, its device is
+            // host-accessible, and the mutable borrow is exclusive for `bytes`.
+            let host =
+                unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), bytes) };
+            source.owner.copy_to_host(source.buffer(), host)?;
+        } else {
+            let destination_owner = Arc::clone(&destination.owner);
+            let fence =
+                destination_owner.copy_async(source.buffer(), destination.buffer_mut(), bytes)?;
+            destination_owner.wait_fence(&fence)?;
+        }
+        residents.insert((value, to_ep), destination);
+        Ok(true)
+    }
+
+    pub(crate) fn run(&mut self, inputs: &[(&str, &Tensor)]) -> Result<Vec<Tensor>> {
+        let input_by_value: HashMap<ValueId, &Tensor> = self
+            .graph
+            .inputs
+            .iter()
+            .filter_map(|&value| {
+                let name = self.graph.value(value).name.as_deref()?;
+                inputs
+                    .iter()
+                    .find(|(input_name, _)| *input_name == name)
+                    .map(|(_, tensor)| (value, *tensor))
+            })
+            .collect();
+        for &value in &self.graph.inputs {
+            if !self.graph.initializers.contains_key(&value) && !input_by_value.contains_key(&value)
+            {
+                return Err(SessionError::Internal(format!(
+                    "missing required heterogeneous graph input '{}'",
+                    self.graph
+                        .value(value)
+                        .name
+                        .as_deref()
+                        .unwrap_or("<unnamed>")
+                )));
+            }
+        }
+
+        let graph_outputs: HashSet<ValueId> = self.graph.outputs.iter().copied().collect();
+        let mut remaining_consumers: HashMap<ValueId, usize> = HashMap::new();
+        for partition in &self.plan.partitions {
+            for &value in &partition.inputs {
+                if self.graph.value(value).producer.is_some() {
+                    *remaining_consumers.entry(value).or_default() += 1;
+                }
+            }
+        }
+
+        let mut residents: HashMap<(ValueId, EpId), ResidentValue> = HashMap::new();
+        self.last_transfer_count = 0;
+        self.last_release_counts.clear();
+        for partition_index in 0..self.partitions.len() {
+            let ep = self.partitions[partition_index].partition.ep;
+            let input_feeds = self.partitions[partition_index].input_feeds.clone();
+            let output_values = self.partitions[partition_index].output_values.clone();
+
+            for &(value, _) in &input_feeds {
+                if self.graph.value(value).producer.is_some()
+                    && self.materialize_on(value, ep, &mut residents)?
+                {
+                    self.last_transfer_count += 1;
+                }
+            }
+
+            let mut normal_inputs = Vec::new();
+            for (value, name) in &input_feeds {
+                if self.graph.value(*value).producer.is_none()
+                    && !self.graph.initializers.contains_key(value)
+                {
+                    normal_inputs.push((
+                        name.as_str(),
+                        *input_by_value.get(value).ok_or_else(|| {
+                            SessionError::Internal(format!(
+                                "graph input value {} is unavailable",
+                                value.0
+                            ))
+                        })?,
+                    ));
+                }
+            }
+
+            let mut output_residents = Vec::with_capacity(output_values.len());
+            for &value in &output_values {
+                let metadata = self.graph.value(value);
+                let shape = as_static_shape(&metadata.shape).expect("validated static shape");
+                let owner = Arc::clone(self.providers.get(&ep).ok_or_else(|| {
+                    SessionError::Internal(format!("missing partition EpId({})", ep.0))
+                })?);
+                output_residents.push((
+                    value,
+                    ResidentValue::allocate(ep, metadata.dtype, shape, owner)?,
+                ));
+            }
+
+            let child = &mut self.partitions[partition_index].executor;
+            let mut bindings: Vec<DeviceIoBinding> =
+                Vec::with_capacity(input_feeds.len() + output_residents.len());
+            for (value, name) in &input_feeds {
+                if self.graph.value(*value).producer.is_none() {
+                    continue;
+                }
+                let resident = residents.get(&(*value, ep)).ok_or_else(|| {
+                    SessionError::Internal(format!(
+                        "value {} was not materialized on EpId({})",
+                        value.0, ep.0
+                    ))
+                })?;
+                let spec = ExternalMemorySpec::input(
+                    name,
+                    None::<String>,
+                    resident.dtype,
+                    resident.shape.clone(),
+                    resident.shape.clone(),
+                    resident.buffer().as_ptr().cast_mut(),
+                    resident.buffer().len(),
+                );
+                // SAFETY: `resident` owns the allocation through the complete
+                // child run; the borrowed binding is dropped before liveness can
+                // release that resident, and no other writer exists.
+                bindings.push(unsafe { child.device_binding_from_external_memory(spec)? });
+            }
+            for (value, resident) in &output_residents {
+                let spec = ExternalMemorySpec::output(
+                    subgraph_value_name(*value),
+                    resident.dtype,
+                    resident.shape.clone(),
+                    resident.shape.clone(),
+                    resident.buffer().as_ptr().cast_mut(),
+                    resident.buffer().len(),
+                );
+                // SAFETY: each output resident is a distinct governed allocation
+                // owned for the complete child run.
+                bindings.push(unsafe { child.device_binding_from_external_memory(spec)? });
+            }
+
+            let returned = child.run_with_device_bindings(&normal_inputs, &mut bindings)?;
+            if returned.iter().any(Option::is_some) {
+                return Err(SessionError::Internal(
+                    "heterogeneous partition returned an unbound tensor output".into(),
+                ));
+            }
+            drop(bindings);
+            for (value, resident) in output_residents {
+                residents.insert((value, ep), resident);
+            }
+
+            let consumed_values = self.partitions[partition_index].partition.inputs.clone();
+            for value in consumed_values {
+                let Some(remaining) = remaining_consumers.get_mut(&value) else {
+                    continue;
+                };
+                *remaining -= 1;
+                if *remaining == 0 && !graph_outputs.contains(&value) {
+                    self.release_value(value, &mut residents)?;
+                }
+            }
+        }
+
+        if self.last_transfer_count != self.plan.transfers.len() {
+            return Err(SessionError::Internal(format!(
+                "heterogeneous execution performed {} transfer(s), but the immutable plan has {}",
+                self.last_transfer_count,
+                self.plan.transfers.len()
+            )));
+        }
+
+        let mut outputs = Vec::with_capacity(self.graph.outputs.len());
+        for &value in &self.graph.outputs {
+            if self.graph.value(value).producer.is_none() {
+                outputs.push(
+                    input_by_value
+                        .get(&value)
+                        .map(|tensor| (*tensor).clone())
+                        .ok_or_else(|| {
+                            SessionError::Internal(format!(
+                                "graph output source value {} is unavailable",
+                                value.0
+                            ))
+                        })?,
+                );
+                continue;
+            }
+            let producer = self.graph.value(value).producer.expect("checked above");
+            let ep = self.plan.node_placement[&producer];
+            let resident = residents.get(&(value, ep)).ok_or_else(|| {
+                SessionError::Internal(format!(
+                    "graph output value {} was never produced on EpId({})",
+                    value.0, ep.0
+                ))
+            })?;
+            outputs.push(Tensor::copy_from_device_buffer(
+                &resident.owner,
+                resident.buffer(),
+                resident.dtype,
+                resident.shape.clone(),
+            )?);
+        }
+        let live_values = residents
+            .keys()
+            .map(|(value, _)| *value)
+            .collect::<HashSet<_>>();
+        for value in live_values {
+            self.release_value(value, &mut residents)?;
+        }
+        Ok(outputs)
+    }
+}
+
+/// Build and execute one heterogeneous plan. Session integration stores the
+/// persistent [`HeterogeneousExecutor`]; this wrapper remains for focused tests.
 pub fn execute(
     plan: &HeterogeneousPlan,
     graph: &Graph,
@@ -1063,76 +1639,7 @@ pub fn execute(
     providers: &[ProviderPlacement],
     inputs: &[(&str, &Tensor)],
 ) -> Result<Vec<Tensor>> {
-    let graph = plan.legalized_graph.as_deref().unwrap_or(graph);
-    let provider_by_ep: HashMap<EpId, Arc<dyn ExecutionProvider>> = providers
-        .iter()
-        .map(|slot| (slot.ep, Arc::clone(&slot.provider)))
-        .collect();
-
-    // Host value map keyed by parent ValueId. Seed with the caller's inputs.
-    let mut values: HashMap<ValueId, Tensor> = HashMap::new();
-    let name_to_value: HashMap<&str, ValueId> = graph
-        .inputs
-        .iter()
-        .filter_map(|&v| graph.value(v).name.as_deref().map(|name| (name, v)))
-        .collect();
-    for (name, tensor) in inputs {
-        if let Some(&vid) = name_to_value.get(name) {
-            values.insert(vid, (*tensor).clone());
-        }
-    }
-
-    for partition in &plan.partitions {
-        let provider = provider_by_ep.get(&partition.ep).ok_or_else(|| {
-            SessionError::Internal(format!(
-                "no execution provider registered for EpId({})",
-                partition.ep.0
-            ))
-        })?;
-        let extraction = extract_subgraph(graph, partition);
-
-        // Assemble this partition's runtime inputs from the host value map.
-        let feed_tensors: Vec<(String, Tensor)> = extraction
-            .input_feeds
-            .iter()
-            .map(|(parent_value, name)| {
-                let tensor = values.get(parent_value).cloned().ok_or_else(|| {
-                    SessionError::Internal(format!(
-                        "boundary input value {} missing before its partition ran",
-                        parent_value.0
-                    ))
-                })?;
-                Ok((name.clone(), tensor))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let feed_refs: Vec<(&str, &Tensor)> = feed_tensors
-            .iter()
-            .map(|(name, tensor)| (name.as_str(), tensor))
-            .collect();
-
-        let mut executor =
-            Executor::build(extraction.graph, Arc::clone(weights), Arc::clone(provider))?;
-        let outputs = executor.run(&feed_refs)?;
-
-        // Record produced boundary outputs back into the host value map.
-        for (parent_value, tensor) in extraction.output_values.iter().zip(outputs) {
-            values.insert(*parent_value, tensor);
-        }
-    }
-
-    // Collect the graph outputs in declared order.
-    graph
-        .outputs
-        .iter()
-        .map(|&v| {
-            values.get(&v).cloned().ok_or_else(|| {
-                SessionError::Internal(format!(
-                    "graph output value {} was never produced by any partition",
-                    v.0
-                ))
-            })
-        })
-        .collect()
+    HeterogeneousExecutor::build(plan.clone(), graph, weights, providers)?.run(inputs)
 }
 
 #[cfg(test)]
