@@ -470,7 +470,8 @@ truth.
 - **Exact companion shape.** The `valid_lengths` value **MUST** be `int64`,
   **MUST** declare `batch_layout: { kind: shared }`, and **MUST** have rank equal
   to the number of axes **outer** to the padded axis in the owning value, with
-  those axes' symbols as its shape, in order. For `pixel_values` of shape
+  those axes' symbols as its shape, in order. Equivalently and as a check:
+  `rank == axis`, the axis index of the padded dimension. For `pixel_values` of shape
   `[frames, patches, features]` padded on `patches` (axis 1), the companion is
   `[frames]`: one length per packed frame. For a hypothetical
   `[windows, bins, features]` padded on `bins`, it is `[windows]`. Axes *inner*
@@ -1092,8 +1093,9 @@ profile and are listed separately for that reason.
    `offsets` and an `owner` are rank 1 by construction (rule 4), so for them the
    two readings coincide. A `valid_lengths` is not:
    [§3.2](#32-tensorcontractpadding) fixes its rank at the number of axes *outer*
-   to the padded one, so a value padded on axis 2 publishes a **rank-2** length
-   vector. Writing the carve-out as a flat "rank 1" makes two rules of this design
+   to the padded one — equivalently, `rank == axis`, the padded dimension's axis
+   index — so a value padded on axis 2 publishes a **rank-2** length vector.
+   Writing the carve-out as a flat "rank 1" makes two rules of this design
    contradict each other — one requires that companion, the other refuses it — and
    the refusal necessarily advises `request_aligned`, which is exactly what a
    companion **MUST NOT** declare. Following the narrower reading would therefore
