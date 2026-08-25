@@ -552,6 +552,7 @@ pub mod contrib_fused;
 pub mod dense_elementwise;
 pub mod dft;
 pub mod dropout;
+pub mod dsa_index_select;
 pub mod elementwise;
 pub mod expand;
 pub mod eye_like;
@@ -1010,6 +1011,10 @@ fn build_cpu_registry_recorded_inner(
     rec.register(
         OpKey::new("IndexShare", "pkg.nxrt", 1),
         Box::new(index_share::IndexShareFactory),
+    );
+    rec.register(
+        OpKey::new("DsaIndexSelect", "pkg.nxrt", 1),
+        Box::new(dsa_index_select::DsaIndexSelectFactory),
     );
     rec.register(
         OpKey::new("VarlenAttention", "pkg.nxrt", 1),
@@ -2579,6 +2584,8 @@ mod tests {
         // BitwiseAnd,
         // BitwiseOr, BitwiseXor, BitwiseNot, and Hardmax add five more.
         // MatMulNBits, BlockQuantizedMatMul, BlockQuantizedMoE, IndexShare,
+        // DsaIndexSelect (the GLM-5.2 DSA query-dependent index-selection
+        // counterpart to IndexShare),
         // VarlenAttention, PackedVarlenAttention, PackedMultiHeadAttention,
         // SparseKvGather, CompressedSparseAttention, and GroupQueryAttention add
         // private/contrib registrations.
