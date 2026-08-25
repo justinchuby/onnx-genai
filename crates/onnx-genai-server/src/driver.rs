@@ -1953,8 +1953,8 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             if result.is_ok() {
                 accounting.session_closed();
             }
-            let _ = response.send(result);
             drop(held_lease);
+            let _ = response.send(result);
         }
         DriverCommand::SessionTokenCount {
             session_id,
