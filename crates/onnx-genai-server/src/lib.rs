@@ -25,6 +25,8 @@ use tracing::Instrument;
 const MEDIA_UPLOAD_BODY_LIMIT: usize = 25 * 1024 * 1024;
 
 mod audio_input;
+#[cfg(feature = "benchmark")]
+pub mod benchmark;
 mod cli;
 mod driver;
 mod image_generation;

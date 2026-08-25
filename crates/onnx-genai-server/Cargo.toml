@@ -14,6 +14,9 @@ default = ["metrics", "cuda-13000"]
 metrics = []
 # Enables profiling integration hooks. Perfetto and OTLP exporters remain deferred.
 profiling = []
+# Exposes the internal worker/lease benchmark harness to `onnx-genai-bench`.
+# This is opt-in so production builds carry no synthetic instrumentation.
+benchmark = []
 # Our hand-written CUDA EP plus everything `ort-cuda` provides, and the native
 # backend needed to reach it. Requires a CUDA host to build (e.g. H200).
 native-cuda = [
