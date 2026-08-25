@@ -83,6 +83,8 @@ pub mod onehot;
 pub mod packed_varlen_attention;
 pub mod pad;
 pub mod paged_attention;
+pub mod planar_block_decode;
+pub mod planar_block_moe;
 pub mod pointwise;
 pub mod pooling;
 pub mod prelu;

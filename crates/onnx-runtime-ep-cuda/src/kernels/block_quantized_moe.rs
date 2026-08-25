@@ -55,6 +55,18 @@ const LINEAR_ENTRY: &str = "bqmoe_linear_f32";
 const ACTIVATE_ENTRY: &str = "bqmoe_activate";
 const COMBINE_ENTRY: &str = "bqmoe_combine_f32";
 
+/// NVRTC module cache key shared with the planar routed-MoE primitive
+/// ([`super::planar_block_moe`]), which reuses the format-agnostic
+/// `bqmoe_route`/`bqmoe_activate`/`bqmoe_combine_f32` kernels verbatim so the
+/// routing/activation/combine arithmetic stays single-source.
+pub(crate) const MOE_MODULE: &str = MODULE;
+/// `bqmoe_route` entry point, reused by [`super::planar_block_moe`].
+pub(crate) const MOE_ROUTE_ENTRY: &str = ROUTE_ENTRY;
+/// `bqmoe_activate` entry point, reused by [`super::planar_block_moe`].
+pub(crate) const MOE_ACTIVATE_ENTRY: &str = ACTIVATE_ENTRY;
+/// `bqmoe_combine_f32` entry point, reused by [`super::planar_block_moe`].
+pub(crate) const MOE_COMBINE_ENTRY: &str = COMBINE_ENTRY;
+
 const INPUT_NAMES: [&str; 9] = [
     "input",
     "router_logits",
@@ -70,13 +82,19 @@ const INPUT_NAMES: [&str; 9] = [
 /// Planar block-scaled B2 formats (DeepSeek-V4): the packed weight carries its
 /// UE8M0 block scales in a *separate* aux tensor, so they are not part of the
 /// interleaved single-tensor [`BlockFormat`] family the CUDA device kernel
-/// decodes. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns them
-/// numerically today; the CUDA planar decoder is a pending follow-up and must
-/// not claim a planar node without proven kernel parity. These strings are the
-/// stable runtime capability names emitted by the Mobius #602 / Deckard #593
-/// planar emitters — recognised here purely to produce an accurate typed
-/// rejection (never an "re-export as mxfp4" message, which would be wrong: the
-/// checkpoint genuinely is these formats).
+/// decodes. Device-proven **primitives** for both formats now exist — a matmul
+/// (`onnx_runtime_ep_cuda::launch_planar_linear`, advertised by
+/// [`crate::planar_matmul_capable_formats`]) and a routed top-k MoE
+/// (`onnx_runtime_ep_cuda::launch_planar_moe`, advertised by
+/// [`crate::planar_moe_capable_formats`]). What remains is the op-node wiring:
+/// the 9-input `BlockQuantizedMoE` schema has no per-projection aux-scale input
+/// to carry the planar UE8M0 banks, so this claim gate still typed-rejects a
+/// planar MoE node until the co-designed Mobius #602 / Deckard #593 node ABI
+/// lands. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns the routed
+/// path at op level today. These strings are the stable runtime capability names
+/// emitted by the planar emitters — recognised here purely to produce an
+/// accurate typed rejection (never an "re-export as mxfp4" message, which would
+/// be wrong: the checkpoint genuinely is these formats).
 const PLANAR_B2_FORMAT_NAMES: [&str; 2] = ["block_fp8", "fp4_planar"];
 
 // Kernels appended after the shared `decode_weight`/`block_sum` prelude. The
@@ -355,6 +373,13 @@ fn module_source() -> &'static str {
     })
 }
 
+/// The compiled NVRTC source for [`MOE_MODULE`], reused verbatim by
+/// [`super::planar_block_moe`] so the routing/activation/combine kernels stay
+/// single-source.
+pub(crate) fn moe_module_source() -> &'static str {
+    module_source()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Activation {
     Relu,
@@ -610,7 +635,7 @@ fn claim_format_attr(
     };
     if PLANAR_B2_FORMAT_NAMES.contains(&text) {
         return Err(Cow::Owned(format!(
-            "BlockQuantizedMoE: CUDA has no exact decoder yet for planar B2 format '{text}' at '{name}' (DeepSeek-V4) — it is a recognised runtime ABI currently owned by the onnx-runtime-ep-cpu planar_block_quant oracle; the CUDA planar decoder is a pending follow-up and must not claim without proven kernel parity"
+            "BlockQuantizedMoE: planar B2 format '{text}' at '{name}' (DeepSeek-V4) has device-proven planar primitives (matmul via onnx_runtime_ep_cuda::launch_planar_linear / planar_matmul_capable_formats, routed top-k MoE via launch_planar_moe / planar_moe_capable_formats), but the 9-input BlockQuantizedMoE node ABI cannot carry the per-projection UE8M0 aux-scale banks these formats require; the op-node claim stays typed-reject until the co-designed aux-scale node inputs land, and the onnx-runtime-ep-cpu planar_block_quant oracle owns the op-level routed path"
         )));
     }
     match BlockFormat::parse(text) {
@@ -1828,9 +1853,11 @@ mod claim_gate_tests {
     #[test]
     fn planar_b2_formats_are_typed_rejected_without_a_success_claim() {
         // DeepSeek-V4 B2: block-FP8 shared/attention, planar-FP4 routed experts.
-        // Both are recognised planar ABI names but have no exact CUDA decoder
-        // yet — the claim gate must decline them (CPU oracle owns them) rather
-        // than mis-executing or emitting misleading "re-export as mxfp4" advice.
+        // Both now have device-proven planar primitives (matmul + routed top-k
+        // MoE), but the 9-input node ABI cannot carry their per-projection
+        // UE8M0 aux-scale banks, so the op-node claim gate must still decline
+        // them (CPU oracle owns the op-level path) rather than mis-executing or
+        // emitting misleading "re-export as mxfp4" advice.
         for planar in ["block_fp8", "fp4_planar"] {
             let node = claim_node(planar, planar, None);
             let reason = unsupported_reason(&node, &[], &[]).unwrap_or_else(|| {
