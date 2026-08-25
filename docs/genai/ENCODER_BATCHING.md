@@ -181,7 +181,7 @@ a temporal axis and may be published incrementally"
 (`crates/onnx-genai-metadata/src/schema/ir.rs:636-643`); `Emit.axis` exists so
 incremental publication grows the right axis, and its own doc names video frames
 in `[batch, channels, frames, height, width]` as the reason
-(`ir.rs:905-915`); there is a canonical `video` workflow fixture
+(`ir.rs:909-915`); there is a canonical `video` workflow fixture
 (`tests/fixtures/onnx_genai_workflows/video`) and a conformance test that
 publishes causal temporal chunks and runs it at batch 2
 (`crates/onnx-genai-engine/tests/onnx_genai_workflow_conformance.rs:900-960`).
@@ -523,20 +523,42 @@ truth.
   runtime silently rewrites a value the metadata says the graph produces. Two
   accounts of one fact (Rule 10), so the rule is **exclusion, not
   reconciliation**: an `Emit` whose `output` declares `padding` **MUST NOT**
-  carry `valid_length`, and the refusal names both the emit and the `padding`
-  entry and says that one of them must go. The choice between them is not
-  arbitrary and they are not equivalent: a trim destroys the padded extent, while
-  `padding` keeps the full tensor and states what is real in it — and only the
-  second survives a group, where rows share an extent that just one of them
-  fills.
-- **`token_packed` needs no separate rule for this.** Per-row trimming routes
-  through `BatchLayout::request_axis()` (`workflow.rs:2183-2189`), which is
-  `None` for `TokenPacked` (`ir.rs:67-72`), so a packed output has no per-row
-  prefix to express in the first place; a whole-tensor `valid_length` on one
-  would trim the packed axis, which [§4](#4-strict-token_packed-validation)
-  rule 7 already forbids by another route. The exclusion therefore binds exactly
-  where padding lives — `request_aligned` and `request_expanded` outputs — and
-  adds no case the packed rules did not already own.
+  carry `valid_length`. The refusal names the emit's `valid_length`, the output,
+  and every padded dimension with the vector bounding it — and it **MUST** say
+  which one is authoritative, because "these two disagree" is not actionable
+  until the reader knows which to delete. `padding.valid_lengths` is the
+  authoritative one, and the asymmetry is structural rather than a preference:
+  `valid_length` truncates what the step writes and is **invisible in the
+  contract**, while a `padding` entry is part of what the caller reads and names
+  the vector rule 8 requires the workflow to publish. A trim also destroys the
+  padded extent, while `padding` keeps the full tensor and states what is real in
+  it — and only the second survives a group, where rows share an extent that just
+  one of them fills.
+- **The exclusion is flat: it does not ask which axis the trim is about.** An
+  emit's growth axis is stated only by default — `Emit.axis` "defaults to the
+  final axis" (`ir.rs:909-915`) — while a padded value's lengths are indexed by
+  the axes *outer* to the padded one. A trim at or outside the padded axis
+  invalidates the vector outright; a trim strictly inside it leaves a declared
+  shape the emitted tensor no longer has. Narrowing the rule to the growth axis
+  would therefore have to decide which axis an emit-level length is *about* in
+  order to buy an admission nobody needs, and it would guess in the direction of
+  admitting the ambiguous case.
+- **`token_packed` needs no separate rule, and gets none.** An emit carrying
+  `valid_length` into an output whose layout declares no request axis is *already*
+  refused at load, by a rule that predates this design: ragged emission needs a
+  declared row axis for the runtime to associate result rows with requests
+  (`crates/onnx-genai-metadata/src/validation.rs:3288-3302`). `request_axis()` is
+  `None` for `TokenPacked` (`ir.rs:67-72`), so a packed output refuses the
+  combination whatever its padding says, and the interpreter's per-row trim path
+  is unreachable for it (`workflow.rs:2183-2189`). A packed **and** padded output
+  hears from both rules, which is correct rather than redundant: they answer
+  different questions — one that there is no row axis to be ragged along, the
+  other that a trim and a length vector are two accounts of one raggedness — and
+  neither should suppress the other, since suppressing either would leave a
+  document whose only remaining message explains the wrong defect. The new
+  exclusion is therefore load-bearing only where a request axis exists —
+  `request_aligned` and `request_expanded` outputs — and a packed output, padded
+  or not, is refused either way.
 - Padding is a *runtime* act. The package declares that padding is expressible
   and where its truth is recorded; it never states a batch width, a padded
   extent, or a fill value schedule.
@@ -1549,7 +1571,14 @@ claim; it is a mechanism, and it lands in P1 **before** any new field is emitted
   predate a question, the other would preserve their bugs. Where the exemption is
   used, existing packages **SHOULD** still be migrated to the explicit spelling,
   so the exemption stays a compatibility guarantee rather than a live code path
-  nothing exercises.
+  nothing exercises. The emit-trim exclusion in
+  [§3.2](#32-tensorcontractpadding) is a worked
+  example of the unconditional half and **MUST NOT** be version-gated: it judges
+  a pair of things a document *did* state. A gate would also be inert, since
+  `padding` is itself a `v1.1` field — a document able to express the
+  contradiction has already been forced to declare `v1.1` by the feature
+  detector, so the gate would be a second, weaker copy of one already in force,
+  and a weaker copy is the kind that later disagrees with the original.
 - **No capability identifier, and not for the reason an earlier revision gave.**
   This design adds nothing to `required_capabilities`
   ([§4.3a](INFERENCE_METADATA_DECISIONS.md#43a-capability-admission-and-complete-built-in-catalogue)).
@@ -1810,12 +1839,19 @@ P2 validation                    │                          │
   rejected, and a padded emit that withholds its `valid_lengths`. P2 also owns
   the [§3.2](#32-tensorcontractpadding) **emit-trim exclusion**: reject at load
   any `Emit` carrying `valid_length` whose `output` contract declares `padding`,
-  with a message naming the emit, the output, and the `padding` entry, and
-  stating that one of the two must go. Its fixtures are a `request_aligned`
-  padded output trimmed by a per-row `valid_length` and one trimmed by a
-  whole-tensor `valid_length`, plus the two positives that must keep working —
-  a `valid_length` emit into an output that declares **no** `padding`, and a
-  padded output emitted with no `valid_length`. Depends on P1.
+  with a message naming the emit's `valid_length`, the output, every padded
+  dimension with the vector bounding it, and `padding.valid_lengths` as the
+  account that survives. Its fixtures are a `request_aligned` padded output
+  trimmed by a per-row `valid_length` and one trimmed by a whole-tensor
+  `valid_length`, plus the two positives that must keep working — a
+  `valid_length` emit into an output that declares **no** `padding`, and a padded
+  output emitted with no `valid_length`. A fifth pins the interaction rather than
+  the rule: a `token_packed` **and** padded output emitted with a `valid_length`
+  **MUST** still be refused by the pre-existing no-row-axis rule
+  (`crates/onnx-genai-metadata/src/validation.rs:3288-3302`), so that adding this
+  exclusion is shown not to have shadowed it. Both positives **MUST** be guarded
+  against becoming vacuous, since a control that stops matching passes forever.
+  Depends on P1.
 - **P3 — preprocessor.** Two independent pieces, in this order.
   **P3a (one level):** let the image adapter accept N encoded items and emit one
   level's `pack_offsets` / `pack_owner` plus per-item `valid_lengths`; unit tests
@@ -1921,7 +1957,7 @@ no downloaded weights, no sample media, and no network in the test path.
 | 22 | **Version gate grammar and direction.** Documents spelling the version absent, `v1`, `1.0`, `v1.1`, `1.1`, `2.0`, and the malformed `latest` / `v1.2.3`; a `v1.1` document offered to a `v1.0`-only runtime; a `v1.0` document offered to a `v1.1` runtime. | The first three normalize to v1.0 and load identically, the malformed two are rejected as malformed naming the value read, the `v1.1`-to-`v1.0` case is refused **before struct deserialization** with one message naming the document version, the highest supported version, and the required upgrade — never an unknown-field error; `2.0` is refused on major; and a v1.0 document on a v1.1 runtime loads and executes unchanged **unless it spells the replaced flat `token_packed` form**, which is refused with a message naming the removed spelling and the one-level `levels` rewrite — not an unknown-field error, and not a silent acceptance. A `2.0` document carrying the same flat pair is refused **on its version only** and never receives the migration message, proving the gate runs first and that a retired-shape claim is scoped to the vocabulary the gate admitted. | P1 |
 | 23 | **Conditional emission, and no rewriting of what exists.** Every existing in-tree document round-tripped through the writer, and a new document that declares `batch_capacity`. | For the existing documents the **bytes and the version strings are unchanged** — `v1` stays `v1`, `1.0` stays `1.0`, absent stays absent, and no field of this design is emitted — so no existing runtime's minimum moves and no semantic identity changes. The new document **MUST** stamp `v1.1`. | P1 |
 | 24 | **Every output level declares its producer.** A mixed-chain output (inner level `extent: produced` with component-output companions, outer level `extent: preserved` reusing the input's clip pair) exercised end to end; a token-merging graph whose output length differs from its input's; and three negative cases — a level omitting `extent`, a `produced` level naming an input companion, and a `preserved` level naming a companion of a different extent. | The mixed chain validates per level and splits at the graph's own inner boundaries while reusing the outer mapping; the negatives are rejected at load naming the value, the level, and both facts; no path ever splits a produced level with input offsets. | P2, P4 |
-| 25 | **Serving admits companions, and only companions, at the rank each reference demands.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a value padded on two dimensions at once, publishing a rank-1 length for axis 1 and a **rank-2** length for axis 2; a `request_aligned` and a `token_packed` variant of that doubly-padded case; one emitting a packed value padded on the axes it does *not* pack, publishing ownership and lengths together at three different ranks; one declaring a rank-1 length for a padded axis 2; one emitting a padded value *without* its lengths; one whose companion is a declared output that no step writes; one whose emit carries a `valid_length` while its output contract declares `padding`; and one emitting an unrelated `shared` rank-2 value. | Every publishing case validates — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items — with rank checked *per reference*, never as a flat rank 1. The mis-ranked length is refused **as a malformed companion**, naming the role and the expected rank and never advising `request_aligned`. The withheld lengths and the declared-but-unwritten companion are both rejected for not publishing. **The trimmed padded emit is rejected at load** — naming the emit, the output and the `padding` entry — because a slice and a length vector are two accounts of one raggedness and the companion would measure a tensor that was never delivered. The unrelated value is still rejected with the existing message. | P2, P6 |
+| 25 | **Serving admits companions, and only companions, at the rank each reference demands.** A serving workflow emitting a packed value with its `shared` rank-1 `offsets` and `owner`; one emitting a padded value with its `valid_lengths`; one emitting a value padded on two dimensions at once, publishing a rank-1 length for axis 1 and a **rank-2** length for axis 2; a `request_aligned` and a `token_packed` variant of that doubly-padded case; one emitting a packed value padded on the axes it does *not* pack, publishing ownership and lengths together at three different ranks; one declaring a rank-1 length for a padded axis 2; one emitting a padded value *without* its lengths; one whose companion is a declared output that no step writes; one whose emit carries a `valid_length` while its output contract declares `padding`; a `token_packed` variant of that same pair; and one emitting an unrelated `shared` rank-2 value. | Every publishing case validates — each request receives its own span with rebased, zero-based offsets, no invocation-global owner values, and the slice of `valid_lengths` indexing its own items — with rank checked *per reference*, never as a flat rank 1. The mis-ranked length is refused **as a malformed companion**, naming the role and the expected rank and never advising `request_aligned`. The withheld lengths and the declared-but-unwritten companion are both rejected for not publishing. **The trimmed padded emit is rejected at load** — naming the emit, the output, the `padding` entry and `padding.valid_lengths` as the surviving account — because a slice and a length vector are two accounts of one raggedness and the companion would measure a tensor that was never delivered. Its packed variant is rejected too, but by the pre-existing no-row-axis rule, so the new exclusion is shown not to have shadowed it. The unrelated value is still rejected with the existing message. | P2, P6 |
 | 26 | **Companion validation causes no hidden transfer.** A group whose companions the runtime built, and a group whose companions a component produced on device. | Runtime-built companions are validated on the host at no transfer cost; produced companions are checked for dtype, rank, and extent without a device read, and the single companion-only transfer needed to split is counted and attributed — the payload never moves. | P4, P7 |
 | 27 | **`request_expanded` participates.** A component with a `request_expanded` port at factor > 1 grouped alongside packed ports. | Ownership is arithmetic — entry `i` belongs to row `i / factor` — no companions are declared or required, footprint is charged as `rows × factor`, and a declaration that is both request-expanded and packed on one axis is rejected at load. | P2, P4 |
 | 28 | **Performance versus sequential direct execution.** Same hardware, same items, grouped versus one-at-a-time, reported separately for image and for video. | Images/s, frames/s, clips/s, and per-request latency for both modes, plus the group sizes actually formed and the padding overhead paid (padded elements as a fraction of real ones). Per-row outputs identical. A regression at any reachable group size is reported, not hidden behind an average. | P7 |

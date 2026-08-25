@@ -825,10 +825,18 @@ declared on its own dimension and they never compete for one.
   shorter tensor beside a length vector measuring the tensor it replaced —
   either lengths that overrun the payload, or a value the runtime rewrote behind
   the metadata that describes it. The rule is exclusion, not reconciliation: an
-  `Emit` whose output declares `padding` **MUST NOT** carry `valid_length`. A
-  `token_packed` output needs no separate rule, since per-row trimming routes
-  through `request_axis()` (`workflow.rs:2183-2189`), which is `None` for
-  `TokenPacked`, and a whole-tensor trim of the packed axis is already refused.
+  `Emit` whose output declares `padding` **MUST NOT** carry `valid_length`, and
+  the refusal names `padding.valid_lengths` as the authoritative account, since
+  a trim is invisible in the contract while a padding entry is part of what the
+  caller reads. The exclusion does not ask which axis the trim is about: an
+  emit's growth axis is only a default (`ir.rs:909-915`), so narrowing it would
+  mean guessing in the direction of admitting the ambiguous case. A `token_packed`
+  output needs no separate rule, because an emit-level `valid_length` into a
+  layout with no request axis is already refused at load as ragged emission
+  lacking a row axis
+  (`crates/onnx-genai-metadata/src/validation.rs:3288-3302`); a packed **and**
+  padded output hears from both rules, which is correct — they answer different
+  questions.
   `padding` does not by itself make a component padding-invariant — that remains
   the profile's `batch_invariance` declaration.
 - **Ownership is an ordered chain of levels over one physically packed axis.**
