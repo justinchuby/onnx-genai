@@ -342,8 +342,11 @@ pub struct PoolCounters {
     ///
     /// A yield rate is only interpretable against the waits that could have
     /// produced it, so read it with [`Self::parks`] and [`Self::spin_hits`]:
-    /// those two count spin windows that ended, and this counts yields spent
-    /// inside them.
+    /// between them those count every spin window that ended by expiring or by
+    /// catching a dispatch, and this counts yields spent inside them. The one
+    /// window they do not account for is the one a worker is in when the pool
+    /// shuts down, so at teardown this counter can exceed what those two
+    /// explain.
     pub spin_yields: u64,
 }
 
@@ -355,10 +358,10 @@ struct AtomicCounters {
     slot_exhausted: AtomicU64,
     straggler_waits: AtomicU64,
     straggler_yields: AtomicU64,
-    spin_yields: AtomicU64,
     parks: AtomicU64,
     spin_hits: AtomicU64,
     panics: AtomicU64,
+    spin_yields: AtomicU64,
 }
 
 impl AtomicCounters {
@@ -370,10 +373,10 @@ impl AtomicCounters {
             slot_exhausted: self.slot_exhausted.load(Ordering::Relaxed),
             straggler_waits: self.straggler_waits.load(Ordering::Relaxed),
             straggler_yields: self.straggler_yields.load(Ordering::Relaxed),
-            spin_yields: self.spin_yields.load(Ordering::Relaxed),
             parks: self.parks.load(Ordering::Relaxed),
             spin_hits: self.spin_hits.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
+            spin_yields: self.spin_yields.load(Ordering::Relaxed),
         }
     }
 }

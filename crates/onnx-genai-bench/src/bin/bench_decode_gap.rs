@@ -799,25 +799,25 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
     // Both denominators can be zero for reasons that are not "no yields", so
     // each gets its own verdict rather than a rate the reader has to discount
     // against the attribution line printed further down.
-    let windows = (result.steady_pool.parks + result.steady_pool.spin_hits) as f64;
+    let windows = result.steady_pool.parks + result.steady_pool.spin_hits;
     if result.steady_pool.dispatches == 0 {
         println!(
             "  spin yields:   n/a -- this model never dispatched to the pool, so its \
              {} yields are another workload's, not a #2075 datum",
             result.steady_pool.spin_yields
         );
-    } else if windows == 0.0 {
+    } else if windows == 0 {
         println!(
-            "  spin yields:   {} total, but no spin window ended in this arm -- the \
-             pool never waited, so this says nothing about #2075",
+            "  spin yields:   {} total, but no spin window ended in this arm by \
+             expiring or catching a dispatch, so there is no denominator to read \
+             them against and this is not a #2075 datum",
             result.steady_pool.spin_yields
         );
     } else {
         println!(
-            "  spin yields:   {:.2}/iter  {:.1}/window over {} windows (#2075)",
+            "  spin yields:   {:.2}/iter  {:.1}/window over {windows} windows (#2075)",
             result.steady_pool.spin_yields as f64 / iterations,
-            result.steady_pool.spin_yields as f64 / windows,
-            windows as u64
+            result.steady_pool.spin_yields as f64 / windows as f64,
         );
     }
     let sample_iters = result.steady_samples().len();
