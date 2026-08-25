@@ -801,4 +801,55 @@ mod tests {
         assert!(i[0].abs() < 1e-5, "DC imag = {}", i[0]);
         assert!((r[2] + 2.0).abs() < 1e-5, "bin[2] real = {}", r[2]);
     }
+
+    /// The per-thread counter has to actually be per-thread.
+    ///
+    /// Every dispatch assertion that survived #2093 -- the one above, and the
+    /// STFT frame test -- differences [`dft_fast_path_hits_this_thread`] around
+    /// a call and asserts an **exact equality**. That is sound only while the
+    /// counter is unshared. If it ever reads the process-global instead, every
+    /// one of those equalities quietly becomes `own + whatever concurrent tests
+    /// transformed in the same window`, which is precisely the lower bound the
+    /// per-thread counter was introduced to escape -- and no test would fail,
+    /// because inflation is the direction that satisfies them.
+    ///
+    /// That is the shape this repository calls a false oracle: the instrument's
+    /// broken reading is indistinguishable from its working one. The doc
+    /// comment on `dft_fast_path_hits_this_thread` argues the property at
+    /// length; this executes it.
+    #[test]
+    fn the_per_thread_counter_does_not_see_another_threads_transforms() {
+        const CONCURRENT_DFTS: u64 = 64;
+
+        let global_before = dft_fast_path_hits();
+        let local_before = dft_fast_path_hits_this_thread();
+
+        std::thread::spawn(|| {
+            for _ in 0..CONCURRENT_DFTS {
+                // n = 2 is a power of two below the vDSP minimum of 4, so this
+                // takes the radix-2 fast path on every target, Apple included.
+                compute_dft(&[1.0, -1.0], &[0.0, 0.0], 2, false, false);
+            }
+        })
+        .join()
+        .expect("the contaminating thread must not panic");
+
+        // Anti-vacuity: without this, a thread that silently did nothing would
+        // satisfy the assertion below just as well as an isolated counter does.
+        let global_after = dft_fast_path_hits();
+        assert!(
+            global_after >= global_before + CONCURRENT_DFTS,
+            "the shared counter must have absorbed the other thread's {CONCURRENT_DFTS} \
+             transforms ({global_before} -> {global_after}); if it did not, this test is \
+             no longer demonstrating the contamination it exists to rule out"
+        );
+
+        assert_eq!(
+            dft_fast_path_hits_this_thread(),
+            local_before,
+            "this thread performed no transform, so its own counter must not have moved \
+             -- a per-thread counter that sees another thread's work turns every exact \
+             dispatch equality in this crate back into a lower bound, silently"
+        );
+    }
 }
