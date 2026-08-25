@@ -116,7 +116,7 @@ jobs:
   # dropped under an already-blessed directory (scripts/tmp/junk.log) is invisible
   # to it. That is the correct trade -- the six incidents were all at the root --
   # but "clean root" means the root's own entries, not the tree beneath them.
-    root-files:
+  root-files:
     name: Root file allowlist
     runs-on: ubuntu-latest
     steps:
