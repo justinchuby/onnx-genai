@@ -20397,12 +20397,17 @@ mod tests {
     /// free of a `taskset` dependency and makes the mask an observable the
     /// child reports (`allowed`/`cores`) rather than an assumption.
     ///
-    /// Returns whether the restriction is even attemptable here.
-    /// `set_current_thread_affinity` is implemented on Linux only and returns
-    /// `Err` everywhere else *by construction*, so `expect`ing it off Linux
-    /// turned this child into an unconditional failure on both Windows lanes.
-    /// The platform fact is reported to the caller instead; the failure on a
-    /// platform that does implement it stays fatal.
+    /// Only Linux can do this. `set_current_thread_affinity` is a documented
+    /// no-op that returns `Err` everywhere else (see `decode_affinity.rs`), so
+    /// on those targets the leader-only cpuset cannot be constructed at all and
+    /// the caller must skip rather than assert. That is a different thing from
+    /// the restriction failing, which stays fatal on Linux. The platform fact
+    /// is `PROCESS_AFFINITY_MASKING_SUPPORTED`, which is asserted against the
+    /// implementation that actually compiled, so the two cannot drift.
+    ///
+    /// Returns whether the narrowing was established, so the caller can assert
+    /// on a premise that was *reported* rather than inferred from one of its
+    /// consequences.
     fn restrict_self_to_leader_cpus() -> bool {
         if !crate::decode_affinity::PROCESS_AFFINITY_MASKING_SUPPORTED {
             return false;
@@ -20743,20 +20748,16 @@ mod tests {
     /// report in what "default" resolved to.
     #[test]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        // Process-wide affinity masking is Linux-only, so on every other target
+        // the leader-only cpuset this test asserts about cannot be built.
+        // Skipping is loud rather than silent: an unexplained green here is
+        // exactly the vacuity the sweep exists to avoid, and the reason belongs
+        // in the log, not only in this comment.
         if !crate::decode_affinity::PROCESS_AFFINITY_MASKING_SUPPORTED {
-            // The premise is a process narrowed to one CPU per physical core,
-            // and the only implementation of that narrowing is Linux's. On
-            // Windows the child stayed on the full cpuset, so `allowed` is the
-            // logical count and the restriction assertion below reported a
-            // defect that is a platform fact -- which is why this test was red
-            // on both Windows lanes from the moment it landed. Requiring it
-            // here could only ever be a false failure, the same exemption
-            // `DETECTION_SUPPORTED` draws for a target with no topology
-            // backend.
             eprintln!(
-                "skipping the leader-cpuset width check: process-wide affinity masking is \
-                 implemented on Linux only, so a leader-only cpuset cannot be constructed in \
-                 this process"
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
+                 process-wide CPU affinity masking is implemented only on Linux, so a \
+                 leader-only cpuset cannot be constructed on this target"
             );
             return;
         }
@@ -20787,9 +20788,9 @@ mod tests {
                 crate::core_topology::REQUIRE_PLACEMENT_ENV
             );
             eprintln!(
-                "skipping the leader-cpuset width check: the child could not restrict itself to \
-                 one CPU per physical core ({report:?}), so the reserved-machine premise does \
-                 not hold in this process"
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: the \
+                 child could not narrow itself to one CPU per physical core ({report:?}), so \
+                 the reserved-machine premise does not hold in this process"
             );
             return;
         }
@@ -20805,8 +20806,12 @@ mod tests {
             return;
         }
 
-        // The restriction has to have actually happened, or `workers == cores`
-        // below would hold for the wrong reason on the full cpuset.
+        // Corroboration, not the premise check -- that is `report.restricted`
+        // above. This equality is *satisfied* by the restriction failing: when
+        // the child cannot read the topology its `cores` falls back to
+        // `allowed`, so it holds on an entirely unrestricted process. Kept
+        // because it does catch a leader set that is not one CPU per core on a
+        // host that answered, which is a different fault.
         assert_eq!(
             report.allowed, report.cores,
             "the child was asked to restrict itself to one CPU per physical \

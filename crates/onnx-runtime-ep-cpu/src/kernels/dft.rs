@@ -245,98 +245,110 @@ fn compute_dft(
     inverse: bool,
     onesided: bool,
 ) -> (Vec<f32>, Vec<f32>) {
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        if let Some(result) = vdsp_dft(real_in, imag_in, n, inverse, onesided) {
-            return result;
-        }
-    }
-
-    // Fallback: radix-2 FFT for power-of-two, naive DFT otherwise.
-    if n.is_power_of_two() && n > 1 {
-        DFT_FFT_TEST_HITS.fetch_add(1, Ordering::Relaxed);
-        fft_radix2(real_in, imag_in, n, inverse, onesided)
-    } else {
-        naive_dft(real_in, imag_in, n, inverse, onesided)
-    }
-}
-
-/// Accelerate vDSP DFT. Returns `None` if the setup cannot be created (non-power-of-two
-/// lengths or other constraints not met by Accelerate).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn vdsp_dft(
-    real_in: &[f32],
-    imag_in: &[f32],
-    n: usize,
-    inverse: bool,
-    onesided: bool,
-) -> Option<(Vec<f32>, Vec<f32>)> {
-    // vDSP_DFT supports power-of-two lengths (and some others, but we restrict to pow2
-    // for predictable allocation and maximum performance).
-    if !n.is_power_of_two() || n < 4 {
-        return None;
-    }
-
-    // Use complex DFT (vDSP_DFT_zop) for all cases — straightforward and correct.
-    let result = vdsp_complex_dft(real_in, imag_in, n, inverse, onesided);
-    if result.is_some() {
-        DFT_VDSP_TEST_HITS.fetch_add(1, Ordering::Relaxed);
-    }
-    result
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-fn vdsp_complex_dft(
-    real_in: &[f32],
-    imag_in: &[f32],
-    n: usize,
-    inverse: bool,
-    onesided: bool,
-) -> Option<(Vec<f32>, Vec<f32>)> {
-    use std::ptr;
-
-    let direction = if inverse {
-        VDSP_DFT_INVERSE
-    } else {
-        VDSP_DFT_FORWARD
-    };
-    let setup = unsafe { vDSP_DFT_zop_CreateSetup(ptr::null(), n as u64, direction) };
-    if setup.is_null() {
-        return None;
-    }
-
-    let mut or_buf = vec![0.0f32; n];
-    let mut oi_buf = vec![0.0f32; n];
-
-    unsafe {
-        vDSP_DFT_Execute(
-            setup,
-            real_in.as_ptr(),
-            imag_in.as_ptr(),
-            or_buf.as_mut_ptr(),
-            oi_buf.as_mut_ptr(),
-        );
-        vDSP_DFT_DestroySetup(setup);
-    }
-
-    // vDSP does not normalize inverse. ONNX DFT inverse divides by N.
-    if inverse {
-        let scale = 1.0 / n as f32;
-        for x in or_buf.iter_mut() {
-            *x *= scale;
-        }
-        for x in oi_buf.iter_mut() {
-            *x *= scale;
-        }
-    }
-
+    let mut real_out = vec![0.0; n];
+    let mut imag_out = vec![0.0; n];
+    compute_dft_into(real_in, imag_in, &mut real_out, &mut imag_out, inverse);
     if onesided {
         let half = n / 2 + 1;
-        or_buf.truncate(half);
-        oi_buf.truncate(half);
+        real_out.truncate(half);
+        imag_out.truncate(half);
+    }
+    (real_out, imag_out)
+}
+
+/// Compute one DFT into caller-owned full-length buffers.
+pub(super) fn compute_dft_into(
+    real_in: &[f32],
+    imag_in: &[f32],
+    real_out: &mut [f32],
+    imag_out: &mut [f32],
+    inverse: bool,
+) {
+    DftPlan::new(real_in.len(), inverse).transform(real_in, imag_in, real_out, imag_out);
+}
+
+/// A transform plan reusable across STFT frames of one fixed length.
+pub(super) struct DftPlan {
+    n: usize,
+    inverse: bool,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    vdsp_setup: VdspDftSetup,
+}
+
+impl DftPlan {
+    pub(super) fn new(n: usize, inverse: bool) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let vdsp_setup = if n.is_power_of_two() && n >= 4 {
+            let direction = if inverse {
+                VDSP_DFT_INVERSE
+            } else {
+                VDSP_DFT_FORWARD
+            };
+            unsafe { vDSP_DFT_zop_CreateSetup(std::ptr::null(), n as u64, direction) }
+        } else {
+            std::ptr::null()
+        };
+        Self {
+            n,
+            inverse,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            vdsp_setup,
+        }
     }
 
-    Some((or_buf, oi_buf))
+    pub(super) fn transform(
+        &self,
+        real_in: &[f32],
+        imag_in: &[f32],
+        real_out: &mut [f32],
+        imag_out: &mut [f32],
+    ) {
+        debug_assert_eq!(real_in.len(), self.n);
+        debug_assert_eq!(imag_in.len(), self.n);
+        debug_assert_eq!(real_out.len(), self.n);
+        debug_assert_eq!(imag_out.len(), self.n);
+
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if !self.vdsp_setup.is_null() {
+            unsafe {
+                vDSP_DFT_Execute(
+                    self.vdsp_setup,
+                    real_in.as_ptr(),
+                    imag_in.as_ptr(),
+                    real_out.as_mut_ptr(),
+                    imag_out.as_mut_ptr(),
+                );
+            }
+            if self.inverse {
+                let scale = 1.0 / self.n as f32;
+                for value in real_out.iter_mut().chain(imag_out.iter_mut()) {
+                    *value *= scale;
+                }
+            }
+            DFT_VDSP_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        if self.n.is_power_of_two() && self.n > 1 {
+            DFT_FFT_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+            real_out.copy_from_slice(real_in);
+            imag_out.copy_from_slice(imag_in);
+            fft_radix2_in_place(real_out, imag_out, self.inverse);
+        } else {
+            naive_dft_into(real_in, imag_in, real_out, imag_out, self.inverse);
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+impl Drop for DftPlan {
+    fn drop(&mut self) {
+        if !self.vdsp_setup.is_null() {
+            unsafe {
+                vDSP_DFT_DestroySetup(self.vdsp_setup);
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -368,6 +380,7 @@ unsafe extern "C" {
 }
 
 /// Cooley–Tukey radix-2 FFT for power-of-two lengths.
+#[cfg(test)]
 fn fft_radix2(
     real_in: &[f32],
     imag_in: &[f32],
@@ -379,6 +392,21 @@ fn fft_radix2(
 
     let mut real = real_in.to_vec();
     let mut imag = imag_in.to_vec();
+    fft_radix2_in_place(&mut real, &mut imag, inverse);
+
+    if onesided {
+        let half = n / 2 + 1;
+        real.truncate(half);
+        imag.truncate(half);
+    }
+
+    (real, imag)
+}
+
+fn fft_radix2_in_place(real: &mut [f32], imag: &mut [f32], inverse: bool) {
+    let n = real.len();
+    debug_assert!(n.is_power_of_two() && n > 1);
+    debug_assert_eq!(imag.len(), n);
 
     // Bit-reversal permutation.
     let bits = n.trailing_zeros();
@@ -422,17 +450,10 @@ fn fft_radix2(
             *x *= scale;
         }
     }
-
-    if onesided {
-        let half = n / 2 + 1;
-        real.truncate(half);
-        imag.truncate(half);
-    }
-
-    (real, imag)
 }
 
 /// Naive O(N²) DFT for arbitrary lengths.
+#[cfg(test)]
 fn naive_dft(
     real_in: &[f32],
     imag_in: &[f32],
@@ -443,9 +464,23 @@ fn naive_dft(
     let out_len = if onesided { n / 2 + 1 } else { n };
     let mut real_out = vec![0.0f32; out_len];
     let mut imag_out = vec![0.0f32; out_len];
+    naive_dft_into(real_in, imag_in, &mut real_out, &mut imag_out, inverse);
+    (real_out, imag_out)
+}
 
+fn naive_dft_into(
+    real_in: &[f32],
+    imag_in: &[f32],
+    real_out: &mut [f32],
+    imag_out: &mut [f32],
+    inverse: bool,
+) {
+    let n = real_in.len();
+    debug_assert_eq!(imag_in.len(), n);
+    debug_assert_eq!(real_out.len(), imag_out.len());
+    debug_assert!(real_out.len() <= n);
     let sign: f32 = if inverse { 1.0 } else { -1.0 };
-    for k in 0..out_len {
+    for k in 0..real_out.len() {
         let mut sum_re = 0.0f32;
         let mut sum_im = 0.0f32;
         for t in 0..n {
@@ -463,8 +498,6 @@ fn naive_dft(
         real_out[k] = sum_re;
         imag_out[k] = sum_im;
     }
-
-    (real_out, imag_out)
 }
 
 #[cfg(test)]

@@ -162,28 +162,125 @@ fn stft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
     };
     let dtype = signal.dtype;
     let rank = signal.shape.len();
-    if rank < 2 {
+    if rank != 3 {
         return Err(ShapeInferError::InvalidRank {
             op: "STFT".into(),
             index: 0,
             rank,
-            detail: "signal must have rank >= 2".into(),
+            detail: "signal must have rank 3: [batch, signal_length, 1|2]".into(),
+        });
+    }
+
+    if let Some(components) = signal.shape[2].as_const()
+        && components != 1
+        && components != 2
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: format!(
+                "signal's last dimension must be 1 (real) or 2 (complex), got {components}"
+            ),
         });
     }
 
     let batch = signal.shape[0].clone();
     let signal_length = signal.shape[1].as_const();
+    if let Some(shape) = ctx.input_shape(1)
+        && !shape.is_empty()
+    {
+        return Err(ShapeInferError::InvalidRank {
+            op: "STFT".into(),
+            index: 1,
+            rank: shape.len(),
+            detail: "frame_step must be a scalar".into(),
+        });
+    }
     let frame_step = scalar_int(ctx, 1);
+    if let Some(step) = frame_step
+        && step <= 0
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: format!("frame_step must be greater than zero, got {step}"),
+        });
+    }
 
-    // The transform size is the frame_length scalar if present, else the length
-    // of the window vector.
-    let frame_length = ctx.has_input(3).then(|| scalar_int(ctx, 3)).flatten();
-    let window_length = ctx.has_input(2).then(|| {
-        ctx.input_shape(2)
-            .and_then(<[DimExpr]>::first)
-            .and_then(DimExpr::as_const)
-    });
-    let dft_size = frame_length.or(window_length.flatten());
+    let has_window = ctx.has_input(2);
+    let has_frame_length = ctx.has_input(3);
+    if !has_window && !has_frame_length {
+        return Err(ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: "either optional window or frame_length must be provided".into(),
+        });
+    }
+
+    let window_length = if has_window {
+        let shape = ctx.input_shape(2).ok_or_else(|| ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: "window input has no tensor shape".into(),
+        })?;
+        if shape.len() != 1 {
+            return Err(ShapeInferError::InvalidRank {
+                op: "STFT".into(),
+                index: 2,
+                rank: shape.len(),
+                detail: "window must have rank 1".into(),
+            });
+        }
+        let length = shape[0].as_const();
+        if let Some(length) = length
+            && length <= 0
+        {
+            return Err(ShapeInferError::Invalid {
+                op: "STFT".into(),
+                detail: format!("window length must be greater than zero, got {length}"),
+            });
+        }
+        length
+    } else {
+        None
+    };
+
+    let frame_length = if has_frame_length {
+        if let Some(shape) = ctx.input_shape(3)
+            && !shape.is_empty()
+        {
+            return Err(ShapeInferError::InvalidRank {
+                op: "STFT".into(),
+                index: 3,
+                rank: shape.len(),
+                detail: "frame_length must be a scalar".into(),
+            });
+        }
+        let length = scalar_int(ctx, 3);
+        if let Some(length) = length
+            && length <= 0
+        {
+            return Err(ShapeInferError::Invalid {
+                op: "STFT".into(),
+                detail: format!("frame_length must be greater than zero, got {length}"),
+            });
+        }
+        length
+    } else {
+        None
+    };
+    if let (Some(window), Some(frame)) = (window_length, frame_length)
+        && window != frame
+    {
+        return Err(ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: format!("window length {window} must equal frame_length {frame}"),
+        });
+    }
+    // When frame_length is present but value-unknown, the transform size stays
+    // unknown even if the window length is known: equality still has to be
+    // validated once the scalar value arrives.
+    let dft_size = if has_frame_length {
+        frame_length
+    } else {
+        window_length
+    };
 
     // STFT's `onesided` defaults to 1, unlike DFT.
     let onesided = ctx
@@ -192,10 +289,24 @@ fn stft(ctx: &mut InferenceContext) -> Result<(), ShapeInferError> {
         .and_then(Attribute::as_int)
         .unwrap_or(1)
         != 0;
+    if onesided && signal.shape[2].as_const() == Some(2) {
+        return Err(ShapeInferError::Invalid {
+            op: "STFT".into(),
+            detail: "onesided=1 requires a real signal (last dimension 1)".into(),
+        });
+    }
 
     let bins = dft_size.map(|size| if onesided { onesided_bins(size) } else { size });
     let frames = match (signal_length, dft_size, frame_step) {
-        (Some(length), Some(size), Some(step)) if step != 0 => Some((length - size) / step + 1),
+        (Some(length), Some(size), Some(_)) if size > length => {
+            return Err(ShapeInferError::Invalid {
+                op: "STFT".into(),
+                detail: format!(
+                    "frame length {size} exceeds signal length {length}; STFT uses complete unpadded frames"
+                ),
+            });
+        }
+        (Some(length), Some(size), Some(step)) => Some((length - size) / step + 1),
         _ => None,
     };
 
