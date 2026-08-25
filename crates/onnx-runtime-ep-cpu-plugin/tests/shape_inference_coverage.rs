@@ -47,22 +47,16 @@ const DECLINED: &[(&str, &str)] = &[
     ("", "NonMaxSuppression"), // output length = number of boxes kept
     ("", "NonZero"),           // output length = count of non-zeros
     ("", "Unique"),            // output length = number of distinct values
-    ("", "BlackmanWindow"),    // size comes from the input tensor's value
-    ("", "HammingWindow"),
-    ("", "HannWindow"),
-    ("", "ConstantOfShape"), // shape comes from input[0]'s values
-    ("", "Expand"),          // shape comes from input[1]'s values
-    ("", "Range"),           // length = ceil((limit - start) / delta)
-    ("", "Tile"),            // repeats come from input[1]'s values
-    ("", "OneHot"),          // depth comes from input[1]'s value
-    ("", "Pad"),             // pads come from input[1]'s values (opset 11+)
-    ("", "TopK"),            // K comes from input[1]'s value (opset 10+)
-    ("", "Split"),           // split sizes come from input[1] (opset 13+)
-    ("", "Unsqueeze"),       // axes come from input[1] (opset 13+)
-    ("", "Resize"),          // scales/sizes come from input[2]/input[3]
-    ("", "AffineGrid"),      // output size comes from input[1]'s values
-    ("", "Col2Im"),          // image_shape comes from input[1]'s values
-    ("", "CenterCropPad"),   // target shape comes from input[1]'s values
+    ("", "Range"),             // length = ceil((limit - start) / delta)
+    ("", "OneHot"),            // depth comes from input[1]'s value
+    ("", "Pad"),               // pads come from input[1]'s values (opset 11+)
+    ("", "TopK"),              // K comes from input[1]'s value (opset 10+)
+    ("", "Split"),             // split sizes come from input[1] (opset 13+)
+    ("", "Unsqueeze"),         // axes come from input[1] (opset 13+)
+    ("", "Resize"),            // scales/sizes come from input[2]/input[3]
+    ("", "AffineGrid"),        // output size comes from input[1]'s values
+    ("", "Col2Im"),            // image_shape comes from input[1]'s values
+    ("", "CenterCropPad"),     // target shape comes from input[1]'s values
     // Several of these carry a *constant initializer* in practice, so a
     // future pass that resolves initializer values at capability time could
     // claim them. Until such a pass exists, declining is the honest answer.
@@ -83,13 +77,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       have a kernel, and we hand them to ORT anyway. This is the work.
     //
     //       Shape-preserving — output shape == input[0].shape. One line each.
-    ("", "BitwiseNot"),
-    ("", "CastLike"),
-    ("", "CumProd"),
-    ("", "CumSum"),
-    ("", "DequantizeLinear"),
-    ("", "EyeLike"),
-    ("", "QuantizeLinear"),
     //       Pooling and CNN geometry: inferrable from `kernel_shape`,
     //       `strides`, `pads`, `dilations` and `ceil_mode`, exactly as
     //       `build_conv` already does for `Conv`.
