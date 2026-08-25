@@ -29,9 +29,3 @@ mod transform;
 mod program;
 pub use program::ImagePreprocessor;
 use program::{CoordinateOrder, PatchChannelOrder, PatchTemporalOrder, PatchifySpec};
-
-fn is_grouping_output_content(content: &str) -> bool {
-    content == onnx_genai_metadata::PACK_OFFSETS_CONTENT
-        || content == onnx_genai_metadata::PACK_OWNER_CONTENT
-        || onnx_genai_metadata::LENGTH_CONTENT_ROLES.contains(&content)
-}
