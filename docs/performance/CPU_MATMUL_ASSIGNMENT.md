@@ -3107,3 +3107,45 @@ ratios on this host are not reproducible, whichever arm they favour.
   investigation, one of them the very same benchmark binary. Cross-agent notice
   before a long run is not politeness, it is a correctness requirement for
   anyone publishing a ratio.
+  **Notice is now known to be insufficient, and the harnesses no longer rely on
+  it.** Announcing before and after a run has a *delivery* step, and the
+  delivery step failed repeatedly: one message reached me four times via three
+  different agents, replies addressed to a second agent were landing in a
+  third's session, and at one point both of us were idling on the other, each
+  believing the ball was in the other's court — while both behaved correctly.
+  A release that is never received is indistinguishable from one that was never
+  sent. `scripts/hostlock.sh` has no delivery step: every participant observes
+  the same filesystem primitive directly. `acc0_gap_matrix.py` now provides a
+  `HostLock` context manager and the three live harnesses take it for the whole
+  sweep (not per cell — a per-cell acquire hands the box back between cells and
+  lets a competitor land inside a matrix whose cells are only comparable if
+  they all saw the same machine). It **fails closed**: a number measured
+  against somebody else's benchmark is not a slow number, it is a meaningless
+  one, and `LoadWatch` can only tell you that afterwards.
+  This is not theoretical. On the first two runs after wiring it up the lock
+  refused to start, once against `gaff-1` validating #1926 and once against
+  `seb` running a t=16 A/B — both at moments when I had already announced the
+  host was free and believed it was mine. Notice had missed both.
+* **Two defects found while adopting the lock, both in how the harness called
+  it rather than in the lock.** Recorded because they are the same class this
+  file keeps re-finding. (1) `--timeout` is only honoured together with
+  `--wait`; passing it alone is accepted and silently does nothing, so the
+  harness's "wait up to 30 minutes" was inert — the same shape as an env knob
+  that parses and never reaches the code it names. (2) `acquire` defaults to
+  `--ttl 3600`, and a TTL does not mean "release this if I abandon it", it
+  means "release this on the clock, whether or not I am still running". These
+  sweeps routinely run for hours, so the default would have handed the box to a
+  second measurer mid-sweep and contaminated *both* sets of numbers, while
+  every log line still read as held. The harness now passes `--ttl 0` and
+  anchors liveness to its own pid, and `--strict-reap` so that an acquire which
+  could only succeed by reaping a dead holder refuses instead: reclaiming a
+  lock does not stop the dead holder's processes from burning cores.
+* **Lock state is recorded with the numbers, not asserted beside them.** Every
+  `LoadWatch` region samples the lock and warns when a timed region runs
+  unlocked, or runs while somebody else holds the box; the sampled state is
+  stored in the output JSON (per row for the gap matrix, once per sweep for the
+  straggler harnesses). A result taken on a shared box stays identifiable as
+  such after the terminal scrollback is gone, instead of resting on the
+  operator's memory of whether they announced it. This is the same principle as
+  asserting realized placement rather than trusting the width label: make the
+  artifact carry the answer.
