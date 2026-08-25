@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 
 # The status checks the `main` branch ruleset marks required. A job outside this
 # set can go red without blocking a merge, so a package tested only there is,
@@ -103,12 +104,76 @@ def lane_packages(lane: str) -> list[str]:
             selected = ORT_BACKED & packages
         case "linux-only":
             selected = LINUX_ONLY & packages
+        case "lint":
+            # Every package any test lane compiles. `cargo clippy` only ever
+            # *checks*, so the ort-sys/CUDA constraint that splits the test
+            # lanes does not apply to it: nothing here is linked or run.
+            selected = packages - denied
         case _:
             raise SystemExit(f"unknown lane '{lane}'")
     return sorted(selected)
 
 
-def verify(simulate_missing: str | None = None) -> int:
+LANES = ("offline-linux", "offline-cross-platform", "ort-backed", "linux-only", "lint")
+
+# `cargo clippy ...` spelled across a folded YAML scalar. A step ends at a blank
+# line or at the next `- name:`/key at or below the invocation's indentation.
+_CLIPPY = re.compile(r"^(?P<indent>\s*)(?:run:\s*)?.*\bcargo clippy\b")
+_GENERATOR = re.compile(
+    r"\$\(\s*python3?\s+\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)\s*\)"
+)
+
+
+def clippy_commands() -> list[tuple[Path, str]]:
+    """Every `cargo clippy` invocation in `.github/workflows`, as raw text.
+
+    Comment lines are skipped. A YAML comment that merely *discusses* clippy is
+    not an invocation, and counting one would let a package claim lint coverage
+    from prose -- which is how the scanner first behaved, and the invocation
+    count is what gave it away.
+    """
+    found: list[tuple[Path, str]] = []
+    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+        lines = workflow.read_text().splitlines()
+        for index, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                continue
+            match = _CLIPPY.match(line)
+            if not match:
+                continue
+            base = len(match.group("indent"))
+            block = [line]
+            for follow in lines[index + 1 :]:
+                if not follow.strip():
+                    break
+                indent = len(follow) - len(follow.lstrip())
+                if indent <= base and (
+                    follow.lstrip().startswith("#")
+                    or re.match(r"\s*(-\s+\w+:|\w[\w-]*:)", follow)
+                ):
+                    break
+                block.append(follow)
+            found.append((workflow, "\n".join(block)))
+    return found
+
+
+def linted_packages() -> set[str]:
+    """Packages reached by some clippy invocation, generators expanded.
+
+    Generator calls are *expanded*, not skipped: a `-p` list that is computed
+    counts exactly as much as one that is spelled out, and a list that is
+    spelled out cannot hide behind the fact that some other step computes one.
+    """
+    linted: set[str] = set()
+    for _, command in clippy_commands():
+        for lane in _GENERATOR.findall(command):
+            if lane in LANES:
+                linted.update(lane_packages(lane))
+        linted.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", command))
+    return linted
+
+
+def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = None) -> int:
     packages = workspace_packages()
     tested = (
         set(lane_packages("offline-linux"))
@@ -122,7 +187,16 @@ def verify(simulate_missing: str | None = None) -> int:
     uncovered = sorted(packages - tested - denied)
     stale_tested = sorted(tested - packages)
     stale_denied = sorted(denied - packages)
+
+    commands = clippy_commands()
+    linted = linted_packages() & packages
+    if simulate_unlinted:
+        linted.discard(simulate_unlinted)
+    unlinted = sorted(tested - linted)
+
+    failed = False
     if uncovered or stale_tested or stale_denied:
+        failed = True
         print("Workspace test package coverage check failed.", file=sys.stderr)
         if uncovered:
             print(
@@ -139,9 +213,42 @@ def verify(simulate_missing: str | None = None) -> int:
             print(f"Non-workspace package(s) in tested lanes: {stale_tested}", file=sys.stderr)
         if stale_denied:
             print(f"Non-workspace package(s) in deny-list: {stale_denied}", file=sys.stderr)
+
+    # Positive control: the lint half is computed by scanning workflow text, so
+    # a scanner that silently matches nothing would report full coverage of an
+    # empty set. Finding no clippy at all means the scanner broke, not that the
+    # repo stopped linting.
+    if not commands:
+        failed = True
+        print(
+            f"No `cargo clippy` invocation found under {WORKFLOWS}; the lint-coverage "
+            "scanner is broken or the workflows moved.",
+            file=sys.stderr,
+        )
+    if unlinted:
+        failed = True
+        print("Workspace lint coverage check failed.", file=sys.stderr)
+        print(
+            "Package(s) are compiled and tested by CI and linted by nothing:",
+            file=sys.stderr,
+        )
+        for package in unlinted:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "Every tested package must be reached by some `cargo clippy` step. The offline\n"
+            "clippy steps select `cargo-args lint`, so a package added to a test lane is\n"
+            "linted automatically -- this failing means a clippy step went back to a\n"
+            "hand-written -p list, or a new lane is tested but not linted.",
+            file=sys.stderr,
+        )
+    if failed:
         return 1
     print(
         f"workspace test package coverage ok: {len(tested)} tested, {len(denied)} denied"
+    )
+    print(
+        f"workspace lint coverage ok: {len(tested)} tested, all linted by "
+        f"{len(commands)} clippy invocation(s)"
     )
     return 0
 
@@ -996,6 +1103,13 @@ def self_test() -> int:
             1,
             ["onnx-genai-engine"],
         ),
+        (
+            "verify --simulate-unlinted onnx-runtime-ep-cpu",
+            verify,
+            {"simulate_unlinted": "onnx-runtime-ep-cpu"},
+            1,
+            ["onnx-runtime-ep-cpu"],
+        ),
         ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
         (
             "verify-required-tier --simulate-dropped-lane ort-backed",
@@ -1046,12 +1160,16 @@ def main() -> int:
     cargo_args = subparsers.add_parser("cargo-args")
     cargo_args.add_argument(
         "lane",
-        choices=["offline-linux", "offline-cross-platform", "ort-backed", "linux-only"],
+        choices=list(LANES),
     )
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument(
         "--simulate-missing",
         help="drop one package from the derived tested set to prove the guard fails",
+    )
+    verify_parser.add_argument(
+        "--simulate-unlinted",
+        help="drop one package from the scanned linted set to prove the lint guard fails",
     )
     subparsers.add_parser("self-test")
     required_parser = subparsers.add_parser("verify-required-tier")
@@ -1062,7 +1180,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "verify":
-        return verify(args.simulate_missing)
+        return verify(args.simulate_missing, args.simulate_unlinted)
     if args.command == "self-test":
         return self_test()
     if args.command == "verify-required-tier":
