@@ -2,12 +2,19 @@
 
 use std::cmp::Ordering;
 
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, KernelSizedOutput, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{Attribute, DataType, Node};
 
 use super::{elem_size, to_dense_bytes, write_dense_bytes};
 use crate::dtype::unsupported_dtype;
 use crate::strided::numel;
+
+#[cfg(test)]
+std::thread_local! {
+    static UNIQUE_PLAN_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub struct UniqueKernel {
     axis: Option<i64>,
@@ -34,15 +41,76 @@ impl KernelFactory for UniqueFactory {
 
 impl Kernel for UniqueKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        if inputs.len() != 1 || !(1..=4).contains(&outputs.len()) {
+        let requested_outputs: Vec<bool> =
+            outputs.iter().map(|output| !output.is_absent()).collect();
+        let owned = self.compute_owned_outputs(inputs, &requested_outputs)?;
+        if owned.len() != outputs.len() {
             return Err(EpError::KernelFailed(format!(
-                "Unique: expected 1 input and 1..=4 outputs, got {} inputs and {} outputs",
-                inputs.len(),
+                "Unique: internal output count mismatch: produced {}, expected {}",
+                owned.len(),
                 outputs.len()
             )));
         }
 
+        for (slot, (output, value)) in outputs.iter_mut().zip(owned).enumerate() {
+            let Some(value) = value else {
+                if !output.is_absent() {
+                    return Err(EpError::KernelFailed(format!(
+                        "Unique: output slot {slot} was requested but not produced"
+                    )));
+                }
+                continue;
+            };
+            validate_output(output, value.dtype, &value.shape, output_name(slot))?;
+            write_dense_bytes(output, &value.bytes)?;
+        }
+        Ok(())
+    }
+
+    fn has_kernel_sized_outputs(&self) -> bool {
+        true
+    }
+
+    fn execute_kernel_sized(
+        &self,
+        inputs: &[TensorView],
+        requested_outputs: &[bool],
+    ) -> Result<Vec<Option<KernelSizedOutput>>> {
+        self.compute_owned_outputs(inputs, requested_outputs)
+    }
+
+    fn supports_strided_input(&self, input_idx: usize) -> bool {
+        input_idx == 0
+    }
+}
+
+impl UniqueKernel {
+    fn compute_owned_outputs(
+        &self,
+        inputs: &[TensorView],
+        requested_outputs: &[bool],
+    ) -> Result<Vec<Option<KernelSizedOutput>>> {
+        if inputs.len() != 1 || !(1..=4).contains(&requested_outputs.len()) {
+            return Err(EpError::KernelFailed(format!(
+                "Unique: expected 1 input and 1..=4 output slots, got {} inputs and {} slots",
+                inputs.len(),
+                requested_outputs.len()
+            )));
+        }
+        if !requested_outputs[0] {
+            return Err(EpError::KernelFailed(
+                "Unique: required output Y (slot 0) is absent".into(),
+            ));
+        }
+
         let input = &inputs[0];
+        if !input.device.is_host_accessible() {
+            return Err(EpError::KernelFailed(format!(
+                "Unique: kernel-sized output execution is host-only, but input 0 is on {:?}; \
+                 place Unique on a host EP instead of copying device payloads implicitly",
+                input.device
+            )));
+        }
         ensure_supported_dtype(input.dtype)?;
 
         let element_size = elem_size(input.dtype)?;
@@ -55,49 +123,63 @@ impl Kernel for UniqueKernel {
             self.axis,
             self.sorted,
         )?;
-
-        let expected_y_shape = match plan.axis {
+        let unique_len = plan.first_indices.len();
+        let y_shape = match plan.axis {
             Some(axis) => {
                 let mut shape = input.shape.to_vec();
-                shape[axis] = plan.first_indices.len();
+                shape[axis] = unique_len;
                 shape
             }
-            None => vec![plan.first_indices.len()],
+            None => vec![unique_len],
         };
-        validate_output(&outputs[0], input.dtype, &expected_y_shape, "Y")?;
-        let y = gather_y(
-            &dense,
-            input.shape,
-            element_size,
-            plan.axis,
-            &plan.first_indices,
-        );
-        write_dense_bytes(&mut outputs[0], &y)?;
-
-        let unique_shape = [plan.first_indices.len()];
-        if outputs.len() >= 2 {
-            validate_output(&outputs[1], DataType::Int64, &unique_shape, "indices")?;
-            write_i64(&mut outputs[1], &plan.first_indices)?;
+        let mut outputs = Vec::with_capacity(requested_outputs.len());
+        for (slot, &requested) in requested_outputs.iter().enumerate() {
+            if !requested {
+                outputs.push(None);
+                continue;
+            }
+            let output = match slot {
+                0 => KernelSizedOutput {
+                    shape: y_shape.clone(),
+                    dtype: input.dtype,
+                    bytes: gather_y(
+                        &dense,
+                        input.shape,
+                        element_size,
+                        plan.axis,
+                        &plan.first_indices,
+                    ),
+                },
+                1 => KernelSizedOutput {
+                    shape: vec![unique_len],
+                    dtype: DataType::Int64,
+                    bytes: encode_i64(&plan.first_indices)?,
+                },
+                2 => KernelSizedOutput {
+                    shape: vec![plan.inverse_indices.len()],
+                    dtype: DataType::Int64,
+                    bytes: encode_i64(&plan.inverse_indices)?,
+                },
+                3 => KernelSizedOutput {
+                    shape: vec![unique_len],
+                    dtype: DataType::Int64,
+                    bytes: encode_i64(&plan.counts)?,
+                },
+                _ => unreachable!("output slot count was checked"),
+            };
+            outputs.push(Some(output));
         }
-        if outputs.len() >= 3 {
-            let inverse_shape = [plan.inverse_indices.len()];
-            validate_output(
-                &outputs[2],
-                DataType::Int64,
-                &inverse_shape,
-                "inverse_indices",
-            )?;
-            write_i64(&mut outputs[2], &plan.inverse_indices)?;
-        }
-        if outputs.len() == 4 {
-            validate_output(&outputs[3], DataType::Int64, &unique_shape, "counts")?;
-            write_i64(&mut outputs[3], &plan.counts)?;
-        }
-        Ok(())
+        Ok(outputs)
     }
+}
 
-    fn supports_strided_input(&self, input_idx: usize) -> bool {
-        input_idx == 0
+fn output_name(slot: usize) -> &'static str {
+    match slot {
+        0 => "Y",
+        1 => "indices",
+        2 => "inverse_indices",
+        3 => "counts",
+        _ => "unknown",
     }
 }
 
@@ -116,6 +198,9 @@ fn unique_plan(
     axis: Option<i64>,
     sorted: bool,
 ) -> Result<UniquePlan> {
+    #[cfg(test)]
+    UNIQUE_PLAN_RUNS.with(|runs| runs.set(runs.get() + 1));
+
     let axis = axis
         .map(|axis| normalize_axis(axis, shape.len()))
         .transpose()?;
@@ -352,14 +437,18 @@ fn validate_output(output: &TensorMut, dtype: DataType, shape: &[usize], name: &
     Ok(())
 }
 
-fn write_i64(output: &mut TensorMut, values: &[usize]) -> Result<()> {
-    let mut bytes = Vec::with_capacity(values.len() * 8);
+fn encode_i64(values: &[usize]) -> Result<Vec<u8>> {
+    let capacity = values
+        .len()
+        .checked_mul(std::mem::size_of::<i64>())
+        .ok_or_else(|| EpError::KernelFailed("Unique: int64 output byte length overflow".into()))?;
+    let mut bytes = Vec::with_capacity(capacity);
     for &value in values {
         let value = i64::try_from(value)
             .map_err(|_| EpError::KernelFailed("Unique: index exceeds i64 range".into()))?;
         bytes.extend_from_slice(&value.to_le_bytes());
     }
-    write_dense_bytes(output, &bytes)
+    Ok(bytes)
 }
 
 fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
@@ -376,6 +465,22 @@ fn optional_int_attr(node: &Node, name: &str) -> Result<Option<i64>> {
 mod tests {
     use super::*;
     use crate::kernels::testutil::Owned;
+
+    fn output_f32(output: &KernelSizedOutput) -> Vec<f32> {
+        output
+            .bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn output_i64(output: &KernelSizedOutput) -> Vec<i64> {
+        output
+            .bytes
+            .chunks_exact(8)
+            .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
 
     #[test]
     fn sorts_axis_slices_lexicographically() {
@@ -490,5 +595,108 @@ mod tests {
         assert!(counts.iter().all(|&count| count == 1));
         assert_eq!(indices[0], item_count - 1);
         assert_eq!(indices[item_count - 1], 0);
+    }
+
+    #[test]
+    fn kernel_sized_all_outputs_plan_once_and_preserve_mixed_dtypes() {
+        UNIQUE_PLAN_RUNS.with(|runs| runs.set(0));
+        let input = Owned::f32(&[6], &[2., 1., 1., 3., 4., 3.]);
+        let outputs = UniqueKernel {
+            axis: None,
+            sorted: false,
+        }
+        .execute_kernel_sized(&[input.view()], &[true, true, true, true])
+        .unwrap();
+
+        assert_eq!(
+            UNIQUE_PLAN_RUNS.with(std::cell::Cell::get),
+            1,
+            "one deferred execution must run Unique planning exactly once"
+        );
+        let outputs: Vec<_> = outputs
+            .iter()
+            .map(|output| output.as_ref().unwrap())
+            .collect();
+        assert_eq!(outputs[0].shape, [4]);
+        assert_eq!(outputs[0].dtype, DataType::Float32);
+        assert_eq!(output_f32(outputs[0]), [2., 1., 3., 4.]);
+        assert_eq!(outputs[1].dtype, DataType::Int64);
+        assert_eq!(output_i64(outputs[1]), [0, 1, 3, 4]);
+        assert_eq!(outputs[2].shape, [6]);
+        assert_eq!(output_i64(outputs[2]), [0, 1, 1, 2, 3, 2]);
+        assert_eq!(output_i64(outputs[3]), [1, 2, 2, 1]);
+    }
+
+    #[test]
+    fn kernel_sized_optional_subset_does_not_materialize_absent_slots() {
+        let input = Owned::f32(&[5], &[3., 1., 3., 2., 1.]);
+        let outputs = UniqueKernel {
+            axis: None,
+            sorted: true,
+        }
+        .execute_kernel_sized(&[input.view()], &[true, false, true, false])
+        .unwrap();
+
+        assert_eq!(output_f32(outputs[0].as_ref().unwrap()), [1., 2., 3.]);
+        assert!(outputs[1].is_none());
+        assert_eq!(output_i64(outputs[2].as_ref().unwrap()), [2, 0, 2, 1, 0]);
+        assert!(outputs[3].is_none());
+    }
+
+    #[test]
+    fn kernel_sized_empty_all_equal_and_all_distinct() {
+        for (values, expected) in [
+            (&[][..], &[][..]),
+            (&[7., 7., 7.][..], &[7.][..]),
+            (&[3., 1., 2.][..], &[1., 2., 3.][..]),
+        ] {
+            let input = Owned::f32(&[values.len()], values);
+            let outputs = UniqueKernel {
+                axis: None,
+                sorted: true,
+            }
+            .execute_kernel_sized(&[input.view()], &[true])
+            .unwrap();
+            assert_eq!(output_f32(outputs[0].as_ref().unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn kernel_sized_accepts_strided_input() {
+        let input = Owned::f32(&[2, 3], &[1., 2., 3., 4., 5., 6.]).with_view(&[3, 2], &[1, 3]);
+        let outputs = UniqueKernel {
+            axis: None,
+            sorted: false,
+        }
+        .execute_kernel_sized(&[input.view()], &[true])
+        .unwrap();
+        assert_eq!(
+            output_f32(outputs[0].as_ref().unwrap()),
+            [1., 4., 2., 5., 3., 6.]
+        );
+    }
+
+    #[test]
+    fn kernel_sized_rejects_device_input_before_planning() {
+        use onnx_runtime_ep_api::DevicePtr;
+        use onnx_runtime_ir::DeviceId;
+
+        UNIQUE_PLAN_RUNS.with(|runs| runs.set(0));
+        let values = [1.0f32, 2.0];
+        let view = TensorView::new(
+            DevicePtr(values.as_ptr().cast()),
+            DataType::Float32,
+            &[2],
+            &[1],
+            DeviceId::cuda(0),
+        );
+        let error = UniqueKernel {
+            axis: None,
+            sorted: true,
+        }
+        .execute_kernel_sized(&[view], &[true])
+        .unwrap_err();
+        assert!(error.to_string().contains("host-only"));
+        assert_eq!(UNIQUE_PLAN_RUNS.with(std::cell::Cell::get), 0);
     }
 }

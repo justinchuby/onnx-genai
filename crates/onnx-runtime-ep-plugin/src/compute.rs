@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::{
-    Kernel, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    Kernel, KernelSizedOutput, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement,
+    WorkspaceView,
 };
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
@@ -51,6 +52,9 @@ pub struct ConvSpatialAxis {
 /// How to infer output shapes at runtime from the concrete input shapes.
 #[derive(Clone, Debug)]
 pub enum ShapeInference {
+    /// The kernel computes data-dependent extents and owned host bytes in one
+    /// pass; Compute validates them before allocating final ORT outputs.
+    KernelSizedOutputs,
     /// Ask the native symbolic registry first, then preserve the existing
     /// plugin rule as a fallback when values remain unavailable or the native
     /// rule is stricter than the historical plugin contract.
@@ -270,6 +274,22 @@ pub enum DeclineReason {
     NodeNotShapeable(&'static str),
 }
 
+const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] = &[("", "Unique")];
+
+fn kernel_sized_output_strategy(domain: &str, op_type: &str) -> bool {
+    let domain = if domain == "ai.onnx" { "" } else { domain };
+    KERNEL_SIZED_OUTPUT_STRATEGIES
+        .iter()
+        .any(|&(expected_domain, expected_op)| domain == expected_domain && op_type == expected_op)
+}
+
+/// Exact production census for the dynamic-output anti-vacuity test.
+#[cfg(feature = "testutil")]
+#[doc(hidden)]
+pub const fn kernel_sized_output_strategy_census() -> &'static [(&'static str, &'static str)] {
+    KERNEL_SIZED_OUTPUT_STRATEGIES
+}
+
 impl ShapeInference {
     /// Full shape inference from a compiled IR `Node` plus the shapes
     /// of its inputs (may be empty slices for absent optional inputs).
@@ -281,6 +301,10 @@ impl ShapeInference {
         let op = node.op_type.as_str();
         let domain = node.domain.as_str();
         let opset = node.version.unwrap_or(0);
+
+        if kernel_sized_output_strategy(domain, op) {
+            return Self::KernelSizedOutputs;
+        }
 
         if let Some(rule) = SharedNativeShapeRule::for_node(node) {
             let fallback = match rule {
@@ -2701,8 +2725,118 @@ unsafe extern "C" fn compute_execute(
                         }
                     }
 
-                    // Infer output shapes.
                     node_probe.end();
+                    if matches!(&entry.shape_inference, ShapeInference::KernelSizedOutputs) {
+                        let requested_outputs: Vec<bool> = (0..entry.num_outputs)
+                            .map(|slot| !entry.absent_output_slots.contains(&slot))
+                            .collect();
+                        let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
+                        let deferred = match run_kernel_sized(
+                            exported,
+                            &*entry.kernel,
+                            &kernel_inputs,
+                            &requested_outputs,
+                            &entry.output_dtypes,
+                            &format!("Compute: node {node_idx}"),
+                        ) {
+                            Ok(outputs) => outputs,
+                            Err(error) => return fail_status(&error),
+                        };
+                        kernel_probe.end();
+
+                        ort_outputs.clear();
+                        new_bufs.clear();
+                        for (out_slot, output) in deferred.into_iter().enumerate() {
+                            let sink = match sinks.get(out_slot) {
+                                Some(sink) => sink,
+                                None => {
+                                    return fail_status(&format!(
+                                        "Compute: kernel-sized output slot {out_slot} has no sink"
+                                    ));
+                                }
+                            };
+                            let Some(output) = output else {
+                                if !matches!(sink, NodeOutputSink::Absent) {
+                                    return fail_status(&format!(
+                                        "Compute: absent kernel-sized output slot {out_slot} has a \
+                                         non-absent sink"
+                                    ));
+                                }
+                                continue;
+                            };
+                            match sink {
+                                NodeOutputSink::Ort(ort_idx) => {
+                                    let mut ort_output = match unsafe {
+                                        allocate_output(
+                                            api_ref,
+                                            kernel_context,
+                                            *ort_idx,
+                                            &output.shape,
+                                            output.dtype,
+                                            false,
+                                        )
+                                    } {
+                                        Ok(output) => output,
+                                        Err(error) => {
+                                            return fail_status(&format!(
+                                                "Compute: kernel-sized output slot {out_slot} \
+                                                 allocation failed: {error}"
+                                            ));
+                                        }
+                                    };
+                                    if let Err(error) =
+                                        materialize_kernel_sized(&mut ort_output, &output, out_slot)
+                                    {
+                                        return fail_status(&format!("Compute: {error}"));
+                                    }
+                                    ort_outputs.push(ort_output);
+                                }
+                                NodeOutputSink::Buffer(buf_idx) => {
+                                    let strides = contiguous_strides(&output.shape);
+                                    new_bufs.push((
+                                        *buf_idx,
+                                        IntermediateBuf {
+                                            data: output.bytes,
+                                            scratch_ptr: std::ptr::null_mut(),
+                                            shape: output.shape,
+                                            strides,
+                                            dtype: output.dtype,
+                                        },
+                                    ));
+                                }
+                                NodeOutputSink::Absent => {
+                                    return fail_status(&format!(
+                                        "Compute: present kernel-sized output slot {out_slot} has \
+                                         an absent sink"
+                                    ));
+                                }
+                            }
+                        }
+
+                        crate::dispatch_probe::count(crate::dispatch_probe::Event::NodeExecuted);
+                        EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        for (buf_idx, buf) in new_bufs.drain(..) {
+                            if buf_idx >= intermediates.len() {
+                                return fail_status(&format!(
+                                    "Compute: buffer index {buf_idx} out of range"
+                                ));
+                            }
+                            if let Some(stale) = intermediates[buf_idx].take() {
+                                recycle_host_intermediate(stale.data);
+                            }
+                            intermediates[buf_idx] = Some(buf);
+                        }
+                        for &buf_idx in
+                            &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
+                        {
+                            if let Some(dead) = intermediates[buf_idx].take() {
+                                recycle_host_intermediate(dead.data);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Infer output shapes.
                     let shape_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
                     let output_shapes = match infer_shapes(&entry.shape_inference, &kernel_inputs) {
                         Ok(s) => s,
@@ -3043,6 +3177,58 @@ unsafe extern "C" fn compute_execute(
                     }
                 }
                 bind_probe.end();
+                if matches!(&entry.shape_inference, ShapeInference::KernelSizedOutputs) {
+                    let requested_outputs: Vec<bool> = (0..entry.num_outputs)
+                        .map(|slot| !entry.absent_output_slots.contains(&slot))
+                        .collect();
+                    let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
+                    let deferred = match run_kernel_sized(
+                        exported,
+                        &*entry.kernel,
+                        kernel_inputs,
+                        &requested_outputs,
+                        &entry.output_dtypes,
+                        "Compute: node 0",
+                    ) {
+                        Ok(outputs) => outputs,
+                        Err(error) => return fail_status(&error),
+                    };
+                    kernel_probe.end();
+
+                    owned_outputs.reserve(entry.num_outputs);
+                    let mut ort_out_idx = 0usize;
+                    for (slot, output) in deferred.into_iter().enumerate() {
+                        let Some(output) = output else {
+                            continue;
+                        };
+                        let mut ort_output = match unsafe {
+                            allocate_output(
+                                api_ref,
+                                kernel_context,
+                                ort_out_idx,
+                                &output.shape,
+                                output.dtype,
+                                false,
+                            )
+                        } {
+                            Ok(output) => output,
+                            Err(error) => {
+                                return fail_status(&format!(
+                                    "Compute: kernel-sized output slot {slot} allocation failed: \
+                                     {error}"
+                                ));
+                            }
+                        };
+                        if let Err(error) = materialize_kernel_sized(&mut ort_output, &output, slot)
+                        {
+                            return fail_status(&format!("Compute: {error}"));
+                        }
+                        owned_outputs.push(ort_output);
+                        ort_out_idx += 1;
+                    }
+                    EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    return ok_status();
+                }
                 let lookup_probe = crate::dispatch_probe::Phase::DispatchLookup.enter();
                 let output_shapes = match infer_shapes(&entry.shape_inference, kernel_inputs) {
                     Ok(s) => s,
@@ -3261,6 +3447,178 @@ unsafe extern "C" fn compute_execute(
     }));
     result.unwrap_or_else(|_| fail_status("Compute: internal panic"))
 }
+
+fn run_kernel_sized(
+    exported: &ExportedComputeInfo,
+    kernel: &dyn Kernel,
+    inputs: &[TensorView<'_>],
+    requested_outputs: &[bool],
+    declared_dtypes: &[DataType],
+    context: &str,
+) -> Result<Vec<Option<KernelSizedOutput>>, String> {
+    if !exported.host_accessible || exported.device_staging.is_some() {
+        return Err(format!(
+            "{context}: kernel-sized outputs are host-only, but this EP uses device-resident \
+             tensors; place this node on a host EP (implicit D2H payload copies are not allowed)"
+        ));
+    }
+    if let Some((slot, input)) = inputs
+        .iter()
+        .enumerate()
+        .find(|(_, input)| !input.is_absent() && !input.device.is_host_accessible())
+    {
+        return Err(format!(
+            "{context}: kernel-sized outputs are host-only, but input slot {slot} is on {:?}; \
+             place this node on a host EP",
+            input.device
+        ));
+    }
+    if !kernel.has_kernel_sized_outputs() {
+        return Err(format!(
+            "{context}: shape strategy requires kernel-sized outputs, but the kernel did not opt in"
+        ));
+    }
+    if requested_outputs.len() != declared_dtypes.len() {
+        return Err(format!(
+            "{context}: output metadata mismatch: {} requested slots but {} declared dtypes",
+            requested_outputs.len(),
+            declared_dtypes.len()
+        ));
+    }
+
+    let outputs = kernel
+        .execute_kernel_sized(inputs, requested_outputs)
+        .map_err(|error| format!("{context}: kernel-sized execution failed: {error}"))?;
+    validate_kernel_sized_outputs(&outputs, requested_outputs, declared_dtypes, context)?;
+    Ok(outputs)
+}
+
+fn validate_kernel_sized_outputs(
+    outputs: &[Option<KernelSizedOutput>],
+    requested_outputs: &[bool],
+    declared_dtypes: &[DataType],
+    context: &str,
+) -> Result<(), String> {
+    if outputs.len() != requested_outputs.len() {
+        return Err(format!(
+            "{context}: kernel-sized output count mismatch: kernel returned {}, node has {} slots",
+            outputs.len(),
+            requested_outputs.len()
+        ));
+    }
+
+    for (slot, ((output, &requested), &declared_dtype)) in outputs
+        .iter()
+        .zip(requested_outputs)
+        .zip(declared_dtypes)
+        .enumerate()
+    {
+        match (requested, output) {
+            (false, None) => continue,
+            (false, Some(_)) => {
+                return Err(format!(
+                    "{context}: absent output slot {slot} unexpectedly returned bytes"
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "{context}: present output slot {slot} returned no bytes"
+                ));
+            }
+            (true, Some(output)) => {
+                if declared_dtype == DataType::Undefined {
+                    return Err(format!(
+                        "{context}: present output slot {slot} has no declared dtype"
+                    ));
+                }
+                if output.dtype != declared_dtype {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} returned dtype {:?}, but the \
+                         graph declares {:?}",
+                        output.dtype, declared_dtype
+                    ));
+                }
+                let element_size = output.dtype.byte_size();
+                if element_size == 0 {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} has unsupported zero-sized \
+                         dtype {:?}",
+                        output.dtype
+                    ));
+                }
+                let numel = output.shape.iter().try_fold(1usize, |product, &extent| {
+                    if extent > i64::MAX as usize {
+                        return Err(format!(
+                            "{context}: kernel-sized output slot {slot} extent {extent} exceeds \
+                             ORT's i64 shape range"
+                        ));
+                    }
+                    product.checked_mul(extent).ok_or_else(|| {
+                        format!(
+                            "{context}: kernel-sized output slot {slot} shape {:?} overflows usize",
+                            output.shape
+                        )
+                    })
+                })?;
+                let expected_bytes = numel.checked_mul(element_size).ok_or_else(|| {
+                    format!(
+                        "{context}: kernel-sized output slot {slot} byte length overflows usize \
+                         for shape {:?} and dtype {:?}",
+                        output.shape, output.dtype
+                    )
+                })?;
+                if output.bytes.len() != expected_bytes {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} returned {} bytes, expected \
+                         {expected_bytes} for shape {:?} and dtype {:?}",
+                        output.bytes.len(),
+                        output.shape,
+                        output.dtype
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn materialize_kernel_sized(
+    output: &mut crate::kernel_ctx::OwnedOutput,
+    value: &KernelSizedOutput,
+    slot: usize,
+) -> Result<(), String> {
+    if output.dtype != value.dtype || output.shape.as_slice() != value.shape.as_slice() {
+        return Err(format!(
+            "kernel-sized output slot {slot} allocation mismatch: ORT returned {:?}{:?}, \
+             requested {:?}{:?}",
+            output.dtype, output.shape, value.dtype, value.shape
+        ));
+    }
+    if !value.bytes.is_empty() {
+        if output.data_ptr.is_null() {
+            return Err(format!(
+                "kernel-sized output slot {slot} allocation returned a null data pointer for {} \
+                 bytes",
+                value.bytes.len()
+            ));
+        }
+        // SAFETY: validation proved the source byte length equals the complete
+        // tensor byte length, and ORT allocated that exact shape and dtype.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                value.bytes.as_ptr(),
+                output.data_ptr.cast::<u8>(),
+                value.bytes.len(),
+            );
+        }
+    }
+    #[cfg(test)]
+    KERNEL_SIZED_MATERIALIZATION_COPIES.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+#[cfg(test)]
+static KERNEL_SIZED_MATERIALIZATION_COPIES: AtomicUsize = AtomicUsize::new(0);
 
 /// Build a contiguous stride array from a shape (C-order, innermost stride = 1).
 /// Whether a node output slot is ORT-allocated or absent (scratch-backed).
@@ -3818,6 +4176,10 @@ fn infer_shapes(
     inputs: &[TensorView<'_>],
 ) -> Result<Vec<Vec<usize>>, String> {
     match strategy {
+        ShapeInference::KernelSizedOutputs => Err(
+            "kernel-sized outputs must execute before allocation; infer_shapes is not applicable"
+                .into(),
+        ),
         ShapeInference::SharedNative { node, fallback } => match infer_shared_node(node, inputs) {
             SharedShapeResult::Resolved(shapes) => Ok(shapes),
             // Preserve the plugin's established permissiveness. In particular,
@@ -4955,6 +5317,182 @@ unsafe extern "C" fn compute_release_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use onnx_runtime_ep_api::EpError;
+
+    struct KernelSizedMock {
+        calls: Arc<AtomicUsize>,
+        output: KernelSizedOutput,
+    }
+
+    impl Kernel for KernelSizedMock {
+        fn execute(
+            &self,
+            _inputs: &[TensorView],
+            _outputs: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            Err(EpError::KernelFailed(
+                "ordinary execute must not run for a kernel-sized strategy".into(),
+            ))
+        }
+
+        fn has_kernel_sized_outputs(&self) -> bool {
+            true
+        }
+
+        fn execute_kernel_sized(
+            &self,
+            _inputs: &[TensorView],
+            requested_outputs: &[bool],
+        ) -> onnx_runtime_ep_api::Result<Vec<Option<KernelSizedOutput>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(requested_outputs
+                .iter()
+                .map(|requested| requested.then(|| self.output.clone()))
+                .collect())
+        }
+    }
+
+    fn kernel_sized_info() -> ExportedComputeInfo {
+        let mut info = ExportedComputeInfo::new(Vec::new());
+        info.set_host_accessible(true);
+        info
+    }
+
+    #[test]
+    fn kernel_sized_dispatch_invokes_algorithm_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let kernel = KernelSizedMock {
+            calls: Arc::clone(&calls),
+            output: KernelSizedOutput {
+                shape: vec![2],
+                dtype: DataType::Float32,
+                bytes: [1.0f32, 2.0]
+                    .into_iter()
+                    .flat_map(f32::to_le_bytes)
+                    .collect(),
+            },
+        };
+        let input_data = [3.0f32, 3.0, 4.0];
+        let input = TensorView::new(
+            DevicePtr(input_data.as_ptr().cast()),
+            DataType::Float32,
+            &[3],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let outputs = run_kernel_sized(
+            &kernel_sized_info(),
+            &kernel,
+            &[input],
+            &[true],
+            &[DataType::Float32],
+            "test",
+        )
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(outputs[0].as_ref().unwrap().shape, [2]);
+    }
+
+    #[test]
+    fn kernel_sized_host_gate_precedes_algorithm() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let kernel = KernelSizedMock {
+            calls: Arc::clone(&calls),
+            output: KernelSizedOutput {
+                shape: vec![1],
+                dtype: DataType::Float32,
+                bytes: 1.0f32.to_le_bytes().to_vec(),
+            },
+        };
+        let input_data = [1.0f32];
+        let input = TensorView::new(
+            DevicePtr(input_data.as_ptr().cast()),
+            DataType::Float32,
+            &[1],
+            &[1],
+            DeviceId::cuda(0),
+        );
+        let error = run_kernel_sized(
+            &kernel_sized_info(),
+            &kernel,
+            &[input],
+            &[true],
+            &[DataType::Float32],
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.contains("host-only"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        let cpu_input = TensorView::new(
+            DevicePtr(input_data.as_ptr().cast()),
+            DataType::Float32,
+            &[1],
+            &[1],
+            DeviceId::cpu(),
+        );
+        let device_output_info = ExportedComputeInfo::new(Vec::new());
+        let error = run_kernel_sized(
+            &device_output_info,
+            &kernel,
+            &[cpu_input],
+            &[true],
+            &[DataType::Float32],
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.contains("this EP uses device-resident tensors"));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn kernel_sized_validation_fails_closed_on_malformed_bytes_and_overflow() {
+        let malformed = vec![Some(KernelSizedOutput {
+            shape: vec![2],
+            dtype: DataType::Float32,
+            bytes: vec![0; 4],
+        })];
+        let error =
+            validate_kernel_sized_outputs(&malformed, &[true], &[DataType::Float32], "test")
+                .unwrap_err();
+        assert!(error.contains("returned 4 bytes, expected 8"));
+
+        let overflow = vec![Some(KernelSizedOutput {
+            shape: vec![i64::MAX as usize, 3],
+            dtype: DataType::Float32,
+            bytes: Vec::new(),
+        })];
+        let error = validate_kernel_sized_outputs(&overflow, &[true], &[DataType::Float32], "test")
+            .unwrap_err();
+        assert!(error.contains("overflows usize"));
+    }
+
+    #[test]
+    fn kernel_sized_materializes_one_copy_per_present_output() {
+        KERNEL_SIZED_MATERIALIZATION_COPIES.store(0, Ordering::Relaxed);
+        let value = KernelSizedOutput {
+            shape: vec![2],
+            dtype: DataType::Float32,
+            bytes: [1.0f32, 2.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+        };
+        let mut destination = vec![0u8; value.bytes.len()];
+        let mut output = crate::kernel_ctx::OwnedOutput {
+            data_ptr: destination.as_mut_ptr().cast(),
+            dtype: DataType::Float32,
+            shape: vec![2].into(),
+            strides: vec![1].into(),
+            mem_info: std::ptr::null(),
+        };
+        materialize_kernel_sized(&mut output, &value, 0).unwrap();
+        assert_eq!(destination, value.bytes);
+        assert_eq!(
+            KERNEL_SIZED_MATERIALIZATION_COPIES.load(Ordering::Relaxed),
+            1
+        );
+    }
 
     /// Return the production portion of a Rust source file, normalised to LF.
     ///
