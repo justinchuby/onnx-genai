@@ -861,7 +861,11 @@ declared on its own dimension and they never compete for one.
   lacking a row axis
   (`crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
   padded output hears from both rules, which is correct — they answer different
-  questions.
+  questions. The exclusion is keyed on `padding` being non-empty rather than on
+  the layout, because a packed value may legally pad: the no-double-spelling rule
+  in [§10.6](#106-packed-companions-must-validate) forbids a `padding` entry only
+  on the dimension the layout *packs*. Scoping it to layouts with a request axis
+  would exempt the value with the most extents a trim can misdescribe.
   `padding` does not by itself make a component padding-invariant — that remains
   the profile's `batch_invariance` declaration.
 - **Ownership is an ordered chain of levels over one physically packed axis.**
