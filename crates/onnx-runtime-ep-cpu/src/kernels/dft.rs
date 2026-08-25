@@ -22,6 +22,29 @@ pub static DFT_VDSP_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 /// Dispatch counter for the radix-2 FFT fallback path.
 pub static DFT_FFT_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 
+/// Power-of-two transforms that took *a* fast path — whichever one this target
+/// has.
+///
+/// `DFT_FFT_TEST_HITS` alone does not answer that question. On Apple targets
+/// `DftPlan::new` builds a vDSP setup for every power-of-two `n >= 4`, and
+/// `transform` returns from that branch before the radix-2 one, so a caller
+/// asserting on the radix-2 counter there is asserting that the platform's own
+/// fast path was *not* used — false by construction, and nothing to do with the
+/// property it meant to check.
+///
+/// What every target shares is that a power-of-two transform must not fall back
+/// to `naive_dft_into`. That is what this sums, so a caller can assert the
+/// property instead of one platform's route to it.
+pub fn fast_path_hits() -> u64 {
+    let radix2 = DFT_FFT_TEST_HITS.load(Ordering::Relaxed);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        return radix2 + DFT_VDSP_TEST_HITS.load(Ordering::Relaxed);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    radix2
+}
+
 pub struct DftFactory;
 
 impl KernelFactory for DftFactory {
