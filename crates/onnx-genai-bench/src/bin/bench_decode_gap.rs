@@ -333,6 +333,19 @@ struct ArmResult {
     total_wall_s: f64,
     /// Native pool counters accumulated across the steady window.
     steady_pool: task_runtime::PoolCounters,
+    /// Iterations the counter deltas above actually span.
+    ///
+    /// Counters are only sampled every `--snapshot-every` iterations, so the
+    /// nearest snapshot at or before the steady boundary is generally *earlier*
+    /// than the boundary. Dividing a counter delta by the sample-window length
+    /// would then overstate every per-iteration figure, so per-iteration
+    /// counters divide by this instead. It is reported, because a counter
+    /// window wider than the sample window is exactly the kind of thing that
+    /// silently turns a per-iteration number into a slightly wrong one.
+    counter_iters: usize,
+    /// Whether the counter window had to fall back to iteration zero, i.e.
+    /// whether these "steady" counters in fact include the warm-up transient.
+    counters_include_warmup: bool,
     /// Routes observed during the attribution inference, if one was taken.
     routes: Vec<RouteRow>,
 }
@@ -349,11 +362,10 @@ impl ArmResult {
         Summary::from(self.steady_samples())
     }
 
-    /// Voluntary context switches per iteration over the steady window: the
+    /// Voluntary context switches per iteration over the counter window: the
     /// park/wake count per dispatch.
     fn parks_per_iter(&self) -> f64 {
-        let iterations = self.steady_samples().len().max(1) as f64;
-        self.steady_metrics.voluntary_ctxt_switches as f64 / iterations
+        self.steady_metrics.voluntary_ctxt_switches as f64 / self.counter_iters.max(1) as f64
     }
 
     /// CPU-seconds burned per wall-second over the steady window. A spinning
@@ -410,8 +422,15 @@ fn assemble(samples: Vec<f64>, snapshots: Vec<Snapshot>, args: &Args) -> ArmResu
     };
     let first = snapshots.first().expect("a snapshot at iteration zero");
     let last = snapshots.last().expect("a snapshot at the final iteration");
-    // The snapshot at or before the steady boundary, so the steady window's
-    // counters never include warm-up.
+    // The latest snapshot at or before the steady boundary. Counters are only
+    // sampled every `--snapshot-every` iterations, so this is generally
+    // *earlier* than the boundary and the counter window is correspondingly
+    // wider than the sample window -- and when steady state is reached before
+    // the first interior snapshot there is no qualifying snapshot at all, so
+    // the window falls back to iteration zero and the counters do include the
+    // warm-up transient. Neither case is avoidable without sampling counters
+    // every iteration (which would perturb what is being measured), so both are
+    // recorded and reported instead of being asserted away.
     let boundary = steady_start
         .and_then(|start| {
             snapshots
@@ -420,6 +439,8 @@ fn assemble(samples: Vec<f64>, snapshots: Vec<Snapshot>, args: &Args) -> ArmResu
                 .find(|point| point.iteration <= start && point.iteration > 0)
         })
         .unwrap_or(first);
+    let counter_iters = last.iteration.saturating_sub(boundary.iteration);
+    let counters_include_warmup = boundary.iteration == 0 && steady_start.unwrap_or(0) > 0;
     ArmResult {
         samples_ms: samples,
         steady_start,
@@ -429,6 +450,8 @@ fn assemble(samples: Vec<f64>, snapshots: Vec<Snapshot>, args: &Args) -> ArmResu
         total_metrics: last.metrics.since(&first.metrics),
         total_wall_s: last.at.duration_since(first.at).as_secs_f64(),
         steady_pool: pool_delta(last.pool, boundary.pool),
+        counter_iters,
+        counters_include_warmup,
         routes: Vec::new(),
     }
 }
@@ -533,9 +556,29 @@ fn run_native_arm(args: &Args, label: &str) -> Result<ArmResult> {
         return Ok(result);
     }
 
-    let result = run_concurrent_native(args, sessions, owned_inputs);
+    // Attribution runs on one session before the concurrent region, not inside
+    // it: the ledger takes a mutex per observation, so recording across N
+    // barrier-synchronised threads would serialise the very contention this arm
+    // exists to measure. Routing does not depend on how many sessions are live,
+    // so one session's routes describe them all -- and without this the
+    // concurrent arm reports zero routes, which the report cannot distinguish
+    // from a ledger that saw nothing and would wrongly call a valid run a dead
+    // instrument.
+    let routes = {
+        let refs = owned_inputs
+            .iter()
+            .map(|(name, tensor)| (name.as_str(), tensor))
+            .collect::<Vec<_>>();
+        let session = sessions.first_mut().expect("at least one session");
+        attribute_routes(|| {
+            std::hint::black_box(session.run(&refs).context("native attribution run")?);
+            Ok(())
+        })?
+    };
+    let mut result = run_concurrent_native(args, sessions, owned_inputs)?;
+    result.routes = routes;
     phases.mark("timed-loop");
-    result
+    Ok(result)
 }
 
 /// The concurrent-session arm.
@@ -731,8 +774,7 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
     println!(
         "  ctxt switches: {:.1} vol/iter  {:.1} invol/iter  ({} vol total)",
         result.parks_per_iter(),
-        result.steady_metrics.involuntary_ctxt_switches as f64
-            / result.steady_samples().len().max(1) as f64,
+        result.steady_metrics.involuntary_ctxt_switches as f64 / result.counter_iters.max(1) as f64,
         result.steady_metrics.voluntary_ctxt_switches
     );
     println!(
@@ -741,7 +783,7 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_metrics.peak_rss_kb,
         result.steady_metrics.threads
     );
-    let iterations = result.steady_samples().len().max(1) as f64;
+    let iterations = result.counter_iters.max(1) as f64;
     println!(
         "  native pool:   {:.2} dispatches/iter  {:.2} parks/iter  {:.2} spin-hits/iter  \
          {} slot-exhausted",
@@ -750,6 +792,19 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_pool.spin_hits as f64 / iterations,
         result.steady_pool.slot_exhausted
     );
+    println!(
+        "  counter window: {} iters (samples above cover {}; counters are sampled every \
+         --snapshot-every iters, so the two differ)",
+        result.counter_iters,
+        result.steady_samples().len()
+    );
+    if result.counters_include_warmup {
+        println!(
+            "  WARNING: steady state was reached before the first interior counter \
+             snapshot, so every counter and cpu figure above spans the whole run and \
+             INCLUDES the warm-up transient. Lower --snapshot-every to separate them."
+        );
+    }
     // A zero-dispatch row has two very different causes and the reader cannot
     // tell them apart from the row alone, so say which one it was.
     if result.steady_pool.dispatches == 0 {
