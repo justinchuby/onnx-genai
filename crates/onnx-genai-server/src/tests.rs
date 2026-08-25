@@ -1,7 +1,7 @@
 use crate::{
     AppState, ChatCompletionRequest, CompletionRequest, EmbeddingEncodingFormat, EmbeddingInput,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, ServerConfig, app,
-    build_generate_request,
+    EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, OrtSessionWorkerCount,
+    ServerConfig, app, build_generate_request,
     driver::{DriverCommand, EngineDriver},
     models_config::ModelSpec,
     routes::{CompletionGeneration, collect_generation_result, prepare_completion},
@@ -1556,6 +1556,117 @@ async fn status_reports_node_status_contract() {
     assert!(body["batch_utilization"].is_number());
     assert!(body["sessions"].is_array());
     assert!(body["prefix_hashes"].is_array());
+    let workers = body["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0]["worker_id"], 0);
+    assert!(workers[0]["active_turns"].is_u64());
+    assert!(workers[0]["live_sessions"].is_u64());
+    assert_eq!(workers[0]["health"], "healthy");
+}
+
+#[tokio::test]
+async fn status_reports_each_configured_ort_worker() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with two ORT workers");
+
+    let response = app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    let workers = body["workers"].as_array().expect("workers is an array");
+    assert_eq!(workers.len(), 2);
+    assert_eq!(workers[0]["worker_id"], 0);
+    assert_eq!(workers[1]["worker_id"], 1);
+    assert!(workers.iter().all(|worker| worker["health"] == "healthy"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multiple_workers_still_refuse_a_second_turn_on_one_session() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with two ORT workers");
+    let router = app(state.clone());
+    let session = "sess-two-workers";
+    let (status, first) = chat_turn_for(router.clone(), "tiny-llm", Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let held = state
+        .sessions
+        .acquire(binding_of(&state, session), session)
+        .expect("an idle session is leasable");
+    let (status, conflict) = chat_turn_for(router, "tiny-llm", Some(session), "again").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["error"]["type"], "conflict_error");
+    drop(held);
+}
+
+#[test]
+fn multiple_ort_workers_fail_closed_for_composite_workflows() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/onnx_genai_workflows/vlm");
+    let error = match AppState::load_with_config(
+        &model_dir,
+        Some("composite".to_string()),
+        ServerConfig {
+            ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+            ..ServerConfig::default()
+        },
+    ) {
+        Ok(_) => panic!("composite execution must not silently fall back to one worker"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(message.contains("composite pipeline"), "{message}");
+    assert!(message.contains("--ort-session-workers 1"), "{message}");
+}
+
+#[cfg(feature = "native-backend")]
+#[test]
+fn multiple_ort_workers_fail_closed_for_native_decode() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-native-scalar-gqa");
+    let error = match AppState::load_with_config(
+        &model_dir,
+        Some("native".to_string()),
+        ServerConfig {
+            ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+            engine_config: EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+            ..ServerConfig::default()
+        },
+    ) {
+        Ok(_) => panic!("native decode must not silently fall back to one worker"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("require the ORT decode backend"),
+        "{message}"
+    );
 }
 
 #[tokio::test]
@@ -2568,7 +2679,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
             request: Box::new(build_generate_request(&slow_request)),
             admission: slow_admission,
             events: slow_tx,
-            permit: slow_permit,
+            permit: crate::driver::WorkerPermit::untracked(slow_permit),
         })
         .await
         .unwrap();
