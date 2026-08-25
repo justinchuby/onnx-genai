@@ -108,6 +108,146 @@ const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 /// Dispatcher spins between `yield_now` calls while waiting for stragglers.
 const DISPATCHER_YIELD_STRIDE: u32 = 1 << 12;
 
+/// How long [`TaskPool::new`]'s readiness barrier waits for every spawned
+/// worker to reach its loop before failing loud.
+///
+/// Deliberately far beyond any real startup: a worker announces on the first
+/// line of `worker_loop`, so the only thing between `spawn` returning `Ok` and
+/// the announcement is the OS scheduling the new thread once. Even under
+/// `qemu-user` on a host at 78 load that is milliseconds, not minutes. A wait
+/// that reaches this deadline is therefore reporting a pool that can no longer
+/// become ready, not a slow one.
+///
+/// Matches `decode_spmd`'s [`crate::decode_spmd`] barrier deliberately: the two
+/// are the same backstop against the same failure, and a reader who has
+/// understood one should not have to re-derive the other's bound.
+const POOL_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Scoped to the thread that builds the pool, not global, for the reason
+// `decode_spmd` documents at length: a global knob is read by every
+// concurrently-building pool in the same test binary, so injecting a fault into
+// one test reaches pools belonging to unrelated tests. A `Mutex` does not fix
+// that, because the tests being corrupted never take it.
+#[cfg(test)]
+thread_local! {
+    /// Test override for [`POOL_READY_TIMEOUT`], in milliseconds; `0` means
+    /// "use the real one". A liveness backstop is only testable if the test
+    /// does not have to wait out the production deadline to observe it.
+    static POOL_READY_TIMEOUT_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test fault injection: the worker index that must never announce
+    /// readiness, or `usize::MAX` for none. Reproduces the one failure the
+    /// barrier cannot distinguish from slowness -- a worker that will never
+    /// arrive.
+    static HOLD_WORKER_BEFORE_READY: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
+
+    /// Test injection: how long the held worker ignores the shutdown flag, in
+    /// milliseconds; `0` honours it immediately.
+    ///
+    /// The held worker above parks on `shared.shutdown`, which
+    /// `abandon_unready_workers` sets. That makes it *cooperative*, so a
+    /// `join()` re-added to the abandon path would return promptly and every
+    /// test would still pass -- while in production, against the genuinely
+    /// wedged worker this backstop exists for, that same join reintroduces the
+    /// unbounded wait. This knob models the worker that does not cooperate, so
+    /// the no-join contract has an oracle. Bounded rather than permanent: a
+    /// thread that never exits would leak into the rest of the test binary and
+    /// trip Miri's remaining-threads check at exit, and a bounded stubbornness
+    /// discriminates just as sharply.
+    static HOLD_WORKER_IGNORES_SHUTDOWN_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test injection: on the first deadline expiry, publish `ready ==
+    /// workers` immediately before the barrier re-reads it, reproducing the
+    /// lost race the re-read exists to absorb. No amount of timing could
+    /// arrange that window reliably.
+    static FORCE_READY_RACE_AT_DEADLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+    /// Test injection of the *other* case: every worker announces, but late.
+    /// Without it the healthy-pool assertion is vacuous, because real workers
+    /// announce inside the spin budget and the deadline is never consulted --
+    /// so the test would pass with a 1 ms bound just as happily as a 120 s one.
+    static DELAY_WORKER_BEFORE_READY_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test injection of a *contended* yield, in microseconds; `0` yields
+    /// normally. The every-yield clock check is invisible when yields are
+    /// cheap: an uncontended `yield_now` costs ~1.2 us, so a stride of 64 moves
+    /// the deadline by ~78 us and no assertion against a millisecond deadline
+    /// can see it. The production measurement behind #1933 recorded ~7 ms per
+    /// yield on a contended pair of CPUs -- three orders of magnitude larger --
+    /// which is what turns a stride into a 3x deadline overrun. Manufacturing
+    /// real contention in a unit test is the kind of load-dependent arrangement
+    /// that flakes; injecting the yield *cost* makes the regime deterministic.
+    static READY_SLOW_YIELD_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Yields the readiness barrier performed on this thread. The anti-vacuity
+    /// observable for the slow-but-healthy case: without it that test passes
+    /// whether or not the wait ever left its pure-spin phase, which is the
+    /// phase the fix is about.
+    static READY_YIELDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The part of a task-runtime worker's thread name that survives `/proc`.
+///
+/// Linux caps `comm` at 15 bytes plus its NUL, so a name longer than that is
+/// truncated before anything can read it back. Shared with the spawn site so
+/// the two cannot drift: a `/proc` scan filtered on a name is a *filter*, and a
+/// filter that matches nothing reports "no threads" -- which is the *passing*
+/// answer for the teardown test that reads it. `the_worker_name_survives_proc_truncation`
+/// is the tripwire on that.
+const TASK_THREAD_NAME_PREFIX: &str = "nxrt-task";
+
+/// Linux's `comm` field width, excluding the terminating NUL (`TASK_COMM_LEN -
+/// 1`). Not configurable and not queryable at runtime; see `man 5 proc`.
+#[cfg(test)]
+const COMM_MAX_BYTES: usize = 15;
+
+/// The readiness barrier's yield, with the injected cost applied. Runs on the
+/// builder thread, which is the test's own thread, so the thread-local scoping
+/// makes this answer the injecting test's question rather than some other
+/// test's.
+fn ready_yield() {
+    thread::yield_now();
+    #[cfg(test)]
+    {
+        READY_YIELDS.with(|count| count.set(count.get() + 1));
+        let us = READY_SLOW_YIELD_US.with(std::cell::Cell::get);
+        if us > 0 {
+            thread::sleep(Duration::from_micros(us));
+        }
+    }
+}
+
+/// Test observation of the held worker's deaf window, tagged by generation.
+///
+/// Generation-tagged rather than a pair of booleans because a held worker from
+/// an *earlier* test outlives the constructor that abandoned it: it is released
+/// by the shutdown store, but the store recording that it left runs on the
+/// worker's thread and can be descheduled past the next test's reset. Two
+/// booleans would then report the previous test's exit as this one's -- a false
+/// failure no amount of resetting can close. A generation only ever matches the
+/// test that issued it.
+#[cfg(test)]
+static DEAF_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DEAF_ENTERED_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DEAF_LEFT_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Read on the builder thread only, which is where the barrier runs, so the
+/// thread-local scoping above answers the injecting test's question rather than
+/// some other test's.
+fn pool_ready_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = POOL_READY_TIMEOUT_MS.with(std::cell::Cell::get);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    POOL_READY_TIMEOUT
+}
+
 /// Cache-line padding. The claim cursor, the completion counter and the epoch
 /// are each written by every participant of a dispatch; sharing a line would
 /// turn one fan-out into three lines' worth of coherency traffic per task.
@@ -554,12 +694,56 @@ impl TaskPool {
             counters: AtomicCounters::default(),
         });
         let mut handles = Vec::with_capacity(requested);
+        // Latch the fault-injection knobs here, on the builder thread, rather
+        // than reading them from inside the worker closure: the knobs are
+        // thread-local to the *injecting* test, and a worker runs on its own
+        // thread where they are always at their defaults.
+        #[cfg(test)]
+        let held_worker = HOLD_WORKER_BEFORE_READY.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let hold_ignores_shutdown_ms = HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let force_ready_race = FORCE_READY_RACE_AT_DEADLINE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let deaf_generation = DEAF_GENERATION.load(Ordering::SeqCst);
+        #[cfg(test)]
+        let ready_delay_ms = DELAY_WORKER_BEFORE_READY_MS.with(std::cell::Cell::get);
         for worker_id in 0..requested {
             let shared = Arc::clone(&shared);
             match thread::Builder::new()
-                .name(format!("nxrt-task-{worker_id}"))
-                .spawn(move || shared.worker_loop(worker_id))
-            {
+                .name(format!("{TASK_THREAD_NAME_PREFIX}-{worker_id}"))
+                .spawn(move || {
+                    #[cfg(test)]
+                    {
+                        if ready_delay_ms > 0 {
+                            thread::sleep(Duration::from_millis(ready_delay_ms));
+                        }
+                        if worker_id == held_worker {
+                            // Not a panic: a panicking worker unwinds and its
+                            // `Arc<Shared>` drops, which is a *tidier* failure
+                            // than the one being reproduced. The defect is a
+                            // worker that exists, holds its share of the pool,
+                            // and never announces -- so park it until the
+                            // builder's shutdown flag releases it.
+                            //
+                            // `HOLD_WORKER_IGNORES_SHUTDOWN_MS` makes it
+                            // deaf to that flag for a bounded window first,
+                            // which is the only shape that can catch a `join()`
+                            // returning to the abandon path.
+                            let deaf_until =
+                                Instant::now() + Duration::from_millis(hold_ignores_shutdown_ms);
+                            DEAF_ENTERED_GENERATION.store(deaf_generation, Ordering::SeqCst);
+                            while !shared.shutdown.load(Ordering::Acquire)
+                                || Instant::now() < deaf_until
+                            {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                            DEAF_LEFT_GENERATION.store(deaf_generation, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                    shared.worker_loop(worker_id);
+                }) {
                 Ok(handle) => handles.push(handle),
                 // A host that will not give us a thread is a host we run
                 // serially on. Never a hard failure: this is a performance
@@ -571,14 +755,99 @@ impl TaskPool {
         // Wait for every worker to reach its loop before any dispatch can
         // publish, so a fan-out cannot be published into a pool that has not
         // started watching the epoch yet.
+        //
+        // Spin briefly, then *yield*, then give up loudly. All three matter,
+        // and the first two are what this loop was missing:
+        //
+        // * A pure `spin_loop` waits on threads that need a core to make
+        //   progress. Where the builder and its workers contend for the same
+        //   CPU, the spinner starves the very workers it is waiting for --
+        //   livelock, not slow progress -- and it is most reachable exactly
+        //   where cores are scarcest: an emulated target (`qemu-user` runs
+        //   every guest thread as a host thread and gives the spinner no
+        //   reason to yield), a cpuset-confined process, or a test harness
+        //   building several pools at once on a loaded box.
+        // * A worker that dies or wedges before announcing makes the condition
+        //   permanently unsatisfiable, and spinning on it burns every core it
+        //   holds *forever*. That is strictly worse than deadlocking quietly,
+        //   because full occupancy is indistinguishable from work: an aarch64
+        //   suite hung this way for 5h40m at ~18 cores and was noticed only by
+        //   someone reading `/proc`.
+        //
+        // The deadline is a liveness backstop, not a performance bound; see
+        // [`POOL_READY_TIMEOUT`].
+        let ready_since = Instant::now();
+        let mut spins = 0u32;
         while shared.ready.load(Ordering::Acquire) < workers {
-            std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins < SPIN_LOOP_BUDGET {
+                std::hint::spin_loop();
+            } else {
+                ready_yield();
+                // Check the clock on *every* yield, not on `CLOCK_CHECK_STRIDE`.
+                // The stride is right for the spin phase, where an iteration
+                // costs nanoseconds and `Instant::now()` would dominate; it is
+                // wrong here, because a yield under contention costs
+                // microseconds to milliseconds and a stride of N multiplies the
+                // deadline's granularity by N yields of an already-starved
+                // thread. #1933 made exactly this correction to `decode_spmd`'s
+                // barrier after a build 3x over its deadline completed as if
+                // healthy.
+                if ready_since.elapsed() >= pool_ready_timeout() {
+                    #[cfg(test)]
+                    if force_ready_race {
+                        shared.ready.store(workers, Ordering::Release);
+                    }
+                    let ready = shared.ready.load(Ordering::Acquire);
+                    // The loop condition and this load are two separate reads,
+                    // so a worker can announce between them. Accept that pool
+                    // rather than tearing down a healthy one and reporting the
+                    // self-contradictory "N of N announced ... never became
+                    // ready".
+                    if ready >= workers {
+                        break;
+                    }
+                    Self::abandon_unready_workers(&shared, handles);
+                    panic!(
+                        "CPU task-runtime pool never became ready: {ready} of {workers} \
+                         workers announced within {:?}. A worker most likely died or \
+                         wedged before entering its loop; failing here rather than \
+                         spinning on a condition that can no longer be satisfied.",
+                        pool_ready_timeout()
+                    );
+                }
+            }
         }
         Self {
             shared,
             handles: Mutex::new(handles),
             workers,
         }
+    }
+
+    /// Release the workers of a pool that never became ready, then hand their
+    /// handles back to be dropped.
+    ///
+    /// The barrier above is about to panic, and `TaskPool::new` has not
+    /// returned, so there is no `Drop` to run: without this, every worker that
+    /// *did* start keeps spinning its adaptive window forever and the failure
+    /// path leaves behind exactly the burning-core condition the deadline
+    /// exists to end.
+    ///
+    /// Uses the same publish-then-wake sequence as [`Self::shutdown`], because
+    /// the stop flag alone is not enough -- a worker already parked on the
+    /// futex never re-reads it and would linger for the life of the process.
+    ///
+    /// Deliberately **not** joined. A build that failed this way has at least
+    /// one worker that never reached its loop; blocking on it here would
+    /// reintroduce the unbounded wait this whole path exists to remove. Woken
+    /// threads observe `shutdown` and exit on their own, and the `Arc<Shared>`
+    /// keeps what they touch alive until the last of them is gone.
+    fn abandon_unready_workers(shared: &Arc<Shared>, handles: Vec<JoinHandle<()>>) {
+        shared.shutdown.store(true, Ordering::SeqCst);
+        shared.epoch.0.fetch_add(1, Ordering::Release);
+        atomic_wait::wake_all(&shared.epoch.0);
+        drop(handles);
     }
 
     /// Threads a fan-out can run across, including the dispatching thread.
@@ -1219,5 +1488,560 @@ mod tests {
                 "round {round} lost or duplicated a task"
             );
         }
+    }
+}
+
+/// The readiness backstop: a pool that cannot become ready must fail loudly
+/// rather than hold the machine at full occupancy indefinitely.
+///
+/// Separate module so the fault-injection knobs are reset by one guard type
+/// rather than by hand in each test. Forgetting a reset leaks a fault into
+/// every later pool this thread builds, which libtest reuses.
+#[cfg(test)]
+mod ready_backstop_tests {
+    use super::*;
+    use std::sync::MutexGuard;
+
+    /// Sets the readiness knobs for the duration of a test and clears them
+    /// afterwards, including on the unwinding path the fault tests take.
+    ///
+    /// Also holds [`INJECTION`] for exactly that window. The knobs themselves
+    /// are thread-locals, but two things these tests depend on are not, so the
+    /// guard is bound to the injection rather than left to each call site to
+    /// remember.
+    struct Injected {
+        _serialise: MutexGuard<'static, ()>,
+        generation: usize,
+    }
+
+    /// Serialises the readiness-injection tests against each other.
+    ///
+    /// Two process-global resources make them unsafe to interleave. First,
+    /// `std::panic::{take_hook, set_hook}` is process-wide, so a concurrent
+    /// test restores the default hook inside another's silenced window and the
+    /// expected panic escapes into the log attributed to the wrong test.
+    /// Second, an injected deadline is measured in milliseconds of wall clock:
+    /// a second test building its own pool at the same time competes for the
+    /// same cores, so a healthy worker can miss a 100 ms deadline because of
+    /// the *other* test's scheduling. That failure is indistinguishable from
+    /// the defect these tests exist to catch, which makes it the worst kind --
+    /// the cheapest way to make it stop is to raise the deadline until the
+    /// test can no longer fail.
+    static INJECTION: Mutex<()> = Mutex::new(());
+
+    impl Injected {
+        fn timeout_ms(ms: u64) -> Self {
+            let serialise = INJECTION
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            POOL_READY_TIMEOUT_MS.with(|cell| cell.set(ms));
+            let generation = DEAF_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            Self {
+                _serialise: serialise,
+                generation,
+            }
+        }
+
+        fn hold_worker(self, index: usize) -> Self {
+            HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(index));
+            self
+        }
+
+        fn hold_ignores_shutdown_ms(self, ms: u64) -> Self {
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(ms));
+            self
+        }
+
+        fn force_ready_race(self) -> Self {
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(true));
+            self
+        }
+
+        fn delay_ms(self, ms: u64) -> Self {
+            DELAY_WORKER_BEFORE_READY_MS.with(|cell| cell.set(ms));
+            self
+        }
+
+        fn slow_yield_us(self, us: u64) -> Self {
+            READY_SLOW_YIELD_US.with(|cell| cell.set(us));
+            self
+        }
+
+        fn yields(&self) -> u64 {
+            READY_YIELDS.with(std::cell::Cell::get)
+        }
+
+        fn reset_yields(self) -> Self {
+            READY_YIELDS.with(|cell| cell.set(0));
+            self
+        }
+    }
+
+    impl Drop for Injected {
+        fn drop(&mut self) {
+            POOL_READY_TIMEOUT_MS.with(|cell| cell.set(0));
+            HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(usize::MAX));
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(0));
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(false));
+            DELAY_WORKER_BEFORE_READY_MS.with(|cell| cell.set(0));
+            READY_SLOW_YIELD_US.with(|cell| cell.set(0));
+            READY_YIELDS.with(|cell| cell.set(0));
+        }
+    }
+
+    /// Build a pool with the panic hook silenced, reporting the message.
+    ///
+    /// Returns `Ok(())` rather than the pool: every caller here is asserting a
+    /// failure, and a successfully built pool is dropped (and so shut down and
+    /// joined) before the assertion fires, rather than being leaked into the
+    /// panic message.
+    fn build_expecting_failure(width: usize) -> Result<(), String> {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = catch_unwind(AssertUnwindSafe(|| TaskPool::new(width)));
+        std::panic::set_hook(previous);
+        outcome.map(drop).map_err(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "<non-string panic payload>".to_string())
+        })
+    }
+
+    /// A worker that never announces must fail the build, not hang it.
+    ///
+    /// This is the whole point of the change: before it, the constructor's
+    /// `while ready < workers { spin_loop() }` had no yield, no bound and no
+    /// exit, so one wedged worker held the builder's core at 100% for as long
+    /// as the process lived -- indistinguishable from work, which is why an
+    /// aarch64 suite could sit in it for hours.
+    #[test]
+    fn a_worker_that_never_announces_fails_the_build_instead_of_hanging() {
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS).hold_worker(0);
+        let started = Instant::now();
+        let message = build_expecting_failure(4).expect_err(
+            "a pool with a worker that never announces was reported as successfully built",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            message.contains("never became ready"),
+            "the build failed for some other reason than the readiness backstop: {message}"
+        );
+        // The count in the message is what tells a reader this was a wedged
+        // worker rather than, say, a spawn failure. `4` means dispatcher plus
+        // three workers, one of which is held.
+        //
+        // Asserted as "fewer than all of 3" rather than the exact "2 of 3":
+        // under emulation or contention a healthy worker can also still be
+        // short of announcing when the deadline fires, and a test that reds on
+        // that is reporting the host, not the backstop. The claim that
+        // separates a wedge from a spawn failure is that the pool had its
+        // workers and they did not all announce.
+        let announced = message
+            .split(" of 3 workers announced")
+            .next()
+            .and_then(|head| head.rsplit(' ').next())
+            .and_then(|count| count.parse::<usize>().ok());
+        match announced {
+            Some(count) => assert!(
+                count < 3,
+                "the backstop fired reporting all 3 workers announced, which is \
+                 not a wedge at all: {message}"
+            ),
+            None => panic!(
+                "the diagnostic does not say how far the pool got, which is the \
+                 only thing that distinguishes this from a spawn failure: {message}"
+            ),
+        }
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the build took {elapsed:?} against a {PAIRED_DEADLINE_MS}ms \
+             deadline, so it is not the deadline that ended it"
+        );
+        drop(injected);
+    }
+
+    /// The deadline the wedge test and its negative control share.
+    ///
+    /// One constant rather than two literals: the control's entire claim is
+    /// that *the same* deadline builds a healthy pool, so if the two numbers
+    /// can drift apart the control silently stops controlling for anything.
+    /// Sized ~1000x a healthy announce (a `fetch_add` per worker) so cross-test
+    /// core contention cannot starve a healthy build past it, while staying
+    /// short enough that the wedge test does not pad the suite.
+    const PAIRED_DEADLINE_MS: u64 = 1_000;
+
+    /// ...and the wait it does must actually be bounded by the deadline, not
+    /// merely by the fault clearing itself.
+    ///
+    /// The negative control for the test above: without the hold, the same
+    /// deadline must build a pool. A backstop that fired on every build would
+    /// pass the test above for the wrong reason.
+    #[test]
+    fn the_same_deadline_builds_a_healthy_pool() {
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS);
+        let pool = TaskPool::new(4);
+        assert_eq!(pool.width(), 4);
+        assert!(pool.dispatch(16, &|_| {}));
+        drop(injected);
+    }
+
+    /// The abandoned workers must not be joined, and a cooperative fault
+    /// cannot show that.
+    ///
+    /// `abandon_unready_workers` drops the handles unjoined on purpose:
+    /// joining would block on precisely the worker that is not coming, which
+    /// is the unbounded wait this whole change removes. Every other test here
+    /// injects a worker that parks on `shared.shutdown` -- the same flag the
+    /// abandon path sets -- so it *is* coming, and a `join()` restored to that
+    /// path would return promptly and leave the suite green while production
+    /// hung. This test makes the held worker deaf to shutdown for 4 s, an
+    /// order of magnitude past the deadline, so a restored join shows up as
+    /// the constructor taking seconds instead of milliseconds.
+    ///
+    /// The stubbornness is bounded rather than permanent so the thread is gone
+    /// by the end of the test rather than leaking into the rest of the binary.
+    /// That costs nothing: 4 s against a 250 ms deadline discriminates by 16x,
+    /// and the assertion is on the *builder*, which under the correct code
+    /// never waits for that thread at all.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "leaves a deliberately deaf worker alive at exit, which Miri's remaining-threads check reports"
+    )]
+    fn an_abandoned_worker_that_ignores_shutdown_does_not_delay_the_builder() {
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS)
+            .hold_worker(0)
+            .hold_ignores_shutdown_ms(8_000);
+        build_expecting_failure(3).expect_err("the injected hold must fail the build");
+        assert_eq!(
+            DEAF_ENTERED_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the injected worker never reached its deaf window, so this test \
+             observed nothing about the abandon path"
+        );
+        assert_ne!(
+            DEAF_LEFT_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the constructor returned only after the deaf worker finished, \
+             which is the signature of the abandon path joining the handles it \
+             must only drop"
+        );
+        drop(injected);
+    }
+
+    /// A worker that announces inside the deadline's race window must be kept,
+    /// not torn down.
+    ///
+    /// The barrier reads `ready` twice -- once in the loop condition, once
+    /// after the deadline fires -- so a worker can announce between them.
+    /// Without the re-read the pool is destroyed and the diagnostic says the
+    /// self-contradictory "N of N workers announced ... never became ready".
+    /// The knob publishes the announcement in exactly that window, which no
+    /// amount of timing could do reliably.
+    #[test]
+    fn a_worker_that_announces_in_the_race_window_is_not_torn_down() {
+        let injected = Injected::timeout_ms(50).hold_worker(0).force_ready_race();
+        let pool = TaskPool::new(3);
+        assert_eq!(
+            pool.width(),
+            3,
+            "a pool whose workers had all announced by the re-read was torn down"
+        );
+        drop(pool);
+        drop(injected);
+    }
+
+    /// Slow is not the same as broken: a pool whose workers announce late --
+    /// which is what emulation and a loaded host produce -- must still build.
+    ///
+    /// The yield counter is the anti-vacuity guard. Real workers announce
+    /// inside `SPIN_LOOP_BUDGET`, so without an injected delay this test never
+    /// reaches the yield-and-check phase at all and would pass identically if
+    /// that phase were deleted.
+    ///
+    /// Not run under Miri, and the guard is the reason. The claim being made
+    /// is a *race* between wall-clock delay and spin iterations: 150 ms must
+    /// outlast `SPIN_LOOP_BUDGET` spins. Miri's clock is virtual and its
+    /// scheduler is not the OS's, so a spin costs no time there, the delay
+    /// elapses inside the budget, and the workers announce before the builder
+    /// ever yields -- the guard fails on a perfectly healthy build. Weakening
+    /// it to accommodate that would delete the only thing keeping this test
+    /// from passing with the yield phase removed, so the test opts out of the
+    /// one environment where its precondition cannot hold instead.
+    ///
+    /// The sibling tests need no such opt-out and deliberately keep none: they
+    /// inject a *hold*, so the builder exhausts the spin budget no matter what
+    /// a spin costs, and reaching the yield path does not depend on the clock.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "races an injected wall-clock delay against the spin budget; Miri's virtual clock cannot represent that"
+    )]
+    fn a_pool_whose_workers_are_merely_slow_still_builds() {
+        let injected = Injected::timeout_ms(30_000).delay_ms(150).reset_yields();
+        let pool = TaskPool::new(4);
+        assert_eq!(pool.width(), 4);
+        assert!(pool.dispatch(16, &|_| {}));
+        assert!(
+            injected.yields() > 0,
+            "the barrier never left its pure-spin phase, so this test says \
+             nothing about the yield-and-deadline path it exists to exercise"
+        );
+        drop(injected);
+    }
+
+    /// The deadline must be consulted on every yield, not on a stride.
+    ///
+    /// #1933's defect, ported here with its regression test: with a stride of
+    /// N, a starved builder evaluates the clock once per N yields, and a yield
+    /// under real contention costs milliseconds. The injected yield cost makes
+    /// that regime deterministic -- 12 ms per yield against a 100 ms deadline
+    /// means a stride of 64 would overrun by ~64x before noticing.
+    ///
+    /// The discriminator is the *yield count*, not elapsed time, and that is
+    /// deliberate. A wall-clock bound has to sit above the healthy path
+    /// (~9 yields x 12 ms ~= 110 ms, plus whatever the host adds) and below the
+    /// strided signature (~64 x 12 ms ~= 770 ms) -- an interval that contention
+    /// can close from below, at which point the test either reds on the host or
+    /// gets widened past 770 ms and silently stops catching the stride. The
+    /// yield count has no such window: the correct code leaves after
+    /// `deadline / yield_cost` yields, a stride of N cannot leave before its
+    /// first multiple of N, and a slow host only makes each yield cost *more*
+    /// wall clock, so the count falls further from the failing value rather
+    /// than towards it. It is the property itself rather than a proxy for it.
+    #[test]
+    fn the_deadline_is_checked_on_every_yield_not_on_a_stride() {
+        let injected = Injected::timeout_ms(100)
+            .hold_worker(0)
+            .slow_yield_us(12_000)
+            .reset_yields();
+        let started = Instant::now();
+        build_expecting_failure(3).expect_err("the injected hold must fail the build");
+        let elapsed = started.elapsed();
+        let yields = injected.yields();
+        assert!(
+            yields > 0,
+            "no yield happened, so the stride this test is about was never reached"
+        );
+        assert!(
+            yields < u64::from(CLOCK_CHECK_STRIDE),
+            "the barrier yielded {yields} times at 12ms per yield against a \
+             100ms deadline, so it cannot have consulted the clock on each one; \
+             not leaving before yield {CLOCK_CHECK_STRIDE} is the signature of a \
+             strided check"
+        );
+        // Liveness only, deliberately far above both regimes: the claim about
+        // *granularity* is the assertion above, and duplicating it as a tight
+        // time bound would just reintroduce the window that bound cannot hold.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the barrier never left its 100ms deadline at all ({elapsed:?} \
+             across {yields} yields)"
+        );
+        drop(injected);
+    }
+
+    /// The name workers are spawned with must still be recognisable after
+    /// Linux truncates it.
+    ///
+    /// Not arch-gated: the identity checked is string arithmetic, and the drift
+    /// it guards against -- someone renaming the spawn site -- happens on
+    /// whatever platform the rename is written on, not on the one that reads
+    /// `/proc`. A filter that matches nothing does not fail; it returns "no
+    /// threads", which is the *passing* answer for the teardown test below.
+    #[test]
+    fn the_worker_name_survives_proc_truncation() {
+        assert!(
+            TASK_THREAD_NAME_PREFIX.len() <= COMM_MAX_BYTES,
+            "the prefix the survivor scan filters on is itself truncated by \
+             comm, so the scan can never match a worker and its count is \
+             always the passing zero"
+        );
+    }
+
+    /// Count the task-runtime workers among a sequence of `comm` reads, or
+    /// report why the sequence cannot be counted.
+    ///
+    /// Takes the reads as an argument rather than performing them, so the blind
+    /// cases have deterministic negative controls: `/proc` cannot be made to
+    /// fail on demand, and a fail-closed policy exercised only by the happy
+    /// path is a policy nobody has tested.
+    #[cfg(target_os = "linux")]
+    fn tally_worker_comms(
+        reads: impl IntoIterator<Item = std::io::Result<String>>,
+    ) -> Result<usize, String> {
+        let mut named = 0usize;
+        let mut workers = 0usize;
+        for read in reads {
+            match read {
+                Ok(comm) => {
+                    named += 1;
+                    workers += usize::from(comm.trim().starts_with(TASK_THREAD_NAME_PREFIX));
+                }
+                // The task exited between listing the directory and reading its
+                // `comm`. Benign, and the only benign error here: a thread that
+                // has gone is a thread that is not running.
+                Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(format!("a task's comm is unreadable: {err}")),
+            }
+        }
+        // A listable directory does not imply readable entries, and it is the
+        // entries the filter depends on: a `/proc` that enumerates tasks but
+        // refuses every `comm` yields the same `0` an empty process would. The
+        // calling thread is always in there and cannot exit under itself, so
+        // reading no name at all is impossible unless the scan is blind.
+        if named == 0 {
+            return Err(
+                "no task's comm could be read at all, not even the calling thread's".to_string(),
+            );
+        }
+        Ok(workers)
+    }
+
+    /// Live task-runtime worker threads in this process, or a panic saying why
+    /// the count is not evidence.
+    #[cfg(target_os = "linux")]
+    fn live_task_worker_threads() -> usize {
+        let entries = std::fs::read_dir("/proc/self/task")
+            .unwrap_or_else(|err| panic!("/proc/self/task could not be listed: {err}"));
+        match tally_worker_comms(
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| std::fs::read_to_string(entry.path().join("comm"))),
+        ) {
+            Ok(workers) => workers,
+            Err(reason) => panic!(
+                "the surviving-worker scan went blind, so its count is not \
+                 evidence either way: {reason}"
+            ),
+        }
+    }
+
+    /// A scan that saw nothing must never be reported as "no survivors".
+    ///
+    /// `0` is the passing value for the teardown test, so an instrument whose
+    /// failure value equals its passing value cannot report the failure it
+    /// exists to catch.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_scan_that_read_nothing_is_never_reported_as_no_survivors() {
+        let empty: [std::io::Result<String>; 0] = [];
+        assert!(
+            tally_worker_comms(empty).is_err(),
+            "a scan that read no task at all reported zero survivors, which is \
+             the same answer a clean teardown gives"
+        );
+        let all_denied = (0..4)
+            .map(|_| Err::<String, _>(std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+        assert!(tally_worker_comms(all_denied).is_err());
+    }
+
+    /// The real scan must be able to see this process, on any host CI uses.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri has no /proc")]
+    fn the_live_scan_can_see_this_process() {
+        let entries = std::fs::read_dir("/proc/self/task").expect("list /proc/self/task");
+        assert!(
+            tally_worker_comms(
+                entries
+                    .filter_map(Result::ok)
+                    .map(|entry| std::fs::read_to_string(entry.path().join("comm"))),
+            )
+            .is_ok(),
+            "the surviving-worker scan cannot read this process's own threads, \
+             so the teardown test below would be vacuous"
+        );
+    }
+
+    /// Selects child mode for [`ready_leak_child`].
+    #[cfg(target_os = "linux")]
+    const READY_LEAK_CHILD_ENV: &str = "ONNX_GENAI_TEST_TASK_POOL_READY_LEAK_CHILD";
+
+    /// Child half of [`a_failed_build_leaves_no_workers_running`].
+    #[test]
+    #[ignore = "child process driven by a_failed_build_leaves_no_workers_running"]
+    #[cfg(target_os = "linux")]
+    fn ready_leak_child() {
+        if std::env::var(READY_LEAK_CHILD_ENV).is_err() {
+            return;
+        }
+        // Prove the instrument can count a live worker before its zero is used
+        // as evidence. `0` is the *passing* answer below, so a scan that can
+        // never see a worker agrees that nothing survived -- the exact shape of
+        // a check that cannot fail.
+        {
+            let probe = TaskPool::new(4);
+            let seen = live_task_worker_threads();
+            assert!(
+                seen >= 3,
+                "the scan saw {seen} workers while a 4-wide pool was alive, so \
+                 its zero below would not be evidence of anything"
+            );
+            drop(probe);
+        }
+        let injected = Injected::timeout_ms(250).hold_worker(0);
+        build_expecting_failure(4).expect_err("the injected hold must fail the build");
+        drop(injected);
+        // Poll rather than sleep a fixed interval: the claim is that they
+        // leave, not that they leave within one arbitrary instant. A worker
+        // parked on the futex and never woken never leaves, so this reports the
+        // steady state either way.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut live = live_task_worker_threads();
+        while live > 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            live = live_task_worker_threads();
+        }
+        println!("task_threads_after={live}");
+    }
+
+    /// A failed build must not leave its surviving workers running.
+    ///
+    /// The backstop's whole purpose is to stop holding a machine, so panicking
+    /// while leaving spinning workers behind would only relocate the defect --
+    /// and relocate it into a constructor that never returned, so no `Drop`
+    /// will ever clean up after it.
+    ///
+    /// Runs in a child process because thread identity cannot be established
+    /// in-process: every pool in the binary names its workers `nxrt-task-N`,
+    /// so a concurrently-running test's pool is indistinguishable from this
+    /// one's. A child owns all of its threads, which makes the count exact.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
+    fn a_failed_build_leaves_no_workers_running() {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("task_runtime::pool::ready_backstop_tests::ready_leak_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(READY_LEAK_CHILD_ENV, "1");
+        let output = cmd.output().expect("run readiness-leak child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let live: usize = stdout
+            .split_once("task_threads_after=")
+            .map(|(_, rest)| {
+                rest.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| {
+                panic!(
+                    "child never reported its worker-thread count; stdout: {stdout}\n\
+                     stderr: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        assert_eq!(
+            live, 0,
+            "a failed build left {live} task-runtime worker(s) running; panicking \
+             while holding threads relocates the defect rather than fixing it"
+        );
     }
 }
