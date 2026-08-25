@@ -659,7 +659,7 @@ guessing this schema refuses everywhere else.
 **Since #2009:** the three roles below are in the shipped vocabulary, which the
 same change renamed `ImageOutputContent` to `VisionOutputContent`
 (`crates/onnx-genai-metadata/src/schema/mod.rs:349-363` for vision,
-`mod.rs:452-454` for audio), so the values are declarable. Nothing *produces*
+`mod.rs:440-456` for audio), so the values are declarable. Nothing *produces*
 them yet — that is the preprocessor's phase, P3 — so the rest of this section
 reads as the specification the producer is written against.
 
@@ -908,7 +908,7 @@ being generalized. It did not, and the claim was withdrawn: `valid_lengths` is a
 extent of the dimension a `padding` entry names*.
 
 **Since #2009:** it is in both vocabularies with exactly that meaning
-(`crates/onnx-genai-metadata/src/schema/mod.rs:359` for vision, `mod.rs:452` for
+(`crates/onnx-genai-metadata/src/schema/mod.rs:359` for vision, `mod.rs:451` for
 audio), added once rather than per modality, which is the point the table below
 argues.
 
