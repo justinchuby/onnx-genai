@@ -6806,23 +6806,26 @@ mod tests {
         // then refuses, and the control skips -- on the *most common* way this
         // suite is run. A skip that is invisible and environment-triggered is
         // the same fail-open shape this change exists to remove.
+        //
+        // Selecting from the allowed set does not finish the job: a run bound
+        // to one sibling per core (`taskset -c 16,18,20,22`) has no shared core
+        // to build, so the control still returns green while testing nothing.
+        // `placement_cpus_or_fail_closed` separates that -- a binding artifact,
+        // which a lane declaring placement mandatory must fail on -- from a
+        // host with no SMT at all, where the layout is genuinely unrepresentable
+        // and a skip is the honest answer.
         let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
             .unwrap_or_else(|| (0..cores.logical_count()).collect())
             .into_iter()
             .collect();
-        let shared = cores.cores().iter().find_map(|group| {
-            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
-            match (inside.next(), inside.next()) {
-                (Some(first), Some(second)) => Some([first, second]),
-                _ => None,
-            }
-        });
+        let shared = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::SharedCore,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "actual-mask control",
+        );
         let Some(shared) = shared else {
-            eprintln!(
-                "skipping actual-mask control: no physical core has two SMT siblings inside \
-                 this process's allowed set {allowed:?}, so the bad layout is unrepresentable \
-                 here"
-            );
             return;
         };
         if !environment_can_pin(&shared) {
@@ -6870,14 +6873,20 @@ mod tests {
 
         // Positive arm: two genuinely distinct cores must not be reported as a
         // defect, otherwise the assertion above is satisfied by a predicate
-        // that is simply always false.
-        let distinct: Vec<usize> = cores
-            .cores()
-            .iter()
-            .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
-            .take(2)
-            .collect();
-        if distinct.len() < 2 || !environment_can_pin(&distinct) {
+        // that is simply always false. Same gate: a run bound to a single
+        // physical core cannot supply this arm, and in a lane that requires
+        // placement that is a defect in the lane, not a platform fact.
+        let distinct = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::DistinctCores,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "the positive arm of the actual-mask control",
+        );
+        let Some(distinct) = distinct else {
+            return;
+        };
+        if !environment_can_pin(&distinct) {
             eprintln!(
                 "skipping the positive arm of the actual-mask control: two distinct physical \
                  cores are not pinnable inside {allowed:?}"
