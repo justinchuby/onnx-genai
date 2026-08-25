@@ -8268,8 +8268,18 @@ mod tests {
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
         // A budget of 1 confines the process to one CPU, which `build_from_env`
         // deliberately declines (no core left for the dispatcher), so the
-        // smallest budget that builds a pool is 2.
-        let budgets: Vec<usize> = [2usize, 4, 8]
+        // smallest budget that builds a pool is 2. That case is not skipped, it
+        // is covered by `a_budget_of_one_reports_one_lane_on_whichever_path_serves_it`
+        // below, because its contract is a change of *path* rather than of width.
+        //
+        // 16 is covered because it is the default physical-core budget on the
+        // 16-physical / 32-logical reference host and the widest budget there
+        // that is not SMT-oversubscribed -- the one width where the headroom
+        // reservation fires under a budget somebody actually benchmarks. Widths
+        // are cheap to add here and expensive to be wrong about: each is a
+        // separate child, and an uncovered width is a `t=N` label with nothing
+        // behind it.
+        let budgets: Vec<usize> = [2usize, 4, 8, 16]
             .into_iter()
             .filter(|&n| n <= available)
             .collect();
@@ -8317,6 +8327,74 @@ mod tests {
                      free for the dispatcher"
                 );
             }
+        }
+    }
+
+    /// The one budget that is not a width: `=1` cannot build a pool on a host
+    /// that honours the confinement, and the read has to say so rather than
+    /// report a width nothing ran at.
+    ///
+    /// [`an_explicit_budget_buys_its_full_width_end_to_end`] starts at 2 because
+    /// `bound_process_to_decode_budget` confines the process to a single CPU
+    /// here, and `build_from_env` then declines: one allowed CPU leaves no core
+    /// for the inline dispatcher alongside a spinning worker. That decline is
+    /// the third silent-reduction path named in [`DecodeWidth`]'s doc, and the
+    /// only one that changes the *path* instead of the width -- so it is exactly
+    /// what a `t=1` row would mislabel, and nothing exercised it end to end.
+    ///
+    /// Keyed on the realized cpuset rather than on `cfg(target_os)`: only Linux
+    /// implements a process-wide affinity mask, so elsewhere the confinement does
+    /// not land, the group is not single-CPU, and the pool builds at width one.
+    /// Both outcomes are contractual, and asserting either unconditionally would
+    /// fail a correct implementation on half our runners. Branching on `allowed`
+    /// rather than on the platform also means the Linux branch is what runs under
+    /// an external `taskset -c 0`, which is the shape a user hits.
+    ///
+    /// What holds on every host is the part worth guarding, and it is asserted
+    /// before the split: one lane requested, one lane realized, on a resolved
+    /// path -- never 0, never `"unresolved"`. A pool that declined must still
+    /// account for the width the caller asked for.
+    #[test]
+    fn a_budget_of_one_reports_one_lane_on_whichever_path_serves_it() {
+        if std::env::var_os(BUDGET_LANE_CHILD_ENV).is_some() {
+            return; // The child arm runs as its own test below.
+        }
+        let lane = run_budget_lane_child(1, None).expect("the unconfined arm never skips");
+        if lane.nodes > 1 {
+            // A split layout reserves per node, which is not this test's case.
+            // `nodes == 0` is the declined pool and is very much the case.
+            eprintln!("budget 1: skipped, {}-node split layout", lane.nodes);
+            return;
+        }
+        assert_eq!(
+            (lane.requested, lane.realized),
+            (Some(1), Some(1)),
+            "a budget of 1 must report one requested and one realized lane, got \
+             requested={:?} realized={:?} on path {} ({} allowed CPUs)",
+            lane.requested,
+            lane.realized,
+            lane.path,
+            lane.allowed
+        );
+        if lane.allowed == 1 {
+            assert_eq!(
+                (lane.lanes, lane.path.as_str()),
+                (0, "flat"),
+                "a single-CPU cpuset must decline the pool and label the flat path, \
+                 got {} lanes on path {}",
+                lane.lanes,
+                lane.path
+            );
+        } else {
+            assert_eq!(
+                (lane.lanes, lane.path.as_str()),
+                (1, "spmd-pool"),
+                "with {} allowed CPUs the confinement did not land, so the pool must \
+                 build at the requested width, got {} lanes on path {}",
+                lane.allowed,
+                lane.lanes,
+                lane.path
+            );
         }
     }
 
