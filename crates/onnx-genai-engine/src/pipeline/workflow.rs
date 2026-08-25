@@ -1197,6 +1197,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &dynamic_symbols,
             )?;
         }
+        super::batching::validate_workflow_packed_inputs(workflow, &values)?;
         let input_names = values.keys().cloned().collect::<Vec<_>>();
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
@@ -1861,6 +1862,12 @@ impl WorkflowRuntime {
                                     })
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
+                        super::batching::validate_component_batch_before_enqueue(
+                            selected_component,
+                            selected_declaration,
+                            &resolved,
+                            &component_symbols,
+                        )?;
                         // Concrete output shapes known from the bound input
                         // symbols, so the native CUDA seam can keep resolvable
                         // outputs (a recurring/state tensor in particular)
@@ -2530,6 +2537,12 @@ impl WorkflowRuntime {
                 )?;
             }
         }
+        super::batching::validate_component_batch_before_enqueue(
+            component,
+            declaration,
+            inputs,
+            &component_symbols,
+        )?;
         let output_shapes = resolve_component_output_shapes(
             declaration,
             outputs,
@@ -4257,7 +4270,7 @@ fn resolve_component_output_shapes(
     resolved
 }
 
-fn validate_workflow_value(
+pub(super) fn validate_workflow_value(
     name: &str,
     value: &Value,
     contract: &TensorContract,

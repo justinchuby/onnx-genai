@@ -854,6 +854,33 @@ impl Value {
         tensor_data_to_vec(self.ptr.as_ptr(), self.numel())
     }
 
+    /// Borrow host-resident Int64 tensor data without copying it.
+    ///
+    /// The returned slice cannot outlive this [`Value`]. Device-resident values
+    /// fail rather than exposing a device address as a host pointer.
+    pub fn as_slice_i64(&self) -> Result<&[i64]> {
+        self.ensure_host_accessible("as_slice_i64")?;
+        if self.dtype != DataType::Int64 {
+            return Err(OrtError::InvalidArgument(format!(
+                "requested borrowed i64 data from {:?} tensor",
+                self.dtype
+            )));
+        }
+        if self.numel() == 0 {
+            return Ok(&[]);
+        }
+        let ptr = tensor_data_ptr(self.ptr.as_ptr())?.cast::<i64>();
+        if !ptr.is_aligned() {
+            return Err(OrtError::InvalidArgument(format!(
+                "cannot borrow Int64 tensor data at misaligned pointer {ptr:p}"
+            )));
+        }
+        // SAFETY: the checked host tensor contains `numel` initialized Int64
+        // elements at an aligned address and `self` keeps them alive for the
+        // returned borrow.
+        Ok(unsafe { std::slice::from_raw_parts(ptr, self.numel()) })
+    }
+
     pub(crate) fn as_ptr(&self) -> *const onnx_genai_ort_sys::OrtValue {
         self.ptr.as_ptr()
     }
@@ -1599,6 +1626,56 @@ impl Value {
                 element_offset,
             },
         })
+    }
+
+    /// Create a no-copy view over a contiguous range of axis zero.
+    ///
+    /// Axis zero is the outermost row-major axis, so this range is one
+    /// contiguous element window. The shared owner keeps host or device storage
+    /// alive until every derived view has dropped.
+    pub fn axis0_view(owner: Arc<Value>, start: usize, len: usize) -> Result<Self> {
+        let first = owner.shape.first().copied().ok_or_else(|| {
+            OrtError::InvalidArgument("axis0_view requires a tensor with rank at least one".into())
+        })?;
+        let axis_extent = usize::try_from(first).map_err(|_| {
+            OrtError::InvalidArgument(format!(
+                "axis0_view requires a non-negative axis-zero extent, got {first}"
+            ))
+        })?;
+        let end = start.checked_add(len).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "axis0_view start {start} plus length {len} overflows"
+            ))
+        })?;
+        if end > axis_extent {
+            return Err(OrtError::InvalidArgument(format!(
+                "axis0_view range {start}..{end} exceeds axis-zero extent {axis_extent}"
+            )));
+        }
+        let row_elements = owner.shape[1..].iter().try_fold(1usize, |total, &extent| {
+            let extent = usize::try_from(extent).map_err(|_| {
+                OrtError::InvalidArgument(format!(
+                    "axis0_view requires non-negative trailing extents, got shape {:?}",
+                    owner.shape
+                ))
+            })?;
+            total.checked_mul(extent).ok_or_else(|| {
+                OrtError::InvalidArgument(format!(
+                    "axis0_view trailing shape is too large: {:?}",
+                    owner.shape
+                ))
+            })
+        })?;
+        let element_offset = start.checked_mul(row_elements).ok_or_else(|| {
+            OrtError::InvalidArgument(format!(
+                "axis0_view element offset overflows for start {start} and row width {row_elements}"
+            ))
+        })?;
+        let mut shape = owner.shape.clone();
+        shape[0] = i64::try_from(len).map_err(|_| {
+            OrtError::InvalidArgument(format!("axis0_view length {len} does not fit i64"))
+        })?;
+        Self::alias_with_offset(owner, element_offset, &shape)
     }
 
     /// Convert an owned tensor into a no-copy alias with the requested shape.
@@ -3088,5 +3165,28 @@ mod alias_offset_tests {
             Value::alias_with_offset(owner, 1, &[2]).unwrap()
         };
         assert_eq!(view.to_vec_i64().unwrap(), vec![8, 9]);
+    }
+
+    /// Packed-axis slicing reuses the payload buffer and advances by whole rows.
+    #[test]
+    fn an_axis_zero_view_has_buffer_identity_without_a_payload_copy() {
+        let owner = Arc::new(Value::from_slice_i64(&[0, 1, 2, 3, 4, 5], &[3, 2]).unwrap());
+        let owner_ptr = owner.data_ptr_addr().unwrap();
+        let view = Value::axis0_view(Arc::clone(&owner), 1, 2).unwrap();
+        assert_eq!(view.shape(), &[2, 2]);
+        assert_eq!(view.to_vec_i64().unwrap(), vec![2, 3, 4, 5]);
+        assert_eq!(
+            view.data_ptr_addr().unwrap(),
+            owner_ptr + 2 * std::mem::size_of::<i64>()
+        );
+    }
+
+    /// Ownership companions are scanned in place rather than copied to a Vec.
+    #[test]
+    fn an_i64_slice_borrows_the_tensor_buffer() {
+        let value = Value::from_slice_i64(&[0, 2, 5], &[3]).unwrap();
+        let borrowed = value.as_slice_i64().unwrap();
+        assert_eq!(borrowed, &[0, 2, 5]);
+        assert_eq!(borrowed.as_ptr() as usize, value.data_ptr_addr().unwrap());
     }
 }
