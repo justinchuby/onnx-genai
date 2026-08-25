@@ -33,6 +33,14 @@
 //! use 16 to reach the `INT4_PREFILL_GEBP_MIN_ROWS_UNBLOCKED` branch, where
 //! the route below the crossover is the generic per-block dot); `PROBE_MS=prefill|cross` picks a row
 //! sweep.
+//!
+//! Every row carries two output fingerprints, `sum` and `fnv`. `fnv` is the
+//! one that matters: an FNV-1a fold over the raw output bytes, so it moves for
+//! any bit that moves, at the position it moved. It exists because a
+//! source-level A/B has to rebuild between arms, and a null taken that way is
+//! uninterpretable without it -- a change that never executed and a change that
+//! executed and cost nothing produce the same table, and no amount of timing
+//! separates them. See `int4_modulo_matrix.py --route-proof`.
 
 mod common;
 
@@ -64,6 +72,55 @@ fn floats(len: usize, seed: f32) -> Vec<f32> {
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     samples[samples.len() / 2]
+}
+
+/// Route proof, not decoration.
+///
+/// A source-level A/B has to rebuild between arms, so "the arm I built is the
+/// arm that ran" is an assumption rather than an observation, and a null is
+/// uninterpretable without it: a change that never executed and a change that
+/// executed and cost nothing produce the same table. The `fnv` column is an
+/// FNV-1a fold over the raw output bytes, so it moves for *any* bit that
+/// moves, at the position it moved -- unlike the float sum, which a
+/// permutation can leave alone. A deliberately poisoned build is expected to
+/// move it on exactly the rows whose route reaches the modified line, and to
+/// leave every other row bit-identical. Those untouched rows are the control:
+/// they show the poison is not simply changing the whole binary's behaviour.
+///
+/// The float sum is kept alongside it because it is comparable with the
+/// decode-loop harness's `checksum=`, which is a plain sum.
+fn checksum(out: &Tensor) -> (f64, u64) {
+    let view = out.view();
+    let len: usize = view.shape.iter().product();
+    // `from_raw_parts` below trusts that `len` elements are contiguous behind
+    // the pointer. That holds for a freshly allocated kernel output and fails
+    // for a strided or sliced view, and the failure is a read past the
+    // allocation rather than a wrong number, so it is checked rather than
+    // assumed. Row-major contiguity is exactly `strides[i] == product of the
+    // dimensions after i`.
+    let mut want = 1i64;
+    for (dim, stride) in view.shape.iter().zip(view.strides.iter()).rev() {
+        assert_eq!(
+            *stride, want,
+            "checksum needs a contiguous f32 output; shape {:?} strides {:?} are not row-major",
+            view.shape, view.strides
+        );
+        want *= *dim as i64;
+    }
+    assert_eq!(
+        view.byte_offset, 0,
+        "checksum does not handle a byte offset"
+    );
+    let values = unsafe { std::slice::from_raw_parts(view.data_ptr::<f32>(), len) };
+    let sum = values.iter().map(|v| f64::from(*v)).sum();
+    let mut fnv = 0xcbf2_9ce4_8422_2325u64;
+    for v in values {
+        for byte in v.to_bits().to_le_bytes() {
+            fnv ^= u64::from(byte);
+            fnv = fnv.wrapping_mul(0x1_0000_01b3);
+        }
+    }
+    (sum, fnv)
 }
 
 fn build_kernel(
@@ -133,8 +190,8 @@ fn main() {
     };
     println!("acc_level={acc} bits={bits} block_size={block_size}");
     println!(
-        "{:>6} {:>6} {:>5} {:>12} {:>12} {:>12}",
-        "k", "n", "m", "cold_ms", "steady_ms", "gflops"
+        "{:>6} {:>6} {:>5} {:>12} {:>12} {:>12} {:>16} {:>16}",
+        "k", "n", "m", "cold_ms", "steady_ms", "gflops", "sum", "fnv"
     );
     for &(k, n) in shapes.iter() {
         let blocks = k.div_ceil(block_size);
@@ -195,7 +252,10 @@ fn main() {
                     .collect(),
             );
             let gflops = (2.0 * m as f64 * k as f64 * n as f64) / (steady * 1e6);
-            println!("{k:>6} {n:>6} {m:>5} {cold:>12.3} {steady:>12.3} {gflops:>12.2}");
+            let (sum, fnv) = checksum(&out);
+            println!(
+                "{k:>6} {n:>6} {m:>5} {cold:>12.3} {steady:>12.3} {gflops:>12.2} {sum:>16.6} {fnv:016x}"
+            );
         }
     }
 
