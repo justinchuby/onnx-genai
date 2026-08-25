@@ -125,6 +125,13 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
         "attention.rs::run_attention_phase2a".to_string(),
         "block_quantized_matmul.rs::execute".to_string(),
         "block_quantized_moe.rs::execute_with_workspace".to_string(),
+        // Declares CaptureSupport::unsupported ("cuFFT plan selection and runtime
+        // scalar/metadata staging are not CUDA-graph capture-safe"). The sync is
+        // the host barrier before the synchronous default-stream metadata upload,
+        // which the kernel's own comment names as one reason capture is
+        // unsupported -- so it belongs here rather than behind an is_capturing
+        // guard that could never be true.
+        "dft.rs::run".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         "matmul_nbits.rs::run".to_string(),
