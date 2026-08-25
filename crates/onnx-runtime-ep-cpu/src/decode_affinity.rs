@@ -629,6 +629,21 @@ pub fn set_current_thread_affinity(cpus: &[usize]) -> std::result::Result<(), St
     Err("process-wide CPU affinity masking is only implemented on Linux (no-op)".to_string())
 }
 
+/// Whether [`set_current_thread_affinity`] can do anything on this target.
+///
+/// A test that narrows its own cpuset to build a controlled shape has to tell
+/// two failures apart: "this target has no process-wide masking, so the shape is
+/// unbuildable by construction" and "masking exists here and did not work".
+/// The first is a legitimate skip; the second is a defect, and reading it as the
+/// first is how a whole platform's coverage disappears without anyone noticing.
+///
+/// Derived from `cfg!` and *not* from a runtime call, for the same reason
+/// [`crate::core_topology::DETECTION_SUPPORTED`] is: a support flag computed by
+/// asking the thing whether it worked answers "unsupported" for every runtime
+/// failure, which is exactly the collapse it exists to prevent.
+#[cfg(test)]
+pub(crate) const AFFINITY_MASKING_SUPPORTED: bool = cfg!(target_os = "linux");
+
 /// Whether the user explicitly requested a decode affinity via
 /// [`DECODE_AFFINITY_ENV`] (a non-empty value). When set, the automatic
 /// good-citizen process mask stands down so the user's affinity choice wins.
@@ -1458,6 +1473,38 @@ mod windows_imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The support flag must not claim less than the call delivers.
+    ///
+    /// The drift that matters is one-directional. If someone implements
+    /// process-wide masking on Windows and leaves
+    /// [`AFFINITY_MASKING_SUPPORTED`] at `cfg!(target_os = "linux")`, every
+    /// caller that uses the flag to decide "unbuildable by construction, skip"
+    /// keeps skipping on a platform that could now answer -- silently, forever.
+    /// That is the fail-open direction and it is what this asserts: a call that
+    /// *succeeded* proves support, whatever the flag says.
+    ///
+    /// The converse -- flag `true`, call failed -- is deliberately **not**
+    /// asserted here. It would false-fail on a CPU hot-unplugged between
+    /// reading the mask and re-applying it, and its real failure mode is
+    /// already loud: every caller of this flag panics rather than skips when
+    /// masking is supported and does not work.
+    #[test]
+    fn a_successful_affinity_call_is_never_reported_as_an_unsupported_target() {
+        let Some(allowed) = allowed_cpus() else {
+            return;
+        };
+        // Re-applying the mask already in force: a no-op on success, and it
+        // cannot widen or narrow the thread running this test either way.
+        let succeeded = set_current_thread_affinity(&allowed).is_ok();
+        assert!(
+            !succeeded || AFFINITY_MASKING_SUPPORTED,
+            "set_current_thread_affinity succeeded on a target where \
+             AFFINITY_MASKING_SUPPORTED is false. Callers read that flag as \
+             `this shape is unbuildable here, skip`, so the flag is now \
+             disabling checks on a platform that can run them."
+        );
+    }
 
     /// Build one `RelationNumaNode` record exactly as the OS lays it out: an
     /// 8-byte header, then `NUMA_NODE_RELATIONSHIP`, then the node's

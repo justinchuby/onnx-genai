@@ -20063,6 +20063,17 @@ mod tests {
         /// old name would have left the parent's escape hatch below checking a
         /// host fact that no longer has anything to do with it.
         worker_masks_readable: bool,
+        /// Whether the child successfully narrowed itself to one CPU per
+        /// physical core. Only the default arm asks for this; every other arm
+        /// reports `false` because it never tried.
+        ///
+        /// A separate field rather than an inference from `allowed == cores`,
+        /// because that equality is also what the arm *asserts*: deriving the
+        /// precondition from the conclusion is how a check comes to confirm
+        /// itself. On a target with no process-wide masking the two are
+        /// genuinely different facts -- narrowing did not happen, and the
+        /// equality may still hold on a machine without SMT.
+        narrowed_to_leaders: bool,
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
         /// number is the only in-band trace of them (#1745).
@@ -20324,8 +20335,9 @@ mod tests {
         // `requested=0` marks the default-resolver arm in the report line: the
         // parent did not ask for a width, so there is no requested value to
         // echo and the only honest thing to print is "none".
+        let mut narrowed = false;
         let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
-            restrict_self_to_leader_cpus();
+            narrowed = restrict_self_to_leader_cpus();
             0
         } else {
             raw.parse().expect("the parent passes a decimal width")
@@ -20386,14 +20398,15 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized} policy={} cpulist={cpulist}",
+             pinned={} proc={} realized={realized} policy={} narrowed={} cpulist={cpulist}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
             u8::from(fully_pinned),
             u8::from(observed_ok),
-            crate::decode_affinity::CorePlacement::from_env().as_str()
+            crate::decode_affinity::CorePlacement::from_env().as_str(),
+            u8::from(narrowed)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
@@ -20406,22 +20419,65 @@ mod tests {
     /// silently halves the pool. Doing it from inside the child keeps the test
     /// free of a `taskset` dependency and makes the mask an observable the
     /// child reports (`allowed`/`cores`) rather than an assumption.
-    fn restrict_self_to_leader_cpus() {
+    ///
+    /// Returns whether the narrowing actually happened, which the parent needs
+    /// in order to tell two different "no" answers apart:
+    ///
+    /// * **Unbuildable by construction.** `set_current_thread_affinity` is
+    ///   implemented on Linux only, so on Windows and macOS this shape cannot be
+    ///   created at all and the arm has nothing to measure. That is a skip, and
+    ///   it is stated on stderr rather than passed silently.
+    /// * **Supported and broken.** On a target that *has* masking, a failure
+    ///   leaves the child on the full cpuset, where the arm's `workers == cores`
+    ///   would be a claim about the host rather than about the resolver. That
+    ///   panics.
+    ///
+    /// The original version panicked on both, which is why #2059 merged with
+    /// both Windows lanes red: it read "this platform has no process-wide
+    /// masking" as a defect. Collapsing them the other way -- skipping on both
+    /// -- would have been worse, because it removes Linux coverage the moment
+    /// masking breaks there, and Linux is where this arm actually runs.
+    fn restrict_self_to_leader_cpus() -> bool {
         let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
-            return;
+            eprintln!(
+                "leader-only narrowing skipped: this target cannot report the CPUs it is \
+                 allowed to run on, so there is no set to narrow"
+            );
+            return false;
         };
-        let Ok(topology) = crate::core_topology::require_host_for_placement() else {
-            return;
+        let topology = match crate::core_topology::require_host_for_placement() {
+            Ok(topology) => topology,
+            Err(reason) => {
+                eprintln!("leader-only narrowing skipped: {reason}");
+                return false;
+            }
         };
         let leaders = topology.leaders_within(&allowed);
         if leaders.is_empty() {
-            return;
+            eprintln!(
+                "leader-only narrowing skipped: the detected topology covers none of the \
+                 {} allowed CPUs, so it names no leaders to narrow to",
+                allowed.len()
+            );
+            return false;
         }
-        // A failure here is not silently tolerated: it would leave the child on
-        // the full cpuset, where `workers == cores` holds for the wrong reason
-        // and the assertion would pass without testing anything.
-        crate::decode_affinity::set_current_thread_affinity(&leaders)
-            .expect("restrict the child to leader CPUs");
+        match crate::decode_affinity::set_current_thread_affinity(&leaders) {
+            Ok(()) => true,
+            // Fails closed exactly where the capability exists. `cfg!`-derived,
+            // so it cannot quietly become `false` on a host that should have
+            // answered -- the same reason `DETECTION_SUPPORTED` is not a
+            // runtime probe.
+            Err(reason) if crate::decode_affinity::AFFINITY_MASKING_SUPPORTED => panic!(
+                "restrict the child to leader CPUs: {reason}. This target implements \
+                 process-wide affinity masking, so this is a failure rather than an \
+                 absent capability, and continuing would leave the child on the full \
+                 cpuset where `workers == cores` holds for the wrong reason."
+            ),
+            Err(reason) => {
+                eprintln!("leader-only narrowing skipped: {reason}");
+                false
+            }
+        }
     }
 
     fn realized_width_report(requested: usize) -> RealizedWidth {
@@ -20607,6 +20663,7 @@ mod tests {
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             worker_masks_readable: field("proc") == 1,
+            narrowed_to_leaders: field("narrowed") == 1,
             attempts: attempts_used,
         };
 
@@ -20775,6 +20832,34 @@ mod tests {
     #[test]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
         let report = realized_default_width_report();
+
+        // The arm is built on a cpuset the child narrows for itself, and
+        // `set_current_thread_affinity` is implemented on Linux only. Where it
+        // is not, the shape is unbuildable by construction and there is nothing
+        // to measure -- which is a different answer from "narrowing failed",
+        // and the child already panicked on that one.
+        //
+        // The guard is `cfg!`-derived rather than a runtime probe, so it cannot
+        // silently start excusing a Linux host: if narrowing regresses on the
+        // platform where this arm actually runs, this fails rather than skips.
+        // #2059 merged with both Windows lanes red for the mirror-image reason
+        // -- it treated an absent capability as a defect -- and the fix must
+        // not overshoot into treating a defect as an absent capability.
+        assert!(
+            report.narrowed_to_leaders || !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED,
+            "this target implements process-wide affinity masking, so the child must have \
+             narrowed itself to one CPU per physical core -- it reports that it did not, \
+             and every assertion below would then be about the host rather than about the \
+             default width resolver ({report:?})"
+        );
+        if !report.narrowed_to_leaders {
+            eprintln!(
+                "skipping {}: this target has no process-wide affinity masking, so a \
+                 leader-only cpuset cannot be constructed here ({report:?})",
+                module_path!()
+            );
+            return;
+        }
 
         if !report.pool_built {
             // No persistent pool on this target: there is no placement to
