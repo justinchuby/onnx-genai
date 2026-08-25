@@ -364,9 +364,9 @@ misclassified_subs() {
                 sub(/\).*/, "", body)
                 if (list) { print "$(python" body ")"; continue }
                 if (block ~ /cargo /) {
-                    if (body !~ /cargo-args /)
+                    if (body !~ /workspace_test_packages\.py cargo-args /)
                         print name ": in a cargo step but not a generator: $(python" body ")"
-                } else if (body !~ /verify/) {
+                } else if (body !~ /workspace_test_packages\.py (verify|verify-required-tier|self-test)( |$|\))/) {
                     print name ": outside a cargo step and not a known checker: $(python" body ")"
                 }
             }
