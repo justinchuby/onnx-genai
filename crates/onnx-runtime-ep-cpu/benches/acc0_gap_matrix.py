@@ -148,6 +148,113 @@ def weight_bytes(model, block):
     return total
 
 
+HOSTLOCK = os.path.join(ROOT, "scripts", "hostlock.sh")
+
+# Set while this process holds the lock, so LoadWatch can tell "I hold the box"
+# apart from "somebody else does" without re-deriving ownership from pids.
+_HELD_BY_US = False
+
+
+def lock_provenance():
+    """The advisory lock's state as key=value fields.
+
+    Recorded *with* the numbers rather than asserted next to them: a result
+    that claims a quiet host should carry the evidence for that claim, in the
+    same file, so a reader can check it instead of trusting the run log.
+    """
+    try:
+        r = subprocess.run(["bash", HOSTLOCK, "provenance"],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return {"hostlock_state": "unavailable"}
+    return dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
+
+
+class HostLock:
+    """Hold the advisory whole-host lock for a whole sweep.
+
+    Several agents share this machine and coordinate by announcing before and
+    after benchmark runs. That protocol has a delivery step, and the delivery
+    step has been observed to fail: a release that is never received is
+    indistinguishable from a release that was never sent, and both parties can
+    then idle waiting for each other while behaving correctly. A filesystem
+    lock has no delivery step -- every participant observes the same primitive
+    directly.
+
+    Fails closed. If the lock cannot be taken, the sweep does not run: a number
+    measured against somebody else's benchmark is not a slow number, it is a
+    meaningless one, and `LoadWatch` can only tell you that *afterwards*.
+    """
+
+    #: Exit codes from hostlock.sh, mapped so a refusal says why rather than
+    #: making the reader go and read the script.
+    WHY = {2: "the host is busy and --wait was not used",
+           3: "timed out waiting for the host",
+           4: "the only way in was to reap a stale lock, and a dead holder's "
+              "benchmark may still be burning cores",
+           5: "the load gate was never satisfied",
+           7: "the lock directory is unusable on this host"}
+
+    def __init__(self, owner, reason, timeout=7200, wait=True):
+        self.owner, self.reason, self.timeout = owner, reason, timeout
+        self.wait = wait
+        self.provenance = {}
+        self.held = False
+
+    def __enter__(self):
+        before = lock_provenance()
+        if before.get("hostlock_state") == "HELD":
+            # Blocking for up to two hours with no output is indistinguishable
+            # from a hang, so name the holder and their reason first.
+            print(f"host lock is HELD by {before.get('held_by', '?')} "
+                  f"({before.get('reason', 'no reason given')}); "
+                  f"{'waiting' if self.wait else 'refusing'}",
+                  file=sys.stderr, flush=True)
+        cmd = ["bash", HOSTLOCK, "acquire", "--owner", self.owner,
+               "--reason", self.reason, "--timeout", str(self.timeout),
+               # `acquire` defaults to --ttl 3600. A TTL is not "release this
+               # if I abandon it", it is "release this on the clock, whether
+               # or not I am still running" -- so on a sweep longer than an
+               # hour it hands the box to a second measurer mid-run and
+               # contaminates both sets of numbers. These sweeps routinely run
+               # for hours. 0 means never expires; the pid anchor below is
+               # what recovers the lock if this process dies.
+               "--ttl", "0",
+               # An acquire that had to reap somebody means their processes may
+               # still be running. Refuse rather than measure on top of them.
+               "--strict-reap",
+               # The invoking shell exits immediately, so anchor liveness to
+               # this process instead -- otherwise the lock looks dead at once
+               # and the next acquirer reaps it out from under a live sweep.
+               "--pid", str(os.getpid())]
+        if self.wait:
+            # --timeout is only honoured with --wait; without it the flag is
+            # accepted and silently does nothing.
+            cmd.append("--wait")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            why = self.WHY.get(r.returncode, "unknown failure")
+            if r.returncode == 3:
+                why += f" after {self.timeout}s"
+            raise SystemExit(
+                f"REFUSING TO RUN: could not take the host lock -- {why} "
+                f"(exit {r.returncode}).\n{r.stdout}{r.stderr}")
+        self.held = True
+        global _HELD_BY_US
+        _HELD_BY_US = True
+        self.provenance = lock_provenance()
+        return self
+
+    def __exit__(self, *exc):
+        if self.held:
+            subprocess.run(["bash", HOSTLOCK, "release"],
+                           capture_output=True, text=True)
+            self.held = False
+            global _HELD_BY_US
+            _HELD_BY_US = False
+        return False
+
+
 def sh(cmd, env=None, timeout=1800):
     e = dict(os.environ)
     e["CARGO_INCREMENTAL"] = "0"
@@ -349,9 +456,36 @@ class LoadWatch:
 
     def __enter__(self):
         self.peak = self.runnable()
+        self.lock = lock_provenance()
+        self._warn_if_unlocked()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         return self
+
+    def _warn_if_unlocked(self):
+        """Record, and complain about, the host-lock state of a timed region.
+
+        LoadWatch and the lock answer different questions -- LoadWatch notices
+        a competitor after it has already landed, the lock stops one landing --
+        so a timed region wants both. This does not refuse to run, because
+        several harnesses use LoadWatch around cheap non-exclusive probes and
+        failing them closed would be a worse trade. What it does guarantee is
+        that the record carries the answer: a result taken without the lock is
+        identifiable as such from its own JSON, rather than resting on the
+        operator's memory of whether they announced the box.
+        """
+        if _HELD_BY_US:
+            return
+        state = self.lock.get("hostlock_state", "unknown")
+        if state == "HELD":
+            who = self.lock.get("held_by", "someone")
+            print(f"WARNING: timing while the host lock is HELD by {who} -- "
+                  f"these numbers are contended by construction",
+                  file=sys.stderr, flush=True)
+        else:
+            print(f"WARNING: timing without the host lock (state={state}) -- "
+                  f"a competitor can land mid-run",
+                  file=sys.stderr, flush=True)
 
     def __exit__(self, *exc):
         self._stop.set()
@@ -421,79 +555,93 @@ def main():
     print(hdr)
     print("-" * len(hdr))
 
-    for launch in range(args.launches):
-      for model in args.models.split(","):
-        wb = weight_bytes(model, args.block)
-        for t in threads:
-            tokens = tokens_for[t]
-            for s in [int(x) for x in args.sessions.split(",")]:
-                load, busy = wait_quiet()
-                if busy:
-                    sys.stderr.write(
-                        f"WARNING {model} t={t} s={s}: measuring against "
-                        f"{len(busy)} competing process(es); cell is UNTRUSTED\n")
-                    for pid, pcpu, cmd in busy[:3]:
-                        sys.stderr.write(f"    pid={pid} cpu={pcpu:.0f}% {cmd}\n")
-                # Interleaved: native, ORT, native again (the A/A partner).
-                # Every arm runs inside a LoadWatch so a competitor that
-                # arrives mid-cell is caught, not just one that was already
-                # there when `wait_quiet` returned.
-                with LoadWatch() as watch:
-                    a1 = native(args.binary, model, args.block, args.acc, t, s,
-                                tokens, args.reps)
-                    o = None
-                    o_wide = None
-                    if args.ort_pin in ("matched", "both"):
-                        o = ort(model, args.block, args.acc, t, s, tokens,
-                                args.reps, pin=native_pin(t))
-                    if args.ort_pin in ("wide", "both"):
-                        o_wide = ort(model, args.block, args.acc, t, s,
-                                     tokens, args.reps, pin=PIN)
-                    if o is None:
-                        o = o_wide
-                    aa = ""
-                    if args.aa:
-                        a2 = native(args.binary, model, args.block, args.acc, t,
-                                    s, tokens, args.reps)
-                        aa = f"{a2['tps'] / a1['tps']:.3f}"
-                if watch.peak > t + args.slack:
-                    sys.stderr.write(
-                        f"WARNING {model} t={t} s={s}: peak runnable "
-                        f"{watch.peak} > {t} + {args.slack} during the cell; "
-                        f"cell is UNTRUSTED\n")
-                    busy = busy or [("-", 0.0, f"peak runnable {watch.peak}")]
-                nat_bw = a1["tps"] * wb / 1e9
-                ort_bw = o["tps"] * wb / 1e9
-                row = {"model": model, "launch": launch, "threads": t,
-                       "sessions": s, "tokens": tokens,
-                       "native": a1, "ort": o, "ratio": a1["tps"] / o["tps"],
-                       # `ratio` is native/ORT (below 1 means we are behind);
-                       # `gap` is its reciprocal, the "Nx behind ORT" the docs
-                       # quote. Both are printed so neither orientation has to
-                       # be inferred from which side of 1.0 a number sits.
-                       "gap": o["tps"] / a1["tps"],
-                       "ort_wide": o_wide,
-                       "ratio_wide": (a1["tps"] / o_wide["tps"]) if o_wide else None,
-                       "native_gbs": nat_bw, "ort_gbs": ort_bw,
-                       "weight_bytes": wb, "loadavg_at_start": load,
-                       "peak_runnable": watch.peak,
-                       "trusted": not busy,
-                       "competitors": [c[2] for c in busy],
-                       "aa": float(aa) if aa else None}
-                rows.append(row)
-                flag = "" if not busy else "  !CONTENDED"
-                wide = ""
-                if o_wide is not None and row["ratio_wide"] is not None:
-                    wide = (f"  wide_ort={o_wide['tps']:.1f} "
-                            f"ratio_wide={row['ratio_wide']:.3f}")
-                print(f"{model:>6} {launch:>2} {t:>3} {s:>2} {a1['tps']:>9.1f} "
-                      f"{a1['spread']:>8.1f} {o['tps']:>9.1f} {o['spread']:>8.1f} "
-                      f"{row['ratio']:>7.3f} {row['gap']:>7.3f} "
-                      f"{nat_bw:>9.1f} {ort_bw:>9.1f} {aa:>6}"
-                      f"{wide}{flag}")
-                sys.stdout.flush()
-                with open(os.path.join(HERE, args.out), "w") as f:
-                    json.dump(rows, f, indent=1)
+    # One lock for the whole matrix, not one per cell: a per-cell acquire
+    # would hand the box back between cells and let a competitor land in
+    # the middle of a matrix whose cells are only comparable to each other
+    # if they all saw the same machine. Released before the summary below,
+    # which is arithmetic and has no business holding the host.
+    with HostLock(owner=os.environ.get("ONNX_GENAI_BENCH_OWNER", "roy"),
+                  reason=f"acc0 gap matrix: {args.models} t={args.threads} "
+                         f"x{args.launches} launches") as lock:
+        for launch in range(args.launches):
+          for model in args.models.split(","):
+            wb = weight_bytes(model, args.block)
+            for t in threads:
+                tokens = tokens_for[t]
+                for s in [int(x) for x in args.sessions.split(",")]:
+                    load, busy = wait_quiet()
+                    if busy:
+                        sys.stderr.write(
+                            f"WARNING {model} t={t} s={s}: measuring against "
+                            f"{len(busy)} competing process(es); cell is UNTRUSTED\n")
+                        for pid, pcpu, cmd in busy[:3]:
+                            sys.stderr.write(f"    pid={pid} cpu={pcpu:.0f}% {cmd}\n")
+                    # Interleaved: native, ORT, native again (the A/A partner).
+                    # Every arm runs inside a LoadWatch so a competitor that
+                    # arrives mid-cell is caught, not just one that was already
+                    # there when `wait_quiet` returned.
+                    with LoadWatch() as watch:
+                        a1 = native(args.binary, model, args.block, args.acc, t, s,
+                                    tokens, args.reps)
+                        o = None
+                        o_wide = None
+                        if args.ort_pin in ("matched", "both"):
+                            o = ort(model, args.block, args.acc, t, s, tokens,
+                                    args.reps, pin=native_pin(t))
+                        if args.ort_pin in ("wide", "both"):
+                            o_wide = ort(model, args.block, args.acc, t, s,
+                                         tokens, args.reps, pin=PIN)
+                        if o is None:
+                            o = o_wide
+                        aa = ""
+                        if args.aa:
+                            a2 = native(args.binary, model, args.block, args.acc, t,
+                                        s, tokens, args.reps)
+                            aa = f"{a2['tps'] / a1['tps']:.3f}"
+                    if watch.peak > t + args.slack:
+                        sys.stderr.write(
+                            f"WARNING {model} t={t} s={s}: peak runnable "
+                            f"{watch.peak} > {t} + {args.slack} during the cell; "
+                            f"cell is UNTRUSTED\n")
+                        busy = busy or [("-", 0.0, f"peak runnable {watch.peak}")]
+                    nat_bw = a1["tps"] * wb / 1e9
+                    ort_bw = o["tps"] * wb / 1e9
+                    row = {"model": model, "launch": launch, "threads": t,
+                           "sessions": s, "tokens": tokens,
+                           "native": a1, "ort": o, "ratio": a1["tps"] / o["tps"],
+                           # `ratio` is native/ORT (below 1 means we are behind);
+                           # `gap` is its reciprocal, the "Nx behind ORT" the docs
+                           # quote. Both are printed so neither orientation has to
+                           # be inferred from which side of 1.0 a number sits.
+                           "gap": o["tps"] / a1["tps"],
+                           "ort_wide": o_wide,
+                           "ratio_wide": (a1["tps"] / o_wide["tps"]) if o_wide else None,
+                           "native_gbs": nat_bw, "ort_gbs": ort_bw,
+                           "weight_bytes": wb, "loadavg_at_start": load,
+                           "peak_runnable": watch.peak,
+                           "trusted": not busy,
+                           # The lock state travels in the row rather than only
+                           # in the run log, so a cell that was measured on a
+                           # shared box stays identifiable after the terminal
+                           # scrollback is gone.
+                           "hostlock": lock.provenance.get("hostlock_state"),
+                           "hostlock_held_by": lock.provenance.get("held_by"),
+                           "competitors": [c[2] for c in busy],
+                           "aa": float(aa) if aa else None}
+                    rows.append(row)
+                    flag = "" if not busy else "  !CONTENDED"
+                    wide = ""
+                    if o_wide is not None and row["ratio_wide"] is not None:
+                        wide = (f"  wide_ort={o_wide['tps']:.1f} "
+                                f"ratio_wide={row['ratio_wide']:.3f}")
+                    print(f"{model:>6} {launch:>2} {t:>3} {s:>2} {a1['tps']:>9.1f} "
+                          f"{a1['spread']:>8.1f} {o['tps']:>9.1f} {o['spread']:>8.1f} "
+                          f"{row['ratio']:>7.3f} {row['gap']:>7.3f} "
+                          f"{nat_bw:>9.1f} {ort_bw:>9.1f} {aa:>6}"
+                          f"{wide}{flag}")
+                    sys.stdout.flush()
+                    with open(os.path.join(HERE, args.out), "w") as f:
+                        json.dump(rows, f, indent=1)
 
     print()
     # Per-width summary over launches. The gap is medianed over *paired* cells

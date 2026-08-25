@@ -435,17 +435,28 @@ def main():
     widths = tuple(int(x) for x in args.widths.split(","))
     if args.replay:
         with open(args.replay) as fh:
-            recs = json.load(fh)
+            blob = json.load(fh)
+        # Datasets taken before the lock was adopted are a bare list.
+        recs = blob["runs"] if isinstance(blob, dict) else blob
+        state = (blob.get("hostlock", {}).get("hostlock_state", "unrecorded")
+                 if isinstance(blob, dict) else "unrecorded (pre-lock dataset)")
+        print(f"hostlock at acquire: {state}")
         report(recs, widths)
         return
 
     recs = []
-    for launch in range(args.launches):
-        recs.append(one_launch(args, launch, widths))
-        if args.out:
-            with open(args.out, "w") as fh:
-                json.dump(recs, fh, indent=1)
-        time.sleep(1)
+    # The sweep holds the box for its whole duration; the report afterwards is
+    # arithmetic and runs unlocked.
+    with H.HostLock(owner=os.environ.get("ONNX_GENAI_BENCH_OWNER", "roy"),
+                    reason=f"acc0 w16 worker split, {args.launches} launches "
+                           f"widths={args.widths}") as lock:
+        for launch in range(args.launches):
+            recs.append(one_launch(args, launch, widths))
+            if args.out:
+                with open(args.out, "w") as fh:
+                    json.dump({"hostlock": lock.provenance, "runs": recs},
+                              fh, indent=1)
+            time.sleep(1)
     report(recs, widths)
 
 

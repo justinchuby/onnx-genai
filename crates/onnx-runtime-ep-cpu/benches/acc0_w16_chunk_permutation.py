@@ -548,7 +548,7 @@ def rule4(pairs, lanes):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", required=True)
+    ap.add_argument("--binary", default=None)
     ap.add_argument("--launches", type=int, default=25)
     ap.add_argument("--tokens", type=int, default=192)
     ap.add_argument("--reps", type=int, default=2)
@@ -565,17 +565,38 @@ def main():
 
     if args.replay:
         with open(args.replay) as fh:
-            recs = json.load(fh)
+            blob = json.load(fh)
+        # Older datasets are a bare list; newer ones carry the lock provenance
+        # alongside the runs. Read both rather than orphan the earlier records.
+        recs = blob["runs"] if isinstance(blob, dict) else blob
+        if isinstance(blob, dict):
+            prov = blob.get("hostlock", {})
+            state = prov.get("hostlock_state", "unrecorded")
+            who = prov.get("held_by", "?")
+            runnable = prov.get("runnable_at_acquire", "?")
+            print(f"hostlock at acquire: {state} held_by={who} "
+                  f"runnable={runnable}")
+        else:
+            print("hostlock at acquire: unrecorded (pre-lock dataset)")
         print("\n".join(report(recs, args)))
         return
 
-    recs = []
-    for launch in range(args.launches):
-        recs.append(one_launch(args, launch))
-        if args.out:
-            with open(args.out, "w") as fh:
-                json.dump(recs, fh, indent=1)
-        print(f"launch {launch + 1}/{args.launches} done", file=sys.stderr, flush=True)
+    if not args.binary:
+        ap.error("--binary is required unless --replay is given")
+
+    # The whole sweep runs under the advisory host lock, not each launch: a
+    # per-launch acquire would release the box between launches and let a
+    # competitor land in the middle of a matrix that is only comparable if
+    # every arm saw the same machine.
+    with H.HostLock(owner="roy",
+                    reason=f"acc0 w16 chunk permutation, {args.launches} launches") as lock:
+        recs = []
+        for launch in range(args.launches):
+            recs.append(one_launch(args, launch))
+            if args.out:
+                with open(args.out, "w") as fh:
+                    json.dump({"hostlock": lock.provenance, "runs": recs}, fh, indent=1)
+            print(f"launch {launch + 1}/{args.launches} done", file=sys.stderr, flush=True)
     print("\n".join(report(recs, args)))
 
 

@@ -37,6 +37,7 @@ pub mod graph_reader;
 pub mod host_pool;
 pub mod kernel_ctx;
 pub mod pin;
+mod shared_shapes;
 pub mod status;
 pub mod transfer;
 
