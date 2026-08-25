@@ -367,6 +367,40 @@ mod tests {
     }
 
     #[test]
+    fn cloned_engine_governors_share_host_and_disk_ceiling() {
+        let first = EngineMemoryGovernor::new(
+            DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Host, 100),
+            100,
+            80,
+        );
+        let second = first.clone();
+
+        let host = first
+            .reserve(Tier::Host, 60, MemoryRole::KvCache, HolderId::new(1))
+            .unwrap();
+        assert!(
+            second
+                .reserve(Tier::Host, 41, MemoryRole::KvCache, HolderId::new(2))
+                .is_err(),
+            "workers must not each receive the full host-RAM budget"
+        );
+        let disk = second
+            .reserve(Tier::Disk, 50, MemoryRole::KvCache, HolderId::new(3))
+            .unwrap();
+        assert!(
+            first
+                .reserve(Tier::Disk, 31, MemoryRole::KvCache, HolderId::new(4))
+                .is_err(),
+            "workers must not each receive the full disk-spill budget"
+        );
+
+        drop(host);
+        drop(disk);
+        assert_eq!(first.used(Tier::Host), 0);
+        assert_eq!(second.used(Tier::Disk), 0);
+    }
+
+    #[test]
     fn compatibility_domains_receive_distinct_authorities() {
         let cuda0 = DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Cuda(0), 100);
         let cuda1 = DeviceMemoryAuthority::new(DeviceCompatibilityDomain::Cuda(1), 100);

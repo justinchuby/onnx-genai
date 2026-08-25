@@ -23,8 +23,8 @@ use crate::lease::{ModelKey, ModelSessionPlacement, SessionLeaseGuard};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 use crate::worker::{
-    SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerStartError, WorkerStatusSnapshot,
-    WorkerTurnGuard, WorkerUnavailable,
+    SessionCloseAccounting, SessionPlacement, SessionPlacementReservation, WorkerHandle, WorkerId,
+    WorkerPool, WorkerStartError, WorkerStatusSnapshot, WorkerTurnGuard, WorkerUnavailable,
 };
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
@@ -121,9 +121,14 @@ impl BatchingReport {
 }
 
 pub(crate) enum DriverCommand {
-    CreateSession(tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>),
+    CreateSession {
+        reservation: SessionPlacementReservation,
+        acknowledgement: std::sync::mpsc::Receiver<()>,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
+    },
     CloseSession {
-        session_id: SessionId,
+        lease: SessionLeaseGuard,
+        accounting: SessionCloseAccounting,
         response: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
     SessionTokenCount {
@@ -182,6 +187,7 @@ pub(crate) enum DriverCommand {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+        permit: WorkerPermit,
     },
     #[cfg(test)]
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
@@ -197,6 +203,11 @@ pub(crate) enum DriverCommand {
         barrier: Arc<std::sync::Barrier>,
         request: Box<GenerateRequest>,
         response: std::sync::mpsc::SyncSender<anyhow::Result<GenerateResult>>,
+    },
+    #[cfg(test)]
+    Block {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
     },
     #[cfg(test)]
     Panic,
@@ -229,6 +240,12 @@ pub(crate) struct DriverFailure {
 pub(crate) struct DriverGeneration {
     pub(crate) admission: oneshot::Receiver<Result<(), DriverFailure>>,
     pub(crate) events: mpsc::Receiver<DriverEvent>,
+}
+
+struct PendingSessionCreation {
+    worker: WorkerId,
+    acknowledgement: std::sync::mpsc::SyncSender<()>,
+    response: oneshot::Receiver<anyhow::Result<SessionId>>,
 }
 
 impl std::fmt::Display for DriverFailure {
@@ -786,23 +803,41 @@ impl EngineDriver {
     /// The placement, not the bare id, is what a caller stores: an engine
     /// session id means nothing away from the worker that issued it.
     pub(crate) async fn create_session(&self) -> anyhow::Result<SessionPlacement> {
+        let pending = self.enqueue_session_creation().await?;
+        let engine_session_id = pending
+            .response
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        pending
+            .acknowledgement
+            .send(())
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        Ok(SessionPlacement::new(pending.worker, engine_session_id))
+    }
+
+    async fn enqueue_session_creation(&self) -> anyhow::Result<PendingSessionCreation> {
         let reservation = self
             .workers
             .reserve_session_placement()
             .map_err(anyhow::Error::new)?;
         let worker = reservation.worker();
         let (response, rx) = tokio::sync::oneshot::channel();
+        let (acknowledgement, acknowledgement_rx) = std::sync::mpsc::sync_channel(1);
         self.workers
             .sender_for(worker)
             .map_err(anyhow::Error::new)?
-            .send(DriverCommand::CreateSession(response))
+            .send(DriverCommand::CreateSession {
+                reservation,
+                acknowledgement: acknowledgement_rx,
+                response,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        let engine_session_id = rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
-        reservation.commit().map_err(anyhow::Error::new)?;
-        Ok(SessionPlacement::new(worker, engine_session_id))
+        Ok(PendingSessionCreation {
+            worker,
+            acknowledgement,
+            response: rx,
+        })
     }
 
     /// Close a session, under the lease that proves no turn is in flight on it.
@@ -812,6 +847,16 @@ impl EngineDriver {
     /// destroy the state that turn is mid-way through writing. The lease is
     /// released when this returns, and never before the engine has answered.
     pub(crate) async fn close_session(&self, lease: SessionLeaseGuard) -> anyhow::Result<()> {
+        self.enqueue_session_close(lease)
+            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn enqueue_session_close(
+        &self,
+        lease: SessionLeaseGuard,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
         anyhow::ensure!(
             lease.model() == &self.model,
             "session lease for model '{}' cannot be closed on model '{}'",
@@ -819,22 +864,21 @@ impl EngineDriver {
             self.model,
         );
         let session = lease.placement();
+        let accounting = self
+            .workers
+            .worker(session.worker)?
+            .session_close_accounting();
         let (response, rx) = tokio::sync::oneshot::channel();
         self.session_commands(session)
             .map_err(anyhow::Error::new)?
             .send(DriverCommand::CloseSession {
-                session_id: session.engine_session_id,
+                lease,
+                accounting,
                 response,
             })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        let result = rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        if result.is_ok() {
-            self.workers.worker(session.worker)?.session_closed();
-        }
-        result
+        Ok(rx)
     }
 
     /// Tokens attended ahead of the prompt and the subset re-prefilled.
@@ -1111,14 +1155,26 @@ impl EngineDriver {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
     ) -> anyhow::Result<Vec<f32>> {
-        let (worker, _turn) = self
+        self.enqueue_embedding(input_ids, options)
+            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn enqueue_embedding(
+        &self,
+        input_ids: Vec<TokenId>,
+        options: EmbeddingOptions,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<Vec<f32>>>> {
+        let (worker, turn) = self
             .workers
             .reserve_stateless_turn()
             .map_err(anyhow::Error::new)?;
-        let _permit = Arc::clone(&self.generation_capacity)
+        let admission = Arc::clone(&self.generation_capacity)
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?;
+        let permit = WorkerPermit::new(admission, turn);
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.workers
             .sender_for(worker)
@@ -1127,11 +1183,11 @@ impl EngineDriver {
                 input_ids,
                 options,
                 reply,
+                permit,
             })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        Ok(rx)
     }
 
     pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
@@ -1663,7 +1719,7 @@ fn admission_step(
 /// This is subtracted from the in-flight count to estimate how many *other*
 /// requests are still arriving, so it must match the set of commands that
 /// actually take a permit — every one of `generate`, `generate_pipeline`,
-/// `generate_fim`, `render_images`, and `synthesize_speech` does.
+/// `generate_fim`, `render_images`, `synthesize_speech`, and `embed` does.
 ///
 /// Counting only the text-generation commands understated the deferred total,
 /// which inflated `expected_this_batch` and latched `saw_pending_sibling` for a
@@ -1680,6 +1736,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
+                    | DriverCommand::Embed { .. }
             )
         })
         .count()
@@ -1866,14 +1923,44 @@ fn route_continuous_events(
 
 fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
     match command {
-        DriverCommand::CreateSession(response) => {
-            let _ = response.send(engine.create_session());
-        }
-        DriverCommand::CloseSession {
-            session_id,
+        DriverCommand::CreateSession {
+            reservation,
+            acknowledgement,
             response,
         } => {
-            let _ = response.send(engine.close_session(session_id));
+            let session_id = match engine.create_session() {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let committed = match reservation.commit() {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let _ = engine.close_session(session_id);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            if response.send(Ok(session_id)).is_err() || acknowledgement.recv().is_err() {
+                let _ = engine.close_session(session_id);
+                return;
+            }
+            committed.persist();
+        }
+        DriverCommand::CloseSession {
+            lease,
+            accounting,
+            response,
+        } => {
+            let held_lease = lease;
+            let result = engine.close_session(held_lease.placement().engine_session_id);
+            if result.is_ok() {
+                accounting.session_closed();
+            }
+            let _ = response.send(result);
+            drop(held_lease);
         }
         DriverCommand::SessionTokenCount {
             session_id,
@@ -1969,6 +2056,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             input_ids,
             options,
             reply,
+            permit: _permit,
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
         }
@@ -1991,6 +2079,11 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         } => {
             barrier.wait();
             let _ = response.send(engine.generate_in_session(session_id, *request));
+        }
+        #[cfg(test)]
+        DriverCommand::Block { entered, release } => {
+            let _ = entered.send(());
+            let _ = release.recv();
         }
         #[cfg(test)]
         DriverCommand::Panic => panic!("injected worker failure"),
@@ -2290,6 +2383,30 @@ mod admission_tests {
         }
     }
 
+    async fn block_worker(driver: &EngineDriver) -> std::sync::mpsc::SyncSender<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Block {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker entered blocking command");
+        release_tx
+    }
+
+    async fn wait_for_prior_commands(driver: &EngineDriver) {
+        let release = block_worker(driver).await;
+        release.send(()).unwrap();
+    }
+
     #[test]
     fn engine_worker_state_is_structurally_not_send() {
         const {
@@ -2463,6 +2580,74 @@ mod admission_tests {
             .await
             .expect("healthy worker accepts");
         assert_eq!(replacement.worker, WorkerId::new(1));
+        driver.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_session_and_embedding_calls_finish_worker_owned_cleanup() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let (driver, ()) = EngineDriver::start(
+            move || {
+                Ok((
+                    Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())?,
+                    (),
+                ))
+            },
+            1,
+            8,
+        )
+        .expect("load tiny fixture");
+
+        // Cancellation after enqueue drops the acknowledgement and response.
+        // The worker creates, closes, and releases the pending reservation.
+        let create_release = block_worker(&driver).await;
+        let pending_create = driver.enqueue_session_creation().await.unwrap();
+        drop(pending_create);
+        create_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // Even after the response was delivered, ownership is not transferred
+        // until the submitting future sends its non-awaiting acknowledgement.
+        let mut delivered_create = driver.enqueue_session_creation().await.unwrap();
+        (&mut delivered_create.response).await.unwrap().unwrap();
+        drop(delivered_create);
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // A close command owns both the exclusive lease and its accounting.
+        // Dropping the response receiver cannot admit another turn early or
+        // leave the live-session count behind.
+        let session = driver.create_session().await.unwrap();
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let binding = driver.binding(session);
+        let lease = leases.acquire(binding.clone(), "cancel-close").unwrap();
+        let close_release = block_worker(&driver).await;
+        let close_response = driver.enqueue_session_close(lease).await.unwrap();
+        drop(close_response);
+        assert!(leases.is_held(&binding));
+        close_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert!(!leases.is_held(&binding));
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // Embedding admission and turn accounting travel with the queued work.
+        // They stay charged after the caller disconnects and release only once
+        // the worker has actually attempted the embedding.
+        let embed_release = block_worker(&driver).await;
+        let embed_response = driver
+            .enqueue_embedding(vec![1], EmbeddingOptions::default())
+            .await
+            .unwrap();
+        drop(embed_response);
+        assert_eq!(driver.generation_capacity.available_permits(), 7);
+        assert_eq!(driver.worker_statuses()[0].worker.active_turns, 1);
+        embed_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.generation_capacity.available_permits(), 8);
+        assert_eq!(driver.worker_statuses()[0].worker.active_turns, 0);
+
         driver.shutdown();
     }
 
