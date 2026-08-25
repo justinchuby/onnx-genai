@@ -40,6 +40,12 @@ env:
 jobs:
   changes:
     name: Detect change scope
+    # 20min hard bound: ~3x the slowest of the last 14 green runs
+    # (3.1min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     # This job must run for *every* event. It used to be gated on
     # `github.event_name == 'pull_request' || github.event_name == 'push'`,
@@ -199,6 +205,12 @@ jobs:
 
   fast-linux:
     name: Fast (Linux x86_64)
+    # 60min hard bound: ~3x the slowest of the last 12 green runs
+    # (17.8min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 60
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -321,6 +333,12 @@ jobs:
 
   rust-quality:
     name: Rust quality
+    # 60min hard bound: ~3x the slowest of the last 12 green runs
+    # (19.2min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 60
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -673,6 +691,12 @@ jobs:
 
   rust-coverage:
     name: Rust coverage (${{ matrix.name }})
+    # 130min hard bound: ~3x the slowest of the last 12 green runs
+    # (40.6min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 130
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     strategy:
@@ -798,6 +822,12 @@ jobs:
 
   rust-windows-arm64:
     name: Rust (Windows ARM64)
+    # 120min hard bound: ~3x the slowest of the last 12 green runs
+    # (37.6min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 120
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-11-arm
@@ -869,6 +899,12 @@ jobs:
 
   ep-conformance:
     name: EP conformance (Linux x86_64)
+    # 20min hard bound: ~3x the slowest of the last 12 green runs
+    # (1.9min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 20
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -937,6 +973,12 @@ jobs:
 
   cli-ort:
     name: CLI ORT (${{ matrix.name }})
+    # 250min hard bound: ~3x the slowest of the last 12 green runs
+    # (81.9min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 250
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     strategy:
@@ -1133,6 +1175,12 @@ jobs:
 
   cuda-compile-linux:
     name: CUDA compile (Linux x86_64)
+    # 30min hard bound: ~3x the slowest of the last 12 green runs
+    # (10.0min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 30
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
@@ -1263,6 +1311,12 @@ jobs:
 
   cuda-compile-windows:
     name: CUDA compile (Windows x86_64)
+    # 20min hard bound: ~3x the slowest of the last 12 green runs
+    # (4.8min), so it cannot fire on a slow-but-healthy run. Without one a
+    # hung job runs to GitHub's 360min default. An unbounded wait presents
+    # as a busy runner, indistinguishable from work until someone looks --
+    # see #2027 and #2123, both of which reached production that way.
+    timeout-minutes: 20
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: windows-latest
