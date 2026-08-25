@@ -77,13 +77,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       have a kernel, and we hand them to ORT anyway. This is the work.
     //
     //       Shape-preserving — output shape == input[0].shape. One line each.
-    ("", "BitwiseNot"),
-    ("", "CastLike"),
-    ("", "CumProd"),
-    ("", "CumSum"),
-    ("", "DequantizeLinear"),
-    ("", "EyeLike"),
-    ("", "QuantizeLinear"),
     //       Pooling and CNN geometry: inferrable from `kernel_shape`,
     //       `strides`, `pads`, `dilations` and `ceil_mode`, exactly as
     //       `build_conv` already does for `Conv`.

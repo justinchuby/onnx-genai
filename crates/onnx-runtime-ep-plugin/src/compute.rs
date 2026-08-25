@@ -577,6 +577,20 @@ impl ShapeInference {
                 }
             }
 
+            // ── Shape-preserving, one line each ───────────────────────────
+            // Output shape == input[0].shape. Listed explicitly rather than
+            // folded into the elementwise arm above because none of them is
+            // elementwise-broadcasting: they take one input whose shape they
+            // carry through, and a broadcast rule would quietly accept a
+            // second input it should not.
+            //
+            // `CastLike` and `EyeLike` take a second input for *dtype* only.
+            // `Quantize`/`DequantizeLinear` take scale and zero-point, which
+            // change how values map, not the extent — including under blocked
+            // quantization. `CumSum`/`CumProd` accumulate along an axis.
+            "BitwiseNot" | "CastLike" | "CumProd" | "CumSum" | "DequantizeLinear" | "EyeLike"
+            | "QuantizeLinear" => Self::SameAsInput(0),
+
             // ── Shapes carried in input values ────────────────────────────
             // Each of these is data-dependent, and each is *cheap*: the extent
             // is a handful of int64s, not a computation over the payload. That
