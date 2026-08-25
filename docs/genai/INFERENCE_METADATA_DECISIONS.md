@@ -993,7 +993,8 @@ is named as an `offsets` or `owner` of another emitted value's layout, or as the
 anything else keeps the existing rejection. The rank is read from the reference,
 not fixed at 1: an `offsets` and an `owner` are rank 1 by construction, while a
 `valid_lengths` has the rank [§10.5](#105-generic-component-batching--proposed)
-fixes — the number of axes outer to the padded one — so a flat rank-1 admission
+fixes — the number of axes outer to the padded one, equivalently `rank == axis`
+for the padded dimension's axis index — so a flat rank-1 admission
 would refuse a companion this design elsewhere requires, and would refuse it by
 advising the one layout a companion may not declare. A companion must also be
 **emitted**, not merely declared, and so must the value that names it: an output
