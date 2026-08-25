@@ -179,6 +179,53 @@ def _at_job_depth(line: str) -> bool:
     return len(line) > 2 and line.startswith("  ") and not line[2].isspace()
 
 
+# Every key GitHub accepts directly under a job. A four-space key outside this
+# set is the signature of a job whose own key was indented one level too far:
+# still valid YAML, so no parser complains, but the job ceases to exist and its
+# checks stop *appearing* on a PR instead of going red. @holden hit exactly this
+# and `gh pr checks` reported fourteen green with zero failures while two checks
+# had silently ceased to be produced. Enumerating what is legal and rejecting
+# the rest is the same choice as `_at_job_depth`: a new job attribute breaks
+# this loudly, which is the direction that can be noticed.
+_JOB_ATTRIBUTES = frozenset(
+    {
+        "concurrency",
+        "container",
+        "continue-on-error",
+        "defaults",
+        "env",
+        "environment",
+        "if",
+        "name",
+        "needs",
+        "outputs",
+        "permissions",
+        "runs-on",
+        "secrets",
+        "services",
+        "steps",
+        "strategy",
+        "timeout-minutes",
+        "uses",
+        "with",
+    }
+)
+_JOB_ATTR_KEY = re.compile(
+    r"""^\ \ \ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:"""
+)
+
+
+def _stray_job_attribute(line: str) -> str | None:
+    """A four-space key that GitHub would not accept as a job attribute."""
+    if line.lstrip().startswith("#"):
+        return None
+    match = _JOB_ATTR_KEY.match(line)
+    if match is None:
+        return None
+    key = match.group("dq") or match.group("sq") or match.group("plain")
+    return None if key in _JOB_ATTRIBUTES else key
+
+
 def _scalar(value: str) -> str:
     """A YAML scalar as written in this workflow: optional quotes, optional comment."""
     value = _TRAILING_COMMENT.sub("", value).strip()
@@ -238,6 +285,14 @@ def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
             key = match.group("dq") or match.group("sq") or match.group("plain")
             continue
         if key is not None:
+            if stray := _stray_job_attribute(line):
+                raise SystemExit(
+                    f"{source}: {key!r} contains {stray!r}, which is not a job "
+                    f"attribute GitHub accepts. A job key indented one level too "
+                    f"far is valid YAML and silently becomes a key of the job "
+                    f"above it; GitHub then reports that job's checks as absent "
+                    f"rather than failing, which no pass/fail gate can see."
+                )
             body.append(line)
     flush()
     if not jobs:
@@ -330,11 +385,21 @@ def _step_entry(lines: list[str]) -> tuple[str | None, str, str | None]:
     return reason, "\n".join(lines), keys.get("shell")
 
 
-def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
+def unconditional_run_blocks(
+    job_body: str, also_credit: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
     """Run blocks that a successful job is guaranteed to have executed.
 
     Returns those blocks and the `if:` expressions that were refused, so a
     caller can say *why* a package looks unexecuted rather than only that it is.
+
+    `also_credit` names refusal reasons a *particular* caller can discharge, and
+    defaults to discharging none. Only the Windows-coverage check passes it, to
+    credit `if: runner.os == 'Windows'` on the platform where that is true. It is
+    a parameter rather than an entry in `_RUNS_IN_A_PASSING_JOB` precisely so it
+    cannot leak into the required-tier gate, where a Windows-only step must stay
+    refused -- both required jobs run on Linux, so crediting it there would let
+    a step that never executes satisfy the gate.
     """
     kept: list[str] = []
     refused: list[str] = []
@@ -347,7 +412,7 @@ def unconditional_run_blocks(job_body: str) -> tuple[list[str], list[str]]:
         blocks = run_blocks(text)
         if not blocks:
             continue
-        if reason is not None:
+        if reason is not None and reason not in also_credit:
             refused.append(reason)
             continue
         pipefail = shell is not None and shell.split()[0] == "bash"
@@ -422,6 +487,72 @@ def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set
     return commands, set(jobs)
 
 
+# `ci.yml` states, in a comment beside the step this PR made Windows-only, that
+# `CLI ORT` "remains the only place these tests run on Windows". That was prose,
+# and prose does not fail. @holden measured the gap it left: indenting a job key
+# by two extra spaces is *valid YAML*, silently reparents the job into the one
+# above it, and GitHub then reports that job's checks as **absent** rather than
+# failing -- so `gh pr checks` shows no red, because it shows nothing at all. A
+# gate keyed on "pending=0 and no failures" is true of a vanished check.
+#
+# Deleting the `cli-ort` block outright is the quieter form: still valid YAML,
+# still a valid workflow, and every gate here passed it before this check
+# existed. Measured, on the real workflow, before writing it: all three of
+# `verify`, `verify-required-tier` and `self-test` exited 0 with the sole
+# Windows executor of the ORT-backed tests removed.
+_WINDOWS_RUNNER = re.compile(r"windows-[A-Za-z0-9_.-]+")
+
+# Refusal reasons that are discharged *on a Windows runner only*. `job_steps`
+# formats a refused condition as `if: <expr>`, so these match its output.
+_WINDOWS_STEP_IF = frozenset(
+    {
+        "if: runner.os == 'Windows'",
+        'if: runner.os == "Windows"',
+        "if: ${{ runner.os == 'Windows' }}",
+    }
+)
+
+
+def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[str]]:
+    """Jobs that can run on Windows and execute ORT-backed packages there."""
+    jobs = workflow_jobs() if jobs is None else jobs
+    found: dict[str, set[str]] = {}
+    for name, body in jobs.items():
+        if not _WINDOWS_RUNNER.search(body):
+            continue
+        blocks, _ = unconditional_run_blocks(body, also_credit=_WINDOWS_STEP_IF)
+        if tested := packages_tested_by(blocks) & set(ORT_BACKED):
+            found[name] = tested
+    return found
+
+
+def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
+    """Fail if no job still runs the ORT-backed tests on a Windows runner."""
+    executors = windows_ort_executors(jobs)
+    covered: set[str] = set()
+    for tested in executors.values():
+        covered |= tested
+    if missing := sorted(set(ORT_BACKED) - covered):
+        print("Windows ORT coverage check failed.", file=sys.stderr)
+        print(
+            "No job runs these packages' tests on a Windows runner:", file=sys.stderr
+        )
+        for package in missing:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "No required check builds the ORT graph on Windows, so this coverage "
+            "exists only here. A job that stops running them does not go red -- "
+            "its checks stop appearing, which no pass/fail gate can see.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"windows ORT coverage ok: {len(covered)} package(s) via "
+        f"{sorted(executors)}"
+    )
+    return 0
+
+
 def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
     commands, job_names = required_lane_commands(simulate_dropped_lane)
 
@@ -457,7 +588,7 @@ def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
         f"required-lane coverage ok: {len(required_tested)} package(s) tested by "
         f"{sorted(REQUIRED_JOB_NAMES)}, {len(DENYLIST)} denied"
     )
-    return 0
+    return verify_windows_ort_coverage()
 
 
 # Job bodies whose keys are written in the ways YAML allows. A key form this
@@ -585,7 +716,7 @@ def _conditional_arms() -> int:
     return failures
 
 
-_PARSER_ARM_COUNT = 5
+_PARSER_ARM_COUNT = 8
 
 
 def _parser_arms() -> int:
@@ -624,6 +755,54 @@ def _parser_arms() -> int:
     else:
         failures += 1
         print(f"  FAIL  {label}: parsed without complaint", file=sys.stderr)
+
+    # A job key indented one level too far is *valid YAML*: the job silently
+    # becomes a key of the job above it, and GitHub then stops producing its
+    # checks rather than failing them. `gh pr checks` cannot express an absence,
+    # so a `pending=0 && failed=[]` merge gate is true of a deleted check.
+    label = "job key indented one level too far is fatal"
+    try:
+        jobs = parse_jobs(_PARSER_FIXTURE.format(key="    beta:"))
+    except SystemExit as exit_error:
+        if "beta" in str(exit_error):
+            print(f"  ok    {label} -> refused, naming 'beta'")
+        else:
+            failures += 1
+            print(f"  FAIL  {label}: refused without naming the stray key", file=sys.stderr)
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: parsed as {sorted(jobs)}", file=sys.stderr)
+
+    # Control for the arm above: the guard must not reject the ordinary job
+    # attributes that legitimately sit at that same four-space depth, or it
+    # would refuse every real workflow and its refusals would mean nothing.
+    label = "real job attributes at four-space depth are accepted"
+    attributes = "    needs: alpha\n    if: success()\n    runs-on: ubuntu-latest\n"
+    try:
+        jobs = parse_jobs(_PARSER_FIXTURE.format(key="  beta:\n" + attributes))
+    except SystemExit as exit_error:
+        failures += 1
+        print(f"  FAIL  {label}: refused a valid workflow: {exit_error}", file=sys.stderr)
+    else:
+        if sorted(jobs) == ["Advisory Job", "Required Job"]:
+            print(f"  ok    {label} -> two jobs")
+        else:
+            failures += 1
+            print(f"  FAIL  {label}: jobs parsed: {sorted(jobs)}", file=sys.stderr)
+
+    # The ORT-backed tests run on Windows in exactly one job, and no required
+    # check builds that graph on Windows at all. Deleting that job is valid
+    # YAML and a valid workflow, so nothing else here would notice.
+    label = "no Windows executor for the ORT-backed tests is fatal"
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = verify_windows_ort_coverage(jobs={"Some Linux Job": "    runs-on: ubuntu-latest\n"})
+    text = out.getvalue() + err.getvalue()
+    if code == 1 and all(package in text for package in ORT_BACKED):
+        print(f"  ok    {label} -> refused, naming all {len(ORT_BACKED)} packages")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: rc={code}, named={text!r}", file=sys.stderr)
     return failures
 
 
