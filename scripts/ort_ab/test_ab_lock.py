@@ -466,60 +466,114 @@ class WidthVerdict(unittest.TestCase):
     noticed -- because `--native-threads 1` was a request the table reported
     back as though it were a measurement.
 
-    The check is categorical, so it holds on a busy shared host: the lanes
-    either came back or they did not. It is not a quiet-host requirement and
-    must not become one (#1802).
+    The separation these cells pin: a **reduced** width is the engine's cap
+    working correctly on a shared or cpuset-confined box and must not fail the
+    sweep (#1802 -- a check only an idle 32-core host can pass is an exclusive
+    -host assumption in disguise), while a **different route** is categorical
+    and fails anywhere.
     """
 
-    def cells(self, *answers, path="pool", pool="4"):
+    def cells(self, *answers, path="pool", pool="4", task="4"):
         return [
-            {"as_requested": a, "path": path, "pool_width": pool} for a in answers
+            {
+                "as_requested": a,
+                "path": path,
+                "pool_width": pool,
+                "task_width": task,
+                "cpus": "32",
+            }
+            for a in answers
         ]
 
     def test_a_realized_request_is_silent(self):
         self.assertEqual(
-            sweep_decode.width_verdict(4, self.cells("yes", "yes")), ("yes", None)
+            sweep_decode.width_verdict(4, self.cells("yes", "yes")),
+            ("yes", None, False),
         )
 
-    def test_a_reduced_width_is_named_not_comparable(self):
-        label, why = sweep_decode.width_verdict(
-            16, self.cells("no", "no", path="flat", pool="1")
+    def test_a_capped_width_is_labelled_and_scoped_but_not_a_failure(self):
+        # The regression this guards: an SMT- or cpuset-capped cell is the
+        # engine obeying policy. Failing it would make the sweep runnable only
+        # on a quiet host, which is the assumption #1802 forbids.
+        # Distinct values throughout, including between the two widths: a
+        # message built from the wrong field reads perfectly well when both
+        # numbers are the same.
+        label, why, fatal = sweep_decode.width_verdict(
+            16, self.cells("no", "no", pool="15", task="8")
         )
-        self.assertEqual(label, "no")
-        self.assertIn("not", why)
-        self.assertIn("comparable", why)
-        self.assertIn("flat", why)
+        self.assertEqual(label, "capped")
+        self.assertFalse(fatal)
+        self.assertIn("pool width 15", why)
+        self.assertIn("task width 8", why)
+        self.assertIn("32 cpus", why)
+        self.assertIn("not a defect", why)
+
+    def test_a_capped_width_fails_only_when_the_caller_asked_it_to(self):
+        label, _, fatal = sweep_decode.width_verdict(
+            16, self.cells("no"), require=True
+        )
+        self.assertEqual(label, "capped")
+        self.assertTrue(fatal)
 
     def test_a_binary_that_cannot_report_width_is_not_read_as_agreement(self):
-        # `absent` and `no` are different findings: one says the request was
-        # reduced, the other says nothing here can tell you either way.
-        label, why = sweep_decode.width_verdict(8, self.cells("absent"))
+        # `absent` and `capped` are different findings: one says the request
+        # was reduced, the other says nothing here can tell you either way.
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("absent"))
         self.assertEqual(label, "absent")
         self.assertIn("unverified", why)
+        self.assertFalse(fatal)
+        self.assertTrue(sweep_decode.width_verdict(8, self.cells("absent"), True)[2])
 
-    def test_a_request_that_never_reached_the_engine_says_so(self):
-        label, why = sweep_decode.width_verdict(8, self.cells("n/a"))
+    def test_a_request_that_never_reached_the_engine_is_fatal(self):
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("n/a"))
         self.assertEqual(label, "not-requested")
         self.assertIn("did not reach", why)
+        self.assertTrue(fatal)
+
+    def test_the_documented_opt_out_is_not_reported_as_a_lost_request(self):
+        # `--native-threads 0` is bench_generic's documented way to opt out of
+        # the bounded pool, so `n/a` is the honest answer to a question we
+        # chose not to ask. Calling it "the knob did not reach the engine"
+        # would be a false statement about a deliberate input.
+        self.assertEqual(
+            sweep_decode.width_verdict(0, self.cells("n/a")), ("opted-out", None, False)
+        )
 
     def test_trials_that_disagree_are_not_medianed_silently(self):
-        label, why = sweep_decode.width_verdict(8, self.cells("yes", "no"))
+        label, why, fatal = sweep_decode.width_verdict(8, self.cells("yes", "no"))
         self.assertEqual(label, "varied")
         self.assertIn("not all on the same route", why)
+        self.assertTrue(fatal)
+
+    def test_trials_on_two_routes_are_varied_even_when_both_say_yes(self):
+        # Both trials got the width they asked for, so `as_requested` agrees
+        # -- and they were still different programs. Only the paths show it.
+        cells = self.cells("yes", path="flat", pool="1", task="1") + self.cells(
+            "yes", path="pool", pool="1", task="1"
+        )
+        label, why, fatal = sweep_decode.width_verdict(1, cells)
+        self.assertEqual(label, "varied")
+        self.assertTrue(fatal)
+        self.assertIn("flat", why)
+        self.assertIn("pool", why)
 
     def test_the_width_fields_are_read_off_a_real_result_line(self):
+        # Every field gets a distinct value on purpose. A fixture whose fields
+        # share a number cannot fail when two of them are swapped, and the
+        # Rust side (bench_generic.rs) keeps the same discipline for the same
+        # reason.
         line = (
             "result: native=1.0 ms ort=2.0 ms native/ort=0.5 native_p90=1.1 "
             "ort_p90=2.1 native_min=0.9 ort_min=1.9 native_threads=4 "
-            "native_pool_width=2 native_path=pool native_task_width=2 "
+            "native_pool_width=15 native_path=pool native_task_width=8 "
             "native_cpus=32 native_width_as_requested=no arm=x parity=PASS"
         )
         self.assertEqual(
             sweep_decode.width_report(line),
             {
-                "pool_width": "2",
+                "pool_width": "15",
                 "path": "pool",
-                "task_width": "2",
+                "task_width": "8",
                 "cpus": "32",
                 "as_requested": "no",
             },
@@ -531,6 +585,69 @@ class WidthVerdict(unittest.TestCase):
                 "as_requested"
             ],
             "absent",
+        )
+
+
+class RouteVerdict(unittest.TestCase):
+    """The cross-column check, and the one that catches the original defect.
+
+    `--native-threads 1` takes the dispatcher's `total_workers <= 1` serial
+    short-circuit rather than a one-worker pool. Each cell on its own looks
+    fine -- width 1 was asked for and width 1 came back -- so only a
+    comparison *between* columns can see that the leftmost point is a
+    different program from the rest of the curve.
+    """
+
+    def test_one_route_everywhere_is_silent(self):
+        self.assertIsNone(
+            sweep_decode.route_verdict({1: {"pool"}, 4: {"pool"}, 16: {"pool"}})
+        )
+
+    def test_a_serial_leftmost_column_is_named_with_its_widths(self):
+        why = sweep_decode.route_verdict({1: {"flat"}, 4: {"pool"}, 16: {"pool"}})
+        self.assertIn("flat: t=1", why)
+        self.assertIn("pool: t=4,16", why)
+        self.assertIn("not a scaling curve", why)
+
+    def test_an_unreportable_route_is_not_counted_as_a_second_one(self):
+        # A binary too old to emit the fields would otherwise read as a route
+        # change, which is a different (and false) claim from "unverified".
+        self.assertIsNone(
+            sweep_decode.route_verdict({1: {"absent"}, 4: {"pool"}, 8: {"?"}})
+        )
+
+    def test_a_route_split_within_one_width_is_reported(self):
+        # Same width, two models, different routes: still not one function of
+        # thread count.
+        why = sweep_decode.route_verdict({4: {"pool", "flat"}})
+        self.assertIn("flat: t=4", why)
+        self.assertIn("pool: t=4", why)
+
+
+class ExitPrecedence(unittest.TestCase):
+    """One number gets out, so which finding it names is a decision.
+
+    Left implicit it becomes "whichever check ran last", which is how a
+    definite structural finding ends up reported as a maybe.
+    """
+
+    def test_a_route_defect_outranks_an_unreadable_end_of_window(self):
+        # 5 is "I could not verify the end of the window"; 6 is "this column
+        # is not the route it claims". The certainty should not be reported
+        # as the doubt.
+        self.assertEqual(sweep_decode.exit_code(5, True), 6)
+
+    def test_custody_outranks_a_route_defect(self):
+        # Every row is discarded either way, so 4 is the instruction the
+        # caller needs and a column finding would only bury it.
+        self.assertEqual(sweep_decode.exit_code(4, True), 4)
+
+    def test_a_clean_window_still_reports_the_route(self):
+        self.assertEqual(sweep_decode.exit_code(0, True), 6)
+
+    def test_nothing_structural_leaves_the_window_code_alone(self):
+        self.assertEqual(
+            [sweep_decode.exit_code(c, False) for c in (0, 4, 5)], [0, 4, 5]
         )
 
 
@@ -612,23 +729,8 @@ class SweepDecodeGate(unittest.TestCase):
         # not mine" (3), and `!= 0` pins none of that.
         self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
 
-    def test_a_cell_whose_width_was_not_realized_fails_the_sweep(self):
-        """The table still prints -- and the exit code stops it being quoted.
-
-        Roy published four decode rows at width 1 before learning that width 1
-        takes a serial short-circuit rather than a one-worker pool. Both arms
-        of his A/B were on that path, so the comparison stood, but the *scope*
-        did not: it was a serial-path result labelled as a decode result. The
-        row is worth seeing; leaving with exit 0 is what makes it quotable.
-        """
-        env = dict(
-            self.env,
-            WIDTH_FIELDS=(
-                "native_pool_width=1 native_path=flat native_task_width=1 "
-                "native_cpus=32 native_width_as_requested=no"
-            ),
-        )
-        out = subprocess.run(
+    def sweep(self, args, env=None, reason="width"):
+        return subprocess.run(
             [
                 "bash",
                 str(HOSTLOCK),
@@ -636,25 +738,184 @@ class SweepDecodeGate(unittest.TestCase):
                 "--owner",
                 "leon",
                 "--reason",
-                "width non-vacuity",
+                reason,
                 "--",
-                *self.args(),
+                *args,
             ],
             capture_output=True,
             text=True,
-            env=env,
+            env=env or self.env,
             timeout=600,
         )
-        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
-        self.assertIn("not comparable", out.stderr)
-        self.assertIn("not a scaling curve", out.stderr)
-        row = next(
-            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+
+    def rows(self, out):
+        return [
+            l.split() for l in out.stdout.splitlines() if l.split()[:1] == ["m"]
+        ]
+
+    def test_a_capped_width_is_labelled_and_the_sweep_still_leaves_with_zero(self):
+        """The #1802 case, and the reason this check is not a width demand.
+
+        A cell that asked for 16 lanes and got 8 because the host's SMT cap or
+        a cpuset said so is the engine behaving correctly. Failing the sweep
+        for it would make the whole harness runnable only on a large idle box
+        -- an exclusive-host assumption smuggled in as a correctness check --
+        and it would brand as invalid exactly the capped-scaling rows the
+        sweep exists to surface.
+        """
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=15 native_path=pool native_task_width=8 "
+                "native_cpus=32 native_width_as_requested=no"
+            ),
         )
+        out = self.sweep(self.args(), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("not a defect", out.stderr)
         # Second from the right: the width answer sits beside the lock label,
         # because a row needs both to be worth anything -- who held the box,
         # and whether the column describes the route.
-        self.assertEqual(row.split()[-2], "no")
+        self.assertEqual(self.rows(out)[0][-2], "capped")
+
+    def test_the_same_capped_cell_fails_only_when_the_caller_asks(self):
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=8 native_path=pool native_task_width=8 "
+                "native_cpus=32 native_width_as_requested=no"
+            ),
+        )
+        out = self.sweep([*self.args(), "--require-width"], env=env)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertEqual(self.rows(out)[0][-2], "capped")
+
+    def test_a_column_on_a_different_route_fails_the_sweep(self):
+        """The defect this file was written for, end to end.
+
+        Roy published four decode rows at width 1 before learning that
+        `--native-threads 1` takes the dispatcher's serial short-circuit
+        rather than a one-worker pool. Every cell passes its own check --
+        width 1 asked, width 1 delivered -- so only the comparison between
+        columns can see that the leftmost point is a different program. The
+        rows still print; the exit code is what stops them being quoted as a
+        scaling curve.
+        """
+        branching = Path(self.tmp) / "branching.sh"
+        branching.write_text(
+            "#!/bin/sh\n"
+            'if [ "$4" = "1" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=4 native_path=pool native_task_width=4 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        branching.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(branching)
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "4"]
+        out = self.sweep(args)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertIn("flat: t=1", out.stderr)
+        self.assertIn("pool: t=4", out.stderr)
+        self.assertIn("not a scaling curve", out.stderr)
+        # Each cell on its own is satisfied: the finding is between them.
+        self.assertEqual([r[-2] for r in self.rows(out)], ["yes", "yes"])
+
+    def test_trials_that_disagree_within_a_cell_are_caught_through_main(self):
+        """Pins the per-trial aggregation, not just the verdict function.
+
+        Every other end-to-end cell runs `--trials 1`, where a bug that reads
+        only the first trial is indistinguishable from one that reads them
+        all. This stub alternates on a counter file, so the second trial of
+        the cell is on a different route from the first.
+        """
+        alternating = Path(self.tmp) / "alternating.sh"
+        alternating.write_text(
+            "#!/bin/sh\n"
+            'n=$(cat "$COUNTER" 2>/dev/null || echo 0)\n'
+            'echo $((n + 1)) > "$COUNTER"\n'
+            'if [ "$n" = "0" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=1 native_path=pool native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=no'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        alternating.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(alternating)
+        args[args.index("--trials") + 1] = "2"
+        env = dict(self.env, COUNTER=f"{self.tmp}/counter")
+        out = self.sweep(args, env=env)
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertEqual(self.rows(out)[0][-2], "varied")
+        self.assertIn("not of one thing", out.stderr)
+        # Both trials' routes reach the cross-column check, not just the
+        # first: dropping the second would lose the only record that this
+        # width ran on two of them.
+        self.assertIn("flat: t=1", out.stderr)
+        self.assertIn("pool: t=1", out.stderr)
+
+    def test_a_handoff_still_outranks_a_route_defect(self):
+        """The other side of the precedence, and it goes the other way.
+
+        Custody changing mid-sweep discards every row regardless of route, so
+        4 is the instruction the caller needs; adding a finding about columns
+        they are about to throw away would bury it.
+        """
+        handoff = Path(self.tmp) / "handoff2.sh"
+        handoff.write_text(
+            "#!/bin/sh\n"
+            'sed -i "s/^owner=.*/owner=someone-else/" "$HOSTLOCK_DIR/meta"\n'
+            + STUB_BENCH.split("\n", 1)[1]
+        )
+        handoff.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(handoff)
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=1 native_path=flat native_task_width=1 "
+                "native_cpus=32 native_width_as_requested=n/a"
+            ),
+        )
+        out = self.sweep(args, env=env)
+        self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+        self.assertIn("discard", out.stderr)
+
+    def test_a_wedged_bench_child_does_not_squat_on_the_host_lock(self):
+        """A hung child holds the whole box, which is the outcome the lock exists to prevent.
+
+        `subprocess.run` without a timeout waits forever, and this wrapper is
+        the lock holder for the whole sweep -- so one wedged bench would park
+        a declaration on a shared machine indefinitely and every other agent
+        would read it as legitimate occupancy.
+        """
+        wedged = Path(self.tmp) / "wedged.sh"
+        wedged.write_text("#!/bin/sh\nsleep 120\n")
+        wedged.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(wedged)
+        out = self.sweep([*args, "--cell-timeout", "1"])
+        self.assertIn("TimeoutExpired", out.stderr)
+        self.assertNotEqual(out.returncode, 0)
+        # And it let go: the next caller finds the box free, not squatted.
+        prov = subprocess.run(
+            ["bash", str(HOSTLOCK), "provenance", "--oneline"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=60,
+        ).stdout
+        self.assertIn("state=FREE", prov)
 
     def test_a_realized_width_reaches_the_row_and_the_header(self):
         out = subprocess.run(

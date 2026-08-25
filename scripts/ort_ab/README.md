@@ -284,20 +284,57 @@ end = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 ```
 
 `sweep_decode.py` also refuses to call a table a scaling curve when it is not
-one. `bench_generic` reports `native_width_as_requested=`, and the sweep now
-puts the answer in a `width_ok` column and exits **6** if any cell's width was
-not realized. The check is categorical — the lanes either came back or they did
-not — so it holds on a busy shared host and is *not* a quiet-host requirement.
-It exists because `--native-threads 1` takes a serial short-circuit rather than
-a one-worker pool, so a `t=1` column is a different code path from every other
-column in the same table; four decode rows were published before anyone noticed.
-`absent` (a binary too old to report it) is a third answer, distinct from `no`.
+one. `bench_generic` reports the widths it actually realized, and the sweep
+puts the answer in a `width_ok` column beside `host_lock`. It exists because
+`--native-threads 1` takes the dispatcher's serial short-circuit rather than a
+one-worker pool, so a `t=1` column is a *different code path* from every other
+column in the same table — four decode rows were published before anyone
+noticed.
+
+The distinction the column draws is between a **capped** width and a
+**different route**, and it is the whole design:
+
+| `width_ok` | meaning | fails the sweep? |
+| --- | --- | --- |
+| `yes` | the lanes asked for came back, on one route | no |
+| `capped` | fewer lanes than requested — an SMT or cpuset cap | **no** (see below) |
+| `varied` | trials in one cell disagreed on route or width | yes (**6**) |
+| `not-requested` | the bench never saw the request at all | yes (**6**) |
+| `opted-out` | `--native-threads 0`, the documented opt-out | no |
+| `absent` | this binary cannot report width | no, unverified |
+
+A capped cell is the engine's own policy working correctly on a shared or
+cpuset-confined box, so it is labelled and scoped, not failed: a check only a
+large idle host can pass is an exclusive-host assumption smuggled in as a
+correctness check, which is exactly what issue #1802 forbids — and it would
+brand as invalid the capped-scaling rows the sweep exists to surface. Pass
+`--require-width` if you genuinely need exact lanes and want those cells to
+fail; it is opt-in because it is a demand on the *host*, not on the engine.
+
+What is fatal is categorical and holds anywhere: trials inside a cell that did
+not agree, a request that never reached the engine, and — the check that
+catches the original defect — **columns that are not all the same route**.
+Each `t=1` cell passes its own check (width 1 asked, width 1 delivered); only
+the comparison *between* columns shows that the leftmost point is a different
+program, so the sweep compares the reported `native_path` across the whole
+table and exits **6** when a curve is drawn through more than one of them.
 
 `sweep_decode.py` prints its rows as it goes, so a custody change cannot be
 stamped onto them retroactively; the exit code carries it instead — **4** for
 a handoff (the rows above span the change: discard them) and **5** when the
 lock could not be re-read at the end (the rows may be sound, and nothing
-establishes that they are). Those are deliberately different answers.
+establishes that they are). Those are deliberately different answers. Only one
+code gets out, so the precedence is fixed rather than incidental: **4** wins
+over everything (every row is discarded anyway, and a finding about columns
+nobody will quote would bury the instruction), and **6** wins over **5** (a
+route defect is a definite structural fact; an unreadable end of window is a
+"cannot tell", and reporting the certainty as the doubt understates what is
+known).
+
+A bench child that wedges would hold the *shared host lock* for as long as it
+hangs — squatting on the box is the one outcome the lock exists to prevent —
+so each invocation is bounded by `--cell-timeout` (default 3600s, `0`
+disables).
 `ab.py` buffers, so it stamps the label on the rows.
 `crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are not wired up yet — see
 issue #2043 for the audit.

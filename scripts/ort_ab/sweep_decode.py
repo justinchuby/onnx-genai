@@ -56,7 +56,14 @@ WIDTH = re.compile(
 )
 
 
-def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int):
+def run_one(
+    binary: Path,
+    model: Path,
+    threads: int,
+    runs: int,
+    warmups: int,
+    timeout: float | None = None,
+):
     cmd = [
         str(binary),
         "--model",
@@ -70,7 +77,13 @@ def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int):
         "--warmups",
         str(warmups),
     ]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+    # A wedged bench would otherwise hang the sweep *while the wrapper holds
+    # the shared host lock* -- squatting on the box is the one outcome the
+    # whole lock discipline exists to prevent, and a hung child is the easiest
+    # way to do it by accident.
+    out = subprocess.run(
+        cmd, capture_output=True, text=True, check=True, timeout=timeout
+    ).stdout
     for line in out.splitlines():
         m = LINE.search(line)
         if m:
@@ -90,54 +103,147 @@ def width_report(line: str) -> dict[str, str]:
     """
     m = WIDTH.search(line)
     if not m:
-        return {"as_requested": "absent", "pool_width": "absent", "path": "absent"}
+        return {
+            "as_requested": "absent",
+            "pool_width": "absent",
+            "path": "absent",
+            "task_width": "absent",
+            "cpus": "absent",
+        }
     return m.groupdict()
 
 
-def width_verdict(requested: int, cells: list[dict[str, str]]) -> tuple[str, str | None]:
+def width_verdict(
+    requested: int, cells: list[dict[str, str]], require: bool = False
+) -> tuple[str, str | None, bool]:
     """Whether this cell's rows describe the route their `t` column names.
 
-    Returns `(label, complaint)`. The label goes on the row so a table pasted
-    into a doc carries it; the complaint, when present, is why the cell is not
-    comparable with the others.
+    Returns `(label, caveat, fatal)`. The label goes on the row so a table
+    pasted into a doc carries it; the caveat says what the label means; and
+    `fatal` says whether the sweep may still leave with exit 0.
 
-    Deliberately NOT a demand for an idle machine. The check is categorical --
-    the width asked for either came back or it did not -- so it holds on a
-    shared, busy box, which is the only kind we have (#1802). It is the same
-    reasoning as the lock: a label nothing can check is a label that drifts.
+    **A reduced width is not a failure here, and that distinction is the whole
+    design.** Asking for 16 lanes on a box whose SMT cap or cpuset affords 8
+    is the engine behaving correctly on a shared machine, which is the only
+    kind we have (#1802): failing the sweep for it would make the check
+    satisfiable only on a large idle host, i.e. exactly the exclusive-host
+    assumption we are not allowed to bake in. That cell is still on the pooled
+    route and still comparable; it just carries a narrower claim, so it is
+    labelled `capped` and says so.
+
+    What *is* fatal is a **route** difference, because it is categorical and
+    host-independent:
+
+    - `not-requested` -- the bench says no width was requested at all, though
+      we passed `--native-threads`. The knob never reached the engine.
+    - `varied` -- the trials inside one cell did not agree, so their median is
+      not of one thing.
+
+    The cross-cell route check in `main` is the third, and it is the one that
+    would have caught the original defect: `--native-threads 1` takes the
+    dispatcher's serial short-circuit rather than a one-worker pool, so the
+    t=1 row is a different `native_path` from every other row in the table.
+
+    `require=True` (`--require-width`) hardens `capped` and `absent` into
+    failures for the caller who genuinely needs exact lanes. It is opt-in
+    because it is a demand on the host, not on the engine.
     """
     answers = {c.get("as_requested", "absent") for c in cells}
-    if answers == {"yes"}:
-        return "yes", None
-    if "absent" in answers:
-        return "absent", (
-            f"t={requested}: this bench binary does not report realized width, so "
-            "the column label is unverified. Rebuild from a revision that emits "
-            "native_width_as_requested."
-        )
+    paths = sorted({c.get("path", "?") for c in cells})
+    pool = sorted({c.get("pool_width", "?") for c in cells})
+    task = sorted({c.get("task_width", "?") for c in cells})
+
+    if answers == {"yes"} and len(paths) == 1:
+        return "yes", None, False
+    if len(answers) > 1 or len(paths) > 1:
+        # Differing *paths* count even when every trial says `yes`: two trials
+        # can each get the width they asked for and still be on different
+        # routes, and a median across those is not a measurement of either.
+        return "varied", (
+            f"t={requested}: the trials in this cell were not all on the same "
+            f"route (paths {paths}, pool widths {pool}, realized "
+            f"{sorted(answers)}), so their median is not of one thing."
+        ), True
     if answers == {"n/a"}:
-        # The binary says no width was ever requested, but this sweep passes
-        # `--native-threads` on every cell. So the flag did not reach the
-        # engine, and the `t` column is describing a request that was never
-        # made -- a worse failure than one that was made and reduced.
+        if requested == 0:
+            # `--native-threads 0` is the documented way to opt out of the
+            # bounded pool, so `n/a` is the honest answer to a question we
+            # chose not to ask. Calling that "the knob did not reach the
+            # engine" would be a false statement about a deliberate input.
+            return "opted-out", None, False
         return "not-requested", (
             f"t={requested}: the bench reports that no width was requested, "
             "though this sweep passed --native-threads. The knob did not "
-            "reach the engine; every column here is the same route."
-        )
-    paths = sorted({c.get("path", "?") for c in cells})
-    widths = sorted({c.get("pool_width", "?") for c in cells})
-    if len(answers) > 1:
-        return "varied", (
-            f"t={requested}: the width request was honoured for some trials and "
-            f"not others (paths {paths}, pool widths {widths}). The trials in "
-            "this cell were not all on the same route, so their median is not "
-            "of one thing."
-        )
-    return "no", (
-        f"t={requested}: asked for {requested} lanes and did not get them "
-        f"(path {paths[0]}, pool width {widths[0]}). This row is not "
-        f"comparable with the cells whose width was realized."
+            "reach the engine, so every column in this table is one route."
+        ), True
+    if "absent" in answers:
+        return "absent", (
+            f"t={requested}: this bench binary does not report realized "
+            "width, so the column label is unverified -- which is not the "
+            "same as wrong. Rebuild from a revision that emits "
+            "native_width_as_requested to check it."
+        ), require
+    cpus = sorted({c.get("cpus", "?") for c in cells})
+    # Both realized widths, never one: `as_requested=no` means the pool width
+    # OR the task width missed the request (bench_generic.rs:707-711), so
+    # naming a single number would sometimes print "got 16, not 16".
+    return "capped", (
+        f"t={requested}: the request was not realized -- route {paths[0]}, "
+        f"pool width {pool[0]}, task width {task[0]}, on a host reporting "
+        f"{cpus[0]} cpus. An SMT or cpuset cap is the engine's own policy "
+        "doing its job, not a defect -- but this row's claim is about the "
+        f"widths it got, not about {requested}."
+    ), require
+
+
+def exit_code(window_code: int, structural: bool) -> int:
+    """Which single finding a streamed sweep leaves with.
+
+    Only one number gets out, so the order is a claim about which finding the
+    caller most needs, and it is worth stating rather than leaving to whatever
+    check happened to run last:
+
+    - **4 (custody changed) wins over everything.** Every row is discarded, so
+      a finding about columns nobody will quote would only bury the one that
+      matters.
+    - **6 (route) beats 5 (unreadable end of window).** 6 is a definite
+      structural fact about what ran; 5 is "I could not tell". Reporting the
+      maybe in place of the certainty understates what is known.
+    """
+    if window_code == 4:
+        return 4
+    return 6 if structural else window_code
+
+
+def route_verdict(observed: dict[int, set[str]]) -> str | None:
+    """The check that would have caught the defect this file exists to prevent.
+
+    `observed` maps requested width to every `native_path` its cells reported
+    (a set, because the same width is swept for each model).
+    A sweep is a scaling curve only if every column is the same route; when
+    `t=1` is `flat` because the dispatcher short-circuits and every other
+    column is `pool`, the leftmost point is a different program, and the
+    curve through it describes nothing.
+
+    Categorical, and independent of load: it compares the routes with each
+    other, not against any expectation of the host.
+    """
+    by_route: dict[str, list[int]] = {}
+    for width, paths in sorted(observed.items()):
+        for path in sorted(paths):
+            if path in ("?", "absent"):
+                continue
+            by_route.setdefault(path, []).append(width)
+    if len(by_route) < 2:
+        return None
+    detail = "; ".join(
+        f"{path}: t={','.join(str(w) for w in widths)}"
+        for path, widths in sorted(by_route.items())
+    )
+    return (
+        f"the columns are not all the same route ({detail}). A sweep across "
+        "code paths is not a scaling curve -- the points do not lie on one "
+        "function of thread count."
     )
 
 
@@ -183,6 +289,20 @@ def main() -> int:
     ap.add_argument("--runs", type=int, default=7)
     ap.add_argument("--warmups", type=int, default=3)
     ap.add_argument(
+        "--cell-timeout",
+        type=float,
+        default=3600.0,
+        help="seconds one bench invocation may take before the sweep gives up "
+        "(it holds the host lock while it waits); 0 disables",
+    )
+    ap.add_argument(
+        "--require-width",
+        action="store_true",
+        help="treat a capped or unreportable width as a failure. Opt-in: it is "
+        "a demand on the host, not on the engine, and a shared or "
+        "cpuset-confined box can legitimately not meet it",
+    )
+    ap.add_argument(
         "--unlocked",
         action="store_true",
         help="run without a host-lock declaration and stamp every row (smoke tests only)",
@@ -205,13 +325,22 @@ def main() -> int:
         f"{'ratio_p50':>9s} {'ratio_p90':>9s} {'native_min':>10s} {'ort_min':>8s} "
         f"{'ratio_min':>9s} {'width_ok':>8s} {'host_lock':>14s}"
     )
-    width_complaints = []
+    width_complaints: list[str] = []
+    width_fatal = False
+    routes: dict[int, set[str]] = {}
     for model in args.models:
         for threads in args.threads:
             trials = []
             for _ in range(args.trials):
                 trials.append(
-                    run_one(args.binary, model, threads, args.runs, args.warmups)
+                    run_one(
+                        args.binary,
+                        model,
+                        threads,
+                        args.runs,
+                        args.warmups,
+                        timeout=args.cell_timeout or None,
+                    )
                 )
             native_p50 = statistics.median(t["native"] for t in trials)
             ort_p50 = statistics.median(t["ort"] for t in trials)
@@ -219,11 +348,15 @@ def main() -> int:
             ort_p90 = statistics.median(t["ort_p90"] for t in trials)
             native_min = min(t["native_min"] for t in trials)
             ort_min = min(t["ort_min"] for t in trials)
-            width_ok, complaint = width_verdict(
-                threads, [t["width"] for t in trials]
+            width_ok, caveat, fatal = width_verdict(
+                threads, [t["width"] for t in trials], require=args.require_width
             )
-            if complaint:
-                width_complaints.append(complaint)
+            if caveat:
+                width_complaints.append(caveat)
+            width_fatal = width_fatal or fatal
+            routes.setdefault(threads, set()).update(
+                t["width"].get("path", "?") for t in trials
+            )
             print(
                 f"{model.stem:26s} {threads:3d} {native_p50:10.3f} {ort_p50:8.3f} "
                 f"{native_p50 / ort_p50:9.3f} {native_p90 / ort_p90:9.3f} "
@@ -239,22 +372,17 @@ def main() -> int:
     if complaint:
         print(complaint, file=sys.stderr)
 
-    # Reported after the table rather than raised mid-sweep: a cell whose width
-    # was not realized is still worth seeing next to the ones that were -- that
-    # comparison is often what identifies the mechanism. What it must not do is
-    # leave with a zero exit, because the whole table then reads as a scaling
-    # curve when part of it is a different route.
+    # Reported after the table rather than raised mid-sweep: a cell whose
+    # width was capped is still worth seeing next to the ones that were not --
+    # that comparison is often what identifies the mechanism.
     for line in width_complaints:
         print(line, file=sys.stderr)
-    if width_complaints and code == 0:
-        print(
-            "the rows above are not all on the route their `t` column names -- "
-            "this is not a scaling curve.",
-            file=sys.stderr,
-        )
-        return 6
-    return code
-    return 0
+
+    route_complaint = route_verdict(routes)
+    if route_complaint:
+        print(route_complaint, file=sys.stderr)
+
+    return exit_code(code, width_fatal or route_complaint is not None)
 
 
 if __name__ == "__main__":
