@@ -156,10 +156,20 @@ jobs:
           case "$EVENT_NAME" in
             pull_request)
               if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
-                files="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
+                # Three-dot: the PR's own changes, i.e. what GitHub shows under
+                # "Files changed". Two-dot against `base.sha` -- the base branch
+                # tip when the event fired, not the merge-base -- also reports
+                # every file main gained since the branch diverged, so a
+                # pure-docs PR is classified as code whenever main moves while
+                # it is open (#2104: #2103's one .md edit reported 9 files, the
+                # 8 extra being #2091's, which is `base.sha` itself).
+                # Fails closed: if the merge-base is missing this
+                # errors, `files` stays empty, and docs_only stays false.
+                files="$(git diff --name-only "$BASE_SHA...$HEAD_SHA" 2>/dev/null || true)"
               fi
               ;;
             push)
+              # Two-dot is correct here: before..after is the push itself.
               if [ -n "${BEFORE_SHA:-}" ] \
                 && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] \
                 && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then

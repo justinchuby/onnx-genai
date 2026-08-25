@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use onnx_genai_server::{ServeArgs, run_serve};
 

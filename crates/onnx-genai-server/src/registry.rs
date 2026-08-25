@@ -91,7 +91,7 @@ pub(crate) struct ModelHandleParts {
 }
 
 impl ModelHandle {
-    pub(crate) fn new(parts: ModelHandleParts) -> anyhow::Result<Self> {
+    pub(crate) fn new(parts: ModelHandleParts) -> Self {
         let ModelHandleParts {
             id,
             model_dir,
@@ -111,7 +111,7 @@ impl ModelHandle {
         // that keys a session or a lease reads it back off the driver, which is
         // why the two can never disagree.
         engine.bind_model(&id);
-        Ok(Self {
+        Self {
             id,
             engine,
             tokenizer,
@@ -126,7 +126,7 @@ impl ModelHandle {
             last_request_at: AtomicU64::new(now_millis()),
             warmed: AtomicBool::new(false),
             warmup_lock: std::sync::Mutex::new(()),
-        })
+        }
     }
 
     /// Stop this model's engine worker and wait for it to exit.
@@ -244,11 +244,10 @@ impl std::error::Error for WarmupError {
 /// `Arc`s, so `AppState` (and therefore every Axum request) shares one registry.
 /// All mutable state lives behind `Arc<RwLock<RegistryInner>>`.
 ///
-/// **Locking discipline:** the heavy model build (`Engine::from_dir`, tokenizer
-/// and chat template) is always performed *outside* the lock via
-/// `tokio::task::spawn_blocking`; the `RwLock` is only ever held for the short,
-/// synchronous critical sections that mutate the maps. No lock is ever held
-/// across an `.await`, so the synchronous `std::sync::RwLock` is deadlock-free here.
+/// **Locking discipline:** model preparation and the wait for worker readiness
+/// happen outside the lock. Lazy loading waits from `tokio::task::spawn_blocking`,
+/// while `Engine::from_dir` itself runs on the new owner worker. The `RwLock` is
+/// held only for short synchronous map mutations and never across an `.await`.
 #[derive(Clone)]
 pub(crate) struct ModelRegistry {
     inner: Arc<RwLock<RegistryInner>>,
@@ -433,33 +432,6 @@ impl ModelRegistry {
         Ok(registry)
     }
 
-    /// Build a registry around a single, already-constructed handle.
-    ///
-    /// Used by the `AppState::new*` constructors that start from a live `Engine`
-    /// rather than a spec path.  Because there is no backing spec, the model is
-    /// not recorded in `available` and therefore cannot be lazily reloaded after
-    /// an unload.
-    pub(crate) fn from_handle(handle: Arc<ModelHandle>, config: ServerConfig) -> Self {
-        let authority_provider = Arc::new(ServerMemoryAuthorities::new(
-            config.engine_config.limits.vram_limit,
-        ));
-        let default_id = Some(handle.id.clone());
-        let mut inner = RegistryInner {
-            models: HashMap::new(),
-            order: Vec::new(),
-            default_id,
-            available: HashMap::new(),
-        };
-        inner.insert_loaded(handle);
-        Self {
-            inner: Arc::new(RwLock::new(inner)),
-            config: Arc::new(config),
-            load_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            policy_lock: Arc::new(tokio::sync::RwLock::new(())),
-            authority_provider,
-        }
-    }
-
     /// Resolve an already-loaded handle by name, updating `last_request_at`.
     ///
     /// - **Empty / whitespace** — falls back to the default model.
@@ -529,9 +501,10 @@ impl ModelRegistry {
 
     /// Load (or return the already-loaded) model for `id`.
     ///
-    /// The heavy construction runs on a blocking thread pool via
-    /// `spawn_blocking`; the registry lock is only taken for the brief insert +
-    /// eviction critical section afterwards.  A per-id async guard serialises
+    /// Model preparation and the blocking wait for the owner's ready handshake
+    /// run on a blocking thread pool; engine construction runs on the owner
+    /// worker itself. The registry lock is only taken for the brief insert +
+    /// eviction critical section afterwards. A per-id async guard serialises
     /// concurrent loads of the same id so the model is built only once.
     pub(crate) async fn load(&self, id: &str) -> anyhow::Result<Arc<ModelHandle>> {
         // Fast path: already loaded.
@@ -1019,8 +992,7 @@ mod tests {
             multimodal: None,
             speech: None,
             image_pipeline: None,
-        })
-        .expect("handle");
+        });
 
         assert!(
             handle.speech.is_none(),
@@ -1319,6 +1291,31 @@ mod tests {
         assert_eq!(registry.ids().unwrap(), Vec::<String>::new());
         // The spec stays available, so the model can be lazily reloaded.
         assert!(registry.contains_available("tiny").unwrap());
+    }
+
+    #[test]
+    fn dropping_the_last_registry_joins_the_engine_worker() {
+        let model_dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let specs = vec![ModelSpec {
+            id: "tiny".to_string(),
+            path: model_dir,
+            eager: true,
+            warmup: false,
+        }];
+        let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
+        let worker = {
+            let handle = registry.resolve("tiny").unwrap().unwrap();
+            Arc::clone(handle.engine.workers.primary())
+        };
+
+        drop(registry);
+
+        assert!(
+            worker.is_joined(),
+            "dropping the last registry must wait for engine teardown",
+        );
+        assert!(!worker.is_running());
     }
 
     /// An unload racing an in-flight request does not tear the engine out from
