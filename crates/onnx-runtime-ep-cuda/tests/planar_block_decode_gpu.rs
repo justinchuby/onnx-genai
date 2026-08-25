@@ -648,14 +648,58 @@ fn capability_strings_are_advertised_on_device() {
 // Measurement probe (ignored by default; run with --ignored on an idle A100)
 // ---------------------------------------------------------------------------
 
+/// Resolve the `nvidia-smi -i <target>` argument for the CUDA device this
+/// process actually pinned. Under `CUDA_VISIBLE_DEVICES`, the process's device
+/// ordinal (`ONNX_GENAI_CUDA_DEVICE`, default 0) indexes into the visible list,
+/// whose entry is the *physical* index or GPU UUID that `nvidia-smi` must query
+/// (`nvidia-smi -i` accepts either). Without `CUDA_VISIBLE_DEVICES` the ordinal
+/// is itself the physical index. Returns `None` when the ordinal cannot be
+/// resolved to a visible device (e.g. it is past the end of the list, or the
+/// list is truncated by an empty token exactly as the CUDA runtime truncates),
+/// so callers can refuse rather than probe the wrong GPU.
+fn resolve_smi_device(visible: Option<&str>, ordinal: usize) -> Option<String> {
+    match visible {
+        Some(list) if !list.trim().is_empty() => {
+            let mut entries = Vec::new();
+            for raw in list.split(',') {
+                let entry = raw.trim();
+                // The CUDA runtime stops enumerating at the first empty/invalid
+                // token, so anything after it is not visible to the process.
+                if entry.is_empty() {
+                    break;
+                }
+                entries.push(entry.to_string());
+            }
+            entries.into_iter().nth(ordinal)
+        }
+        _ => Some(ordinal.to_string()),
+    }
+}
+
+/// The `nvidia-smi -i` target for the device pinned by this process's
+/// environment, or `None` if it cannot be resolved.
+fn pinned_smi_target() -> Option<String> {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").ok();
+    let ordinal = std::env::var("ONNX_GENAI_CUDA_DEVICE")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    resolve_smi_device(visible.as_deref(), ordinal)
+}
+
 fn gpu_is_idle() -> bool {
-    // Best-effort idle check via nvidia-smi utilization on the pinned device.
+    // Best-effort idle check via nvidia-smi utilization on the *pinned* device
+    // (the physical GPU / UUID selected by CUDA_VISIBLE_DEVICES + ordinal), not
+    // a hardcoded physical index — otherwise the probe validates the wrong GPU.
+    let Some(target) = pinned_smi_target() else {
+        return false;
+    };
     let output = std::process::Command::new("nvidia-smi")
         .args([
             "--query-gpu=utilization.gpu",
             "--format=csv,noheader,nounits",
             "-i",
-            "0",
+            &target,
         ])
         .output();
     match output {
@@ -666,6 +710,61 @@ fn gpu_is_idle() -> bool {
             .unwrap_or(false),
         _ => false,
     }
+}
+
+/// True if a compute process other than this test binary is resident on the
+/// pinned device. Used as the mid-measurement tenant guard instead of
+/// `utilization.gpu`: our own batched kernels legitimately drive utilization to
+/// 100%, so a rolling-window utilization sample would report that self-load as
+/// "busy" and trip a false positive. Foreign PIDs are the honest signal.
+fn foreign_compute_present() -> bool {
+    let mine = std::process::id();
+    let Some(target) = pinned_smi_target() else {
+        // Cannot prove exclusivity on an unresolved device — treat as foreign.
+        return true;
+    };
+    let output = std::process::Command::new("nvidia-smi")
+        .args([
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &target,
+        ])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .any(|pid| pid != mine),
+        _ => true,
+    }
+}
+
+#[test]
+fn resolve_smi_device_maps_visible_ordinal_to_physical_target() {
+    // No CUDA_VISIBLE_DEVICES: the ordinal is itself the physical index.
+    assert_eq!(resolve_smi_device(None, 0).as_deref(), Some("0"));
+    assert_eq!(resolve_smi_device(None, 3).as_deref(), Some("3"));
+    assert_eq!(resolve_smi_device(Some(""), 2).as_deref(), Some("2"));
+
+    // A visible list: ordinal indexes into it, yielding the *physical* index.
+    // This is the case the old hardcoded `-i 0` got wrong: with the list "2,5"
+    // and ordinal 0 the pinned GPU is physical 2, not 0.
+    assert_eq!(resolve_smi_device(Some("2,5"), 0).as_deref(), Some("2"));
+    assert_eq!(resolve_smi_device(Some("2,5"), 1).as_deref(), Some("5"));
+    assert_eq!(resolve_smi_device(Some(" 7 , 1 "), 0).as_deref(), Some("7"));
+
+    // UUIDs pass through verbatim (nvidia-smi -i accepts a GPU UUID).
+    assert_eq!(
+        resolve_smi_device(Some("GPU-abc123,GPU-def456"), 1).as_deref(),
+        Some("GPU-def456")
+    );
+
+    // Ordinal past the end of the visible list is unresolvable.
+    assert_eq!(resolve_smi_device(Some("2,5"), 2), None);
+    // CUDA truncates the visible list at the first empty token.
+    assert_eq!(resolve_smi_device(Some("2,,5"), 1), None);
+    assert_eq!(resolve_smi_device(Some("2,,5"), 0).as_deref(), Some("2"));
 }
 
 /// Warm-then-batch timing on the pinned device. Reports median + range of a
@@ -729,28 +828,55 @@ fn planar_matmul_measurement() {
     runtime.synchronize().unwrap();
 
     // Batched kernel window: median of n≥3 batches of `batch` launches each.
+    // Mid-measurement exclusivity is checked by *foreign compute PIDs*, not
+    // utilization: our own batched kernels drive utilization to 100% by design,
+    // so a utilization sample would false-trip on self-load. A foreign resident
+    // process is the honest "GPU became busy" signal.
     let batch = 64usize;
-    let mut samples = Vec::new();
-    for _ in 0..5 {
-        assert!(gpu_is_idle(), "GPU became busy mid-measurement");
-        let t = Instant::now();
-        for _ in 0..batch {
-            launch_planar_linear(runtime, PlanarActivationDtype::F16, &dims, &ptrs).unwrap();
+    let sample_shape = |samples: &mut Vec<f64>| {
+        for _ in 0..5 {
+            assert!(
+                !foreign_compute_present(),
+                "a foreign compute process appeared on the pinned GPU mid-measurement"
+            );
+            let t = Instant::now();
+            for _ in 0..batch {
+                launch_planar_linear(runtime, PlanarActivationDtype::F16, &dims, &ptrs).unwrap();
+            }
+            runtime.synchronize().unwrap();
+            samples.push(t.elapsed().as_secs_f64() / batch as f64);
         }
-        runtime.synchronize().unwrap();
-        samples.push(t.elapsed().as_secs_f64() / batch as f64);
-    }
+    };
+
+    let mut samples = Vec::new();
+    sample_shape(&mut samples);
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = samples[samples.len() / 2];
     let min = samples[0];
     let max = *samples.last().unwrap();
 
+    // First-shape drift recheck: re-measure the identical shape after the run
+    // and report drift vs the first median. A large drift means the device was
+    // not in steady state (throttling / contention) and the number is suspect.
+    let mut recheck = Vec::new();
+    sample_shape(&mut recheck);
+    recheck.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let recheck_median = recheck[recheck.len() / 2];
+    let drift = (recheck_median - median).abs() / median;
+
     eprintln!(
-        "planar block_fp8 f16 [{m}x{in_features}->{out}] batched kernel/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}",
+        "planar block_fp8 f16 [{m}x{in_features}->{out}] batched kernel/launch: median {:.1} us (min {:.1}, max {:.1}); host enqueue {:.2} us/launch over {enqueue_n}; first-shape recheck median {:.1} us (drift {:.1}%)",
         median * 1e6,
         min * 1e6,
         max * 1e6,
         host_enqueue.as_secs_f64() / enqueue_n as f64 * 1e6,
+        recheck_median * 1e6,
+        drift * 100.0,
+    );
+    assert!(
+        drift < 0.25,
+        "first-shape drift {:.1}% exceeds 25%: device not in steady state, measurement is unreliable",
+        drift * 100.0
     );
 
     ep.deallocate(a_buf).unwrap();
