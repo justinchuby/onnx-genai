@@ -772,6 +772,20 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_metrics.cpu_us() as f64 / 1e6,
         result.cpu_per_wall()
     );
+    // Kernel time is where a scheduler's waiting shows up -- `sched_yield` and
+    // futex traffic land here and nowhere else -- so a pool that converts an
+    // idle gap into syscalls is visible as a sys share even when total CPU
+    // looks reasonable. Both halves were already being collected from
+    // /proc/self/stat and then discarded at the report.
+    let cpu_us = result.steady_metrics.cpu_us();
+    if cpu_us > 0 {
+        println!(
+            "  cpu split:     {:.3} s user  {:.3} s sys  ({:.1}% sys)",
+            result.steady_metrics.user_us as f64 / 1e6,
+            result.steady_metrics.sys_us as f64 / 1e6,
+            100.0 * result.steady_metrics.sys_us as f64 / cpu_us as f64
+        );
+    }
     println!(
         "  ctxt switches: {:.1} vol/iter  {:.1} invol/iter  ({} vol total)",
         result.parks_per_iter(),
@@ -1000,12 +1014,21 @@ fn dump_csv(path: &std::path::Path, arm: &str, result: &ArmResult) -> Result<()>
 fn emit_result_line(arm: &str, result: &ArmResult) {
     let summary = result.summary();
     println!(
-        "result: arm={arm} p50={:.4} ms p90={:.4} ms cpu_per_wall={:.2} vol_ctxt_per_iter={:.2} \
+        "result: arm={arm} p50={:.4} ms p90={:.4} ms cpu_per_wall={:.2} sys_share={:.3} \
+         vol_ctxt_per_iter={:.2} \
          parks_per_iter={:.2} spin_hits_per_iter={:.2} spin_yields_per_iter={:.2} \
          steady_iters={} rss_kb={}",
         summary.p50,
         summary.p90,
         result.cpu_per_wall(),
+        {
+            let cpu = result.steady_metrics.cpu_us();
+            if cpu > 0 {
+                result.steady_metrics.sys_us as f64 / cpu as f64
+            } else {
+                0.0
+            }
+        },
         result.parks_per_iter(),
         result.steady_pool.parks as f64 / summary.count.max(1) as f64,
         result.steady_pool.spin_hits as f64 / summary.count.max(1) as f64,
