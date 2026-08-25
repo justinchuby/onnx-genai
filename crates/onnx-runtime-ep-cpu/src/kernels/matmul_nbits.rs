@@ -23535,6 +23535,98 @@ mod tests {
         assert_eq!(deferred_decode_width(), None);
     }
 
+    /// Assert that a decode-shaped flat fan-out is *routed* to the task
+    /// runtime, reading both widths the decision uses rather than either one.
+    ///
+    /// `flat_fan_out` reads `wide` (the ambient Rayon width, or the deferred
+    /// hint) and `lanes` (`task_runtime::width()`, which is the host and cannot
+    /// be pinned from a test). Pinning only `wide` makes the *verdict* the same
+    /// on a 4-vCPU runner as on a 32-thread workstation but not the *path*: a
+    /// wide host returns at `wide <= lanes()`, a narrow one falls through to the
+    /// `HOT_FAN_OUT_*` test. Asserting the verdict against both observed widths
+    /// says which one was taken when it ever stops holding.
+    fn assert_routed_to_the_task_runtime(n: usize, k: usize) {
+        let wide = effective_fan_out_width();
+        let lanes = crate::task_runtime::width().max(1);
+        assert_eq!(
+            wide, MIN_ROUTED_FAN_OUT_WIDTH,
+            "the fan-out width under test is not the routing width, so this \
+             test is measuring the host instead of the policy"
+        );
+        assert_eq!(
+            flat_fan_out(n.saturating_mul(k), 1, || lanes, wide),
+            PrefillFanOut::TaskRuntime,
+            "a decode-shaped {n}x{k} fan-out at wide={wide} lanes={lanes} was \
+             routed to the wide pool"
+        );
+    }
+
+    /// Run `fan_out` until the task runtime actually publishes a dispatch for
+    /// it, tolerating only the one decline the pool documents.
+    ///
+    /// Routing a fan-out to the pool does not oblige the pool to take it:
+    /// `TaskPool::dispatch` returns `false` -- running the body inline and
+    /// publishing nothing -- when all `SLOT_COUNT` slots are busy. That is a
+    /// scheduling outcome, not a routing decision, so asserting a dispatch on a
+    /// single call asserts something the runtime never promised.
+    ///
+    /// Not hypothetical: it is how
+    /// [`parallel_output_rows_dispatches_to_the_task_runtime`] failed the
+    /// `Fast (Linux x86_64)` lane on #1173 while passing on a 32-thread
+    /// workstation. Holding all eight slots and running that test's body
+    /// verbatim reproduces it exactly -- `dispatches +0`, `slot_exhausted +1`,
+    /// every output row still written correctly. A narrow runner reaches it
+    /// because these tests install a 16-thread Rayon pool on four cores, and
+    /// oversubscription is what makes a dispatcher hold its slot long enough
+    /// for the rest of the suite to take the other seven.
+    ///
+    /// Retrying is sound because that decline is transient by construction: a
+    /// slot is released as soon as its dispatcher returns. A missing dispatch
+    /// the slot counter does *not* account for is a routing failure and is
+    /// reported as one, so the tolerance is narrow rather than a blanket retry.
+    /// Like every assertion on these counters it stays directional -- they are
+    /// process-global on purpose -- and this does not change that.
+    ///
+    /// The bound is wall-clock rather than a retry count because the thing
+    /// being waited out is a descheduled dispatcher: under the oversubscription
+    /// that produces the decline at all, one scheduler quantum is milliseconds,
+    /// while a few dozen declined fan-outs and yields are microseconds. A count
+    /// alone would expire before the condition it is meant to outlast.
+    fn fan_out_until_dispatched(what: &str, mut fan_out: impl FnMut()) {
+        const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+        let first = crate::task_runtime::testing::counters();
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let mut attempts = 0u64;
+        loop {
+            let before = crate::task_runtime::testing::counters();
+            fan_out();
+            let after = crate::task_runtime::testing::counters();
+            attempts += 1;
+            if after.dispatches > before.dispatches {
+                return;
+            }
+            assert!(
+                after.slot_exhausted > before.slot_exhausted,
+                "{what} published no dispatch and the pool declined none for \
+                 want of a slot, so it never reached the task runtime (pool \
+                 width {})",
+                crate::task_runtime::testing::pool_width()
+            );
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let last = crate::task_runtime::testing::counters();
+        panic!(
+            "{what}: the task runtime declined {attempts} consecutive fan-outs \
+             over {PATIENCE:?} for want of a free slot (pool width {}, \
+             slot_exhausted +{})",
+            crate::task_runtime::testing::pool_width(),
+            last.slot_exhausted - first.slot_exhausted
+        );
+    }
+
     /// Deferring the install must not move the routing decision. A deferred
     /// width of `MIN_ROUTED_FAN_OUT_WIDTH` with `calls == 1` is the decode case,
     /// and it has to reach the task runtime on any host -- the hint is read
@@ -23546,25 +23638,26 @@ mod tests {
             return;
         }
         let (n, k) = (6144usize, 4096usize);
-        assert!(
-            output_chunk_len(n, k) < n,
-            "the partition policy declined to split {n}x{k}"
-        );
         let mut result = vec![0.0f32; n];
-        let before = crate::task_runtime::testing::counters();
         {
             let _deferred = DeferredDecodeGuard::enter(MIN_ROUTED_FAN_OUT_WIDTH);
-            parallel_output_rows(&mut result, k, |start, outputs| {
-                for (offset, output) in outputs.iter_mut().enumerate() {
-                    *output = (start + offset) as f32;
-                }
+            // Inside the guard: the deferred hint is the width both
+            // `output_chunk_len` and the routing decision read, so evaluating
+            // the precondition outside it would check a partition the fan-out
+            // under test never uses.
+            assert!(
+                output_chunk_len(n, k) < n,
+                "the partition policy declined to split {n}x{k}"
+            );
+            assert_routed_to_the_task_runtime(n, k);
+            fan_out_until_dispatched("a deferred fan-out", || {
+                parallel_output_rows(&mut result, k, |start, outputs| {
+                    for (offset, output) in outputs.iter_mut().enumerate() {
+                        *output = (start + offset) as f32;
+                    }
+                });
             });
         }
-        let after = crate::task_runtime::testing::counters();
-        assert!(
-            after.dispatches > before.dispatches,
-            "a deferred fan-out did not reach the task runtime"
-        );
         for (index, value) in result.iter().enumerate() {
             assert_eq!(
                 *value, index as f32,
@@ -23725,9 +23818,16 @@ mod tests {
     /// [`MIN_ROUTED_FAN_OUT_WIDTH`] the fan-out is *supposed* to stay on Rayon.
     /// So on any host narrower than that -- every stock CI runner -- asserting a
     /// dispatch asserts something policy never promised. Installing a pool of
-    /// exactly the routing width makes the decision under test the same one on
-    /// a 4-vCPU runner as on a 32-thread workstation, instead of silently
-    /// testing the host.
+    /// exactly the routing width takes that early-out off the table.
+    ///
+    /// It does not make the decision host-independent, though, and the comment
+    /// that used to claim it did was wrong in the same way as naming a route
+    /// without proving it. [`flat_fan_out`] reads *two* widths and the pool pins
+    /// only one: `lanes` is `task_runtime::width()`, which still reads the host,
+    /// so a 32-thread workstation returns at `wide <= lanes()` while a 4-vCPU
+    /// runner falls through to the `HOT_FAN_OUT_*` test. Same verdict at
+    /// `calls == 1`, different path -- which is why the route is asserted here
+    /// against both observed widths instead of being inferred from a counter.
     #[test]
     fn parallel_output_rows_dispatches_to_the_task_runtime() {
         if crate::task_runtime::width() <= 1 {
@@ -23739,7 +23839,7 @@ mod tests {
             .num_threads(MIN_ROUTED_FAN_OUT_WIDTH)
             .build()
             .expect("could not build a routing-width Rayon pool");
-        let (before, after) = routing_width.install(|| {
+        routing_width.install(|| {
             // Inside the pool: `output_chunk_len` reads the same Rayon width the
             // routing decision does, so the precondition and the behaviour under
             // test have to be evaluated against the same one.
@@ -23748,18 +23848,15 @@ mod tests {
                 "the partition policy declined to split {n}x{k}, so this test \
                  cannot observe a dispatch"
             );
-            let before = crate::task_runtime::testing::counters();
-            parallel_output_rows(&mut result, k, |start, outputs| {
-                for (offset, output) in outputs.iter_mut().enumerate() {
-                    *output = (start + offset) as f32;
-                }
+            assert_routed_to_the_task_runtime(n, k);
+            fan_out_until_dispatched("the flat fan-out", || {
+                parallel_output_rows(&mut result, k, |start, outputs| {
+                    for (offset, output) in outputs.iter_mut().enumerate() {
+                        *output = (start + offset) as f32;
+                    }
+                });
             });
-            (before, crate::task_runtime::testing::counters())
         });
-        assert!(
-            after.dispatches > before.dispatches,
-            "the flat fan-out published no task-runtime dispatch"
-        );
         for (index, value) in result.iter().enumerate() {
             assert_eq!(*value, index as f32, "output row {index} was not written");
         }
