@@ -766,6 +766,94 @@ pipeline:
 }
 
 #[test]
+fn encoded_video_adapter_fails_closed_at_the_registered_runtime_boundary() -> anyhow::Result<()> {
+    let metadata = r#"
+schema_version: v1.1
+preprocessing:
+  video:
+    transforms:
+      - { op: decode, outputs: [decoded] }
+      - { op: resize, inputs: [decoded], outputs: [pixels], size: 2, mode: stretch,
+          interpolation: bilinear }
+    outputs:
+      - source: pixels
+        name: video.pixel_values
+        content: pixels
+        dtype: float32
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, 3, 2, 2]
+          batch_layout: { kind: request_aligned, axis: 0 }
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: { onnx-genai.video-preprocess: "1" }
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      request.video:
+        contract: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+        role: { kind: opaque }
+        source: { kind: application, name: video }
+        required: true
+    outputs:
+      result:
+        contract:
+          dtype: float32
+          rank: 4
+          shape: [batch, 3, 2, 2]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        role: video
+        stage: post_adapter
+    components:
+      preprocess:
+        implementation: { kind: adapter, abi: onnx-genai.video-preprocess, version: "1" }
+        ports:
+          inputs:
+            encoded: { dtype: uint8, rank: 1, shape: [encoded_bytes] }
+          outputs:
+            pixels:
+              dtype: float32
+              rank: 4
+              shape: [batch, 3, 2, 2]
+              batch_layout: { kind: request_aligned, axis: 0 }
+    steps:
+      - kind: invoke
+        component: preprocess
+        inputs: { encoded: request.video }
+        outputs: { pixels: video.pixel_values }
+      - kind: emit
+        value: video.pixel_values
+        output: result
+        mode: replace
+"#;
+    let root = package("video-adapter-fail-closed", metadata, &[])?;
+    let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
+    let encoded = vec![0_u8; 16];
+    let request =
+        PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(vec![])))
+            .with_input(
+                "video",
+                Value::from_raw_bytes(encoded, &[16], DataType::Uint8)?,
+            );
+
+    let error = match engine.run_pipeline(request) {
+        Ok(_) => panic!("encoded video execution is not implemented"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("encoded video-container decode"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        message.contains("grouped frame-sequence preprocessing API"),
+        "unexpected error: {message}"
+    );
+    Ok(())
+}
+
+#[test]
 fn optional_media_presence_selects_real_or_empty_features() -> anyhow::Result<()> {
     let metadata = r#"
 pipeline:

@@ -14,4 +14,5 @@
 //! before the engine computes sequence length and allocates KV cache pages.
 
 pub mod audio;
+pub mod batching;
 pub mod image;
