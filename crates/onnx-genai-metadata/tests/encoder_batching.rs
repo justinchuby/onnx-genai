@@ -2750,6 +2750,16 @@ fn a_companion_is_admitted_at_its_own_rank_and_not_at_another_kinds() {
         &document,
         "names as a padded dimension's valid_lengths at rank 2, but it is int64 at rank 1",
     );
+    // The negative half is the one that matters. Falling through to the generic
+    // serving message would advise a `request_aligned` layout, which a companion
+    // MUST NOT declare -- advice that turns a package with one wrong number into
+    // a package that is wrong in a second, harder way.
+    assert!(
+        !errors(&document)
+            .iter()
+            .any(|error| error.contains("without a declared batch_layout")),
+        "a misshapen companion must not be advised toward the one layout it may not have"
+    );
 }
 
 #[test]
