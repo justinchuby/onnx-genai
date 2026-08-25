@@ -27,6 +27,7 @@ use std::sync::Arc;
 mod adapters;
 mod arg_reduce;
 mod audio;
+mod batching;
 mod device_ops;
 pub(crate) mod generation;
 mod islands;
@@ -40,6 +41,10 @@ mod workflow;
 pub use adapters::{AdapterActivation, AdapterLifecycleDiagnostic, AdapterSelection};
 pub use arg_reduce::{ArgReduceRewrites, WideArgReduceLowering, lower_degenerate_arg_reductions};
 pub use audio::{EncodedAudio, encode_pcm16_wav, resample_planar};
+pub use batching::{
+    BatchContractError, ComposedOwnership, OwnershipLevelValues, PackedOwnership,
+    PackedRequestView, PackedTensor, PackedValueView, RebasedI64Slice, batch_contract_error,
+};
 pub(crate) use generation::validate_generation_workflow;
 pub use islands::ExecutionIslandDiagnostic;
 pub use onnx_genai_metadata::WorkflowOutputRole;
