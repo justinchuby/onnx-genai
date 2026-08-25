@@ -809,11 +809,74 @@ impl Executor {
     }
 
     pub(super) fn build_with_cuda_requirement(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+        require_cuda: bool,
+    ) -> Result<Self> {
+        Self::build_with_mode(
+            graph,
+            weights,
+            ep,
+            require_cuda,
+            hetero_placement_env_enabled(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_with_heterogeneous_enabled(
+        graph: Graph,
+        weights: Arc<WeightStore>,
+        ep: Arc<dyn ExecutionProvider>,
+    ) -> Result<Self> {
+        Self::build_with_mode(graph, weights, ep, false, true)
+    }
+
+    fn build_with_mode(
         mut graph: Graph,
         weights: Arc<WeightStore>,
         mut ep: Arc<dyn ExecutionProvider>,
         require_cuda: bool,
+        hetero_enabled: bool,
     ) -> Result<Self> {
+        if hetero_enabled && !require_cuda && ep.device_type() != DeviceType::Cpu {
+            let cpu = auto_detect_cpu_ep()?;
+            let providers = vec![
+                crate::hetero::ProviderPlacement {
+                    ep: onnx_runtime_ep_api::EpId(0),
+                    provider: Arc::clone(&ep),
+                },
+                crate::hetero::ProviderPlacement {
+                    ep: onnx_runtime_ep_api::EpId(1),
+                    provider: Arc::clone(&cpu),
+                },
+            ];
+            if let crate::hetero::PlacementDecision::Heterogeneous(plan) =
+                crate::hetero::classify_placement(&graph, &providers)?
+            {
+                let planned_graph = plan
+                    .legalized_graph
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(|| graph.clone());
+                let heterogeneous = crate::hetero::HeterogeneousExecutor::build(
+                    *plan, &graph, &weights, &providers,
+                )?;
+                let report = heterogeneous.placement_report().to_string();
+
+                // The outer Executor is only an API coordinator. Build its
+                // legacy fields from an empty graph so no whole-model CPU
+                // kernels, weights, or activation buffers are materialized.
+                let mut coordinator =
+                    Self::build_with_mode(Graph::new(), weights, cpu, false, false)?;
+                coordinator.graph = planned_graph;
+                coordinator.heterogeneous = Some(Box::new(heterogeneous));
+                coordinator.execution_provider_fallback_report = None;
+                eprintln!("[onnx-genai-info] heterogeneous placement: {report}");
+                return Ok(coordinator);
+            }
+        }
+
         let execution_provider_fallback_report =
             Self::place_graph(&mut graph, &weights, &mut ep, require_cuda)?;
         // Topological order up front: also validates the selected graph is a DAG.
@@ -880,6 +943,7 @@ impl Executor {
             graph,
             weights,
             ep,
+            heterogeneous: None,
             graph_slot: DeviceGraphSlot::Primary,
             weight_handles,
             expert_region_candidates,
@@ -1213,12 +1277,11 @@ impl Executor {
                     unsupported_nodes: report.to_string(),
                 });
             }
-            // Thread-3 Phase 3: before silently dropping the whole session onto
-            // CPU (a catastrophic perf cliff), consult the per-op heterogeneous
-            // planner when opted in (`ONNX_GENAI_HETERO`). A genuinely mixed
-            // graph fails closed with an actionable per-op summary; a homogeneous
-            // graph proceeds to the byte-identical whole-session fallback below.
-            // Default OFF ⇒ this is a no-op and the fallback is unchanged.
+            // Defensive post-pass guard: the opt-in mixed plan is built before
+            // this single-EP placement path. Reaching here with a newly mixed
+            // post-pass graph means an EP optimizer introduced a decline after
+            // planning, so fail closed rather than silently collapsing to CPU.
+            // Default OFF remains the byte-identical fallback below.
             let hetero_providers = [
                 crate::hetero::ProviderPlacement {
                     ep: onnx_runtime_ep_api::EpId(0),
@@ -2205,7 +2268,10 @@ impl Executor {
     }
 
     pub(crate) fn device_id(&self) -> onnx_runtime_ir::DeviceId {
-        self.ep.device_id()
+        self.heterogeneous.as_deref().map_or_else(
+            || self.ep.device_id(),
+            |heterogeneous| heterogeneous.primary_device(),
+        )
     }
 
     pub(crate) fn allocate_device_binding(
@@ -2216,6 +2282,11 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "persistent device-binding allocation",
+            ));
+        }
         let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
             if output_name.is_some() {
                 !self.binding_consumers_use_physical_capacity(vid)
@@ -2255,6 +2326,11 @@ impl Executor {
         allocation_bytes: usize,
         committed_ranges: Vec<std::ops::Range<usize>>,
     ) -> Result<DeviceIoBinding> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "persistent committed device-binding allocation",
+            ));
+        }
         let expose_logical_input_shape = self.input_index.get(&input_name).is_some_and(|&vid| {
             if output_name.is_some() {
                 !self.binding_consumers_use_physical_capacity(vid)
@@ -2294,6 +2370,11 @@ impl Executor {
         &self,
         spec: crate::tensor::ExternalMemorySpec,
     ) -> Result<DeviceIoBinding> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "persistent external-memory device binding",
+            ));
+        }
         let crate::tensor::ExternalMemorySpec {
             input_name,
             bind_input,
@@ -2352,6 +2433,11 @@ impl Executor {
         physical_shape: Vec<usize>,
         logical_shape: Vec<usize>,
     ) -> Result<DeviceIoBinding> {
+        if self.heterogeneous.is_some() {
+            return Err(heterogeneous_api_error(
+                "persistent output device-binding allocation",
+            ));
+        }
         DeviceIoBinding::allocate(
             self.ep.clone(),
             DeviceBindingSpec {
@@ -2505,11 +2591,20 @@ impl Executor {
         self.execution_provider_fallback_report.as_ref()
     }
 
+    pub(crate) fn heterogeneous_placement_report(&self) -> Option<&str> {
+        self.heterogeneous
+            .as_deref()
+            .map(crate::hetero::HeterogeneousExecutor::placement_report)
+    }
+
     /// Attach the shared runtime trace context. When enabled, the executor opens
     /// one span per executed op so kernels can attach kernel-variant and
     /// capture-rejection reasons. Propagated to any already-built child
     /// (control-flow subgraph) executors so nested ops are traced too.
     pub(crate) fn set_trace_context(&mut self, trace: TraceContext) {
+        if let Some(heterogeneous) = self.heterogeneous.as_mut() {
+            heterogeneous.set_trace_context(trace.clone());
+        }
         for child in self.subgraph_execs.values_mut() {
             child.set_trace_context(trace.clone());
         }

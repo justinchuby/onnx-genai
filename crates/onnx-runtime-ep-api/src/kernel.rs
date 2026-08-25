@@ -665,6 +665,15 @@ pub trait Kernel: Send {
         None
     }
 
+    /// Whether [`Self::view_outputs`] can ever return a zero-copy alias.
+    ///
+    /// Heterogeneous execution uses independently owned boundary buffers. Its
+    /// first slice rejects view-producing kernels before execution rather than
+    /// discovering an alias after an upstream partition has already run.
+    fn may_produce_views(&self) -> bool {
+        false
+    }
+
     /// Whether the output may overwrite the input at `input_index`.
     ///
     /// This is an opt-in semantic promise: the executor performs the separate

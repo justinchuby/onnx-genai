@@ -26,6 +26,10 @@ impl KernelFactory for ReshapeFactory {
 }
 
 impl Kernel for ReshapeKernel {
+    fn may_produce_views(&self) -> bool {
+        true
+    }
+
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("Reshape", inputs, outputs, 1, 2, 1)?;
         if outputs[0].dtype != inputs[0].dtype {
