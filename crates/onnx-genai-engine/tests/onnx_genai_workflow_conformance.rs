@@ -184,33 +184,24 @@ fn mobius_parameter_adapters_preserve_order_rows_and_compaction() -> anyhow::Res
     Ok(())
 }
 
-fn assert_batched_policy_super_island(engine: &Engine) {
+const POLICY_COMPONENTS: [&str; 3] = ["token_sampler", "termination", "token_state_update"];
+
+fn assert_policy_components_keep_admission_boundaries(engine: &Engine) {
     let diagnostics = engine.execution_island_diagnostics();
-    let island = diagnostics
-        .iter()
-        .find(|island| {
-            ["token_sampler", "termination", "token_state_update"]
-                .iter()
-                .all(|component| island.components.iter().any(|item| item == component))
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "sampler, termination, and state update must share one execution island: \
-                 {diagnostics:#?}"
-            )
-        });
-    assert!(island.runs > 0, "batched policy island must execute");
-    assert_eq!(island.session_runs, island.runs);
     assert!(
-        island.component_boundaries_elided >= 2,
-        "the three policy components must execute as a fused island"
+        diagnostics.iter().all(|island| {
+            POLICY_COMPONENTS
+                .iter()
+                .all(|component| !island.components.iter().any(|item| item == component))
+        }),
+        "request-batched policy components must remain outside execution islands: {diagnostics:#?}"
     );
-    if island.device.starts_with("cuda:") {
-        assert_eq!(island.fallback_reason, None);
-    } else {
-        assert_eq!(
-            island.fallback_reason.as_deref(),
-            Some("island is not placed on CUDA")
+    let invocations = engine.component_invocations();
+    for component in POLICY_COMPONENTS {
+        assert!(
+            invocations.get(component).copied().unwrap_or(0) > 0,
+            "request-batched policy component '{component}' must execute individually: \
+             {invocations:?}"
         );
     }
 }
@@ -311,7 +302,7 @@ fn mobius_decoder_workflow_executes() -> anyhow::Result<()> {
             .len(),
         3
     );
-    assert_batched_policy_super_island(&engine);
+    assert_policy_components_keep_admission_boundaries(&engine);
     Ok(())
 }
 
@@ -369,11 +360,6 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     assert_eq!(rows[1].0, 1);
     assert_eq!(rows[1].1.to_vec_i64()?, second_tokens);
 
-    let stable_before = engine
-        .execution_island_diagnostics()
-        .iter()
-        .map(|island| island.stable_binding_runs)
-        .sum::<u64>();
     // A compacted batch submits the surviving rows in a new order. Because rows
     // are positional, the result rows come back in the submitted order: the
     // caller, which owns the permutation, maps them back to its requests.
@@ -390,15 +376,7 @@ fn mobius_decoder_rows_match_independent_runs_and_dynamic_batch_replay() -> anyh
     };
     assert_eq!(compacted_row(0)?, second_tokens);
     assert_eq!(compacted_row(1)?, first_tokens);
-    let stable_after = engine
-        .execution_island_diagnostics()
-        .iter()
-        .map(|island| island.stable_binding_runs)
-        .sum::<u64>();
-    assert!(
-        stable_after > stable_before,
-        "same-shape row compaction must reuse stable island bindings"
-    );
+    assert_policy_components_keep_admission_boundaries(&engine);
 
     let inactive = decoder_batch_request(&[4, 5, 6, 0], 2, 2, &[2, 1], &[true, false], 3)?;
     let inactive_output = engine.run_pipeline_outputs(inactive)?;
@@ -459,7 +437,7 @@ fn mobius_vlm_workflow_executes_complete_image_path() -> anyhow::Result<()> {
             .shape(),
         [1, 2]
     );
-    assert_batched_policy_super_island(&engine);
+    assert_policy_components_keep_admission_boundaries(&engine);
     Ok(())
 }
 
@@ -803,24 +781,21 @@ fn mobius_tts_workflow_executes_real_producer_graphs() -> anyhow::Result<()> {
     assert_eq!(&batched_waveform[..frames], first);
     assert_eq!(&batched_waveform[frames..], second);
 
-    let stable_before = engine
-        .execution_island_diagnostics()
-        .iter()
-        .map(|island| island.stable_binding_runs)
-        .sum::<u64>();
     let compacted = engine.run_pipeline_outputs(tts_request(&[3, 4, 1, 2], 2)?)?;
     let compacted_waveform = compacted["waveform"].to_vec_f32()?;
     assert_eq!(&compacted_waveform[..frames], second);
     assert_eq!(&compacted_waveform[frames..], first);
-    let stable_after = engine
-        .execution_island_diagnostics()
-        .iter()
-        .map(|island| island.stable_binding_runs)
-        .sum::<u64>();
     assert!(
-        stable_after > stable_before,
-        "same-shape nested TTS compaction must preserve stable bindings"
+        engine.execution_island_diagnostics().is_empty(),
+        "request-batched TTS components must retain their admission boundaries"
     );
+    let invocations = engine.component_invocations();
+    for component in ["tts_state_initializer", "talker", "code_predictor", "codec"] {
+        assert!(
+            invocations.get(component).copied().unwrap_or(0) > 0,
+            "the compacted TTS pass must invoke '{component}' individually: {invocations:?}"
+        );
+    }
 
     let reused = engine.run_pipeline_outputs(tts_request(&[3, 4], 1)?)?;
     assert_eq!(reused["waveform"].to_vec_f32()?, second);

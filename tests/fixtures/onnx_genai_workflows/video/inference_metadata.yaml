@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -150,14 +150,17 @@ pipeline:
         stage: pre_adapter
     components:
       transformer:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: transformer/model.onnx.textproto
       vae_decoder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx.textproto
       model_input:
+        batch_capacity: { uniform_dimensions: [channels, frames, height, schedule_length, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/model_input.onnx.textproto
@@ -166,6 +169,7 @@ pipeline:
             sample:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -175,6 +179,7 @@ pipeline:
             step:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
             schedule:
@@ -186,6 +191,7 @@ pipeline:
             model_input:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -193,6 +199,7 @@ pipeline:
               - height
               - width
       solver_step:
+        batch_capacity: { uniform_dimensions: [channels, frames, height, schedule_length, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/solver_step.onnx.textproto
@@ -201,6 +208,7 @@ pipeline:
             sample:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -210,6 +218,7 @@ pipeline:
             derivative:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -219,6 +228,7 @@ pipeline:
             step:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
             schedule:
@@ -230,6 +240,7 @@ pipeline:
             next_state:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -246,6 +257,7 @@ pipeline:
             schedule: schedule
             next_state: next_state
       continue_predicate:
+        batch_capacity: { budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/continue_predicate.onnx.textproto
@@ -254,6 +266,7 @@ pipeline:
             done:
               dtype: bool
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
@@ -263,6 +276,7 @@ pipeline:
               shape:
               - 1
       video_latent_init:
+        batch_capacity: { uniform_dimensions: [channels, frames, height, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_latent_init.onnx.textproto
@@ -271,6 +285,7 @@ pipeline:
             noise:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -281,6 +296,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -290,10 +306,12 @@ pipeline:
             history:
               dtype: int64
               rank: 2
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - 0
       schedule_history_append:
+        batch_capacity: { uniform_dimensions: [history], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/schedule_history_append.onnx.textproto
@@ -302,22 +320,26 @@ pipeline:
             history:
               dtype: int64
               rank: 2
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - history
             timestep:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             next:
               dtype: int64
               rank: 2
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
-              - history
+              - history + 1
       video_latent_permute:
+        batch_capacity: { uniform_dimensions: [channels, frames, height, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_latent_permute.onnx.textproto
@@ -326,6 +348,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - frames
@@ -336,6 +359,7 @@ pipeline:
             permuted:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -343,6 +367,7 @@ pipeline:
               - height
               - width
       video_latent_unscale:
+        batch_capacity: { uniform_dimensions: [channels, frames, height, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_latent_unscale.onnx.textproto
@@ -351,6 +376,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -361,6 +387,7 @@ pipeline:
             unscaled:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -368,6 +395,7 @@ pipeline:
               - height
               - width
       video_decode_chunks:
+        batch_capacity: { uniform_dimensions: [channels, height, latent_frames, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_decode_chunks.onnx.textproto
@@ -376,6 +404,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -389,6 +418,7 @@ pipeline:
               shape:
               - 1
       video_decode_chunk:
+        batch_capacity: { uniform_dimensions: [channels, height, latent_frames, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_decode_chunk.onnx.textproto
@@ -397,6 +427,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -406,12 +437,14 @@ pipeline:
             step:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             chunk:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -419,6 +452,7 @@ pipeline:
               - height
               - width
       video_conv_cache_init:
+        batch_capacity: { uniform_dimensions: [channels, height, latent_frames, width], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/video_conv_cache_init.onnx.textproto
@@ -427,6 +461,7 @@ pipeline:
             latent:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - channels
@@ -437,6 +472,7 @@ pipeline:
             conv_cache.conv_in:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - 4
@@ -446,6 +482,7 @@ pipeline:
             conv_cache.conv_out:
               dtype: float32
               rank: 5
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
               - 3
@@ -453,6 +490,7 @@ pipeline:
               - 2*height
               - 2*width
       diffusion_schedule:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/diffusion_schedule.onnx.textproto
@@ -465,6 +503,7 @@ pipeline:
               shape:
               - 4
       diffusion_timesteps:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/diffusion_timesteps.onnx.textproto
@@ -477,6 +516,7 @@ pipeline:
               shape:
               - 3
       schedule_lookup:
+        batch_capacity: { uniform_dimensions: [schedule_length], budgets: [{ dimensions: [batch], max_total: 2 }] }
         implementation:
           kind: onnx
           artifact: policies/schedule_lookup.onnx.textproto
@@ -490,12 +530,14 @@ pipeline:
             step:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
           outputs:
             timestep:
               dtype: int64
               rank: 1
+              batch_layout: { kind: request_aligned, axis: 0 }
               shape:
               - batch
     state:
