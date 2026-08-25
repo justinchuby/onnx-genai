@@ -636,6 +636,35 @@ impl NativeDecodeSession {
                 state_pairs.push((pair.output.clone(), pair.input.clone()));
             }
         }
+        // DeepSeek-V4 CompressedSparseAttention (CSA/HCA) threads its compressed
+        // KV / carry / learned-index state as role-typed `present_* -> past_*`
+        // edges. Discover each declared group, validate every edge against the
+        // graph's real typed IO, and refuse (typed) before any buffer is
+        // reserved. Valid edges fold into the same recurrent-state lists as
+        // fixed loop-carried state: the runner then binds stable-address scratch
+        // once and rebinds present->past each step through the existing
+        // authority, so compressed state gets snapshot/rollback/fork/teardown for
+        // free. A schedule that alternates ratio-4 and ratio-128 layers declares
+        // one group per layer; absent means the graph threads no CSA state and
+        // ordinary inference is byte-identical.
+        if let Some(groups) = io.and_then(|io| io.csa_state_groups.as_ref()) {
+            let occupied: HashSet<&str> = kv_inputs
+                .iter()
+                .map(String::as_str)
+                .chain(present_outputs.iter().map(String::as_str))
+                .collect();
+            let csa_edges = csa::resolve_csa_state_groups(
+                session.inputs(),
+                session.outputs(),
+                groups,
+                &occupied,
+            )?;
+            for (past_input, present_output) in csa_edges {
+                kv_inputs.push(past_input.clone());
+                present_outputs.push(present_output.clone());
+                state_pairs.push((present_output, past_input));
+            }
+        }
         let fixed_state_inputs = state_pairs
             .iter()
             .map(|(_, input)| input.clone())

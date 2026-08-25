@@ -53,6 +53,7 @@ fn synthetic_io() -> DecoderAbi {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        csa_state_groups: None,
     }
 }
 
