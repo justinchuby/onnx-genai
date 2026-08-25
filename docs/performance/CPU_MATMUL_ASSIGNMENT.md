@@ -3149,3 +3149,44 @@ ratios on this host are not reproducible, whichever arm they favour.
   operator's memory of whether they announced it. This is the same principle as
   asserting realized placement rather than trusting the width label: make the
   artifact carry the answer.
+
+## `dequant_panel_avx2` modulo elimination: the withheld rows, resolved (2026-08-25)
+
+Full report:
+[`docs/benchmarks/2026-08-25-int4-pack-modulo-elimination-matrix.md`](../benchmarks/2026-08-25-int4-pack-modulo-elimination-matrix.md).
+
+* **#1809's prefill claim was incomplete, and it was incomplete in a
+  predictable place.** It reported "a null on prefill" from `m = 64/256/512`,
+  having **withheld `m = 1` and `m = 8`** because their A/A null came back at
+  5.31% and 4.62%. The pack is amortized over `m` rows, so the mechanism puts
+  the effect at *small* `m` — the sweep had a hole exactly where the answer
+  was. `m = 8` is **1.007x, 95% CI [1.0050, 1.0092]**, and the gain decays
+  monotonically to a bounded null by `m = 64`.
+  A withheld row is honest; it is not neutral. It removes the reader's ability
+  to tell "no effect" from "not looked at", and here those were different.
+* **The instrument, not the operator, decided the rows were trustworthy this
+  time.** The A/A nulls that failed at 4–5% now sit at 0.04–0.17%, from two
+  changes: a CPU-efficiency gate on each launch (`os.wait4` rusage
+  `(utime + stime)/wall`, floor 0.95) instead of a runnable count sampled at
+  run boundaries, and 61 independent launches per arm instead of one careful
+  pairing. The per-launch spread at `m = 1` is **102%** while the median A/A
+  null is **0.14%** — one pairing on this host can be off by 2x, and no amount
+  of care inside a single launch fixes that.
+* **Every row now proves its own route.** `int4_prefill_route_ab` prints an
+  FNV-1a fold of the raw output bytes, and `int4_modulo_matrix.py
+  --route-proof` runs a deliberately poisoned third build. `before == after` on
+  all 16 rows (the elimination is exact, so the speedup is free), and the
+  poison moves on every row whose route reaches the line — except block 32
+  `m = 1`, which is bit-identical because that row takes the N-blocked decode
+  kernel and never calls the pack. A control that is *supposed* to stay still,
+  and does.
+* **The best null in the table was free.** Block 32 `m = 1` is an A/B whose two
+  binaries differ only in code that row never executes, yet still differ in
+  layout, ASLR and page backing. It reads 1.0028, CI [0.9986, 1.0042]. That
+  bounds everything the experiment measures other than the change itself,
+  which a same-binary A/A cannot do.
+* **Disposition: no kernel change.** #1809's code was already correct and
+  already on main. What shipped here is the corrected scope, the per-row route
+  fingerprint, and the two scripts that make the matrix reproducible. The
+  decode row reproduces at 1.012x on current main, after #1729 and #1794 both
+  moved decode placement and default width underneath it.
