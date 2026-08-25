@@ -2891,3 +2891,85 @@ fn a_companion_of_a_result_nobody_produces_describes_nothing() {
          emitted",
     );
 }
+
+#[test]
+fn an_emit_length_is_still_the_ordinary_way_to_publish_a_ragged_result() {
+    // The over-broad failure this rule invites: `valid_length` is how ordinary
+    // ragged generation publishes a prefix, and it is only a contradiction when
+    // the output also declares `padding`. An implementation keyed on the emit
+    // rather than on the pair would break every decoder in the repository, so
+    // the acceptance is pinned here rather than left to the fixtures that
+    // happen to exercise it.
+    let document = PADDED_EMIT_WORKFLOW
+        .replace(
+            "      capabilities: [workflow_ssa, typed_emit, serving_service_contract]",
+            "      capabilities: [workflow_ssa, typed_emit, serving_service_contract, emit_valid_length]",
+        )
+        .replace(
+            "          batch_layout: { kind: request_aligned, axis: 0 }\n          padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n        role: tensor\n        stage: pre_adapter\n",
+            "          batch_layout: { kind: request_aligned, axis: 0 }\n        role: tensor\n        stage: pre_adapter\n",
+        )
+        .replace(
+            "              batch_layout: { kind: request_aligned, axis: 0 }\n              padding: [{ dimension: max_tiles, valid_lengths: lengths }]\n    steps:",
+            "              batch_layout: { kind: request_aligned, axis: 0 }\n    steps:",
+        )
+        .replace(
+            "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
+            "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
+        )
+        .replace(
+            "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n      - kind: emit\n        value: tile_lengths\n        output: tile_lengths\n        mode: replace\n",
+            "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
+        )
+        .replace(
+            "      tile_lengths:\n        contract: { dtype: int64, rank: 1, shape: [batch], batch_layout: { kind: shared } }\n        role: tensor\n        stage: pre_adapter\n",
+            "",
+        );
+    assert!(
+        document.contains("valid_length: accepted_len"),
+        "this fixture must actually carry an emit-level length"
+    );
+    // Scoped to the emitted output: the *input* side still pads, which is the
+    // realistic shape of this workflow and is what makes the acceptance mean
+    // something. Only the value being emitted must carry no padding.
+    assert!(
+        !document.contains(
+            "padding: [{ dimension: max_tiles, valid_lengths: tile_lengths }]\n        role: tensor"
+        ),
+        "and the output it emits into must declare no padding"
+    );
+    validate_metadata(&parse(&document)).expect(
+        "an emit-level length is ordinary ragged emission when nothing else claims the extent",
+    );
+}
+
+#[test]
+fn a_packed_output_that_also_pads_hears_from_both_rules() {
+    // The padding exclusion is keyed on `padding`, not on the batch layout, and
+    // `padding` legally lives on the axes a packed value does *not* pack. So a
+    // packed output that pads elsewhere reaches this rule as well as the older
+    // request-axis one, and both are right: one says a packed result has no
+    // per-row prefix to express, the other says its padded extents already have
+    // an account. Keying the exclusion on `request_aligned` instead would lose
+    // the second for exactly the values that carry two paddings.
+    let document = packed_two_padded_dimensions().replace(
+        "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
+        "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
+    );
+    assert_ne!(
+        document,
+        packed_two_padded_dimensions(),
+        "the emit must actually gain a valid_length"
+    );
+    let reported = errors(&document);
+    for expected in [
+        "with a per-row valid_length or guard, but 'features' does not declare request_aligned",
+        "with valid_length 'accepted_len', but 'features' declares padding whose valid_lengths \
+         'tile_lengths' on dimension 'max_tiles', 'patch_lengths' on dimension 'max_patches'",
+    ] {
+        assert!(
+            reported.iter().any(|error| error.contains(expected)),
+            "expected an error containing {expected:?}, got {reported:#?}"
+        );
+    }
+}
