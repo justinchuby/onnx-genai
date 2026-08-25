@@ -2070,7 +2070,7 @@ cargo run -p onnx-genai-metadata --bin validate_metadata -- <path>
 | Removed fields rejected | `metadata_fixtures.rs::removed_row_identity_fields_are_rejected_fail_closed` |
 | Row-wise emit / ragged outputs | `metadata_fixtures.rs::row_wise_emit_requires_a_request_aligned_batch_layout` |
 | State semantics vs. allocator policy | `metadata_fixtures.rs::state_service_declares_semantics_not_allocator_policy` |
-| Adapter artifact compatibility | `tests/adapter_artifact_compat.rs` |
+| Adapter artifact compatibility | `crates/onnx-genai-metadata/tests/adapter_artifact_compat.rs` |
 | Canonical identity | `crates/onnx-genai-metadata/src/identity.rs` unit tests |
 | Cache dependency derivation | `crates/onnx-genai-metadata/src/cache.rs` + `redesign_invariants.rs` |
 | Row ABI (`compact`/`release`) | `crates/onnx-genai-engine/src/pipeline/row_state.rs` |
