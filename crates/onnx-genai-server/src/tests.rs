@@ -2592,32 +2592,42 @@ async fn stalled_output_route_does_not_block_another_completion() {
 async fn native_driver_sessions_generate_through_server_path() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tiny-native-sub4-engine");
-    let (driver, ()) = EngineDriver::start(
-        move || {
-            Ok((
-                Engine::from_dir(
-                    &model_dir,
-                    EngineConfig {
-                        decode_backend: EngineDecodeBackend::Native,
-                        ..EngineConfig::default()
-                    },
-                )?,
-                (),
-            ))
+    let model_id = "tiny-native-sub4-engine";
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some(model_id.to_string()),
+        ServerConfig {
+            max_queue_depth: 4,
+            engine_config: EngineConfig {
+                decode_backend: EngineDecodeBackend::Native,
+                ..EngineConfig::default()
+            },
+            ..ServerConfig::default()
         },
-        2,
-        4,
     )
     .unwrap();
-    let session_id = driver.create_session().await.unwrap();
+    let handle = handle_for(&state, model_id);
+    let placement = handle.engine.create_session().await.unwrap();
+    let client_id = "native-driver-session";
+    let binding = handle.engine.binding(placement);
+    assert!(
+        state
+            .sessions
+            .insert(client_id.to_string(), binding.clone())
+            .unwrap()
+            .is_none()
+    );
+    let lease = state.sessions.acquire(binding, client_id).unwrap();
+    assert_eq!(leases_held(&state), 1, "generation holds the session lease");
 
     let mut request =
         onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let generation = driver
-        .generate(Some(session_id), request, None)
+    let generation = handle
+        .engine
+        .generate(Some(lease), request, None)
         .await
         .unwrap();
     let result = timeout(
@@ -2629,8 +2639,28 @@ async fn native_driver_sessions_generate_through_server_path() {
     .expect("native session generation failed");
 
     assert_eq!(result.token_ids, vec![1, 1]);
-    assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
-    driver.close_session(session_id).await.unwrap();
+    assert_eq!(
+        leases_held(&state),
+        0,
+        "completed generation releases the session lease"
+    );
+    assert_eq!(
+        handle.engine.session_token_count(placement).await.unwrap(),
+        3
+    );
+
+    let lease = state.sessions.take_for_close(client_id).unwrap();
+    assert_eq!(leases_held(&state), 1, "close holds the session lease");
+    handle.engine.close_session(lease).await.unwrap();
+    assert!(
+        state.sessions.get(client_id).unwrap().is_none(),
+        "closed session is no longer routed"
+    );
+    assert_eq!(
+        leases_held(&state),
+        0,
+        "completed close releases the session lease"
+    );
 }
 
 // ── KV cache dtype CLI/env surface tests ─────────────────────────────────────
