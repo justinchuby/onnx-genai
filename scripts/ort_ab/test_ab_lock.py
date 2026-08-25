@@ -557,6 +557,15 @@ class WidthVerdict(unittest.TestCase):
         self.assertIn("flat", why)
         self.assertIn("pool", why)
 
+    def test_a_trial_with_no_route_to_report_does_not_make_a_cell_varied(self):
+        # `unresolved` is the absence of a route, not a second one: a cell
+        # that got the width it asked for should not be branded incomparable
+        # because one trial never built the pool.
+        cells = self.cells("yes", path="unresolved") + self.cells(
+            "yes", path="spmd-pool"
+        )
+        self.assertEqual(sweep_decode.width_verdict(4, cells), ("yes", None, False))
+
     def test_the_width_fields_are_read_off_a_real_result_line(self):
         # Every field gets a distinct value on purpose. A fixture whose fields
         # share a number cannot fail when two of them are swapped, and the
@@ -608,6 +617,15 @@ class RouteVerdict(unittest.TestCase):
         self.assertIn("flat: t=1", why)
         self.assertIn("pool: t=4,16", why)
         self.assertIn("not a scaling curve", why)
+
+    def test_a_model_that_never_decoded_is_not_a_second_route(self):
+        # `unresolved` is what the binary reports when the decode pool was
+        # never built -- normal for a model that does not take this path
+        # (decode_spmd.rs:3338). Counting it as a route would fail a sweep for
+        # including such a model, which is a false report of a route split.
+        self.assertIsNone(
+            sweep_decode.route_verdict({2: {"unresolved"}, 4: {"spmd-pool"}})
+        )
 
     def test_an_unreportable_route_is_not_counted_as_a_second_one(self):
         # A binary too old to emit the fields would otherwise read as a route
@@ -750,7 +768,9 @@ class SweepDecodeGate(unittest.TestCase):
 
     def rows(self, out):
         return [
-            l.split() for l in out.stdout.splitlines() if l.split()[:1] == ["m"]
+            line.split()
+            for line in out.stdout.splitlines()
+            if line.split()[:1] == ["m"]
         ]
 
     def test_a_capped_width_is_labelled_and_the_sweep_still_leaves_with_zero(self):
@@ -905,8 +925,11 @@ class SweepDecodeGate(unittest.TestCase):
         args = self.args()
         args[args.index("--binary") + 1] = str(wedged)
         out = self.sweep([*args, "--cell-timeout", "1"])
-        self.assertIn("TimeoutExpired", out.stderr)
-        self.assertNotEqual(out.returncode, 0)
+        # 1, and a sentence naming the timeout: a bare TimeoutExpired
+        # traceback is indistinguishable from any other crash to the person
+        # reading a log the next morning.
+        self.assertEqual(out.returncode, 1, out.stdout + out.stderr)
+        self.assertIn("--cell-timeout 1.0s", out.stderr)
         # And it let go: the next caller finds the box free, not squatted.
         prov = subprocess.run(
             ["bash", str(HOSTLOCK), "provenance", "--oneline"],
@@ -916,6 +939,75 @@ class SweepDecodeGate(unittest.TestCase):
             timeout=60,
         ).stdout
         self.assertIn("state=FREE", prov)
+
+    def test_the_documented_way_to_disable_the_timeout_disables_it(self):
+        # `--cell-timeout 0` is documented as "no limit". Passing 0 straight
+        # through to subprocess would instead time out immediately, and no
+        # other cell would notice.
+        slow = Path(self.tmp) / "slow.sh"
+        slow.write_text("#!/bin/sh\nsleep 1\n" + STUB_BENCH.split("\n", 1)[1])
+        slow.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(slow)
+        out = self.sweep([*args, "--cell-timeout", "0"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_a_deliberate_route_split_is_still_reported_and_still_labelled(self):
+        """Acknowledging a split is not hiding it.
+
+        Comparing the serial path against pooled widths is a real question, so
+        there is a flag for it -- but the rows keep their route and the split
+        is still printed, because the reader of the table needs to know it is
+        two curves whatever the runner intended.
+        """
+        branching = Path(self.tmp) / "branching2.sh"
+        branching.write_text(
+            "#!/bin/sh\n"
+            'if [ "$4" = "1" ]; then\n'
+            "  W='native_pool_width=1 native_path=flat native_task_width=1 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "else\n"
+            "  W='native_pool_width=4 native_path=pool native_task_width=4 "
+            "native_cpus=32 native_width_as_requested=yes'\n"
+            "fi\n"
+            'echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 '
+            'native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"\n'
+        )
+        branching.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(branching)
+        args[args.index("--threads") + 1 : args.index("--threads") + 2] = ["1", "4"]
+        out = self.sweep([*args, "--allow-route-split"])
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("not a scaling curve", out.stderr)
+        self.assertEqual([r[-3] for r in self.rows(out)], ["flat", "pool"])
+
+    def test_the_route_each_row_took_is_in_the_table(self):
+        """The datum whose absence let four serial rows be published as decode.
+
+        A stderr complaint does not survive being pasted into a document; a
+        column does.
+        """
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=4 native_path=spmd-pool native_task_width=4 "
+                "native_cpus=32 native_width_as_requested=yes"
+            ),
+        )
+        out = self.sweep(self.args(), env=env)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        header = next(
+            line for line in out.stdout.splitlines() if "ratio_min" in line
+        ).split()
+        self.assertEqual(header[-3], "route")
+        self.assertEqual(self.rows(out)[0][-3], "spmd-pool")
+
+    def test_the_default_thread_list_does_not_mix_routes(self):
+        # A default that always exits non-zero trains its readers to ignore
+        # the code. t=1 is a different route by construction, so it is not in
+        # the default list; asking for it is a decision.
+        self.assertNotIn(1, sweep_decode.default_threads())
 
     def test_a_realized_width_reaches_the_row_and_the_header(self):
         out = subprocess.run(

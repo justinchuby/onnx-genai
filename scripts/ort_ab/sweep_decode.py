@@ -153,9 +153,10 @@ def width_verdict(
     pool = sorted({c.get("pool_width", "?") for c in cells})
     task = sorted({c.get("task_width", "?") for c in cells})
 
-    if answers == {"yes"} and len(paths) == 1:
+    known = [p for p in paths if p not in UNKNOWN_ROUTES]
+    if answers == {"yes"} and len(known) <= 1:
         return "yes", None, False
-    if len(answers) > 1 or len(paths) > 1:
+    if len(answers) > 1 or len(known) > 1:
         # Differing *paths* count even when every trial says `yes`: two trials
         # can each get the width they asked for and still be on different
         # routes, and a median across those is not a measurement of either.
@@ -196,6 +197,19 @@ def width_verdict(
     ), require
 
 
+def default_threads() -> list[int]:
+    """The swept widths, and why 1 is not among them.
+
+    `--native-threads 1` confines the process to a single cpu, so decode takes
+    the flat route rather than a one-worker pool: a table containing it is two
+    curves, and `route_verdict` says so. A default that always exits non-zero
+    would teach its readers to ignore the exit code, so asking for the serial
+    column is a decision -- run it as its own sweep, or ask for the mixed
+    table explicitly with `--allow-route-split`.
+    """
+    return [2, 4, 8, 16]
+
+
 def exit_code(window_code: int, structural: bool) -> int:
     """Which single finding a streamed sweep leaves with.
 
@@ -215,11 +229,20 @@ def exit_code(window_code: int, structural: bool) -> int:
     return 6 if structural else window_code
 
 
+UNKNOWN_ROUTES = ("?", "absent", "unresolved")
+
+
 def route_verdict(observed: dict[int, set[str]]) -> str | None:
     """The check that would have caught the defect this file exists to prevent.
 
     `observed` maps requested width to every `native_path` its cells reported
     (a set, because the same width is swept for each model).
+
+    Three labels mean "no route to compare" rather than a route:
+    `unresolved` (the decode pool was never built, which is normal for a model
+    that never decodes -- `decode_spmd.rs:3338`), `absent` (a binary too old to
+    report) and `?`. Counting any of them as a route would fail a sweep for
+    running a model that simply does not take this path.
     A sweep is a scaling curve only if every column is the same route; when
     `t=1` is `flat` because the dispatcher short-circuits and every other
     column is `pool`, the leftmost point is a different program, and the
@@ -231,7 +254,7 @@ def route_verdict(observed: dict[int, set[str]]) -> str | None:
     by_route: dict[str, list[int]] = {}
     for width, paths in sorted(observed.items()):
         for path in sorted(paths):
-            if path in ("?", "absent"):
+            if path in UNKNOWN_ROUTES:
                 continue
             by_route.setdefault(path, []).append(width)
     if len(by_route) < 2:
@@ -284,7 +307,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--binary", type=Path, default=Path("target/release/bench_generic"))
     ap.add_argument("--models", nargs="+", type=Path, required=True)
-    ap.add_argument("--threads", nargs="+", type=int, default=[1, 2, 4, 8, 16])
+    ap.add_argument("--threads", nargs="+", type=int, default=default_threads())
     ap.add_argument("--trials", type=int, default=5)
     ap.add_argument("--runs", type=int, default=7)
     ap.add_argument("--warmups", type=int, default=3)
@@ -294,6 +317,13 @@ def main() -> int:
         default=3600.0,
         help="seconds one bench invocation may take before the sweep gives up "
         "(it holds the host lock while it waits); 0 disables",
+    )
+    ap.add_argument(
+        "--allow-route-split",
+        action="store_true",
+        help="permit columns on different routes (e.g. a serial t=1 next to "
+        "pooled widths). The split is still reported and every row still "
+        "carries its route; this says you meant it",
     )
     ap.add_argument(
         "--require-width",
@@ -323,7 +353,7 @@ def main() -> int:
     print(
         f"{'model':26s} {'t':>3s} {'native_p50':>10s} {'ort_p50':>8s} "
         f"{'ratio_p50':>9s} {'ratio_p90':>9s} {'native_min':>10s} {'ort_min':>8s} "
-        f"{'ratio_min':>9s} {'width_ok':>8s} {'host_lock':>14s}"
+        f"{'ratio_min':>9s} {'route':>10s} {'width_ok':>8s} {'host_lock':>14s}"
     )
     width_complaints: list[str] = []
     width_fatal = False
@@ -332,16 +362,26 @@ def main() -> int:
         for threads in args.threads:
             trials = []
             for _ in range(args.trials):
-                trials.append(
-                    run_one(
-                        args.binary,
-                        model,
-                        threads,
-                        args.runs,
-                        args.warmups,
-                        timeout=args.cell_timeout or None,
+                try:
+                    trials.append(
+                        run_one(
+                            args.binary,
+                            model,
+                            threads,
+                            args.runs,
+                            args.warmups,
+                            timeout=args.cell_timeout or None,
+                        )
                     )
-                )
+                except subprocess.TimeoutExpired:
+                    print(
+                        f"t={threads}: the bench did not finish within "
+                        f"--cell-timeout {args.cell_timeout}s and was killed. "
+                        "The host lock is released with this process; raise "
+                        "the timeout or investigate the wedge before retrying.",
+                        file=sys.stderr,
+                    )
+                    return 1
             native_p50 = statistics.median(t["native"] for t in trials)
             ort_p50 = statistics.median(t["ort"] for t in trials)
             native_p90 = statistics.median(t["native_p90"] for t in trials)
@@ -354,14 +394,19 @@ def main() -> int:
             if caveat:
                 width_complaints.append(caveat)
             width_fatal = width_fatal or fatal
-            routes.setdefault(threads, set()).update(
-                t["width"].get("path", "?") for t in trials
-            )
+            cell_routes = {t["width"].get("path", "?") for t in trials}
+            routes.setdefault(threads, set()).update(cell_routes)
+            # The route in the table, not only in a stderr complaint: this is
+            # the datum whose absence let four rows be published as decode
+            # results when they were on the serial path, and a pasted table
+            # should carry it.
+            route_label = "/".join(sorted(cell_routes))[:10]
             print(
                 f"{model.stem:26s} {threads:3d} {native_p50:10.3f} {ort_p50:8.3f} "
                 f"{native_p50 / ort_p50:9.3f} {native_p90 / ort_p90:9.3f} "
                 f"{native_min:10.3f} {ort_min:8.3f} "
-                f"{native_min / ort_min:9.3f} {width_ok:>8s} {lock_label:>14s}",
+                f"{native_min / ort_min:9.3f} {route_label:>10s} "
+                f"{width_ok:>8s} {lock_label:>14s}",
                 flush=True,
             )
 
@@ -380,9 +425,12 @@ def main() -> int:
 
     route_complaint = route_verdict(routes)
     if route_complaint:
+        # Printed either way: acknowledging a split is not the same as hiding
+        # it, and the reader of the table still needs to know it is two curves.
         print(route_complaint, file=sys.stderr)
 
-    return exit_code(code, width_fatal or route_complaint is not None)
+    structural = width_fatal or (route_complaint is not None and not args.allow_route_split)
+    return exit_code(code, structural)
 
 
 if __name__ == "__main__":

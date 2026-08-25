@@ -303,13 +303,15 @@ The distinction the column draws is between a **capped** width and a
 | `opted-out` | `--native-threads 0`, the documented opt-out | no |
 | `absent` | this binary cannot report width | no, unverified |
 
-A capped cell is the engine's own policy working correctly on a shared or
-cpuset-confined box, so it is labelled and scoped, not failed: a check only a
-large idle host can pass is an exclusive-host assumption smuggled in as a
-correctness check, which is exactly what issue #1802 forbids — and it would
-brand as invalid the capped-scaling rows the sweep exists to surface. Pass
-`--require-width` if you genuinely need exact lanes and want those cells to
-fail; it is opt-in because it is a demand on the *host*, not on the engine.
+`capped` does **not** certify that the cap was legitimate — `as_requested=no`
+cannot tell an SMT or cpuset cap from a width bug. It declines to *fail*, and
+it names the numbers (route, pool width, task width, host cpus) so a reader
+can judge. That way round because a check only a large idle host can pass is
+an exclusive-host assumption smuggled in as a correctness check, which is what
+issue #1802 forbids — and it would brand as invalid the capped-scaling rows
+the sweep exists to surface. Pass `--require-width` if you genuinely need
+exact lanes and want those cells to fail; it is opt-in because it is a demand
+on the *host*, not on the engine.
 
 What is fatal is categorical and holds anywhere: trials inside a cell that did
 not agree, a request that never reached the engine, and — the check that
@@ -318,6 +320,21 @@ Each `t=1` cell passes its own check (width 1 asked, width 1 delivered); only
 the comparison *between* columns shows that the leftmost point is a different
 program, so the sweep compares the reported `native_path` across the whole
 table and exits **6** when a curve is drawn through more than one of them.
+`unresolved` (the decode pool was never built — normal for a model that does
+not take this path) and `absent` are *unknown* routes, not second ones, and
+never split a table on their own.
+
+Every row also carries a `route` column, because a stderr complaint does not
+survive being pasted into a document and the route is the datum whose absence
+let four serial-path rows be published as decode results.
+
+For the same reason `1` is **not** in the default `--threads` list any more:
+`--native-threads 1` confines the process to a single cpu, so decode takes the
+flat route rather than a one-worker pool, and a default that always exits
+non-zero would teach its readers to ignore the exit code. Sweep the serial
+column on its own, or ask for the mixed table with `--allow-route-split`,
+which acknowledges the split — it does not hide it, the complaint still
+prints and the rows still carry their routes.
 
 `sweep_decode.py` prints its rows as it goes, so a custody change cannot be
 stamped onto them retroactively; the exit code carries it instead — **4** for
