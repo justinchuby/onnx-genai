@@ -6816,23 +6816,26 @@ mod tests {
         // then refuses, and the control skips -- on the *most common* way this
         // suite is run. A skip that is invisible and environment-triggered is
         // the same fail-open shape this change exists to remove.
+        //
+        // Selecting from the allowed set does not finish the job: a run bound
+        // to one sibling per core (`taskset -c 16,18,20,22`) has no shared core
+        // to build, so the control still returns green while testing nothing.
+        // `placement_cpus_or_fail_closed` separates that -- a binding artifact,
+        // which a lane declaring placement mandatory must fail on -- from a
+        // host with no SMT at all, where the layout is genuinely unrepresentable
+        // and a skip is the honest answer.
         let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
             .unwrap_or_else(|| (0..cores.logical_count()).collect())
             .into_iter()
             .collect();
-        let shared = cores.cores().iter().find_map(|group| {
-            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
-            match (inside.next(), inside.next()) {
-                (Some(first), Some(second)) => Some([first, second]),
-                _ => None,
-            }
-        });
+        let shared = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::SharedCore,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "actual-mask control",
+        );
         let Some(shared) = shared else {
-            eprintln!(
-                "skipping actual-mask control: no physical core has two SMT siblings inside \
-                 this process's allowed set {allowed:?}, so the bad layout is unrepresentable \
-                 here"
-            );
             return;
         };
         if !environment_can_pin(&shared) {
@@ -6880,14 +6883,20 @@ mod tests {
 
         // Positive arm: two genuinely distinct cores must not be reported as a
         // defect, otherwise the assertion above is satisfied by a predicate
-        // that is simply always false.
-        let distinct: Vec<usize> = cores
-            .cores()
-            .iter()
-            .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
-            .take(2)
-            .collect();
-        if distinct.len() < 2 || !environment_can_pin(&distinct) {
+        // that is simply always false. Same gate: a run bound to a single
+        // physical core cannot supply this arm, and in a lane that requires
+        // placement that is a defect in the lane, not a platform fact.
+        let distinct = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::DistinctCores,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "the positive arm of the actual-mask control",
+        );
+        let Some(distinct) = distinct else {
+            return;
+        };
+        if !environment_can_pin(&distinct) {
             eprintln!(
                 "skipping the positive arm of the actual-mask control: two distinct physical \
                  cores are not pinnable inside {allowed:?}"
@@ -8354,8 +8363,20 @@ mod tests {
         let available = std::thread::available_parallelism().map_or(1, |n| n.get());
         // A budget of 1 confines the process to one CPU, which `build_from_env`
         // deliberately declines (no core left for the dispatcher), so the
-        // smallest budget that builds a pool is 2.
-        let budgets: Vec<usize> = [2usize, 4, 8]
+        // smallest budget that builds a pool is 2. That case is not skipped, it
+        // is covered by `a_budget_of_one_reports_one_lane_on_whichever_path_serves_it`
+        // below, because its contract is a change of *path* rather than of width.
+        //
+        // 16 is covered because it is the default physical-core budget on the
+        // 16-physical / 32-logical reference host and the widest budget there
+        // that is not SMT-oversubscribed, so it is the width most published rows
+        // use. `matmul_nbits`'s `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+        // already sweeps 1/2/4/8/16 against the *ambient* cpuset; what is added
+        // here is that width under this crate's own confinement, where
+        // `bound_process_to_decode_budget` makes the group fully subscribed and
+        // the `allowed == budget` arm below is the assertion that fires. Widths
+        // are cheap here -- one child each -- and expensive to be wrong about.
+        let budgets: Vec<usize> = [2usize, 4, 8, 16]
             .into_iter()
             .filter(|&n| n <= available)
             .collect();
@@ -8403,6 +8424,101 @@ mod tests {
                      free for the dispatcher"
                 );
             }
+        }
+    }
+
+    /// The one budget that is not a width: `=1` cannot build a pool on a host
+    /// that honours the confinement, and the read has to say so rather than
+    /// report a width nothing ran at.
+    ///
+    /// [`an_explicit_budget_buys_its_full_width_end_to_end`] starts at 2 because
+    /// `bound_process_to_decode_budget` confines the process to a single CPU
+    /// here, and `build_from_env` then declines: one allowed CPU leaves no core
+    /// for the inline dispatcher alongside a spinning worker. That decline is
+    /// the third silent-reduction path named in [`DecodeWidth`]'s doc, and the
+    /// only one that changes the *path* instead of the width -- so it is exactly
+    /// what a `t=1` row would mislabel.
+    ///
+    /// `matmul_nbits`'s `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`
+    /// also sweeps width 1, and does assert that a single-CPU cpuset builds no
+    /// pool -- but against the *ambient* cpuset, so on any CI runner with more
+    /// than one CPU that arm is skipped and never runs. Driving the confinement
+    /// from inside the process reaches it on every Linux host, and it is the
+    /// only test that asserts the `"flat"` label `report_spmd_fallback` sets:
+    /// deleting that one line leaves the label `"unresolved"` and fails here
+    /// alone.
+    ///
+    /// Keyed on the realized cpuset rather than on `cfg(target_os)`: only Linux
+    /// implements a process-wide affinity mask, so elsewhere the confinement does
+    /// not land, the group is not single-CPU, and the pool builds at width one.
+    /// Both outcomes are contractual, and asserting either unconditionally would
+    /// fail a correct implementation on half our runners. Branching on `allowed`
+    /// rather than on the platform also means the Linux branch is what runs under
+    /// an external `taskset -c 0`, which is the shape a user hits.
+    ///
+    /// What holds on every host is the part worth guarding, and it is asserted
+    /// before the split: one lane requested, one lane realized, on a resolved
+    /// path -- never 0, never `"unresolved"`. A pool that declined must still
+    /// account for the width the caller asked for.
+    ///
+    /// The non-Linux arm is an *introspection* contract and not a claim about
+    /// parallelism: a width-one pool has `total_workers() == 1` and therefore
+    /// takes the serial short-circuit on every dispatch. What it asserts is that
+    /// the read distinguishes that pool (`1` lane, `"spmd-pool"`) from the
+    /// declined one (`0` lanes, `"flat"`), which is the distinction a `t=1` row
+    /// depends on.
+    #[test]
+    fn a_budget_of_one_reports_one_lane_on_whichever_path_serves_it() {
+        // Structural symmetry with the sibling sweep rather than a live guard:
+        // children are spawned with `--exact ... budget_lane_child`, so this test
+        // is never selected inside one. It is kept because the failure it
+        // prevents -- a harness change that drops `--exact`, turning every child
+        // into a fork bomb -- costs more than the dead line does.
+        if std::env::var_os(BUDGET_LANE_CHILD_ENV).is_some() {
+            return; // The child arm runs as its own test below.
+        }
+        let lane = run_budget_lane_child(1, None).expect("the unconfined arm never skips");
+        // Asserted rather than skipped: `split_workers` needs two *populated*
+        // nodes, and one worker populates one, so a budget of 1 can only produce
+        // the declined pool (`nodes == 0`) or a single group. A split here would
+        // mean the shard planner handed out more groups than workers.
+        assert!(
+            lane.nodes <= 1,
+            "a budget of 1 cannot produce a {}-node split; one worker populates \
+             one node ({} allowed CPUs, path {})",
+            lane.nodes,
+            lane.allowed,
+            lane.path
+        );
+        assert_eq!(
+            (lane.requested, lane.realized),
+            (Some(1), Some(1)),
+            "a budget of 1 must report one requested and one realized lane, got \
+             requested={:?} realized={:?} on path {} ({} allowed CPUs)",
+            lane.requested,
+            lane.realized,
+            lane.path,
+            lane.allowed
+        );
+        if lane.allowed == 1 {
+            assert_eq!(
+                (lane.lanes, lane.path.as_str()),
+                (0, "flat"),
+                "a single-CPU cpuset must decline the pool and label the flat path, \
+                 got {} lanes on path {}",
+                lane.lanes,
+                lane.path
+            );
+        } else {
+            assert_eq!(
+                (lane.lanes, lane.path.as_str()),
+                (1, "spmd-pool"),
+                "with {} allowed CPUs the confinement did not land, so the pool must \
+                 build at the requested width, got {} lanes on path {}",
+                lane.allowed,
+                lane.lanes,
+                lane.path
+            );
         }
     }
 

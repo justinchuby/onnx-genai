@@ -19838,8 +19838,17 @@ mod tests {
     /// Marker prefix for the realized-width child's single report line.
     const SPMD_WIDTH_MARKER: &str = "SPMD_REALIZED_WIDTH:";
 
-    /// Set on the realized-width child; its value is the requested width.
+    /// Set on the realized-width child; its value is the requested width, or
+    /// [`SPMD_WIDTH_CHILD_DEFAULT`] to exercise the *default* resolver instead.
     const SPMD_WIDTH_CHILD_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_CHILD";
+
+    /// Value of [`SPMD_WIDTH_CHILD_ENV`] that means "resolve the width yourself".
+    ///
+    /// The child restricts itself to one CPU per physical core and then builds
+    /// the pool with no explicit width, which is the shape every pinned
+    /// benchmark run on this host has. See
+    /// [`a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given`].
+    const SPMD_WIDTH_CHILD_DEFAULT: &str = "default";
 
     /// Set on a realized-width child to make it misreport its own placement.
     /// See [`placement_is_honest`] and
@@ -20309,12 +20318,20 @@ mod tests {
     #[test]
     fn spmd_realized_width_subprocess() {
         let _probe = lock_dispatch_probe();
-        let Ok(requested) = std::env::var(SPMD_WIDTH_CHILD_ENV) else {
+        let Ok(raw) = std::env::var(SPMD_WIDTH_CHILD_ENV) else {
             return;
         };
-        let requested: usize = requested
-            .parse()
-            .expect("the parent passes a decimal width");
+        // `requested=0` marks the default-resolver arm in the report line: the
+        // parent did not ask for a width, so there is no requested value to
+        // echo and the only honest thing to print is "none".
+        let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
+            restrict_self_to_leader_cpus();
+            0
+        } else {
+            raw.parse().expect("the parent passes a decimal width")
+        };
+        // Read *after* any narrowing above, so the report describes the cpuset
+        // the pool was actually built on rather than the one inherited.
         let allowed_cpus = crate::decode_affinity::allowed_cpus().unwrap_or_default();
         let allowed = allowed_cpus.len();
         // The set, not just its size. The parent predicts the layout a policy
@@ -20381,8 +20398,40 @@ mod tests {
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
+    /// Narrow this process to one CPU per physical core, in place.
+    ///
+    /// This is what `taskset -c 0,2,4,...` does to a benchmark run, and it is
+    /// the cpuset shape that #1780 got wrong: every allowed CPU is already a
+    /// distinct core, so a resolver that approximates cores as `available / 2`
+    /// silently halves the pool. Doing it from inside the child keeps the test
+    /// free of a `taskset` dependency and makes the mask an observable the
+    /// child reports (`allowed`/`cores`) rather than an assumption.
+    fn restrict_self_to_leader_cpus() {
+        let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
+            return;
+        };
+        let Ok(topology) = crate::core_topology::require_host_for_placement() else {
+            return;
+        };
+        let leaders = topology.leaders_within(&allowed);
+        if leaders.is_empty() {
+            return;
+        }
+        // A failure here is not silently tolerated: it would leave the child on
+        // the full cpuset, where `workers == cores` holds for the wrong reason
+        // and the assertion would pass without testing anything.
+        crate::decode_affinity::set_current_thread_affinity(&leaders)
+            .expect("restrict the child to leader CPUs");
+    }
+
     fn realized_width_report(requested: usize) -> RealizedWidth {
         realized_width_report_with(requested, false, None)
+    }
+
+    /// Spawn the child with **no** explicit width, on a leader-only cpuset, so
+    /// the default resolver is the thing under test.
+    fn realized_default_width_report() -> RealizedWidth {
+        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, None)
     }
 
     /// The sweep's child, with the placement policy named rather than inherited.
@@ -20397,15 +20446,22 @@ mod tests {
         placement: Option<crate::decode_affinity::CorePlacement>,
     ) -> RealizedWidth {
         let width = requested.to_string();
+        realized_width_report_inner(&width, Some(&width), dishonest, placement)
+    }
+
+    fn realized_width_report_inner(
+        child_value: &str,
+        explicit_width: Option<&str>,
+        dishonest: bool,
+        placement: Option<crate::decode_affinity::CorePlacement>,
+    ) -> RealizedWidth {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
             .arg("kernels::matmul_nbits::tests::spmd_realized_width_subprocess")
             .arg("--nocapture")
             .arg("--test-threads=1")
-            .env(SPMD_WIDTH_CHILD_ENV, &width)
-            .env(DECODE_THREADS_ENV, &width)
-            .env("RAYON_NUM_THREADS", &width)
+            .env(SPMD_WIDTH_CHILD_ENV, child_value)
             .env(crate::decode_spmd::PERSISTENT_POOL_ENV, "1")
             .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV)
             // The exact assertion assumes the `Fixed` schedule. Under `mlas` a
@@ -20418,6 +20474,22 @@ mod tests {
             // same way this spawn refuses to inherit an affinity override.
             .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
             .env_remove(SPMD_PARITY_CHILD_ENV);
+        // An explicit width bypasses the default resolver entirely, so the
+        // default arm has to remove both -- inheriting either one from the
+        // parent's own test environment would quietly turn the default arm
+        // into a second explicit-width arm that always passes.
+        match explicit_width {
+            Some(width) => {
+                command
+                    .env(DECODE_THREADS_ENV, width)
+                    .env("RAYON_NUM_THREADS", width);
+            }
+            None => {
+                command
+                    .env_remove(DECODE_THREADS_ENV)
+                    .env_remove("RAYON_NUM_THREADS");
+            }
+        }
         match placement {
             Some(policy) => {
                 command.env(
@@ -20465,7 +20537,7 @@ mod tests {
             {
                 record_environmental_retry(
                     "spmd_realized_width",
-                    &format!("requested={requested}"),
+                    &format!("requested={child_value}"),
                     attempt,
                     SPMD_WIDTH_CHILD_MAX_ATTEMPTS,
                 );
@@ -20475,7 +20547,7 @@ mod tests {
 
             assert!(
                 output.status.success(),
-                "realized-width child failed (requested={requested}, status={}):\nstdout:\n{stdout}\n\
+                "realized-width child failed (requested={child_value}, status={}):\nstdout:\n{stdout}\n\
                  stderr:\n{stderr}",
                 child_status_detail(&output.status)
             );
@@ -20489,7 +20561,7 @@ mod tests {
                     .map(|at| &line[at + SPMD_WIDTH_MARKER.len()..])
             })
             .unwrap_or_else(|| {
-                panic!("the child emitted no width report for requested={requested}:\n{stdout}")
+                panic!("the child emitted no width report for child_value={child_value}:\n{stdout}")
             });
         let text = |key: &str| -> &str {
             let needle = format!("{key}=");
@@ -20674,6 +20746,80 @@ mod tests {
             rejected,
             "the sweep's placement-honesty assertion accepted a pool that misreports its \
              own placement ({lying:?})"
+        );
+    }
+
+    /// A pinned run that does not name a width must still use every core it
+    /// was given.
+    ///
+    /// #1780: `taskset -c 0,2,4,...` hands the process a cpuset in which every
+    /// allowed CPU is already a distinct physical core. A resolver that
+    /// approximates the core count as `available / 2` then halves it, so the
+    /// pool builds on half the cores that were deliberately reserved for it.
+    /// #1794 fixed the resolver and covered
+    /// [`default_persistent_threads`] with unit tests over
+    /// `(available, allowed_physical_cores)`.
+    ///
+    /// Those unit tests cannot catch the regression that matters. They call the
+    /// pure function with the right second argument already in hand; the defect
+    /// was in what reached it. Plumb `None` into that call site and every one of
+    /// them still passes, because none of them builds a pool. This one does, on
+    /// a real leader-only cpuset, and asserts the property the benchmark record
+    /// actually depends on: **workers == cores**.
+    ///
+    /// It is the same shape as the rest of this sweep -- assert what the kernel
+    /// did, not what the resolver said about itself. The EP's own line was
+    /// `requested=8 realized=8 as_requested` throughout #1780: honest, agreed
+    /// with by every guard, and wrong, because the defect sat upstream of the
+    /// report in what "default" resolved to.
+    #[test]
+    fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        let report = realized_default_width_report();
+
+        if !report.pool_built {
+            // No persistent pool on this target: there is no placement to
+            // check, and inventing a pass here would be the vacuous case this
+            // sweep exists to avoid.
+            return;
+        }
+        if report.cores == 0 {
+            // Topology unreadable, so "one worker per core" is unanswerable.
+            return;
+        }
+
+        // The restriction has to have actually happened, or `workers == cores`
+        // below would hold for the wrong reason on the full cpuset.
+        assert_eq!(
+            report.allowed, report.cores,
+            "the child was asked to restrict itself to one CPU per physical \
+             core, so every allowed CPU must be a distinct core; allowed={} \
+             cores={} -- the restriction did not take, and the width assertion \
+             below would be testing nothing",
+            report.allowed, report.cores
+        );
+
+        assert_eq!(
+            report.workers,
+            report.cores,
+            "a default-width pool on a leader-only cpuset built {} workers on \
+             {} reserved cores. This is #1780: the run asked for no width, the \
+             resolver approximated the core count, and the pool silently used \
+             {} of the machine it was given. Every pinned benchmark that omits \
+             an explicit width measures this.",
+            report.workers,
+            report.cores,
+            if report.cores == 0 {
+                "part".to_string()
+            } else {
+                format!("{}/{}", report.workers, report.cores)
+            }
+        );
+
+        assert_eq!(
+            report.realized, "one-per-core",
+            "a default-width pool on a leader-only cpuset must realize one \
+             worker per physical core, got `{}`",
+            report.realized
         );
     }
 

@@ -270,6 +270,28 @@ somebody else declared, because that damage lands on their measurement, where
 no label of ours can reach it. `scripts/ort_ab/test_ab_lock.py` covers the
 admission table and runs in the `Host lock` workflow.
 
+The gate itself lives in `scripts/ort_ab/hostlock_gate.py` so that every
+driver passes the same one rather than each reimplementing an admission check
+from this file. `sweep_decode.py` uses it too — a thread sweep is the most
+saturating thing we run, and its `min`-of-`min` aggregation was written to
+*survive* contention rather than exclude it, which is blind to an SMT sibling
+and to steady external load. Two calls wire up a new harness:
+
+```python
+label, prov = hostlock_gate.require("python3 scripts/ort_ab/mine.py <args>")
+...
+end = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
+```
+
+`sweep_decode.py` prints its rows as it goes, so a custody change cannot be
+stamped onto them retroactively; the exit code carries it instead — **4** for
+a handoff (the rows above span the change: discard them) and **5** when the
+lock could not be re-read at the end (the rows may be sound, and nothing
+establishes that they are). Those are deliberately different answers.
+`ab.py` buffers, so it stamps the label on the rows.
+`crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are not wired up yet — see
+issue #2043 for the audit.
+
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
 that pid's start time, and the next acquirer reclaims it as soon as that

@@ -36,6 +36,9 @@ use crate::deferred_release::{
     CudaDeferredReleaseQueue, DeferredActionOutcome, DeferredReleaseAction, RetainedOwnership,
 };
 use crate::pinned_pool::{PinnedStagingPool, PooledStaging};
+use crate::prefill_double_buffer::{
+    CudaPrefillError, CudaPrefillTransfer, PrefillDoubleBuffer, PrefillReject,
+};
 use crate::runtime::{CopyCompleted, CudaRuntime, FailedHtodCompletion, PinnedStaging, raw_ptr};
 
 /// Alignment for stable-VA weight slots (issue #716). The VMM arena rounds
@@ -677,6 +680,25 @@ pub const WEIGHT_OFFLOAD_SCAN_RESISTANT_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_S
 /// construction rejects an enabled policy before initializing the device. The
 /// default (size-blind) path is unaffected.
 pub const WEIGHT_OFFLOAD_BYTE_AWARE_ENV: &str = "ONNX_GENAI_WEIGHT_OFFLOAD_BYTE_AWARE";
+
+/// Environment gate for the whole-layer prefill double buffer (default-off).
+/// When unset (or not a truthy value) [`CudaWeightResidency::prefill_double_buffer`]
+/// declines with [`PrefillReject::Disabled`], so the shipped path is
+/// byte-identical to today until this primitive is independently measured and
+/// wired into a lifecycle.
+pub const PREFILL_DOUBLE_BUFFER_ENV: &str = "ONNX_GENAI_PREFILL_DOUBLE_BUFFER";
+
+/// Whether the prefill double buffer is enabled via [`PREFILL_DOUBLE_BUFFER_ENV`].
+/// Only `1`/`true`/`yes`/`on` (case-insensitive) enable it; every other value,
+/// and an unset variable, keep it off.
+pub fn prefill_double_buffer_enabled() -> bool {
+    std::env::var(PREFILL_DOUBLE_BUFFER_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 /// Parse [`WEIGHT_OFFLOAD_ASYNC_PAGEIN_ENV`]. Async page-in is **default-on**:
 /// unset (`None`) enables it. When a value *is* present, this is opt-**in**, not
@@ -2312,7 +2334,7 @@ impl CudaWeightPage {
     }
 }
 
-fn fill_staging_from_regions(
+pub(crate) fn fill_staging_from_regions(
     weight: &LazyWeight,
     source: &dyn MmapRegionSource,
     staging: &mut PinnedStaging,
@@ -5709,6 +5731,49 @@ impl CudaWeightResidency {
     /// which hands out a different pointer per page-in and is capture-illegal.
     pub fn stable_va_paging_active(&self) -> bool {
         self.physical.get().is_some()
+    }
+
+    /// Build a whole-layer prefill double buffer over this residency's runtime
+    /// and shared pinned staging pool.
+    ///
+    /// **Default-off / byte-identical.** Returns [`PrefillReject::Disabled`]
+    /// unless [`PREFILL_DOUBLE_BUFFER_ENV`] is set, so the shipped default path
+    /// never constructs the pipeline and stays byte-identical. This is the
+    /// (deliberately caller-less, primitive-only) opt-in entry: it reserves two
+    /// stable staging slots so layer `N` computes while layer `N+1`'s transfer
+    /// overlaps, without becoming a second residency/cache authority — the
+    /// existing paging lifecycle stays the sole mapping/accounting authority.
+    ///
+    /// `layer_bytes` is the largest layer's transfer size the pipeline is sized
+    /// for; every layer submitted must fit it. `source` supplies the layer
+    /// region bytes for every fill.
+    pub fn prefill_double_buffer(
+        &self,
+        source: Arc<dyn MmapRegionSource>,
+        layer_bytes: u64,
+    ) -> Result<PrefillDoubleBuffer<CudaPrefillTransfer>, PrefillReject<CudaPrefillError>> {
+        if !prefill_double_buffer_enabled() {
+            return Err(PrefillReject::Disabled);
+        }
+        self.build_prefill_double_buffer(source, layer_bytes)
+    }
+
+    /// Construct the pipeline regardless of the env gate. Exposed for the GPU
+    /// correctness/overlap tests, which drive the primitive directly; the
+    /// shipped code path only reaches it through the gated
+    /// [`Self::prefill_double_buffer`].
+    #[doc(hidden)]
+    pub fn build_prefill_double_buffer(
+        &self,
+        source: Arc<dyn MmapRegionSource>,
+        layer_bytes: u64,
+    ) -> Result<PrefillDoubleBuffer<CudaPrefillTransfer>, PrefillReject<CudaPrefillError>> {
+        let transfer = CudaPrefillTransfer::new(
+            Arc::clone(&self.runtime),
+            Arc::clone(&self.staging_pool),
+            source,
+        );
+        PrefillDoubleBuffer::new(transfer, layer_bytes)
     }
 }
 

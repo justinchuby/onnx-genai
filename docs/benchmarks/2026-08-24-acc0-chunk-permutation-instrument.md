@@ -1,10 +1,12 @@
 # acc0 width-16 straggler: separating "slow lane" from "slow chunk"
 
-**Status: instrument landed, experiment not yet run.** This document describes a
-diagnostic knob and the correctness evidence for it. It deliberately contains
-**no timing results** — the measurement it enables is the next step, and
-publishing the instrument and its verdict together would make it impossible to
-tell which of the two was designed first.
+**Status: instrument landed; experiment run, result in §5.**
+
+Sections 1–4 were written and merged (#2030, #2041) *before* the experiment ran
+and are unedited below, including the predictions in §4. That ordering is the
+point: publishing the instrument and its verdict together would make it
+impossible to tell which of the two was designed first. §5 was appended
+afterwards and scores the result against those predictions as written.
 
 ## 1. The ambiguity this exists to break (#2017)
 
@@ -154,3 +156,121 @@ A third outcome is possible and would be the most informative: the straggler
 tracks *neither* under permutation, which would say the victim is selected by
 something that moves when the assignment moves — i.e. an interaction, not a
 property of either map alone.
+
+---
+
+## 5. Result (added 2026-08-24, after the experiment ran)
+
+Three datasets on a quiet host, 832 pooled trusted samples (120 + 476 + 236). Every launch is a
+fresh process; each launch runs all arms interleaved.
+
+| dataset | arms (`k`) | launches | pooled samples |
+|---|---|---|---|
+| pilot | 0, 4, 8, 12 | 30 | 120 |
+| confirmatory | 0, 4, 8, 12 | 120 | 476 |
+| odd-`k` | 1, 3, 5, 7 | 60 | 236 |
+
+Controls held in all three: CONTROL 1 (the binary reports the arm it was
+launched as) retained 1.000 in every arm — the observable added in #2041 is what
+makes this checkable at all. CONTROL 2 (placement fixed) found exactly **one**
+lane→cpu map, `[0,2,4,…,28]`, 15 distinct cpus, across all launches.
+
+### 5.1 RULE 1 (pre-registered primary) — NEITHER, in all three datasets
+
+| dataset | lane conc. | lane floor | chunk conc. | chunk floor | verdict |
+|---|---|---|---|---|---|
+| pilot | 0.1417 | 0.1417 | 0.1083 | 0.1500 | NEITHER |
+| confirmatory | 0.1429 | 0.1429 | 0.0903 | 0.1050 | NEITHER |
+| odd-`k` | 0.1822 | 0.1822 | 0.0975 | 0.1356 | NEITHER |
+
+This is the outcome §4 called "the most informative", and it was written down
+before any data existed. No single index dominates in either frame. Note the
+shape: the lane frame lands *exactly on* its own shuffle floor in all three,
+while the chunk frame sits well below it. That is the signature of a frame that
+carries information without being determinative, and it is what the
+distributional rules below were added to characterise.
+
+NEITHER is not "no effect". Within a process the victim is overwhelming: median
+`straggler_share` **0.748** over 476 runs against a chance share of 0.0667, i.e.
+**11.2×**. The straggler is real and stable inside one process; what moves is
+*which* lane it is, from process to process.
+
+### 5.2 RULE 2 — the lane frame is non-uniform, the chunk frame is not
+
+`max cell / N` can only see "always the same index". It is blind to "drawn from
+a biased subset", so RULE 2 adds a chi-square, with a different null per frame:
+label-shuffle for chunk, uniform for lane.
+
+| dataset | lane χ² | p | chunk χ² | p |
+|---|---|---|---|---|
+| pilot | 82.00 | <0.0001 | 22.00 | 0.78 |
+| confirmatory | 135.66 | <0.0001 | 29.43 | 0.87 |
+| odd-`k` | 79.38 | <0.0001 | 24.55 | 0.57 |
+
+Three independent replications, same direction, and the dissociation is clean:
+pooling in the lane frame **preserves** the structure, pooling in the chunk
+frame **destroys** it. That asymmetry is only possible if the structure is
+anchored to the lane. Confirmatory lane histogram (lane 0…14):
+
+```
+[49, 68, 27, 34, 10, 40, 39, 48, 50, 26, 9, 29, 21, 20, 6]
+```
+
+Lane 1 (cpu 2) is the modal victim in all three datasets.
+
+### 5.3 RULE 3 — two structural regularities, pre-registered then replicated
+
+Both were read off the pilot histogram and then tested on data that did not
+generate them.
+
+| hypothesis | null | pilot | confirmatory | odd-`k` |
+|---|---|---|---|---|
+| H1 odd lane index | 0.4667 | 0.667 (p=1e-5) | 0.557 (p=5e-5) | 0.585 (p=2e-4) |
+| H2 lanes 0–7 (first 32 MiB L3) | 0.5333 | 0.750 (p<1e-5) | 0.662 (p<1e-5) | 0.636 (p=9.5e-4) |
+
+H2 replicates three times: the straggler is materially more likely to be a lane
+in the **first L3 domain** (cpus 0–14) than the second, even though placement is
+one-per-core and verified.
+
+### 5.4 RULE 4 — a defect in my own arm set, and the fix
+
+While scoring RULE 3 I found that the four original arms are `k ∈ {0,4,8,12}`,
+**all even**. Since chunk = (lane + k) mod 16, even `k` preserves parity: an odd
+lane always computes an odd chunk. **H1 was therefore frame-ambiguous** in the
+first two datasets — they cannot tell "odd lane" from "odd chunk". H2 was never
+confounded, because k=4/8/12 move indices across the lanes-0–7 boundary.
+
+Recording it rather than quietly fixing it, and then breaking it with odd `k`
+(pre-registered before the odd-`k` run existed), n=236:
+
+| test | null | observed | p | |
+|---|---|---|---|---|
+| odd **lane** | 0.4667 | 0.5847 | 0.00018 | significant |
+| odd **chunk** | 0.5333 | 0.4153 | 0.99989 | not significant |
+
+**Verdict A: the parity effect is lane-anchored.** With the confound broken the
+chunk frame does not merely fail to reach significance, it falls *below* its own
+null. The chunk/data frame carries no information in any test in this document.
+
+### 5.5 What this closes, and the one thing it does not
+
+The ambiguity §1 was built to break is broken. "Slow lane" and "slow chunk" made
+identical predictions in every prior experiment; they no longer do, and the
+answer is **lane**. That retires the entire data-property class — cache colouring
+of the weight range, page interleave, NUMA placement of that chunk — as the
+selector. It is the 8th rejected selector and the first to close a class rather
+than a single candidate, and it also converts six earlier "lane index" results
+from ambiguous to interpretable.
+
+Positively: the victim is core-anchored, drawn from a biased distribution over
+lanes rather than a fixed one, concentrated in the first L3 domain and on odd
+lane indices (cpus ≡ 2 mod 4).
+
+**The limit, stated plainly.** CONTROL 2 reports exactly one lane→cpu map, which
+is what makes the experiment valid — but it also means this study separates lane
+from *chunk*, not lane from *cpu*. "Lane 1 is slow" and "cpu 2 is slow" remain
+the same claim here, exactly as "lane" and "chunk" were before #2017. The
+instrument that would break *that* is a lane→cpu permutation, the direct analogue
+of this one. It is named as the obvious next instrument, not as a hypothesis with
+evidence behind it; per standing rule no ninth selector is nominated without
+testing it.

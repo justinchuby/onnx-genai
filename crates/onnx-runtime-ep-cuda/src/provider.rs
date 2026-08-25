@@ -47,7 +47,9 @@ use onnx_runtime_ep_api::{
     KernelMatch, LazyWeight, OpRegistry, PagedWeight, Result, WorkspaceAllocation, deny,
     structural_input_bytes,
 };
-use onnx_runtime_ir::{DataType, DeviceId, DeviceType, Node, Shape, TensorLayout};
+use onnx_runtime_ir::{
+    DataType, DeviceId, DeviceType, Graph, Node, NodeId, Shape, TensorLayout, ValueId,
+};
 use onnx_runtime_memory_governor::{
     AllocationChargeMode, AllocationPublication, AllocationReleaseOutcome, AllocationRequest,
     AllocationSettlementStatus, AllocationSettlementToken, AllocationSettlementWait,
@@ -62,7 +64,10 @@ use crate::deferred_release::{
 use crate::kernels::build_cuda_registry_with_metrics;
 use crate::kernels::csa_checkpoint::CsaMetrics;
 use crate::optimizer::cuda_optimization_passes;
-use crate::route_residency::{RouteResidencyBoundary, RouteResidencyDiagnostics};
+use crate::route_residency::{
+    RouteResidencyBoundary, RouteResidencyDiagnostics, RouteResidencyInstallOutcome,
+    build_route_residency_boundary,
+};
 use crate::runtime::{CudaRuntime, cuptr};
 use crate::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
 
@@ -1623,6 +1628,104 @@ impl CudaExecutionProvider {
         &self.route_diag
     }
 
+    /// Construct and install a production [`RouteResidencyBoundary`] from a
+    /// loaded model graph's expert banks, if — and only if — this EP is a valid
+    /// single binding authority for one.
+    ///
+    /// This is the production seam Slice 7C's caller was waiting for: it runs
+    /// once, after the model's weights/catalog are fully loaded and *before*
+    /// decode capture, and installs a real binding so
+    /// [`ExecutionProvider::consume_route_residency_at_boundary`] has something
+    /// to drive when the feature is enabled. It is fail-closed at every step and
+    /// records the typed outcome in [`route_residency_diagnostics`]:
+    ///
+    /// * Default-off gate off → [`RouteResidencyInstallOutcome::GateDisabled`].
+    ///   Nothing is discovered, built, or installed; no telemetry/policy
+    ///   overhead is created. This is the shipped default.
+    /// * No coarse-residency authority on this EP (offload disabled) →
+    ///   [`RouteResidencyInstallOutcome::OffloadDisabled`]. Nothing installed.
+    /// * Property-based binding fail-closes →
+    ///   [`RouteResidencyInstallOutcome::Rejected`] carrying the typed
+    ///   [`RouteResidencyBindingReject`]. Nothing installed.
+    /// * Otherwise a real binding is installed and
+    ///   [`RouteResidencyInstallOutcome::Installed`] is returned.
+    ///
+    /// The bank identity/membership and boundary kind come entirely from
+    /// property-based discovery over `graph`; `sources`/`catalogs`/`allocators`/
+    /// pools are this EP's existing authorities, keyed by the discovered
+    /// node/values. The binding is single-authority per EP/request/device: a
+    /// second successful install replaces the first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_install_route_residency_binding(
+        &self,
+        graph: &Graph,
+        sources: &std::collections::HashMap<
+            NodeId,
+            Arc<dyn crate::route_residency::RouteTelemetrySource>,
+        >,
+        catalogs: std::collections::HashMap<ValueId, onnx_runtime_loader::WeightRegionCatalog>,
+        allocators: std::collections::HashMap<
+            ValueId,
+            Arc<onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator>,
+        >,
+        device_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        host_pool: Arc<onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool>,
+        expected_request: u32,
+        initial_epoch: u32,
+    ) -> RouteResidencyInstallOutcome {
+        // Default-off gate first: no discovery, no allocation, no telemetry —
+        // the disabled path installs nothing and creates no boundary state.
+        if !crate::coarse_residency::coarse_residency_profile_enabled() {
+            self.route_diag
+                .record_decline("coarse-residency gate disabled");
+            return RouteResidencyInstallOutcome::GateDisabled;
+        }
+        let Some(residency) = self.residency.as_ref() else {
+            self.route_diag
+                .record_decline("weight offload/coarse residency disabled");
+            return RouteResidencyInstallOutcome::OffloadDisabled;
+        };
+        let device_ordinal = self.device.index as i32;
+        let expected_device = self.device.index;
+        match build_route_residency_boundary(
+            graph,
+            Arc::clone(residency),
+            sources,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            1,
+            device_ordinal,
+            expected_request,
+            expected_device,
+            initial_epoch,
+        ) {
+            Ok(boundary) => {
+                let banks = boundary.bank_value_count();
+                self.install_route_residency_boundary(Arc::new(boundary));
+                self.route_diag.record_install(banks);
+                RouteResidencyInstallOutcome::Installed { banks }
+            }
+            Err(reject) => {
+                self.route_diag.record_decline(&reject.reason());
+                RouteResidencyInstallOutcome::Rejected(reject)
+            }
+        }
+    }
+
+    /// Remove any installed route-residency binding, releasing the producer
+    /// source/residency/pool handles it held. Called at request/model teardown
+    /// ([`ExecutionProvider::shutdown`]); idempotent and safe when nothing is
+    /// installed (the default). After draining, the boundary consumer is inert
+    /// again until a new binding is installed.
+    pub fn drain_route_residency_boundary(&self) {
+        *self
+            .route_boundary
+            .lock()
+            .expect("cuda_ep route-residency boundary poisoned") = None;
+    }
+
     /// Test-only sibling of [`ExecutionProvider::consume_route_residency_at_boundary`]
     /// that drives the installed boundary through the phase-8 driver-fault
     /// consumer, so a deterministic unmap/map fault proves the *caller-driven*
@@ -2261,6 +2364,10 @@ impl ExecutionProvider for CudaExecutionProvider {
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        // Drain any installed route-residency binding first, so the boundary
+        // consumer is inert during teardown and the producer source/residency
+        // handles it held are released before residency retirement.
+        self.drain_route_residency_boundary();
         // Retire residency so every page it holds enqueues its release behind
         // the stream fences recorded at this moment. Releases already accepted
         // finish afterwards, because the queue's worker, the binding's
