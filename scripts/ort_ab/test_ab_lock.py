@@ -421,11 +421,16 @@ class EndToEnd(unittest.TestCase):
             )
 
 
+# `${WIDTH_FIELDS-...}` so a cell can drop or rewrite the realized-width
+# report without a second stub: an older binary that never emitted them is a
+# case the sweep has to survive, and it is one `env` away from here.
 STUB_BENCH = """#!/bin/sh
 # Emits one line in `bench_generic`'s paired format. The numbers are fixed:
 # nothing here measures anything, it only has to parse.
+W="${WIDTH_FIELDS-native_pool_width=1 native_path=flat native_task_width=1 \\
+native_cpus=32 native_width_as_requested=yes}"
 echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 \\
-native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800"
+native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800 $W"
 """
 
 
@@ -450,6 +455,82 @@ class EndOfWindow(unittest.TestCase):
     def test_an_unchanged_window_is_silent(self):
         self.assertEqual(
             sweep_decode.end_of_window_verdict("mine:leon", "mine:leon"), (0, None)
+        )
+
+
+class WidthVerdict(unittest.TestCase):
+    """Does the row describe the route its `t` column names?
+
+    A thread sweep whose leftmost column takes a serial short-circuit is not
+    a scaling curve, and the harness printed four such rows before anybody
+    noticed -- because `--native-threads 1` was a request the table reported
+    back as though it were a measurement.
+
+    The check is categorical, so it holds on a busy shared host: the lanes
+    either came back or they did not. It is not a quiet-host requirement and
+    must not become one (#1802).
+    """
+
+    def cells(self, *answers, path="pool", pool="4"):
+        return [
+            {"as_requested": a, "path": path, "pool_width": pool} for a in answers
+        ]
+
+    def test_a_realized_request_is_silent(self):
+        self.assertEqual(
+            sweep_decode.width_verdict(4, self.cells("yes", "yes")), ("yes", None)
+        )
+
+    def test_a_reduced_width_is_named_not_comparable(self):
+        label, why = sweep_decode.width_verdict(
+            16, self.cells("no", "no", path="flat", pool="1")
+        )
+        self.assertEqual(label, "no")
+        self.assertIn("not", why)
+        self.assertIn("comparable", why)
+        self.assertIn("flat", why)
+
+    def test_a_binary_that_cannot_report_width_is_not_read_as_agreement(self):
+        # `absent` and `no` are different findings: one says the request was
+        # reduced, the other says nothing here can tell you either way.
+        label, why = sweep_decode.width_verdict(8, self.cells("absent"))
+        self.assertEqual(label, "absent")
+        self.assertIn("unverified", why)
+
+    def test_a_request_that_never_reached_the_engine_says_so(self):
+        label, why = sweep_decode.width_verdict(8, self.cells("n/a"))
+        self.assertEqual(label, "not-requested")
+        self.assertIn("did not reach", why)
+
+    def test_trials_that_disagree_are_not_medianed_silently(self):
+        label, why = sweep_decode.width_verdict(8, self.cells("yes", "no"))
+        self.assertEqual(label, "varied")
+        self.assertIn("not all on the same route", why)
+
+    def test_the_width_fields_are_read_off_a_real_result_line(self):
+        line = (
+            "result: native=1.0 ms ort=2.0 ms native/ort=0.5 native_p90=1.1 "
+            "ort_p90=2.1 native_min=0.9 ort_min=1.9 native_threads=4 "
+            "native_pool_width=2 native_path=pool native_task_width=2 "
+            "native_cpus=32 native_width_as_requested=no arm=x parity=PASS"
+        )
+        self.assertEqual(
+            sweep_decode.width_report(line),
+            {
+                "pool_width": "2",
+                "path": "pool",
+                "task_width": "2",
+                "cpus": "32",
+                "as_requested": "no",
+            },
+        )
+
+    def test_a_line_without_the_fields_reports_absent_rather_than_guessing(self):
+        self.assertEqual(
+            sweep_decode.width_report("result: native=1.0 ms ort=2.0 ms")[
+                "as_requested"
+            ],
+            "absent",
         )
 
 
@@ -530,6 +611,76 @@ class SweepDecodeGate(unittest.TestCase):
         # changed hands" from "the binary crashed" (1) and from "the host was
         # not mine" (3), and `!= 0` pins none of that.
         self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+
+    def test_a_cell_whose_width_was_not_realized_fails_the_sweep(self):
+        """The table still prints -- and the exit code stops it being quoted.
+
+        Roy published four decode rows at width 1 before learning that width 1
+        takes a serial short-circuit rather than a one-worker pool. Both arms
+        of his A/B were on that path, so the comparison stood, but the *scope*
+        did not: it was a serial-path result labelled as a decode result. The
+        row is worth seeing; leaving with exit 0 is what makes it quotable.
+        """
+        env = dict(
+            self.env,
+            WIDTH_FIELDS=(
+                "native_pool_width=1 native_path=flat native_task_width=1 "
+                "native_cpus=32 native_width_as_requested=no"
+            ),
+        )
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "width non-vacuity",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 6, out.stdout + out.stderr)
+        self.assertIn("not comparable", out.stderr)
+        self.assertIn("not a scaling curve", out.stderr)
+        row = next(
+            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+        )
+        # Second from the right: the width answer sits beside the lock label,
+        # because a row needs both to be worth anything -- who held the box,
+        # and whether the column describes the route.
+        self.assertEqual(row.split()[-2], "no")
+
+    def test_a_realized_width_reaches_the_row_and_the_header(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "width realized",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        header = next(l for l in out.stdout.splitlines() if "ratio_min" in l).split()
+        self.assertEqual(header[-2], "width_ok")
+        row = next(
+            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+        )
+        self.assertEqual(row.split()[-2], "yes")
 
     def test_the_sweeps_escape_hatch_runs_and_stamps_every_row(self):
         """Otherwise hard-wiring `unlocked=False` would be invisible.

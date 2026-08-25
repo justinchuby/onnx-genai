@@ -41,6 +41,20 @@ LINE = re.compile(
     r"native_min=(?P<native_min>[\d.]+) ort_min=(?P<ort_min>[\d.]+)"
 )
 
+# `bench_generic` already reports what the width request actually became --
+# `native_width_as_requested` is `no` when the pool or the task runtime handed
+# back fewer lanes than were asked for. This sweep threw those fields away and
+# labelled every row with the number it *asked* for, which is the defect that
+# ate four published decode rows: at t=1 the dispatcher takes a serial
+# short-circuit, so the t=1 column measures a different code path from every
+# other column in the same table. A thread sweep whose leftmost column is a
+# different route is not a scaling curve.
+WIDTH = re.compile(
+    r"native_pool_width=(?P<pool_width>\S+) native_path=(?P<path>\S+) "
+    r"native_task_width=(?P<task_width>\S+) native_cpus=(?P<cpus>\S+) "
+    r"native_width_as_requested=(?P<as_requested>\S+)"
+)
+
 
 def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int):
     cmd = [
@@ -60,8 +74,71 @@ def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int):
     for line in out.splitlines():
         m = LINE.search(line)
         if m:
-            return {k: float(v) for k, v in m.groupdict().items()}
+            cell = {k: float(v) for k, v in m.groupdict().items()}
+            cell["width"] = width_report(line)
+            return cell
     raise RuntimeError(f"no result line for {model} t={threads}")
+
+
+def width_report(line: str) -> dict[str, str]:
+    """The realized-width fields, or a marker saying the binary did not emit them.
+
+    `absent` is not the same as `no`, and neither is the same as a missing
+    column: an older `bench_generic` that never reported width would otherwise
+    read as a satisfied request. It is a distinct value so the sweep can say
+    "this binary cannot tell me" rather than assuming either answer.
+    """
+    m = WIDTH.search(line)
+    if not m:
+        return {"as_requested": "absent", "pool_width": "absent", "path": "absent"}
+    return m.groupdict()
+
+
+def width_verdict(requested: int, cells: list[dict[str, str]]) -> tuple[str, str | None]:
+    """Whether this cell's rows describe the route their `t` column names.
+
+    Returns `(label, complaint)`. The label goes on the row so a table pasted
+    into a doc carries it; the complaint, when present, is why the cell is not
+    comparable with the others.
+
+    Deliberately NOT a demand for an idle machine. The check is categorical --
+    the width asked for either came back or it did not -- so it holds on a
+    shared, busy box, which is the only kind we have (#1802). It is the same
+    reasoning as the lock: a label nothing can check is a label that drifts.
+    """
+    answers = {c.get("as_requested", "absent") for c in cells}
+    if answers == {"yes"}:
+        return "yes", None
+    if "absent" in answers:
+        return "absent", (
+            f"t={requested}: this bench binary does not report realized width, so "
+            "the column label is unverified. Rebuild from a revision that emits "
+            "native_width_as_requested."
+        )
+    if answers == {"n/a"}:
+        # The binary says no width was ever requested, but this sweep passes
+        # `--native-threads` on every cell. So the flag did not reach the
+        # engine, and the `t` column is describing a request that was never
+        # made -- a worse failure than one that was made and reduced.
+        return "not-requested", (
+            f"t={requested}: the bench reports that no width was requested, "
+            "though this sweep passed --native-threads. The knob did not "
+            "reach the engine; every column here is the same route."
+        )
+    paths = sorted({c.get("path", "?") for c in cells})
+    widths = sorted({c.get("pool_width", "?") for c in cells})
+    if len(answers) > 1:
+        return "varied", (
+            f"t={requested}: the width request was honoured for some trials and "
+            f"not others (paths {paths}, pool widths {widths}). The trials in "
+            "this cell were not all on the same route, so their median is not "
+            "of one thing."
+        )
+    return "no", (
+        f"t={requested}: asked for {requested} lanes and did not get them "
+        f"(path {paths[0]}, pool width {widths[0]}). This row is not "
+        f"comparable with the cells whose width was realized."
+    )
 
 
 def end_of_window_verdict(start: str, end: str) -> tuple[int, str | None]:
@@ -126,8 +203,9 @@ def main() -> int:
     print(
         f"{'model':26s} {'t':>3s} {'native_p50':>10s} {'ort_p50':>8s} "
         f"{'ratio_p50':>9s} {'ratio_p90':>9s} {'native_min':>10s} {'ort_min':>8s} "
-        f"{'ratio_min':>9s} {'host_lock':>14s}"
+        f"{'ratio_min':>9s} {'width_ok':>8s} {'host_lock':>14s}"
     )
+    width_complaints = []
     for model in args.models:
         for threads in args.threads:
             trials = []
@@ -141,11 +219,16 @@ def main() -> int:
             ort_p90 = statistics.median(t["ort_p90"] for t in trials)
             native_min = min(t["native_min"] for t in trials)
             ort_min = min(t["ort_min"] for t in trials)
+            width_ok, complaint = width_verdict(
+                threads, [t["width"] for t in trials]
+            )
+            if complaint:
+                width_complaints.append(complaint)
             print(
                 f"{model.stem:26s} {threads:3d} {native_p50:10.3f} {ort_p50:8.3f} "
                 f"{native_p50 / ort_p50:9.3f} {native_p90 / ort_p90:9.3f} "
                 f"{native_min:10.3f} {ort_min:8.3f} "
-                f"{native_min / ort_min:9.3f} {lock_label:>14s}",
+                f"{native_min / ort_min:9.3f} {width_ok:>8s} {lock_label:>14s}",
                 flush=True,
             )
 
@@ -155,6 +238,21 @@ def main() -> int:
     code, complaint = end_of_window_verdict(lock_label, end_label)
     if complaint:
         print(complaint, file=sys.stderr)
+
+    # Reported after the table rather than raised mid-sweep: a cell whose width
+    # was not realized is still worth seeing next to the ones that were -- that
+    # comparison is often what identifies the mechanism. What it must not do is
+    # leave with a zero exit, because the whole table then reads as a scaling
+    # curve when part of it is a different route.
+    for line in width_complaints:
+        print(line, file=sys.stderr)
+    if width_complaints and code == 0:
+        print(
+            "the rows above are not all on the route their `t` column names -- "
+            "this is not a scaling curve.",
+            file=sys.stderr,
+        )
+        return 6
     return code
     return 0
 

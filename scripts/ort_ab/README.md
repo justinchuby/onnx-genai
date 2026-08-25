@@ -283,6 +283,16 @@ label, prov = hostlock_gate.require("python3 scripts/ort_ab/mine.py <args>")
 end = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 ```
 
+`sweep_decode.py` also refuses to call a table a scaling curve when it is not
+one. `bench_generic` reports `native_width_as_requested=`, and the sweep now
+puts the answer in a `width_ok` column and exits **6** if any cell's width was
+not realized. The check is categorical — the lanes either came back or they did
+not — so it holds on a busy shared host and is *not* a quiet-host requirement.
+It exists because `--native-threads 1` takes a serial short-circuit rather than
+a one-worker pool, so a `t=1` column is a different code path from every other
+column in the same table; four decode rows were published before anyone noticed.
+`absent` (a binary too old to report it) is a third answer, distinct from `no`.
+
 `sweep_decode.py` prints its rows as it goes, so a custody change cannot be
 stamped onto them retroactively; the exit code carries it instead — **4** for
 a handoff (the rows above span the change: discard them) and **5** when the
