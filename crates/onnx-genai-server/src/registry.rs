@@ -372,6 +372,24 @@ impl ModelRegistry {
             .collect())
     }
 
+    pub(crate) fn worker_statuses(
+        &self,
+    ) -> Result<Vec<(String, crate::driver::WorkerRuntimeStatus)>, RegistryError> {
+        let inner = self.read()?;
+        let mut model_ids = inner.models.keys().cloned().collect::<Vec<_>>();
+        model_ids.sort();
+        Ok(model_ids
+            .into_iter()
+            .flat_map(|model_id| {
+                inner.models[&model_id]
+                    .engine
+                    .worker_statuses()
+                    .into_iter()
+                    .map(move |status| (model_id.clone(), status))
+            })
+            .collect())
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -953,6 +971,7 @@ mod tests {
             // asserted not-applicable: nothing here has determined a
             // decode path, and "pending" is the only claim that holds.
             kv_telemetry: Default::default(),
+            worker_kv_telemetry: Arc::new(vec![Default::default()]),
             resource_snapshot: Default::default(),
             memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
                 0,

@@ -3,8 +3,143 @@
 use super::*;
 use crate::engine::memory_plan::Holder;
 use crate::memory_authority::{
-    DeviceCompatibilityDomain, MemoryAuthorityProvider, SharedMemoryAuthorityProvider,
+    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
+    SharedMemoryAuthorityProvider,
 };
+
+/// Typed refusal for an ORT session-worker configuration the loaded engine
+/// cannot execute safely.
+#[derive(Debug, thiserror::Error)]
+pub enum OrtSessionWorkerLoadError {
+    #[error(
+        "ORT session workers require the ORT decode backend, but this model resolved to \
+         {backend:?}; set --backend ort or use --ort-session-workers 1"
+    )]
+    Backend { backend: EngineDecodeBackend },
+    #[error(
+        "ORT session workers currently support only a contracted single-decoder workflow; \
+         this package requires interpreted composite execution. Use --ort-session-workers 1."
+    )]
+    CompositeWorkflow,
+    #[error(
+        "ORT session workers do not yet support speculative, draft, MTP, or EAGLE execution; \
+         remove the speculative configuration or use --ort-session-workers 1"
+    )]
+    Speculative,
+    #[error(
+        "ORT session workers do not yet support an external KV connector because connector \
+         runtime state is worker-local; use the null connector or --ort-session-workers 1"
+    )]
+    ExternalKvConnector,
+    #[error(
+        "ORT session workers cannot share the loaded decoder session safely: {reason} \
+         Re-launch with --ort-session-workers 1 or select a provider/configuration that \
+         reports concurrent Run support."
+    )]
+    ConcurrentRunUnsupported { reason: String },
+    #[error("ORT session workers require the loaded decoder session, but this ORT engine has none")]
+    MissingSession,
+    #[error("ORT session workers require the loaded model tokenizer, but this engine has none")]
+    MissingTokenizer,
+    #[error(
+        "ORT session workers require the ORT environment that owns the shared session, but this \
+         engine has none"
+    )]
+    MissingEnvironment,
+}
+
+/// Immutable, `Send + Sync` construction plan for additional ORT engine
+/// workers. Every call to [`build_worker`](Self::build_worker) creates fresh
+/// mutable KV, scheduler, workflow, sampler, binding, and diagnostic state on
+/// the calling thread. It shares immutable `Arc`-owned runtime resources plus
+/// narrowly scoped process/device accounting authorities; no worker-local
+/// mutable execution state is reachable through the factory.
+pub struct OrtEngineWorkerFactory {
+    config: EngineConfig,
+    metadata: InferenceMetadata,
+    metadata_hints: MetadataHints,
+    kv_model: Option<KvModelInfo>,
+    decode_path: ModelDecodePath,
+    memory_strategy_plan: MemoryStrategyPlan,
+    workflow: crate::pipeline::HostedWorkflowWorkerFactory,
+    environment: Arc<Environment>,
+    session: Arc<Session>,
+    tokenizer: Arc<Tokenizer>,
+    device_authority: DeviceMemoryAuthority,
+    process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    shared_memory_plan: Arc<std::sync::Mutex<crate::engine::memory_plan::ModelMemoryPlan>>,
+    fim_config: Option<FimConfig>,
+    num_speculative_tokens: usize,
+}
+
+impl OrtEngineWorkerFactory {
+    /// Construct one worker-local engine on the calling thread.
+    pub fn build_worker(&self) -> anyhow::Result<Engine> {
+        let governor = Arc::new(build_worker_governor(
+            &self.config,
+            self.kv_model.as_ref(),
+            &self.decode_path,
+            self.device_authority.clone(),
+            self.process_memory_manager.clone(),
+        )?);
+        let kv_cache = allocate_kv_cache(&self.config, self.kv_model.as_ref(), &governor)?;
+        let scheduler = build_worker_scheduler(
+            &self.config,
+            self.kv_model.as_ref(),
+            &self.decode_path,
+            &governor,
+        )?;
+        Ok(Engine {
+            workflow: Box::new(self.workflow.build()),
+            decode_backend: EngineDecodeBackend::Ort,
+            metadata: self.metadata.clone(),
+            metadata_hints: self.metadata_hints.clone(),
+            kv_cache,
+            prefix_cache: PrefixCache::new(),
+            token_prefix_cache: Vec::new(),
+            kv_model: self.kv_model.clone(),
+            decode_path: self.decode_path.clone(),
+            scheduler,
+            governor,
+            sessions: HashMap::new(),
+            workflow_sessions: HashMap::new(),
+            // Local ids intentionally begin at one in every worker.
+            // SessionPlacement supplies the worker-qualified public identity.
+            workflow_session_ids: SharedSessionIds::new(),
+            session: Some(Arc::clone(&self.session)),
+            #[cfg(feature = "native-backend")]
+            native_session: None,
+            #[cfg(feature = "native-backend")]
+            weight_placement: None,
+            memory_strategy_plan: self.memory_strategy_plan.clone(),
+            #[cfg(feature = "native-backend")]
+            native_sessions: HashMap::new(),
+            #[cfg(feature = "native-backend")]
+            native_active_session: None,
+            #[cfg(feature = "native-backend")]
+            native_session_ids: SharedSessionIds::new(),
+            #[cfg(feature = "native-backend")]
+            native_access_counter: 0,
+            #[cfg(feature = "native-backend")]
+            native_default_session: None,
+            #[cfg(feature = "native-backend")]
+            native_max_sessions: 0,
+            #[cfg(feature = "native-backend")]
+            native_recurrent_prefix_stats: RecurrentPrefixCacheStats::default(),
+            draft: None,
+            mtp: None,
+            eagle3: None,
+            tokenizer: Some(Arc::clone(&self.tokenizer)),
+            fim_config: self.fim_config.clone(),
+            num_speculative_tokens: self.num_speculative_tokens,
+            speculative_mode: SpeculativeMode::None,
+            last_speculative_stats: SpeculativeStats::default(),
+            connector: ConnectorBridge::null(),
+            _shared_memory_plan: Some(Arc::clone(&self.shared_memory_plan)),
+            _environment: Some(Arc::clone(&self.environment)),
+        })
+    }
+}
 
 impl Engine {
     /// Whether the decode core can execute every graph step this package
@@ -34,6 +169,95 @@ impl Engine {
         onnx_genai_metadata::classify_workflow(workflow)
             .contracted_single_decoder()
             .is_some()
+    }
+
+    /// Freeze the immutable resources needed by additional ORT workers.
+    ///
+    /// The engine remains on its owner thread. The returned factory contains
+    /// only `Arc`-owned immutable ORT resources plus cloned configuration and
+    /// metadata, and constructs all mutable state on the worker that will own it.
+    pub fn ort_worker_factory(
+        &self,
+        model_directory: ModelDirectory,
+        config: EngineConfig,
+    ) -> Result<OrtEngineWorkerFactory, OrtSessionWorkerLoadError> {
+        if self.decode_backend != EngineDecodeBackend::Ort {
+            return Err(OrtSessionWorkerLoadError::Backend {
+                backend: self.decode_backend,
+            });
+        }
+        if !self.holds_decode_core() {
+            return Err(OrtSessionWorkerLoadError::CompositeWorkflow);
+        }
+        if self.draft.is_some()
+            || self.mtp.is_some()
+            || self.eagle3.is_some()
+            || !matches!(self.speculative_mode, SpeculativeMode::None)
+            || self.speculative_contract().is_some()
+            || config.draft_model.is_some()
+            || !matches!(config.speculative_mode, SpeculativeMode::None)
+        {
+            return Err(OrtSessionWorkerLoadError::Speculative);
+        }
+        if !matches!(&config.kv_connector.backend, KvConnectorBackend::Null) {
+            return Err(OrtSessionWorkerLoadError::ExternalKvConnector);
+        }
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(OrtSessionWorkerLoadError::MissingSession)?;
+        if let Some(reason) = session.concurrent_run_support().reason() {
+            return Err(OrtSessionWorkerLoadError::ConcurrentRunUnsupported {
+                reason: reason.to_string(),
+            });
+        }
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or(OrtSessionWorkerLoadError::MissingTokenizer)?;
+        let environment = self
+            ._environment
+            .as_ref()
+            .ok_or(OrtSessionWorkerLoadError::MissingEnvironment)?;
+        let workflow = self
+            .metadata
+            .pipeline
+            .as_ref()
+            .map(|pipeline| pipeline.workflow.clone())
+            .expect("a loaded decode core has a declared workflow");
+        let hosted_directory = onnx_genai_ort::PipelineModelDirectory {
+            root: model_directory.root.clone(),
+            metadata_path: model_directory.metadata_path.clone(),
+            spec: onnx_genai_metadata::PipelineSpec { workflow },
+            adapters: None,
+            metadata: Some(self.metadata.clone()),
+            preprocessing: None,
+            model_paths: std::collections::BTreeMap::from([(
+                onnx_genai_metadata::decoder_workflow::DECODER_COMPONENT.to_string(),
+                model_directory.model_path.clone(),
+            )]),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: Some(model_directory.tokenizer_path),
+                per_component: std::collections::BTreeMap::new(),
+            },
+        };
+        Ok(OrtEngineWorkerFactory {
+            config,
+            metadata: self.metadata.clone(),
+            metadata_hints: self.metadata_hints.clone(),
+            kv_model: self.kv_model.clone(),
+            decode_path: self.decode_path.clone(),
+            memory_strategy_plan: self.memory_strategy_plan.clone(),
+            workflow: self.workflow.hosted_worker_factory(hosted_directory),
+            environment: Arc::clone(environment),
+            session: Arc::clone(session),
+            tokenizer: Arc::clone(tokenizer),
+            device_authority: self.governor.device_authority(),
+            process_memory_manager: self.governor.process_memory_manager(),
+            shared_memory_plan: self.governor.plan_keepalive(),
+            fim_config: self.fim_config.clone(),
+            num_speculative_tokens: self.num_speculative_tokens,
+        })
     }
 
     /// The workflow a package declares, read from the package.
@@ -376,11 +600,11 @@ impl Engine {
         // runs uncaptured regardless. Native whole-step capture is separate.
         configure_ort_cuda_graph(&mut session_options, &model_directory.model_path);
 
-        let environment = {
+        let environment = Arc::new({
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
-        };
+        });
         let session = Arc::new({
             let _span = onnx_genai_ort::prof_span!("engine.ort_session_load");
             augment_backend_error(
@@ -491,12 +715,13 @@ impl Engine {
             draft,
             mtp,
             eagle3,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(Arc::new(tokenizer)),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
             connector,
+            _shared_memory_plan: None,
         })
     }
 
@@ -834,7 +1059,7 @@ impl Engine {
             None,
             governor_kv_config.page_size_bytes,
         );
-        let governor = {
+        let governor = Arc::new({
             let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
             EngineResourceGovernor::new_with_authority_and_reservation(
                 config.limits.clone(),
@@ -847,7 +1072,7 @@ impl Engine {
                 Some(authority_domain),
             )
             .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
-        };
+        });
         let mut scheduler_config = config.scheduler.clone();
         // The native pool carries no per-layer geometry, so it holds only
         // bookkeeping. Its size is a fixed bound rather than a budget
@@ -1126,11 +1351,11 @@ impl Engine {
         // MTP is the one native proposer kind; the effective mode is decided
         // below once the MTP loader has reported.
         let shared_kv_mode = SpeculativeMode::None;
-        let environment = {
+        let environment = Arc::new({
             let _span = onnx_genai_ort::prof_span!("engine.ort_environment");
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
-        };
+        });
         // Sidecar-declared MTP self-speculation: the pure-attention MTP head
         // loads on the ORT `environment` (ORT CUDA EP), seeded from the native
         // hybrid target's declared hidden output. Yields `None` for every
@@ -1194,12 +1419,13 @@ impl Engine {
             draft: None,
             mtp,
             eagle3: None,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(Arc::new(tokenizer)),
             fim_config,
             num_speculative_tokens: config.num_speculative_tokens.max(1),
             speculative_mode,
             last_speculative_stats: SpeculativeStats::default(),
             connector,
+            _shared_memory_plan: None,
             _environment: Some(environment),
         })
     }
@@ -1524,14 +1750,14 @@ fn build_governor_and_scheduler(
     decode_path: &ModelDecodePath,
     authority_provider: Option<&SharedMemoryAuthorityProvider>,
     authority_domain: &DeviceCompatibilityDomain,
-) -> anyhow::Result<(EngineResourceGovernor, Scheduler)> {
+) -> anyhow::Result<(Arc<EngineResourceGovernor>, Scheduler)> {
     let governor_kv_config = match (kv_model, decode_path) {
         (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
             governor_no_paged_kv_config(config)?
         }
         _ => governor_kv_config(kv_model, config)?,
     };
-    let governor = {
+    let governor = Arc::new({
         let _span = onnx_genai_ort::prof_span!("engine.resource_governor");
         EngineResourceGovernor::new_with_authority(
             config.limits.clone(),
@@ -1543,6 +1769,46 @@ fn build_governor_and_scheduler(
             Some(authority_domain),
         )
         .map_err(|error| anyhow::anyhow!("Failed to initialize Resource Governor: {error}"))?
+    });
+    let scheduler = build_worker_scheduler(config, kv_model, decode_path, &governor)?;
+    Ok((governor, scheduler))
+}
+
+fn build_worker_governor(
+    config: &EngineConfig,
+    kv_model: Option<&KvModelInfo>,
+    decode_path: &ModelDecodePath,
+    device_authority: DeviceMemoryAuthority,
+    process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+) -> anyhow::Result<EngineResourceGovernor> {
+    let governor_kv_config = match (kv_model, decode_path) {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
+            governor_no_paged_kv_config(config)?
+        }
+        _ => governor_kv_config(kv_model, config)?,
+    };
+    EngineResourceGovernor::new_worker_with_shared_device(
+        config.limits.clone(),
+        config.allow_runtime_override,
+        governor_kv_config,
+        None,
+        device_authority,
+        process_memory_manager,
+    )
+    .map_err(|error| anyhow::anyhow!("Failed to initialize worker Resource Governor: {error}"))
+}
+
+fn build_worker_scheduler(
+    config: &EngineConfig,
+    kv_model: Option<&KvModelInfo>,
+    decode_path: &ModelDecodePath,
+    governor: &EngineResourceGovernor,
+) -> anyhow::Result<Scheduler> {
+    let governor_kv_config = match (kv_model, decode_path) {
+        (None, ModelDecodePath::StaticCache { .. } | ModelDecodePath::Generic) => {
+            governor_no_paged_kv_config(config)?
+        }
+        _ => governor_kv_config(kv_model, config)?,
     };
     let mut scheduler_config = config.scheduler.clone();
     if scheduler_config.bytes_per_token.is_none() {
@@ -1555,8 +1821,10 @@ fn build_governor_and_scheduler(
         };
     }
 
-    let scheduler = Scheduler::with_byte_budget(scheduler_config, governor.byte_budget());
-    Ok((governor, scheduler))
+    Ok(Scheduler::with_byte_budget(
+        scheduler_config,
+        governor.byte_budget(),
+    ))
 }
 
 pub(crate) fn validate_shared_authority_limit(

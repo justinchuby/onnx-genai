@@ -135,6 +135,7 @@ pub(crate) struct NodeStatus {
     batch_utilization: f32,
     sessions: Vec<SessionStatus>,
     prefix_hashes: Vec<String>,
+    workers: Vec<WorkerStatusInfo>,
 }
 
 /// Per-session detail entry in [`NodeStatus::sessions`] (§34.8).
@@ -144,6 +145,19 @@ pub(crate) struct SessionStatus {
     priority: String,
     kv_pages: u32,
     state: String,
+}
+
+/// Per-model worker occupancy and health. Worker ids are local to a model, so
+/// the model id is part of every observable identity.
+#[derive(Debug, Serialize)]
+pub(crate) struct WorkerStatusInfo {
+    model_id: String,
+    worker_id: usize,
+    active_turns: usize,
+    live_sessions: usize,
+    health: &'static str,
+    kv_pages_in_use: usize,
+    kv_pages_total: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,7 +179,9 @@ pub(crate) struct DebugConfigResponse {
     max_output_tokens: usize,
     max_sessions: usize,
     max_queue_depth: usize,
+    ort_session_workers: usize,
     model_max_context: Option<usize>,
+    workers: Vec<WorkerStatusInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -451,6 +467,15 @@ impl ApiError {
         }
     }
 
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            kind: "unavailable_error",
+            retry_after_secs: None,
+        }
+    }
+
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -507,6 +532,12 @@ impl ApiError {
 /// something that will never succeed, and hid a package defect behind an
 /// operational one.
 pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
+    if let Some(unavailable) = error
+        .chain()
+        .find_map(|source| source.downcast_ref::<crate::worker::WorkerUnavailable>())
+    {
+        return ApiError::unavailable(unavailable.to_string());
+    }
     match onnx_genai_engine::package_capability_error(&error) {
         Some(capability) => package_capability_failure(capability),
         None => ApiError::internal(format!("session create failed: {error}")),
@@ -546,6 +577,7 @@ pub(crate) fn generation_failure(error: DriverFailure) -> ApiError {
         // request succeeds at once the turn in flight finishes. Both are read
         // off the engine's own type, so neither status depends on wording.
         DriverFailureKind::PackageCapability(capability) => package_capability_failure(capability),
+        DriverFailureKind::WorkerUnavailable => ApiError::unavailable(error.message),
         DriverFailureKind::Internal => {
             ApiError::internal(format!("generation failed: {}", error.message))
         }
@@ -726,11 +758,14 @@ async fn close_leased_session(
         );
         return Ok(());
     };
-    handle
-        .engine
-        .close_session(lease)
-        .await
-        .map_err(|err| ApiError::internal(format!("session close failed: {err}")))
+    handle.engine.close_session(lease).await.map_err(|err| {
+        err.chain()
+            .find_map(|source| source.downcast_ref::<crate::worker::WorkerUnavailable>())
+            .map_or_else(
+                || ApiError::internal(format!("session close failed: {err}")),
+                |unavailable| ApiError::unavailable(unavailable.to_string()),
+            )
+    })
 }
 
 /// Close an evicted binding, if the registry handed one back.
@@ -835,5 +870,17 @@ mod overload_tests {
 
         assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.kind, "server_error");
+    }
+
+    #[test]
+    fn failed_worker_maps_to_typed_service_unavailable() {
+        let error = generation_failure(DriverFailure {
+            message: "engine worker 1 failed; sessions placed on this worker are unavailable"
+                .to_string(),
+            kind: DriverFailureKind::WorkerUnavailable,
+        });
+
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.kind, "unavailable_error");
     }
 }

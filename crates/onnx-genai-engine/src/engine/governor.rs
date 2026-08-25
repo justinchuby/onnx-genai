@@ -192,7 +192,7 @@ pub struct EngineResourceGovernor {
     /// lease rather than subtracted before the ledger sees it.
     ///
     /// Kept for its Drop: unloading the model returns these bytes to the tier.
-    plan: std::sync::Mutex<ModelMemoryPlan>,
+    plan: Arc<std::sync::Mutex<ModelMemoryPlan>>,
     #[cfg(feature = "native-backend")]
     weight_offload_host_cache: onnx_runtime_ep_cpu::WeightOffloadHostCache,
 }
@@ -253,6 +253,40 @@ impl EngineResourceGovernor {
             provider,
             domain,
         )
+    }
+
+    /// Build a worker-local governor over an already-accounted shared device
+    /// authority. The worker gets private policy, host/disk ledgers, plans, and
+    /// diagnostics; only the process-wide device ledger is shared.
+    pub(crate) fn new_worker_with_shared_device(
+        limits: ResourceLimits,
+        allow_runtime_override: bool,
+        kv_config: ModelKvConfig,
+        cuda_device_index: Option<u32>,
+        device: DeviceMemoryAuthority,
+        process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
+    ) -> Result<Self, ResourceError> {
+        let capacities = capacity_providers_for_device(&limits, cuda_device_index);
+        let domain = device.domain().clone();
+        let mut governor = Self::new_with_capacities_and_authority(
+            limits,
+            allow_runtime_override,
+            capacities,
+            kv_config,
+            (0, 0),
+            None,
+            Some(&domain),
+        )?;
+        let snapshot = governor.inner.snapshot();
+        let memory = EngineMemoryGovernor::new(
+            device,
+            snapshot.resolved_limits.host_ram_bytes,
+            snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
+        );
+        governor.memory = memory.clone();
+        governor.process_memory_manager = process_memory_manager;
+        governor.plan = Arc::new(std::sync::Mutex::new(ModelMemoryPlan::new(memory)));
+        Ok(governor)
     }
 
     // Eight parameters (one over the lint's threshold) because this is
@@ -495,7 +529,7 @@ impl EngineResourceGovernor {
             allow_runtime_override,
             memory,
             process_memory_manager,
-            plan: std::sync::Mutex::new(plan),
+            plan: Arc::new(std::sync::Mutex::new(plan)),
             #[cfg(feature = "native-backend")]
             weight_offload_host_cache,
         })
@@ -509,6 +543,10 @@ impl EngineResourceGovernor {
     /// Every claim this model makes, in one place.
     pub(crate) fn plan(&self) -> std::sync::MutexGuard<'_, ModelMemoryPlan> {
         self.plan.lock().expect("model memory plan lock poisoned")
+    }
+
+    pub(crate) fn plan_keepalive(&self) -> Arc<std::sync::Mutex<ModelMemoryPlan>> {
+        Arc::clone(&self.plan)
     }
 
     /// What this model actually holds, per holder, as leases rather than as the

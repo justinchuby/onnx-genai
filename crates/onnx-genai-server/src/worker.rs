@@ -10,15 +10,17 @@
 //! to observe its exit; a [`WorkerPool`] is the set of those handles, addressed
 //! by [`WorkerId`].
 //!
-//! The pool holds exactly one worker today, and every session is placed on
-//! [`WorkerId::PRIMARY`]. Nothing here shards work or runs two engines: the
-//! shape exists so a session can name the worker that owns its KV state, which
-//! is the fact a second worker would need and the current code cannot express.
+//! The pool defaults to one worker and may opt into multiple supported ORT
+//! workers. Session placements always name the worker that owns their KV state.
 use std::{
     any::Any,
     fmt,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc as std_mpsc},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU8, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
+    },
     thread,
 };
 
@@ -36,12 +38,9 @@ use crate::driver::DriverCommand;
 pub(crate) struct WorkerId(usize);
 
 impl WorkerId {
-    /// The worker every session is placed on while the pool holds one worker.
+    /// The sole worker in the default configuration.
     pub(crate) const PRIMARY: Self = Self(0);
 
-    /// Only tests name a worker other than the primary today; production code
-    /// reads an id back out of a session placement rather than minting one.
-    #[cfg(test)]
     pub(crate) const fn new(index: usize) -> Self {
         Self(index)
     }
@@ -92,6 +91,9 @@ pub(crate) enum WorkerUnavailable {
     /// The worker's command channel has been shut down; its thread is exiting
     /// or has exited.
     Stopped(WorkerId),
+    /// The worker thread panicked or otherwise failed after startup. Sessions
+    /// owned by this worker are lost and are never migrated implicitly.
+    Failed(WorkerId),
 }
 
 impl fmt::Display for WorkerUnavailable {
@@ -105,6 +107,11 @@ impl fmt::Display for WorkerUnavailable {
             // closed command channel: a stopped worker is a stopped driver as
             // far as a request is concerned.
             Self::Stopped(_) => formatter.write_str("engine driver stopped"),
+            Self::Failed(worker) => write!(
+                formatter,
+                "engine worker {worker} failed; sessions placed on this worker are unavailable \
+                 and must be recreated"
+            ),
         }
     }
 }
@@ -172,6 +179,129 @@ pub(crate) struct WorkerHandle {
     /// `None` once the thread has been joined (or once this handle was dropped
     /// without an explicit shutdown, which detaches it).
     join: Mutex<Option<thread::JoinHandle<()>>>,
+    state: Arc<WorkerState>,
+}
+
+const WORKER_STARTING: u8 = 0;
+const WORKER_HEALTHY: u8 = 1;
+const WORKER_STOPPED: u8 = 2;
+const WORKER_FAILED: u8 = 3;
+
+struct WorkerState {
+    health: AtomicU8,
+    live_sessions: AtomicUsize,
+    pending_sessions: AtomicUsize,
+    active_turns: AtomicUsize,
+}
+
+impl WorkerState {
+    fn new() -> Self {
+        Self {
+            health: AtomicU8::new(WORKER_STARTING),
+            live_sessions: AtomicUsize::new(0),
+            pending_sessions: AtomicUsize::new(0),
+            active_turns: AtomicUsize::new(0),
+        }
+    }
+
+    fn health(&self) -> WorkerHealth {
+        match self.health.load(Ordering::Acquire) {
+            WORKER_STARTING => WorkerHealth::Starting,
+            WORKER_HEALTHY => WorkerHealth::Healthy,
+            WORKER_STOPPED => WorkerHealth::Stopped,
+            WORKER_FAILED => WorkerHealth::Failed,
+            _ => WorkerHealth::Failed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerHealth {
+    Starting,
+    Healthy,
+    Stopped,
+    Failed,
+}
+
+impl WorkerHealth {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Healthy => "healthy",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkerStatusSnapshot {
+    pub(crate) id: WorkerId,
+    pub(crate) active_turns: usize,
+    pub(crate) live_sessions: usize,
+    pub(crate) health: WorkerHealth,
+}
+
+/// One queued or active turn charged to a worker.
+///
+/// The counter is incremented before enqueue and released by `Drop`, so send
+/// failure, cancellation, backend error, and normal completion share one exact
+/// accounting path.
+pub(crate) struct WorkerTurnGuard {
+    state: Arc<WorkerState>,
+}
+
+impl Drop for WorkerTurnGuard {
+    fn drop(&mut self) {
+        let previous = self.state.active_turns.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "worker active-turn counter underflow");
+    }
+}
+
+impl fmt::Debug for WorkerTurnGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("WorkerTurnGuard")
+    }
+}
+
+/// In-flight session placement. Dropping before commit rolls the pending load
+/// back; committing moves it into the live-session count atomically with
+/// respect to the placement policy.
+pub(crate) struct SessionPlacementReservation {
+    worker: WorkerId,
+    state: Arc<WorkerState>,
+    committed: bool,
+}
+
+impl SessionPlacementReservation {
+    pub(crate) fn worker(&self) -> WorkerId {
+        self.worker
+    }
+
+    pub(crate) fn commit(mut self) -> Result<(), WorkerUnavailable> {
+        let pending = self.state.pending_sessions.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(pending > 0, "worker pending-session counter underflow");
+        self.committed = true;
+        match self.state.health() {
+            WorkerHealth::Healthy => {
+                self.state.live_sessions.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            WorkerHealth::Failed => Err(WorkerUnavailable::Failed(self.worker)),
+            WorkerHealth::Stopped | WorkerHealth::Starting => {
+                Err(WorkerUnavailable::Stopped(self.worker))
+            }
+        }
+    }
+}
+
+impl Drop for SessionPlacementReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            let pending = self.state.pending_sessions.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(pending > 0, "worker pending-session counter underflow");
+        }
+    }
 }
 
 impl WorkerHandle {
@@ -201,19 +331,40 @@ impl WorkerHandle {
             )));
         }
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let state = Arc::new(WorkerState::new());
+        let thread_state = Arc::clone(&state);
+        let thread_id = id;
         let join = thread::Builder::new()
             .name(thread_name)
             .spawn(
                 move || match panic::catch_unwind(AssertUnwindSafe(initialize)) {
                     Ok(Ok((state, ready))) => {
+                        thread_state.health.store(WORKER_HEALTHY, Ordering::Release);
                         if ready_tx.send(Ok(ready)).is_ok() {
-                            run(state);
+                            match panic::catch_unwind(AssertUnwindSafe(|| run(state))) {
+                                Ok(()) => {
+                                    thread_state.health.store(WORKER_STOPPED, Ordering::Release);
+                                }
+                                Err(payload) => {
+                                    thread_state.live_sessions.store(0, Ordering::Release);
+                                    thread_state.health.store(WORKER_FAILED, Ordering::Release);
+                                    tracing::error!(
+                                        worker = %thread_id,
+                                        panic = %panic_message(payload),
+                                        "engine worker failed; its sessions are unavailable",
+                                    );
+                                }
+                            }
+                        } else {
+                            thread_state.health.store(WORKER_STOPPED, Ordering::Release);
                         }
                     }
                     Ok(Err(error)) => {
+                        thread_state.health.store(WORKER_FAILED, Ordering::Release);
                         let _ = ready_tx.send(Err(WorkerStartError::Initialization(error)));
                     }
                     Err(payload) => {
+                        thread_state.health.store(WORKER_FAILED, Ordering::Release);
                         let _ = ready_tx.send(Err(WorkerStartError::InitializationPanicked(
                             panic_message(payload),
                         )));
@@ -227,6 +378,7 @@ impl WorkerHandle {
                 id,
                 commands: Mutex::new(Some(commands)),
                 join: Mutex::new(Some(join)),
+                state,
             }),
             ready,
         ))
@@ -240,6 +392,12 @@ impl WorkerHandle {
             id,
             commands: Mutex::new(Some(commands)),
             join: Mutex::new(None),
+            state: Arc::new(WorkerState {
+                health: AtomicU8::new(WORKER_HEALTHY),
+                live_sessions: AtomicUsize::new(0),
+                pending_sessions: AtomicUsize::new(0),
+                active_turns: AtomicUsize::new(0),
+            }),
         })
     }
 
@@ -252,6 +410,11 @@ impl WorkerHandle {
     /// Returns a clone rather than a borrow so a caller can `await` a send
     /// without holding the lock across the await point.
     pub(crate) fn sender(&self) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
+        match self.state.health() {
+            WorkerHealth::Failed => return Err(WorkerUnavailable::Failed(self.id)),
+            WorkerHealth::Stopped => return Err(WorkerUnavailable::Stopped(self.id)),
+            WorkerHealth::Starting | WorkerHealth::Healthy => {}
+        }
         lock(&self.commands)
             .clone()
             .ok_or(WorkerUnavailable::Stopped(self.id))
@@ -259,7 +422,7 @@ impl WorkerHandle {
 
     /// Whether this worker still accepts commands.
     pub(crate) fn is_running(&self) -> bool {
-        lock(&self.commands).is_some()
+        self.state.health() == WorkerHealth::Healthy && lock(&self.commands).is_some()
     }
 
     /// Close the command channel and wait for the worker thread to exit.
@@ -289,6 +452,47 @@ impl WorkerHandle {
     #[cfg(test)]
     pub(crate) fn is_joined(&self) -> bool {
         lock(&self.join).is_none()
+    }
+
+    fn placement_load(&self) -> usize {
+        self.state
+            .live_sessions
+            .load(Ordering::Acquire)
+            .saturating_add(self.state.pending_sessions.load(Ordering::Acquire))
+    }
+
+    fn active_turns(&self) -> usize {
+        self.state.active_turns.load(Ordering::Acquire)
+    }
+
+    fn reserve_session(&self) -> SessionPlacementReservation {
+        self.state.pending_sessions.fetch_add(1, Ordering::AcqRel);
+        SessionPlacementReservation {
+            worker: self.id,
+            state: Arc::clone(&self.state),
+            committed: false,
+        }
+    }
+
+    fn reserve_turn(&self) -> WorkerTurnGuard {
+        self.state.active_turns.fetch_add(1, Ordering::AcqRel);
+        WorkerTurnGuard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn session_closed(&self) {
+        let previous = self.state.live_sessions.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "worker live-session counter underflow");
+    }
+
+    pub(crate) fn status(&self) -> WorkerStatusSnapshot {
+        WorkerStatusSnapshot {
+            id: self.id,
+            active_turns: self.active_turns(),
+            live_sessions: self.state.live_sessions.load(Ordering::Acquire),
+            health: self.state.health(),
+        }
     }
 }
 
@@ -325,20 +529,36 @@ impl fmt::Debug for WorkerHandle {
 
 /// The set of engine workers a driver commands.
 ///
-/// One worker today. The pool is addressed by [`WorkerId`] rather than by "the
-/// sender", so every session-bound command already names the thread it must
-/// reach; growing the pool is then a question of how a *new* session picks a
-/// worker, not of rewriting every call site.
+/// The pool is addressed by [`WorkerId`] rather than by "the sender", so every
+/// session-bound command names the thread it must reach.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkerPool {
     workers: Arc<Vec<Arc<WorkerHandle>>>,
+    selection: Arc<Mutex<()>>,
 }
 
 impl WorkerPool {
     /// A pool of exactly one worker, which owns the whole engine.
+    #[cfg(test)]
     pub(crate) fn single(worker: Arc<WorkerHandle>) -> Self {
+        Self::new(vec![worker])
+    }
+
+    pub(crate) fn new(workers: Vec<Arc<WorkerHandle>>) -> Self {
+        assert!(
+            !workers.is_empty(),
+            "worker pool is constructed with at least one worker"
+        );
+        for (index, worker) in workers.iter().enumerate() {
+            assert_eq!(
+                worker.id(),
+                WorkerId::new(index),
+                "worker ids are dense and ordered"
+            );
+        }
         Self {
-            workers: Arc::new(vec![worker]),
+            workers: Arc::new(workers),
+            selection: Arc::new(Mutex::new(())),
         }
     }
 
@@ -351,8 +571,46 @@ impl WorkerPool {
     /// With one worker this is that worker. It is a named method rather than an
     /// index so the placement policy has exactly one home when there is a
     /// choice to make.
-    pub(crate) fn placement_worker(&self) -> WorkerId {
-        self.primary().id()
+    pub(crate) fn reserve_session_placement(
+        &self,
+    ) -> Result<SessionPlacementReservation, WorkerUnavailable> {
+        let _selection = lock(&self.selection);
+        let worker = self
+            .workers
+            .iter()
+            .filter(|worker| worker.is_running())
+            .min_by_key(|worker| (worker.placement_load(), worker.id()))
+            .ok_or_else(|| self.no_running_worker_error())?;
+        Ok(worker.reserve_session())
+    }
+
+    /// Reserve one stateless turn on the least-loaded healthy worker.
+    pub(crate) fn reserve_stateless_turn(
+        &self,
+    ) -> Result<(WorkerId, WorkerTurnGuard), WorkerUnavailable> {
+        let _selection = lock(&self.selection);
+        let worker = self
+            .workers
+            .iter()
+            .filter(|worker| worker.is_running())
+            .min_by_key(|worker| (worker.active_turns(), worker.id()))
+            .ok_or_else(|| self.no_running_worker_error())?;
+        Ok((worker.id(), worker.reserve_turn()))
+    }
+
+    pub(crate) fn reserve_turn(&self, id: WorkerId) -> Result<WorkerTurnGuard, WorkerUnavailable> {
+        let worker = self.worker(id)?;
+        worker.sender()?;
+        Ok(worker.reserve_turn())
+    }
+
+    fn no_running_worker_error(&self) -> WorkerUnavailable {
+        self.workers
+            .iter()
+            .find(|worker| worker.state.health() == WorkerHealth::Failed)
+            .map_or(WorkerUnavailable::Stopped(WorkerId::PRIMARY), |worker| {
+                WorkerUnavailable::Failed(worker.id())
+            })
     }
 
     /// The pool's first worker, which every non-session command goes to.
@@ -383,6 +641,10 @@ impl WorkerPool {
     /// A sender for the worker that serves commands bound to no session.
     pub(crate) fn primary_sender(&self) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
         self.primary().sender()
+    }
+
+    pub(crate) fn statuses(&self) -> Vec<WorkerStatusSnapshot> {
+        self.workers.iter().map(|worker| worker.status()).collect()
     }
 
     /// Shut down and join every worker in the pool.
@@ -538,7 +800,11 @@ mod tests {
         let pool = WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands));
 
         assert_eq!(pool.len(), 1);
-        assert_eq!(pool.placement_worker(), WorkerId::PRIMARY);
+        let reservation = pool
+            .reserve_session_placement()
+            .expect("the primary worker accepts sessions");
+        assert_eq!(reservation.worker(), WorkerId::PRIMARY);
+        reservation.commit().unwrap();
         assert!(pool.sender_for(WorkerId::PRIMARY).is_ok());
 
         let error = pool
@@ -557,6 +823,84 @@ mod tests {
         );
     }
 
+    fn detached_pool(size: usize) -> (WorkerPool, Vec<mpsc::Receiver<DriverCommand>>) {
+        let mut receivers = Vec::with_capacity(size);
+        let workers = (0..size)
+            .map(|index| {
+                let (commands, rx) = mpsc::channel(4);
+                receivers.push(rx);
+                WorkerHandle::detached(WorkerId::new(index), commands)
+            })
+            .collect();
+        (WorkerPool::new(workers), receivers)
+    }
+
+    #[test]
+    fn session_placement_is_least_loaded_with_lowest_id_ties() {
+        let (pool, _receivers) = detached_pool(2);
+
+        let first = pool.reserve_session_placement().unwrap();
+        assert_eq!(first.worker(), WorkerId::new(0));
+        first.commit().unwrap();
+        let second = pool.reserve_session_placement().unwrap();
+        assert_eq!(second.worker(), WorkerId::new(1));
+        second.commit().unwrap();
+        let tied = pool.reserve_session_placement().unwrap();
+        assert_eq!(tied.worker(), WorkerId::new(0));
+        drop(tied);
+
+        let statuses = pool.statuses();
+        assert_eq!(statuses[0].live_sessions, 1);
+        assert_eq!(statuses[1].live_sessions, 1);
+    }
+
+    #[test]
+    fn pending_session_reservations_participate_and_release_exactly() {
+        let (pool, _receivers) = detached_pool(2);
+
+        let pending = pool.reserve_session_placement().unwrap();
+        assert_eq!(pending.worker(), WorkerId::new(0));
+        let next = pool.reserve_session_placement().unwrap();
+        assert_eq!(next.worker(), WorkerId::new(1));
+        drop(pending);
+        drop(next);
+
+        assert_eq!(pool.statuses()[0].live_sessions, 0);
+        assert_eq!(pool.statuses()[1].live_sessions, 0);
+        assert_eq!(
+            pool.reserve_session_placement().unwrap().worker(),
+            WorkerId::new(0)
+        );
+    }
+
+    #[test]
+    fn stateless_turns_balance_and_cancellation_releases_counters() {
+        let (pool, _receivers) = detached_pool(2);
+
+        let (first_worker, first) = pool.reserve_stateless_turn().unwrap();
+        let (second_worker, second) = pool.reserve_stateless_turn().unwrap();
+        assert_eq!(first_worker, WorkerId::new(0));
+        assert_eq!(second_worker, WorkerId::new(1));
+        assert!(
+            !pool
+                .sender_for(first_worker)
+                .unwrap()
+                .same_channel(&pool.sender_for(second_worker).unwrap()),
+            "different workers have distinct command loops and cannot share a continuous batch"
+        );
+        assert_eq!(pool.statuses()[0].active_turns, 1);
+        assert_eq!(pool.statuses()[1].active_turns, 1);
+
+        drop(first);
+        assert_eq!(
+            pool.reserve_stateless_turn().unwrap().0,
+            WorkerId::new(0),
+            "a cancelled turn must return its worker to the least-loaded set"
+        );
+        drop(second);
+        assert_eq!(pool.statuses()[1].active_turns, 0);
+    }
+
     #[test]
     fn shutting_down_a_pool_stops_every_worker() {
         let counter = Arc::new(AtomicUsize::new(0));
@@ -572,6 +916,38 @@ mod tests {
             Err(WorkerUnavailable::Stopped(WorkerId::PRIMARY))
         ));
         pool.shutdown();
+    }
+
+    #[test]
+    fn pool_shutdown_drops_each_worker_state_on_its_owner_thread() {
+        let caller = thread::current().id();
+        let (dropped_tx, dropped_rx) = std_mpsc::sync_channel(2);
+        let workers = (0..2)
+            .map(|index| {
+                let id = WorkerId::new(index);
+                let (commands, mut rx) = mpsc::channel(1);
+                let drop_tx = dropped_tx.clone();
+                WorkerHandle::spawn(
+                    id,
+                    format!("drop-probe-{id}"),
+                    commands,
+                    move || Ok::<_, Infallible>((DropThread(drop_tx), ())),
+                    move |_state| while rx.blocking_recv().is_some() {},
+                )
+                .expect("start drop-probe worker")
+                .0
+            })
+            .collect();
+        drop(dropped_tx);
+        let pool = WorkerPool::new(workers);
+
+        pool.shutdown();
+
+        let first = dropped_rx.recv().expect("first worker dropped");
+        let second = dropped_rx.recv().expect("second worker dropped");
+        assert_ne!(first, caller);
+        assert_ne!(second, caller);
+        assert_ne!(first, second, "each worker owns a distinct OS thread");
     }
 
     #[test]

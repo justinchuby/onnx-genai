@@ -183,7 +183,7 @@ fn try_lock_engine<T>(inner: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
     })
 }
 
-#[pyclass(module = "onnx_genai", name = "Engine")]
+#[pyclass(module = "onnx_genai", name = "Engine", unsendable)]
 struct Engine {
     inner: Mutex<RustEngine>,
 }
@@ -251,17 +251,16 @@ impl Engine {
     ) -> PyResult<GenerateResult> {
         let (mut request, overrides) =
             request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.detach(|| {
-            let mut engine = try_lock_engine(&self.inner)?;
-            // Inference metadata no longer carries generation defaults, so only
-            // the caller's explicit keyword arguments select sampling; the
-            // runtime greedy default applies to everything they omitted.
-            request.options.resolve_sampling_defaults(None, &overrides);
-            engine
-                .generate(request)
-                .map(GenerateResult::from)
-                .map_err(generation_error)
-        })
+        let _ = py;
+        let mut engine = try_lock_engine(&self.inner)?;
+        // Inference metadata no longer carries generation defaults, so only
+        // the caller's explicit keyword arguments select sampling; the
+        // runtime greedy default applies to everything they omitted.
+        request.options.resolve_sampling_defaults(None, &overrides);
+        engine
+            .generate(request)
+            .map(GenerateResult::from)
+            .map_err(generation_error)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -285,56 +284,50 @@ impl Engine {
         }
         let (mut request, overrides) =
             request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
-        py.detach(|| {
-            let mut callback_error: Option<PyErr> = None;
-            let mut callback_fn = |token: GenerateToken| {
-                let call = Python::attach(|py| {
-                    callback.call1(
-                        py,
-                        (
-                            token.text,
-                            token.token_id,
-                            token.finish_reason.as_ref().map(finish_reason_name),
-                        ),
+        let mut callback_error: Option<PyErr> = None;
+        let mut callback_fn = |token: GenerateToken| {
+            let call = Python::attach(|py| {
+                callback.call1(
+                    py,
+                    (
+                        token.text,
+                        token.token_id,
+                        token.finish_reason.as_ref().map(finish_reason_name),
+                    ),
+                )
+            });
+            match call {
+                Ok(_) => Ok(()),
+                Err(err) => {
+                    callback_error = Some(err);
+                    Err(
+                        std::io::Error::other("Python streaming callback raised an exception")
+                            .into(),
                     )
-                });
-                match call {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        callback_error = Some(err);
-                        Err(
-                            std::io::Error::other("Python streaming callback raised an exception")
-                                .into(),
-                        )
-                    }
                 }
-            };
-            // The guard remains held while Rust generates, including callback
-            // invocations. Re-entry is safe because every method uses try_lock
-            // and therefore fails immediately instead of waiting on this mutex.
-            let mut engine = try_lock_engine(&self.inner)?;
-            // Inference metadata no longer carries generation defaults, so only
-            // the caller's explicit keyword arguments select sampling; the
-            // runtime greedy default applies to everything they omitted.
-            request.options.resolve_sampling_defaults(None, &overrides);
-            let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
-            let result = engine.generate_with_callback(request, Some(callback_fn));
-            if let Some(err) = callback_error {
-                return Err(err);
             }
-            result.map(GenerateResult::from).map_err(generation_error)
-        })
+        };
+        // The guard remains held while Rust generates, including callback
+        // invocations. Re-entry is safe because every method uses try_lock
+        // and therefore fails immediately instead of waiting on this mutex.
+        let mut engine = try_lock_engine(&self.inner)?;
+        request.options.resolve_sampling_defaults(None, &overrides);
+        let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
+        let result = engine.generate_with_callback(request, Some(callback_fn));
+        if let Some(err) = callback_error {
+            return Err(err);
+        }
+        result.map(GenerateResult::from).map_err(generation_error)
     }
 
     fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
-        py.detach(|| {
-            let engine = try_lock_engine(&self.inner)?;
-            engine.tokenize(text).map_err(|err| {
-                PyValueError::new_err(format!(
-                    "failed to tokenize input text: {err}. Verify the model directory contains \
-                     a valid tokenizer.json compatible with the loaded model."
-                ))
-            })
+        let _ = py;
+        let engine = try_lock_engine(&self.inner)?;
+        engine.tokenize(text).map_err(|err| {
+            PyValueError::new_err(format!(
+                "failed to tokenize input text: {err}. Verify the model directory contains \
+                 a valid tokenizer.json compatible with the loaded model."
+            ))
         })
     }
 }
@@ -354,7 +347,7 @@ fn _onnx_genai(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{ENGINE_IN_USE, Engine, build_options, sampling_overrides, try_lock_engine};
+    use super::{ENGINE_IN_USE, build_options, sampling_overrides, try_lock_engine};
     use onnx_genai_engine::{GenerateOptions, GenerationDefaults};
 
     #[test]
@@ -422,12 +415,6 @@ mod tests {
         );
         assert!(!options.greedy, "model do_sample=true must disable greedy");
         assert_eq!(options.temperature, 0.6);
-    }
-
-    #[test]
-    fn engine_pyclass_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Engine>();
     }
 
     #[test]
