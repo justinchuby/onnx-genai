@@ -309,10 +309,21 @@ jobs:
         run: >-
           cargo build --locked
           -p onnx-genai-bench --features bench-native --bin profile_native
+      # The package set is resolved into a variable before use, never
+      # substituted inline. As `cargo test $(resolver ...)` a resolver failure
+      # expands to nothing and leaves a bare `cargo test`, which exits 0 having
+      # tested cargo's `default-members` instead of this lane's set -- for this
+      # lane that silently drops 14 crates (the whole plugin/ABI surface) and
+      # pulls in `onnx-genai-ort-sys`, which the DENYLIST exists to keep out.
+      # The assignment makes a non-zero resolver exit fail the step under
+      # `set -e`; the `test -n` covers a resolver that succeeds but prints
+      # nothing. `verify` cannot catch this: it never reads this file, so a
+      # lane name here that the resolver does not know stays invisible to it.
       - name: Test Linux offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Linux offline crates
         run: >-
           cargo clippy --locked --all-targets
@@ -757,9 +768,10 @@ jobs:
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-offline.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-offline.json $packages
       - name: Upload offline coverage to Codecov
         if: always()
         uses: codecov/codecov-action@v4
@@ -772,9 +784,10 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
-        run: >-
-          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json
-          $(python .github/scripts/workspace_test_packages.py cargo-args linux-only)
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
+          test -n "$packages" || { echo "::error::lane 'linux-only' resolved to an empty package set"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path codecov-mlas.json $packages
       - name: Upload MLAS coverage to Codecov
         if: always() && runner.os == 'Linux'
         uses: codecov/codecov-action@v4
@@ -845,9 +858,10 @@ jobs:
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
+          test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages
       - name: Clippy Windows ARM64 offline crates
         run: >-
           cargo clippy --locked --all-targets
@@ -1060,10 +1074,10 @@ jobs:
       # Serialize because several integration tests temporarily select sessions
       # through process-wide environment variables.
       - name: Test ORT-backed workspace crates
-        run: >-
-          cargo test --locked
-          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
-          -- --test-threads=1
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
+          test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
+          cargo test --locked $packages -- --test-threads=1
       - name: Execute checked-in Mobius workflow packages
         env:
           MOBIUS_WORKFLOW_CONFORMANCE_DIR: ${{ github.workspace }}/tests/fixtures/onnx_genai_workflows
