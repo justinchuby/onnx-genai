@@ -197,6 +197,20 @@ pub enum ShapeInference {
     /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
     /// has to be read off input 1.
     CausalConvWithState,
+    /// `ai.onnx::ConstantOfShape`: output dims come from input 0's *values*, a
+    /// 1-D int64 tensor. Rank equals that tensor's length; an empty one yields a
+    /// scalar.
+    ConstantOfShape,
+    /// `ai.onnx::Expand`: **bidirectional** (numpy) broadcast between the input's
+    /// shape and the target shape carried in input 1's values — not simply the
+    /// target, which is the easy mistake.
+    Expand,
+    /// `ai.onnx::Tile`: each dim multiplied by the matching entry of input 1's
+    /// values.
+    Tile,
+    /// `ai.onnx::HannWindow` / `HammingWindow` / `BlackmanWindow`: a 1-D window
+    /// whose length is input 0's scalar *value*.
+    Window,
     /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
     ///
     /// Output shape is the input's, with the last dimension forced to 2 (the
@@ -562,6 +576,30 @@ impl ShapeInference {
                     num_outputs,
                 }
             }
+
+            // ── Shape-preserving, one line each ───────────────────────────
+            // Output shape == input[0].shape. Listed explicitly rather than
+            // folded into the elementwise arm above because none of them is
+            // elementwise-broadcasting: they take one input whose shape they
+            // carry through, and a broadcast rule would quietly accept a
+            // second input it should not.
+            //
+            // `CastLike` and `EyeLike` take a second input for *dtype* only.
+            // `Quantize`/`DequantizeLinear` take scale and zero-point, which
+            // change how values map, not the extent — including under blocked
+            // quantization. `CumSum`/`CumProd` accumulate along an axis.
+            "BitwiseNot" | "CastLike" | "CumProd" | "CumSum" | "DequantizeLinear" | "EyeLike"
+            | "QuantizeLinear" => Self::SameAsInput(0),
+
+            // ── Shapes carried in input values ────────────────────────────
+            // Each of these is data-dependent, and each is *cheap*: the extent
+            // is a handful of int64s, not a computation over the payload. That
+            // is what separates them from `Unique` / `NonMaxSuppression`, where
+            // the extent is the whole algorithm.
+            "ConstantOfShape" => Self::ConstantOfShape,
+            "Expand" => Self::Expand,
+            "Tile" => Self::Tile,
+            "HannWindow" | "HammingWindow" | "BlackmanWindow" => Self::Window,
 
             // ── DFT ───────────────────────────────────────────────────────
             // Pre-opset-20 the axis is an attribute defaulting to -2; from
@@ -3595,6 +3633,47 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
 // Shape inference implementations
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read a 1-D `i64` (or `i32`) tensor's values out of a host-accessible view.
+///
+/// Same device refusal as [`read_scalar_i64`], and honours the stride rather
+/// than assuming a packed buffer.
+fn read_i64_vec(t: &TensorView<'_>, what: &str) -> Result<Vec<i64>, String> {
+    if !t.device.is_host_accessible() {
+        return Err(format!(
+            "{what} is on {:?}, which the host cannot read during shape \
+             inference. An EP with device-resident inputs must copy it to the \
+             host before Compute.",
+            t.device
+        ));
+    }
+    let len: usize = t.shape.iter().product();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let base = t.data.as_ptr() as *const u8;
+    if base.is_null() {
+        return Err(format!("{what} has a null data pointer"));
+    }
+    let elem = match t.dtype {
+        DataType::Int64 => 8usize,
+        DataType::Int32 => 4,
+        other => return Err(format!("{what} must be Int32 or Int64, got {other:?}")),
+    };
+    let stride = t.strides.first().copied().unwrap_or(1);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let off = t.byte_offset as isize + (i as isize) * (stride as isize) * (elem as isize);
+        // SAFETY: host-accessible view of `len` elements of the stated dtype;
+        // the offset is inside it by the view's contract.
+        let p = unsafe { base.offset(off) };
+        out.push(match t.dtype {
+            DataType::Int64 => unsafe { p.cast::<i64>().read_unaligned() },
+            _ => i64::from(unsafe { p.cast::<i32>().read_unaligned() }),
+        });
+    }
+    Ok(out)
+}
+
 /// Read a scalar `i64` (or `i32`) out of a host-accessible view.
 ///
 /// Same device restriction, and for the same reason, as [`count_true`]: this
@@ -3684,6 +3763,21 @@ fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
         }
     }
     Ok(out)
+}
+
+/// Test-only entry point to [`infer_shapes`].
+///
+/// Exposed so `shape_tables_agree` in `onnx-runtime-ep-cpu-plugin` can drive
+/// this table and the native `onnx-runtime-shape-inference` one over the same
+/// node and compare them. Two independent encodings of one ONNX specification
+/// drift, and the drift is silent — the two paths simply disagree about the same
+/// graph. Keeping the function itself private preserves the invariant that
+/// production callers reach it only through the Compute path.
+pub fn infer_shapes_for_test(
+    strategy: &ShapeInference,
+    inputs: &[TensorView<'_>],
+) -> Result<Vec<Vec<usize>>, String> {
+    infer_shapes(strategy, inputs)
 }
 
 /// Infer output shapes from the shape inference strategy and input views.
@@ -4427,6 +4521,76 @@ fn infer_shapes(
             Ok(outputs)
         }
 
+        ShapeInference::ConstantOfShape => {
+            if inputs.is_empty() {
+                return Err("ConstantOfShape: expected 1 input".into());
+            }
+            let dims = read_i64_vec(&inputs[0], "ConstantOfShape shape")?;
+            let mut shape = Vec::with_capacity(dims.len());
+            for d in dims {
+                shape.push(usize::try_from(d).map_err(|_| {
+                    format!("ConstantOfShape: dimension must be non-negative, got {d}")
+                })?);
+            }
+            Ok(vec![shape])
+        }
+
+        ShapeInference::Expand => {
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "Expand: expected 2 inputs (data, shape), got {}",
+                    inputs.len()
+                ));
+            }
+            let target = read_i64_vec(&inputs[1], "Expand shape")?;
+            let mut want = Vec::with_capacity(target.len());
+            for d in target {
+                want.push(usize::try_from(d).map_err(|_| {
+                    format!("Expand: target dimension must be non-negative, got {d}")
+                })?);
+            }
+            // Bidirectional, not "take the target": ONNX broadcasts the input's
+            // shape against `shape`, so a target of [1] against data [3] yields
+            // [3], and a target longer than the input extends the rank.
+            let shape = onnx_runtime_ir::broadcast_shapes(inputs[0].shape, &want)
+                .map_err(|e| format!("Expand: broadcast failed: {e}"))?;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::Tile => {
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "Tile: expected 2 inputs (data, repeats), got {}",
+                    inputs.len()
+                ));
+            }
+            let repeats = read_i64_vec(&inputs[1], "Tile repeats")?;
+            if repeats.len() != inputs[0].shape.len() {
+                return Err(format!(
+                    "Tile: repeats has {} entries but the input has rank {}",
+                    repeats.len(),
+                    inputs[0].shape.len()
+                ));
+            }
+            let mut shape = Vec::with_capacity(repeats.len());
+            for (d, r) in inputs[0].shape.iter().zip(repeats) {
+                let r = usize::try_from(r)
+                    .map_err(|_| format!("Tile: repeats must be non-negative, got {r}"))?;
+                shape.push(d * r);
+            }
+            Ok(vec![shape])
+        }
+
+        ShapeInference::Window => {
+            if inputs.is_empty() {
+                return Err("Window: expected 1 input (size)".into());
+            }
+            let n = read_scalar_i64(&inputs[0], "Window size")?;
+            let n = usize::try_from(n)
+                .map_err(|_| format!("Window: size must be non-negative, got {n}"))?;
+            Ok(vec![vec![n]])
+        }
+
         ShapeInference::Dft {
             onesided,
             axis_attr,
@@ -4926,6 +5090,109 @@ fn after() {}
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Vec<usize>>, String> {
         infer_shapes(strategy, inputs)
+    }
+
+    // ── Shapes carried in input values ───────────────────────────────────────
+
+    #[test]
+    fn constant_of_shape_takes_its_rank_from_the_value_length() {
+        let dims = [2i64, 3, 4];
+        let t = i64_scalar(&dims, &[3], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::ConstantOfShape, &[t]).unwrap(),
+            vec![vec![2, 3, 4]]
+        );
+    }
+
+    #[test]
+    fn constant_of_shape_empty_input_is_a_scalar() {
+        let empty: [i64; 0] = [];
+        let t = i64_scalar(&empty, &[0], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::ConstantOfShape, &[t]).unwrap(),
+            vec![Vec::<usize>::new()]
+        );
+    }
+
+    #[test]
+    fn expand_broadcasts_bidirectionally_rather_than_taking_the_target() {
+        // The trap: `Expand` is *bidirectional*. Data [3,1] against a target
+        // [1,4] is [3,4] — a rule that returned the target would answer [1,4],
+        // and one that returned the data shape would answer [3,1].
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3, 1], &[1, 1], &buf);
+        let want = [1i64, 4];
+        let shape_in = i64_scalar(&want, &[2], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Expand, &[data, shape_in]).unwrap(),
+            vec![vec![3, 4]]
+        );
+    }
+
+    #[test]
+    fn expand_target_may_add_rank() {
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let want = [2i64, 3];
+        let shape_in = i64_scalar(&want, &[2], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Expand, &[data, shape_in]).unwrap(),
+            vec![vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn tile_multiplies_each_dim_by_its_repeat() {
+        let buf = vec![0.0f32; 6];
+        let data = f32_data(&[2, 3], &[3, 1], &buf);
+        let reps = [3i64, 2];
+        let r = i64_scalar(&reps, &[2], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Tile, &[data, r]).unwrap(),
+            vec![vec![6, 6]]
+        );
+    }
+
+    #[test]
+    fn tile_rejects_a_repeats_length_that_does_not_match_the_rank() {
+        let buf = vec![0.0f32; 6];
+        let data = f32_data(&[2, 3], &[3, 1], &buf);
+        let reps = [3i64];
+        let r = i64_scalar(&reps, &[1], &[1]);
+        let err = infer(&ShapeInference::Tile, &[data, r]).unwrap_err();
+        assert!(
+            err.contains("rank"),
+            "error should name the mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn window_length_is_the_scalar_input_value() {
+        let n = [16i64];
+        let t = i64_scalar(&n, &[1], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Window, &[t]).unwrap(),
+            vec![vec![16]]
+        );
+    }
+
+    #[test]
+    fn value_carried_shapes_refuse_device_memory() {
+        // Same contract as Compress: the host cannot dereference device memory,
+        // so it errors with the reason instead of guessing an extent.
+        let dims = [2i64, 3];
+        let t = TensorView::new(
+            DevicePtr(dims.as_ptr() as *mut std::ffi::c_void),
+            DataType::Int64,
+            &[2],
+            &[1],
+            onnx_runtime_ir::DeviceId::cuda(0),
+        );
+        let err = infer(&ShapeInference::ConstantOfShape, &[t]).unwrap_err();
+        assert!(
+            err.contains("host cannot read"),
+            "error should name the device restriction: {err}"
+        );
     }
 
     // ── DFT ──────────────────────────────────────────────────────────────────

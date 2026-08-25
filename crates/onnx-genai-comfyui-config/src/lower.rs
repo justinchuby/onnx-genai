@@ -98,7 +98,10 @@ impl<'a> Lowering<'a> {
         workflow.insert("steps".to_owned(), Value::Array(steps));
 
         let mut document = Map::new();
-        document.insert("schema_version".to_owned(), json!("v1"));
+        document.insert(
+            "schema_version".to_owned(),
+            json!(onnx_genai_metadata::SCHEMA_VERSION),
+        );
         document.insert(
             "pipeline".to_owned(),
             json!({ "workflow": Value::Object(workflow) }),

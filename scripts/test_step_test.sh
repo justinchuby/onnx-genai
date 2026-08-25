@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# miri_step_test.sh — conformance suite for run_miri's arity guard
+# test_step_test.sh — conformance suite for the step wrapper's arity guard
 #
 # `run_miri` is a gate whose failure mode is a green report: if it ever lets a
 # step that executed nothing report success, nothing downstream notices,
@@ -26,7 +26,7 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 ROOT="$(pwd)"
-WORK="$ROOT/.miri-step-selftest"
+WORK="$ROOT/.test-step-selftest"
 
 rm -rf "$WORK"
 mkdir -p "$WORK"
@@ -34,10 +34,10 @@ cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 
 # Keep the wrapper's own log out of the checkout.
-export MIRI_STEP_LOG_DIR="$WORK"
+export TEST_STEP_LOG_DIR="$WORK"
 
-# shellcheck source=scripts/miri_step.sh
-. "$ROOT/scripts/miri_step.sh"
+# shellcheck source=scripts/test_step.sh
+. "$ROOT/scripts/test_step.sh"
 
 PASS=0
 FAIL=0
@@ -177,15 +177,197 @@ check "NEGATIVE CONTROL: the pre-guard wrapper reports success on 0 tests" \
 # A guard that is never called is the same green report by another route.
 
 check "the Miri workflow sources this wrapper" \
-    "$(grep -q 'scripts/miri_step\.sh' "$ROOT/.github/workflows/miri.yml" && echo 0 || echo 1)" \
-    "miri.yml does not source scripts/miri_step.sh -- the guard is inert"
+    "$(grep -q 'scripts/test_step\.sh' "$ROOT/.github/workflows/miri.yml" && echo 0 || echo 1)" \
+    "miri.yml does not source scripts/test_step.sh -- the guard is inert"
 
 check "...and no longer defines its own run_miri" \
     "$(grep -q '^\s*run_miri() {' "$ROOT/.github/workflows/miri.yml" && echo 1 || echo 0)" \
     "miri.yml still defines run_miri inline, which would shadow the guarded one"
 
+# ─── run_test_step: the general entry point ───────────────────────────────
+# Same guard, different lane and different log tokens. Re-run rather than
+# assumed-by-inspection: `run_miri` and `run_test_step` are two call sites of
+# one implementation, and "it delegates, so it must behave the same" is exactly
+# the inference this file exists to refuse.
+
+OUT="$(run_test_step "normal step" fake 0 "running 3 tests" "$RESULT_3" 2>&1)"
+STATUS=$?
+check "run_test_step passes a step that ran tests" \
+    "$([ "$STATUS" = "0" ] && echo 0 || echo 1)" "$OUT"
+check "...and reports the count under its own token" \
+    "$(echo "$OUT" | grep -q "^TEST_STEP_EXECUTED normal step: 3" && echo 0 || echo 1)" "$OUT"
+check "...and does not emit MIRI_ tokens from a non-Miri lane" \
+    "$(echo "$OUT" | grep -q "MIRI_" && echo 1 || echo 0)" "$OUT"
+
+OUT="$(run_test_step "empty filter" fake 0 "running 0 tests" "$RESULT_EMPTY" 2>&1)"
+STATUS=$?
+check "run_test_step FAILS a step whose filter matched nothing" \
+    "$([ "$STATUS" = "1" ] && echo 0 || echo 1)" \
+    "a name filter matching nothing exits 0 in libtest; the wrapper must not: $OUT"
+check "...and says so as a workflow error" \
+    "$(echo "$OUT" | grep -q '^::error::Test step .empty filter. executed 0 tests' && echo 0 || echo 1)" "$OUT"
+
+OUT="$(run_test_step "all ignored" fake 0 "running 0 tests" "$RESULT_IGNORED" 2>&1)"
+STATUS=$?
+check "run_test_step FAILS an all-ignored step" \
+    "$([ "$STATUS" = "1" ] && echo 0 || echo 1)" \
+    "ignored must not count as executed: $OUT"
+
+OUT="$(run_test_step "genuine failure" fake 101 "$RESULT_FAILED" 2>&1)"
+STATUS=$?
+check "run_test_step propagates a real failure's exit status" \
+    "$([ "$STATUS" = "101" ] && echo 0 || echo 1)" "$OUT"
+
+# ─── Wiring: the three MLAS steps (#2055) ─────────────────────────────────
+# These are the only steps in the pipeline that build onnx-runtime-ep-cpu with
+# --features mlas, they select by name/module path, and libtest exits 0 on a
+# filter that matches nothing. Asserting the guard exists is not enough; assert
+# each filter is actually routed through it.
+
+CI="$ROOT/.github/workflows/ci.yml"
+
+check "the Rust quality lane sources this wrapper" \
+    "$(grep -q 'scripts/test_step\.sh' "$CI" && echo 0 || echo 1)" \
+    "ci.yml does not source scripts/test_step.sh -- the MLAS steps are unguarded"
+
+for filter in \
+    optimization_registry_excludes_nchwc_without_cnn_ops \
+    kernels::moe:: \
+    kernels::qlinear_matmul::
+do
+    # The filter must appear inside a `run_test_step` invocation, not merely
+    # somewhere in the file: a step that still shells out to a bare `cargo
+    # test` would satisfy a naive grep for the filter alone.
+    check "the '$filter' MLAS step runs through run_test_step" \
+        "$(awk -v f="$filter" '
+            /run_test_step/ { armed = 1 }
+            /^      - name:/ { armed = 0 }
+            armed && index($0, f) { found = 1 }
+            END { exit(found ? 0 : 1) }
+        ' "$CI" && echo 0 || echo 1)" \
+        "ci.yml runs '$filter' outside the guard, so an empty filter there is still green"
+done
+
+# The three cells above pin the filters that exist today. This one is the
+# forward-looking half: ANY `cargo test` step in ci.yml that carries a bare
+# name filter must be routed through the guard. Without it, #2055 is fixed for
+# exactly three steps and reopens the moment a fourth is added -- which is how
+# the hole got here in the first place.
+#
+# A "bare name filter" is a positional argument: a token that is not an option
+# and not the value of one. That is the only selector libtest does not police;
+# `-p` and `--test` both exit 101 when they match nothing, so an option-only
+# step needs no guard.
+
+unguarded_filtered_steps() {
+    awk '
+        function flush(   i, n, tok, parts, skip) {
+            if (block == "" || block !~ /cargo test/) return
+            if (block ~ /run_test_step/) return
+            # `$(...)` is opaque to a static scan. Blank it out here so it is
+            # not misread as a positional -- and note that doing so would open
+            # a quiet hole, which the cell below closes by EXECUTING each one
+            # and proving it expands to options only.
+            gsub(/\$\([^)]*\)/, " ", block)
+            n = split(block, parts, /[ \t]+/)
+            skip = 0
+            for (i = 1; i <= n; i++) {
+                tok = parts[i]
+                if (tok == "" || tok == "\\" || tok == "|" || tok == ">-") continue
+                if (skip) { skip = 0; continue }
+                if (tok ~ /^-/) {
+                    # Options that consume the following token as their value.
+                    if (tok ~ /^(-p|--package|--test|--bench|--example|--bin|--features|--target|--target-dir|--manifest-path|--profile|-j|--jobs|--color|--message-format|--exclude)$/)
+                        skip = 1
+                    continue
+                }
+                # Words that are part of the invocation itself, not selectors.
+                if (tok ~ /^(cargo|test|env|bash|sudo|run:|[A-Z_]+=.*)$/) continue
+                print name
+                return
+            }
+        }
+        /^      - name:/ { flush(); block = ""; name = $0; sub(/^ *- name: */, "", name); inrun = 0; next }
+        /^        run:/ { inrun = 1; block = block " " $0; sub(/^ *run: */, "", block); next }
+        {
+            if (!inrun) next
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line ~ /^#/) next
+            block = block " " line
+        }
+        END { flush() }
+    ' "$1"
+}
+
+STRAY="$(unguarded_filtered_steps "$CI")"
+check "no cargo test step in ci.yml carries an unguarded name filter" \
+    "$([ -z "$STRAY" ] && echo 0 || echo 1)" \
+    "these steps select tests by name outside run_test_step, so an empty filter is green: $STRAY"
+
+# And the detector itself, by mutation: a synthetic unguarded filtered step
+# must be found. A scanner that reports "nothing unguarded" because it parses
+# nothing is the same vacuous pass this whole file exists to refuse.
+cat > "$WORK/mutant.yml" <<'YAML'
+      - name: A guarded step
+        run: |
+          . ./scripts/test_step.sh
+          run_test_step "ok" cargo test -p some-crate some::filter::
+      - name: An option-only step
+        run: cargo test --locked -p some-crate --test some_target
+      - name: A build, not a test
+        run: cargo build --locked -p some-crate --features mlas
+      - name: An unguarded filtered step
+        run: >-
+          cargo test --locked
+          -p some-crate
+          --features mlas
+          kernels::something::
+YAML
+MUT="$(unguarded_filtered_steps "$WORK/mutant.yml")"
+check "MUTATION: the detector finds an unguarded filtered step" \
+    "$([ "$MUT" = "An unguarded filtered step" ] && echo 0 || echo 1)" \
+    "expected exactly 'An unguarded filtered step', got: [$MUT]"
+
+# The scanner blanks out `$(...)`, so a generator that emitted a bare word
+# would slip past it. Close that by running each generator ci.yml actually
+# uses and proving its expansion is options only. Executed, not assumed: the
+# whole point of this file is that "it looks like it only emits -p" is the
+# kind of claim that is wrong exactly when it matters.
+# shellcheck disable=SC2016  # the $( is literal text being searched for
+SUBS="$(grep -o '\$(python[^)]*)' "$CI" | sort -u)"
+check "ci.yml's package-list generators are actually enumerated" \
+    "$([ -n "$SUBS" ] && echo 0 || echo 1)" \
+    "found no \$(python ...) substitutions in ci.yml -- the cell below would be vacuous"
+
+BAD_SUB=""
+while IFS= read -r sub; do
+    [ -n "$sub" ] || continue
+    cmd="${sub#\$(}"
+    cmd="${cmd%)}"
+    # CI resolves `python`; this box only has `python3`.
+    cmd="${cmd/#python /python3 }"
+    # shellcheck disable=SC2086
+    expansion="$(cd "$ROOT" && eval $cmd 2>&1)" || { BAD_SUB="$BAD_SUB [did not run: $sub]"; continue; }
+    prev=""
+    for tok in $expansion; do
+        case "$tok" in
+            -*) prev="$tok"; continue ;;
+        esac
+        case "$prev" in
+            -p|--package|--exclude) prev=""; continue ;;
+        esac
+        BAD_SUB="$BAD_SUB [$sub emits bare token: $tok]"
+        break
+    done
+done <<< "$SUBS"
+
+check "...and every one expands to options only, never a name filter" \
+    "$([ -z "$BAD_SUB" ] && echo 0 || echo 1)" \
+    "a generator can inject a bare test filter past the scanner:$BAD_SUB"
+
 echo ""
-EXPECTED=18
+EXPECTED=33
 TOTAL=$((PASS + FAIL))
 if [ "$TOTAL" -ne "$EXPECTED" ]; then
     echo "✗ $TOTAL assertions ran, expected $EXPECTED — a cell was added or lost" >&2

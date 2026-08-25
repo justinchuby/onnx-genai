@@ -78,9 +78,9 @@ jobs:
           # select tests BY NAME, and libtest exits 0 on a filter that matches
           # nothing, so a renamed test silently turns its step into a no-op that
           # reports `ok`. The wrapper fails the step when it executed no tests.
-          # See scripts/miri_step.sh and scripts/miri_step_test.sh.
-          # shellcheck source=scripts/miri_step.sh
-          . ./scripts/miri_step.sh
+          # See scripts/test_step.sh and scripts/test_step_test.sh.
+          # shellcheck source=scripts/test_step.sh
+          . ./scripts/test_step.sh
 
           # Keep Stacked Borrows (Miri default) instead of Tree Borrows so the raw
           # pointer ownership checks stay maximally strict. Only ep-api/session/C

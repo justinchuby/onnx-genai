@@ -21,16 +21,60 @@ pub struct TensorContract {
     /// stay runtime-private.
     #[serde(default, skip_serializing_if = "BatchLayout::is_shared")]
     pub batch_layout: BatchLayout,
+    /// Which dimensions of this tensor may be padded, and where the truth
+    /// about how much of each entry is real is recorded.
+    ///
+    /// A dense tensor is the only shape a fixed-arity component can consume, so
+    /// a group whose items carry different amounts of data has to be padded up
+    /// to a common extent. Nothing in the padded tensor says where the real
+    /// entries stop, and guessing from a sentinel is exactly the hidden
+    /// heuristic this schema refuses: validity is named, typed, and validated
+    /// like any other value. An empty list means the value carries no padding,
+    /// and a runtime must not introduce any.
+    ///
+    /// One entry per padded dimension: a clip tensor padded along frames and
+    /// again along patches states both, because a single companion cannot say
+    /// where two independent extents end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub padding: Vec<PaddedDimension>,
+}
+
+/// One padded dimension of a value and the companion that bounds it.
+///
+/// The dimension is named by its shape symbol rather than by an axis index. The
+/// same extent sits at different positions in different values — `patches` is
+/// axis 1 of the pixel tensor and axis 0 of a pooled one — and an index would
+/// name whichever the author happened to be looking at.
+///
+/// Padding is always appended: the real entries of a padded dimension form a
+/// prefix. That is what lets one integer per enclosing entry say everything a
+/// full boolean mask would say, and it is a rule rather than a convention
+/// because left padding would shift every position-dependent computation and an
+/// interior hole cannot be expressed by a length at all.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PaddedDimension {
+    /// Shape symbol of the padded dimension of the owning value.
+    #[schemars(length(min = 1))]
+    pub dimension: String,
+    /// Value giving how many leading entries of `dimension` are real, one entry
+    /// per position of the axes outer to it.
+    ///
+    /// It resolves in the namespace of the contract's owner: a sibling port for
+    /// a component port, a workflow value for a workflow input, output, or
+    /// state cell.
+    #[schemars(length(min = 1))]
+    pub valid_lengths: String,
 }
 
 /// Structural relationship between a typed value and the runtime batch.
 ///
 /// `shared` values are invariant across requests. `request_aligned` values carry
 /// exactly one entry per in-flight request along `axis`, so compaction permutes
-/// that axis. `token_packed` values are ragged: `offsets` names the
-/// request-aligned exclusive-prefix offset value and `owner` names the
-/// per-item owner mapping, which together let a runtime split and regroup the
-/// packed value without any serialized request ID. `runtime_sequence_state`
+/// that axis. `token_packed` values are ragged: the items of every request are
+/// concatenated along one physical axis, and the ownership companions say which
+/// request each item came from, which is what lets a runtime split and regroup
+/// the packed value without any serialized request ID. `runtime_sequence_state`
 /// marks a value whose per-sequence storage the runtime owns outright.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -48,15 +92,98 @@ pub enum BatchLayout {
         /// Validation requires this to be at least one.
         factor: usize,
     },
+    /// Items belonging to many requests concatenated along one axis.
+    ///
+    /// There is exactly one packed axis. Structure above the item — frames
+    /// inside clips inside request rows — is ownership, not a second axis: the
+    /// tensor stays a flat run of items and `levels` says how to fold that run
+    /// back into requests.
     TokenPacked {
-        /// Request-aligned value holding the exclusive prefix offset of each request's items.
-        offsets: String,
-        /// Item-aligned value mapping each packed item to its owning request row.
-        owner: String,
         /// Packed axis of this value.
+        ///
+        /// Validation requires axis zero. A run of items is only splittable
+        /// into per-request pieces without copying when the items are the
+        /// outermost, contiguous stride of the tensor, and a packed axis
+        /// anywhere else would silently turn every split into a gather.
         axis: usize,
+        /// Ownership chain of the packed axis, innermost level first.
+        ///
+        /// Level zero owns the physically packed positions; the last level owns
+        /// into request rows. One level is the ordinary flat case — items in
+        /// rows — and two states one grouping in between, as frames in clips in
+        /// rows. Validation rejects a third: a runtime walks the whole chain on
+        /// every split, and each level multiplies the states that have to be
+        /// checked and tested.
+        #[schemars(length(min = 1, max = 2))]
+        levels: Vec<OwnershipLevel>,
     },
     RuntimeSequenceState,
+}
+
+/// One level of a packed value's ownership chain.
+///
+/// A level is a pair, never a tensor axis: `offsets` gives the exclusive prefix
+/// offset of each parent's run and `owner` gives the owning position of each
+/// entry at this level. The two together are what a runtime walks to answer
+/// "which request does this item belong to".
+///
+/// Both are `shared`, never `request_aligned`. An exclusive prefix sum is not
+/// permutation-followable — permuting rows does not permute a prefix-offset
+/// vector, it invalidates it — so a runtime that compacts rebuilds the chain
+/// rather than gathering it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnershipLevel {
+    /// Value holding the exclusive prefix offset of each parent's run at this
+    /// level, with a final entry holding the total. Its extent is the parent
+    /// count plus one.
+    #[schemars(length(min = 1))]
+    pub offsets: String,
+    /// Value mapping each entry at this level to the position of its parent.
+    /// Its extent is this level's own unit count, which at level zero is the
+    /// packed extent.
+    #[schemars(length(min = 1))]
+    pub owner: String,
+    /// Where this level's unit count comes from, for a value a component
+    /// produces.
+    ///
+    /// Absent is right for a value a component consumes, whose every count the
+    /// caller assembled. An output states it per level, because the levels of
+    /// one chain do not answer together: a token-merging encoder decides how
+    /// many tokens each clip becomes while leaving which clip belongs to which
+    /// request exactly as it found it. A single answer for the whole chain
+    /// could only be wrong at one end or the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extent: Option<PackedExtent>,
+}
+
+/// Where the unit count of one ownership level comes from.
+///
+/// Neither answer is derivable from the contract: an output of the same rank
+/// and symbols as its input may be a per-item transform or a token merger, and
+/// the two split at completely different boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackedExtent {
+    /// The level's units correspond one-to-one, in order, with an input
+    /// level's, so the output reuses that input's companions unchanged. A
+    /// component may drop inner levels it has consumed; it may not invent a
+    /// correspondence it does not have.
+    Preserved,
+    /// The graph decides the extent, so the level's companions are outputs of
+    /// the same component. An input's offsets describe an extent this value
+    /// does not have.
+    Produced,
+}
+
+impl PackedExtent {
+    /// Serialized spelling, for diagnostics that name what a document declared.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Preserved => "preserved",
+            Self::Produced => "produced",
+        }
+    }
 }
 
 impl BatchLayout {
@@ -80,9 +207,63 @@ impl BatchLayout {
         }
     }
 
+    /// Axis along which items belonging to many requests are concatenated.
+    ///
+    /// This counts items, never request rows. The two are different numbers as
+    /// soon as one request contributes more than one item, so nothing that
+    /// reasons about rows — row scope, compaction selections, per-row state —
+    /// may read this as a row axis.
+    pub fn packed_axis(&self) -> Option<usize> {
+        match self {
+            Self::TokenPacked { axis, .. } => Some(*axis),
+            _ => None,
+        }
+    }
+
+    /// Ownership chain of a packed value, innermost level first.
+    pub fn levels(&self) -> &[OwnershipLevel] {
+        match self {
+            Self::TokenPacked { levels, .. } => levels,
+            _ => &[],
+        }
+    }
+
+    /// Every companion value this layout names, innermost level first.
+    pub fn companions(&self) -> Vec<(usize, &'static str, &str)> {
+        self.levels()
+            .iter()
+            .enumerate()
+            .flat_map(|(index, level)| {
+                [
+                    (index, "offsets", level.offsets.as_str()),
+                    (index, "owner", level.owner.as_str()),
+                ]
+            })
+            .collect()
+    }
+
+    /// Values the innermost level needs to map items back to owners.
+    pub fn packing(&self) -> Option<(&str, &str)> {
+        self.levels()
+            .first()
+            .map(|level| (level.offsets.as_str(), level.owner.as_str()))
+    }
+
     /// Whether the runtime must move this value when it compacts or releases rows.
     pub fn is_row_scoped(&self) -> bool {
         !matches!(self, Self::Shared)
+    }
+
+    /// Serialized `kind` of this layout, for diagnostics that name what a
+    /// document declared rather than how the reader spells it.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::RequestAligned { .. } => "request_aligned",
+            Self::RequestExpanded { .. } => "request_expanded",
+            Self::TokenPacked { .. } => "token_packed",
+            Self::RuntimeSequenceState => "runtime_sequence_state",
+        }
     }
 }
 
@@ -606,7 +787,7 @@ pub struct WorkflowOutput {
     pub contract: TensorContract,
     pub role: WorkflowOutputRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_range: Option<ImageOutputValueRange>,
+    pub value_range: Option<PixelValueRange>,
     pub stage: OutputStage,
     /// Concrete media delivery contract for a post-processing output.
     ///
@@ -618,13 +799,18 @@ pub struct WorkflowOutput {
     pub media: Option<MediaOutputContract>,
 }
 
-/// Numeric interpretation of pixels emitted by an image workflow output.
+/// Numeric interpretation of pixels emitted by an image or video workflow
+/// output.
+///
+/// A frame carries the same pixels a still image does, so both output roles
+/// read their normalization from one contract rather than from two vocabularies
+/// that could disagree.
 ///
 /// This is an output contract, not a model-family hint: consumers must never
 /// infer normalization from observed pixel values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum ImageOutputValueRange {
+pub enum PixelValueRange {
     ZeroToOne,
     NegativeOneToOne,
     #[serde(rename = "zero_to_255")]
@@ -721,6 +907,86 @@ pub struct WorkflowComponent {
     /// additional state they read that is not visible as a typed input.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub cache_affects_state: BTreeSet<String>,
+    /// How much one invocation of this component may carry.
+    ///
+    /// Absence means one request row per invocation: a runtime that wants to
+    /// serve two requests calls the component twice. That is the safe reading
+    /// for every component whose producer has not thought about batching, so it
+    /// is the default. A component that declares a capacity is stating that its
+    /// artifact accepts several contributions stacked on one axis, which is the
+    /// fact a scheduler needs before it may coalesce work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_capacity: Option<ComponentBatchCapacity>,
+}
+
+/// Batching capacity of one invocation of a component.
+///
+/// This describes the shape of an invocation, never a scheduling policy: which
+/// dimensions must already agree before two contributions can share a call, and
+/// how much the assembled call may materialize. A runtime decides whether to
+/// group at all, and may always group fewer; the package only says what its
+/// artifact tolerates.
+///
+/// Everything here is keyed by shape symbol rather than by axis index. Ports of
+/// one component routinely differ in rank — a rank-3 payload, a rank-1
+/// companion, a rank-2 pooled output — so an axis index is only meaningful
+/// relative to one port, while a symbol names the same quantity on every port
+/// that mentions it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentBatchCapacity {
+    /// Shape symbols whose extents every item in a group must agree on.
+    ///
+    /// A symbol here names a property of one item — a patch width, a mel bin, a
+    /// frame count of a fixed-length clip — that the artifact cannot vary
+    /// within a single call. Items that disagree on it cannot share an
+    /// invocation, so a scheduler splits them into separate groups.
+    ///
+    /// It may not name a count: not the extent of a packed axis, and not the
+    /// unit or run count of an ownership level. Those are the numbers a packed
+    /// layout exists to let vary per request, and pinning one would describe a
+    /// fixed-shape batch the package did not declare. A video whose frame count
+    /// really is fixed is expressed by pinning the frame dimension of an
+    /// ordinary request-aligned tensor and declaring no frame ownership level
+    /// at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uniform_dimensions: Vec<String>,
+    /// Upper bounds on what one assembled invocation materializes, keyed by
+    /// shape symbol.
+    ///
+    /// These are static geometry — a fixed position table, an exported
+    /// constant, a kernel bound — never a measured throughput sweet spot, which
+    /// would be a cost model and belongs to the runtime. Every entry is an
+    /// upper bound and never an obligation: a runtime may group fewer,
+    /// including one. An empty list bounds nothing beyond what the runtime's
+    /// own row budget already bounds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub budgets: Vec<CapacityBudget>,
+}
+
+/// One materialized-footprint bound of an assembled invocation.
+///
+/// A budget bounds what the invocation materializes, not what is nominally
+/// valid. A packed dimension's footprint is the sum of the items' valid extents,
+/// which is exactly the packed extent because packing stores no padding; a
+/// padded dimension's footprint is the enclosing count times the padded extent,
+/// which is the rectangle the runtime allocates and the kernel reads. Budgeting
+/// the valid sum instead would let one long and fifteen short items pass a bound
+/// the group then blows through.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityBudget {
+    /// Shape symbols whose materialized extents multiply to the bounded
+    /// quantity, in order.
+    ///
+    /// One symbol bounds that dimension directly — items at an ownership level,
+    /// positions on a packed axis. Several bound an activation-shaped quantity,
+    /// such as total padded patch slots, without the package ever naming bytes.
+    #[schemars(length(min = 1), inner(length(min = 1)))]
+    pub dimensions: Vec<String>,
+    /// Largest product of those extents one invocation may carry.
+    #[schemars(range(min = 1))]
+    pub max_total: usize,
 }
 
 /// Row scope of a component's runtime-private state.
@@ -825,7 +1091,7 @@ pub enum WorkflowStep {
         #[serde(default)]
         termination: WorkflowLoopTermination,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        iteration: Option<WorkflowLoopIteration>,
+        iteration: Option<Box<WorkflowLoopIteration>>,
         #[serde(default)]
         carried: Vec<WorkflowCarry>,
     },
@@ -846,6 +1112,9 @@ pub enum WorkflowStep {
         output: String,
         mode: WorkflowEmitMode,
         /// Axis along which the output grows; defaults to the final axis.
+        ///
+        /// A rank-four or deeper value must name it: the final axis of a media
+        /// tensor is a spatial extent, never the one an append concatenates.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         axis: Option<usize>,
     },
@@ -886,7 +1155,7 @@ pub enum WorkflowNode {
         max_iterations: String,
         termination: WorkflowLoopTermination,
         /// Optional zero-based induction value, scoped to this loop's body and continue_when.
-        iteration: Option<WorkflowLoopIteration>,
+        iteration: Option<Box<WorkflowLoopIteration>>,
         carried: Vec<WorkflowLoopCarry>,
         effects: BTreeMap<String, WorkflowLoopEffect>,
     },
@@ -912,6 +1181,7 @@ pub enum WorkflowNode {
         /// value whose sequence axis sits elsewhere - video frames in
         /// `[batch, channels, frames, height, width]`, for instance - names it
         /// here so incremental publication does not concatenate the wrong axis.
+        /// A rank-four or deeper value has no defensible default and must say.
         axis: Option<usize>,
         effect_name: String,
         effect: EffectTransition,

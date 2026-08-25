@@ -849,6 +849,7 @@ fn port_contracts_from_graph(
                     shape: None,
                     optional: false,
                     batch_layout: onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 },
+                    padding: Vec::new(),
                 },
             )
         })

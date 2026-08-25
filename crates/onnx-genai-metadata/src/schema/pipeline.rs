@@ -30,46 +30,61 @@ pub struct PipelineSpec {
 /// Declared, architecture-neutral input preprocessing programs.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, JsonSchema)]
 pub struct PreprocessingSpec {
-    /// Typed image preprocessing transform program and its named tensor outputs.
+    /// Typed still-image preprocessing program and its named tensor outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<ImagePreprocessingProgram>,
+    pub image: Option<VisionPreprocessingProgram>,
+
+    /// Typed video preprocessing program and its named tensor outputs.
+    ///
+    /// A video is a still image plus a temporal axis, so it declares the same
+    /// program type: the spatial transforms and their parameters are identical,
+    /// and the temporal ones (`sample_frames`, `pad_frames`) are further
+    /// operations in the same generic vocabulary. Splitting the two would
+    /// duplicate every spatial parameter for no gain, while keeping them one
+    /// key would hide that a package preprocesses stills and clips differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<VisionPreprocessingProgram>,
 
     /// Typed audio preprocessing transform program and its named tensor outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioPreprocessingProgram>,
 }
 
-/// Generic image preprocessing program: an ordered transform pipeline plus the
+/// Generic pixel preprocessing program: an ordered transform pipeline plus the
 /// named workflow SSA tensor outputs it emits.
 ///
 /// The program is expressed entirely as parameterized, architecture-neutral
 /// data. Transform operations are generic (decode, resize, rescale, normalize,
-/// tile, patchify, pad). In workflow metadata, outputs are materialized by a
-/// manifest-pinned preprocessing adapter invocation and bind processor-local
-/// values to typed SSA names. A package may name an output `pixel_position_ids`,
-/// `image_grid_thw`, or anything else without introducing runtime model-family
-/// dispatch.
+/// tile, patchify, pad, and for clips sample_frames and pad_frames). In workflow
+/// metadata, outputs are materialized by a manifest-pinned preprocessing adapter
+/// invocation and bind processor-local values to typed SSA names. A package may
+/// name an output `pixel_position_ids`, `image_grid_thw`, `video_grid_thw`, or
+/// anything else without introducing runtime model-family dispatch.
+///
+/// One program type covers stills and clips, the way one audio program covers
+/// every audio family: a frame is an image, so a video program declares the
+/// same spatial work plus the temporal operations that select and pad frames.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
-pub struct ImagePreprocessingProgram {
+pub struct VisionPreprocessingProgram {
     /// Ordered list of generic transform operations applied to decoded pixels.
     #[serde(default)]
-    pub transforms: Vec<ImageTransform>,
+    pub transforms: Vec<VisionTransform>,
 
     /// Named tensor outputs the program emits, each bound to a workflow SSA value.
     #[schemars(length(min = 1))]
-    pub outputs: Vec<ImageOutputBinding>,
+    pub outputs: Vec<VisionOutputBinding>,
 }
 
-/// One generic image transform operation.
+/// One generic pixel transform operation.
 ///
 /// `op` selects the operation from a generic vocabulary; the remaining fields
 /// are the parameters that operation reads (only the relevant ones are set).
 /// Every parameter is model DATA — concrete sizes, patch sizes, means, and so on
 /// live in a model's fixture, never as constants baked into this schema.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
-pub struct ImageTransform {
+pub struct VisionTransform {
     /// Generic operation selector (e.g. `resize`, `normalize`, `patchify`).
-    #[schemars(with = "schema_vocabulary::ImageTransformOp")]
+    #[schemars(with = "schema_vocabulary::VisionTransformOp")]
     pub op: String,
 
     /// Named values consumed by this transform.
@@ -83,14 +98,14 @@ pub struct ImageTransform {
     /// Named values produced by this transform.
     ///
     /// These names are processor-local data. Final graph bindings select them
-    /// through `ImageOutputBinding::source`.
+    /// through `VisionOutputBinding::source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1), inner(length(min = 1)))]
     pub outputs: Option<Vec<String>>,
 
     /// Target size for a `resize` operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<ImageSizeSpec>,
+    pub size: Option<VisionSizeSpec>,
 
     /// Resize/crop mode (e.g. `pad`, `crop`, `stretch`) — generic string data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -199,7 +214,7 @@ pub struct ImageTransform {
     pub temporal_order: Option<String>,
     /// Order patches are emitted in (`merge_groups`, the default, or `raster`).
     /// Independent of `merge_size`, which only sets how many patches collapse
-    /// into one image token.
+    /// into one vision token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub patch_order: Option<String>,
@@ -217,16 +232,35 @@ pub struct ImageTransform {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pad_value: Option<f64>,
 
-    /// Exact first-axis length produced by a `pad` operation.
+    /// Exact first-axis length produced by a `pad` operation, or the exact frame
+    /// count produced by a `pad_frames` operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub target_length: Option<usize>,
+
+    /// Frame rate a `sample_frames` operation resamples a clip to.
+    ///
+    /// Temporal parameters, like every other parameter here, are model DATA: a
+    /// package that preprocesses clips states its own sampling rate and frame
+    /// budget instead of a runtime inferring them from a model family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+
+    /// Exact number of frames a `sample_frames` operation selects from a clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub num_frames: Option<usize>,
+
+    /// Stride, in decoded frames, between the frames `sample_frames` selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub frame_stride: Option<usize>,
 }
 
-/// A square size or an explicit width/height for an image transform.
+/// A square size or an explicit width/height for a pixel transform.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(untagged)]
-pub enum ImageSizeSpec {
+pub enum VisionSizeSpec {
     /// A single edge length applied to both dimensions.
     Square(u32),
     /// Explicit width and height.
@@ -238,12 +272,12 @@ pub enum ImageSizeSpec {
     },
 }
 
-/// One named tensor output produced by an image preprocessing program.
+/// One named tensor output produced by a pixel preprocessing program.
 ///
 /// The output binds a processor-local value to a typed workflow SSA name.
 /// Neither the name nor the content role is inferred from a model identity.
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema)]
-pub struct ImageOutputBinding {
+pub struct VisionOutputBinding {
     /// Named processor-local value produced by a transform.
     #[schemars(length(min = 1))]
     pub source: String,
@@ -253,8 +287,9 @@ pub struct ImageOutputBinding {
     pub name: String,
 
     /// Generic content role this tensor carries (pixels, coordinates, grid,
-    /// original size, or validity mask) — never a model-family label.
-    #[schemars(with = "schema_vocabulary::ImageOutputContent")]
+    /// original size, validity mask, or the offsets/owner map of a packed batch
+    /// at item, frame, or clip granularity) — never a model-family label.
+    #[schemars(with = "schema_vocabulary::VisionOutputContent")]
     pub content: String,
 
     /// Declared output dtype. Always explicit; never inferred from the model.
@@ -278,7 +313,7 @@ pub struct ImageOutputBinding {
 /// named workflow SSA tensor outputs it emits.
 ///
 /// The program is expressed entirely as parameterized, architecture-neutral
-/// data, mirroring `ImagePreprocessingProgram`. Transform operations are
+/// data, mirroring `VisionPreprocessingProgram`. Transform operations are
 /// generic (decode, resample, downmix, rescale, normalize, pad, frame,
 /// spectrogram, log_mel). In workflow metadata, outputs are materialized by a
 /// manifest-pinned preprocessing adapter invocation and bind processor-local
