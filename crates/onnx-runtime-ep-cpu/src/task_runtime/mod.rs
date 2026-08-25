@@ -188,9 +188,22 @@ fn smt_cap(inferred: usize, capped: usize) -> usize {
 }
 
 /// The process-wide native pool, built on first use.
+static POOL: OnceLock<TaskPool> = OnceLock::new();
+
+/// The process-wide native pool, built on first use.
 fn global_pool() -> &'static TaskPool {
-    static POOL: OnceLock<TaskPool> = OnceLock::new();
     POOL.get_or_init(|| TaskPool::new(resolve_width()))
+}
+
+/// The pool if some kernel has already built it, and `None` if none has.
+///
+/// The distinction matters to anything that only wants to *observe*. Building
+/// the pool spawns `width - 1` worker threads, so an observer that reaches it
+/// through [`global_pool`] manufactures the threads it is about to report --
+/// and on a route that never dispatches, every one of them is an artefact of
+/// the measurement.
+fn built_pool() -> Option<&'static TaskPool> {
+    POOL.get()
 }
 
 /// Threads the native pool can spread a fan-out across, including the caller's.
@@ -467,14 +480,25 @@ pub mod testing {
         }
     }
 
-    /// Counters for the process-wide native pool.
+    /// Counters for the process-wide native pool, or zeroes if no kernel has
+    /// built it yet.
     ///
     /// Monotonic, so a test takes a snapshot before and after and asserts on the
     /// difference; there is deliberately no reset, because resetting a
     /// process-wide counter makes concurrent tests lie to each other.
+    ///
+    /// Deliberately does **not** build the pool. It used to, and that made it an
+    /// instrument that changed what it measured: a benchmark taking a "before"
+    /// snapshot spawned `width - 1` workers, then reported a model that never
+    /// dispatched as having an idle pool. Measured on an fp32 model, which runs
+    /// on Rayon and touches this pool nowhere, the snapshot alone created 15
+    /// threads and they showed up as parks in the steady window. Zeroes are the
+    /// honest answer for a pool that does not exist, and the delta a caller
+    /// computes is unaffected: if the pool is built between the two snapshots,
+    /// the "before" it missed was zero anyway.
     #[must_use]
     pub fn counters() -> PoolCounters {
-        global_pool().counters()
+        super::built_pool().map_or_else(PoolCounters::default, TaskPool::counters)
     }
 
     /// Threads the process-wide native pool can use, including the caller's.
@@ -866,5 +890,98 @@ mod tests {
     #[test]
     fn the_task_thread_budget_rejects_zero() {
         assert!(set_task_thread_budget(Some(0)).is_err());
+    }
+
+    /// Observing the counters must not build the pool.
+    ///
+    /// This is the instrument-perturbs-the-measurement case, and it had already
+    /// happened: `testing::counters()` reached the pool through `global_pool()`,
+    /// so a benchmark's "before" snapshot spawned `width - 1` workers before the
+    /// model ran. On an fp32 model -- which fans out on Rayon and never touches
+    /// this pool -- that manufactured 15 threads and then reported them parking,
+    /// so the harness showed an idle native pool for a route with no native pool
+    /// in it.
+    ///
+    /// Runs in a child process because the property is only observable in a
+    /// process where nothing has built the pool yet. In the shared test binary
+    /// any earlier test may have built it, and then this assertion holds
+    /// vacuously -- it would pass just as happily against the defect it exists
+    /// to catch. A child running this one test `--exact` is virgin by
+    /// construction.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
+    fn observing_the_counters_does_not_build_the_pool() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("task_runtime::tests::counters_observer_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(COUNTERS_OBSERVER_CHILD_ENV, "1")
+            .output()
+            .expect("run counters-observer child");
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    const COUNTERS_OBSERVER_CHILD_ENV: &str = "ONNX_GENAI_COUNTERS_OBSERVER_CHILD";
+
+    /// Child half of [`observing_the_counters_does_not_build_the_pool`].
+    #[test]
+    #[ignore = "spawned by its parent test"]
+    #[cfg(target_os = "linux")]
+    fn counters_observer_child() {
+        if std::env::var(COUNTERS_OBSERVER_CHILD_ENV).is_err() {
+            return;
+        }
+        let threads = || {
+            std::fs::read_dir("/proc/self/task")
+                .expect("read /proc/self/task")
+                .count()
+        };
+
+        let before = threads();
+        let snapshot = testing::counters();
+        // Thread creation is asynchronous from the observer's point of view, so
+        // a count taken immediately could miss workers that are still being
+        // spawned and would report the defect as absent.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let after = threads();
+
+        assert_eq!(
+            before,
+            after,
+            "observing the counters spawned {} thread(s): the snapshot built the \
+             pool, so any measurement taken around it includes workers the \
+             measurement itself created",
+            after.saturating_sub(before)
+        );
+        assert_eq!(
+            snapshot,
+            PoolCounters::default(),
+            "no kernel has dispatched in this process, so the honest answer is \
+             zeroes; a non-zero row here describes a pool that only exists \
+             because it was asked about"
+        );
+
+        // Anti-vacuity: the assertions above must be capable of failing. If
+        // building the pool did not create threads, the count above would be
+        // stable whether or not `counters()` built it, and this test would pass
+        // against the defect. Proving the observable is live costs one pool.
+        let built = super::width();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let with_pool = threads();
+        assert!(
+            with_pool > after,
+            "building the pool (width {built}) created no threads, so the \
+             thread-count observable above cannot detect the defect this test \
+             exists to catch"
+        );
+        println!("observer_child before={before} after={after} with_pool={with_pool}");
     }
 }

@@ -54,6 +54,7 @@ mod pipeline_admission;
 pub mod profile;
 pub mod runtime_capability;
 pub mod session;
+mod session_owner;
 pub mod thread_affinity;
 pub mod tokenizer;
 pub mod value;

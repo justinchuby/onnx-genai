@@ -2623,6 +2623,122 @@ fn unique_kernel_sized_outputs_run_through_real_plugin() {
     }
 }
 
+#[test]
+fn non_max_suppression_kernel_sized_output_runs_through_real_plugin() {
+    let _lock = lock_ort_ep();
+    let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/non_max_suppression_kernel_sized/model.onnx.textproto");
+    let Some((_lib, api, env, options, session)) =
+        (unsafe { conformance_setup("cpu_ep_nms_kernel_sized", &model_path, true) })
+    else {
+        eprintln!("*** SKIPPED: NonMaxSuppression plugin E2E — ORT or plugin unavailable ***");
+        return;
+    };
+
+    unsafe {
+        assert_ops_assigned_to_our_ep(
+            api,
+            session,
+            &["NonMaxSuppression"],
+            "non_max_suppression_kernel_sized",
+        );
+        let mut boxes = vec![
+            0., 0., 1., 1., //
+            0., 0., 0.9, 0.9, //
+            2., 2., 3., 3.,
+        ];
+        let mut scores = vec![0.9, 0.8, 0.7, 0.1, 0.95, 0.2];
+        let mut max_output = [2_i64];
+        let mut iou_threshold = [0.5_f32];
+        let mut score_threshold = [0.15_f32];
+        let boxes_value = make_float_tensor(api, &mut boxes, &[1, 3, 4]);
+        let scores_value = make_float_tensor(api, &mut scores, &[1, 2, 3]);
+        let iou_value = make_float_tensor(api, &mut iou_threshold, &[]);
+        let score_value = make_float_tensor(api, &mut score_threshold, &[]);
+
+        let mut mem_info: *mut ort::OrtMemoryInfo = ptr::null_mut();
+        check_status(
+            api,
+            ((*api).CreateCpuMemoryInfo.unwrap())(
+                ort::OrtDeviceAllocator,
+                ort::OrtMemTypeDefault,
+                &mut mem_info,
+            ),
+            "CreateCpuMemoryInfo(NMS i64)",
+        );
+        let mut max_value: *mut ort::OrtValue = ptr::null_mut();
+        check_status(
+            api,
+            ((*api).CreateTensorWithDataAsOrtValue.unwrap())(
+                mem_info,
+                max_output.as_mut_ptr().cast(),
+                std::mem::size_of_val(&max_output),
+                ptr::null(),
+                0,
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                &mut max_value,
+            ),
+            "CreateTensor(max_output)",
+        );
+        ((*api).ReleaseMemoryInfo.unwrap())(mem_info);
+
+        let input_names = [
+            c"boxes".as_ptr(),
+            c"scores".as_ptr(),
+            c"max_output".as_ptr(),
+            c"iou_threshold".as_ptr(),
+            c"score_threshold".as_ptr(),
+        ];
+        let input_values = [
+            boxes_value as *const ort::OrtValue,
+            scores_value,
+            max_value,
+            iou_value,
+            score_value,
+        ];
+        let output_names = [c"selected_indices".as_ptr()];
+        let mut output: *mut ort::OrtValue = ptr::null_mut();
+        check_status(
+            api,
+            ((*api).Run.unwrap())(
+                session,
+                ptr::null(),
+                input_names.as_ptr(),
+                input_values.as_ptr(),
+                input_values.len(),
+                output_names.as_ptr(),
+                1,
+                &mut output,
+            ),
+            "Run(non_max_suppression_kernel_sized)",
+        );
+        assert!(!output.is_null());
+        assert_output_shape(api, output, &[4, 3], "non_max_suppression_kernel_sized");
+        assert_output_dtype(
+            api,
+            output,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            "non_max_suppression_kernel_sized",
+        );
+        let mut data: *mut std::ffi::c_void = ptr::null_mut();
+        check_status(
+            api,
+            ((*api).GetTensorMutableData.unwrap())(output, &mut data),
+            "GetTensorMutableData(NMS)",
+        );
+        assert_eq!(
+            std::slice::from_raw_parts(data.cast::<i64>(), 12),
+            [0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]
+        );
+
+        ((*api).ReleaseValue.unwrap())(output);
+        for value in [boxes_value, scores_value, max_value, iou_value, score_value] {
+            ((*api).ReleaseValue.unwrap())(value);
+        }
+        conformance_teardown(api, env, options, session, "cpu_ep_nms_kernel_sized");
+    }
+}
+
 // ─── B1 dtype: Cast (f32 → i64) ─────────────────────────────────────────────
 
 /// Cast f32 [2,3] → i64.  Output dtype must be INT64, not FLOAT.

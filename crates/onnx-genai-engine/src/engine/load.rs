@@ -381,7 +381,7 @@ impl Engine {
             Environment::new("onnx-genai-engine")
                 .map_err(|e| anyhow::anyhow!("Failed to create ORT environment: {e}"))?
         };
-        let session = {
+        let session = Arc::new({
             let _span = onnx_genai_ort::prof_span!("engine.ort_session_load");
             augment_backend_error(
                 Session::new(
@@ -392,7 +392,7 @@ impl Engine {
                 .map_err(|e| anyhow::anyhow!("Failed to load ORT session: {e}")),
                 EngineDecodeBackend::Ort,
             )?
-        };
+        });
 
         // Stage: metadata and decode-path resolution.
         let shared_kv = shared_kv_offer(&session, &metadata, &model_directory.model_path);
@@ -467,7 +467,7 @@ impl Engine {
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),
             _environment: Some(environment),
-            session: Some(Box::new(session)),
+            session: Some(session),
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
@@ -1660,12 +1660,14 @@ fn load_draft_model(
             .map(onnx_genai_metadata::load_metadata)
             .transpose()?
             .and_then(|metadata| metadata.decoder_io().cloned());
-        let draft_session = Session::new(
-            environment,
-            &draft_directory.model_path,
-            session_options.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {e}"))?;
+        let draft_session = Arc::new(
+            Session::new(
+                environment,
+                &draft_directory.model_path,
+                session_options.clone(),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load draft ORT session: {e}"))?,
+        );
         let draft_decode_path =
             // Draft models are loaded with sliding_window=None and sink_tokens=0:
             // draft architectures are typically distinct from the target (e.g. a
@@ -1680,7 +1682,7 @@ fn load_draft_model(
             // inference_metadata.yaml and pass the values from there.
             detect_model_decode_path(None, None, 0, crate::decode::SharedKvOffer::default())?;
         let draft_kv_model = infer_kv_model_info(
-            &draft_session,
+            draft_session.as_ref(),
             draft_io.as_ref(),
             config.page_size,
             onnx_genai_kv::KvDType::F32,
@@ -1710,7 +1712,7 @@ fn load_draft_model(
                 PagedKvCache::new(config.page_size, BOOKKEEPING_POOL_PAGES)
             };
         Some(DraftModel {
-            session: Box::new(draft_session),
+            session: draft_session,
             decode_path: draft_decode_path,
             io: draft_io,
             kv_model: draft_kv_model,
@@ -2396,12 +2398,14 @@ fn build_mtp_model_from_resolved(
             "MTP kv_mode accepted_prefix is declared but not executable: the frozen Mobius contract does not define correction-token/cache alignment"
         );
     }
-    let head_session = Session::new(
-        environment,
-        &mtp_config.public_config.head_model,
-        session_options.clone(),
-    )
-    .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?;
+    let head_session = Arc::new(
+        Session::new(
+            environment,
+            &mtp_config.public_config.head_model,
+            session_options.clone(),
+        )
+        .map_err(|error| anyhow::anyhow!("Failed to load MTP head: {error}"))?,
+    );
     let decode_options = onnx_genai_ort::MtpDecodeOptions {
         kv_mode: mtp_config.public_config.kv_mode,
         batch_size: 1,
@@ -2466,7 +2470,7 @@ fn build_mtp_model_from_resolved(
     Ok(MtpModel {
         config: mtp_config.public_config.clone(),
         runtime_config: mtp_config.clone(),
-        session: Arc::new(head_session),
+        session: head_session,
         embedder,
         lm_head,
         hidden_output: mtp_config.public_config.target_hidden_output.clone(),
@@ -2669,12 +2673,14 @@ fn load_eagle3_model(
                 );
             }
         }
-        let head_session = Session::new(
-            environment,
-            &eagle_config.head_model,
-            session_options.clone(),
-        )
-        .map_err(|error| anyhow::anyhow!("Failed to load EAGLE-3 head: {error}"))?;
+        let head_session = Arc::new(
+            Session::new(
+                environment,
+                &eagle_config.head_model,
+                session_options.clone(),
+            )
+            .map_err(|error| anyhow::anyhow!("Failed to load EAGLE-3 head: {error}"))?,
+        );
         let head_signature = Eagle3DecodeSession::detect(&head_session)
             .map_err(|error| anyhow::anyhow!("Failed to inspect EAGLE-3 head: {error}"))?
             .context("configured EAGLE-3 head model does not expose EAGLE-3 head I/O")?;
@@ -2743,7 +2749,7 @@ fn load_eagle3_model(
         }
         Some(Eagle3Model {
             config: eagle_config.clone(),
-            session: Box::new(head_session),
+            session: head_session,
             embedder: LinearEmbedder::new(
                 embedding,
                 eagle_config.vocab_size,

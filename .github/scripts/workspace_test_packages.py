@@ -4,12 +4,30 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import re
 import subprocess
 import sys
+from collections.abc import Iterable
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+
+# The status checks the `main` branch ruleset marks required. A job outside this
+# set can go red without blocking a merge, so a package tested only there is,
+# for merge purposes, untested: #1982 left `shape_dispatch_gate` failing on
+# `main` with both required checks green, because the only lane that ran it was
+# advisory. See #2015.
+#
+# This mirrors a repository setting that a workflow file cannot read, so it is
+# maintained by hand. `verify_required_tier` asserts every name here still
+# matches a job in the workflow, which catches the rename direction. A ruleset
+# edit that *drops* a required check is not observable from inside the repo and
+# is the one drift this gate cannot see.
+REQUIRED_JOB_NAMES = frozenset({"Fast (Linux x86_64)", "Rust quality"})
 
 # Crates that are intentionally not selected by any CI cargo-test lane.
 # Every entry is a written exception to the default rule: workspace members are
@@ -130,6 +148,968 @@ def verify(simulate_missing: str | None = None) -> int:
     return 0
 
 
+# A `cargo test`/`cargo llvm-cov` invocation is the only thing that counts as
+# executing a package's tests. `cargo build` and `cargo clippy --all-targets`
+# compile the same test targets but never run an assertion, so they must not
+# satisfy this gate.
+_RUNS_TESTS = re.compile(r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b")
+_LANE_CALL = re.compile(r"workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)")
+_PACKAGE_FLAG = re.compile(r"(?:^|\s)(?:-p|--package)[\s=]+([A-Za-z0-9_-]+)")
+_VAR_ASSIGN = re.compile(
+    r"(?:^|\s)(?P<var>[A-Za-z_][A-Za-z0-9_]*)=(?P<value>\"[^\"]*\"|'[^']*'|\S*)"
+)
+_VAR_REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+
+# `ubuntu-latest` does not ship PyYAML in the interpreter `python` resolves to,
+# and PEP 668 blocks installing it globally, so this gate parses the workflow
+# itself. Only the two block styles the file uses are handled, and anything
+# unrecognised is reported rather than assumed: an under-read here makes the
+# gate stricter (packages look unenforced and it fails loudly), so the direction
+# that must be guarded is over-reading, which is what job-slice attribution and
+# comment stripping are for.
+# A job key may be quoted and may carry a trailing comment; both are valid YAML.
+# Missing one silently folds that job's steps into the *previous* job, and since
+# `rust-coverage` follows required `rust-quality`, that direction manufactures a
+# false green. Anything at job-key depth that does not parse here is therefore a
+# hard error rather than body text -- see `_at_job_depth`.
+_JOB_KEY = re.compile(
+    r"""^\ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:\s*(?:\#.*)?$"""
+)
+_JOB_NAME = re.compile(r"^    name:\s*(.+?)\s*$")
+_TRAILING_COMMENT = re.compile(r"\s+\#.*$")
+
+
+def _at_job_depth(line: str) -> bool:
+    """True for a line indented exactly two spaces, i.e. a direct child of `jobs:`."""
+    return len(line) > 2 and line.startswith("  ") and not line[2].isspace()
+
+
+# Every key GitHub accepts directly under a job. A four-space key outside this
+# set is the signature of a job whose own key was indented one level too far:
+# still valid YAML, so no parser complains, but the job ceases to exist and its
+# checks stop *appearing* on a PR instead of going red. @holden hit exactly this
+# and `gh pr checks` reported fourteen green with zero failures while two checks
+# had silently ceased to be produced. Enumerating what is legal and rejecting
+# the rest is the same choice as `_at_job_depth`: a new job attribute breaks
+# this loudly, which is the direction that can be noticed.
+_JOB_ATTRIBUTES = frozenset(
+    {
+        "concurrency",
+        "container",
+        "continue-on-error",
+        "defaults",
+        "env",
+        "environment",
+        "if",
+        "name",
+        "needs",
+        "outputs",
+        "permissions",
+        "runs-on",
+        "secrets",
+        "services",
+        "steps",
+        "strategy",
+        "timeout-minutes",
+        "uses",
+        "with",
+    }
+)
+_JOB_ATTR_KEY = re.compile(
+    r"""^\ \ \ \ (?:"(?P<dq>[^"]+)"|'(?P<sq>[^']+)'|(?P<plain>[A-Za-z0-9_.-]+))\s*:"""
+)
+
+
+def _stray_job_attribute(line: str) -> str | None:
+    """A four-space key that GitHub would not accept as a job attribute."""
+    if line.lstrip().startswith("#"):
+        return None
+    match = _JOB_ATTR_KEY.match(line)
+    if match is None:
+        return None
+    key = match.group("dq") or match.group("sq") or match.group("plain")
+    return None if key in _JOB_ATTRIBUTES else key
+
+
+def _scalar(value: str) -> str:
+    """A YAML scalar as written in this workflow: optional quotes, optional comment."""
+    value = _TRAILING_COMMENT.sub("", value).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value
+_RUN_KEY = re.compile(r"^(\s*)(- )?run:\s*(.*)$")
+_FOLDED = {">", ">-", ">+"}
+_LITERAL = {"|", "|-", "|+"}
+
+
+def workflow_jobs() -> dict[str, str]:
+    """Map each job's display name to its YAML body with comments removed."""
+    return parse_jobs(WORKFLOW.read_text(encoding="utf-8"), source=str(WORKFLOW))
+
+
+def parse_jobs(text: str, source: str = "<workflow>") -> dict[str, str]:
+    """`workflow_jobs` over arbitrary text, so the parser itself is testable."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
+    except StopIteration:
+        raise SystemExit(f"{source}: no top-level `jobs:` block to check")
+
+    jobs: dict[str, str] = {}
+    key: str | None = None
+    body: list[str] = []
+
+    def flush() -> None:
+        nonlocal key, body
+        if key is None:
+            return
+        name = key
+        for line in body:
+            if match := _JOB_NAME.match(line):
+                name = _scalar(match.group(1))
+                break
+        if name in jobs:
+            raise SystemExit(f"{source}: two jobs are both named {name!r}")
+        jobs[name] = "\n".join(
+            line for line in body if not line.lstrip().startswith("#")
+        )
+        key, body = None, []
+
+    for line in lines[start + 1 :]:
+        if line.strip() and not line.startswith(" ") and not line.startswith("#"):
+            break
+        if _at_job_depth(line) and not line.lstrip().startswith("#"):
+            match = _JOB_KEY.match(line)
+            if match is None:
+                raise SystemExit(
+                    f"{source}: line at job-key depth is not a job key this gate "
+                    f"can parse: {line!r}. Refusing to guess -- absorbing it into the "
+                    f"previous job would credit its steps to that job."
+                )
+            flush()
+            key = match.group("dq") or match.group("sq") or match.group("plain")
+            continue
+        if key is not None:
+            if stray := _stray_job_attribute(line):
+                raise SystemExit(
+                    f"{source}: {key!r} contains {stray!r}, which is not a job "
+                    f"attribute GitHub accepts. A job key indented one level too "
+                    f"far is valid YAML and silently becomes a key of the job "
+                    f"above it; GitHub then reports that job's checks as absent "
+                    f"rather than failing, which no pass/fail gate can see."
+                )
+            body.append(line)
+    flush()
+    if not jobs:
+        raise SystemExit(f"{source}: parsed no jobs; the gate would check nothing")
+    return jobs
+
+
+# A step's `if:` decides whether it runs at all, and this gate cannot evaluate
+# GitHub's expression language. Crediting a guarded step would let `if: false`
+# -- or a copy-pasted `if: runner.os == 'Windows'` on a Linux-only job -- remove
+# a package's only required executor while the gate still reported it covered.
+# So only steps that are guaranteed to have run in a *successful* job are
+# counted: no `if:` (which defaults to `success()`), or an expression on this
+# list. Anything else is not credited, which can only make the gate stricter and
+# it names the step when it refuses.
+_STEP_ITEM = re.compile(r"^\s*- ")
+_STEP_IF = re.compile(r"^\s*if:\s*(.+?)\s*$")
+# `continue-on-error: true` lets the step (or job) fail without failing the
+# check, so its tests run but cannot block a merge -- which is the only property
+# this gate cares about. Crediting it would satisfy the gate with coverage that
+# is decorative.
+_STEP_COE = re.compile(r"^\s*continue-on-error:\s*(.+?)\s*$")
+_JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
+
+
+# A step this gate credits only runs if its *job* runs. Both required jobs carry
+# a job-level `if:`, and a skipped required check SATISFIES a ruleset -- so the
+# whole tier can be waved through by never executing. @holden demonstrated the
+# live route with real builds (#2077): two `.md` files under `docs/` are pulled
+# into Rust by `include_str!`, so a pure-markdown edit is classified docs-only,
+# both required jobs skip, and the tree does not compile.
+#
+# The classifier's correctness is #2081's problem, not this gate's. What IS this
+# gate's problem is that it models step-level `if:` (see `unconditional_run_blocks`)
+# and would credit a step in a job whose own condition had been quietly narrowed.
+# So: the required jobs may carry the repo's known docs-only guard or no guard at
+# all, and anything else is refused rather than interpreted.
+_JOB_IF = re.compile(r"^    if:\s*(.+?)\s*$", re.MULTILINE)
+_ALLOWED_JOB_IF = frozenset({"needs.changes.outputs.docs_only != 'true'"})
+
+
+def job_condition(job_body: str) -> str | None:
+    """The job-level `if:`, or None. Step-level `if:` is indented deeper."""
+    match = _JOB_IF.search(job_body)
+    return match.group(1) if match else None
+
+
+def verify_required_job_conditions(jobs: dict[str, str]) -> int:
+    """Refuse a required job whose own `if:` is not one this gate has reasoned about."""
+    problems = []
+    # Iterating the intersection alone would return 0 for a required job that is
+    # simply absent -- the same "unread value degrades to the most permissive
+    # verdict" shape this gate exists to refuse. `verify_required_tier` already
+    # rejects a missing required job earlier, so this is defence in depth: it
+    # keeps the guarantee inside the function rather than in the caller's order.
+    for name in sorted(REQUIRED_JOB_NAMES - set(jobs)):
+        problems.append((name, "<required job absent from the workflow>"))
+    for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
+        condition = job_condition(jobs[name])
+        if condition is not None and condition not in _ALLOWED_JOB_IF:
+            problems.append((name, condition))
+    if not problems:
+        return 0
+    print("Required-lane coverage check failed.", file=sys.stderr)
+    print(
+        "A required job carries a job-level `if:` this gate has not reasoned about.\n"
+        "A skipped required check satisfies the ruleset, so narrowing this condition\n"
+        "silently voids every guarantee below it -- the steps still exist and still\n"
+        "never run.",
+        file=sys.stderr,
+    )
+    for name, condition in problems:
+        print(f"  - {name}: if: {condition}", file=sys.stderr)
+    print(
+        f"Known-good conditions: {sorted(_ALLOWED_JOB_IF)} (or no `if:` at all).",
+        file=sys.stderr,
+    )
+    return 1
+_FALSEY = {"false", "${{ false }}", "'false'", '"false"'}
+_STEP_SHELL = re.compile(r"^\s*shell:\s*(.+?)\s*$")
+# A command whose failure is swallowed runs its tests and reports success
+# anyway. `||` does this unconditionally. A pipe does it only without pipefail,
+# which is the difference between GitHub's default Linux shell (`bash -e`) and
+# an explicit `shell: bash` (`bash --noprofile --norc -eo pipefail`).
+_TEST_CALL = r"cargo\s+(?:\+\S+\s+)?(?:test|llvm-cov)\b[^\n;&|]*"
+_OR_AFTER_TEST = re.compile(_TEST_CALL + r"\|\|")
+_PIPE_AFTER_TEST = re.compile(_TEST_CALL + r"\|(?!\|)")
+
+
+def _swallow_reason(block: str, pipefail: bool) -> str | None:
+    if _OR_AFTER_TEST.search(block):
+        return "`||` after a cargo test swallows its failure"
+    if not pipefail and _PIPE_AFTER_TEST.search(block):
+        return "cargo test piped without pipefail; its failure is masked"
+    return None
+_RUNS_IN_A_PASSING_JOB = {"success()", "always()", "true", "${{ true }}", "${{ success() }}"}
+
+
+def job_steps(job_body: str) -> list[tuple[str | None, str, str | None]]:
+    """Each step as (reason it must not be credited, its YAML text, its shell)."""
+    steps: list[tuple[str | None, str, str | None]] = []
+    current: list[str] = []
+    for line in job_body.splitlines():
+        if _STEP_ITEM.match(line):
+            if current:
+                steps.append(_step_entry(current))
+            current = [line]
+        elif current:
+            current.append(line)
+    if current:
+        steps.append(_step_entry(current))
+    return steps
+
+
+def _step_entry(lines: list[str]) -> tuple[str | None, str, str | None]:
+    """(reason this step must not be credited, step text, its `shell:`)."""
+    first = lines[0]
+    dash_indent = len(first) - len(first.lstrip())
+    # The step's own keys sit at the SHALLOWEST column under the dash -- not at
+    # `dash + 2`. YAML allows any run of spaces after the dash (`-   name:`),
+    # which puts the real keys deeper than dash+2; an equality test then reads
+    # `if:` as shell text and credits a guarded step. Taking the minimum also
+    # survives `- run: |` leading the step, where the first following line is
+    # shell text deeper than the sibling keys.
+    deeper = [
+        len(line) - len(line.lstrip())
+        for line in lines[1:]
+        if line.strip() and len(line) - len(line.lstrip()) > dash_indent
+    ]
+    body_indent = min(deeper) if deeper else dash_indent + 2
+    keys: dict[str, str] = {}
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if index == 0:
+            stripped = first.lstrip()
+            text = stripped[1:].lstrip() if stripped.startswith("- ") else ""
+        elif len(line) - len(line.lstrip()) == body_indent:
+            # A key at the step's own depth. Anything deeper is shell text
+            # inside a run block and must not be read as a step key.
+            text = line.lstrip()
+        else:
+            continue
+        if match := _STEP_IF.match(text):
+            keys.setdefault("if", match.group(1))
+        elif match := _STEP_COE.match(text):
+            keys.setdefault("continue-on-error", match.group(1))
+        elif match := _STEP_SHELL.match(text):
+            keys.setdefault("shell", match.group(1))
+    reason: str | None = None
+    condition = keys.get("if")
+    if condition is not None and condition not in _RUNS_IN_A_PASSING_JOB:
+        reason = f"if: {condition}"
+    tolerated = keys.get("continue-on-error")
+    if reason is None and tolerated is not None and tolerated not in _FALSEY:
+        reason = f"continue-on-error: {tolerated}"
+    return reason, "\n".join(lines), keys.get("shell")
+
+
+def unconditional_run_blocks(
+    job_body: str, also_credit: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
+    """Run blocks that a successful job is guaranteed to have executed.
+
+    Returns those blocks and the `if:` expressions that were refused, so a
+    caller can say *why* a package looks unexecuted rather than only that it is.
+
+    `also_credit` names refusal reasons a *particular* caller can discharge, and
+    defaults to discharging none. Only the Windows-coverage check passes it, to
+    credit `if: runner.os == 'Windows'` on the platform where that is true. It is
+    a parameter rather than an entry in `_RUNS_IN_A_PASSING_JOB` precisely so it
+    cannot leak into the required-tier gate, where a Windows-only step must stay
+    refused -- both required jobs run on Linux, so crediting it there would let
+    a step that never executes satisfy the gate.
+    """
+    kept: list[str] = []
+    refused: list[str] = []
+    if match := _JOB_COE.search(job_body):
+        if match.group(1) not in _FALSEY:
+            # The job itself is allowed to fail, so nothing it runs can block a
+            # merge. Refuse every block rather than a step at a time.
+            return [], [f"continue-on-error: {match.group(1)} (job level)"]
+    for reason, text, shell in job_steps(job_body):
+        blocks = run_blocks(text)
+        if not blocks:
+            continue
+        if reason is not None and reason not in also_credit:
+            refused.append(reason)
+            continue
+        pipefail = shell is not None and shell.split()[0] == "bash"
+        for block in blocks:
+            swallowed = _swallow_reason(block, pipefail)
+            if swallowed:
+                refused.append(swallowed)
+            else:
+                kept.append(block)
+    return kept, refused
+
+
+def run_blocks(job_body: str) -> list[str]:
+    """Every `run:` scalar in a job, folded or literal, as shell text."""
+    lines = job_body.splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = _RUN_KEY.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        indent = len(match.group(1)) + (2 if match.group(2) else 0)
+        header = match.group(3).strip()
+        index += 1
+        if header and header not in _FOLDED and header not in _LITERAL:
+            blocks.append(header)
+            continue
+        # A folded scalar is one shell command wrapped across lines; a literal
+        # one is a script whose newlines separate commands. Collapsing the two
+        # would either lose a command boundary or invent one.
+        joiner = " " if header in _FOLDED else "\n"
+        collected: list[str] = []
+        while index < len(lines):
+            line = lines[index]
+            if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+                break
+            collected.append(line.strip())
+            index += 1
+        blocks.append(joiner.join(part for part in collected if part))
+    return blocks
+
+
+def packages_tested_by(commands: Iterable[str]) -> set[str]:
+    """Packages whose tests the given shell commands actually execute.
+
+    Known, deliberate under-read: a `cargo test` continued across physical lines
+    with a trailing backslash puts its `-p` flags in fragments that carry no
+    cargo invocation, so they are not attributed. `Rust quality`'s three MLAS
+    steps are written that way and are credited to no lane by this function --
+    harmless today because `Fast` covers that package, and harmless in principle
+    because it can only ever make the gate stricter. It is NOT joined here on
+    purpose: joining continuations moves attribution in the permissive
+    direction, and this gate's whole thesis is that an over-read is fatal while
+    an under-read merely fails loudly. If a package's only required-lane
+    execution is ever written this way, this gate will refuse it rather than
+    credit it, and the fix is to put the invocation on one line.
+    Bounded exception, added when the guarded two-line form landed: a lane
+    resolved into a shell variable is credited to a later `cargo test` in the
+    same block *only if that command references the variable*. The reference is
+    what does the crediting, so this stays a dataflow read rather than a join --
+    an assignment the cargo invocation never uses is still worth nothing, and
+    the self-test arms below fail if it is ever worth something. Reassignment
+    replaces a variable's lanes rather than adding to them, so shadowing the
+    name with a non-lane value drops the credit instead of keeping it.
+    """
+    tested: set[str] = set()
+    for command in commands:
+        lanes_by_var: dict[str, set[str]] = {}
+        for fragment in re.split(r"&&|\|\||;|\n", command):
+            for assignment in _VAR_ASSIGN.finditer(fragment):
+                lanes_by_var[assignment.group("var")] = set(
+                    _LANE_CALL.findall(assignment.group("value"))
+                )
+            if not _RUNS_TESTS.search(fragment):
+                continue
+            for lane in _LANE_CALL.findall(fragment):
+                tested.update(lane_packages(lane))
+            for name in _VAR_REF.findall(fragment):
+                for lane in lanes_by_var.get(name, ()):
+                    tested.update(lane_packages(lane))
+            tested.update(_PACKAGE_FLAG.findall(fragment))
+    return tested
+
+
+def required_lane_commands(skip_lane: str | None = None) -> tuple[list[str], set[str]]:
+    jobs = workflow_jobs()
+    commands: list[str] = []
+    for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
+        blocks, refused = unconditional_run_blocks(jobs[name])
+        for condition in refused:
+            print(
+                f"note: {name!r} has a conditional step this gate will not credit: "
+                f"if: {condition}",
+                file=sys.stderr,
+            )
+        for block in blocks:
+            if skip_lane and re.search(rf"cargo-args\s+{re.escape(skip_lane)}\b", block):
+                continue
+            commands.append(block)
+    return commands, set(jobs)
+
+
+# `ci.yml` states, in a comment beside the step this PR made Windows-only, that
+# `CLI ORT` "remains the only place these tests run on Windows". That was prose,
+# and prose does not fail. @holden measured the gap it left: indenting a job key
+# by two extra spaces is *valid YAML*, silently reparents the job into the one
+# above it, and GitHub then reports that job's checks as **absent** rather than
+# failing -- so `gh pr checks` shows no red, because it shows nothing at all. A
+# gate keyed on "pending=0 and no failures" is true of a vanished check.
+#
+# Deleting the `cli-ort` block outright is the quieter form: still valid YAML,
+# still a valid workflow, and every gate here passed it before this check
+# existed. Measured, on the real workflow, before writing it: all three of
+# `verify`, `verify-required-tier` and `self-test` exited 0 with the sole
+# Windows executor of the ORT-backed tests removed.
+_WINDOWS_RUNNER = re.compile(r"windows-[A-Za-z0-9_.-]+")
+
+# Refusal reasons that are discharged *on a Windows runner only*. `job_steps`
+# formats a refused condition as `if: <expr>`, so these match its output.
+_WINDOWS_STEP_IF = frozenset(
+    {
+        "if: runner.os == 'Windows'",
+        'if: runner.os == "Windows"',
+        "if: ${{ runner.os == 'Windows' }}",
+    }
+)
+
+
+def windows_ort_executors(jobs: dict[str, str] | None = None) -> dict[str, set[str]]:
+    """Jobs that can run on Windows and execute ORT-backed packages there."""
+    jobs = workflow_jobs() if jobs is None else jobs
+    found: dict[str, set[str]] = {}
+    for name, body in jobs.items():
+        if not _WINDOWS_RUNNER.search(body):
+            continue
+        blocks, _ = unconditional_run_blocks(body, also_credit=_WINDOWS_STEP_IF)
+        if tested := packages_tested_by(blocks) & set(ORT_BACKED):
+            found[name] = tested
+    return found
+
+
+def verify_windows_ort_coverage(jobs: dict[str, str] | None = None) -> int:
+    """Fail if no job still runs the ORT-backed tests on a Windows runner."""
+    executors = windows_ort_executors(jobs)
+    covered: set[str] = set()
+    for tested in executors.values():
+        covered |= tested
+    if missing := sorted(set(ORT_BACKED) - covered):
+        print("Windows ORT coverage check failed.", file=sys.stderr)
+        print(
+            "No job runs these packages' tests on a Windows runner:", file=sys.stderr
+        )
+        for package in missing:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "No required check builds the ORT graph on Windows, so this coverage "
+            "exists only here. A job that stops running them does not go red -- "
+            "its checks stop appearing, which no pass/fail gate can see.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"windows ORT coverage ok: {len(covered)} package(s) via "
+        f"{sorted(executors)}"
+    )
+    return 0
+
+
+def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
+    commands, job_names = required_lane_commands(simulate_dropped_lane)
+
+    if missing_jobs := sorted(REQUIRED_JOB_NAMES - job_names):
+        print(
+            "Required-lane coverage check failed.\n"
+            f"REQUIRED_JOB_NAMES names job(s) that no longer exist in {WORKFLOW.name}: "
+            f"{missing_jobs}\n"
+            "Renaming a required job also breaks the branch ruleset; update both.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if rc := verify_required_job_conditions(workflow_jobs()):
+        return rc
+
+    packages = workspace_packages()
+    required_tested = packages_tested_by(commands) & packages
+    unenforced = sorted(packages - required_tested - set(DENYLIST))
+    if unenforced:
+        print("Required-lane coverage check failed.", file=sys.stderr)
+        print(
+            "Workspace member(s) whose tests no required status check executes:",
+            file=sys.stderr,
+        )
+        for package in unenforced:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "Their tests can go red on `main` while every required check is green.\n"
+            f"Run them from one of {sorted(REQUIRED_JOB_NAMES)}, or add a DENYLIST "
+            "entry with a reason.",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        f"required-lane coverage ok: {len(required_tested)} package(s) tested by "
+        f"{sorted(REQUIRED_JOB_NAMES)}, {len(DENYLIST)} denied"
+    )
+    return verify_windows_ort_coverage()
+
+
+# Job bodies whose keys are written in the ways YAML allows. A key form this
+# parser fails to recognise does not degrade to "unknown job": the body is
+# appended to whatever job came last, so an advisory job's steps are credited to
+# the required job above it. `rust-coverage` sits directly below `rust-quality`,
+# so that is a concrete route to a false green, and it is the reason
+# `_at_job_depth` raises instead of guessing. Measured before the fix: trailing
+# comment and quoted forms both produced a passing gate on a workflow whose
+# required job ran none of the tests.
+_PARSER_FIXTURE = """jobs:
+  alpha:
+    name: Required Job
+    steps:
+      - run: cargo test -p pkg-alpha
+{key}
+    name: Advisory Job
+    steps:
+      - run: cargo test -p pkg-beta
+"""
+
+
+_CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
+    # label, step YAML (None = job-level arm), packages credited, reasons refused
+    (
+        "unconditional step is credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    # Reviewer finding: the step-key column is not always dash+2. YAML allows any
+    # run of spaces after the dash, which pushes the real keys deeper; reading the
+    # column as dash+2 dropped `if:` as shell text and CREDITED a guarded step.
+    (
+        "extra spaces after the dash still expose the step's if:",
+        "      -   name: x\n          if: false\n          run: cargo test -p pkg-alpha\n",
+        [],
+        ["if: false"],
+    ),
+    (
+        "extra spaces after the dash still expose continue-on-error",
+        "      -   name: x\n          continue-on-error: true\n          run: cargo test -p pkg-alpha\n",
+        [],
+        ["continue-on-error: true"],
+    ),
+    (
+        "a run: block leading the step does not hide a later if:",
+        "      - run: |\n          cargo test -p pkg-alpha\n        if: false\n",
+        [],
+        ["if: false"],
+    ),
+    (
+        "if: always() is credited",
+        "      - name: x\n        if: always()\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "if: false is not credited",
+        "      - name: x\n        if: false\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["if: false"],
+    ),
+    (
+        "a platform guard is not credited",
+        "      - name: x\n        if: runner.os == 'Windows'\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["if: runner.os == 'Windows'"],
+    ),
+    (
+        "if: on the list-item line is still a step condition",
+        "      - if: false\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["if: false"],
+    ),
+    (
+        "continue-on-error: true is not credited",
+        "      - name: x\n        continue-on-error: true\n        run: cargo test -p pkg-alpha\n",
+        [],
+        ["continue-on-error: true"],
+    ),
+    (
+        "job-level continue-on-error refuses the whole job",
+        None,
+        [],
+        ["continue-on-error: true (job level)"],
+    ),
+    (
+        "continue-on-error: false is credited",
+        "      - name: x\n        continue-on-error: false\n        run: cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "`|| true` after a cargo test is not credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha || true\n",
+        [],
+        ["`||` after a cargo test swallows its failure"],
+    ),
+    (
+        "piped cargo test without pipefail is not credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha | tee out.log\n",
+        [],
+        ["cargo test piped without pipefail; its failure is masked"],
+    ),
+    (
+        "piped under `shell: bash` (pipefail) is credited",
+        "      - name: x\n        shell: bash\n        run: cargo test -p pkg-alpha | tee out.log\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "an && chain is credited",
+        "      - name: x\n        run: cargo test -p pkg-alpha && echo done\n",
+        ["pkg-alpha"],
+        [],
+    ),
+    (
+        "`if:` inside shell text is not a step condition",
+        "      - name: x\n        run: |\n          if: not-a-condition\n          cargo test -p pkg-alpha\n",
+        ["pkg-alpha"],
+        [],
+    ),
+)
+
+
+def _conditional_arms() -> int:
+    """A step the job may skip must not count as having run its tests."""
+    failures = 0
+    for label, step, want_credited, want_refused in _CONDITIONAL_ARMS:
+        body = (
+            "    continue-on-error: true\n    steps:\n"
+            "      - name: x\n        run: cargo test -p pkg-alpha\n"
+            if step is None
+            else "    steps:\n" + step
+        )
+        kept, refused = unconditional_run_blocks(body)
+        credited = sorted(packages_tested_by(kept))
+        if credited != want_credited or refused != want_refused:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        credited want={want_credited} got={credited}", file=sys.stderr)
+            print(f"        refused  want={want_refused} got={refused}", file=sys.stderr)
+        else:
+            print(f"  ok    {label} -> credited {credited}, refused {refused}")
+    return failures
+
+
+_PARSER_ARM_COUNT = 8
+
+
+def _parser_arms() -> int:
+    """Prove a job boundary is never absorbed into the job above it."""
+    failures = 0
+    for label, key in (
+        ("plain job key (control)", "  beta:"),
+        ("job key with a trailing comment", "  beta:  # advisory lane"),
+        ('job key in double quotes', '  "beta":'),
+        ("job key in single quotes", "  'beta':"),
+    ):
+        text = _PARSER_FIXTURE.format(key=key)
+        try:
+            jobs = parse_jobs(text)
+        except SystemExit as exit_error:
+            print(f"  FAIL  {label}: parser refused a valid workflow: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        required_body = jobs.get("Required Job", "")
+        leaked = "pkg-beta" in required_body
+        if sorted(jobs) != ["Advisory Job", "Required Job"] or leaked:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        jobs parsed: {sorted(jobs)}", file=sys.stderr)
+            if leaked:
+                print("        the advisory job's step was credited to the required job", file=sys.stderr)
+        else:
+            print(f"  ok    {label} -> two jobs, no step credited across the boundary")
+
+    # An unrecognised line at job-key depth must stop the gate, not extend a job.
+    label = "unparseable line at job-key depth is fatal"
+    try:
+        parse_jobs(_PARSER_FIXTURE.format(key="  beta: not-a-job-body"))
+    except SystemExit:
+        print(f"  ok    {label} -> refused")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: parsed without complaint", file=sys.stderr)
+
+    # A job key indented one level too far is *valid YAML*: the job silently
+    # becomes a key of the job above it, and GitHub then stops producing its
+    # checks rather than failing them. `gh pr checks` cannot express an absence,
+    # so a `pending=0 && failed=[]` merge gate is true of a deleted check.
+    label = "job key indented one level too far is fatal"
+    try:
+        jobs = parse_jobs(_PARSER_FIXTURE.format(key="    beta:"))
+    except SystemExit as exit_error:
+        if "beta" in str(exit_error):
+            print(f"  ok    {label} -> refused, naming 'beta'")
+        else:
+            failures += 1
+            print(f"  FAIL  {label}: refused without naming the stray key", file=sys.stderr)
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: parsed as {sorted(jobs)}", file=sys.stderr)
+
+    # Control for the arm above: the guard must not reject the ordinary job
+    # attributes that legitimately sit at that same four-space depth, or it
+    # would refuse every real workflow and its refusals would mean nothing.
+    label = "real job attributes at four-space depth are accepted"
+    attributes = "    needs: alpha\n    if: success()\n    runs-on: ubuntu-latest\n"
+    try:
+        jobs = parse_jobs(_PARSER_FIXTURE.format(key="  beta:\n" + attributes))
+    except SystemExit as exit_error:
+        failures += 1
+        print(f"  FAIL  {label}: refused a valid workflow: {exit_error}", file=sys.stderr)
+    else:
+        if sorted(jobs) == ["Advisory Job", "Required Job"]:
+            print(f"  ok    {label} -> two jobs")
+        else:
+            failures += 1
+            print(f"  FAIL  {label}: jobs parsed: {sorted(jobs)}", file=sys.stderr)
+
+    # The ORT-backed tests run on Windows in exactly one job, and no required
+    # check builds that graph on Windows at all. Deleting that job is valid
+    # YAML and a valid workflow, so nothing else here would notice.
+    label = "no Windows executor for the ORT-backed tests is fatal"
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        code = verify_windows_ort_coverage(jobs={"Some Linux Job": "    runs-on: ubuntu-latest\n"})
+    text = out.getvalue() + err.getvalue()
+    if code == 1 and all(package in text for package in ORT_BACKED):
+        print(f"  ok    {label} -> refused, naming all {len(ORT_BACKED)} packages")
+    else:
+        failures += 1
+        print(f"  FAIL  {label}: rc={code}, named={text!r}", file=sys.stderr)
+    return failures
+
+
+
+_OK_IF = "needs.changes.outputs.docs_only != 'true'"
+_REQ = sorted(REQUIRED_JOB_NAMES)
+
+
+def _job_body(condition: str | None = None, step_condition: str | None = None) -> str:
+    body = "    name: x\n    runs-on: ubuntu-latest\n"
+    if condition is not None:
+        body += f"    if: {condition}\n"
+    body += "    steps:\n      - name: t\n"
+    if step_condition is not None:
+        body += f"        if: {step_condition}\n"
+    return body + "        run: cargo test -p pkg-alpha\n"
+
+
+# label, jobs, expected exit, names the report must contain
+_JOB_CONDITION_ARMS: tuple[tuple[str, dict, int, list[str]], ...] = (
+    # Positive control FIRST: a zero from the arms below has to be attributable
+    # to the condition being acceptable, not to a harness that cannot refuse.
+    ("job-if: the known docs-only guard is accepted",
+     {n: _job_body(_OK_IF) for n in _REQ}, 0, []),
+    ("job-if: absent is accepted (the job always runs)",
+     {n: _job_body(None) for n in _REQ}, 0, []),
+    ("job-if: narrowed on one required job is refused",
+     {_REQ[0]: _job_body(_OK_IF),
+      _REQ[1]: _job_body(_OK_IF + " && github.event_name == 'push'")}, 1, [_REQ[1]]),
+    ("job-if: replaced wholesale is refused",
+     {_REQ[0]: _job_body("false"), _REQ[1]: _job_body(_OK_IF)}, 1, [_REQ[0]]),
+    # Discriminator: a step-level `if:` is indented deeper and must not be read
+    # as the job's. Without this arm a regex that matched any `if:` would pass
+    # every arm above -- the fixtures would not distinguish the two.
+    # Discriminator. The fixture carries ONLY a step-level `if:` -- no job-level
+    # one -- because a job-level guard would be matched first by `.search()` and
+    # the arm would pass under a regex that wrongly matched both. Monkeypatching
+    # `_JOB_IF` to `^\s*if:` makes exactly this arm fail, which is what makes it
+    # a control rather than a restatement.
+    ("job-if: a step-level if: is not read as the job's",
+     {n: _job_body(None, step_condition="false") for n in _REQ}, 0, []),
+    ("job-if: both present -- the job's is the one read",
+     {n: _job_body(_OK_IF, step_condition="false") for n in _REQ}, 0, []),
+    ("job-if: an absent required job is refused, not passed over",
+     {_REQ[0]: _job_body(_OK_IF)}, 1, [_REQ[1]]),
+)
+
+
+def _job_condition_arms() -> int:
+    failures = 0
+    for label, jobs, want_code, want_named in _JOB_CONDITION_ARMS:
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = verify_required_job_conditions(jobs)
+        except SystemExit as exit_error:
+            print(f"  FAIL  {label}\n        raised SystemExit: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        text = out.getvalue() + err.getvalue()
+        missing = [name for name in want_named if name not in text]
+        if code != want_code or missing:
+            failures += 1
+            print(f"  FAIL  {label}\n        exit want={want_code} got={code}", file=sys.stderr)
+            if missing:
+                print(f"        expected the report to name: {missing}", file=sys.stderr)
+        else:
+            named = f", naming {want_named}" if want_named else ""
+            print(f"  ok    {label} -> exit {code}{named}")
+    return failures
+
+def _probe_guarded_assignment(used: bool = True) -> int:
+    """Attribution probe for the guarded two-line form.
+
+    `used=True` is the form the workflow ships. `used=False` is the mutation
+    that matters: the same assignment, with a `cargo test` that never mentions
+    the variable. If that arm ever credits the lane, the dataflow read has
+    become a join and the gate has moved in the permissive direction.
+    """
+    resolver = "python .github/scripts/workspace_test_packages.py cargo-args ort-backed"
+    invocation = (
+        "cargo test --locked $packages -- --test-threads=1"
+        if used
+        else "cargo test --locked -p onnx-genai-cli"
+    )
+    block = "\n".join(
+        [
+            f'packages="$({resolver})"',
+            'test -n "$packages" || { echo "::error::empty"; exit 1; }',
+            invocation,
+        ]
+    )
+    tested = packages_tested_by([block])
+    want = set(ORT_BACKED) if used else {"onnx-genai-cli"}
+    if tested != want:
+        print(
+            "attribution mismatch: "
+            f"unexpected={sorted(tested - want)} absent={sorted(want - tested)}",
+            file=sys.stderr,
+        )
+        return 1
+    print("attribution as stated: " + ", ".join(sorted(tested)))
+    return 0
+
+
+def self_test() -> int:
+    """Prove both gates still refuse, on content and not merely on exit code.
+
+    An exit status is not enough to tell a refusal from a crash: `python` not
+    being on PATH exits 127, and every `SystemExit` in this file exits 1, so a
+    workflow-parse failure is indistinguishable from a real verdict. Each arm
+    below therefore states the packages it expects to be named and fails if the
+    guard reports anything else -- including reporting nothing.
+    """
+    arms: list[tuple[str, object, dict, int, list[str]]] = [
+        ("verify (control)", verify, {}, 0, []),
+        (
+            "verify --simulate-missing onnx-genai-engine",
+            verify,
+            {"simulate_missing": "onnx-genai-engine"},
+            1,
+            ["onnx-genai-engine"],
+        ),
+        ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
+        (
+            "verify-required-tier --simulate-dropped-lane ort-backed",
+            verify_required_tier,
+            {"simulate_dropped_lane": "ort-backed"},
+            1,
+            sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by credits a lane the cargo call uses",
+            _probe_guarded_assignment,
+            {"used": True},
+            0,
+            sorted(ORT_BACKED),
+        ),
+        (
+            "packages_tested_by refuses a lane the cargo call never uses",
+            _probe_guarded_assignment,
+            {"used": False},
+            0,
+            ["onnx-genai-cli"],
+        ),
+    ]
+    failures = 0
+    for label, function, kwargs, want_code, want_named in arms:
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = function(**kwargs)
+        except SystemExit as exit_error:  # a crash must not read as a verdict
+            print(f"  FAIL  {label}\n        raised SystemExit: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        text = out.getvalue() + err.getvalue()
+        missing = [package for package in want_named if package not in text]
+        if code != want_code or missing:
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        exit want={want_code} got={code}", file=sys.stderr)
+            if missing:
+                print(f"        expected the report to name: {missing}", file=sys.stderr)
+            print("        ---\n" + "\n".join(f"        {line}" for line in text.splitlines()), file=sys.stderr)
+        else:
+            named = f", naming {want_named}" if want_named else ""
+            print(f"  ok    {label} -> exit {code}{named}")
+    failures += _parser_arms()
+    failures += _conditional_arms()
+    failures += _job_condition_arms()
+    total = (
+        len(arms) + _PARSER_ARM_COUNT + len(_CONDITIONAL_ARMS) + len(_JOB_CONDITION_ARMS)
+    )
+    if failures:
+        print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
+        return 1
+    print(f"workspace test package self-test: {total}/{total} arms behaved as stated")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -143,10 +1123,20 @@ def main() -> int:
         "--simulate-missing",
         help="drop one package from the derived tested set to prove the guard fails",
     )
+    subparsers.add_parser("self-test")
+    required_parser = subparsers.add_parser("verify-required-tier")
+    required_parser.add_argument(
+        "--simulate-dropped-lane",
+        help="ignore required-job steps that run this lane, to prove the guard fails",
+    )
     args = parser.parse_args()
 
     if args.command == "verify":
         return verify(args.simulate_missing)
+    if args.command == "self-test":
+        return self_test()
+    if args.command == "verify-required-tier":
+        return verify_required_tier(args.simulate_dropped_lane)
     # Windows Python writes stdout in text mode and translates "\n" into
     # "\r\n". bash splits command substitution on IFS, which contains newline
     # but not carriage return, so each token would keep a trailing "\r" and
