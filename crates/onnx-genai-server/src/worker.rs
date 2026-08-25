@@ -16,11 +16,7 @@ use std::{
     any::Any,
     fmt,
     panic::{self, AssertUnwindSafe},
-    sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
-        mpsc as std_mpsc,
-    },
+    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc as std_mpsc},
     thread,
 };
 
@@ -182,36 +178,170 @@ pub(crate) struct WorkerHandle {
     state: Arc<WorkerState>,
 }
 
-const WORKER_STARTING: u8 = 0;
-const WORKER_HEALTHY: u8 = 1;
-const WORKER_STOPPED: u8 = 2;
-const WORKER_FAILED: u8 = 3;
-
 struct WorkerState {
-    health: AtomicU8,
-    live_sessions: AtomicUsize,
-    pending_sessions: AtomicUsize,
-    active_turns: AtomicUsize,
+    lifecycle: Mutex<WorkerLifecycle>,
+}
+
+struct WorkerLifecycle {
+    health: WorkerHealth,
+    live_sessions: usize,
+    pending_sessions: usize,
+    active_turns: usize,
 }
 
 impl WorkerState {
     fn new() -> Self {
         Self {
-            health: AtomicU8::new(WORKER_STARTING),
-            live_sessions: AtomicUsize::new(0),
-            pending_sessions: AtomicUsize::new(0),
-            active_turns: AtomicUsize::new(0),
+            lifecycle: Mutex::new(WorkerLifecycle {
+                health: WorkerHealth::Starting,
+                live_sessions: 0,
+                pending_sessions: 0,
+                active_turns: 0,
+            }),
         }
     }
 
     fn health(&self) -> WorkerHealth {
-        match self.health.load(Ordering::Acquire) {
-            WORKER_STARTING => WorkerHealth::Starting,
-            WORKER_HEALTHY => WorkerHealth::Healthy,
-            WORKER_STOPPED => WorkerHealth::Stopped,
-            WORKER_FAILED => WorkerHealth::Failed,
-            _ => WorkerHealth::Failed,
+        lock(&self.lifecycle).health
+    }
+
+    fn mark_healthy(&self) {
+        lock(&self.lifecycle).health = WorkerHealth::Healthy;
+    }
+
+    fn mark_stopped(&self) {
+        let mut lifecycle = lock(&self.lifecycle);
+        if lifecycle.health != WorkerHealth::Failed {
+            lifecycle.health = WorkerHealth::Stopped;
         }
+        lifecycle.live_sessions = 0;
+        lifecycle.pending_sessions = 0;
+        lifecycle.active_turns = 0;
+    }
+
+    fn mark_failed(&self) {
+        let mut lifecycle = lock(&self.lifecycle);
+        lifecycle.health = WorkerHealth::Failed;
+        lifecycle.live_sessions = 0;
+        lifecycle.active_turns = 0;
+    }
+
+    fn placement_load(&self) -> Option<usize> {
+        let lifecycle = lock(&self.lifecycle);
+        (lifecycle.health == WorkerHealth::Healthy).then(|| {
+            lifecycle
+                .live_sessions
+                .saturating_add(lifecycle.pending_sessions)
+        })
+    }
+
+    fn reserve_session(
+        self: &Arc<Self>,
+        worker: WorkerId,
+    ) -> Result<SessionPlacementReservation, WorkerUnavailable> {
+        let mut lifecycle = lock(&self.lifecycle);
+        match lifecycle.health {
+            WorkerHealth::Healthy => {
+                lifecycle.pending_sessions += 1;
+                Ok(SessionPlacementReservation {
+                    worker,
+                    state: Arc::clone(self),
+                    committed: false,
+                })
+            }
+            WorkerHealth::Failed => Err(WorkerUnavailable::Failed(worker)),
+            WorkerHealth::Starting | WorkerHealth::Stopped => {
+                Err(WorkerUnavailable::Stopped(worker))
+            }
+        }
+    }
+
+    fn commit_session(
+        self: &Arc<Self>,
+        worker: WorkerId,
+    ) -> Result<CommittedSession, WorkerUnavailable> {
+        let mut lifecycle = lock(&self.lifecycle);
+        checked_decrement(&mut lifecycle.pending_sessions, worker, "pending-session");
+        match lifecycle.health {
+            WorkerHealth::Healthy => {
+                lifecycle.live_sessions += 1;
+                Ok(CommittedSession {
+                    worker,
+                    state: Arc::clone(self),
+                    armed: true,
+                })
+            }
+            WorkerHealth::Failed => Err(WorkerUnavailable::Failed(worker)),
+            WorkerHealth::Starting | WorkerHealth::Stopped => {
+                Err(WorkerUnavailable::Stopped(worker))
+            }
+        }
+    }
+
+    fn release_pending_session(&self, worker: WorkerId) {
+        checked_decrement(
+            &mut lock(&self.lifecycle).pending_sessions,
+            worker,
+            "pending-session",
+        );
+    }
+
+    fn reserve_turn(
+        self: &Arc<Self>,
+        worker: WorkerId,
+    ) -> Result<WorkerTurnGuard, WorkerUnavailable> {
+        let mut lifecycle = lock(&self.lifecycle);
+        match lifecycle.health {
+            WorkerHealth::Healthy => {
+                lifecycle.active_turns += 1;
+                Ok(WorkerTurnGuard {
+                    worker,
+                    state: Arc::clone(self),
+                })
+            }
+            WorkerHealth::Failed => Err(WorkerUnavailable::Failed(worker)),
+            WorkerHealth::Starting | WorkerHealth::Stopped => {
+                Err(WorkerUnavailable::Stopped(worker))
+            }
+        }
+    }
+
+    fn release_turn(&self, worker: WorkerId) {
+        checked_decrement(
+            &mut lock(&self.lifecycle).active_turns,
+            worker,
+            "active-turn",
+        );
+    }
+
+    fn release_live_session(&self, worker: WorkerId) {
+        checked_decrement(
+            &mut lock(&self.lifecycle).live_sessions,
+            worker,
+            "live-session",
+        );
+    }
+
+    fn status(&self, id: WorkerId) -> WorkerStatusSnapshot {
+        let lifecycle = lock(&self.lifecycle);
+        WorkerStatusSnapshot {
+            id,
+            active_turns: lifecycle.active_turns,
+            live_sessions: lifecycle.live_sessions,
+            health: lifecycle.health,
+        }
+    }
+}
+
+fn checked_decrement(value: &mut usize, worker: WorkerId, counter: &'static str) {
+    if let Some(next) = value.checked_sub(1) {
+        *value = next;
+    } else {
+        tracing::warn!(
+            worker = %worker,
+            counter,
+            "ignored a stale worker counter release after lifecycle invalidation"
+        );
     }
 }
 
@@ -248,13 +378,13 @@ pub(crate) struct WorkerStatusSnapshot {
 /// failure, cancellation, backend error, and normal completion share one exact
 /// accounting path.
 pub(crate) struct WorkerTurnGuard {
+    worker: WorkerId,
     state: Arc<WorkerState>,
 }
 
 impl Drop for WorkerTurnGuard {
     fn drop(&mut self) {
-        let previous = self.state.active_turns.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "worker active-turn counter underflow");
+        self.state.release_turn(self.worker);
     }
 }
 
@@ -273,33 +403,54 @@ pub(crate) struct SessionPlacementReservation {
     committed: bool,
 }
 
+pub(crate) struct CommittedSession {
+    worker: WorkerId,
+    state: Arc<WorkerState>,
+    armed: bool,
+}
+
+impl CommittedSession {
+    /// Transfer ownership of the live count to the persistent engine session.
+    pub(crate) fn persist(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommittedSession {
+    fn drop(&mut self) {
+        if self.armed {
+            self.state.release_live_session(self.worker);
+        }
+    }
+}
+
+pub(crate) struct SessionCloseAccounting {
+    worker: WorkerId,
+    state: Arc<WorkerState>,
+}
+
+impl SessionCloseAccounting {
+    /// Release the persistent live-session count after the engine confirms close.
+    pub(crate) fn session_closed(self) {
+        self.state.release_live_session(self.worker);
+    }
+}
+
 impl SessionPlacementReservation {
     pub(crate) fn worker(&self) -> WorkerId {
         self.worker
     }
 
-    pub(crate) fn commit(mut self) -> Result<(), WorkerUnavailable> {
-        let pending = self.state.pending_sessions.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(pending > 0, "worker pending-session counter underflow");
+    pub(crate) fn commit(mut self) -> Result<CommittedSession, WorkerUnavailable> {
         self.committed = true;
-        match self.state.health() {
-            WorkerHealth::Healthy => {
-                self.state.live_sessions.fetch_add(1, Ordering::AcqRel);
-                Ok(())
-            }
-            WorkerHealth::Failed => Err(WorkerUnavailable::Failed(self.worker)),
-            WorkerHealth::Stopped | WorkerHealth::Starting => {
-                Err(WorkerUnavailable::Stopped(self.worker))
-            }
-        }
+        self.state.commit_session(self.worker)
     }
 }
 
 impl Drop for SessionPlacementReservation {
     fn drop(&mut self) {
         if !self.committed {
-            let pending = self.state.pending_sessions.fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(pending > 0, "worker pending-session counter underflow");
+            self.state.release_pending_session(self.worker);
         }
     }
 }
@@ -339,15 +490,14 @@ impl WorkerHandle {
             .spawn(
                 move || match panic::catch_unwind(AssertUnwindSafe(initialize)) {
                     Ok(Ok((state, ready))) => {
-                        thread_state.health.store(WORKER_HEALTHY, Ordering::Release);
+                        thread_state.mark_healthy();
                         if ready_tx.send(Ok(ready)).is_ok() {
                             match panic::catch_unwind(AssertUnwindSafe(|| run(state))) {
                                 Ok(()) => {
-                                    thread_state.health.store(WORKER_STOPPED, Ordering::Release);
+                                    thread_state.mark_stopped();
                                 }
                                 Err(payload) => {
-                                    thread_state.live_sessions.store(0, Ordering::Release);
-                                    thread_state.health.store(WORKER_FAILED, Ordering::Release);
+                                    thread_state.mark_failed();
                                     tracing::error!(
                                         worker = %thread_id,
                                         panic = %panic_message(payload),
@@ -356,15 +506,15 @@ impl WorkerHandle {
                                 }
                             }
                         } else {
-                            thread_state.health.store(WORKER_STOPPED, Ordering::Release);
+                            thread_state.mark_stopped();
                         }
                     }
                     Ok(Err(error)) => {
-                        thread_state.health.store(WORKER_FAILED, Ordering::Release);
+                        thread_state.mark_failed();
                         let _ = ready_tx.send(Err(WorkerStartError::Initialization(error)));
                     }
                     Err(payload) => {
-                        thread_state.health.store(WORKER_FAILED, Ordering::Release);
+                        thread_state.mark_failed();
                         let _ = ready_tx.send(Err(WorkerStartError::InitializationPanicked(
                             panic_message(payload),
                         )));
@@ -393,10 +543,12 @@ impl WorkerHandle {
             commands: Mutex::new(Some(commands)),
             join: Mutex::new(None),
             state: Arc::new(WorkerState {
-                health: AtomicU8::new(WORKER_HEALTHY),
-                live_sessions: AtomicUsize::new(0),
-                pending_sessions: AtomicUsize::new(0),
-                active_turns: AtomicUsize::new(0),
+                lifecycle: Mutex::new(WorkerLifecycle {
+                    health: WorkerHealth::Healthy,
+                    live_sessions: 0,
+                    pending_sessions: 0,
+                    active_turns: 0,
+                }),
             }),
         })
     }
@@ -446,6 +598,7 @@ impl WorkerHandle {
                 tracing::debug!(worker = %self.id, "engine worker stopped");
             }
         }
+        self.state.mark_stopped();
     }
 
     /// Whether the worker thread has been joined by an explicit shutdown.
@@ -455,44 +608,30 @@ impl WorkerHandle {
     }
 
     fn placement_load(&self) -> usize {
-        self.state
-            .live_sessions
-            .load(Ordering::Acquire)
-            .saturating_add(self.state.pending_sessions.load(Ordering::Acquire))
+        self.state.placement_load().unwrap_or(usize::MAX)
     }
 
     fn active_turns(&self) -> usize {
-        self.state.active_turns.load(Ordering::Acquire)
+        self.status().active_turns
     }
 
-    fn reserve_session(&self) -> SessionPlacementReservation {
-        self.state.pending_sessions.fetch_add(1, Ordering::AcqRel);
-        SessionPlacementReservation {
+    fn reserve_session(&self) -> Result<SessionPlacementReservation, WorkerUnavailable> {
+        self.state.reserve_session(self.id)
+    }
+
+    fn reserve_turn(&self) -> Result<WorkerTurnGuard, WorkerUnavailable> {
+        self.state.reserve_turn(self.id)
+    }
+
+    pub(crate) fn session_close_accounting(&self) -> SessionCloseAccounting {
+        SessionCloseAccounting {
             worker: self.id,
             state: Arc::clone(&self.state),
-            committed: false,
         }
-    }
-
-    fn reserve_turn(&self) -> WorkerTurnGuard {
-        self.state.active_turns.fetch_add(1, Ordering::AcqRel);
-        WorkerTurnGuard {
-            state: Arc::clone(&self.state),
-        }
-    }
-
-    pub(crate) fn session_closed(&self) {
-        let previous = self.state.live_sessions.fetch_sub(1, Ordering::AcqRel);
-        debug_assert!(previous > 0, "worker live-session counter underflow");
     }
 
     pub(crate) fn status(&self) -> WorkerStatusSnapshot {
-        WorkerStatusSnapshot {
-            id: self.id,
-            active_turns: self.active_turns(),
-            live_sessions: self.state.live_sessions.load(Ordering::Acquire),
-            health: self.state.health(),
-        }
+        self.state.status(self.id)
     }
 }
 
@@ -575,13 +714,17 @@ impl WorkerPool {
         &self,
     ) -> Result<SessionPlacementReservation, WorkerUnavailable> {
         let _selection = lock(&self.selection);
-        let worker = self
-            .workers
-            .iter()
-            .filter(|worker| worker.is_running())
-            .min_by_key(|worker| (worker.placement_load(), worker.id()))
-            .ok_or_else(|| self.no_running_worker_error())?;
-        Ok(worker.reserve_session())
+        loop {
+            let worker = self
+                .workers
+                .iter()
+                .filter(|worker| worker.is_running())
+                .min_by_key(|worker| (worker.placement_load(), worker.id()))
+                .ok_or_else(|| self.no_running_worker_error())?;
+            if let Ok(reservation) = worker.reserve_session() {
+                return Ok(reservation);
+            }
+        }
     }
 
     /// Reserve one stateless turn on the least-loaded healthy worker.
@@ -589,19 +732,23 @@ impl WorkerPool {
         &self,
     ) -> Result<(WorkerId, WorkerTurnGuard), WorkerUnavailable> {
         let _selection = lock(&self.selection);
-        let worker = self
-            .workers
-            .iter()
-            .filter(|worker| worker.is_running())
-            .min_by_key(|worker| (worker.active_turns(), worker.id()))
-            .ok_or_else(|| self.no_running_worker_error())?;
-        Ok((worker.id(), worker.reserve_turn()))
+        loop {
+            let worker = self
+                .workers
+                .iter()
+                .filter(|worker| worker.is_running())
+                .min_by_key(|worker| (worker.active_turns(), worker.id()))
+                .ok_or_else(|| self.no_running_worker_error())?;
+            if let Ok(turn) = worker.reserve_turn() {
+                return Ok((worker.id(), turn));
+            }
+        }
     }
 
     pub(crate) fn reserve_turn(&self, id: WorkerId) -> Result<WorkerTurnGuard, WorkerUnavailable> {
         let worker = self.worker(id)?;
         worker.sender()?;
-        Ok(worker.reserve_turn())
+        worker.reserve_turn()
     }
 
     fn no_running_worker_error(&self) -> WorkerUnavailable {
@@ -804,7 +951,7 @@ mod tests {
             .reserve_session_placement()
             .expect("the primary worker accepts sessions");
         assert_eq!(reservation.worker(), WorkerId::PRIMARY);
-        reservation.commit().unwrap();
+        reservation.commit().unwrap().persist();
         assert!(pool.sender_for(WorkerId::PRIMARY).is_ok());
 
         let error = pool
@@ -841,10 +988,10 @@ mod tests {
 
         let first = pool.reserve_session_placement().unwrap();
         assert_eq!(first.worker(), WorkerId::new(0));
-        first.commit().unwrap();
+        first.commit().unwrap().persist();
         let second = pool.reserve_session_placement().unwrap();
         assert_eq!(second.worker(), WorkerId::new(1));
-        second.commit().unwrap();
+        second.commit().unwrap().persist();
         let tied = pool.reserve_session_placement().unwrap();
         assert_eq!(tied.worker(), WorkerId::new(0));
         drop(tied);
@@ -902,6 +1049,27 @@ mod tests {
     }
 
     #[test]
+    fn failure_is_atomic_with_session_commit_and_stale_release() {
+        let (pool, _receivers) = detached_pool(1);
+        let worker = Arc::clone(pool.primary());
+        let pending = pool.reserve_session_placement().unwrap();
+        let turn = pool.reserve_turn(WorkerId::PRIMARY).unwrap();
+
+        worker.state.mark_failed();
+
+        assert!(matches!(
+            pending.commit(),
+            Err(WorkerUnavailable::Failed(WorkerId::PRIMARY))
+        ));
+        drop(turn);
+        worker.session_close_accounting().session_closed();
+        let status = worker.status();
+        assert_eq!(status.health, WorkerHealth::Failed);
+        assert_eq!(status.live_sessions, 0);
+        assert_eq!(status.active_turns, 0);
+    }
+
+    #[test]
     fn shutting_down_a_pool_stops_every_worker() {
         let counter = Arc::new(AtomicUsize::new(0));
         let (worker, extra_sender) = counting_worker(Arc::clone(&counter));
@@ -916,6 +1084,28 @@ mod tests {
             Err(WorkerUnavailable::Stopped(WorkerId::PRIMARY))
         ));
         pool.shutdown();
+    }
+
+    #[test]
+    fn graceful_shutdown_clears_worker_counts() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (worker, extra_sender) = counting_worker(counter);
+        drop(extra_sender);
+        let pool = WorkerPool::single(Arc::clone(&worker));
+        pool.reserve_session_placement()
+            .unwrap()
+            .commit()
+            .unwrap()
+            .persist();
+        let turn = pool.reserve_turn(WorkerId::PRIMARY).unwrap();
+
+        pool.shutdown();
+
+        let status = worker.status();
+        assert_eq!(status.health, WorkerHealth::Stopped);
+        assert_eq!(status.live_sessions, 0);
+        assert_eq!(status.active_turns, 0);
+        drop(turn);
     }
 
     #[test]

@@ -56,7 +56,8 @@ to one worker.
 
 The worker factory shares only immutable/lifetime resources: `Arc<Session>`,
 `Arc<Environment>`, `Arc<Tokenizer>`, and `Arc<WorkflowPlan>`, plus the
-process-wide device memory authority needed for exact global accounting. Every
+model-wide device/host/disk memory authorities needed for exact aggregate
+accounting. Every
 worker constructs fresh KV caches, scheduler/governor policy, workflow mutable
 state, bindings, values, allocators, samplers, graph-capture ids, diagnostics,
 session maps, and local id allocators on its owner thread.
@@ -74,12 +75,12 @@ unavailable and are not migrated or restarted; other workers remain routable.
 Pool startup is all-or-nothing, and a later-worker initialization failure
 shuts down and joins every worker already reported ready.
 
-The Python binding reaches the same conclusion by a different route: it holds
-`inner: Mutex<RustEngine>` (`crates/onnx-genai-python/src/lib.rs:187-188`) and
-refuses contention outright rather than blocking, raising `PyRuntimeError` with
-the message *"engine is in use by another thread — onnx_genai Engine is not
-re-entrant; serialize calls or use one Engine per thread"*
-(`python/src/lib.rs:173-184`).
+The Python binding uses the same owner-thread rule through a typed façade:
+`EngineOwner` constructs, runs, and drops `RustEngine` on one OS thread while
+the sendable pyclass moves only commands and results. Python releases the GIL
+while waiting. An atomic single-flight gate preserves the existing immediate
+`PyRuntimeError` for concurrent or callback-reentrant calls rather than queuing
+them behind the active operation.
 
 So today's server answer is: one session remains single-flight, while distinct
 sessions may execute in parallel only across explicitly configured, supported
@@ -392,11 +393,13 @@ reason.
   path `create_session` *returns the KV sequence id directly*
   (`engine/runtime.rs:1538`), so the session identifier and the paged-KV
   sequence identifier are the same number. This matters in §4.1.
-- **Memory accounting has one process-wide device authority.** Each worker owns
-  a private governor, scheduler budget, host/disk ledger, and diagnostics. Their
-  device-tier leases charge the same authority, and the primary fixed-weight
+- **Memory accounting shares every tier authority.** Each worker owns private
+  governor policy, scheduler state, plans, and diagnostics, but device, host,
+  and disk leases charge the same model-wide ledgers. The primary fixed-weight
   plan is retained until the last engine sharing the ORT session drops. Thus
-  weights are charged once while worker-local KV is charged once per worker.
+  weights are charged once while every worker-local KV pool is charged once
+  against one aggregate host ceiling rather than receiving a private copy of
+  that ceiling.
   Underneath,
   `ByteBudget` is already `Arc<Mutex<BudgetState>>` and documents itself as *"A
   shared, dynamic, cross-session KV byte budget"* whose clones "account against a
@@ -1505,9 +1508,9 @@ exists per runtime — a second would double-count every reservation"*
 **Therefore accounting stays global and shared; only the things it accounts for
 are per-worker.**
 
-- The device memory authority and its `LeaseLedger` stay one instance, shared
-  across workers behind `Arc`
-  (`crates/onnx-genai-engine/src/memory_authority.rs:37-50`).
+- Device, host, and disk authorities stay one set of ledgers shared across
+  workers. Worker-local policy may report the same configured ceilings, but
+  every actual lease admits against those aggregate ledgers.
 - `ByteBudget` is already built for this: it is `Arc<Mutex<BudgetState>>` and
   documents that clones "account against a single running total, so no single
   session can blow the global ceiling" (`byte_budget.rs:122-133`). Each worker
@@ -2291,13 +2294,21 @@ worker thread, and the former `unsafe impl Send for Engine` is gone.
 
 The primary worker freezes an `OrtEngineWorkerFactory`. Additional workers
 share the immutable ORT session/environment/tokenizer/workflow plan and global
-device memory authority, while constructing fresh worker-local mutable state.
+device/host/disk memory authorities, while constructing fresh worker-local
+mutable state.
 Startup is transactional: any initialization failure shuts down and joins
 already-ready workers.
 
 Session placement is least live-plus-pending sessions with lowest-id ties;
 stateless placement is least active turns with the same tie rule. RAII
 reservations release counters on success, error, cancellation, and failed send.
+Queued create commands own their reservation and retain an unclaimed session
+until the submitting future acknowledges receipt; cancellation closes it on
+the owner thread. Queued close commands own the exclusive lease and live-count
+release, and embedding commands own their admission/active-turn permits until
+execution finishes, independently of response receiver delivery. Worker
+health and all placement counters transition under one lifecycle lock, so
+failure and shutdown cannot race a late commit into a cleared count.
 All session operations currently exposed by the server route through the saved
 placement. Local ids may collide, no cross-worker migration occurs, and
 continuous batching remains per worker.
@@ -2327,9 +2338,11 @@ rows in flight.
   façade. The low-level `Engine` intentionally remains an owner-thread object;
   callers needing parallelism construct one engine per owner or use the server
   worker pool rather than wrapping an engine in a global mutex.
-- The Python `Engine` pyclass is explicitly `unsendable`, matching the
-  low-level engine's structural owner-thread contract. This server phase makes
-  no Python session-concurrency claim.
+- The Python `Engine` pyclass is sendable because it contains only an
+  owner-thread command façade, not a low-level engine. `RustEngine` remains
+  structurally thread-affine, Python waits with the GIL released, and the
+  façade remains single-flight; this server phase makes no Python
+  session-concurrency claim.
 - The C ABI exposes no session lifecycle today
   (its entire exported surface runs from `oge_last_error` to `oge_string_free`,
   `crates/onnx-genai-capi/src/lib.rs:79-423`, with no `oge_session_*` entry

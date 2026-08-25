@@ -3,7 +3,7 @@
 use super::*;
 use crate::engine::memory_plan::Holder;
 use crate::memory_authority::{
-    DeviceCompatibilityDomain, DeviceMemoryAuthority, MemoryAuthorityProvider,
+    DeviceCompatibilityDomain, EngineMemoryGovernor, MemoryAuthorityProvider,
     SharedMemoryAuthorityProvider,
 };
 
@@ -48,11 +48,18 @@ pub enum OrtSessionWorkerLoadError {
     MissingEnvironment,
 }
 
+struct SessionEnvironment<S, E> {
+    session: S,
+    // Rust drops fields in declaration order. The environment must therefore
+    // remain last so every session reference is released before its owner.
+    environment: E,
+}
+
 /// Immutable, `Send + Sync` construction plan for additional ORT engine
 /// workers. Every call to [`build_worker`](Self::build_worker) creates fresh
 /// mutable KV, scheduler, workflow, sampler, binding, and diagnostic state on
 /// the calling thread. It shares immutable `Arc`-owned runtime resources plus
-/// narrowly scoped process/device accounting authorities; no worker-local
+/// model-wide device/host/disk accounting authorities; no worker-local
 /// mutable execution state is reachable through the factory.
 pub struct OrtEngineWorkerFactory {
     config: EngineConfig,
@@ -62,14 +69,14 @@ pub struct OrtEngineWorkerFactory {
     decode_path: ModelDecodePath,
     memory_strategy_plan: MemoryStrategyPlan,
     workflow: crate::pipeline::HostedWorkflowWorkerFactory,
-    environment: Arc<Environment>,
-    session: Arc<Session>,
     tokenizer: Arc<Tokenizer>,
-    device_authority: DeviceMemoryAuthority,
+    memory_authority: EngineMemoryGovernor,
     process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     shared_memory_plan: Arc<std::sync::Mutex<crate::engine::memory_plan::ModelMemoryPlan>>,
     fim_config: Option<FimConfig>,
     num_speculative_tokens: usize,
+    // Final resource field; its own final field is the environment.
+    session_environment: SessionEnvironment<Arc<Session>, Arc<Environment>>,
 }
 
 impl OrtEngineWorkerFactory {
@@ -79,7 +86,7 @@ impl OrtEngineWorkerFactory {
             &self.config,
             self.kv_model.as_ref(),
             &self.decode_path,
-            self.device_authority.clone(),
+            self.memory_authority.clone(),
             self.process_memory_manager.clone(),
         )?);
         let kv_cache = allocate_kv_cache(&self.config, self.kv_model.as_ref(), &governor)?;
@@ -106,7 +113,7 @@ impl OrtEngineWorkerFactory {
             // Local ids intentionally begin at one in every worker.
             // SessionPlacement supplies the worker-qualified public identity.
             workflow_session_ids: SharedSessionIds::new(),
-            session: Some(Arc::clone(&self.session)),
+            session: Some(Arc::clone(&self.session_environment.session)),
             #[cfg(feature = "native-backend")]
             native_session: None,
             #[cfg(feature = "native-backend")]
@@ -136,8 +143,45 @@ impl OrtEngineWorkerFactory {
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
             _shared_memory_plan: Some(Arc::clone(&self.shared_memory_plan)),
-            _environment: Some(Arc::clone(&self.environment)),
+            _environment: Some(Arc::clone(&self.session_environment.environment)),
         })
+    }
+}
+
+#[cfg(test)]
+mod worker_factory_drop_order_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::SessionEnvironment;
+
+    struct DropProbe {
+        name: &'static str,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.order.lock().unwrap().push(self.name);
+        }
+    }
+
+    #[test]
+    fn session_environment_releases_session_before_environment() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let resources = SessionEnvironment {
+            session: DropProbe {
+                name: "session",
+                order: Arc::clone(&order),
+            },
+            environment: DropProbe {
+                name: "environment",
+                order: Arc::clone(&order),
+            },
+        };
+
+        drop(resources);
+
+        assert_eq!(*order.lock().unwrap(), ["session", "environment"]);
     }
 }
 
@@ -249,14 +293,16 @@ impl Engine {
             decode_path: self.decode_path.clone(),
             memory_strategy_plan: self.memory_strategy_plan.clone(),
             workflow: self.workflow.hosted_worker_factory(hosted_directory),
-            environment: Arc::clone(environment),
-            session: Arc::clone(session),
             tokenizer: Arc::clone(tokenizer),
-            device_authority: self.governor.device_authority(),
+            memory_authority: self.governor.memory().clone(),
             process_memory_manager: self.governor.process_memory_manager(),
             shared_memory_plan: self.governor.plan_keepalive(),
             fim_config: self.fim_config.clone(),
             num_speculative_tokens: self.num_speculative_tokens,
+            session_environment: SessionEnvironment {
+                session: Arc::clone(session),
+                environment: Arc::clone(environment),
+            },
         })
     }
 
@@ -1778,7 +1824,7 @@ fn build_worker_governor(
     config: &EngineConfig,
     kv_model: Option<&KvModelInfo>,
     decode_path: &ModelDecodePath,
-    device_authority: DeviceMemoryAuthority,
+    memory_authority: EngineMemoryGovernor,
     process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
 ) -> anyhow::Result<EngineResourceGovernor> {
     let governor_kv_config = match (kv_model, decode_path) {
@@ -1787,12 +1833,12 @@ fn build_worker_governor(
         }
         _ => governor_kv_config(kv_model, config)?,
     };
-    EngineResourceGovernor::new_worker_with_shared_device(
+    EngineResourceGovernor::new_worker_with_shared_memory(
         config.limits.clone(),
         config.allow_runtime_override,
         governor_kv_config,
         None,
-        device_authority,
+        memory_authority,
         process_memory_manager,
     )
     .map_err(|error| anyhow::anyhow!("Failed to initialize worker Resource Governor: {error}"))

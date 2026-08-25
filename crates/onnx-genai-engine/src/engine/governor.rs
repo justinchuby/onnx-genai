@@ -255,19 +255,21 @@ impl EngineResourceGovernor {
         )
     }
 
-    /// Build a worker-local governor over an already-accounted shared device
-    /// authority. The worker gets private policy, host/disk ledgers, plans, and
-    /// diagnostics; only the process-wide device ledger is shared.
-    pub(crate) fn new_worker_with_shared_device(
+    /// Build a worker-local governor over the model's shared tier authorities.
+    ///
+    /// Policy, plans, and diagnostics remain worker-local. Device, host, and
+    /// disk leases all charge the same model-wide ledgers, so adding workers
+    /// cannot multiply any configured memory ceiling.
+    pub(crate) fn new_worker_with_shared_memory(
         limits: ResourceLimits,
         allow_runtime_override: bool,
         kv_config: ModelKvConfig,
         cuda_device_index: Option<u32>,
-        device: DeviceMemoryAuthority,
+        memory: EngineMemoryGovernor,
         process_memory_manager: onnx_runtime_memory_governor::ProcessMemoryManager,
     ) -> Result<Self, ResourceError> {
         let capacities = capacity_providers_for_device(&limits, cuda_device_index);
-        let domain = device.domain().clone();
+        let domain = memory.device_authority().domain().clone();
         let mut governor = Self::new_with_capacities_and_authority(
             limits,
             allow_runtime_override,
@@ -277,12 +279,6 @@ impl EngineResourceGovernor {
             None,
             Some(&domain),
         )?;
-        let snapshot = governor.inner.snapshot();
-        let memory = EngineMemoryGovernor::new(
-            device,
-            snapshot.resolved_limits.host_ram_bytes,
-            snapshot.disk_spill.as_ref().map_or(0, |tier| tier.limit),
-        );
         governor.memory = memory.clone();
         governor.process_memory_manager = process_memory_manager;
         governor.plan = Arc::new(std::sync::Mutex::new(ModelMemoryPlan::new(memory)));
