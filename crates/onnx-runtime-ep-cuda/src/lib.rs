@@ -102,6 +102,7 @@ mod trace;
 pub use onnx_runtime_cuda_memory::{virtual_memory, vmm_allocator};
 pub mod coarse_residency;
 pub mod granule_transition;
+pub mod prefill_double_buffer;
 pub mod route_residency;
 pub mod weight_paging;
 
