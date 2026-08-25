@@ -379,7 +379,9 @@ fn block_quantized_moe_kernel(top_k: usize) -> Box<dyn Kernel> {
         Attribute::String(b"identity".to_vec()),
     );
     node.attributes
-        .insert("format".into(), Attribute::String(b"mxfp4".to_vec()));
+        .insert("fc1_format".into(), Attribute::String(b"mxfp4".to_vec()));
+    node.attributes
+        .insert("fc2_format".into(), Attribute::String(b"mxfp4".to_vec()));
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
     CpuExecutionProvider::new()

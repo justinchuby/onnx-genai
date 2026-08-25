@@ -255,9 +255,19 @@ fn model_node(config: &Config, inputs: &[Option<HostTensor>]) -> (Graph, NodeId)
         Attribute::Int(config.swiglu_fusion as i64),
     );
     node.attributes.insert(
-        "format".into(),
+        "fc1_format".into(),
         Attribute::String(FORMAT.as_bytes().to_vec()),
     );
+    node.attributes.insert(
+        "fc2_format".into(),
+        Attribute::String(FORMAT.as_bytes().to_vec()),
+    );
+    if config.needs_fc3() {
+        node.attributes.insert(
+            "fc3_format".into(),
+            Attribute::String(FORMAT.as_bytes().to_vec()),
+        );
+    }
     node.attributes
         .insert("block_layout_version".into(), Attribute::Int(1));
     if config.activation == "swiglu" {
@@ -626,7 +636,7 @@ fn block_quantized_moe_claim_gate_matches_implemented_config() {
     bad_format
         .node_mut(node)
         .attributes
-        .insert("format".into(), Attribute::String(b"q4_0".to_vec()));
+        .insert("fc1_format".into(), Attribute::String(b"q4_0".to_vec()));
     let bad_model = Model::new(&bad_format);
     assert!(matches!(
         ep.supports_op(bad_model.graph.node(node), 1, &shapes, &dtypes, &[]),
