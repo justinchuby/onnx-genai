@@ -20437,7 +20437,27 @@ mod tests {
     /// masking" as a defect. Collapsing them the other way -- skipping on both
     /// -- would have been worse, because it removes Linux coverage the moment
     /// masking breaks there, and Linux is where this arm actually runs.
+    ///
+    /// #2078 fixed the red with the platform half of this, which is the part
+    /// that matters for a green lane. Reporting the *outcome* rather than the
+    /// platform is what closes the remainder: the parent then keys its skip on
+    /// what happened rather than on what it assumes must have happened, and the
+    /// three unanswerable paths below stop being silent `return`s.
     fn restrict_self_to_leader_cpus() -> bool {
+        // Short-circuit before touching topology or cpuset state. On a target
+        // with no masking the answer is already settled, and probing on the way
+        // to a foregone conclusion only creates ways for this arm to fail for
+        // reasons that are not its subject -- `require_host_for_placement`
+        // below fails closed on Windows, which is right in general and wrong
+        // as a side effect of a call that was never going to narrow anything.
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            eprintln!(
+                "leader-only narrowing skipped: process-wide CPU affinity masking is \
+                 implemented only on Linux, so a leader-only cpuset cannot be constructed \
+                 on this target"
+            );
+            return false;
+        }
         let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
             eprintln!(
                 "leader-only narrowing skipped: this target cannot report the CPUs it is \
@@ -20831,35 +20851,47 @@ mod tests {
     /// report in what "default" resolved to.
     #[test]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        // Process-wide affinity masking is Linux-only, so on every other target
+        // the leader-only cpuset this test asserts about cannot be built. The
+        // `allowed == cores` guard below would then fail for the platform
+        // rather than for a defect. Skipping is loud rather than silent: an
+        // unexplained green here is exactly the vacuity the sweep exists to
+        // avoid, and the reason belongs in the log, not only in this comment.
+        //
+        // Keyed on the same `cfg!`-derived constant the child uses, rather than
+        // on a second copy of `cfg!(target_os = "linux")`, so that the day
+        // Windows masking is implemented there is one place to change and a
+        // unit test that fails if it is not changed. Two independent copies of
+        // a support predicate drift, and the direction they drift in is a
+        // permanent silent skip.
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            eprintln!(
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
+                 process-wide CPU affinity masking is implemented only on Linux, so a \
+                 leader-only cpuset cannot be constructed on this target"
+            );
+            return;
+        }
+
         let report = realized_default_width_report();
 
-        // The arm is built on a cpuset the child narrows for itself, and
-        // `set_current_thread_affinity` is implemented on Linux only. Where it
-        // is not, the shape is unbuildable by construction and there is nothing
-        // to measure -- which is a different answer from "narrowing failed",
-        // and the child already panicked on that one.
+        // Past the platform gate, narrowing is not optional. This asserts what
+        // *happened* rather than re-deriving what the platform should have
+        // allowed: the child has three further paths on which it declines to
+        // narrow (no readable cpuset, undetectable topology, a topology
+        // covering none of the allowed CPUs), and every one of them used to be
+        // a silent `return` that left this arm measuring the full cpuset.
         //
-        // The guard is `cfg!`-derived rather than a runtime probe, so it cannot
-        // silently start excusing a Linux host: if narrowing regresses on the
-        // platform where this arm actually runs, this fails rather than skips.
-        // #2059 merged with both Windows lanes red for the mirror-image reason
-        // -- it treated an absent capability as a defect -- and the fix must
-        // not overshoot into treating a defect as an absent capability.
+        // `allowed == cores` below catches that only on an SMT host, where the
+        // two differ. On a machine without SMT it holds on the *un-narrowed*
+        // set too, and the arm would pass while testing nothing.
         assert!(
-            report.narrowed_to_leaders || !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED,
+            report.narrowed_to_leaders,
             "this target implements process-wide affinity masking, so the child must have \
              narrowed itself to one CPU per physical core -- it reports that it did not, \
              and every assertion below would then be about the host rather than about the \
              default width resolver ({report:?})"
         );
-        if !report.narrowed_to_leaders {
-            eprintln!(
-                "skipping {}: this target has no process-wide affinity masking, so a \
-                 leader-only cpuset cannot be constructed here ({report:?})",
-                module_path!()
-            );
-            return;
-        }
 
         if !report.pool_built {
             // No persistent pool on this target: there is no placement to

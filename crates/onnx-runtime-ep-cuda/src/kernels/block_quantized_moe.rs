@@ -67,6 +67,18 @@ const INPUT_NAMES: [&str; 9] = [
     "router_weights",
 ];
 
+/// Planar block-scaled B2 formats (DeepSeek-V4): the packed weight carries its
+/// UE8M0 block scales in a *separate* aux tensor, so they are not part of the
+/// interleaved single-tensor [`BlockFormat`] family the CUDA device kernel
+/// decodes. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns them
+/// numerically today; the CUDA planar decoder is a pending follow-up and must
+/// not claim a planar node without proven kernel parity. These strings are the
+/// stable runtime capability names emitted by the Mobius #602 / Deckard #593
+/// planar emitters — recognised here purely to produce an accurate typed
+/// rejection (never an "re-export as mxfp4" message, which would be wrong: the
+/// checkpoint genuinely is these formats).
+const PLANAR_B2_FORMAT_NAMES: [&str; 2] = ["block_fp8", "fp4_planar"];
+
 // Kernels appended after the shared `decode_weight`/`block_sum` prelude. The
 // routing, activation, and combine kernels match the CPU oracle's arithmetic
 // (total-order top-k, f64 tanh GELU, stable sigmoid SwiGLU); the linear kernel
@@ -596,6 +608,11 @@ fn claim_format_attr(
             "BlockQuantizedMoE: attribute '{name}' must be a string naming a CUDA-supported block format"
         )));
     };
+    if PLANAR_B2_FORMAT_NAMES.contains(&text) {
+        return Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: CUDA has no exact decoder yet for planar B2 format '{text}' at '{name}' (DeepSeek-V4) — it is a recognised runtime ABI currently owned by the onnx-runtime-ep-cpu planar_block_quant oracle; the CUDA planar decoder is a pending follow-up and must not claim without proven kernel parity"
+        )));
+    }
     match BlockFormat::parse(text) {
         Ok(format) => Ok(Some(format)),
         Err(_) => Err(Cow::Owned(format!(
@@ -1804,6 +1821,41 @@ mod claim_gate_tests {
             .expect("fc3_format without a wired gate must be declined");
         assert!(
             reason.contains("fc3_format is only valid when fc3_experts_weights is wired"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn planar_b2_formats_are_typed_rejected_without_a_success_claim() {
+        // DeepSeek-V4 B2: block-FP8 shared/attention, planar-FP4 routed experts.
+        // Both are recognised planar ABI names but have no exact CUDA decoder
+        // yet — the claim gate must decline them (CPU oracle owns them) rather
+        // than mis-executing or emitting misleading "re-export as mxfp4" advice.
+        for planar in ["block_fp8", "fp4_planar"] {
+            let node = claim_node(planar, planar, None);
+            let reason = unsupported_reason(&node, &[], &[]).unwrap_or_else(|| {
+                panic!("planar B2 format '{planar}' must be declined by the CUDA claim gate")
+            });
+            assert!(
+                reason.contains(planar) && reason.contains("planar B2 format"),
+                "unexpected rejection reason for {planar}: {reason}"
+            );
+            assert!(
+                !reason.contains("re-export"),
+                "planar rejection must not advise a lossy re-export: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn planar_b2_format_on_a_single_projection_is_typed_rejected() {
+        // A mixed node where only the routed (fc2) projection is planar-FP4 must
+        // still be declined; the planar recognition fires per projection.
+        let node = claim_node("iq1_s", "fp4_planar", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("a planar projection anywhere must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("fp4_planar"),
             "unexpected rejection reason: {reason}"
         );
     }
