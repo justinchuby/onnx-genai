@@ -103,6 +103,49 @@ per loop. A window that is clear when you begin is not evidence it stayed clear.
 **Check:** a RED under contention is invalid evidence — re-run solo before
 calling it a regression. A GREEN under contention is weak evidence too.
 
+**On a shared host, verifying is not enough — you must also claim.** Checking
+that the box is idle is a *pre*-check, and a pre-check cannot see a competitor
+that starts after you do. Several agents share this machine and used to
+coordinate by announcing runs to each other. That protocol has a delivery step,
+and the delivery step failed: messages arrived four times over via three
+different agents, replies landed in uninvolved sessions, and both parties ended
+up idling on each other while behaving correctly. A release that is never
+received is indistinguishable from one that was never sent.
+
+**Rule: any saturating benchmark or full EP test matrix must hold the host lock
+for its whole duration.** "Saturating" means it takes cores or a GPU that
+another agent's measurement would notice — every `benches/acc0_*.py` sweep, any
+`--steady` decode loop, and the full EP conformance matrix all qualify.
+
+```sh
+scripts/hostlock.sh run --owner <you> --reason "what you are running" -- <cmd>
+```
+
+`run` is the form to prefer: it anchors liveness to its own pid, releases on
+every exit path including signals, and needs no expiry. If you must use
+`acquire`/`release` directly, pass `--ttl 0` and `--pid $$`, because the default
+anchor is the invoking shell and the default TTL is one hour — a TTL means
+"release this on the clock whether or not I am still running", so on a
+multi-hour sweep the default hands the host to a second measurer mid-run and
+contaminates *both* sets of numbers while every log line still reads as held.
+
+Take it for the **whole sweep**, not per cell: a per-cell acquire hands the box
+back between cells and lets a competitor land inside a matrix whose cells are
+only comparable to each other if they all saw the same machine.
+
+Hold it **and** keep the after-the-fact check. They answer different questions —
+the lock stops a competitor landing, the load watch notices one that landed
+anyway (a co-tenant outside the protocol, or a build nobody announced). Record
+`scripts/hostlock.sh provenance` *with* the numbers rather than asserting a quiet
+host beside them, so a row taken on a shared box stays identifiable after the
+scrollback is gone. The row names the lock directory too, because a private lock
+(`HOSTLOCK_DIR` set) coordinates with nobody while producing rows otherwise
+byte-identical to real ones.
+
+This is not theoretical: the first two sweeps run after the harnesses started
+taking the lock were both refused, against two different agents, at moments when
+the host had been announced as free.
+
 ### 6. Wall-clock on a box that pages your own memory
 
 Identical configurations here have ranged **3.9–28 tok/s**, and #863 showed the

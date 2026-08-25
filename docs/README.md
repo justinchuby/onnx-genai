@@ -90,6 +90,12 @@ Generation-side design: [`SCHEDULING.md`](genai/SCHEDULING.md),
 [`MODEL_PACKAGE.md`](genai/MODEL_PACKAGE.md),
 [`INFERENCE_METADATA_DECISIONS.md`](genai/INFERENCE_METADATA_DECISIONS.md)
 (normative metadata specification and complete built-in capability catalogue),
+[`ENCODER_BATCHING.md`](genai/ENCODER_BATCHING.md)
+(generic component batching for image, video, audio, and text encoders — the
+metadata surface is implemented, the runtime is phased:
+symbol-keyed `batch_capacity`, `padding` with validity lengths, one packed axis
+with an ownership-level chain, schema version gating, phasing and acceptance
+matrix),
 [`WORKFLOW_POLICY_COMPONENTS.md`](WORKFLOW_POLICY_COMPONENTS.md)
 (policy components from first principles and the producer contract),
 [`MOBIUS_WORKFLOW_PRODUCER.md`](genai/MOBIUS_WORKFLOW_PRODUCER.md),

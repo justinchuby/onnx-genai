@@ -20747,12 +20747,35 @@ mod tests {
     /// with by every guard, and wrong, because the defect sat upstream of the
     /// report in what "default" resolved to.
     #[test]
+    // Reported as `ignored` rather than silently returning `ok`: libtest
+    // captures a passing test's output, so the `eprintln!` below is invisible
+    // in a default CI log and a skip on this target was indistinguishable from
+    // a pass. `ignored` prints its reason in the default output and, unlike a
+    // pass, is not counted as an executed test.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "process-wide CPU affinity masking is implemented only on Linux, so a \
+                  leader-only cpuset cannot be constructed on this target"
+    )]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
         // Process-wide affinity masking is Linux-only, so on every other target
-        // the leader-only cpuset this test asserts about cannot be built.
-        // Skipping is loud rather than silent: an unexplained green here is
-        // exactly the vacuity the sweep exists to avoid, and the reason belongs
-        // in the log, not only in this comment.
+        // the leader-only cpuset this test asserts about cannot be built. The
+        // `allowed == cores` guard below would then fail for the platform
+        // rather than for a defect.
+        //
+        // The `#[cfg_attr(..., ignore)]` above is what makes that visible in a
+        // default CI log. This arm is the belt for a run that overrides it with
+        // `--ignored`: it must still not assert on an unrestricted cpuset. Its
+        // `eprintln!` is only rendered under `--nocapture`, which is why it is
+        // not the primary signal.
+        //
+        // The platform fact is read from `PROCESS_AFFINITY_MASKING_SUPPORTED`
+        // rather than re-spelled as `cfg!(target_os = "linux")` here, so that
+        // this site and `set_current_thread_affinity`'s implementation cannot
+        // drift apart: the constant is checked against what the platform
+        // actually does by `the_masking_capability_constant_agrees_with_what_\
+        // this_platform_does`, and a bare `cfg!` at each site is checked by
+        // nothing.
         if !crate::decode_affinity::PROCESS_AFFINITY_MASKING_SUPPORTED {
             eprintln!(
                 "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
