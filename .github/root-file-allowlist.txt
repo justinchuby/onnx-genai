@@ -1,0 +1,35 @@
+# Files permitted at the repository root, one per line.
+#
+# Every entry here is deliberate. The root is where scratch artefacts land,
+# because `git add -A` in a worktree you have been working in does not care
+# what a file is for, and a one-line addition at the root is invisible in a
+# large diff. Four have reached `main` this way:
+#
+#   .commitmsg/  removed by 490b846c3
+#   .commitmsg   re-added by #1881, removed by #1999
+#   .pris_v4.log 1364-line cargo transcript, #1951, removed by #1975
+#   .body.md     PR body for #2026, removed by the PR that added this file
+#
+# Each was repaired by adding one more pattern to .gitignore, and each time the
+# next one was named outside every pattern. .body.md landed *after* two such
+# fixes, hours after both. Enumerating what belongs is the only form of this
+# check that does not need to predict the next filename.
+#
+# To add a root file legitimately: add it here in the same PR. That is the
+# escape hatch, and unlike a label it leaves a permanent record of the decision.
+.gitattributes
+.gitignore
+.gitmodules
+.mcp.json
+AGENTS.md
+Cargo.lock
+Cargo.toml
+LICENSE
+README.md
+RULES.md
+codecov.yml
+dispatch_manifest.toml
+feature_gate_exemptions.toml
+requirements-cuda-dev.txt
+roy_validate.sh
+rust-toolchain.toml

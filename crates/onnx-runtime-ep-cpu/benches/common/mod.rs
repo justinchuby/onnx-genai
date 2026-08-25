@@ -363,8 +363,15 @@ pub fn report_decode_width() {
     } else {
         "WIDTH-UNRESOLVED"
     };
+    // Reported from the built pool, not from the environment: a harness that
+    // sets a permutation and reads its own env back has verified nothing. This
+    // is the observable that makes `ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION`
+    // checkable at benchmark time, so an arm that silently ran the default is a
+    // visible disagreement rather than a silent one.
+    let chunk_perm = onnx_runtime_ep_cpu::decode_spmd::decode_chunk_permutation()
+        .map_or_else(|| "none".to_string(), |perm| perm.label());
     println!(
-        "decode_width requested={} realized={} path={} {verdict}",
+        "decode_width requested={} realized={} path={} chunk_perm={chunk_perm} {verdict}",
         show(width.requested),
         show(width.realized),
         width.path,

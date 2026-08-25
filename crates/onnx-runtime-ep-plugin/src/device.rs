@@ -751,6 +751,10 @@ mod tests {
     }
 
     impl ExecutionProvider for MockGpuEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "mock_gpu_ep"
         }
@@ -860,6 +864,10 @@ mod tests {
     struct MockCpuEp;
 
     impl ExecutionProvider for MockCpuEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "mock_cpu_ep"
         }
@@ -1225,6 +1233,10 @@ mod tests {
         }
 
         impl ExecutionProvider for CountingEp {
+            fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+                Ok(())
+            }
+
             fn name(&self) -> &str {
                 "counting_ep"
             }
@@ -1417,6 +1429,10 @@ mod tests {
     struct ZeroHostileEp;
 
     impl ExecutionProvider for ZeroHostileEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "zero_hostile_ep"
         }
@@ -1722,6 +1738,10 @@ mod tests {
             }
         }
         impl ExecutionProvider for CountingEp {
+            fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+                Ok(())
+            }
+
             fn name(&self) -> &str {
                 "counting_ep_notif"
             }

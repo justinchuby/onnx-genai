@@ -91,12 +91,13 @@
 //! [`COARSE_RESIDENCY_ENABLE_ENV`]: crate::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
-    ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, StaticProfileResidencyPolicy,
+    ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result, StaticProfileResidencyPolicy,
     plan_residency,
 };
 use onnx_runtime_ir::ValueId;
@@ -385,4 +386,347 @@ pub fn consume_route_window_at_boundary_with_phase8_faults(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slice 7C — production boundary wiring.
+//
+// The consumer above is pure host glue but takes ~14 arguments and names CUDA
+// types the EP-agnostic executor cannot. So the single production call site
+// (`Executor::finish_device_validation` → `ExecutionProvider::
+// consume_route_residency_at_boundary`) reaches it through the CUDA EP, which
+// owns one optional `RouteResidencyBoundary` binding. The binding carries the
+// producer window source plus every already-existing authority handle the
+// consumer needs; the EP override drives snapshot → consume → reset exactly
+// once per boundary and records the typed outcome here. Production installs no
+// binding yet (honest "reachable seam" — matching how 7A/7B shipped), so the
+// override is a lock + `None` check when the gate is on and a bare env read
+// when it is off. The Slice-7C GPU tests install a binding and exercise the
+// whole matrix through this same override.
+// ---------------------------------------------------------------------------
+
+/// The producer half of one route-telemetry window, abstracted so the boundary
+/// caller can drive a real armed [`QMoEKernel`] in production and a controllable
+/// double in tests without either side depending on the other. The two methods
+/// are exactly the producer's existing stream-completion snapshot authority and
+/// its guarded window advance — this trait adds *no* new mechanism, it only
+/// names the ordered pair the boundary consumer must call.
+///
+/// [`QMoEKernel`]: crate::kernels::qmoe::QMoEKernel
+pub trait RouteTelemetrySource: Send + Sync {
+    /// Host copy of the current (already stream-completed) window, or `None`
+    /// when telemetry is disarmed. Self-synchronizing; see
+    /// `QMoEKernel::route_telemetry_snapshot`.
+    fn route_telemetry_snapshot(&self) -> Result<Option<TelemetrySnapshot>>;
+
+    /// Advance to the next accumulation window (epoch bump + re-zero). Rejected
+    /// while the stream is capturing/replaying; see
+    /// `QMoEKernel::reset_route_telemetry_boundary`.
+    fn reset_route_telemetry_boundary(&self) -> Result<()>;
+}
+
+/// One expert bank's binding for the boundary consumer: the producer window
+/// source plus the exact residency + catalog/allocator/pool/expert-group
+/// arguments [`consume_route_window_at_boundary`] needs, and the boundary's own
+/// identity (request/device) and monotonic expected epoch.
+///
+/// This is *pure binding* — it owns no new allocator and maps nothing; every
+/// field is a handle to an existing authority (the residency is the EP's own
+/// [`CudaWeightResidency`], the source is a live `QMoEKernel`). It is installed
+/// on the CUDA EP via `CudaExecutionProvider::install_route_residency_boundary`.
+/// Production wiring that constructs one from a live session's expert banks is a
+/// later slice, so today it is populated only by the Slice-7C GPU tests.
+pub struct RouteResidencyBoundary {
+    source: Arc<dyn RouteTelemetrySource>,
+    residency: Arc<CudaWeightResidency>,
+    bank_values: Vec<ValueId>,
+    boundary: LazyWeightBoundary,
+    catalogs: HashMap<ValueId, WeightRegionCatalog>,
+    allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: Arc<PhysicalHandlePool>,
+    host_pool: Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expected_request: u32,
+    expected_device: u32,
+    /// The boundary epoch this consumer expects the just-completed window to
+    /// carry. Starts at the armed epoch and advances in lockstep with the
+    /// producer's window each time a window is consumed and reset, so a record
+    /// that failed to advance (an older epoch) is caught as stale.
+    expected_epoch: AtomicU32,
+    expert_groups: Vec<ExpertWeightGroup>,
+}
+
+impl RouteResidencyBoundary {
+    /// Bind one expert bank's producer source and residency authorities for the
+    /// boundary consumer. `initial_epoch` is the epoch the first consumed window
+    /// must carry (the producer arms at `1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source: Arc<dyn RouteTelemetrySource>,
+        residency: Arc<CudaWeightResidency>,
+        bank_values: Vec<ValueId>,
+        boundary: LazyWeightBoundary,
+        catalogs: HashMap<ValueId, WeightRegionCatalog>,
+        allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+        device_pool: Arc<PhysicalHandlePool>,
+        host_pool: Arc<PhysicalHandlePool>,
+        device_count: usize,
+        device_ordinal: i32,
+        expected_request: u32,
+        expected_device: u32,
+        initial_epoch: u32,
+        expert_groups: Vec<ExpertWeightGroup>,
+    ) -> Self {
+        Self {
+            source,
+            residency,
+            bank_values,
+            boundary,
+            catalogs,
+            allocators,
+            device_pool,
+            host_pool,
+            device_count,
+            device_ordinal,
+            expected_request,
+            expected_device,
+            expected_epoch: AtomicU32::new(initial_epoch),
+            expert_groups,
+        }
+    }
+
+    fn expected_epoch(&self) -> u32 {
+        self.expected_epoch.load(Ordering::Relaxed)
+    }
+
+    fn advance_epoch(&self) {
+        self.expected_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Observability for the boundary consumer. Every boundary records its typed
+/// reason/outcome here — there is no silent success and no silent whole-bank
+/// (design-discipline "carry the reason"). Mirrors the crate's other EP-owned
+/// metric surfaces; the CUDA EP exposes it through
+/// `CudaExecutionProvider::route_residency_diagnostics`.
+#[derive(Debug, Default)]
+pub struct RouteResidencyDiagnostics {
+    boundaries: AtomicU64,
+    applied: AtomicU64,
+    rejected: AtomicU64,
+    whole_bank: AtomicU64,
+    empty: AtomicU64,
+    last_reason: Mutex<Option<String>>,
+}
+
+impl RouteResidencyDiagnostics {
+    /// Total boundaries the consumer actually ran (gate on and a binding
+    /// installed) — the reachability counter the wiring tests assert on.
+    pub fn boundaries(&self) -> u64 {
+        self.boundaries.load(Ordering::Relaxed)
+    }
+
+    /// Boundaries that applied a routed hot-set through the #1854 lifecycle.
+    pub fn applied(&self) -> u64 {
+        self.applied.load(Ordering::Relaxed)
+    }
+
+    /// Boundaries rejected before consume/reset because the point was unsafe.
+    pub fn rejected(&self) -> u64 {
+        self.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Boundaries that fail-closed to whole-bank (poison/overflow/stale/foreign
+    /// identity/empty routed set).
+    pub fn whole_bank(&self) -> u64 {
+        self.whole_bank.load(Ordering::Relaxed)
+    }
+
+    /// Boundaries where the source was disarmed (no window to consume).
+    pub fn empty(&self) -> u64 {
+        self.empty.load(Ordering::Relaxed)
+    }
+
+    /// The human reason of the most recent boundary (for diagnostics surfaces).
+    pub fn last_reason(&self) -> Option<String> {
+        self.last_reason.lock().unwrap().clone()
+    }
+
+    fn set_reason(&self, reason: String) {
+        *self.last_reason.lock().unwrap() = Some(reason);
+    }
+
+    fn record_rejected(&self, reason: &str) {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        self.set_reason(format!("rejected: {reason}"));
+    }
+
+    fn record_empty(&self, reason: &str) {
+        self.empty.fetch_add(1, Ordering::Relaxed);
+        self.set_reason(format!("empty: {reason}"));
+    }
+
+    fn record_outcome(&self, outcome: &RouteWindowConsumeOutcome) {
+        match outcome {
+            RouteWindowConsumeOutcome::Disabled => {
+                self.set_reason("disabled".into());
+            }
+            RouteWindowConsumeOutcome::RejectedNotSafeBoundary { reason } => {
+                self.rejected.fetch_add(1, Ordering::Relaxed);
+                self.set_reason(format!("rejected: {reason}"));
+            }
+            RouteWindowConsumeOutcome::WholeBank { reason } => {
+                self.whole_bank.fetch_add(1, Ordering::Relaxed);
+                self.set_reason(format!("whole-bank: {reason}"));
+            }
+            RouteWindowConsumeOutcome::Applied {
+                routed_experts,
+                epoch,
+                count,
+                ..
+            } => {
+                self.applied.fetch_add(1, Ordering::Relaxed);
+                self.set_reason(format!(
+                    "applied hot-set of {} experts at epoch {epoch} (count {count})",
+                    routed_experts.len()
+                ));
+            }
+        }
+    }
+}
+
+/// Whether a boundary outcome consumed the window (and therefore the producer
+/// must advance to the next one). Disabled/Rejected never touched the window.
+fn window_was_consumed(outcome: &RouteWindowConsumeOutcome) -> bool {
+    matches!(
+        outcome,
+        RouteWindowConsumeOutcome::Applied { .. } | RouteWindowConsumeOutcome::WholeBank { .. }
+    )
+}
+
+/// Drive one boundary for `binding`, recording the typed outcome in `diag`.
+///
+/// Ordering (the lawful boundary sequence from the module docs): fail-closed
+/// safe-point pre-check → producer snapshot → the merged
+/// [`consume_route_window_at_boundary`] → producer window advance — the reset
+/// (and the expected-epoch advance that keeps stale detection honest) fires
+/// **only** after a window was actually consumed, so an unsafe or disarmed
+/// boundary neither snapshots nor resets. Reuses only the merged #1971 consumer
+/// and #1854 lifecycle; adds no mapping, allocation, or host sync of its own.
+///
+/// The caller (the CUDA EP override) has already checked the default-off gate
+/// and that a binding is installed, so reaching here means the consumer runs.
+pub fn run_route_residency_boundary(
+    binding: &RouteResidencyBoundary,
+    diag: &RouteResidencyDiagnostics,
+) -> Result<()> {
+    diag.boundaries.fetch_add(1, Ordering::Relaxed);
+
+    // Fail closed before the snapshot dtoh so an unsafe boundary (capture/
+    // replay, admission in flight, unsettled deferred release, multi-device,
+    // live routed guard) neither reads telemetry nor advances the window.
+    if let Some(reason) = binding
+        .residency
+        .resize_safe_point(binding.device_count)
+        .blocking_reason()
+    {
+        diag.record_rejected(reason);
+        return Ok(());
+    }
+
+    let Some(snapshot) = binding.source.route_telemetry_snapshot()? else {
+        diag.record_empty("route telemetry disarmed; no window to consume");
+        return Ok(());
+    };
+
+    let outcome = consume_route_window_at_boundary(
+        &binding.residency,
+        &snapshot,
+        binding.expected_epoch(),
+        binding.expected_request,
+        binding.expected_device,
+        &binding.bank_values,
+        binding.boundary,
+        &binding.catalogs,
+        &binding.allocators,
+        &binding.device_pool,
+        &binding.host_pool,
+        binding.device_count,
+        binding.device_ordinal,
+        &binding.expert_groups,
+    );
+
+    if window_was_consumed(&outcome) {
+        binding.source.reset_route_telemetry_boundary()?;
+        binding.advance_epoch();
+    }
+
+    diag.record_outcome(&outcome);
+    Ok(())
+}
+
+/// Test-only sibling of [`run_route_residency_boundary`] that routes the plan
+/// application through the phase-8 driver-fault consumer, so a deterministic
+/// unmap/map fault can prove the *caller-driven* transition rolls back
+/// range-precisely and quarantines exactly like a real driver failure. Same
+/// ordering and reset discipline as production; only the apply path differs.
+#[cfg(any(test, feature = "gpu-tests"))]
+pub fn run_route_residency_boundary_with_phase8_faults(
+    runtime: &Arc<crate::runtime::CudaRuntime>,
+    binding: &RouteResidencyBoundary,
+    diag: &RouteResidencyDiagnostics,
+    phase8_faults: HashMap<ValueId, Arc<onnx_runtime_cuda_memory::release::DriverFaultPlan>>,
+) -> Result<()> {
+    diag.boundaries.fetch_add(1, Ordering::Relaxed);
+
+    if let Some(reason) = binding
+        .residency
+        .resize_safe_point(binding.device_count)
+        .blocking_reason()
+    {
+        diag.record_rejected(reason);
+        return Ok(());
+    }
+
+    let Some(snapshot) = binding.source.route_telemetry_snapshot()? else {
+        diag.record_empty("route telemetry disarmed; no window to consume");
+        return Ok(());
+    };
+
+    let outcome = consume_route_window_at_boundary_with_phase8_faults(
+        runtime,
+        &binding.residency,
+        &snapshot,
+        binding.expected_epoch(),
+        binding.expected_request,
+        binding.expected_device,
+        &binding.bank_values,
+        binding.boundary,
+        &binding.catalogs,
+        &binding.allocators,
+        &binding.device_pool,
+        &binding.host_pool,
+        binding.device_count,
+        binding.device_ordinal,
+        &binding.expert_groups,
+        phase8_faults,
+    );
+
+    if window_was_consumed(&outcome) {
+        binding.source.reset_route_telemetry_boundary()?;
+        binding.advance_epoch();
+    }
+
+    diag.record_outcome(&outcome);
+    Ok(())
+}
+
+/// Compile-time proof that the production producer satisfies the boundary
+/// source contract, so the GPU tests' controllable double stands in for a real
+/// armed kernel without diverging from it.
+#[allow(dead_code)]
+fn _assert_qmoe_is_route_telemetry_source() {
+    fn is_source<T: RouteTelemetrySource>() {}
+    is_source::<crate::kernels::qmoe::QMoEKernel>();
 }

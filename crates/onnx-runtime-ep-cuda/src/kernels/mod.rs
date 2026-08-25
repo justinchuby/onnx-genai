@@ -38,6 +38,7 @@ pub mod conv;
 pub mod conv_transpose;
 pub mod csa_checkpoint;
 pub mod csa_device_state;
+pub mod csa_state_group;
 pub mod cumprod;
 pub mod cumsum;
 pub mod data_transform;

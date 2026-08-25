@@ -25,6 +25,8 @@ pub enum OrtError {
     Cuda(String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ThreadAffinity(#[from] crate::thread_affinity::ThreadAffinityError),
 }
 
 pub type Result<T> = std::result::Result<T, OrtError>;

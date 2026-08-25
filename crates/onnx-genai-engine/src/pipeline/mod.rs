@@ -11,14 +11,14 @@ use crate::{EngineDecodeBackend, GeneratePrompt, GenerateRequest, MemoryStrategy
 use anyhow::Context;
 use onnx_genai_metadata::decoder_workflow::IterationPolicy;
 use onnx_genai_metadata::{
-    CompiledWorkflow, ComponentImplementation, DeviceKind, LiteralValue, PreprocessingSpec,
-    RuntimeInputRole, ScalarValue, TensorContract, TensorDimension, WorkflowEmitMode,
-    WorkflowInputSource, WorkflowNode, WorkflowSpec,
+    ComponentImplementation, DeviceKind, LiteralValue, RuntimeInputRole, ScalarValue,
+    TensorContract, TensorDimension, WorkflowEmitMode, WorkflowInputSource, WorkflowNode,
+    WorkflowSpec,
 };
 use onnx_genai_ort::{
     DataType, PipelineModelDirectory, PipelineModels, SessionOptions, Tokenizer, Value,
 };
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
@@ -33,6 +33,7 @@ mod islands;
 #[cfg(feature = "native-backend")]
 mod native_component;
 mod row_state;
+mod runtime_state;
 pub mod speculative;
 mod workflow;
 
@@ -56,12 +57,6 @@ pub fn has_buffered_pcm16_wav_output(workflow: &WorkflowSpec) -> bool {
 pub use audio::buffered_pcm16_wav_output_names;
 
 pub type PipelineTensors = HashMap<String, Value>;
-
-/// What identifies one cached embedding table: the component and initializer it
-/// was read from, the residency it was made resident in, and the bit pattern of
-/// the declared normalizer applied to its rows. Bits rather than the float
-/// itself because a key has to be hashable and total.
-type EmbeddingTableKey = (String, String, i32, Option<u32>);
 
 /// Structured workflow outputs with request-aligned rows.
 ///
@@ -161,120 +156,54 @@ impl From<GenerateRequest> for PipelineGenerateRequest {
 }
 
 /// Engine for packages expressed exclusively with `pipeline.workflow`.
+///
+/// The three fields below are the state split of
+/// `docs/architecture/SESSION_CONCURRENCY.md` §3, one field per category: the
+/// frozen plan that could be shared by every worker, the backend handles that
+/// belong to exactly one, and the mutable state that one worker accumulates
+/// while executing them. Per-pass state (§3.3) is not a field at all — it is
+/// [`runtime_state::WorkflowPass`], created when a pass starts and dropped when
+/// it ends.
+///
+/// This is a `W = 1` runtime, and stays one: the runtime is constructed, used
+/// and dropped on a single thread exactly as before. What the split changes is
+/// that the thread affinity is now a property of the types rather than of the
+/// comments.
 pub(crate) struct WorkflowRuntime {
-    package_root: std::path::PathBuf,
-    models: PipelineModels,
-    memory_strategy_plan: MemoryStrategyPlan,
-    decode_backend: EngineDecodeBackend,
-    workflow: WorkflowSpec,
-    compiled_workflow: CompiledWorkflow,
-    /// Outputs this workflow fills one request row at a time, derived once from
-    /// the compiled graph so every emit into one output agrees.
-    row_wise_outputs: HashSet<String>,
-    movable_emit_values: HashSet<String>,
-    execution_islands: Vec<islands::ExecutionIsland>,
-    device_bridge_components: HashSet<String>,
-    component_bindings:
-        RefCell<HashMap<workflow::ComponentBindingKey, workflow::StableComponentBinding>>,
-    component_allocators: RefCell<HashMap<String, Arc<onnx_genai_ort::Allocator>>>,
-    component_outputs: RefCell<HashMap<workflow::ComponentOutputKey, Arc<onnx_genai_ort::Value>>>,
-    workflow_performance: RefCell<workflow::WorkflowPerformanceCounters>,
-    workflow_execution_generation: Cell<u64>,
-    workflow_session_state: RefCell<HashMap<(String, String), Value>>,
-    /// Sessions with a pass in flight, for leases declared `policy: exclusive`.
+    /// §3.1 — immutable after load, and shareable because of it.
+    plan: Arc<runtime_state::WorkflowPlan>,
+    /// §3.2 storage under §3.3 access: everything this worker mutates.
     ///
-    /// Two turns of one conversation that both read the history before either
-    /// writes it produce a last-write-wins conversation: the first turn's
-    /// prompt and generation vanish. The declaration says the lease is
-    /// exclusive, so this is what makes that true rather than assumed — a
-    /// second concurrent turn is refused with a name, not silently lost.
-    workflow_session_leases: RefCell<std::collections::HashSet<String>>,
-    /// Device→host materializations this runtime performed.
-    ///
-    /// A proposal chain's whole point is that its per-token work stays on the
-    /// device that produced it, and "stays on the device" is not something a
-    /// throughput number diagnoses: a reintroduced copy shows up as a slower
-    /// run months later, attributed to anything but the line that caused it.
-    /// Counting the transfers makes it a property a test can hold.
-    host_staging_count: std::cell::Cell<u64>,
-    /// Bytes this runtime read back out of device memory deliberately.
-    ///
-    /// The counter above says *how many times* a whole tensor came down; this
-    /// one says how much came down on the one path that is allowed to bring
-    /// anything down at all — the token id a device argmax produces. Four bytes
-    /// per row is the budget, and stating it as a number is what stops "only
-    /// the token ids" from quietly becoming "the token ids and one small
-    /// tensor".
-    device_readback_bytes: std::cell::Cell<u64>,
-    /// Embedding tables read out of a component's artifact, cached for the
-    /// runtime's life.
-    ///
-    /// Re-reading a `[vocab, hidden]` initializer off disk once per proposal is
-    /// pure waste — the file cannot change under a loaded package — and at real
-    /// vocabularies it is the dominant cost of starting a proposal. The
-    /// residency is part of the key because a device mirror and the host copy
-    /// it was uploaded from are different tensors answering the same question,
-    /// and the mirror must be uploaded once, not once per draft token. The
-    /// declared normalizer joins them for the same reason: it changes what the
-    /// cached rows are, not merely where they live.
-    embedding_tables: RefCell<HashMap<EmbeddingTableKey, std::rc::Rc<speculative::EmbeddingTable>>>,
-    /// How many times an embedding table was read out of an artifact.
-    embedding_table_loads: std::cell::Cell<u64>,
-    /// Nodes this runtime executed through a declared contract, by contract id.
-    ///
-    /// Selection of an algorithmic executor is supposed to come from what the
-    /// workflow *authors*, and a claim like that is worth nothing unless
-    /// something counts it. A test can assert that a package whose body names
-    /// one contract routed its nodes there and nowhere else, which is a
-    /// statement about the interpreter's dispatch rather than about which
-    /// function a caller happened to call.
-    contract_executions: RefCell<std::collections::BTreeMap<String, u64>>,
-    /// Sibling interpreters over this package's loop re-authored for another
-    /// iteration policy, built on first use and keyed by the policy.
-    ///
-    /// A continuous batch and a speculative block are *different iteration
-    /// algorithms over the same declared generation*, and which one runs is
-    /// answered by the contract the loop body's node names. The bodies that
-    /// name them are authored by
-    /// [`onnx_genai_metadata::decoder_workflow::iteration_variant`] from this
-    /// package's own declaration — the same module that authored the
-    /// single-token body — so the three cannot become three different
-    /// statements of one loop.
-    ///
-    /// A variant's body invokes binding components only: the executor
-    /// registered for its contract owns the session, the cache and the
-    /// sampling. So a variant interpreter holds no models, no allocators and no
-    /// governor, and building one costs a workflow compile rather than a load.
-    iteration_runtimes: RefCell<std::collections::BTreeMap<IterationPolicy, Rc<WorkflowRuntime>>>,
-    adapter_service: Option<onnx_genai_metadata::AdapterServiceContract>,
-    adapter_cache: RefCell<adapters::AdapterCache>,
-    active_adapter_context: RefCell<Option<adapters::AdapterRunContext>>,
-    preprocessing: Option<PreprocessingSpec>,
-    /// The package's speculative compatibility contract, when it declares one.
-    /// The chained proposal driver in [`speculative`] reads every field it needs
-    /// from here, so proposal execution is metadata-driven rather than keyed on
-    /// a model name.
-    speculative: Option<onnx_genai_metadata::SpeculativeContract>,
-    /// Native (pure-Rust) component sessions, present only when the engine was
-    /// built for `EngineDecodeBackend::Native`. The universal interpreter drives
-    /// these through the same seam it uses for ORT sessions; see
-    /// `docs/architecture/NATIVE_WORKFLOW_BACKEND.md`.
-    #[cfg(feature = "native-backend")]
-    native_components: Option<RefCell<native_component::NativeComponentSet>>,
+    /// Declared before [`Self::backend`] so the values, bindings and allocators
+    /// derived from a session are released before the session itself even if
+    /// the explicit `Drop` below were ever removed.
+    worker: runtime_state::WorkerRuntimeState,
+    /// §3.2 — the ORT and native handles this worker owns.
+    backend: runtime_state::WorkerBackend,
     /// Kept last so the ORT environment, its registered allocator bridge, and
     /// their plugin/provider teardown outlive every component and execution-island
     /// session that may still call back into them.
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
+/// Release ORT state that outranks its owner's field order.
+///
+/// Bindings and session-derived allocators now co-own their `Arc<Session>`, so
+/// they can no longer outlive the session whatever order the fields drop in.
+/// A `Value` cannot: it is a bare `OrtValue` handle with no back-reference to
+/// the allocator whose memory it holds, so ORT still requires every value to be
+/// released before that allocator. Nothing in the type system says so, which is
+/// exactly why it is done here explicitly instead of left to the field list.
+///
+/// The state split moved where these live, not whether they are cleared:
+/// §13 Phase 1 retains this `Drop` verbatim until `Value` gains an ownership
+/// edge to its `Allocator`.
 impl Drop for WorkflowRuntime {
     fn drop(&mut self) {
-        for island in &mut self.execution_islands {
+        for island in &mut self.backend.execution_islands {
             island.clear_bindings();
         }
-        self.component_bindings.get_mut().clear();
-        self.component_outputs.get_mut().clear();
-        self.component_allocators.get_mut().clear();
+        self.worker.release_ort_state();
     }
 }
 
@@ -426,36 +355,26 @@ impl WorkflowRuntime {
         let device_bridge_components =
             workflow::compile_device_bridge_components(&compiled_workflow.graph, &HashSet::new());
         Ok(Self {
-            package_root,
-            models,
-            memory_strategy_plan,
-            decode_backend,
-            workflow,
-            compiled_workflow,
-            row_wise_outputs,
-            movable_emit_values,
-            execution_islands: Vec::new(),
-            device_bridge_components,
-            component_bindings: RefCell::new(HashMap::new()),
-            component_allocators: RefCell::new(HashMap::new()),
-            component_outputs: RefCell::new(HashMap::new()),
-            workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
-            workflow_execution_generation: Cell::new(0),
-            workflow_session_state: RefCell::new(HashMap::new()),
-            workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
-            host_staging_count: std::cell::Cell::new(0),
-            device_readback_bytes: std::cell::Cell::new(0),
-            embedding_tables: RefCell::new(HashMap::new()),
-            embedding_table_loads: std::cell::Cell::new(0),
-            contract_executions: RefCell::new(std::collections::BTreeMap::new()),
-            iteration_runtimes: RefCell::new(std::collections::BTreeMap::new()),
-            adapter_service: None,
-            adapter_cache: RefCell::new(adapters::AdapterCache::default()),
-            active_adapter_context: RefCell::new(None),
-            preprocessing: None,
-            speculative,
-            #[cfg(feature = "native-backend")]
-            native_components: None,
+            plan: Arc::new(runtime_state::WorkflowPlan {
+                package_root,
+                workflow,
+                compiled_workflow,
+                row_wise_outputs,
+                movable_emit_values,
+                device_bridge_components,
+                memory_strategy_plan,
+                decode_backend,
+                adapter_service: None,
+                preprocessing: None,
+                speculative,
+            }),
+            worker: runtime_state::WorkerRuntimeState::default(),
+            backend: runtime_state::WorkerBackend::new(
+                models,
+                Vec::new(),
+                #[cfg(feature = "native-backend")]
+                None,
+            ),
             _ort_environment: None,
         })
     }
@@ -780,36 +699,26 @@ impl WorkflowRuntime {
         let ort_environment = models.environment_handle();
         Ok((
             Self {
-                package_root: directory.root.clone(),
-                models,
-                memory_strategy_plan,
-                decode_backend,
-                workflow,
-                compiled_workflow,
-                row_wise_outputs,
-                movable_emit_values,
-                execution_islands,
-                device_bridge_components,
-                component_bindings: RefCell::new(HashMap::new()),
-                component_allocators: RefCell::new(HashMap::new()),
-                component_outputs: RefCell::new(HashMap::new()),
-                workflow_performance: RefCell::new(workflow::WorkflowPerformanceCounters::default()),
-                workflow_execution_generation: Cell::new(0),
-                workflow_session_state: RefCell::new(HashMap::new()),
-                workflow_session_leases: RefCell::new(std::collections::HashSet::new()),
-                host_staging_count: std::cell::Cell::new(0),
-                device_readback_bytes: std::cell::Cell::new(0),
-                embedding_tables: RefCell::new(HashMap::new()),
-                embedding_table_loads: std::cell::Cell::new(0),
-                contract_executions: RefCell::new(std::collections::BTreeMap::new()),
-                iteration_runtimes: RefCell::new(std::collections::BTreeMap::new()),
-                adapter_service: directory.adapters,
-                adapter_cache: RefCell::new(adapters::AdapterCache::default()),
-                active_adapter_context: RefCell::new(None),
-                preprocessing: directory.preprocessing,
-                speculative,
-                #[cfg(feature = "native-backend")]
-                native_components,
+                plan: Arc::new(runtime_state::WorkflowPlan {
+                    package_root: directory.root.clone(),
+                    workflow,
+                    compiled_workflow,
+                    row_wise_outputs,
+                    movable_emit_values,
+                    device_bridge_components,
+                    memory_strategy_plan,
+                    decode_backend,
+                    adapter_service: directory.adapters,
+                    preprocessing: directory.preprocessing,
+                    speculative,
+                }),
+                worker: runtime_state::WorkerRuntimeState::default(),
+                backend: runtime_state::WorkerBackend::new(
+                    models,
+                    execution_islands,
+                    #[cfg(feature = "native-backend")]
+                    native_components,
+                ),
                 _ort_environment: ort_environment,
             },
             resource_governor,
@@ -817,7 +726,27 @@ impl WorkflowRuntime {
     }
 
     pub fn decode_backend(&self) -> EngineDecodeBackend {
-        self.decode_backend
+        self.plan.decode_backend
+    }
+
+    /// The immutable plan this runtime executes (§3.1).
+    ///
+    /// Handed out behind an `Arc` because that is what it is: frozen at load and
+    /// therefore shareable. Nothing yet shares it — there is one worker — but a
+    /// caller that could only borrow it would have to be rewritten before one
+    /// could, and the point of the split is that it does not.
+    #[cfg(test)]
+    pub(crate) fn plan(&self) -> &Arc<runtime_state::WorkflowPlan> {
+        &self.plan
+    }
+
+    /// Open one execution pass over this worker's state (§3.3).
+    ///
+    /// Minting the pass id here is what invalidates the previous pass's cached
+    /// service state: an island or a stable binding compares the id it was
+    /// written under against the id of the pass now running.
+    pub(crate) fn begin_pass(&self, max_iterations_only: bool) -> runtime_state::WorkflowPass {
+        self.worker.begin_pass(max_iterations_only)
     }
 
     /// Number of native component invocations performed by this engine so far,
@@ -825,7 +754,8 @@ impl WorkflowRuntime {
     /// native sessions — not an ORT fallback — executed a workflow.
     #[cfg(feature = "native-backend")]
     pub fn native_component_run_count(&self) -> Option<u64> {
-        self.native_components
+        self.backend
+            .native_components
             .as_ref()
             .map(|set| set.borrow().run_count())
     }
@@ -838,7 +768,8 @@ impl WorkflowRuntime {
     /// test prove end-to-end device residency rather than a host round-trip.
     #[cfg(feature = "native-backend")]
     pub fn native_device_residency_counts(&self) -> Option<(u64, u64)> {
-        self.native_components
+        self.backend
+            .native_components
             .as_ref()
             .map(|set| set.borrow().device_residency_counts())
     }
@@ -860,7 +791,7 @@ impl WorkflowRuntime {
     /// explicitly rather than assuming.
     pub(crate) fn component_execution_residency(&self) -> anyhow::Result<device_ops::Residency> {
         #[cfg(feature = "native-backend")]
-        if let Some(components) = self.native_components.as_ref()
+        if let Some(components) = self.backend.native_components.as_ref()
             && let Some(ordinal) = components.borrow().cuda_ordinal()
         {
             let device = i32::try_from(ordinal).map_err(|_| {
@@ -878,7 +809,7 @@ impl WorkflowRuntime {
 
     /// The workflow this runtime executes.
     pub(crate) fn workflow_spec(&self) -> &onnx_genai_metadata::WorkflowSpec {
-        &self.workflow
+        &self.plan.workflow
     }
 
     /// How many device→host materializations this runtime has performed.
@@ -899,11 +830,11 @@ impl WorkflowRuntime {
     }
 
     fn own_host_staging_count(&self) -> u64 {
-        self.host_staging_count.get()
+        self.worker.counters.host_staging_count.get()
     }
 
     fn own_device_readback_bytes(&self) -> u64 {
-        self.device_readback_bytes.get()
+        self.worker.counters.device_readback_bytes.get()
     }
 
     /// This runtime's own count plus every iteration variant's.
@@ -914,6 +845,7 @@ impl WorkflowRuntime {
     fn fold_counter(&self, counter: fn(&WorkflowRuntime) -> u64) -> u64 {
         counter(self)
             + self
+                .worker
                 .iteration_runtimes
                 .borrow()
                 .values()
@@ -928,8 +860,8 @@ impl WorkflowRuntime {
     /// caller asking what this package executed wants one answer, not one per
     /// algorithm it happened to run.
     pub fn contract_executions(&self) -> std::collections::BTreeMap<String, u64> {
-        let mut executed = self.contract_executions.borrow().clone();
-        for variant in self.iteration_runtimes.borrow().values() {
+        let mut executed = self.worker.counters.contract_executions.borrow().clone();
+        for variant in self.worker.iteration_runtimes.borrow().values() {
             for (contract, count) in variant.contract_executions() {
                 *executed.entry(contract).or_default() += count;
             }
@@ -950,17 +882,17 @@ impl WorkflowRuntime {
         &self,
         policy: IterationPolicy,
     ) -> anyhow::Result<Rc<WorkflowRuntime>> {
-        if let Some(existing) = self.iteration_runtimes.borrow().get(&policy) {
+        if let Some(existing) = self.worker.iteration_runtimes.borrow().get(&policy) {
             return Ok(Rc::clone(existing));
         }
         let variant =
-            onnx_genai_metadata::decoder_workflow::iteration_variant(&self.workflow, policy)
+            onnx_genai_metadata::decoder_workflow::iteration_variant(&self.plan.workflow, policy)
                 .map_err(|error| {
-                    anyhow::anyhow!(
-                        "this package's declared generation loop cannot be re-authored as \
+                anyhow::anyhow!(
+                    "this package's declared generation loop cannot be re-authored as \
                          {policy:?}: {error}"
-                    )
-                })?;
+                )
+            })?;
         generation::validate_generation_workflow(&variant)?;
         // A variant body invokes bindings only, so the directory it is built
         // over names no artifacts. Declaring that explicitly — rather than
@@ -969,7 +901,7 @@ impl WorkflowRuntime {
         // interpreter would fail to resolve, instead of quietly loading a
         // second copy of the decoder.
         let directory = PipelineModelDirectory {
-            root: self.package_root.clone(),
+            root: self.plan.package_root.clone(),
             metadata_path: None,
             spec: onnx_genai_metadata::PipelineSpec {
                 workflow: variant.clone(),
@@ -984,14 +916,15 @@ impl WorkflowRuntime {
             },
         };
         let runtime = Rc::new(WorkflowRuntime::hosted(
-            self.package_root.clone(),
+            self.plan.package_root.clone(),
             variant,
-            self.decode_backend,
-            self.memory_strategy_plan.clone(),
+            self.plan.decode_backend,
+            self.plan.memory_strategy_plan.clone(),
             PipelineModels::hosted(directory, SessionOptions::default(), None),
-            self.speculative.clone(),
+            self.plan.speculative.clone(),
         )?);
-        self.iteration_runtimes
+        self.worker
+            .iteration_runtimes
             .borrow_mut()
             .insert(policy, Rc::clone(&runtime));
         Ok(runtime)
@@ -1000,6 +933,8 @@ impl WorkflowRuntime {
     /// Record one node executed through a declared contract.
     pub(crate) fn record_contract_execution(&self, contract: &str) {
         *self
+            .worker
+            .counters
             .contract_executions
             .borrow_mut()
             .entry(contract.to_string())
@@ -1012,7 +947,8 @@ impl WorkflowRuntime {
     /// behind would grow the map for the process's life and let a re-used id
     /// resume a conversation the caller ended.
     pub(crate) fn forget_session(&self, session_id: &str) {
-        self.workflow_session_state
+        self.worker
+            .session_state
             .borrow_mut()
             .retain(|(session, _), _| session != session_id);
     }
@@ -1075,7 +1011,7 @@ impl WorkflowRuntime {
             "this workflow declares no prompt continuation, so it has no conversation to seed",
         )?;
         let rows = i64::try_from(tokens.len())?;
-        self.workflow_session_state.borrow_mut().insert(
+        self.worker.session_state.borrow_mut().insert(
             (session_id.to_string(), cell.to_string()),
             Value::from_slice_i64(tokens, &[1, rows])?,
         );
@@ -1087,7 +1023,8 @@ impl WorkflowRuntime {
         let Some(cell) = facts.prompt_continuation() else {
             return 0;
         };
-        self.workflow_session_state
+        self.worker
+            .session_state
             .borrow()
             .get(&(session_id.to_string(), cell.to_string()))
             .and_then(|value| value.to_vec_i64().ok())
@@ -1103,7 +1040,8 @@ impl WorkflowRuntime {
     pub(crate) fn session_conversation(&self, session_id: &str) -> Option<Vec<i64>> {
         let (cell, _, _, _) = workflow::workflow_prompt_continuation(self.workflow_spec())?;
         Some(
-            self.workflow_session_state
+            self.worker
+                .session_state
                 .borrow()
                 .get(&(session_id.to_string(), cell.to_string()))
                 .map(|value| value.to_vec_i64().unwrap_or_default())
@@ -1112,11 +1050,11 @@ impl WorkflowRuntime {
     }
 
     pub fn memory_strategy_plan(&self) -> &MemoryStrategyPlan {
-        &self.memory_strategy_plan
+        &self.plan.memory_strategy_plan
     }
 
     pub fn models(&self) -> &PipelineModels {
-        &self.models
+        &self.backend.models
     }
 
     /// Execution-provider placement reported by the loaded component sessions.
@@ -1125,10 +1063,11 @@ impl WorkflowRuntime {
         // device the components actually run on instead of an empty/"native"
         // placeholder derived from an absent ORT session set.
         #[cfg(feature = "native-backend")]
-        if let Some(native) = self.native_components.as_ref() {
+        if let Some(native) = self.backend.native_components.as_ref() {
             return native.borrow().device_label().to_string();
         }
         let mut summaries = self
+            .backend
             .models
             .sessions
             .values()
@@ -1144,7 +1083,7 @@ impl WorkflowRuntime {
     }
 
     pub fn adapter_lifecycle_diagnostic(&self) -> AdapterLifecycleDiagnostic {
-        self.adapter_cache.borrow().diagnostic()
+        self.worker.adapter_cache.borrow().diagnostic()
     }
 
     pub fn run_pipeline(
@@ -1191,11 +1130,12 @@ impl WorkflowRuntime {
     /// encode, and inventing an empty tokenizer for it would turn a load-time
     /// fact into a runtime surprise.
     pub(crate) fn package_tokenizer(&self) -> Option<&Tokenizer> {
-        self.models.tokenizer_for("")
+        self.backend.models.tokenizer_for("")
     }
 
     fn tokenizer(&self) -> anyhow::Result<&Tokenizer> {
-        self.models
+        self.backend
+            .models
             .tokenizer_for("")
             .context("no tokenizer available for this workflow package")
     }
@@ -1214,6 +1154,7 @@ impl WorkflowRuntime {
         role: WorkflowOutputRole,
     ) -> Option<&'a Value> {
         let name = self
+            .plan
             .workflow
             .outputs
             .iter()
@@ -1229,6 +1170,7 @@ impl WorkflowRuntime {
         role: WorkflowOutputRole,
     ) -> Option<&'a Value> {
         let name = self
+            .plan
             .workflow
             .outputs
             .iter()
@@ -1271,6 +1213,7 @@ impl WorkflowRuntime {
         role: WorkflowOutputRole,
     ) -> Vec<(usize, &'a Value)> {
         let Some(name) = self
+            .plan
             .workflow
             .outputs
             .iter()
@@ -1294,10 +1237,10 @@ impl WorkflowRuntime {
         &self,
         session_id: &str,
     ) -> anyhow::Result<WorkflowSessionCheckpoint> {
-        let session_state = self.workflow_session_state.borrow();
+        let session_state = self.worker.session_state.borrow();
         let mut semantic_state = HashMap::new();
         let mut contracts = HashMap::new();
-        for (cell, declaration) in &self.workflow.state {
+        for (cell, declaration) in &self.plan.workflow.state {
             if declaration.scope != onnx_genai_metadata::WorkflowStateScope::Session
                 || declaration.class != onnx_genai_metadata::WorkflowStateClass::Semantic
             {
@@ -1320,7 +1263,7 @@ impl WorkflowRuntime {
         checkpoint: &WorkflowSessionCheckpoint,
     ) -> anyhow::Result<()> {
         for cell in checkpoint.semantic_state.keys() {
-            let Some(declaration) = self.workflow.state.get(cell) else {
+            let Some(declaration) = self.plan.workflow.state.get(cell) else {
                 anyhow::bail!("workflow checkpoint references unknown state cell '{cell}'");
             };
             if declaration.scope != onnx_genai_metadata::WorkflowStateScope::Session
@@ -1339,8 +1282,8 @@ impl WorkflowRuntime {
             .iter()
             .map(|(cell, value)| Ok((cell.clone(), clone_value(value)?)))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut session_state = self.workflow_session_state.borrow_mut();
-        for (cell, declaration) in &self.workflow.state {
+        let mut session_state = self.worker.session_state.borrow_mut();
+        for (cell, declaration) in &self.plan.workflow.state {
             if declaration.scope == onnx_genai_metadata::WorkflowStateScope::Session
                 && declaration.class == onnx_genai_metadata::WorkflowStateClass::Semantic
             {
@@ -1631,6 +1574,7 @@ pipeline:
             loop {
                 let snapshot = governor.process_memory_manager().snapshot()?;
                 let stats = engine
+                    .backend
                     .models
                     .environment()?
                     .managed_cuda_allocator_stats(0)
@@ -1672,10 +1616,11 @@ pipeline:
                 )
                 .expect("pipeline engine");
             assert!(
-                !engine.execution_islands.is_empty(),
+                !engine.backend.execution_islands.is_empty(),
                 "workflow should lower into an execution island"
             );
             let build_stats = engine
+                .backend
                 .models
                 .environment()
                 .expect("pipeline environment")
@@ -1697,6 +1642,7 @@ pipeline:
                 .expect("execution island diagnostics");
             assert!(island.runs > 0, "execution island never ran: {island:?}");
             let after_run = engine
+                .backend
                 .models
                 .environment()
                 .expect("pipeline environment")
@@ -1727,6 +1673,7 @@ pipeline:
                 .allocations
                 .len();
             let component_allocator = engine
+                .backend
                 .models
                 .session("decoder")
                 .expect("component session")
@@ -1739,7 +1686,7 @@ pipeline:
                 &component_allocator,
             )
             .expect("component-managed device allocation");
-            let island_allocator = engine.execution_islands[0]
+            let island_allocator = engine.backend.execution_islands[0]
                 .session()
                 .device_allocator()
                 .expect("island device allocator")
@@ -1804,6 +1751,7 @@ pipeline:
             assert!(island.captures >= 1, "island never captured: {island:?}");
             assert!(island.replays >= 1, "island never replayed: {island:?}");
             let stats = engine
+                .backend
                 .models
                 .environment()
                 .expect("pipeline environment")
@@ -1913,8 +1861,8 @@ mod iteration_runtime_tests {
         assert_eq!(runtime.host_staging_count(), 0);
         assert_eq!(runtime.device_readback_bytes(), 0);
 
-        variant.host_staging_count.set(3);
-        variant.device_readback_bytes.set(12);
+        variant.worker.counters.host_staging_count.set(3);
+        variant.worker.counters.device_readback_bytes.set(12);
         assert_eq!(
             runtime.host_staging_count(),
             3,
@@ -1922,7 +1870,7 @@ mod iteration_runtime_tests {
         );
         assert_eq!(runtime.device_readback_bytes(), 12);
 
-        runtime.host_staging_count.set(1);
+        runtime.worker.counters.host_staging_count.set(1);
         assert_eq!(
             runtime.host_staging_count(),
             4,
@@ -1930,7 +1878,7 @@ mod iteration_runtime_tests {
         );
 
         // A variant holds no variants, so the fold is exhaustive one level deep.
-        assert!(variant.iteration_runtimes.borrow().is_empty());
+        assert!(variant.worker.iteration_runtimes.borrow().is_empty());
         Ok(())
     }
 
@@ -1942,9 +1890,261 @@ mod iteration_runtime_tests {
             IterationPolicy::ContinuousBatch,
             IterationPolicy::SpeculativeBlock,
         ] {
-            runtime.iteration_runtime(policy)?.host_staging_count.set(2);
+            runtime
+                .iteration_runtime(policy)?
+                .worker
+                .counters
+                .host_staging_count
+                .set(2);
         }
         assert_eq!(runtime.host_staging_count(), 4);
+        Ok(())
+    }
+}
+
+/// The state split of `docs/architecture/SESSION_CONCURRENCY.md` §3, held to by
+/// the compiler where it can be and by a test where it cannot.
+///
+/// These are `W = 1` contracts. None of them claims the runtime is concurrent;
+/// they claim that the state a second worker would have to own is separated
+/// from the state it could share, and that the compiler now knows which is
+/// which.
+#[cfg(test)]
+mod state_split_contracts {
+    use super::runtime_state::{PassId, WorkflowPlan, assert_impl_all, assert_not_impl_all};
+    use super::*;
+
+    // §3.1: the plan is shareable because it is frozen. If a mutable cell is
+    // ever added to `WorkflowPlan`, this stops compiling — which is the point.
+    assert_impl_all!(Arc<WorkflowPlan>: Send, Sync);
+
+    // §3.2/§3.3: the runtime that owns backend handles and worker state is not
+    // shareable and not sendable. `Engine`'s hand-written `unsafe impl Send`
+    // (`engine/model.rs`) still moves the whole engine onto the driver thread
+    // exactly once, as it did before this split; what these assert is that the
+    // interpreter does not offer that on its own.
+    assert_not_impl_all!(WorkflowRuntime: Send);
+    assert_not_impl_all!(WorkflowRuntime: Sync);
+
+    /// The plan can be read from another thread; the runtime holding it cannot
+    /// go with it.
+    ///
+    /// The static assertions above are the real contract. This is what makes
+    /// the first half of it *useful* rather than merely true: an `Arc` of the
+    /// plan really does cross a thread boundary and answer the same question on
+    /// the other side, which is what §3.1's "shared by every worker behind
+    /// `Arc`" will mean when there is more than one worker.
+    #[test]
+    fn the_immutable_plan_can_be_read_from_another_thread() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        let expected = runtime.plan().workflow.outputs.len();
+        let shared = Arc::clone(runtime.plan());
+        let observed = std::thread::spawn(move || shared.workflow.outputs.len())
+            .join()
+            .map_err(|_| anyhow::anyhow!("plan reader thread panicked"))?;
+        assert_eq!(
+            observed, expected,
+            "a frozen plan must read the same on any thread"
+        );
+        assert_eq!(
+            Arc::strong_count(runtime.plan()),
+            1,
+            "the borrowed clone is released with the thread that read it"
+        );
+        Ok(())
+    }
+
+    /// Pass ids come from the worker that runs the pass, and start at "none".
+    ///
+    /// The id is what invalidates a previous pass's cached service state, so a
+    /// runtime that has run nothing must not compare equal to one that has run
+    /// a pass — which is what `PassId::NONE` is for.
+    #[test]
+    fn each_pass_gets_a_fresh_id_from_the_worker_that_runs_it() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        assert_eq!(
+            runtime.worker.current_pass(),
+            PassId::NONE,
+            "a runtime that has run nothing is in no pass"
+        );
+        let first = runtime.begin_pass(false);
+        let second = runtime.begin_pass(false);
+        assert_ne!(first.id, second.id, "two passes must not share an id");
+        assert_eq!(runtime.worker.current_pass(), second.id);
+
+        // A re-authored iteration variant is a second interpreter with its own
+        // worker state, so it counts its own passes. Its ids are only ever
+        // compared against its own cached state, which is what makes a
+        // worker-local namespace sound.
+        let variant = runtime.iteration_runtime(IterationPolicy::ContinuousBatch)?;
+        assert_eq!(variant.worker.current_pass(), PassId::NONE);
+        assert_eq!(variant.begin_pass(false).id, first.id);
+        assert_eq!(
+            runtime.worker.current_pass(),
+            second.id,
+            "a variant's pass must not advance its parent's"
+        );
+        Ok(())
+    }
+
+    /// A conversation still continues, and the cells it continues from are the
+    /// worker's.
+    ///
+    /// The session-scoped cells moved from a field of the runtime to a field of
+    /// its worker state. This reads one back through the public accessors a
+    /// continuing turn uses, so the move is a change of owner and not of
+    /// behaviour.
+    #[cfg(feature = "native-backend")]
+    #[test]
+    fn a_session_continues_from_the_workers_own_cells() -> anyhow::Result<()> {
+        let runtime = generation::test_conversation_decoder_runtime()?;
+        let (cell, _, _, _) = workflow::workflow_prompt_continuation(runtime.workflow_spec())
+            .context("the conversation fixture must declare a prompt continuation")?;
+        assert!(runtime.prepends_session_conversation());
+
+        runtime.worker.session_state.borrow_mut().insert(
+            ("session-a".to_string(), cell.to_string()),
+            Value::from_slice_i64(&[7, 8, 9], &[1, 3])?,
+        );
+        runtime.worker.session_state.borrow_mut().insert(
+            ("session-b".to_string(), cell.to_string()),
+            Value::from_slice_i64(&[4], &[1, 1])?,
+        );
+
+        assert_eq!(
+            runtime.session_conversation("session-a"),
+            Some(vec![7, 8, 9])
+        );
+        assert_eq!(runtime.session_conversation_len("session-a"), Some(3));
+        assert_eq!(runtime.session_prepended_prompt_len("session-a"), 3);
+
+        runtime.forget_session("session-a");
+        assert_eq!(
+            runtime.session_conversation("session-a"),
+            Some(Vec::new()),
+            "closing a session must release the cells it accumulated"
+        );
+        assert_eq!(
+            runtime.session_conversation("session-b"),
+            Some(vec![4]),
+            "and must release no other session's"
+        );
+        Ok(())
+    }
+
+    /// Dropping the runtime still releases the values it cached.
+    ///
+    /// A `Value` is a bare `OrtValue` handle with no back-reference to the
+    /// allocator it came from (§3.4), so nothing in the type system orders their
+    /// release and the clears in `Drop` are load-bearing. Moving the maps into
+    /// worker state moved those clears; it did not remove them. Holding a second
+    /// `Arc` to a cached output is how that is observed: if the drop path stops
+    /// clearing, the count stays at two.
+    // The output cache is keyed to `Arc<Value>` because that is the owner type
+    // the stable-binding path uses; the refcount is never contended because the
+    // whole worker is single-threaded, which is exactly what this asserts.
+    #[allow(clippy::arc_with_non_send_sync)]
+    #[test]
+    fn dropping_the_runtime_still_releases_the_values_it_cached() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        let cached = Arc::new(Value::from_slice_i64(&[11, 12], &[1, 2])?);
+        runtime.worker.component_outputs.borrow_mut().insert(
+            (
+                "decoder".to_string(),
+                "logits".to_string(),
+                vec![1, 2],
+                "f32".to_string(),
+            ),
+            Arc::clone(&cached),
+        );
+        assert_eq!(Arc::strong_count(&cached), 2);
+        drop(runtime);
+        assert_eq!(
+            Arc::strong_count(&cached),
+            1,
+            "the drop path must release cached values, and before the allocators \
+             that own their memory"
+        );
+        Ok(())
+    }
+
+    /// And releases them *before* the allocators, which drop order alone would
+    /// not guarantee.
+    ///
+    /// Release order is not observable from a test: a released `Value` reports
+    /// nothing, and an allocator freed too early is undefined behaviour rather
+    /// than a failed assertion. So this reads the two places the ordering lives
+    /// and fails if either the call or the sequence inside it is lost — which is
+    /// what #2019's contract and §13 Phase 1 both say must be retained.
+    #[test]
+    fn the_drop_path_clears_values_before_allocators() -> anyhow::Result<()> {
+        let source_of = |file: &str| -> anyhow::Result<String> {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/pipeline")
+                .join(file);
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))
+        };
+
+        let owner = source_of("mod.rs")?;
+        let drop_impl = owner
+            .split("impl Drop for WorkflowRuntime")
+            .nth(1)
+            .context("WorkflowRuntime must keep its explicit Drop")?;
+        let drop_body = &drop_impl[..drop_impl.find("\n}").unwrap_or(drop_impl.len())];
+        assert!(
+            drop_body.contains("release_ort_state()"),
+            "WorkflowRuntime::drop must still release ORT state through its worker"
+        );
+
+        let state = source_of("runtime_state.rs")?;
+        let release = state
+            .split("fn release_ort_state")
+            .nth(1)
+            .context("worker state must keep release_ort_state")?;
+        let body = &release[..release.find("\n    }").unwrap_or(release.len())];
+        let position = |field: &str| {
+            body.find(&format!("{field}.get_mut().clear()"))
+                .unwrap_or_else(|| panic!("release_ort_state must clear {field}"))
+        };
+        assert!(
+            position("component_bindings") < position("component_outputs"),
+            "bindings hold bound values, so they are released first"
+        );
+        assert!(
+            position("component_outputs") < position("component_allocators"),
+            "a Value has no back-reference to its allocator, so values go first"
+        );
+        Ok(())
+    }
+
+    /// One pass at a time per session, still refused by name.
+    ///
+    /// The lease set moved into worker state. It is the inner-layer invariant
+    /// of §4.2 and stays exactly as reachable as it was — this asserts the
+    /// refusal still comes back typed after the move.
+    #[test]
+    fn the_workers_session_lease_still_refuses_a_second_holder() -> anyhow::Result<()> {
+        let runtime = generation::test_decoder_runtime()?;
+        let leases = &runtime.worker.session_leases;
+        assert!(leases.borrow().is_empty());
+
+        let held = workflow::SessionLeaseGuard::acquire(leases, "session-a")?;
+        let Err(refused) = workflow::SessionLeaseGuard::acquire(leases, "session-a") else {
+            anyhow::bail!("a second holder of an exclusive lease must be refused");
+        };
+        assert!(matches!(
+            refused.downcast_ref::<crate::engine::PackageCapabilityError>(),
+            Some(crate::engine::PackageCapabilityError::ExclusiveLeaseConflict { session })
+                if session == "session-a"
+        ));
+        // A different conversation is not blocked by this one.
+        let other = workflow::SessionLeaseGuard::acquire(leases, "session-b")?;
+        drop(other);
+        drop(held);
+        assert!(
+            leases.borrow().is_empty(),
+            "a lease is released when its pass ends"
+        );
         Ok(())
     }
 }

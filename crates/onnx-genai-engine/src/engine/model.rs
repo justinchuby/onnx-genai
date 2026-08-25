@@ -62,8 +62,13 @@ pub struct Engine {
     /// id handed out here. The value is the logical token count so far, which
     /// is what a caller asking about a session wants to know.
     pub(crate) workflow_sessions: HashMap<SessionId, usize>,
-    /// Monotonic counter for interpreter session ids.
-    pub(crate) workflow_session_counter: u64,
+    /// Mints interpreter session ids.
+    ///
+    /// The ids leave the engine — a caller holds one, and the server routes on
+    /// it — so this is the shared namespace of `engine::ids`, not a worker-local
+    /// counter. A second worker minting from a second counter would hand the
+    /// same id to two conversations.
+    pub(crate) workflow_session_ids: SharedSessionIds,
     /// ORT session for decoder execution.
     pub(crate) session: Option<Box<Session>>,
     /// Native decoder session. Native execution is single-request and serialized
@@ -84,9 +89,9 @@ pub struct Engine {
     /// Which native session currently has its KV state loaded in `native_session`.
     #[cfg(feature = "native-backend")]
     pub(crate) native_active_session: Option<SessionId>,
-    /// Monotonic counter for native session id generation.
+    /// Mints native session ids, in their own shared namespace.
     #[cfg(feature = "native-backend")]
-    pub(crate) native_session_counter: u64,
+    pub(crate) native_session_ids: SharedSessionIds,
     /// Monotonic counter for LRU access stamps. Kept separate from the id
     /// counter so that touching a session does not consume session ids.
     #[cfg(feature = "native-backend")]
@@ -177,7 +182,7 @@ impl Engine {
             governor,
             sessions: HashMap::new(),
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             session: None,
             #[cfg(feature = "native-backend")]
             native_session: None,
@@ -189,7 +194,7 @@ impl Engine {
             #[cfg(feature = "native-backend")]
             native_active_session: None,
             #[cfg(feature = "native-backend")]
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             #[cfg(feature = "native-backend")]
             native_access_counter: 0,
             #[cfg(feature = "native-backend")]

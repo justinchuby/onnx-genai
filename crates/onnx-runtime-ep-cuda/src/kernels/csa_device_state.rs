@@ -10,6 +10,9 @@ use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Result};
 use onnx_runtime_ir::{Node, Shape};
 
+use crate::kernels::csa_state_group::{
+    CsaStateGroupBytes, CsaStateGroupCharge, CsaStateGroupLedger,
+};
 use crate::runtime::CudaRuntime;
 
 const ATTN_WIDTH: usize = 583;
@@ -127,6 +130,18 @@ pub(crate) struct CsaDeviceBufferManager {
     /// scores). Reserved once at runner init with stable addresses so the
     /// device-only capture path never allocates per call.
     workspaces: Vec<CUdeviceptr>,
+    /// RAII accounting charge against the CSA state-group ledger, holding the
+    /// governor [`MemoryLease`] for these bytes. Held for the manager's lifetime
+    /// so residency is released from the one accounting authority
+    /// (`MemoryGovernor::used(Tier::Device)`) exactly when the physical buffers
+    /// are freed (`Drop`) or the reservation is rolled back. The ledger is
+    /// mandatory: every CSA device-buffer reservation is charged to the shared
+    /// governor, so there is no unaccounted path (B6/B6.2). Read only through
+    /// its `Drop` in production; `charged_bytes` reads it under test.
+    ///
+    /// [`MemoryLease`]: onnx_runtime_memory_governor::MemoryLease
+    #[allow(dead_code)]
+    charge: CsaStateGroupCharge,
 }
 
 impl CsaDeviceBufferManager {
@@ -134,7 +149,26 @@ impl CsaDeviceBufferManager {
         runtime: Arc<CudaRuntime>,
         layout: CsaBufferLayout,
         workspace_bytes: &[usize],
+        ledger: Arc<CsaStateGroupLedger>,
+        charge_key: (u64, u32),
     ) -> Result<Self> {
+        // Fail closed on the one accounting authority BEFORE touching CUDA: the
+        // charge reserves these bytes from the shared `MemoryGovernor` (B6.2),
+        // so an over-budget state group is refused with a typed reason and no
+        // physical device memory is reserved — a rejected group can never leak,
+        // and the reserved bytes are visible in the same device books as every
+        // other holder. The ledger is always present (single accountant, no
+        // unaccounted bypass); "disarmed" means the backing governor is
+        // unlimited, so it never refuses and adds no device op, keeping the
+        // reservation byte-identical. `charge` holds the governor lease in a
+        // local so any early return below releases both the lease and the
+        // attribution mirror via RAII (transaction rollback).
+        let charge = ledger
+            .try_charge(
+                charge_key,
+                CsaStateGroupBytes::from_layout(&layout, workspace_bytes),
+            )
+            .map_err(EpError::from)?;
         let sizes = [
             layout.attention_r4_bytes,
             layout.attention_r4_carry_bytes,
@@ -179,12 +213,21 @@ impl CsaDeviceBufferManager {
             layout,
             buffers,
             workspaces,
+            charge,
         })
     }
 
     /// Stable address of pooled workspace `index` (reserved in `reserve`).
     pub(crate) fn workspace(&self, index: usize) -> CUdeviceptr {
         self.workspaces[index]
+    }
+
+    /// Bytes this manager currently holds against the CSA state-group ledger.
+    /// Lets a test assert `ledger.resident == sum(reserved)` and that teardown
+    /// returns to baseline.
+    #[cfg(test)]
+    pub(crate) fn charged_bytes(&self) -> u64 {
+        self.charge.total()
     }
 }
 
@@ -264,5 +307,249 @@ mod tests {
         assert_eq!(layout.attention_r4_bytes, 2 * 256 * 583);
         assert_eq!(layout.index_r4_bytes, 2 * 256 * 68);
         assert_eq!(layout.dense_ring_bytes, 2 * 128 * 583);
+    }
+
+    /// A fixed, non-trivial layout for accounting tests (reuses the static
+    /// sizing path, so it never touches CUDA).
+    fn sample_layout() -> CsaBufferLayout {
+        let mut graph = Graph::new();
+        let query = graph.create_named_value(
+            "q",
+            onnx_runtime_ir::DataType::Float32,
+            static_shape([2, 1, 1, 512]),
+        );
+        let cache = graph.create_named_value(
+            "cache",
+            onnx_runtime_ir::DataType::Uint8,
+            static_shape([2, 0, 583]),
+        );
+        let mut node = Node::new(
+            NodeId(0),
+            "CompressedSparseAttention",
+            vec![Some(query), Some(cache)],
+            vec![],
+        );
+        node.domain = "pkg.nxrt".into();
+        node.attributes
+            .insert("max_seq_len".into(), Attribute::Int(1024));
+        node.attributes
+            .insert("sliding_window".into(), Attribute::Int(128));
+        CsaBufferLayout::from_claim(
+            &node,
+            &[static_shape([2, 1, 1, 512]), static_shape([2, 0, 583])],
+            4,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// The reservation charges the ledger with exactly the bytes it physically
+    /// reserves, and dropping the manager returns residency to baseline. This is
+    /// the core B6 property: the ledger is the sole accountant and never leaks.
+    #[test]
+    fn reserve_charges_ledger_and_releases_on_drop() {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping CSA ledger reserve test: CUDA runtime unavailable");
+            return;
+        };
+        let layout = sample_layout();
+        let workspaces = [4096usize, 2048, 0];
+        let expected = CsaStateGroupBytes::from_layout(&layout, &workspaces).total();
+        assert!(expected > 0, "sample layout must reserve some bytes");
+
+        let ledger = Arc::new(CsaStateGroupLedger::default());
+        assert_eq!(ledger.resident_bytes(), 0, "baseline before reserve");
+        {
+            let manager = CsaDeviceBufferManager::reserve(
+                runtime.clone(),
+                layout,
+                &workspaces,
+                Arc::clone(&ledger),
+                (7, runtime.ordinal()),
+            )
+            .expect("reserve within unlimited ledger");
+            assert_eq!(
+                manager.charged_bytes(),
+                expected,
+                "manager holds the charge"
+            );
+            assert_eq!(
+                ledger.resident_bytes(),
+                expected,
+                "ledger residency equals reserved bytes"
+            );
+            assert_eq!(ledger.peak_bytes(), expected);
+            assert_eq!(ledger.active_group_count(), 1);
+        }
+        assert_eq!(ledger.resident_bytes(), 0, "teardown returns to baseline");
+        assert_eq!(ledger.active_group_count(), 0);
+        assert_eq!(
+            ledger.peak_bytes(),
+            expected,
+            "peak is retained after release"
+        );
+    }
+
+    /// Over-limit reservation fails closed with a typed OOM *before* any device
+    /// allocation, and leaves the ledger untouched (no leaked residency).
+    #[test]
+    fn reserve_fails_closed_over_limit_without_leaking() {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping CSA ledger OOM test: CUDA runtime unavailable");
+            return;
+        };
+        let layout = sample_layout();
+        let workspaces = [4096usize];
+        let needed = CsaStateGroupBytes::from_layout(&layout, &workspaces).total();
+
+        let ledger = Arc::new(CsaStateGroupLedger::with_device_limit(needed - 1));
+        let result = CsaDeviceBufferManager::reserve(
+            runtime.clone(),
+            layout,
+            &workspaces,
+            Arc::clone(&ledger),
+            (1, runtime.ordinal()),
+        )
+        .map(|_| ());
+        assert!(
+            matches!(result, Err(EpError::OutOfMemory { .. })),
+            "over-limit reservation must fail closed with OutOfMemory, got {result:?}"
+        );
+        assert_eq!(ledger.resident_bytes(), 0, "nothing charged on refusal");
+        assert_eq!(ledger.active_group_count(), 0, "no group admitted");
+        assert_eq!(ledger.charge_failures(), 1, "the refusal is counted");
+        assert_eq!(
+            ledger.governor_device_used(),
+            0,
+            "the governor's device books also stay at baseline on refusal"
+        );
+    }
+
+    /// Two reservations under distinct `(request, device)` keys are isolated:
+    /// each carries its own residency and dropping one does not disturb the
+    /// other.
+    #[test]
+    fn reservations_are_isolated_per_request() {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping CSA ledger isolation test: CUDA runtime unavailable");
+            return;
+        };
+        let workspaces = [1024usize];
+        let per = CsaStateGroupBytes::from_layout(&sample_layout(), &workspaces).total();
+        let ledger = Arc::new(CsaStateGroupLedger::default());
+        let device = runtime.ordinal();
+
+        let first = CsaDeviceBufferManager::reserve(
+            runtime.clone(),
+            sample_layout(),
+            &workspaces,
+            Arc::clone(&ledger),
+            (1, device),
+        )
+        .expect("first reserve");
+        let second = CsaDeviceBufferManager::reserve(
+            runtime.clone(),
+            sample_layout(),
+            &workspaces,
+            Arc::clone(&ledger),
+            (2, device),
+        )
+        .expect("second reserve");
+
+        assert_eq!(ledger.active_group_count(), 2);
+        assert_eq!(ledger.resident_for(1, device), per);
+        assert_eq!(ledger.resident_for(2, device), per);
+        assert_eq!(ledger.resident_bytes(), per * 2);
+
+        drop(first);
+        assert_eq!(ledger.resident_for(1, device), 0, "first released");
+        assert_eq!(
+            ledger.resident_for(2, device),
+            per,
+            "second unaffected by first's teardown"
+        );
+        drop(second);
+        assert_eq!(ledger.resident_bytes(), 0, "both released to baseline");
+    }
+
+    /// Reserved workspace addresses are stable for the manager's lifetime, as
+    /// the capture path requires (no per-call reallocation, no VA churn).
+    #[test]
+    fn reserved_workspace_addresses_are_stable() {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping CSA workspace stability test: CUDA runtime unavailable");
+            return;
+        };
+        let workspaces = [2048usize, 4096, 8192];
+        let manager = CsaDeviceBufferManager::reserve(
+            runtime.clone(),
+            sample_layout(),
+            &workspaces,
+            Arc::new(CsaStateGroupLedger::default()),
+            (3, runtime.ordinal()),
+        )
+        .expect("reserve");
+        for i in 0..workspaces.len() {
+            assert_eq!(
+                manager.workspace(i),
+                manager.workspace(i),
+                "workspace {i} address must be stable across reads"
+            );
+        }
+        assert_ne!(
+            manager.workspace(0),
+            manager.workspace(1),
+            "distinct workspaces occupy distinct addresses"
+        );
+    }
+
+    /// An unlimited (default) ledger accounts the reservation but never refuses,
+    /// so the reservation is byte-identical to the pre-accounting path — the
+    /// ledger is always present (no unaccounted bypass), and "disarmed" is a
+    /// limit setting, not a structural escape hatch.
+    #[test]
+    fn unlimited_ledger_accounts_without_refusing() {
+        let Some(runtime) = crate::test_support::maybe_runtime() else {
+            eprintln!("skipping CSA unlimited-ledger test: CUDA runtime unavailable");
+            return;
+        };
+        let workspaces = [1024usize];
+        let expected = CsaStateGroupBytes::from_layout(&sample_layout(), &workspaces).total();
+        let ledger = Arc::new(CsaStateGroupLedger::default());
+        assert_eq!(
+            ledger.device_available_bytes(),
+            u64::MAX,
+            "default ledger's backing governor is unlimited"
+        );
+        let manager = CsaDeviceBufferManager::reserve(
+            runtime.clone(),
+            sample_layout(),
+            &workspaces,
+            Arc::clone(&ledger),
+            (0, runtime.ordinal()),
+        )
+        .expect("unlimited ledger never refuses");
+        assert_eq!(
+            manager.charged_bytes(),
+            expected,
+            "reservation is accounted"
+        );
+        assert_eq!(
+            ledger.governor_device_used(),
+            expected,
+            "the physical reservation is visible in the one governor's device books"
+        );
+        assert_eq!(
+            ledger.charge_failures(),
+            0,
+            "no refusal on the disarmed path"
+        );
+        drop(manager);
+        assert_eq!(ledger.resident_bytes(), 0, "teardown returns to baseline");
+        assert_eq!(
+            ledger.governor_device_used(),
+            0,
+            "teardown also returns the governor's device books to baseline"
+        );
     }
 }

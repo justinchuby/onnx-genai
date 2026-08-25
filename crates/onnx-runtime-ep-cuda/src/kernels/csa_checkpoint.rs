@@ -38,6 +38,7 @@ use std::sync::{Arc, Mutex};
 use cudarc::driver::sys::CUdeviceptr;
 use onnx_runtime_ep_api::{EpError, Result};
 
+use crate::kernels::csa_state_group::CsaStateGroupLedger;
 use crate::runtime::CudaRuntime;
 
 /// The five logical CSA cursors (D6, §4.6). Every cursor is a bounded scalar
@@ -307,9 +308,32 @@ pub struct CsaMetrics {
     host_bytes_total: AtomicU64,
     bytes_avoided_total: AtomicU64,
     layers: Mutex<BTreeMap<u64, CsaLayerMetrics>>,
+    /// B6/B6.2 accounting authority: the single ledger every CSA device-buffer
+    /// reservation charges, isolated per `(request, device)`. Its admission
+    /// delegates to the shared [`MemoryGovernor`] threaded from the EP, so CSA
+    /// bytes are counted in the one set of device books; the `Default` surface
+    /// backs it with a private unlimited reference governor, which keeps the
+    /// reservation path byte-identical until a real budget is threaded in.
+    ///
+    /// [`MemoryGovernor`]: onnx_runtime_memory_governor::MemoryGovernor
+    state_groups: Arc<CsaStateGroupLedger>,
 }
 
 impl CsaMetrics {
+    /// A telemetry surface whose CSA state-group ledger charges the shared
+    /// process `governor` — the B6.2 unification, so CSA device residency lands
+    /// in the same books (`MemoryGovernor::used(Tier::Device)`) as every other
+    /// device holder. The EP threads its governor here at construction; the
+    /// `Default` surface uses a private unlimited reference governor instead.
+    pub(crate) fn with_governor(
+        governor: Arc<dyn onnx_runtime_memory_governor::MemoryGovernor + Send + Sync>,
+    ) -> Self {
+        Self {
+            state_groups: Arc::new(CsaStateGroupLedger::new(governor)),
+            ..Self::default()
+        }
+    }
+
     /// Record one decode's observability for `layer_id`.
     pub fn record_layer(&self, layer_id: u64, sample: CsaLayerMetrics) {
         self.device_bytes_total
@@ -328,6 +352,69 @@ impl CsaMetrics {
     /// Increment the speculative rollback counter (§8 "rollback counts").
     pub fn record_rollback(&self) {
         self.rollback_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The shared CSA state-group accounting ledger (B6). Every CSA device
+    /// buffer reservation charges this ledger, so it is the single authority
+    /// for CSA device residency. Clone is cheap (`Arc`); all clones share the
+    /// same accounting state.
+    pub(crate) fn state_group_ledger(&self) -> Arc<CsaStateGroupLedger> {
+        Arc::clone(&self.state_groups)
+    }
+
+    /// Resident CSA state-group device bytes across all requests/devices (B6).
+    /// This is the accounting authority's residency observed through the §8
+    /// telemetry surface, so callers never reach into the ledger directly.
+    pub fn csa_state_group_resident_bytes(&self) -> u64 {
+        self.state_groups.resident_bytes()
+    }
+
+    /// High-water mark of CSA state-group residency since process start.
+    pub fn csa_state_group_peak_bytes(&self) -> u64 {
+        self.state_groups.peak_bytes()
+    }
+
+    /// Resident compressed-record bytes — the class the HCA path shrinks
+    /// relative to `csa_state_group_dense_ring_bytes`.
+    pub fn csa_state_group_compressed_bytes(&self) -> u64 {
+        self.state_groups.compressed_bytes()
+    }
+
+    /// Resident dense-ring bytes (the uncompressed sliding window).
+    pub fn csa_state_group_dense_ring_bytes(&self) -> u64 {
+        self.state_groups.dense_ring_bytes()
+    }
+
+    /// Count of reservations refused because they would cross the managed
+    /// limit (fail-closed admissions).
+    pub fn csa_state_group_charge_failures(&self) -> u64 {
+        self.state_groups.charge_failures()
+    }
+
+    /// Number of distinct `(request, device)` CSA state groups currently
+    /// resident.
+    pub fn csa_state_group_active_count(&self) -> usize {
+        self.state_groups.active_group_count()
+    }
+
+    /// Resident bytes for one `(request, device)` group — the isolation view.
+    pub fn csa_state_group_resident_for(&self, request: u64, device_ordinal: u32) -> u64 {
+        self.state_groups.resident_for(request, device_ordinal)
+    }
+
+    /// Device bytes the backing governor can still grant — the live ceiling CSA
+    /// state groups fail closed against. There is no private CSA limit: the one
+    /// governor authority owns admission (B6.2), so this is a read-only view.
+    pub fn csa_state_group_device_available_bytes(&self) -> u64 {
+        self.state_groups.device_available_bytes()
+    }
+
+    /// Device bytes the backing governor accounts across every holder — the
+    /// single-authority total CSA residency now contributes to. In a
+    /// CSA-dedicated governor this equals `csa_state_group_resident_bytes`; in
+    /// the shared process governor it also includes weights, KV and workspaces.
+    pub fn csa_state_group_governor_device_used(&self) -> u64 {
+        self.state_groups.governor_device_used()
     }
 
     /// Total speculative rollbacks observed.
