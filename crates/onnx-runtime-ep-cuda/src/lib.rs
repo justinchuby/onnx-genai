@@ -119,6 +119,13 @@ pub use kernels::attention::AttentionKernel;
 pub use kernels::csa_checkpoint::{
     CsaAttentionMode, CsaCheckpoint, CsaCheckpointJournal, CsaCursors, CsaLayerMetrics, CsaMetrics,
 };
+pub use kernels::dsa_index_select::{
+    DsaWorkspaceStats, dsa_workspace_stats, reset_dsa_workspace_stats,
+};
+#[cfg(feature = "gpu-tests")]
+pub use kernels::dsa_index_select::{
+    dsa_plugin_capture_stats_for_test, set_dsa_plugin_capture_replays_for_test,
+};
 pub use kernels::gather::GATHER_CAPTURE_ERROR_INDEX;
 pub use kernels::gather_block_quantized::GATHER_BLOCK_QUANTIZED_CAPTURE_ERROR_INDEX;
 pub use kernels::group_query_attention::{

@@ -33,6 +33,7 @@ use onnx_runtime_ep_api::{
 };
 use onnx_runtime_ep_cpu::CpuExecutionProvider;
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
+use onnx_runtime_ep_cuda::kernels::dsa_index_select::DsaIndexSelectFactory;
 use onnx_runtime_ep_cuda::runtime::cuptr;
 use onnx_runtime_ir::{
     Attribute, DataType, DeviceId, Graph, Node, NodeId, compute_contiguous_strides, static_shape,
@@ -314,6 +315,15 @@ fn run_gpu(
 ) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let model = Model::new(graph);
     let kernel = ep.get_kernel(model.graph.node(node), &concrete_shapes(inputs), 1)?;
+    run_gpu_with_kernel(ep, kernel.as_ref(), inputs, output_specs)
+}
+
+fn run_gpu_with_kernel(
+    ep: &CudaExecutionProvider,
+    kernel: &dyn onnx_runtime_ep_api::Kernel,
+    inputs: &[Option<HostTensor>],
+    output_specs: &[OutputSpec],
+) -> onnx_runtime_ep_api::Result<Vec<Vec<u8>>> {
     let runtime = ep.runtime();
 
     let buffers = upload_inputs(ep, inputs)?;
@@ -349,7 +359,7 @@ fn run_gpu(
         })
         .collect();
     let mut workspace_buffer = None;
-    let workspace = workspace_view_for(kernel.as_ref(), &views, &mut workspace_buffer, ep)?;
+    let workspace = workspace_view_for(kernel, &views, &mut workspace_buffer, ep)?;
     let result = kernel.execute_with_workspace(&views, &mut out_views, workspace);
     drop(out_views);
     drop(views);
@@ -899,6 +909,83 @@ fn sequential_requests_are_isolated() {
     ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
 )]
 #[test]
+fn forced_small_grid_stride_executes_every_row() {
+    let ep = require_cuda();
+    let case = Case {
+        batch: 1,
+        q_seq: 5,
+        heads: 2,
+        head_dim: 8,
+        key_seq: 7,
+        top_k: 4,
+        scale: 0.125,
+        weights_scale: Some(0.5),
+    };
+    let inputs = glm_inputs(case, 0x600D);
+    let (graph, node, specs) = build_node(&inputs, case);
+    let factory = DsaIndexSelectFactory {
+        runtime: ep.runtime().clone(),
+    };
+    let kernel = factory
+        .create_kernel_with_grid_limit(graph.node(node), 2)
+        .expect("create forced-small-grid DsaIndexSelect");
+    let gpu = run_gpu_with_kernel(&ep, &kernel, &inputs, &specs)
+        .expect("forced-small-grid DsaIndexSelect");
+    let cpu = run_cpu(&graph, node, &inputs, &specs).expect("CPU oracle");
+    assert_indices_bit_exact(&gpu[0], &cpu[0], "two-block grid-stride execution");
+    assert_eq!(
+        as_i64(&gpu[0]).len(),
+        case.q_seq * case.top_k,
+        "all five rows must execute even though only two blocks were launched"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn kernel_owned_workspace_is_stable_without_reallocation() {
+    let ep = require_cuda();
+    let case = glm_case(4, 12);
+    let inputs = glm_inputs(case, 0x0051_A81E);
+    let (graph, node, specs) = build_node(&inputs, case);
+    let factory = DsaIndexSelectFactory {
+        runtime: ep.runtime().clone(),
+    };
+    let kernel = factory
+        .create_kernel_with_grid_limit(graph.node(node), 2)
+        .expect("create DsaIndexSelect");
+
+    let allocations_before = ep.runtime().allocation_counts().allocations;
+    run_gpu_with_kernel(&ep, &kernel, &inputs, &specs).expect("first eager run");
+    let first = kernel.workspace_snapshot();
+    assert_ne!(first.0, 0);
+    assert_eq!(first.1, 512);
+    assert_eq!(
+        ep.runtime().allocation_counts().allocations,
+        allocations_before + 1
+    );
+
+    run_gpu_with_kernel(&ep, &kernel, &inputs, &specs).expect("second eager run");
+    let second = kernel.workspace_snapshot();
+    assert_eq!(
+        second.0, first.0,
+        "fixed-shape warm runs must reuse the exact workspace pointer"
+    );
+    assert_eq!(second.1, first.1);
+    assert_eq!(
+        ep.runtime().allocation_counts().allocations,
+        allocations_before + 1,
+        "steady-state execution must not allocate another workspace"
+    );
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
 fn captured_replay_is_byte_identical_and_no_fallback() {
     let ep = require_cuda();
     let case = glm_case(4, 12);
@@ -1084,6 +1171,43 @@ fn supports_op_claims_valid_and_low_precision_storage() {
             "{storage:?} query/key/weights storage (f32 bias) must be claimed by supports_op"
         );
     }
+}
+
+#[cfg_attr(
+    not(feature = "gpu-tests"),
+    ignore = "requires CUDA device; enable the gpu-tests feature on a CUDA runner"
+)]
+#[test]
+fn native_provider_accepts_only_exact_opset_v1() {
+    let ep = require_cuda();
+    let case = glm_case(1, 4);
+    let inputs = glm_inputs(case, 0x0A57);
+    let (graph, node, _specs) = build_node(&inputs, case);
+    let model = Model::new(&graph);
+    let node_ref = model.graph.node(node);
+    let (shapes, dtypes) = shapes_and_dtypes(&inputs);
+
+    assert!(matches!(
+        ep.supports_op(node_ref, 1, &shapes, &dtypes, &[]),
+        KernelMatch::Supported { .. }
+    ));
+    assert!(
+        matches!(
+            ep.supports_op(node_ref, 2, &shapes, &dtypes, &[]),
+            KernelMatch::Unsupported { .. }
+        ),
+        "the frozen DsaIndexSelect ABI must not inherit since-version v2 support"
+    );
+    assert!(
+        ep.get_kernel(node_ref, &concrete_shapes(&inputs), 1)
+            .is_ok(),
+        "native provider must create the v1 kernel"
+    );
+    assert!(
+        ep.get_kernel(node_ref, &concrete_shapes(&inputs), 2)
+            .is_err(),
+        "native provider must reject direct v2 kernel creation"
+    );
 }
 
 #[cfg_attr(

@@ -1,6 +1,6 @@
 # DsaIndexSelect — GLM-5.2 DSA query-dependent index selection — frozen v1
 
-**Status:** frozen v1 (CPU oracle + typed validator landed; CUDA is the next slice)
+**Status:** frozen v1 (CPU oracle + native/plugin CUDA implementation)
 **Operator:** `pkg.nxrt::DsaIndexSelect`, version 1
 **Pairs with:** `pkg.nxrt::IndexShare` (see `INDEXSHARE_DESIGN.md`)
 
@@ -164,7 +164,10 @@ The CUDA NVRTC kernel `dsa_index_select_row` reproduces the frozen semantics
 above **bit-for-bit** against the CPU oracle (integer `selected_indices`, so
 parity is byte-exact, not tolerance-based). Design as landed:
 
-- **One launch, one block per `(b, s)` row.** Phase 1 computes the head-weighted
+- **One launch, grid-stride rows.** Each block walks `(b, s)` rows by
+  `gridDim.x`, whose launch bound is capped by the device's reported maximum
+  grid X. Every accepted row therefore executes even when `B·S` exceeds that
+  bound. Phase 1 computes the head-weighted
   ReLU'd scaled score for every allowed key in parallel (threads widen f16/bf16
   storage to f32 with `__half2float` / `__bfloat162float`, matching the CPU
   oracle's `half::to_f32`, so scores are identical). Phase 2 runs the
@@ -183,15 +186,22 @@ parity is byte-exact, not tolerance-based). Design as landed:
   `weighted + bias`) have no fusible partner and already match CPU rounding.
 - **Fixed scratch, no page allocation.** The only device memory the op adds is a
   `B·S·T` f32 `scores` buffer plus a `B·S·T` u8 `state` buffer in the
-  executor-owned **SessionPersistent** workspace (256-aligned, overwritten fresh
-  each call). `onnx-genai-kv` remains the sole page/slot/lifetime authority — the
-  op allocates and owns no pages.
+  kernel-owned persistent slot (256-aligned, overwritten fresh each call). The
+  slot grows only outside capture, is shared by the native and ORT-plugin paths,
+  and is released with the compiled kernel/session. The kernel declares no
+  external workspace, so the plugin never downgrades persistent storage to
+  ORT's recycled step scratch. `onnx-genai-kv` remains the sole
+  page/slot/lifetime authority — the op allocates and owns no pages.
 - **Capture-safe.** The kernel produces indices (no index *input* to validate),
-  so there is **no capture-error latch, no D2H, and no host sync on any path**.
+  so there is **no D2H and no host sync on the capturing path**.
   `warmed` flips true only after a non-capturing eager pass has NVRTC-compiled
   the kernel and sized the workspace; `capture_support()` reports `Supported`
   only once warmed, so a captured region performs no host alloc / sync / compile.
-- **Claim gate.** `supports_op` delegates to the shared CPU
+- **Exact v1 claim gate.** Native `supports_op`/`get_kernel` and the plugin
+  registry accept only `pkg.nxrt::DsaIndexSelect` v1. The plugin graph reader
+  preserves the model's real domain-opset imports rather than substituting the
+  schema since-version, and the CUDA plugin contributes the `pkg.nxrt` schema
+  needed for a real ORT session. Shape/dtype validation delegates to the shared CPU
   `unsupported_reason`, first projecting the query/key/weights float dtypes to f32
   (CUDA supports f16/bf16 storage) while leaving `attention_bias` untouched, so
   the oracle's strict f32-only bias reject still fires. Quantized cache modes,

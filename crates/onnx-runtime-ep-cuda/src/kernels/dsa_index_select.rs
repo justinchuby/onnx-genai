@@ -29,15 +29,16 @@
 //! The op *produces* the `selected_indices` tensor — it consumes no index input
 //! — so there is no host D2H validation to skip and no capture-error latch: the
 //! kernel never synchronizes the stream or copies to the host on any path. After
-//! a warmed eager execution has sized the executor-owned persistent workspace
+//! a warmed eager execution has sized the kernel-owned persistent workspace
 //! (the per-row score and selection-state scratch keep stable device addresses
 //! across warmup → capture → replay) and compiled the NVRTC kernel, the launch
 //! path is legal to record into a CUDA graph and replay with only device-buffer
 //! contents changing:
 //!
 //!   * No `stream.synchronize()` on the capturing path.
-//!   * No per-call `cudaMalloc`/`cudaFree`: scratch is supplied through the
-//!     session workspace contract, so captured replay keeps fixed addresses.
+//!   * No per-call `cudaMalloc`/`cudaFree`: a kernel-owned slot grows before
+//!     capture and keeps a fixed address through capture and replay. This is the
+//!     same path under native execution and the ORT plugin C ABI.
 //!   * No host round-trip of any kind.
 //!
 //! Capture stays gated off until such a warmup has run (mirroring
@@ -56,19 +57,18 @@
 use std::borrow::Cow;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use crate::error::driver_err;
+use crate::runtime::{CudaRuntime, cuptr};
 use cudarc::driver::sys::CUdeviceptr;
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 use onnx_runtime_ep_api::{
     CaptureSupport, EpError, Kernel, KernelFactory, Result, TensorMetadata, TensorMut, TensorView,
-    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
+    WorkspaceRequirement,
 };
 use onnx_runtime_ir::{DataType, Node};
-use onnx_runtime_memory_governor::MemoryRole;
-
-use crate::error::driver_err;
-use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "DsaIndexSelect";
 
@@ -110,9 +110,10 @@ __device__ __forceinline__ int total_order_key(float x) {
   return bits ^ flip;
 }
 
-// One block per (batch, query) row. Threads cooperatively score every key
-// position (Phase 1); the lead thread then runs the deterministic top-k
-// selection and ascending emit (Phase 2). `state` marks each position as
+// Blocks walk rows with a grid-stride loop, so every accepted row executes even
+// when total_rows exceeds the device's maximum grid X. Threads cooperatively
+// score every key position (Phase 1); the lead thread then runs the deterministic
+// top-k selection and ascending emit (Phase 2). `state` marks each position as
 // 0 = allowed/unselected, 1 = masked, 2 = selected.
 extern "C" __global__ void dsa_index_select_row(
     const void* query, const void* key, const void* weights, const float* bias,
@@ -120,95 +121,95 @@ extern "C" __global__ void dsa_index_select_row(
     unsigned long long batch, unsigned long long q_seq, unsigned long long heads,
     unsigned long long head_dim, unsigned long long key_seq,
     unsigned long long top_k, float scale, float weights_scale, int dtype) {
-  const unsigned long long row = blockIdx.x;
   const unsigned long long total_rows = batch * q_seq;
-  if (row >= total_rows) {
-    return;
-  }
-  const unsigned long long b = row / q_seq;
-  const unsigned long long s = row - b * q_seq;
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
-  const unsigned long long weights_base = (b * q_seq + s) * heads;
-  const unsigned long long bias_base = (b * q_seq + s) * key_seq;  // bias[b,0,s,.]
-  const unsigned long long score_base = row * key_seq;
-  const unsigned long long out_base = row * top_k;
+  for (unsigned long long row = blockIdx.x; row < total_rows; row += gridDim.x) {
+    const unsigned long long b = row / q_seq;
+    const unsigned long long weights_base = row * heads;
+    const unsigned long long bias_base = row * key_seq;  // bias[b,0,s,.]
+    const unsigned long long score_base = row * key_seq;
+    const unsigned long long out_base = row * top_k;
 
-  // Initialise the output row to the -1 padding sentinel.
-  for (unsigned long long i = tid; i < top_k; i += nthreads) {
-    out[out_base + i] = -1;
-  }
-
-  // Phase 1: head-weighted, ReLU'd, scaled score for every allowed key.
-  for (unsigned long long t = tid; t < key_seq; t += nthreads) {
-    const float bias_bt = bias[bias_base + t];
-    // NaN and the -inf / finfo.min causal fill are both "not allowed"; binding
-    // the comparison keeps the negation on a bool (partial-order safe).
-    const bool allowed = bias_bt > MASK_THRESHOLD;
-    if (!allowed) {
-      state[score_base + t] = 1;         // masked / -inf causal fill
-      scores[score_base + t] = NEG_INF;
-      continue;
+    // Initialise the output row to the -1 padding sentinel.
+    for (unsigned long long i = tid; i < top_k; i += nthreads) {
+      out[out_base + i] = -1;
     }
-    float weighted = 0.0f;
-    for (unsigned long long h = 0; h < heads; ++h) {
-      const unsigned long long q_base = ((b * q_seq + s) * heads + h) * head_dim;
-      const unsigned long long k_base = (b * key_seq + t) * head_dim;
-      float dot = 0.0f;
-      for (unsigned long long d = 0; d < head_dim; ++d) {
-        // __fadd_rn / __fmul_rn keep every multiply-add un-fused so the device
-        // reduction matches the CPU oracle's non-FMA rounding order bit-for-bit
-        // (NVRTC compiles with the NVCC default --fmad=true, which would
-        // otherwise contract dot += q*k into a single-rounding fma.rn.f32 and
-        // perturb the score enough to flip an integer top-k selection).
-        dot = __fadd_rn(dot, __fmul_rn(load_float(query, q_base + d, dtype),
-                                       load_float(key, k_base + d, dtype)));
+
+    // Phase 1: head-weighted, ReLU'd, scaled score for every allowed key.
+    for (unsigned long long t = tid; t < key_seq; t += nthreads) {
+      const float bias_bt = bias[bias_base + t];
+      // NaN and the -inf / finfo.min causal fill are both "not allowed"; binding
+      // the comparison keeps the negation on a bool (partial-order safe).
+      const bool allowed = bias_bt > MASK_THRESHOLD;
+      if (!allowed) {
+        state[score_base + t] = 1;         // masked / -inf causal fill
+        scores[score_base + t] = NEG_INF;
+        continue;
       }
-      const float scored = fmaxf(scale * dot, 0.0f);  // Relu(scale * dot)
-      const float wprod = load_float(weights, weights_base + h, dtype) * weights_scale;
-      weighted = __fadd_rn(weighted, __fmul_rn(scored, wprod));
-    }
-    scores[score_base + t] = weighted + bias_bt;
-    state[score_base + t] = 0;            // allowed, unselected
-  }
-  __syncthreads();
-
-  // Phase 2: deterministic top-k on the lead thread. `keep` rounds of argmax by
-  // (total_cmp desc, index asc), then emit the winners ascending by position.
-  if (tid == 0) {
-    unsigned long long allowed_count = 0;
-    for (unsigned long long t = 0; t < key_seq; ++t) {
-      if (state[score_base + t] == 0) {
-        allowed_count += 1;
+      float weighted = 0.0f;
+      for (unsigned long long h = 0; h < heads; ++h) {
+        const unsigned long long q_base = (row * heads + h) * head_dim;
+        const unsigned long long k_base = (b * key_seq + t) * head_dim;
+        float dot = 0.0f;
+        for (unsigned long long d = 0; d < head_dim; ++d) {
+          // __fadd_rn / __fmul_rn keep every multiply-add un-fused so the device
+          // reduction matches the CPU oracle's non-FMA rounding order bit-for-bit
+          // (NVRTC compiles with the NVCC default --fmad=true, which would
+          // otherwise contract dot += q*k into a single-rounding fma.rn.f32 and
+          // perturb the score enough to flip an integer top-k selection).
+          dot = __fadd_rn(dot, __fmul_rn(load_float(query, q_base + d, dtype),
+                                         load_float(key, k_base + d, dtype)));
+        }
+        const float scored = fmaxf(scale * dot, 0.0f);  // Relu(scale * dot)
+        const float wprod = load_float(weights, weights_base + h, dtype) * weights_scale;
+        weighted = __fadd_rn(weighted, __fmul_rn(scored, wprod));
       }
+      scores[score_base + t] = weighted + bias_bt;
+      state[score_base + t] = 0;            // allowed, unselected
     }
-    const unsigned long long keep = allowed_count < top_k ? allowed_count : top_k;
-    for (unsigned long long r = 0; r < keep; ++r) {
-      long long best_t = -1;
-      int best_key = 0;
+    __syncthreads();
+
+    // Phase 2: deterministic top-k on the lead thread. `keep` rounds of argmax by
+    // (total_cmp desc, index asc), then emit the winners ascending by position.
+    if (tid == 0) {
+      unsigned long long allowed_count = 0;
       for (unsigned long long t = 0; t < key_seq; ++t) {
-        if (state[score_base + t] != 0) {
-          continue;                       // masked or already selected
-        }
-        const int candidate = total_order_key(scores[score_base + t]);
-        // Strict `>` keeps the lower index on an exact tie (ascending scan).
-        if (best_t < 0 || candidate > best_key) {
-          best_key = candidate;
-          best_t = (long long)t;
+        if (state[score_base + t] == 0) {
+          allowed_count += 1;
         }
       }
-      if (best_t < 0) {
-        break;                            // defensive; `keep` rules this out
+      const unsigned long long keep = allowed_count < top_k ? allowed_count : top_k;
+      for (unsigned long long r = 0; r < keep; ++r) {
+        long long best_t = -1;
+        int best_key = 0;
+        for (unsigned long long t = 0; t < key_seq; ++t) {
+          if (state[score_base + t] != 0) {
+            continue;                       // masked or already selected
+          }
+          const int candidate = total_order_key(scores[score_base + t]);
+          // Strict `>` keeps the lower index on an exact tie (ascending scan).
+          if (best_t < 0 || candidate > best_key) {
+            best_key = candidate;
+            best_t = (long long)t;
+          }
+        }
+        if (best_t < 0) {
+          break;                            // defensive; `keep` rules this out
+        }
+        state[score_base + (unsigned long long)best_t] = 2;   // selected
       }
-      state[score_base + (unsigned long long)best_t] = 2;   // selected
+      unsigned long long slot = 0;
+      for (unsigned long long t = 0; t < key_seq; ++t) {
+        if (state[score_base + t] == 2) {
+          out[out_base + slot] = (long long)t;
+          slot += 1;
+        }
+      }
     }
-    unsigned long long slot = 0;
-    for (unsigned long long t = 0; t < key_seq; ++t) {
-      if (state[score_base + t] == 2) {
-        out[out_base + slot] = (long long)t;
-        slot += 1;
-      }
+    if ((unsigned long long)gridDim.x >= total_rows - row) {
+      break;
     }
   }
 }
@@ -287,15 +288,15 @@ struct WorkspaceLayout {
 }
 
 impl WorkspaceLayout {
-    fn ptr_at(self, workspace: WorkspaceView, offset: usize) -> CUdeviceptr {
-        workspace.ptr().0 as CUdeviceptr + offset as CUdeviceptr
+    fn ptr_at(self, workspace: CUdeviceptr, offset: usize) -> CUdeviceptr {
+        workspace + offset as CUdeviceptr
     }
 
-    fn scores(self, workspace: WorkspaceView) -> CUdeviceptr {
+    fn scores(self, workspace: CUdeviceptr) -> CUdeviceptr {
         self.ptr_at(workspace, self.scores_offset)
     }
 
-    fn state(self, workspace: WorkspaceView) -> CUdeviceptr {
+    fn state(self, workspace: CUdeviceptr) -> CUdeviceptr {
         self.ptr_at(workspace, self.state_offset)
     }
 }
@@ -342,12 +343,166 @@ fn dsa_index_select_workspace_layout(dims: Dims) -> Result<WorkspaceLayout> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DsaWorkspaceStats {
+    pub allocations: u64,
+    pub releases: u64,
+    pub live_bytes: u64,
+    pub last_ptr: u64,
+}
+
+static DSA_WORKSPACE_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static DSA_WORKSPACE_RELEASES: AtomicU64 = AtomicU64::new(0);
+static DSA_WORKSPACE_LIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+static DSA_WORKSPACE_LAST_PTR: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "gpu-tests")]
+static DSA_TEST_CAPTURE_REPLAYS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-tests")]
+static DSA_TEST_CAPTURE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-tests")]
+static DSA_TEST_CAPTURED_REPLAYS: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "gpu-tests")]
+static DSA_TEST_CAPTURE_ERROR: AtomicU64 = AtomicU64::new(0);
+
+pub fn dsa_workspace_stats() -> DsaWorkspaceStats {
+    DsaWorkspaceStats {
+        allocations: DSA_WORKSPACE_ALLOCATIONS.load(Ordering::Relaxed),
+        releases: DSA_WORKSPACE_RELEASES.load(Ordering::Relaxed),
+        live_bytes: DSA_WORKSPACE_LIVE_BYTES.load(Ordering::Relaxed),
+        last_ptr: DSA_WORKSPACE_LAST_PTR.load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_dsa_workspace_stats() -> bool {
+    if DSA_WORKSPACE_LIVE_BYTES.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    DSA_WORKSPACE_ALLOCATIONS.store(0, Ordering::Relaxed);
+    DSA_WORKSPACE_RELEASES.store(0, Ordering::Relaxed);
+    DSA_WORKSPACE_LAST_PTR.store(0, Ordering::Relaxed);
+    true
+}
+
+#[cfg(feature = "gpu-tests")]
+pub fn set_dsa_plugin_capture_replays_for_test(replays: u64) {
+    DSA_TEST_CAPTURE_REPLAYS.store(replays, Ordering::Release);
+    DSA_TEST_CAPTURE_COUNT.store(0, Ordering::Relaxed);
+    DSA_TEST_CAPTURED_REPLAYS.store(0, Ordering::Relaxed);
+    DSA_TEST_CAPTURE_ERROR.store(0, Ordering::Relaxed);
+}
+
+#[cfg(feature = "gpu-tests")]
+pub fn dsa_plugin_capture_stats_for_test() -> (u64, u64, u64) {
+    (
+        DSA_TEST_CAPTURE_COUNT.load(Ordering::Acquire),
+        DSA_TEST_CAPTURED_REPLAYS.load(Ordering::Acquire),
+        DSA_TEST_CAPTURE_ERROR.load(Ordering::Acquire),
+    )
+}
+
+#[derive(Debug)]
+struct DsaWorkspace {
+    runtime: Arc<CudaRuntime>,
+    ptr: CUdeviceptr,
+    bytes: usize,
+}
+
+impl DsaWorkspace {
+    fn new(runtime: Arc<CudaRuntime>) -> Self {
+        Self {
+            runtime,
+            ptr: 0,
+            bytes: 0,
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<CUdeviceptr> {
+        let bytes = bytes.max(1);
+        if self.bytes >= bytes {
+            DSA_WORKSPACE_LAST_PTR.store(self.ptr, Ordering::Relaxed);
+            return Ok(self.ptr);
+        }
+        if self.runtime.is_capturing()? {
+            return Err(error(format!(
+                "workspace requires {bytes} bytes during CUDA graph capture; warm the fixed shape before capture"
+            )));
+        }
+
+        let ptr = self.runtime.alloc_raw(bytes)?;
+        if self.ptr != 0 {
+            if let Err(sync_error) = self.runtime.drain_for_unmap() {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(sync_error);
+            }
+            // SAFETY: synchronization completed all prior users of `self.ptr`,
+            // which remains exclusively owned by this workspace.
+            if let Err(free_error) = unsafe { self.runtime.free_raw(self.ptr) } {
+                // SAFETY: `ptr` was allocated above and has not escaped.
+                let _ = unsafe { self.runtime.free_raw(ptr) };
+                return Err(free_error);
+            }
+            DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
+            DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Relaxed);
+        }
+
+        self.ptr = ptr;
+        self.bytes = bytes;
+        DSA_WORKSPACE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        DSA_WORKSPACE_LIVE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        DSA_WORKSPACE_LAST_PTR.store(ptr, Ordering::Release);
+        Ok(ptr)
+    }
+}
+
+impl Drop for DsaWorkspace {
+    fn drop(&mut self) {
+        if self.ptr == 0 {
+            return;
+        }
+        // SAFETY: `self.ptr` was allocated by this runtime, remains exclusively
+        // owned here, and is released exactly once.
+        let _ = unsafe { self.runtime.free_raw(self.ptr) };
+        DSA_WORKSPACE_RELEASES.fetch_add(1, Ordering::Relaxed);
+        DSA_WORKSPACE_LIVE_BYTES.fetch_sub(self.bytes as u64, Ordering::Release);
+        self.ptr = 0;
+        self.bytes = 0;
+    }
+}
+
 pub struct DsaIndexSelectFactory {
     pub runtime: Arc<CudaRuntime>,
 }
 
 impl KernelFactory for DsaIndexSelectFactory {
     fn create(&self, node: &Node, _input_shapes: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
+        Ok(Box::new(self.create_kernel(node)?))
+    }
+}
+
+impl DsaIndexSelectFactory {
+    fn create_kernel(&self, node: &Node) -> Result<DsaIndexSelectKernel> {
+        self.create_kernel_with_max_grid_x(node, None)
+    }
+
+    #[doc(hidden)]
+    pub fn create_kernel_with_grid_limit(
+        &self,
+        node: &Node,
+        max_grid_x: u32,
+    ) -> Result<DsaIndexSelectKernel> {
+        if max_grid_x == 0 {
+            return Err(error("test grid limit must be greater than zero"));
+        }
+        self.create_kernel_with_max_grid_x(node, Some(max_grid_x))
+    }
+
+    fn create_kernel_with_max_grid_x(
+        &self,
+        node: &Node,
+        max_grid_x: Option<u32>,
+    ) -> Result<DsaIndexSelectKernel> {
         let top_k = required_positive_int(node, "top_k")?;
         let scale = required_finite_positive_float(node, "scale")?;
         let weights_scale = match node.attr("weights_scale") {
@@ -370,13 +525,15 @@ impl KernelFactory for DsaIndexSelectFactory {
                 )));
             }
         }
-        Ok(Box::new(DsaIndexSelectKernel {
+        Ok(DsaIndexSelectKernel {
             runtime: self.runtime.clone(),
             top_k,
             scale,
             weights_scale,
+            workspace: Mutex::new(DsaWorkspace::new(self.runtime.clone())),
+            max_grid_x,
             warmed: AtomicBool::new(false),
-        }))
+        })
     }
 }
 
@@ -386,6 +543,8 @@ pub struct DsaIndexSelectKernel {
     top_k: usize,
     scale: f32,
     weights_scale: f32,
+    workspace: Mutex<DsaWorkspace>,
+    max_grid_x: Option<u32>,
     /// Set after a successful eager execution has compiled the NVRTC kernel and
     /// sized the persistent workspace, the precondition for CUDA-graph capture.
     warmed: AtomicBool,
@@ -393,33 +552,39 @@ pub struct DsaIndexSelectKernel {
 
 impl Kernel for DsaIndexSelectKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
-        let _ = (inputs, outputs);
-        Err(error(
-            "DsaIndexSelect requires executor-provided persistent workspace",
-        ))
+        self.execute_impl(inputs, outputs)
     }
 
     fn workspace_requirement(&self, inputs: &[TensorMetadata<'_>]) -> Result<WorkspaceRequirement> {
         let dims = self.validate_metadata(inputs)?;
-        let layout = dsa_index_select_workspace_layout(dims)?;
-        Ok(WorkspaceRequirement {
-            bytes: u64::try_from(layout.bytes)
-                .map_err(|_| error("DsaIndexSelect workspace does not fit u64"))?,
-            alignment: WORKSPACE_ALIGNMENT,
-            lifetime: WorkspaceLifetime::SessionPersistent,
-            role: MemoryRole::Workspace { step_scoped: false },
-        })
+        dsa_index_select_workspace_layout(dims)?;
+        Ok(WorkspaceRequirement::NONE)
     }
 
-    fn execute_with_workspace(
-        &self,
-        inputs: &[TensorView],
-        outputs: &mut [TensorMut],
-        workspace: Option<WorkspaceView>,
-    ) -> Result<()> {
-        let workspace = workspace.ok_or_else(|| {
-            error("DsaIndexSelect requires executor-provided persistent workspace")
-        })?;
+    fn supports_strided_input(&self, _index: usize) -> bool {
+        false
+    }
+
+    fn capture_support(&self) -> CaptureSupport {
+        if self.warmed.load(Ordering::Relaxed) {
+            CaptureSupport::Supported
+        } else {
+            CaptureSupport::unsupported(
+                "requires a warmed fixed-shape eager DsaIndexSelect pass to compile the NVRTC \
+                 kernel and size the kernel-owned workspace",
+            )
+        }
+    }
+}
+
+impl DsaIndexSelectKernel {
+    #[doc(hidden)]
+    pub fn workspace_snapshot(&self) -> (u64, usize) {
+        let workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        (workspace.ptr, workspace.bytes)
+    }
+
+    fn execute_impl(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         if inputs.len() != 4 {
             return Err(error(format!("expected 4 inputs, got {}", inputs.len())));
         }
@@ -480,21 +645,35 @@ impl Kernel for DsaIndexSelectKernel {
         let capturing = self.runtime.is_capturing()?;
 
         let layout = dsa_index_select_workspace_layout(dims)?;
-        if workspace.bytes() < layout.bytes {
-            return Err(error(format!(
-                "DsaIndexSelect workspace invariant mismatch: execute requires {} bytes, prepared {} bytes",
-                layout.bytes,
-                workspace.bytes()
-            )));
-        }
+        let mut workspace = self.workspace.lock().unwrap_or_else(|e| e.into_inner());
+        let workspace_ptr = workspace.reserve(layout.bytes)?;
 
         let query_ptr = cuptr(inputs[0].data_ptr::<u8>() as *const c_void);
         let key_ptr = cuptr(inputs[1].data_ptr::<u8>() as *const c_void);
         let weights_ptr = cuptr(inputs[2].data_ptr::<u8>() as *const c_void);
         let bias_ptr = cuptr(inputs[3].data_ptr::<u8>() as *const c_void);
         let out_ptr = cuptr(outputs[0].data_ptr_mut::<u8>() as *const c_void);
-        let scores_ptr = layout.scores(workspace);
-        let state_ptr = layout.state(workspace);
+        let scores_ptr = layout.scores(workspace_ptr);
+        let state_ptr = layout.state(workspace_ptr);
+
+        #[cfg(feature = "gpu-tests")]
+        {
+            let test_replays = DSA_TEST_CAPTURE_REPLAYS.swap(0, Ordering::AcqRel);
+            if test_replays != 0 {
+                return self.execute_capture_replay_test_seam(
+                    query_ptr,
+                    key_ptr,
+                    weights_ptr,
+                    bias_ptr,
+                    scores_ptr,
+                    state_ptr,
+                    out_ptr,
+                    dims,
+                    dtype_code(dtype)?,
+                    test_replays,
+                );
+            }
+        }
 
         self.launch_row(
             query_ptr,
@@ -520,23 +699,67 @@ impl Kernel for DsaIndexSelectKernel {
         }
     }
 
-    fn supports_strided_input(&self, _index: usize) -> bool {
-        false
-    }
-
-    fn capture_support(&self) -> CaptureSupport {
-        if self.warmed.load(Ordering::Relaxed) {
-            CaptureSupport::Supported
-        } else {
-            CaptureSupport::unsupported(
-                "requires a warmed fixed-shape eager DsaIndexSelect pass to compile the NVRTC \
-                 kernel and size the prepared workspace",
-            )
+    #[cfg(feature = "gpu-tests")]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_capture_replay_test_seam(
+        &self,
+        query_ptr: CUdeviceptr,
+        key_ptr: CUdeviceptr,
+        weights_ptr: CUdeviceptr,
+        bias_ptr: CUdeviceptr,
+        scores_ptr: CUdeviceptr,
+        state_ptr: CUdeviceptr,
+        out_ptr: CUdeviceptr,
+        dims: Dims,
+        dtype: i32,
+        replays: u64,
+    ) -> Result<()> {
+        self.launch_row(
+            query_ptr,
+            key_ptr,
+            weights_ptr,
+            bias_ptr,
+            scores_ptr,
+            state_ptr,
+            out_ptr,
+            dims,
+            dtype,
+        )?;
+        self.runtime.drain_for_unmap()?;
+        self.warmed.store(true, Ordering::Release);
+        self.runtime.reset_graph()?;
+        self.runtime.reset_capture_error()?;
+        self.runtime.begin_graph_capture(&[self])?;
+        if let Err(error) = self.launch_row(
+            query_ptr,
+            key_ptr,
+            weights_ptr,
+            bias_ptr,
+            scores_ptr,
+            state_ptr,
+            out_ptr,
+            dims,
+            dtype,
+        ) {
+            let _ = self.runtime.abort_graph_capture();
+            return Err(error);
         }
+        if let Err(error) = self.runtime.end_graph_capture() {
+            let _ = self.runtime.abort_graph_capture();
+            return Err(error);
+        }
+        for _ in 0..replays {
+            self.runtime.replay_graph()?;
+        }
+        self.runtime.drain_for_unmap()?;
+        let capture_error = u64::from(self.runtime.check_capture_error()?);
+        self.runtime.reset_graph()?;
+        DSA_TEST_CAPTURE_COUNT.fetch_add(1, Ordering::Relaxed);
+        DSA_TEST_CAPTURED_REPLAYS.fetch_add(replays, Ordering::Relaxed);
+        DSA_TEST_CAPTURE_ERROR.store(capture_error, Ordering::Release);
+        Ok(())
     }
-}
 
-impl DsaIndexSelectKernel {
     fn validate_metadata(&self, inputs: &[TensorMetadata<'_>]) -> Result<Dims> {
         if inputs.len() != 4 {
             return Err(error(format!(
@@ -612,6 +835,14 @@ impl DsaIndexSelectKernel {
         }
         require_eq("bias/query seq", dims.q_seq, bias[2])?;
         require_eq("bias/key seq", dims.key_seq, bias[3])?;
+        checked_elements(
+            "query",
+            &[dims.batch, dims.q_seq, dims.heads, dims.head_dim],
+        )?;
+        checked_elements("key", &[dims.batch, dims.key_seq, dims.head_dim])?;
+        checked_elements("weights", &[dims.batch, dims.q_seq, dims.heads])?;
+        checked_elements("attention_bias", &[dims.batch, dims.q_seq, dims.key_seq])?;
+        checked_elements("selected_indices", &[dims.batch, dims.q_seq, self.top_k])?;
         Ok(dims)
     }
 
@@ -628,19 +859,29 @@ impl DsaIndexSelectKernel {
         dims: Dims,
         dtype: i32,
     ) -> Result<()> {
-        let total_rows = (dims.batch * dims.q_seq) as u64;
+        let total_rows = dims
+            .batch
+            .checked_mul(dims.q_seq)
+            .and_then(|rows| u64::try_from(rows).ok())
+            .ok_or_else(|| error("DsaIndexSelect row count overflow"))?;
         if total_rows == 0 {
             return Ok(());
         }
         let func = self
             .runtime
             .nvrtc_function(MODULE, SOURCE, "dsa_index_select_row")?;
-        let batch = dims.batch as u64;
-        let q_seq = dims.q_seq as u64;
-        let heads = dims.heads as u64;
-        let head_dim = dims.head_dim as u64;
-        let key_seq = dims.key_seq as u64;
-        let top_k = self.top_k as u64;
+        let batch = u64::try_from(dims.batch)
+            .map_err(|_| error("DsaIndexSelect batch does not fit u64"))?;
+        let q_seq = u64::try_from(dims.q_seq)
+            .map_err(|_| error("DsaIndexSelect query sequence does not fit u64"))?;
+        let heads = u64::try_from(dims.heads)
+            .map_err(|_| error("DsaIndexSelect head count does not fit u64"))?;
+        let head_dim = u64::try_from(dims.head_dim)
+            .map_err(|_| error("DsaIndexSelect head dimension does not fit u64"))?;
+        let key_seq = u64::try_from(dims.key_seq)
+            .map_err(|_| error("DsaIndexSelect key sequence does not fit u64"))?;
+        let top_k = u64::try_from(self.top_k)
+            .map_err(|_| error("DsaIndexSelect top_k does not fit u64"))?;
         let scale = self.scale;
         let weights_scale = self.weights_scale;
         let mut builder = self.runtime.stream().launch_builder(&func);
@@ -666,8 +907,13 @@ impl DsaIndexSelectKernel {
         // scratch is sized for `batch*q_seq*key_seq` f32/u8 by
         // `dsa_index_select_workspace_layout`.
         unsafe {
+            let device_max_grid_x = self.runtime.capabilities().max_grid_dim_x();
+            let max_grid_x = self
+                .max_grid_x
+                .unwrap_or(device_max_grid_x)
+                .min(device_max_grid_x);
             builder.launch(LaunchConfig {
-                grid_dim: (total_rows.min(u32::MAX as u64).max(1) as u32, 1, 1),
+                grid_dim: (total_rows.min(u64::from(max_grid_x)).max(1) as u32, 1, 1),
                 block_dim: (ROW_THREADS, 1, 1),
                 shared_mem_bytes: 0,
             })
@@ -675,6 +921,14 @@ impl DsaIndexSelectKernel {
         .map_err(|e| driver_err("launch dsa_index_select_row", e))
         .map(|_| ())
     }
+}
+
+fn checked_elements(name: &str, dims: &[usize]) -> Result<usize> {
+    dims.iter().try_fold(1usize, |elements, &dim| {
+        elements
+            .checked_mul(dim)
+            .ok_or_else(|| error(format!("{name} element count overflow")))
+    })
 }
 
 fn require_eq(what: &str, left: usize, right: usize) -> Result<()> {
@@ -732,4 +986,39 @@ fn required_finite_positive_float(node: &Node, name: &str) -> Result<f32> {
 
 fn error(message: impl Into<String>) -> EpError {
     EpError::KernelFailed(format!("cuda_ep {OP}: {}", message.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_layout_rejects_row_and_cell_overflow() {
+        let row_overflow = dsa_index_select_workspace_layout(Dims {
+            batch: usize::MAX,
+            q_seq: 2,
+            heads: 1,
+            head_dim: 1,
+            key_seq: 1,
+        })
+        .expect_err("batch*q_seq overflow must be typed-rejected");
+        assert!(format!("{row_overflow}").contains("row count overflow"));
+
+        let cell_overflow = dsa_index_select_workspace_layout(Dims {
+            batch: 1,
+            q_seq: usize::MAX,
+            heads: 1,
+            head_dim: 1,
+            key_seq: 2,
+        })
+        .expect_err("rows*key_seq overflow must be typed-rejected");
+        assert!(format!("{cell_overflow}").contains("cell count overflow"));
+    }
+
+    #[test]
+    fn tensor_index_spaces_reject_overflow() {
+        let error = checked_elements("query", &[usize::MAX, 2])
+            .expect_err("tensor element overflow must be typed-rejected");
+        assert!(format!("{error}").contains("query element count overflow"));
+    }
 }
