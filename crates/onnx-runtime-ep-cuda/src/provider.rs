@@ -2428,7 +2428,7 @@ impl ExecutionProvider for CudaExecutionProvider {
         opset: u64,
         shapes: &[Shape],
         input_dtypes: &[DataType],
-        _layouts: &[TensorLayout],
+        layouts: &[TensorLayout],
     ) -> KernelMatch {
         // Keyed on (op_type, domain, opset) via the registry, the same single
         // source of truth the CPU EP uses.
@@ -2461,6 +2461,13 @@ impl ExecutionProvider for CudaExecutionProvider {
         if matches!(op.op_type.as_str(), "FusedMatMulBias" | "FusedGemm")
             && op.domain == "com.microsoft"
             && let Some(reason) = crate::kernels::fused_gemm::unsupported_reason(op, shapes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
+        if op.op_type == "DFT"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) =
+                crate::kernels::dft::unsupported_reason(op, shapes, input_dtypes, layouts)
         {
             return KernelMatch::unsupported(reason);
         }

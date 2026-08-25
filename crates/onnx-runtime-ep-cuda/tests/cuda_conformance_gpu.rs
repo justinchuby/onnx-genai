@@ -2662,6 +2662,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
 
     // Reduction / metadata / movement covered elsewhere.
     p.push(dedicated("ReduceSum", "movement_gpu.rs", "reduction"));
+    p.push(dedicated(
+        "DFT",
+        "dft_gpu.rs",
+        "cuFFT real/complex forward/inverse and arbitrary-axis parity",
+    ));
     p.push(dedicated("Gather", "movement_gpu.rs", "indexed gather"));
     p.push(dedicated("Shape", "movement_gpu.rs", "shape metadata"));
     p.push(dedicated(

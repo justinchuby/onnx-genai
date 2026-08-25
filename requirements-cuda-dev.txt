@@ -7,6 +7,9 @@
 # CUDA EP's loader already knows how to find them: it recovers a wheel root from
 # any `<root>/nvidia/<component>/{bin,lib}` entry on the loader path, or from
 # `NXRT_CUDA_WHEEL_ROOTS`. See `crates/onnx-runtime-ep-cuda/src/dynamic_library.rs`.
+# They remain separately installed NVIDIA runtime dependencies governed by
+# NVIDIA's license; this repository and its Rust crates do not bundle the
+# binaries.
 #
 # ---------------------------------------------------------------------------
 # The major version here MUST match the crate's selected CUDA feature.
@@ -63,6 +66,12 @@ nvidia-cuda-nvrtc==13.1.115
 
 # cuBLAS / cuBLASLt — the GEMM backend. Required.
 nvidia-cublas==13.1.1.3
+
+# cuFFT — batched DFT backend. cuFFT 12.1.0.78 is the release shipped with the
+# CUDA 13.1 wheel line. Its JIT dependency is pinned to the same toolchain so a
+# later rolling nvidia-nvjitlink release cannot emit code newer than the driver.
+nvidia-cufft==12.1.0.78
+nvidia-nvjitlink==13.1.115
 
 # CUDA runtime (cudart) and, importantly, the headers NVRTC #includes
 # (`cuda_fp16.h`, `cuda_bf16.h`). Without these the f16/bf16 kernels fail to

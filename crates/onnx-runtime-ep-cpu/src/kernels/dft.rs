@@ -62,7 +62,7 @@ impl Kernel for DftKernel {
         }
 
         // Determine the signal axis.
-        let axis_raw = if inputs.len() >= 3 && !inputs[2].shape.is_empty() {
+        let axis_raw = if inputs.len() >= 3 && !inputs[2].is_absent() {
             // Opset 20: axis as input
             let axis_data = super::to_dense_i64(&inputs[2])?;
             axis_data[0]
@@ -81,12 +81,25 @@ impl Kernel for DftKernel {
                 "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
             )));
         }
+        if self.onesided && !is_real_input {
+            return Err(EpError::KernelFailed(
+                "DFT: onesided=1 is valid only for real input (last dimension 1)".into(),
+            ));
+        }
 
         // Determine DFT length.
         let signal_len = input.shape[axis];
-        let dft_length = if inputs.len() >= 2 && numel(inputs[1].shape) > 0 {
+        let dft_length = if inputs.len() >= 2 && !inputs[1].is_absent() {
             let len_data = super::to_dense_i64(&inputs[1])?;
-            len_data[0] as usize
+            usize::try_from(len_data[0])
+                .ok()
+                .filter(|length| *length > 0)
+                .ok_or_else(|| {
+                    EpError::KernelFailed(format!(
+                        "DFT: dft_length must be positive, got {}",
+                        len_data[0]
+                    ))
+                })?
         } else {
             signal_len
         };
@@ -653,6 +666,20 @@ mod tests {
             out[0]
         );
         assert!(out[1].abs() < 1e-3, "DC imag = {} expected 0.0", out[1]);
+    }
+
+    #[test]
+    fn dft_kernel_rejects_onesided_complex_input() {
+        let input = Owned::f32(&[1, 4, 2], &[0.0; 8]);
+        let mut output = Owned::zeros_f32(&[1, 3, 2]);
+        let node = make_dft_node(-2, 1);
+        let kernel = DftFactory
+            .create(&node, &[vec![1, 4, 2]])
+            .expect("factory create");
+        let error = kernel
+            .execute(&[input.view()], &mut [output.view_mut()])
+            .expect_err("onesided complex DFT must be rejected");
+        assert!(error.to_string().contains("valid only for real input"));
     }
 
     /// Verify radix-2 FFT fallback fires (n=2, which is pow2 but below vDSP minimum).
