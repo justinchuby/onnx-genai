@@ -1108,7 +1108,8 @@ fn requires_batch_admission_boundary(component: &WorkflowComponent) -> bool {
             .any(|contract| {
                 matches!(
                     contract.batch_layout,
-                    onnx_genai_metadata::BatchLayout::TokenPacked { .. }
+                    onnx_genai_metadata::BatchLayout::RequestAligned { .. }
+                        | onnx_genai_metadata::BatchLayout::TokenPacked { .. }
                         | onnx_genai_metadata::BatchLayout::RequestExpanded { .. }
                 )
             })
@@ -2451,13 +2452,22 @@ batch_layout:
         );
         assert!(requires_batch_admission_boundary(&packed));
 
+        let mut request_aligned = component(ComponentImplementation::Onnx {
+            artifact: "decoder.onnx".into(),
+        });
+        request_aligned
+            .ports
+            .inputs
+            .insert("tokens".into(), batch_tensor("int64", 2));
+        assert!(requires_batch_admission_boundary(&request_aligned));
+
         let mut ordinary = component(ComponentImplementation::Onnx {
             artifact: "decoder.onnx".into(),
         });
         ordinary
             .ports
             .inputs
-            .insert("tokens".into(), batch_tensor("int64", 2));
+            .insert("constant".into(), singleton_tensor("int64"));
         assert!(!requires_batch_admission_boundary(&ordinary));
     }
 

@@ -267,6 +267,7 @@ pub struct WorkflowExecutionPlan<'a> {
     input_aliases: HashMap<String, String>,
     initial_symbols: HashMap<String, i64>,
     dynamic_symbols: std::collections::HashSet<String>,
+    request_count: usize,
     session_id: Option<String>,
     component_overrides: HashMap<String, String>,
     max_iterations_only: bool,
@@ -1197,7 +1198,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &dynamic_symbols,
             )?;
         }
-        super::batching::validate_workflow_batch_inputs(workflow, &values)?;
+        let request_count = super::batching::validate_workflow_batch_inputs(workflow, &values)?;
         let input_names = values.keys().cloned().collect::<Vec<_>>();
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
@@ -1248,6 +1249,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             input_aliases,
             initial_symbols,
             dynamic_symbols,
+            request_count,
             session_id,
             component_overrides,
             max_iterations_only: !request.options.stop_on_eos,
@@ -1276,7 +1278,31 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut symbols,
             &self.dynamic_symbols,
         )?;
-        self.values.insert(package_name.clone(), value);
+        let previous = self.values.insert(package_name.clone(), value);
+        let request_count = match super::batching::validate_workflow_batch_inputs(
+            &self.engine.plan.workflow,
+            &self.values,
+        ) {
+            Ok(request_count) => request_count,
+            Err(error) => {
+                self.values.remove(package_name);
+                if let Some(previous) = previous {
+                    self.values.insert(package_name.clone(), previous);
+                }
+                return Err(error.into());
+            }
+        };
+        if request_count != self.request_count {
+            self.values.remove(package_name);
+            if let Some(previous) = previous {
+                self.values.insert(package_name.clone(), previous);
+            }
+            anyhow::bail!(
+                "workflow input '{package_name}' changes request cardinality from {} to \
+                 {request_count}; rebuild the execution plan for a different batch",
+                self.request_count
+            );
+        }
         if !self.input_names.contains(package_name) {
             self.input_names.push(package_name.clone());
         }
@@ -1467,6 +1493,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
             &mut values,
             &mut symbols,
             &self.dynamic_symbols,
+            self.request_count,
             &mut emit_counts,
             &mut final_state_refs,
             &self.component_overrides,
@@ -1727,6 +1754,7 @@ impl WorkflowRuntime {
         values: &mut PipelineTensors,
         symbols: &mut HashMap<String, i64>,
         dynamic_symbols: &std::collections::HashSet<String>,
+        workflow_request_count: usize,
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
@@ -1742,6 +1770,7 @@ impl WorkflowRuntime {
                         values,
                         symbols,
                         dynamic_symbols,
+                        workflow_request_count,
                         emit_counts,
                         final_state_refs,
                         component_overrides,
@@ -1788,6 +1817,7 @@ impl WorkflowRuntime {
                                 declaration,
                                 inputs,
                                 values,
+                                workflow_request_count,
                             )?;
                             let mut component_symbols = prepared.symbols;
                             let request_count = prepared.request_count;
@@ -1866,6 +1896,7 @@ impl WorkflowRuntime {
                             selected_declaration,
                             &selected_inputs,
                             values,
+                            workflow_request_count,
                         )?;
                         let resolved = prepared.resolved;
                         let mut component_symbols = prepared.symbols;
@@ -1914,9 +1945,16 @@ impl WorkflowRuntime {
                                 declaration,
                                 inputs,
                                 values,
+                                workflow_request_count,
                             )?
                         } else {
-                            prepare_component_batch_inputs(component, declaration, inputs, values)?
+                            prepare_component_batch_inputs(
+                                component,
+                                declaration,
+                                inputs,
+                                values,
+                                workflow_request_count,
+                            )?
                         };
                         let mut component_symbols = prepared.symbols;
                         let request_count = prepared.request_count;
@@ -2014,8 +2052,13 @@ impl WorkflowRuntime {
                         for value in inputs.values() {
                             self.materialize_workflow_value(values, value)?;
                         }
-                        let prepared =
-                            prepare_component_batch_inputs(component, declaration, inputs, values)?;
+                        let prepared = prepare_component_batch_inputs(
+                            component,
+                            declaration,
+                            inputs,
+                            values,
+                            workflow_request_count,
+                        )?;
                         let mut component_symbols = prepared.symbols;
                         let request_count = prepared.request_count;
                         drop(prepared.resolved);
@@ -2086,6 +2129,7 @@ impl WorkflowRuntime {
                     values,
                     symbols,
                     dynamic_symbols,
+                    workflow_request_count,
                     emit_counts,
                     final_state_refs,
                     component_overrides,
@@ -2100,6 +2144,7 @@ impl WorkflowRuntime {
                         values,
                         symbols,
                         dynamic_symbols,
+                        workflow_request_count,
                         emit_counts,
                         final_state_refs,
                         component_overrides,
@@ -2145,6 +2190,7 @@ impl WorkflowRuntime {
                     &mut branch_values,
                     symbols,
                     dynamic_symbols,
+                    workflow_request_count,
                     emit_counts,
                     &mut branch_state_refs,
                     component_overrides,
@@ -2368,6 +2414,7 @@ impl WorkflowRuntime {
                         values,
                         symbols,
                         dynamic_symbols,
+                        workflow_request_count,
                         emit_counts,
                         final_state_refs,
                         component_overrides,
@@ -2576,6 +2623,7 @@ impl WorkflowRuntime {
         inputs: &[(&str, &Value)],
         outputs: &std::collections::BTreeMap<String, String>,
         symbol_hints: &HashMap<String, i64>,
+        expected_requests: usize,
     ) -> anyhow::Result<Vec<(String, Value)>> {
         let workflow = &self.plan.workflow;
         let declaration = workflow
@@ -2602,11 +2650,13 @@ impl WorkflowRuntime {
                 )?;
             }
         }
-        let request_count = super::batching::validate_component_batch_before_enqueue(
+        let request_count = super::batching::validate_workflow_component_batch_before_enqueue(
             component,
             declaration,
             inputs,
             &component_symbols,
+            expected_requests,
+            false,
         )?;
         let output_shapes = resolve_component_output_shapes(
             declaration,
@@ -4312,7 +4362,14 @@ fn resolve_component_output_shapes(
     dynamic_symbols: &std::collections::HashSet<String>,
 ) -> std::collections::BTreeMap<String, Vec<usize>> {
     let mut resolved = std::collections::BTreeMap::new();
+    let ownership_companions = super::batching::component_output_ownership_companions(declaration);
     for port in selected_outputs.keys() {
+        // Native CUDA treats every resolved output shape as permission to bind
+        // a device buffer. Ownership metadata is tiny and must be host-readable
+        // for validation, so leave only those outputs unbound.
+        if ownership_companions.contains(port) {
+            continue;
+        }
         let Some(contract) = declaration.ports.outputs.get(port) else {
             continue;
         };
@@ -4439,8 +4496,16 @@ fn prepare_component_batch_inputs<'a>(
     declaration: &onnx_genai_metadata::WorkflowComponent,
     bindings: &'a BTreeMap<String, String>,
     values: &'a PipelineTensors,
+    workflow_request_count: usize,
 ) -> anyhow::Result<PreparedComponentInputs<'a>> {
-    prepare_component_batch_inputs_impl(component, declaration, bindings, values, false)
+    prepare_component_batch_inputs_impl(
+        component,
+        declaration,
+        bindings,
+        values,
+        workflow_request_count,
+        false,
+    )
 }
 
 fn prepare_hosted_component_batch_inputs<'a>(
@@ -4448,8 +4513,16 @@ fn prepare_hosted_component_batch_inputs<'a>(
     declaration: &onnx_genai_metadata::WorkflowComponent,
     bindings: &'a BTreeMap<String, String>,
     values: &'a PipelineTensors,
+    workflow_request_count: usize,
 ) -> anyhow::Result<PreparedComponentInputs<'a>> {
-    prepare_component_batch_inputs_impl(component, declaration, bindings, values, true)
+    prepare_component_batch_inputs_impl(
+        component,
+        declaration,
+        bindings,
+        values,
+        workflow_request_count,
+        true,
+    )
 }
 
 fn prepare_component_batch_inputs_impl<'a>(
@@ -4457,6 +4530,7 @@ fn prepare_component_batch_inputs_impl<'a>(
     declaration: &onnx_genai_metadata::WorkflowComponent,
     bindings: &'a BTreeMap<String, String>,
     values: &'a PipelineTensors,
+    workflow_request_count: usize,
     allow_runtime_owned_inputs: bool,
 ) -> anyhow::Result<PreparedComponentInputs<'a>> {
     let mut symbols = HashMap::new();
@@ -4483,21 +4557,14 @@ fn prepare_component_batch_inputs_impl<'a>(
             Some(Ok((port.as_str(), tensor)))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let request_count = if allow_runtime_owned_inputs {
-        super::batching::validate_available_component_batch_before_enqueue(
-            component,
-            declaration,
-            &resolved,
-            &symbols,
-        )?
-    } else {
-        super::batching::validate_component_batch_before_enqueue(
-            component,
-            declaration,
-            &resolved,
-            &symbols,
-        )?
-    };
+    let request_count = super::batching::validate_workflow_component_batch_before_enqueue(
+        component,
+        declaration,
+        &resolved,
+        &symbols,
+        workflow_request_count,
+        allow_runtime_owned_inputs,
+    )?;
     Ok(PreparedComponentInputs {
         resolved,
         symbols,
@@ -6132,6 +6199,119 @@ steps: []
         .expect("test workflow")
     }
 
+    fn request_aligned_workflow() -> WorkflowSpec {
+        serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  rows:
+    contract:
+      dtype: int64
+      rank: 2
+      shape: [batch, hidden]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    role: { kind: opaque }
+    source: { kind: application, name: rows }
+outputs: {}
+components:
+  encoder:
+    implementation: { kind: onnx, artifact: encoder.onnx }
+    contract: { id: onnx-genai.token-policy, version: "1" }
+    ports:
+      inputs:
+        rows:
+          dtype: int64
+          rank: 2
+          shape: [batch, hidden]
+          batch_layout: { kind: request_aligned, axis: 0 }
+      outputs: {}
+state: {}
+steps: []
+"#,
+        )
+        .expect("request-aligned workflow")
+    }
+
+    fn shared_branch_workflow() -> WorkflowSpec {
+        serde_yaml::from_str(
+            r#"
+manifest: {}
+inputs:
+  rows:
+    contract:
+      dtype: int64
+      rank: 2
+      shape: [batch, hidden]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    role: { kind: opaque }
+    source: { kind: application, name: rows }
+  seed:
+    contract:
+      dtype: int64
+      rank: 1
+      shape: [seed_items]
+      batch_layout: { kind: shared }
+    role: { kind: opaque }
+    source: { kind: application, name: seed }
+  choose:
+    contract:
+      dtype: int64
+      rank: 1
+      shape: [one]
+      batch_layout: { kind: shared }
+    role: { kind: opaque }
+    source: { kind: application, name: choose }
+outputs: {}
+components:
+  encoder:
+    implementation: { kind: onnx, artifact: encoder.onnx }
+    contract: { id: onnx-genai.token-policy, version: "1" }
+    batch_capacity: {}
+    ports:
+      inputs:
+        seed:
+          dtype: int64
+          rank: 1
+          shape: [seed_items]
+          batch_layout: { kind: shared }
+      outputs:
+        packed:
+          dtype: int64
+          rank: 1
+          shape: [items]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:
+              - { offsets: packed_offsets, owner: packed_owner }
+        packed_offsets:
+          dtype: int64
+          rank: 1
+          shape: [offset_rows]
+          batch_layout: { kind: shared }
+        packed_owner:
+          dtype: int64
+          rank: 1
+          shape: [owner_rows]
+          batch_layout: { kind: shared }
+state: {}
+steps:
+  - kind: branch
+    predicate: choose
+    cases:
+      "1":
+        kind: invoke
+        component: encoder
+        inputs: { seed: seed }
+        outputs:
+          packed: branch.packed
+          packed_offsets: branch.packed_offsets
+          packed_owner: branch.packed_owner
+"#,
+        )
+        .expect("shared branch workflow")
+    }
+
     fn over_budget_values() -> PipelineTensors {
         PipelineTensors::from([
             (
@@ -6200,12 +6380,15 @@ steps: []
         values: &mut PipelineTensors,
         host: &mut Option<&mut dyn WorkflowNodeHost>,
     ) -> anyhow::Result<()> {
+        let request_count =
+            super::super::batching::validate_workflow_batch_inputs(workflow, values)?;
         runtime.run_workflow_node(
             node,
             workflow,
             values,
             &mut HashMap::new(),
             &std::collections::HashSet::new(),
+            request_count,
             &mut HashMap::new(),
             &mut HashMap::new(),
             &HashMap::new(),
@@ -6220,6 +6403,36 @@ steps: []
     struct RecordingHost {
         contract: String,
         seen: Vec<String>,
+    }
+
+    struct WrongCardinalityHost {
+        seen: usize,
+    }
+
+    impl WorkflowNodeHost for WrongCardinalityHost {
+        fn hosted_contracts(&self) -> &'static [&'static str] {
+            super::super::generation::DECODE_CORE_CONTRACTS
+        }
+
+        fn execute_contract_node(
+            &mut self,
+            request: WorkflowNodeRequest<'_>,
+        ) -> anyhow::Result<bool> {
+            if request.contract != "onnx-genai.token-policy" {
+                return Ok(false);
+            }
+            self.seen += 1;
+            for (port, value_ref) in request.outputs {
+                let value = match port.as_str() {
+                    "packed" => Value::from_slice_i64(&[10], &[1])?,
+                    "packed_offsets" => Value::from_slice_i64(&[0, 1], &[2])?,
+                    "packed_owner" => Value::from_slice_i64(&[0], &[1])?,
+                    _ => continue,
+                };
+                request.values.insert(value_ref.clone(), value);
+            }
+            Ok(true)
+        }
     }
 
     impl WorkflowNodeHost for RecordingHost {
@@ -6389,6 +6602,83 @@ steps: []
             "admission must fail before adapter dispatch"
         );
     }
+
+    #[test]
+    fn request_aligned_hosted_invocation_needs_declared_capacity() {
+        let workflow = request_aligned_workflow();
+        let runtime = test_runtime(workflow.clone());
+        let mut values = PipelineTensors::from([(
+            "rows".to_string(),
+            Value::from_slice_i64(&[1, 2], &[2, 1]).expect("rows"),
+        )]);
+        let node = WorkflowNode::Invoke {
+            component: "encoder".to_string(),
+            inputs: BTreeMap::from([("rows".to_string(), "rows".to_string())]),
+            outputs: BTreeMap::new(),
+            effects: BTreeMap::new(),
+        };
+        let mut host = RecordingHost {
+            contract: "onnx-genai.token-policy".to_string(),
+            seen: Vec::new(),
+        };
+        let error = {
+            let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+            run_test_node(&runtime, &workflow, &node, &mut values, &mut hosted)
+                .expect_err("known two-row inputs require batch_capacity")
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(
+                super::super::batching::BatchContractError::UndeclaredCapacity {
+                    request_count: 2,
+                    ..
+                }
+            )
+        ));
+        assert!(host.seen.is_empty());
+    }
+
+    #[test]
+    fn canonical_request_count_reaches_a_shared_input_branch() {
+        let workflow = shared_branch_workflow();
+        let runtime = test_runtime(workflow.clone());
+        let request = PipelineGenerateRequest::new(GenerateRequest::new(GeneratePrompt::TokenIds(
+            Vec::new(),
+        )))
+        .with_input(
+            "rows",
+            Value::from_slice_i64(&[1, 2], &[2, 1]).expect("rows"),
+        )
+        .with_input("seed", Value::from_slice_i64(&[7], &[1]).expect("seed"))
+        .with_input(
+            "choose",
+            Value::from_slice_i64(&[1], &[1]).expect("branch selector"),
+        );
+        let mut plan = WorkflowExecutionPlan::new(&runtime, request).expect("execution plan");
+        assert_eq!(plan.request_count, 2);
+        let mut host = WrongCardinalityHost { seen: 0 };
+        let error = {
+            let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+            match plan.execute_retained_with_host(&mut hosted) {
+                Ok(_) => panic!("one owner cannot represent a canonical two-request workflow"),
+                Err(error) => error,
+            }
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(super::super::batching::BatchContractError::RequestExtent {
+                actual: 1,
+                expected: 2,
+                ..
+            })
+        ));
+        assert_eq!(host.seen, 1);
+        assert!(!plan.values.contains_key("branch.packed"));
+        assert!(!plan.values.contains_key("branch.packed_offsets"));
+        assert!(!plan.values.contains_key("branch.packed_owner"));
+    }
 }
 
 #[cfg(test)]
@@ -6514,6 +6804,27 @@ ports:
         ));
         assert!(values.is_empty());
     }
+
+    #[test]
+    fn ownership_companions_are_not_planned_as_native_device_outputs() {
+        let declaration = component_with_packed_outputs();
+        let shapes = resolve_component_output_shapes(
+            &declaration,
+            &output_bindings(),
+            &HashMap::from([
+                ("batch".to_string(), 1),
+                ("items".to_string(), 2),
+                ("offset_rows".to_string(), 2),
+                ("owner_rows".to_string(), 2),
+            ]),
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(shapes.get("packed"), Some(&vec![2]));
+        assert_eq!(shapes.get("good"), Some(&vec![1]));
+        assert!(!shapes.contains_key("packed_offsets"));
+        assert!(!shapes.contains_key("packed_owner"));
+    }
 }
 
 /// The loop records why it stopped.
@@ -6599,6 +6910,7 @@ impl WorkflowRuntime {
         values: &mut PipelineTensors,
         symbols: &mut HashMap<String, i64>,
         dynamic_symbols: &std::collections::HashSet<String>,
+        workflow_request_count: usize,
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
@@ -6619,6 +6931,7 @@ impl WorkflowRuntime {
             values,
             symbols,
             dynamic_symbols,
+            workflow_request_count,
             emit_counts,
             final_state_refs,
             component_overrides,
@@ -6685,6 +6998,7 @@ impl WorkflowRuntime {
         values: &mut PipelineTensors,
         symbols: &mut HashMap<String, i64>,
         dynamic_symbols: &std::collections::HashSet<String>,
+        workflow_request_count: usize,
         emit_counts: &mut HashMap<String, usize>,
         final_state_refs: &mut HashMap<String, String>,
         component_overrides: &HashMap<String, String>,
@@ -6757,6 +7071,7 @@ impl WorkflowRuntime {
             values,
             symbols,
             dynamic_symbols,
+            workflow_request_count,
             emit_counts,
             final_state_refs,
             component_overrides,
@@ -6842,6 +7157,7 @@ pub(crate) struct WorkflowGenerationCursor {
     values: PipelineTensors,
     symbols: HashMap<String, i64>,
     dynamic_symbols: std::collections::HashSet<String>,
+    request_count: usize,
     emit_counts: HashMap<String, usize>,
     final_state_refs: HashMap<String, String>,
     component_overrides: HashMap<String, String>,
@@ -6893,6 +7209,7 @@ impl WorkflowGenerationCursor {
         let mut values = std::mem::take(&mut plan.values);
         let mut symbols = plan.initial_symbols.clone();
         let dynamic_symbols = plan.dynamic_symbols.clone();
+        let request_count = plan.request_count;
         let component_overrides = plan.component_overrides.clone();
         let mut emit_counts = HashMap::new();
         let mut final_state_refs = HashMap::new();
@@ -6903,6 +7220,7 @@ impl WorkflowGenerationCursor {
             &mut values,
             &mut symbols,
             &dynamic_symbols,
+            request_count,
             &mut emit_counts,
             &mut final_state_refs,
             &component_overrides,
@@ -6913,6 +7231,7 @@ impl WorkflowGenerationCursor {
             values,
             symbols,
             dynamic_symbols,
+            request_count,
             emit_counts,
             final_state_refs,
             component_overrides,
@@ -6940,6 +7259,7 @@ impl WorkflowGenerationCursor {
             &mut self.values,
             &mut self.symbols,
             &self.dynamic_symbols,
+            self.request_count,
             &mut self.emit_counts,
             &mut self.final_state_refs,
             &self.component_overrides,

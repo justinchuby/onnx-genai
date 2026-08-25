@@ -927,7 +927,7 @@ impl WorkflowRuntime {
         if let Some(existing) = self.worker.iteration_runtimes.borrow().get(&policy) {
             return Ok(Rc::clone(existing));
         }
-        let variant =
+        let mut variant =
             onnx_genai_metadata::decoder_workflow::iteration_variant(&self.plan.workflow, policy)
                 .map_err(|error| {
                 anyhow::anyhow!(
@@ -935,6 +935,18 @@ impl WorkflowRuntime {
                          {policy:?}: {error}"
                 )
             })?;
+        if policy == IterationPolicy::ContinuousBatch {
+            // This variant is created only behind the continuous scheduler,
+            // which has already admitted and assigned every live row. Record
+            // that proven batching boundary on the runtime-local component so
+            // the universal pre-dispatch check does not mistake scheduler
+            // capacity for an undeclared package capability.
+            let component = variant
+                .components
+                .get_mut(onnx_genai_metadata::decoder_workflow::BATCH_STEP_COMPONENT)
+                .context("continuous-batch variant has no batch_step component")?;
+            component.batch_capacity = Some(onnx_genai_metadata::ComponentBatchCapacity::default());
+        }
         generation::validate_generation_workflow(&variant)?;
         // A variant body invokes bindings only, so the directory it is built
         // over names no artifacts. Declaring that explicitly — rather than
