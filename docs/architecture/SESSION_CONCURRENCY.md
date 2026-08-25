@@ -203,8 +203,8 @@ So the honest summary is:
 | Decode core (native) | `Engine::native_sessions` (`engine/model.rs:78-100`) | none | no |
 
 ✅ **All three rows now answer "yes", from one place.** Phase 2's routing lease
-(`server/src/lease.rs`) is keyed by `SessionPlacement` and is taken before the
-turn is enqueued, so which of these three paths ends up serving it is not
+(`server/src/lease.rs`) is keyed by `ModelSessionPlacement` and is taken before
+the turn is enqueued, so which of these three paths ends up serving it is not
 something the refusal depends on. The interpreter's row keeps its own guard as
 the inner invariant; the two decode-core rows are covered by the routing lease
 alone.
@@ -977,10 +977,10 @@ into a latency cliff).
 ### 4.2 The routing lease
 
 ✅ **Shipped (Phase 2).** The lease described below exists as
-`crates/onnx-genai-server/src/lease.rs`: `SessionLeases`, a `WorkerId`-sharded
-map of `SessionPlacement`, owned by `EngineDriver` (the routing façade) and
-acquired through `EngineDriver::acquire_session_lease` before any command is
-built. `SessionLeaseGuard` is the RAII half, and it is `#[must_use]`. The
+`crates/onnx-genai-server/src/lease.rs`: `SessionLeases`, a sharded map of
+`ModelSessionPlacement`, owned by the `SessionRegistry` — the one routing-layer
+map of client id → conversation, shared by every loaded model — and acquired
+through `SessionRegistry::acquire` before any command is built. `SessionLeaseGuard` is the RAII half, and it is `#[must_use]`. The
 paragraphs below are kept in the present tense as the design they describe; where
 what landed is narrower than what they specify, §13's Phase 2 entry says so by
 name.
@@ -992,9 +992,9 @@ the lease Decision 3 needs **did not exist** before that — the interpreter's
 
 **A new lease is introduced at the routing layer.** It is keyed by the typed
 public session identity — the `SessionPlacement` that #2012 already threads
-through the driver, the session registry and the routes (`worker.rs:66-85`) —
-and it applies to every session-bearing turn regardless of which execution path
-serves it. Decode-core ORT sessions, decode-core native sessions, and
+through the driver, the session registry and the routes (`worker.rs:66-85`),
+qualified by the model that owns the engine which issued it — and it applies to
+every session-bearing turn regardless of which execution path serves it. Decode-core ORT sessions, decode-core native sessions, and
 interpreted workflow sessions are all covered by one lease, because a caller
 holding one session id should get one answer about what a concurrent second turn
 does.
@@ -1018,12 +1018,27 @@ raised, and the key it is raised against, are new.
 Where the lease state lives is a consequence of §4.1, not a free choice. Since
 routing is a pure function of the session id and a session belongs to exactly
 one worker for its whole life, contention on the lease map is contention between
-*request-handling* tasks, not between workers. It is therefore one map in the
-routing façade, sharded by `WorkerId` to keep the critical section short, holding
-`SessionPlacement → LeaseState`. It is *not* a `Mutex<HashSet<String>>` dropped
-into `WorkflowRuntime` where the old one was, and it is *not* per-worker state —
-a per-worker map cannot be consulted before the command reaches the worker, and
-§4.2.1 explains why that timing is the whole point.
+*request-handling* tasks, not between workers. It is therefore **one map in the
+routing façade** — sharded to keep the critical section short — holding
+`ModelSessionPlacement → LeaseState`, and owned by the `SessionRegistry`, which
+is the thing that holds the bindings the lease is about. It is *not* a
+`Mutex<HashSet<String>>` dropped into `WorkflowRuntime` where the old one was,
+and it is *not* per-worker state — a per-worker map cannot be consulted before
+the command reaches the worker, and §4.2.1 explains why that timing is the whole
+point.
+
+✅ **The key is model-qualified, and the map is one map.** A `SessionPlacement`
+names a worker and an engine session id, and both are per-engine: each engine
+numbers its own sessions and each pool starts at worker 0, so two loaded models
+routinely produce the identical placement for two unrelated conversations. A
+per-`EngineDriver` map would additionally have meant that the *session registry*
+— which is global across models — had to pick which engine's map to consult for
+a binding, and picking wrong is precisely the failure the lease exists to
+prevent. Both are fixed by the same decision: the key is
+`ModelSessionPlacement { model: ModelKey, placement: SessionPlacement }`
+(`server/src/lease.rs`), the map is owned by the `SessionRegistry`, and every
+route acquires through it. A driver learns its own `ModelKey` once, in
+`ModelHandle::new`, and refuses a lease naming any other model.
 
 #### 4.2.1 The lease is acquired before enqueue, not inside the worker loop
 
@@ -1262,9 +1277,38 @@ One further consequence of the lease reaches a place the table does not name:
 picks the least recently used binding and closes it; it walks candidates
 oldest-first and takes the first lease it can, so a binding with a turn in flight
 is skipped rather than destroyed under its caller. If every binding is mid-turn
-there is no victim and the registry runs one over its bound until a turn ends —
-bounded by the generation-capacity semaphore, and preferable to closing a live
-conversation (`server/src/session.rs`, `evict_lru`).
+there is no victim, and the *new* session is refused with a typed
+`AtCapacity` — mapped to the same 429 `resource_limit_error` (with
+`Retry-After`) every other transient capacity answer uses — rather than admitted
+over the bound. Admitting it would have made `max_sessions` advisory
+*permanently*: nothing walks the registry back down, because the next insert
+evicts one and adds one, so a server sized for *n* conversations could be pushed
+to *n + k* and stay there. The refusal is transient by construction and clears
+the moment any turn in flight ends (`server/src/session.rs`, `evict_lru`).
+
+**Every one of those decisions is keyed model-first.** The session registry is a
+single map across every loaded model, but a `SessionPlacement` is unique only
+*within* one engine: each engine numbers its sessions from its own counter and
+each worker pool starts at worker 0, so two loaded models routinely name two
+unrelated conversations with the identical placement. The lease key and the
+registry entry are therefore `ModelSessionPlacement` — a `ModelKey` plus the
+placement (`server/src/lease.rs`) — and there is exactly one `SessionLeases` map,
+owned by the `SessionRegistry` itself rather than by any engine. An engine-owned
+map would have answered "is this session busy?" only for the engine the caller
+happened to be holding, which is the one thing a routing conflict cannot get
+wrong. The engine learns its own `ModelKey` once, in `ModelHandle::new`, so the
+handle's id and the driver's are the same string by construction; a close whose
+lease names a different model is refused by the driver rather than performed.
+
+**Close is one decision, not three.** `DELETE` does not read a binding, take its
+lease, and then remove it: those are three decisions about a binding that can
+change between them, and the middle one is where a rebind slips in and the close
+destroys a conversation it never leased. `SessionRegistry::take_for_close` holds
+the registry lock across the find, the acquire and the remove, and hands back the
+guard — which names the owning model — so what is leased, what is unbound, and
+what is closed are the same binding by construction, on the engine that owns it
+rather than on the default model. LRU eviction removes its victim under the same
+lock and the same rule.
 
 Three routing rules deserve their reasons stated.
 
@@ -1345,25 +1389,35 @@ loser closing the session it opened rather than leaking it
 (`session.rs:22-29`, `routes/completions.rs:1325-1338`).
 
 PR #2012 already did half of this section's work. `SessionEntry` no longer stores
-a bare engine session id; it stores a `SessionPlacement`, with the reason written
-into the type: *"Stored as a pair because a later turn has to be routed back to
-that worker, and an engine session id alone cannot say which one it is"*
-(`session.rs:32-41`). That is precisely the routing key §4.1 needs, already
-threaded through the create path (`routes/completions.rs:1313`, `:1331-1338`).
+a bare engine session id; it stores a placement, with the reason written into the
+type: *"a later turn has to be routed back to that worker, and an engine session
+id alone cannot say which one it is"*. That is precisely the routing key §4.1
+needs, already threaded through the create path.
 
 So the registry's *identity* model is untouched by this design. It stores and
-returns an opaque placement; whether the shard lives in a side field or is
-encoded in the id is invisible to it, and clients continue to see an opaque
+returns an opaque binding; whether the shard lives in a side field or is encoded
+in the id is invisible to it, and clients continue to see an opaque
 `X-Session-Id` they never parse.
 
-⚠️ **One thing did change, and it is not identity.** Eviction closes a
-conversation, and a close takes the lease (§5), so `insert` and `claim` now take
-the lease map and hand the evicted binding back *holding its guard*
+⚠️ **Two things did change, and neither is client-visible identity.**
+
+First, eviction closes a conversation, and a close takes the lease (§5), so
+`insert` and `claim` hand the evicted binding back *holding its guard*
 (`SessionClaim::Claimed { evicted: Option<SessionLeaseGuard> }`). The caller
 closes under that guard, which is what stops a turn from starting on a session
 between the moment it is unbound and the moment the engine frees it, and what
 stops the client id being rebound to a new conversation while the old one is
-still being torn down.
+still being torn down. When there is no evictable binding, the insert is refused
+(§5) rather than admitted over `max_sessions`.
+
+Second, ✅ **the stored binding is model-qualified.** A `SessionPlacement` alone
+is unique only inside one engine, and the registry spans every loaded model, so
+`SessionEntry` stores a `ModelSessionPlacement` and the registry owns the one
+`SessionLeases` map keyed the same way. This is what makes `DELETE` close on the
+model that opened the session instead of on the default one, what makes eviction
+close its victim on the victim's engine, and what stops model A's first session
+and model B's first session — which have the identical placement — from being
+treated as one conversation.
 
 ---
 
@@ -1960,6 +2014,19 @@ for, because the lease reaches further than the turn path:
 mid-turn, and `a_panic_while_holding_the_lease_releases_it` (`lease.rs`) pins the
 unwind path that `Drop` is relied on for.
 
+A third group landed for the registry invariants of §5 and §5.1, and it is
+concurrent in the same sense the list above demands. Two models are loaded whose
+first sessions have *provably identical* placements — the fixture asserts the
+collision rather than assuming it — and the tests then pin that a busy session on
+one model cannot be evicted or closed by the other, that a `DELETE` of a
+non-default model's session closes it on that model's engine, that an insert at
+full capacity with every conversation busy is **refused** rather than admitted
+over `max_sessions`, and that the next insert after a release evicts rather than
+grows (`server/src/tests.rs`, `session.rs`). Two thread-and-barrier regressions
+cover the close race directly: racing deletes unbind exactly one binding once,
+and a delete racing a rebind never leaves an orphan — every conversation ends
+either bound or closed, never both and never neither.
+
 ### 12.2 ORT / native parity
 
 Concurrency must not change results *that it has no right to change*. Stating
@@ -2188,10 +2255,11 @@ The gate is §12.2's `W = 1` bit-identity requirement against the pre-migration
 driver, which is unconditional at `W = 1` and therefore a real gate.
 
 ✅ **Landed: the routing lease itself, and the refusal it makes reachable.**
-`crates/onnx-genai-server/src/lease.rs` holds `SessionLeases` (a `WorkerId`-sharded
-map keyed by `SessionPlacement`) and the `#[must_use]` RAII `SessionLeaseGuard`.
-`EngineDriver` owns the map, because §4.2 requires it be readable before a
-command exists. Acquisition happens on the calling task in the route handler
+`crates/onnx-genai-server/src/lease.rs` holds `SessionLeases` (a sharded map
+keyed by `ModelSessionPlacement`) and the `#[must_use]` RAII `SessionLeaseGuard`.
+The `SessionRegistry` owns the one map, because §4.2 requires it be readable
+before a command exists and §5.1 requires the same map answer for every loaded
+model. Acquisition happens on the calling task in the route handler
 (`routes/completions.rs`, `lease_bound_session`) **before** the session-carry
 round trip, before the admission permit, and before the `DriverCommand` is built;
 a conflict is mapped through the pre-existing `package_capability_failure`, which
@@ -2209,6 +2277,23 @@ before it unbinds the id, and what LRU eviction must take to choose a victim
 sessions alike, because it is keyed on the routing identity rather than on
 anything a package declares. Stateless requests and FIM completions take no
 lease, and distinct sessions never conflict with each other.
+
+✅ **Landed with it: the three registry invariants the lease is only correct
+under.** (a) The key is **model-qualified** and the map is **one map** — two
+loaded models produce identical `SessionPlacement`s for their first sessions, so
+a bare placement is not a global identity and a per-driver map is not a global
+answer (§4.2). A session id bound to one model is refused with the same typed 409
+if it is presented on another, rather than generating into an unrelated
+conversation that happens to share a placement. (b) `max_sessions` is **strict**:
+when every binding is mid-turn there is no evictable victim, and the new session
+is refused with a typed capacity error mapped to the existing 429
+`resource_limit_error` rather than admitted over the bound, which would have made
+the limit advisory permanently (§5). (c) Close is **atomic**: `take_for_close`
+finds, leases and unbinds one binding under the registry lock and returns the
+guard naming its owner, so `DELETE` closes exactly what it removed on exactly the
+model that owns it — never the default model, and never a conversation that was
+rebound between the read and the remove (§5). LRU eviction removes its victim
+under the same lock and rule.
 
 ⚠️ **Not landed, and this phase is not complete without it: the `EngineOwner`
 deletion above.** It requires constructing the engine on the worker thread

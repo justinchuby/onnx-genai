@@ -1600,7 +1600,7 @@ async fn status_active_sessions_reflect_real_state() {
     let client_id = state.sessions.next_client_id().unwrap();
     state
         .sessions
-        .insert(client_id, engine_session, handle.engine.session_leases())
+        .insert(client_id, handle.engine.binding(engine_session))
         .expect("register session");
 
     let response = app(state)
@@ -4300,20 +4300,16 @@ async fn concurrent_turns_on_one_session_do_not_lose_a_conversation() {
     );
 }
 
-/// How many sessions of the default model currently hold a turn lease.
+/// How many sessions currently hold a turn lease, across every loaded model.
+///
+/// One map for the whole server, so this is the honest total rather than one
+/// engine's view of it.
 fn leases_held(state: &AppState) -> usize {
-    state
-        .registry
-        .resolve("")
-        .expect("resolve default model")
-        .expect("a model is loaded")
-        .engine
-        .session_leases()
-        .held()
+    state.sessions.leases().held()
 }
 
-/// The placement a client id currently resolves to.
-fn placement_of(state: &AppState, client_id: &str) -> crate::worker::SessionPlacement {
+/// The model-qualified binding a client id currently resolves to.
+fn binding_of(state: &AppState, client_id: &str) -> crate::lease::ModelSessionPlacement {
     state
         .sessions
         .get(client_id)
@@ -4351,8 +4347,9 @@ async fn a_second_turn_on_a_busy_session_is_refused_rather_than_queued() {
         .engine
         .clone();
     // Stand in for a turn in flight: this is the same guard `generate` carries.
-    let held = engine
-        .acquire_session_lease(placement_of(&state, session), session)
+    let held = state
+        .sessions
+        .acquire(binding_of(&state, session), session)
         .expect("an idle session is leasable");
 
     let start = Arc::new(tokio::sync::Barrier::new(2));
@@ -4395,7 +4392,7 @@ async fn a_second_turn_on_a_busy_session_is_refused_rather_than_queued() {
             .sessions
             .get(session)
             .expect("registry")
-            .map(|placement| placement.engine_session_id),
+            .map(|binding| binding.placement().engine_session_id),
         Some(held.placement().engine_session_id),
         "a refused turn leaves the binding exactly where it was"
     );
@@ -4467,16 +4464,10 @@ async fn stateless_requests_take_no_lease_and_are_never_refused() {
     let (status, first) =
         chat_turn(router.clone(), Some("sess-stateless-peer"), "hello world").await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let engine = state
-        .registry
-        .resolve("")
-        .expect("resolve default model")
-        .expect("a model is loaded")
-        .engine
-        .clone();
-    let held = engine
-        .acquire_session_lease(
-            placement_of(&state, "sess-stateless-peer"),
+    let held = state
+        .sessions
+        .acquire(
+            binding_of(&state, "sess-stateless-peer"),
             "sess-stateless-peer",
         )
         .expect("an idle session is leasable");
@@ -4522,15 +4513,9 @@ async fn deleting_a_session_during_a_turn_is_refused_and_the_session_survives() 
 
     let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let engine = state
-        .registry
-        .resolve("")
-        .expect("resolve default model")
-        .expect("a model is loaded")
-        .engine
-        .clone();
-    let held = engine
-        .acquire_session_lease(placement_of(&state, session), session)
+    let held = state
+        .sessions
+        .acquire(binding_of(&state, session), session)
         .expect("an idle session is leasable");
 
     let start = Arc::new(tokio::sync::Barrier::new(2));
@@ -4581,6 +4566,358 @@ async fn deleting_a_session_during_a_turn_is_refused_and_the_session_survives() 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(state.sessions.get(session).expect("registry").is_none());
     assert_eq!(leases_held(&state), 0);
+}
+
+// ── Phase 2: one lease map, across every loaded model ───────────────────────
+
+fn handle_for(state: &AppState, model: &str) -> Arc<crate::registry::ModelHandle> {
+    state
+        .registry
+        .resolve(model)
+        .expect("registry")
+        .unwrap_or_else(|| panic!("{model} is loaded"))
+}
+
+/// Two loaded models, one real engine session opened and bound in each.
+///
+/// The fixture exists to reproduce the collision that makes a model-blind lease
+/// key wrong. Every engine numbers its sessions from its own counter and every
+/// worker pool starts at worker 0, so `model-a`'s first session and
+/// `model-b`'s first session have the *identical* placement while naming two
+/// entirely unrelated conversations. The returned placement is that shared
+/// value: a key that is not model-qualified cannot tell these two apart, and
+/// every test below is a way of asking what that costs.
+async fn colliding_two_model_sessions(
+    config: ServerConfig,
+) -> (AppState, crate::worker::SessionPlacement) {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let specs = vec![
+        ModelSpec {
+            id: "model-a".to_string(),
+            path: path.clone(),
+            eager: true,
+            warmup: false,
+        },
+        ModelSpec {
+            id: "model-b".to_string(),
+            path,
+            eager: true,
+            warmup: false,
+        },
+    ];
+    let state = AppState::load_from_specs(specs, config).expect("load two tiny-llm fixtures");
+    let a = handle_for(&state, "model-a");
+    let b = handle_for(&state, "model-b");
+    let placement_a = a.engine.create_session().await.expect("model-a session");
+    let placement_b = b.engine.create_session().await.expect("model-b session");
+    assert_eq!(
+        placement_a, placement_b,
+        "the fixture is only interesting if the two engines collide, and they do: \
+         each numbers its own sessions and each pool starts at worker 0",
+    );
+    state
+        .sessions
+        .insert("sess-on-a".to_string(), a.engine.binding(placement_a))
+        .expect("bind model-a's session");
+    state
+        .sessions
+        .insert("sess-on-b".to_string(), b.engine.binding(placement_b))
+        .expect("bind model-b's session");
+    (state, placement_a)
+}
+
+/// `DELETE` closes the conversation on the model that owns it.
+///
+/// The route used to resolve the *default* model and close there. With two
+/// models loaded and their placements collided, that closed model-a's
+/// conversation whenever a client deleted model-b's — destroying a live
+/// conversation nobody asked about while leaving the one that was asked about
+/// running, and orphaned.
+#[tokio::test]
+async fn deleting_a_session_closes_it_on_the_model_that_owns_it() {
+    let (state, placement) = colliding_two_model_sessions(ServerConfig::default()).await;
+    let router = app(state.clone());
+    let a = handle_for(&state, "model-a");
+    let b = handle_for(&state, "model-b");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/v1/sessions/sess-on-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(state.sessions.get("sess-on-b").expect("registry").is_none());
+    assert_eq!(leases_held(&state), 0, "the close released its lease");
+
+    // model-b's engine no longer has the session, because that is the one that
+    // was closed.
+    let lease = state
+        .sessions
+        .acquire(b.engine.binding(placement), "sess-on-b")
+        .expect("nothing holds it");
+    let error = b
+        .engine
+        .close_session(lease)
+        .await
+        .expect_err("the DELETE already closed it on model-b");
+    assert!(error.to_string().contains("not found"), "{error}");
+
+    // model-a's identically placed conversation was never touched.
+    let lease = state
+        .sessions
+        .acquire(a.engine.binding(placement), "sess-on-a")
+        .expect("idle");
+    a.engine
+        .close_session(lease)
+        .await
+        .expect("model-a's session is exactly where it was");
+}
+
+/// A lease taken on one model cannot be spent on another.
+///
+/// The guard names the model it leased, and the driver checks that name before
+/// it destroys anything. This is the backstop for the whole model-qualified
+/// key: even if a future caller resolved the wrong engine, the close is refused
+/// rather than performed on the wrong conversation.
+#[tokio::test]
+async fn a_lease_from_one_model_cannot_close_another_models_session() {
+    let (state, placement) = colliding_two_model_sessions(ServerConfig::default()).await;
+    let a = handle_for(&state, "model-a");
+    let b = handle_for(&state, "model-b");
+
+    let lease = state
+        .sessions
+        .acquire(a.engine.binding(placement), "sess-on-a")
+        .expect("idle");
+    let error = b
+        .engine
+        .close_session(lease)
+        .await
+        .expect_err("model-b must refuse a lease it did not issue");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot be closed on model 'model-b'"),
+        "{error}"
+    );
+
+    // And the conversation the refused close named is still there.
+    let lease = state
+        .sessions
+        .acquire(a.engine.binding(placement), "sess-on-a")
+        .expect("the refused close released its lease");
+    a.engine
+        .close_session(lease)
+        .await
+        .expect("model-a's session survived the refusal");
+}
+
+/// Eviction never takes another model's live conversation, refuses when every
+/// binding is busy, and closes what it does take on the right engine.
+///
+/// Three properties in one arc, because they are one arc: a full registry has
+/// to choose a victim, that choice has to skip whatever has a turn in flight
+/// regardless of which model it belongs to, and when there is nothing to choose
+/// the answer is a refusal rather than a quiet overshoot of `max_sessions`.
+#[tokio::test]
+async fn eviction_across_models_skips_live_conversations_and_refuses_when_all_are_busy() {
+    let (state, placement) = colliding_two_model_sessions(ServerConfig {
+        max_sessions: 2,
+        ..ServerConfig::default()
+    })
+    .await;
+    let a = handle_for(&state, "model-a");
+    let b = handle_for(&state, "model-b");
+
+    // A turn in flight on model-b's session, and model-b's binding made the
+    // least recently accessed one: the obvious victim, and the wrong one.
+    let turn_on_b = state
+        .sessions
+        .acquire(b.engine.binding(placement), "sess-on-b")
+        .expect("a turn on model-b");
+    state
+        .sessions
+        .get("sess-on-a")
+        .expect("registry")
+        .expect("still bound");
+
+    let second_on_a = a
+        .engine
+        .create_session()
+        .await
+        .expect("another model-a session");
+    let evicted = state
+        .sessions
+        .insert("sess-on-a-2".to_string(), a.engine.binding(second_on_a))
+        .expect("room can be made")
+        .expect("something had to go");
+    assert_eq!(
+        evicted.model().as_str(),
+        "model-a",
+        "the live model-b conversation is skipped, however old it is",
+    );
+    assert_eq!(evicted.placement(), placement);
+    // Closed on the model the guard names — which for a collided placement is
+    // the only thing that distinguishes it from destroying model-b's.
+    a.engine
+        .close_session(evicted)
+        .await
+        .expect("the evicted conversation is closed on its own engine");
+    assert_eq!(state.sessions.len(), 2, "the bound holds");
+
+    // Now every bound conversation has a turn in flight, so there is no victim.
+    let turn_on_a = state
+        .sessions
+        .acquire(a.engine.binding(second_on_a), "sess-on-a-2")
+        .expect("a turn on model-a");
+    let second_on_b = b
+        .engine
+        .create_session()
+        .await
+        .expect("another model-b session");
+    let refused = state
+        .sessions
+        .insert("sess-on-b-2".to_string(), b.engine.binding(second_on_b))
+        .expect_err("a bound that yields under load is not a bound");
+    assert!(matches!(
+        refused,
+        crate::session::SessionRegistryError::AtCapacity { bound: 2 }
+    ));
+    assert_eq!(
+        state.sessions.len(),
+        2,
+        "the registry never went over its bound, even transiently",
+    );
+
+    // The refusal is transient: model-b's turn ends, and its binding becomes
+    // the victim it always was — closed on model-b's engine.
+    drop(turn_on_b);
+    let evicted = state
+        .sessions
+        .insert("sess-on-b-2".to_string(), b.engine.binding(second_on_b))
+        .expect("room can be made again")
+        .expect("something had to go");
+    assert_eq!(evicted.model().as_str(), "model-b");
+    assert_eq!(evicted.placement(), placement);
+    b.engine
+        .close_session(evicted)
+        .await
+        .expect("model-b's conversation is closed on model-b");
+    assert_eq!(state.sessions.len(), 2);
+
+    drop(turn_on_a);
+    assert_eq!(leases_held(&state), 0, "nothing leaked a lease");
+}
+
+/// A session id from one model is refused on another, not silently continued
+/// into whatever conversation shares its placement there.
+#[tokio::test]
+async fn a_session_bound_to_one_model_is_refused_on_another() {
+    let (state, _placement) = colliding_two_model_sessions(ServerConfig::default()).await;
+    let router = app(state.clone());
+
+    let (status, body) = chat_turn_for(router, "model-a", Some("sess-on-b"), "hello").await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "model-a must not generate into model-b's conversation: {body}"
+    );
+    assert_eq!(body["error"]["type"], "conflict_error", "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("model-b"), "{body}");
+    assert!(message.contains("model-a"), "{body}");
+    assert_eq!(leases_held(&state), 0, "a refusal takes no lease with it");
+}
+
+/// A full registry whose every conversation is busy refuses a new session
+/// instead of admitting one over the bound.
+///
+/// `max_sessions` is what an operator sized the server's session memory
+/// against. Admitting one anyway left the registry permanently at `max + k` —
+/// nothing ever walks it back down, because the next insert evicts one and adds
+/// one. The refusal is a 429 for the same reason every other "at capacity"
+/// answer here is: the request succeeds unchanged once any turn ends.
+#[tokio::test]
+async fn creating_a_session_when_every_conversation_is_busy_is_refused_not_overshot() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            max_sessions: 1,
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with a one-session bound");
+    let router = app(state.clone());
+
+    let first = create_http_session(&router).await;
+    assert_eq!(state.sessions.len(), 1);
+    let turn = state
+        .sessions
+        .acquire(binding_of(&state, &first), &first)
+        .expect("a turn on the only session");
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers().contains_key("retry-after"),
+        "a transient capacity refusal says when to come back",
+    );
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "resource_limit_error", "{body}");
+    assert_eq!(
+        state.sessions.len(),
+        1,
+        "the refused create left the registry at its bound, not over it",
+    );
+    assert!(
+        state.sessions.get(&first).expect("registry").is_some(),
+        "and it did not close the live conversation to make room",
+    );
+
+    // Once the turn ends the same request succeeds, by evicting — and the
+    // registry is still at exactly its bound.
+    drop(turn);
+    let second = create_http_session(&router).await;
+    assert_ne!(second, first);
+    assert_eq!(state.sessions.len(), 1);
+    assert!(state.sessions.get(&first).expect("registry").is_none());
+    assert_eq!(leases_held(&state), 0);
+}
+
+async fn create_http_session(router: &axum::Router) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    body["id"].as_str().expect("a session id").to_string()
 }
 
 /// A request that fails admission must not open a session, and must not evict
@@ -5298,12 +5635,8 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
     //    409 when it is busy, because the lease is decided in the routing layer
     //    before the turn is ever evaluated against the package.
     let busy = state
-        .registry
-        .resolve("")
-        .expect("resolve default model")
-        .expect("a model is loaded")
-        .engine
-        .acquire_session_lease(placement_of(&state, "sess-bound"), "sess-bound")
+        .sessions
+        .acquire(binding_of(&state, "sess-bound"), "sess-bound")
         .expect("an idle session is leasable");
     let (status, conflict) = chat_turn(router, Some("sess-bound"), "hello").await;
     assert_eq!(status, StatusCode::CONFLICT, "{conflict}");

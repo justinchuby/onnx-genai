@@ -160,8 +160,7 @@ async fn run_completion(
     let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
     let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session =
-        open_session_after_admission(&handle, &state.sessions, conversational, lease).await?;
+    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
     let result = collect_generation_result(generation.events)
         .await
@@ -215,8 +214,7 @@ async fn stream_completion(
     let carried_tokens = carried_session_tokens(&handle, lease.as_ref()).await?;
     let prompt_tokens = carried_tokens.attended + prepared.prompt_tokens;
     enforce_context_cap(prompt_tokens, request.max_tokens, handle.model_max_context)?;
-    let session =
-        open_session_after_admission(&handle, &state.sessions, conversational, lease).await?;
+    let session = open_session_after_admission(&state, &handle, conversational, lease).await?;
     let generation = submit_completion(&handle, prepared.generation, session).await?;
     await_driver_admission(generation.admission).await?;
     let mut driver_rx = generation.events;
@@ -433,13 +431,8 @@ async fn run_chat_completion(
     let mut generation_request = prepared.request;
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
-    let session_lookup = open_session_after_admission(
-        &handle,
-        &state.sessions,
-        client_session_id.as_deref(),
-        lease,
-    )
-    .await?;
+    let session_lookup =
+        open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
 
     // The placement outlives the guard on purpose: the guard is moved into the
     // command that carries the turn, and the token count is read after that turn
@@ -612,13 +605,8 @@ async fn stream_chat_completion(
     generation_request.options.max_new_tokens = output_budget;
     generation_request.options.max_context = handle.model_max_context;
     let (tx, rx) = mpsc::channel(16);
-    let session_lookup = open_session_after_admission(
-        &handle,
-        &state.sessions,
-        client_session_id.as_deref(),
-        lease,
-    )
-    .await?;
+    let session_lookup =
+        open_session_after_admission(&state, &handle, client_session_id.as_deref(), lease).await?;
     // One submission. The driver resolves how to execute it from the runtime it
     // owns, so this route no longer branches on which package shape was loaded.
     let generation = handle
@@ -1293,17 +1281,41 @@ fn lease_bound_session(
     let Some(client_id) = client_session_id else {
         return Ok(None);
     };
-    let Some(placement) = sessions
-        .get(client_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
-    else {
+    let Some(binding) = sessions.get(client_id).map_err(session_registry_failure)? else {
         return Ok(None);
     };
-    handle
-        .engine
-        .acquire_session_lease(placement, client_id)
+    ensure_session_belongs_to_model(handle, &binding, client_id)?;
+    sessions
+        .acquire(binding, client_id)
         .map(Some)
         .map_err(package_capability_failure)
+}
+
+/// Refuse a session id that names a conversation inside a *different* model.
+///
+/// A binding is a model plus a placement, and a placement means nothing outside
+/// the engine that issued it: every engine numbers its sessions from its own
+/// counter, so model B's engine almost certainly has a session with model A's
+/// session's id, holding an unrelated conversation. Continuing A's session on B
+/// would therefore not fail — it would silently generate into whatever B had
+/// there, and write the result back over it.
+///
+/// The refusal is a 409 because the request is well formed and the session is
+/// real; what conflicts is the pairing. Sending the same request to the model
+/// the session belongs to succeeds.
+fn ensure_session_belongs_to_model(
+    handle: &ModelHandle,
+    binding: &ModelSessionPlacement,
+    client_id: &str,
+) -> Result<(), ApiError> {
+    if binding.model() == handle.engine.model_key() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "session {client_id} belongs to model '{}' and cannot be continued on model '{}'",
+        binding.model(),
+        handle.id,
+    )))
 }
 
 /// What the session contributes to context accounting and prefill work, without
@@ -1339,8 +1351,8 @@ async fn carried_session_tokens(
 /// request arrived; it is passed straight through, because a turn takes its
 /// session's lease exactly once.
 async fn open_session_after_admission(
+    state: &AppState,
     handle: &ModelHandle,
-    sessions: &SessionRegistry,
     client_session_id: Option<&str>,
     held: Option<SessionLeaseGuard>,
 ) -> Result<Option<SessionLeaseGuard>, ApiError> {
@@ -1348,7 +1360,7 @@ async fn open_session_after_admission(
         return Ok(held);
     }
     match client_session_id {
-        Some(client_id) => get_or_create_session(&handle.engine, sessions, client_id)
+        Some(client_id) => get_or_create_session(state, handle, client_id)
             .await
             .map(Some),
         None => Ok(None),
@@ -1377,46 +1389,50 @@ fn conversational_session_id<'a>(
 /// Returns the guard rather than the placement, so a caller cannot hold a
 /// session id it has not proved it may take a turn on.
 async fn get_or_create_session(
-    engine: &EngineDriver,
-    sessions: &SessionRegistry,
+    state: &AppState,
+    handle: &ModelHandle,
     client_id: &str,
 ) -> Result<SessionLeaseGuard, ApiError> {
+    let sessions = &state.sessions;
     // Bound in the window since the request last looked: this is another
     // request's session now, and taking a turn on it is subject to its lease.
-    if let Some(session) = sessions
-        .get(client_id)
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
-    {
-        return engine
-            .acquire_session_lease(session, client_id)
+    if let Some(binding) = sessions.get(client_id).map_err(session_registry_failure)? {
+        ensure_session_belongs_to_model(handle, &binding, client_id)?;
+        return sessions
+            .acquire(binding, client_id)
             .map_err(package_capability_failure);
     }
 
-    let opened = engine
+    let opened = handle
+        .engine
         .create_session()
         .await
         .map_err(session_create_failure)?;
+    let binding = handle.engine.binding(opened);
     // Nothing else can name a session this request has not published yet, so
     // this cannot conflict — and taking it here means the session is leased
     // from the moment it exists, whichever way the claim below resolves.
-    let lease = engine
-        .acquire_session_lease(opened, client_id)
+    let lease = sessions
+        .acquire(binding.clone(), client_id)
         .map_err(package_capability_failure)?;
-    // Claim decides; a caller that lost the race closes the session it opened
-    // rather than leaving it to accumulate a conversation nobody will read.
-    match sessions
-        .claim(client_id.to_string(), opened, engine.session_leases())
-        .map_err(|err| ApiError::internal(format!("session registry failed: {err}")))?
-    {
-        crate::session::SessionClaim::Existing(existing) => {
-            close_evicted_session(engine, Some(lease)).await?;
-            engine
-                .acquire_session_lease(existing, client_id)
+    // Claim decides; a caller that lost the race, and a caller the registry
+    // refused outright, both close the session they opened rather than leaving
+    // it to accumulate a conversation nobody will read.
+    match sessions.claim(client_id.to_string(), binding) {
+        Ok(crate::session::SessionClaim::Existing(existing)) => {
+            close_leased_session(&state.registry, lease).await?;
+            ensure_session_belongs_to_model(handle, &existing, client_id)?;
+            sessions
+                .acquire(existing, client_id)
                 .map_err(package_capability_failure)
         }
-        crate::session::SessionClaim::Claimed { evicted } => {
-            close_evicted_session(engine, evicted).await?;
+        Ok(crate::session::SessionClaim::Claimed { evicted }) => {
+            close_evicted_session(&state.registry, evicted).await?;
             Ok(lease)
+        }
+        Err(error) => {
+            close_leased_session(&state.registry, lease).await?;
+            Err(session_registry_failure(error))
         }
     }
 }
