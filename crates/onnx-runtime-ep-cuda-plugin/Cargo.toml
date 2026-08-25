@@ -25,9 +25,11 @@ onnx-runtime-ep-cuda = { workspace = true, optional = true }
 
 [dev-dependencies]
 onnx-genai-ort-sys = { workspace = true }
+onnx-runtime-ort-testkit = { workspace = true }
 onnx-runtime-ep-plugin = { path = "../onnx-runtime-ep-plugin", version = "=0.1.0-dev.5" }
 onnx-runtime-ep-api = { workspace = true }
 onnx-runtime-ir = { workspace = true }
+libloading = { workspace = true }
 
 [lints]
 workspace = true

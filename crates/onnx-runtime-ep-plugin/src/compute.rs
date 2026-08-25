@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use onnx_genai_ort_sys as ort;
 use onnx_runtime_ep_api::HostToDeviceCopier;
 use onnx_runtime_ep_api::kernel::{
-    Kernel, KernelSizedOutput, TensorMetadata, WorkspaceLifetime, WorkspaceRequirement,
-    WorkspaceView,
+    Kernel, KernelSizedOutput, KernelSizedOutputMetadata, KernelSizedOutputPolicy, TensorMetadata,
+    WorkspaceLifetime, WorkspaceRequirement, WorkspaceView,
 };
 use onnx_runtime_ep_api::tensor::{DevicePtr, DevicePtrMut, TensorMut, TensorView};
 use onnx_runtime_ir::{DataType, DeviceId, Node};
@@ -2730,6 +2730,251 @@ unsafe extern "C" fn compute_execute(
                         let requested_outputs: Vec<bool> = (0..entry.num_outputs)
                             .map(|slot| !entry.absent_output_slots.contains(&slot))
                             .collect();
+                        if entry.kernel.kernel_sized_output_policy()
+                            == KernelSizedOutputPolicy::DeviceWorkspace
+                        {
+                            let ort_indices: Vec<Option<usize>> = sources
+                                .iter()
+                                .map(|source| match source {
+                                    NodeInputSource::Ort(index) => Some(*index),
+                                    NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                                })
+                                .collect();
+                            if let Some(staging) = exported.device_staging.as_ref() {
+                                let output_mem_infos: Vec<*const ort::OrtMemoryInfo> =
+                                    ort_outputs.iter().map(|output| output.mem_info).collect();
+                                if let Err(error) = unsafe {
+                                    stage_host_boundary_inputs(
+                                        api_ref,
+                                        kernel_context,
+                                        staging,
+                                        &mut kernel_inputs,
+                                        &ort_indices,
+                                        &[],
+                                        &output_mem_infos,
+                                        &format!("Compute: node {node_idx} kernel-sized metadata"),
+                                    )
+                                } {
+                                    return fail_status(&error);
+                                }
+                            }
+
+                            let plans = match exported.workspace_plan_cache(node_idx) {
+                                Some(plans) => plans,
+                                None => {
+                                    return fail_status(&format!(
+                                        "Compute: node {node_idx}: no workspace plan cache for \
+                                         kernel-sized device outputs"
+                                    ));
+                                }
+                            };
+                            node_ort_operands.clear();
+                            node_ort_operands.extend(sources.iter().filter_map(
+                                |source| match source {
+                                    NodeInputSource::Ort(index) => Some(*index),
+                                    NodeInputSource::Buffer(_) | NodeInputSource::Absent => None,
+                                },
+                            ));
+                            let workspace = match unsafe {
+                                prepare_workspace(
+                                    api_ref,
+                                    kernel_context,
+                                    PlacementSources {
+                                        ort_inputs: OrtOperands::Resolved(&node_ort_operands),
+                                        subgraph_fallback: SubgraphFallback {
+                                            staging: exported.device_staging.as_ref(),
+                                            memo: &subgraph_fallback_memo,
+                                        },
+                                    },
+                                    &*entry.kernel,
+                                    plans,
+                                    &kernel_inputs,
+                                    format_args!(
+                                        "Compute: node {node_idx} kernel-sized device workspace"
+                                    ),
+                                )
+                            } {
+                                Ok(workspace) => workspace,
+                                Err(error) => return fail_status(&error),
+                            };
+                            let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
+                            let metadata = match run_device_kernel_sized(
+                                &*entry.kernel,
+                                &kernel_inputs,
+                                &requested_outputs,
+                                &entry.output_dtypes,
+                                workspace,
+                                &format!("Compute: node {node_idx}"),
+                            ) {
+                                Ok(outputs) => outputs,
+                                Err(error) => return fail_status(&error),
+                            };
+
+                            ort_outputs.clear();
+                            new_bufs.clear();
+                            slot_kinds.clear();
+                            for (slot, output) in metadata.iter().enumerate() {
+                                let sink = match sinks.get(slot) {
+                                    Some(sink) => sink,
+                                    None => {
+                                        return fail_status(&format!(
+                                            "Compute: device kernel-sized output slot {slot} has \
+                                             no sink"
+                                        ));
+                                    }
+                                };
+                                let Some(output) = output else {
+                                    if !matches!(sink, NodeOutputSink::Absent) {
+                                        return fail_status(&format!(
+                                            "Compute: absent device kernel-sized slot {slot} has a \
+                                             non-absent sink"
+                                        ));
+                                    }
+                                    slot_kinds.push(RoutedSlotKind::Absent(0));
+                                    continue;
+                                };
+                                match sink {
+                                    NodeOutputSink::Ort(ort_index) => {
+                                        match unsafe {
+                                            allocate_output(
+                                                api_ref,
+                                                kernel_context,
+                                                *ort_index,
+                                                &output.shape,
+                                                output.dtype,
+                                                true,
+                                            )
+                                        } {
+                                            Ok(output) => ort_outputs.push(output),
+                                            Err(error) => {
+                                                return fail_status(&format!(
+                                                    "Compute: device kernel-sized output slot \
+                                                     {slot} allocation failed: {error}"
+                                                ));
+                                            }
+                                        }
+                                        slot_kinds.push(RoutedSlotKind::Ort);
+                                    }
+                                    NodeOutputSink::Buffer(buffer_index) => {
+                                        let mem_info = match intermediate_scratch {
+                                            Some(mem_info) => mem_info,
+                                            None => {
+                                                return fail_status(
+                                                    "Compute: device kernel-sized intermediate \
+                                                     has no device scratch placement",
+                                                );
+                                            }
+                                        };
+                                        let numel = match output
+                                            .shape
+                                            .iter()
+                                            .try_fold(1usize, |product, &extent| {
+                                                product.checked_mul(extent)
+                                            }) {
+                                            Some(numel) => numel,
+                                            None => {
+                                                return fail_status(
+                                                    "Compute: device kernel-sized intermediate \
+                                                     shape overflow",
+                                                );
+                                            }
+                                        };
+                                        let bytes =
+                                            match numel.checked_mul(output.dtype.byte_size()) {
+                                                Some(bytes) => bytes,
+                                                None => {
+                                                    return fail_status(
+                                                        "Compute: device kernel-sized intermediate \
+                                                     byte length overflow",
+                                                    );
+                                                }
+                                            };
+                                        let scratch = match unsafe {
+                                            alloc_scratch(
+                                                api_ref,
+                                                kernel_context,
+                                                mem_info,
+                                                bytes.max(1),
+                                            )
+                                        } {
+                                            Ok(scratch) => scratch.cast::<u8>(),
+                                            Err(error) => {
+                                                return fail_status(&format!(
+                                                    "Compute: device kernel-sized intermediate \
+                                                     allocation failed: {error}"
+                                                ));
+                                            }
+                                        };
+                                        new_bufs.push((
+                                            *buffer_index,
+                                            IntermediateBuf {
+                                                data: Vec::new(),
+                                                scratch_ptr: scratch,
+                                                shape: output.shape.clone(),
+                                                strides: contiguous_strides(&output.shape),
+                                                dtype: output.dtype,
+                                            },
+                                        ));
+                                        slot_kinds.push(RoutedSlotKind::Buffer);
+                                    }
+                                    NodeOutputSink::Absent => {
+                                        return fail_status(&format!(
+                                            "Compute: present device kernel-sized slot {slot} has \
+                                             an absent sink"
+                                        ));
+                                    }
+                                }
+                            }
+
+                            let mut ort_iter =
+                                ort_outputs.iter_mut().map(|output| output.view_mut());
+                            let mut buffer_iter = new_bufs.iter_mut();
+                            let mut output_views: Vec<TensorMut<'_>> = slot_kinds
+                                .iter()
+                                .map(|kind| match kind {
+                                    RoutedSlotKind::Ort => ort_iter.next().unwrap(),
+                                    RoutedSlotKind::Buffer => {
+                                        let (_, buffer) = buffer_iter.next().unwrap();
+                                        buf_view_mut(buffer)
+                                    }
+                                    RoutedSlotKind::Absent(_) => absent_output_view(),
+                                })
+                                .collect();
+                            if let Err(error) = entry.kernel.materialize_kernel_sized_device(
+                                &kernel_inputs,
+                                &mut output_views,
+                                workspace,
+                            ) {
+                                return fail_status(&format!(
+                                    "Compute: device kernel-sized materialization failed: {error}"
+                                ));
+                            }
+                            kernel_probe.end();
+                            crate::dispatch_probe::count(
+                                crate::dispatch_probe::Event::NodeExecuted,
+                            );
+                            EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                            for (buffer_index, buffer) in new_bufs.drain(..) {
+                                if buffer_index >= intermediates.len() {
+                                    return fail_status(&format!(
+                                        "Compute: buffer index {buffer_index} out of range"
+                                    ));
+                                }
+                                if let Some(stale) = intermediates[buffer_index].take() {
+                                    recycle_host_intermediate(stale.data);
+                                }
+                                intermediates[buffer_index] = Some(buffer);
+                            }
+                            for &buffer_index in
+                                &retire_items[retire_starts[node_idx]..retire_starts[node_idx + 1]]
+                            {
+                                if let Some(dead) = intermediates[buffer_index].take() {
+                                    recycle_host_intermediate(dead.data);
+                                }
+                            }
+                            continue;
+                        }
+
                         let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                         let deferred = match run_kernel_sized(
                             exported,
@@ -3181,6 +3426,118 @@ unsafe extern "C" fn compute_execute(
                     let requested_outputs: Vec<bool> = (0..entry.num_outputs)
                         .map(|slot| !entry.absent_output_slots.contains(&slot))
                         .collect();
+                    if entry.kernel.kernel_sized_output_policy()
+                        == KernelSizedOutputPolicy::DeviceWorkspace
+                    {
+                        if let Some(staging) = exported.device_staging.as_ref()
+                            && let Err(error) = unsafe {
+                                stage_host_boundary_inputs(
+                                    api_ref,
+                                    kernel_context,
+                                    staging,
+                                    kernel_inputs,
+                                    &entry.input_slots,
+                                    &[],
+                                    &[],
+                                    "Compute: node 0 kernel-sized metadata",
+                                )
+                            }
+                        {
+                            return fail_status(&error);
+                        }
+                        let plans = match exported.workspace_plan_cache(0) {
+                            Some(plans) => plans,
+                            None => {
+                                return fail_status(
+                                    "Compute: node 0: no workspace plan cache for kernel-sized \
+                                     device outputs",
+                                );
+                            }
+                        };
+                        let subgraph_fallback_memo = std::cell::Cell::new(None);
+                        let workspace = match unsafe {
+                            prepare_workspace(
+                                api_ref,
+                                kernel_context,
+                                PlacementSources {
+                                    ort_inputs: OrtOperands::Slots(&entry.input_slots),
+                                    subgraph_fallback: SubgraphFallback {
+                                        staging: exported.device_staging.as_ref(),
+                                        memo: &subgraph_fallback_memo,
+                                    },
+                                },
+                                &*entry.kernel,
+                                plans,
+                                kernel_inputs,
+                                "Compute: node 0 kernel-sized device workspace",
+                            )
+                        } {
+                            Ok(workspace) => workspace,
+                            Err(error) => return fail_status(&error),
+                        };
+                        let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
+                        let metadata = match run_device_kernel_sized(
+                            &*entry.kernel,
+                            kernel_inputs,
+                            &requested_outputs,
+                            &entry.output_dtypes,
+                            workspace,
+                            "Compute: node 0",
+                        ) {
+                            Ok(outputs) => outputs,
+                            Err(error) => return fail_status(&error),
+                        };
+                        owned_outputs.reserve(entry.num_outputs);
+                        let mut ort_output_index = 0usize;
+                        for (slot, output) in metadata.iter().enumerate() {
+                            let Some(output) = output else {
+                                continue;
+                            };
+                            match unsafe {
+                                allocate_output(
+                                    api_ref,
+                                    kernel_context,
+                                    ort_output_index,
+                                    &output.shape,
+                                    output.dtype,
+                                    true,
+                                )
+                            } {
+                                Ok(output) => owned_outputs.push(output),
+                                Err(error) => {
+                                    return fail_status(&format!(
+                                        "Compute: device kernel-sized output slot {slot} \
+                                         allocation failed: {error}"
+                                    ));
+                                }
+                            }
+                            ort_output_index += 1;
+                        }
+                        let mut ort_iter = owned_outputs.iter_mut().map(|output| output.view_mut());
+                        let mut output_views: Vec<TensorMut<'_>> = metadata
+                            .iter()
+                            .map(|output| {
+                                if output.is_some() {
+                                    ort_iter.next().unwrap()
+                                } else {
+                                    absent_output_view()
+                                }
+                            })
+                            .collect();
+                        if let Err(error) = entry.kernel.materialize_kernel_sized_device(
+                            kernel_inputs,
+                            &mut output_views,
+                            workspace,
+                        ) {
+                            return fail_status(&format!(
+                                "Compute: device kernel-sized materialization failed: {error}"
+                            ));
+                        }
+                        kernel_probe.end();
+                        EXECUTED_NODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        return ok_status();
+                    }
+
                     let kernel_probe = crate::dispatch_probe::Phase::KernelInvoke.enter();
                     let deferred = match run_kernel_sized(
                         exported,
@@ -3456,6 +3813,12 @@ fn run_kernel_sized(
     declared_dtypes: &[DataType],
     context: &str,
 ) -> Result<Vec<Option<KernelSizedOutput>>, String> {
+    if kernel.kernel_sized_output_policy() != KernelSizedOutputPolicy::HostOwned {
+        return Err(format!(
+            "{context}: host-owned kernel-sized dispatch received policy {:?}",
+            kernel.kernel_sized_output_policy()
+        ));
+    }
     if !exported.host_accessible || exported.device_staging.is_some() {
         return Err(format!(
             "{context}: kernel-sized outputs are host-only, but this EP uses device-resident \
@@ -3491,6 +3854,101 @@ fn run_kernel_sized(
         .map_err(|error| format!("{context}: kernel-sized execution failed: {error}"))?;
     validate_kernel_sized_outputs(&outputs, requested_outputs, declared_dtypes, context)?;
     Ok(outputs)
+}
+
+fn run_device_kernel_sized(
+    kernel: &dyn Kernel,
+    inputs: &[TensorView<'_>],
+    requested_outputs: &[bool],
+    declared_dtypes: &[DataType],
+    workspace: Option<WorkspaceView>,
+    context: &str,
+) -> Result<Vec<Option<KernelSizedOutputMetadata>>, String> {
+    if !kernel.has_kernel_sized_outputs()
+        || kernel.kernel_sized_output_policy() != KernelSizedOutputPolicy::DeviceWorkspace
+    {
+        return Err(format!(
+            "{context}: device-workspace shape strategy requires an explicitly opted-in device \
+             policy"
+        ));
+    }
+    if requested_outputs.len() != declared_dtypes.len() {
+        return Err(format!(
+            "{context}: output metadata mismatch: {} requested slots but {} declared dtypes",
+            requested_outputs.len(),
+            declared_dtypes.len()
+        ));
+    }
+    let outputs = kernel
+        .prepare_kernel_sized_device(inputs, requested_outputs, workspace)
+        .map_err(|error| format!("{context}: device metadata phase failed: {error}"))?;
+    validate_kernel_sized_metadata(&outputs, requested_outputs, declared_dtypes, context)?;
+    Ok(outputs)
+}
+
+fn validate_kernel_sized_metadata(
+    outputs: &[Option<KernelSizedOutputMetadata>],
+    requested_outputs: &[bool],
+    declared_dtypes: &[DataType],
+    context: &str,
+) -> Result<(), String> {
+    if outputs.len() != requested_outputs.len() {
+        return Err(format!(
+            "{context}: kernel-sized metadata count mismatch: kernel returned {}, node has {} slots",
+            outputs.len(),
+            requested_outputs.len()
+        ));
+    }
+    for (slot, ((output, &requested), &declared_dtype)) in outputs
+        .iter()
+        .zip(requested_outputs)
+        .zip(declared_dtypes)
+        .enumerate()
+    {
+        match (requested, output) {
+            (false, None) => continue,
+            (false, Some(_)) => {
+                return Err(format!(
+                    "{context}: absent output slot {slot} unexpectedly returned device metadata"
+                ));
+            }
+            (true, None) => {
+                return Err(format!(
+                    "{context}: present output slot {slot} returned no device metadata"
+                ));
+            }
+            (true, Some(output)) => {
+                if output.dtype != declared_dtype {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} returned dtype {:?}, but the \
+                         graph declares {:?}",
+                        output.dtype, declared_dtype
+                    ));
+                }
+                if output.dtype == DataType::Undefined || output.dtype.byte_size() == 0 {
+                    return Err(format!(
+                        "{context}: kernel-sized output slot {slot} has unsupported dtype {:?}",
+                        output.dtype
+                    ));
+                }
+                output.shape.iter().try_fold(1usize, |product, &extent| {
+                    if extent > i64::MAX as usize {
+                        return Err(format!(
+                            "{context}: kernel-sized output slot {slot} extent {extent} exceeds \
+                             ORT's i64 shape range"
+                        ));
+                    }
+                    product.checked_mul(extent).ok_or_else(|| {
+                        format!(
+                            "{context}: kernel-sized output slot {slot} shape {:?} overflows usize",
+                            output.shape
+                        )
+                    })
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_kernel_sized_outputs(
@@ -5324,6 +5782,62 @@ mod tests {
         output: KernelSizedOutput,
     }
 
+    struct DeviceKernelSizedMock {
+        prepares: Arc<AtomicUsize>,
+        materializes: Arc<AtomicUsize>,
+    }
+
+    impl Kernel for DeviceKernelSizedMock {
+        fn execute(
+            &self,
+            _: &[TensorView],
+            _: &mut [TensorMut],
+        ) -> onnx_runtime_ep_api::Result<()> {
+            unreachable!("device kernel-sized mock uses split phases")
+        }
+
+        fn has_kernel_sized_outputs(&self) -> bool {
+            true
+        }
+
+        fn kernel_sized_output_policy(&self) -> KernelSizedOutputPolicy {
+            KernelSizedOutputPolicy::DeviceWorkspace
+        }
+
+        fn prepare_kernel_sized_device(
+            &self,
+            _: &[TensorView],
+            requested_outputs: &[bool],
+            _: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<Vec<Option<KernelSizedOutputMetadata>>> {
+            self.prepares.fetch_add(1, Ordering::Relaxed);
+            Ok(requested_outputs
+                .iter()
+                .enumerate()
+                .map(|(slot, requested)| {
+                    requested.then(|| KernelSizedOutputMetadata {
+                        shape: vec![2],
+                        dtype: if slot == 0 {
+                            DataType::Float32
+                        } else {
+                            DataType::Int64
+                        },
+                    })
+                })
+                .collect())
+        }
+
+        fn materialize_kernel_sized_device(
+            &self,
+            _: &[TensorView],
+            _: &mut [TensorMut],
+            _: Option<WorkspaceView>,
+        ) -> onnx_runtime_ep_api::Result<()> {
+            self.materializes.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
     impl Kernel for KernelSizedMock {
         fn execute(
             &self,
@@ -5391,6 +5905,36 @@ mod tests {
         .unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(outputs[0].as_ref().unwrap().shape, [2]);
+    }
+
+    #[test]
+    fn device_kernel_sized_policy_splits_metadata_and_materialization_once() {
+        let prepares = Arc::new(AtomicUsize::new(0));
+        let materializes = Arc::new(AtomicUsize::new(0));
+        let kernel = DeviceKernelSizedMock {
+            prepares: Arc::clone(&prepares),
+            materializes: Arc::clone(&materializes),
+        };
+        let metadata = run_device_kernel_sized(
+            &kernel,
+            &[],
+            &[true, false, true],
+            &[DataType::Float32, DataType::Undefined, DataType::Int64],
+            None,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(prepares.load(Ordering::Relaxed), 1);
+        assert!(metadata[1].is_none());
+        let mut outputs = [
+            absent_output_view(),
+            absent_output_view(),
+            absent_output_view(),
+        ];
+        kernel
+            .materialize_kernel_sized_device(&[], &mut outputs, None)
+            .unwrap();
+        assert_eq!(materializes.load(Ordering::Relaxed), 1);
     }
 
     #[test]

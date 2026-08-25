@@ -266,7 +266,7 @@ are correct as history — they are not a statement about today.
 
 ### Remaining CPU-only operators
 
-`ai.onnx`: `NonMaxSuppression`, `Unique`.
+`ai.onnx`: `NonMaxSuppression`.
 `com.microsoft`: `FusedAttention`, `MoE`, `PackedMultiHeadAttention`.
 
 Each is either explained as a deliberate non-gap in this file or is open work
@@ -376,8 +376,15 @@ complete frames and applies the optional window before one batched cuFFT call.
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|
 | **CUTLASS / cuDNN SDPA** | `FusedAttention` | Flash/SDPA implementation avoids materialising the O(S²) score tensor. |
-| **NVRTC-custom** | `Unique` | Data-dependent output construction with no suitable runtime library. |
 | **deferred heavy operators** | `NonMaxSuppression` | Data-dependent selection deserves a dedicated follow-up wave and focused review. |
+
+`Unique` now has an honest bounded NVRTC slice: flattened, contiguous Float32
+inputs with at most 1024 elements (further clamped to the device's
+threads-per-block limit). One device bitonic-sort/grouping phase leaves reusable
+state in governed workspace, copies only the 8-byte count to host for ORT output
+allocation, then launches one device materialization phase. Axis mode, dynamic
+input extents, other dtypes, larger inputs, strided layouts, and CUDA graph
+capture decline at placement with an explicit reason.
 
 Wave 4 raises the advertised CUDA set from **48 to 54** op names. Its six
 activations are GPU-validated against independent CPU formulas on the local
