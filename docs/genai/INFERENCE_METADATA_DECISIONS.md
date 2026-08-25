@@ -937,7 +937,7 @@ resident, and splitting a packed result back to rows is an aliasing operation â€
 which is the practical reason the packed axis is pinned to 0 and the ownership
 rules demand contiguity, since a no-copy view is a contiguous element window and
 "a slice along an inner axis is not a contiguous range"
-(`crates/onnx-genai-ort/src/value.rs:1526-1542`). Second, backend support for
+(`crates/onnx-genai-ort/src/value.rs:1524-1543`). Second, backend support for
 grouped execution is asked **before** a group is formed, never discovered by
 attempting one, and it is recorded per (component implementation, operator class,
 execution provider) rather than as one global flip: a triple that has not proven
