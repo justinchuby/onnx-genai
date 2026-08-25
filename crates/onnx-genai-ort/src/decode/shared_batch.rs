@@ -26,10 +26,10 @@ pub struct SharedBufferBatchOptions {
 /// keeping the batch a fixed `batch_size` every step.
 pub struct BatchedSharedBufferDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     kv_pairs: Vec<KvPair>,
     kv_buffers: HashMap<String, Arc<Value>>,
-    kv_allocator: Option<crate::Allocator>,
+    kv_allocator: Option<crate::Allocator<'a>>,
     batch_size: usize,
     max_len: usize,
     row_lens: Vec<usize>,

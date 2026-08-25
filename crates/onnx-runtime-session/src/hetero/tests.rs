@@ -61,6 +61,10 @@ impl AcceleratorEp {
 }
 
 impl ExecutionProvider for AcceleratorEp {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "accel_ep"
     }

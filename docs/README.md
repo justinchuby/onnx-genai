@@ -9,6 +9,7 @@ give you a stale answer.
 | If you want | Read |
 |---|---|
 | What the project is and how it is put together | [`architecture/DESIGN.md`](architecture/DESIGN.md) |
+| What sessions promise about threads, and why | [`architecture/SESSION_CONCURRENCY.md`](architecture/SESSION_CONCURRENCY.md) |
 | Which CUDA feature to build with, and why there are two | [`build-features.md`](build-features.md) |
 | Why memory is arranged the way it is | [`memory/MEMORY_ARCHITECTURE.md`](memory/MEMORY_ARCHITECTURE.md) |
 | The proposed cross-stack memory contracts | [`memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md`](memory/MEMORY_MANAGEMENT_MODEL_DESIGN.md) |
@@ -27,6 +28,9 @@ Project-level structure and the ORT2 direction: [`DESIGN.md`](architecture/DESIG
 [`INDEXSHARE_DESIGN.md`](architecture/INDEXSHARE_DESIGN.md)), the plugin ABI
 ([`NXRT_ABI.md`](architecture/NXRT_ABI.md)), and cross-cutting conventions
 ([`ERROR_AND_LOGGING_CONVENTIONS.md`](architecture/ERROR_AND_LOGGING_CONVENTIONS.md),
+[`SESSION_CONCURRENCY.md`](architecture/SESSION_CONCURRENCY.md)
+(**authoritative for session thread-safety, session ownership and the exclusive-lease
+refusal**),
 [`CROSS_PLATFORM.md`](architecture/CROSS_PLATFORM.md),
 [`MINIMAL_BUILD.md`](architecture/MINIMAL_BUILD.md),
 [`PYTHON.md`](architecture/PYTHON.md),

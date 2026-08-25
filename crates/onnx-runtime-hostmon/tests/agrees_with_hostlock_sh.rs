@@ -44,8 +44,37 @@ fn script() -> PathBuf {
 /// away is worse than no test.
 fn lock_dir(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    // Restore permissions before removing. These tests deliberately create
+    // directories that cannot be written or listed, and `Mode` only unwinds
+    // them on panic: a `SIGKILL` or an OOM leaves a *non-empty* mode-500
+    // directory, on which `remove_dir_all` fails with `EACCES`. The error was
+    // being discarded here, so the next run inherited the fixture and failed
+    // somewhere else entirely -- a stale artifact wearing the costume of a real
+    // regression.
+    restore_modes(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// Best-effort `chmod 0700` down a tree, so a leftover fixture is removable.
+///
+/// Each directory is restored *before* it is listed, because a mode-600 one
+/// cannot be read until it is searchable again.
+fn restore_modes(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        restore_modes(&entry.path());
+    }
 }
 
 fn hostlock(dir: &Path, args: &[&str]) -> (bool, String) {
@@ -113,6 +142,7 @@ struct ScratchLock(PathBuf);
 
 impl Drop for ScratchLock {
     fn drop(&mut self) {
+        restore_modes(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
@@ -810,4 +840,199 @@ fn open_and_close_read_the_real_lock_and_the_real_owner() {
     );
 
     anchor.retire();
+}
+
+/// Restores a fixture's mode on unwind.
+///
+/// A `chmod 500` directory left behind by a panicking assertion cannot be
+/// removed by [`ScratchLock`], so the next run inherits a fixture it can
+/// neither read nor delete and every subsequent failure is a stale artifact
+/// rather than a real one.
+struct Mode(PathBuf);
+
+impl Drop for Mode {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn chmod(dir: &Path, mode: u32) -> Mode {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod fixture");
+    Mode(dir.to_path_buf())
+}
+
+/// A host where the lock cannot be created must read as unusable on both sides.
+///
+/// This is the reader's half of the defect `hostlock.sh` fixed by growing an
+/// `UNUSABLE` state and exit 7: an absent lock directory is `free` only when it
+/// is absent *because nobody took it*. When it is absent because nothing can be
+/// created there, the script now refuses to run and the reader used to stamp
+/// `host_lock=free` on the row -- the more dangerous of the two, because the
+/// script at least stops, while a false `free` is a durable claim about
+/// conditions that reads as reassurance weeks later.
+///
+/// The states are compared against the script's own porcelain rather than
+/// against my expectation of it. A reader that agreed with a comment and not
+/// with the writer is the failure this whole file exists to prevent.
+#[test]
+fn a_host_that_cannot_take_the_lock_reads_unusable_in_both_implementations() {
+    use onnx_runtime_hostmon::hostlock::{LockState, state_at};
+
+    let root = ScratchLock(lock_dir("hostlock-unusable"));
+    let root = &root.0;
+    std::fs::create_dir_all(root).expect("scratch root");
+
+    // Control first: absent under a writable ancestor. If this ever reported
+    // unusable, every assertion below would pass for the wrong reason and the
+    // guard would have turned into a blanket refusal.
+    let creatable = root.join("deep/a/b/hl");
+    let (ok, out) = hostlock(&creatable, &["status", "--porcelain"]);
+    assert!(ok, "status on a creatable path failed: {out}");
+    assert!(
+        out.contains("state=FREE"),
+        "an absent-but-creatable lock is free to the script: {out}"
+    );
+    assert_eq!(
+        state_at(&creatable),
+        LockState::Free,
+        "and free to the reader"
+    );
+
+    // A plain file at the lock path: `mkdir` cannot succeed, and the box holds
+    // no lock either.
+    let as_file = root.join("as-a-file");
+    std::fs::write(&as_file, b"not a lock\n").expect("fixture");
+    let (_, out) = hostlock(&as_file, &["status", "--porcelain"]);
+    assert!(
+        out.contains("state=UNUSABLE"),
+        "a file at the lock path is unusable to the script: {out}"
+    );
+    assert_eq!(state_at(&as_file), LockState::Unusable);
+
+    // The same fault one level up: an *intermediate* ancestor that is a regular
+    // file. It must be executable, or `access(X_OK)` refuses it and the guard
+    // passes for the wrong reason -- which is what made this the one branch the
+    // battery could delete without a single cell noticing. The walk stops at
+    // the nearest existing ancestor, so this is the arm that has to recognise
+    // it, not the leaf check above.
+    let not_a_dir = root.join("notdir");
+    std::fs::write(&not_a_dir, b"x").expect("fixture");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&not_a_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fixture");
+    }
+    let under_a_file = not_a_dir.join("hl");
+    let (_, out) = hostlock(&under_a_file, &["status", "--porcelain"]);
+    assert!(
+        out.contains("state=UNUSABLE"),
+        "a file as an intermediate ancestor is unusable to the script: {out}"
+    );
+    assert_eq!(
+        state_at(&under_a_file),
+        LockState::Unusable,
+        "an executable regular file passes access(W_OK|X_OK) and still cannot hold a lock"
+    );
+
+    // Both permission bits, because a directory that is writable but not
+    // searchable cannot hold entries either, and a `-w`-only check passes it.
+    for (name, mode) in [("no-write", 0o500), ("no-search", 0o600)] {
+        let parent = root.join(name);
+        std::fs::create_dir_all(&parent).expect("fixture");
+        let _mode = chmod(&parent, mode);
+        let lock = parent.join("hl");
+        let (_, out) = hostlock(&lock, &["status", "--porcelain"]);
+        assert!(
+            out.contains("state=UNUSABLE"),
+            "mode {mode:o} is unusable to the script: {out}"
+        );
+        assert_eq!(state_at(&lock), LockState::Unusable, "mode {mode:o}");
+
+        // And the refusal is the whole point: a run must not start here.
+        let (ok, out) = hostlock(
+            &lock,
+            &["acquire", "--owner", "leon", "--reason", "unusable-fixture"],
+        );
+        assert!(!ok, "acquire must refuse on an unusable host: {out}");
+    }
+}
+
+/// Once a lock exists, an unwritable parent stops being the question.
+///
+/// The reader must answer "held" for a directory it could not itself have
+/// created, exactly as `lock_state` does: reporting `unusable` here would
+/// relabel a peer's live declaration as a broken host, and the agent reading it
+/// would go off to fix a config while somebody's benchmark was running.
+#[test]
+fn a_published_lock_outranks_a_host_that_could_not_have_created_it() {
+    use onnx_runtime_hostmon::hostlock::{LockState, state_at};
+
+    let root = ScratchLock(lock_dir("hostlock-held-unwritable"));
+    let root = &root.0;
+    let lock = root.join("hl");
+    std::fs::create_dir_all(root).expect("scratch root");
+
+    let mut anchor = Anchor::spawn();
+    let (ok, out) = hostlock(
+        &lock,
+        &[
+            "acquire",
+            "--owner",
+            "sebastian",
+            "--reason",
+            "held-on-an-unwritable-parent",
+            "--pid",
+            &anchor.pid().to_string(),
+        ],
+    );
+    assert!(ok, "acquire failed: {out}");
+
+    let _mode = chmod(root, 0o500);
+    let (_, out) = hostlock(&lock, &["status", "--porcelain"]);
+    assert!(
+        out.contains("state=HELD"),
+        "a published lock is held even where a new one could not be made: {out}"
+    );
+    let state = state_at(&lock);
+    assert!(
+        matches!(state, LockState::Held(ref h) if h.owner == "sebastian"),
+        "the reader must agree, got {state:?}"
+    );
+
+    anchor.retire();
+}
+
+/// A fixture stranded by a kill must be cleaned, not inherited.
+///
+/// The tests above create directories that cannot be written or listed, and
+/// their `Drop` guards only run on unwind. A `SIGKILL` leaves a **non-empty**
+/// mode-500 directory behind, and `remove_dir_all` fails on it with `EACCES` --
+/// so before [`restore_modes`] the next run started against a fixture from a
+/// previous one and failed somewhere unrelated. Asserted here rather than
+/// trusted, because the failure it prevents does not look like this test.
+#[test]
+fn a_fixture_stranded_by_a_kill_is_cleaned_rather_than_inherited() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let stranded = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("hostlock-stranded");
+    let _ = std::fs::remove_dir_all(&stranded);
+    std::fs::create_dir_all(stranded.join("hl")).expect("fixture");
+    std::fs::write(stranded.join("hl/meta"), b"owner=roy\n").expect("fixture");
+    std::fs::set_permissions(&stranded, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+
+    // The bare removal the helper used to do, so the cell fails if this
+    // precondition ever stops holding and the recovery becomes untested.
+    assert!(
+        std::fs::remove_dir_all(&stranded).is_err(),
+        "a non-empty mode-500 directory must be the hard case; if it is not, \
+         this cell no longer pins anything"
+    );
+
+    let cleaned = lock_dir("hostlock-stranded");
+    assert!(
+        !cleaned.exists(),
+        "lock_dir must recover a stranded fixture, not leave it for the next run"
+    );
 }

@@ -569,8 +569,7 @@ impl Engine {
 
     #[cfg(feature = "native-backend")]
     fn next_native_session_id(&mut self) -> SessionId {
-        self.native_session_counter = self.native_session_counter.saturating_add(1);
-        SessionId::from(self.native_session_counter)
+        self.native_session_ids.mint()
     }
 
     /// Stamp a session as most-recently-used and return the new stamp.
@@ -1525,8 +1524,7 @@ impl Engine {
                 // 500 for a package that is simply stateless.
                 return Err(PackageCapabilityError::NoSessionState.into());
             }
-            self.workflow_session_counter += 1;
-            let id = self.workflow_session_counter;
+            let id = self.workflow_session_ids.mint();
             self.workflow_sessions.insert(id, 0);
             return Ok(id);
         }
@@ -3045,7 +3043,7 @@ mod tests {
                 }
             }),
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -3066,7 +3064,7 @@ mod tests {
             memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,
@@ -3562,7 +3560,7 @@ mod tests {
         let mut engine = Engine {
             workflow: Box::new(crate::pipeline::generation::test_decoder_runtime()?),
             workflow_sessions: HashMap::new(),
-            workflow_session_counter: 0,
+            workflow_session_ids: SharedSessionIds::new(),
             decode_backend: EngineDecodeBackend::Native,
             metadata: InferenceMetadata::default(),
             metadata_hints: MetadataHints::default(),
@@ -3583,7 +3581,7 @@ mod tests {
             memory_strategy_plan: MemoryStrategyPlan::unknown(0, None, "test engine fixture"),
             native_sessions: HashMap::new(),
             native_active_session: None,
-            native_session_counter: 0,
+            native_session_ids: SharedSessionIds::new(),
             native_access_counter: 0,
             native_default_session: None,
             native_max_sessions: 8,

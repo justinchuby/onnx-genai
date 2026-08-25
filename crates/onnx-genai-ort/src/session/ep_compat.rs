@@ -26,6 +26,18 @@ pub mod capability {
     /// EP exposes device-resident logits + a device allocator for on-device
     /// argmax/sampling.
     pub const DEVICE_SAMPLING: &str = "device_sampling";
+    /// EP permits several threads to call `Run`/`RunWithBinding` on one session
+    /// at the same time.
+    ///
+    /// ORT's session-level contract allows concurrent `Run`, but that only
+    /// holds when every provider underneath it does too — a provider that keeps
+    /// one mutable per-session context (a QNN HTP context, a plugin EP with a
+    /// single command queue) turns a second concurrent run into corruption
+    /// rather than contention. So this is declared per EP, and
+    /// [`crate::Session::supports_concurrent_run`] is the conjunction over the
+    /// providers a session actually resolved to. Absence means "not known to be
+    /// safe", which is the answer that fails closed.
+    pub const CONCURRENT_RUN: &str = "concurrent_run";
 }
 
 /// Capabilities the runtime core reasons about, resolved once per EP.
@@ -95,7 +107,10 @@ impl EpCapabilities {
             HardwareKind::Cpu,
             None,
             None,
-            &[capability::FIXED_CAPACITY_PRESENT_BINDING],
+            &[
+                capability::FIXED_CAPACITY_PRESENT_BINDING,
+                capability::CONCURRENT_RUN,
+            ],
         )
     }
 }
@@ -248,7 +263,9 @@ pub(crate) fn known_execution_provider_values() -> &'static str {
 /// This is the single compatibility table mapping EP *names* to behavior.
 #[must_use]
 pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
-    use capability::{DEVICE_KV, DEVICE_SAMPLING, FIXED_CAPACITY_PRESENT_BINDING, GRAPH_CAPTURE};
+    use capability::{
+        CONCURRENT_RUN, DEVICE_KV, DEVICE_SAMPLING, FIXED_CAPACITY_PRESENT_BINDING, GRAPH_CAPTURE,
+    };
 
     if selection.is_host_default() {
         return ResolvedEp {
@@ -278,6 +295,7 @@ pub fn resolve_execution_provider(selection: &EpSelection) -> ResolvedEp {
                     GRAPH_CAPTURE,
                     DEVICE_KV,
                     DEVICE_SAMPLING,
+                    CONCURRENT_RUN,
                 ],
             );
             #[cfg(feature = "cuda")]

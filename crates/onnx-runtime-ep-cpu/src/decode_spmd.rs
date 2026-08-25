@@ -115,7 +115,49 @@ pub const PERSISTENT_POOL_ENV: &str = "ONNX_GENAI_CPU_DECODE_PERSISTENT_POOL";
 /// SPMD split; `steal` decomposes the op into coarser tiles and lets resident
 /// workers claim tiles dynamically, so a delayed worker does not strand a whole
 /// static shard behind the per-op barrier.
+///
+/// `steal` is honoured in a **default (MLAS-free) build**: the dynamic claim is
+/// an `AtomicUsize` cursor over the tile table, run on the ordinary native SPMD
+/// pool. Building with the `mlas` feature additionally swaps the *executor* for
+/// `mlas_sys::WorkStealingThreadPool`, but that is a research reference and not
+/// what production selects -- the scheduling policy itself carries no MLAS
+/// dependency. Until 2026-08-24 the parse arms below were themselves gated on
+/// `feature = "mlas"`, which made this switch silently inert in every
+/// production build while the native claim path it selects sat unreachable.
 pub const DECODE_SCHEDULE_ENV: &str = "ONNX_GENAI_CPU_DECODE_SCHEDULE";
+/// Permutes which decode lane computes which output chunk, **without moving any
+/// lane off its CPU**.
+///
+/// Diagnostic instrument for #2017, and it exists because two different faults
+/// are currently indistinguishable. Lane `i` always runs on a fixed CPU *and*
+/// always computes output chunk `i`, so "lane 7 is slow" (a thread/core/hardware
+/// property) and "chunk 7 is slow" (a data property -- the weight rows in that
+/// range) predict identical observations in every experiment. Six candidate
+/// straggler selectors have been rejected without being able to separate these
+/// two, because no dataset can: both maps are static for the life of a process.
+///
+/// Turning this on holds placement fixed and permutes only the assignment, so
+/// the straggler either follows the **lane** or follows the **chunk** and the
+/// tie breaks in one run.
+///
+/// Values: unset / `off` / `identity` (default, byte-for-byte today's
+/// behaviour), `rotate:<k>` (lane `i` takes chunk `i + k`), `seed:<n>`
+/// (deterministic shuffle).
+///
+/// Guarantees, all asserted by tests rather than claimed here:
+/// * the *set* of segments is exactly the unpermuted set -- only which worker
+///   receives which one changes -- so results stay **bit-identical** and every
+///   output row is still computed exactly once;
+/// * the permutation is applied **within a NUMA node group**, never across one,
+///   so [`SpmdDecodePools::place_rows`] first-touches each row range on the same
+///   node it would have anyway and weight placement still lines up with dispatch;
+/// * `place_rows` and dispatch read the same permuted table, so a lane touches
+///   and later computes the same rows.
+///
+/// Not a performance knob and not on any default path: `identity` is the default
+/// and is the identity function, not merely a permutation that happens to be
+/// cheap.
+pub const CHUNK_PERMUTATION_ENV: &str = "ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION";
 
 /// Bounded active-spin window before a worker parks, mirroring the
 /// **LLVM/Intel OpenMP runtime `KMP_BLOCKTIME`** design: after a fork/join the
@@ -1450,6 +1492,12 @@ pub struct SpmdDecodePools {
     /// the kernel actually enforced lives in [`Self::worker_placements`], and
     /// realized-placement questions must be asked there.
     worker_cpus: Vec<Option<usize>>,
+    /// Which output chunk each lane computes. See [`CHUNK_PERMUTATION_ENV`].
+    ///
+    /// Read once at pool build and stored, not re-read per dispatch: the map has
+    /// to be the same for `place_rows` (which first-touches the pages) and for
+    /// every later dispatch, or a lane would compute rows it never touched.
+    chunk_permutation: ChunkPermutation,
     /// What each spawned worker observed about *itself* after its pin attempt,
     /// global-worker-index order.
     ///
@@ -1521,13 +1569,112 @@ enum DecodeSchedule {
     Steal,
 }
 
+/// How lanes map to output chunks. See [`CHUNK_PERMUTATION_ENV`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkPermutation {
+    /// Lane `i` computes chunk `i` -- today's behaviour, and the default.
+    Identity,
+    /// Lane `i` computes chunk `(i + k) % workers_in_node`.
+    Rotate(usize),
+    /// Deterministic shuffle from a fixed seed.
+    Seed(u64),
+}
+
+impl ChunkPermutation {
+    /// The permutation for one node group of `count` workers: entry `i` is the
+    /// *canonical* chunk index that lane `i` should compute.
+    ///
+    /// Always a genuine permutation of `0..count` -- that is what keeps coverage
+    /// exact -- and always the identity for `count <= 1`.
+    fn indices(self, count: usize) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..count).collect();
+        if count <= 1 {
+            return order;
+        }
+        match self {
+            Self::Identity => {}
+            Self::Rotate(k) => {
+                let k = k % count;
+                order.rotate_left(k);
+            }
+            Self::Seed(seed) => {
+                // Fisher-Yates driven by splitmix64: no dependency, and the same
+                // seed gives the same permutation on every host and run, so a
+                // reported `seed:<n>` is reproducible evidence rather than a
+                // description of a shuffle nobody can repeat.
+                let mut state = seed ^ 0x9e37_79b9_7f4a_7c15;
+                let mut next = || {
+                    state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    let mut z = state;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    z ^ (z >> 31)
+                };
+                for i in (1..count).rev() {
+                    let j = (next() % (i as u64 + 1)) as usize;
+                    order.swap(i, j);
+                }
+            }
+        }
+        order
+    }
+
+    /// Whether this is the identity for every group size.
+    fn is_identity(self) -> bool {
+        matches!(self, Self::Identity)
+    }
+
+    /// How this permutation prints in the benchmark width line.
+    ///
+    /// Round-trips through [`chunk_permutation_from_raw`], so a harness can feed
+    /// the reported label back in and get the same permutation.
+    pub fn label(self) -> String {
+        match self {
+            Self::Identity => "identity".to_string(),
+            Self::Rotate(k) => format!("rotate:{k}"),
+            Self::Seed(n) => format!("seed:{n}"),
+        }
+    }
+}
+
+fn chunk_permutation_from_raw(raw: Option<&str>) -> ChunkPermutation {
+    let Some(value) = raw.map(str::trim) else {
+        return ChunkPermutation::Identity;
+    };
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("off")
+        || value.eq_ignore_ascii_case("identity")
+    {
+        return ChunkPermutation::Identity;
+    }
+    if let Some(rest) = value
+        .strip_prefix("rotate:")
+        .or_else(|| value.strip_prefix("ROTATE:"))
+        && let Ok(k) = rest.trim().parse::<usize>()
+    {
+        return ChunkPermutation::Rotate(k);
+    }
+    if let Some(rest) = value
+        .strip_prefix("seed:")
+        .or_else(|| value.strip_prefix("SEED:"))
+        && let Ok(n) = rest.trim().parse::<u64>()
+    {
+        return ChunkPermutation::Seed(n);
+    }
+    // An unparseable value falls back to the default rather than failing the
+    // build: this is a diagnostic knob, and a typo must not change numerics.
+    ChunkPermutation::Identity
+}
+
+fn chunk_permutation() -> ChunkPermutation {
+    chunk_permutation_from_raw(std::env::var(CHUNK_PERMUTATION_ENV).ok().as_deref())
+}
+
 fn decode_schedule_from_raw(raw: Option<&str>) -> DecodeSchedule {
     match raw.map(str::trim) {
         Some(value) if value.eq_ignore_ascii_case("fixed") => DecodeSchedule::Fixed,
         Some(value) if value.eq_ignore_ascii_case("spmd") => DecodeSchedule::Fixed,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("steal") => DecodeSchedule::Steal,
-        #[cfg(feature = "mlas")]
         Some(value) if value.eq_ignore_ascii_case("work-stealing") => DecodeSchedule::Steal,
         _ => DecodeSchedule::Fixed,
     }
@@ -1619,6 +1766,11 @@ impl SpmdDecodePools {
                 // instead of "claimed nothing", and `worker_cpus()` documents
                 // the distinction.
                 worker_cpus: Vec::new(),
+                // The MLAS work-stealing pool hands out tiles dynamically, so
+                // there is no static lane->chunk map to permute. Recording the
+                // identity here says "this pool makes no such assignment"
+                // rather than silently implying the knob applies.
+                chunk_permutation: ChunkPermutation::Identity,
                 // Likewise: threads we neither spawned nor pinned have no
                 // placement of ours to observe.
                 worker_placements: Vec::new(),
@@ -1901,6 +2053,7 @@ impl SpmdDecodePools {
             total_workers,
             schedule,
             worker_cpus,
+            chunk_permutation: chunk_permutation(),
             worker_placements,
             dispatcher_cpu,
             dispatcher_tid: AtomicI64::new(0),
@@ -1962,6 +2115,18 @@ impl SpmdDecodePools {
     /// See [`Self::planned_placement_is_one_worker_per_physical_core`].
     pub fn worker_cpus(&self) -> &[Option<usize>] {
         &self.worker_cpus
+    }
+
+    /// The lane->chunk permutation this pool was **built with**.
+    ///
+    /// Read from the pool's own field rather than from the environment on
+    /// purpose: an env read would report what was *requested*, and the whole
+    /// reason this is reported at all is that a knob which is requested and not
+    /// honoured is the defect class of #1792 and #2014. Reporting the pool's
+    /// state makes "the binary ignored the knob" a visible disagreement between
+    /// the harness's env and this label, rather than an invisible one.
+    pub fn chunk_permutation(&self) -> ChunkPermutation {
+        self.chunk_permutation
     }
 
     /// The allowed CPU that the dispatcher reservation freed, if any.
@@ -2469,7 +2634,12 @@ impl SpmdDecodePools {
 
     /// Contiguous `(start, len)` output-row segment for each global worker index,
     /// node-major: a node's rows are split evenly across that node's workers.
-    fn worker_row_segments(&self, n: usize) -> Vec<(usize, usize)> {
+    ///
+    /// The **canonical** table, before any [`CHUNK_PERMUTATION_ENV`] relabeling.
+    /// Alignment is computed on this order (see
+    /// [`Self::worker_row_segments_aligned`]) so that permuting cannot change
+    /// which boundaries exist, only who receives them.
+    fn worker_row_segments_canonical(&self, n: usize) -> Vec<(usize, usize)> {
         let node_lengths = self.node_row_lengths(n);
         let mut segments = Vec::with_capacity(self.total_workers);
         let mut node_start = 0;
@@ -2487,6 +2657,41 @@ impl SpmdDecodePools {
         segments
     }
 
+    /// Relabel `segments` in place so lane `i` receives the chunk the configured
+    /// [`ChunkPermutation`] names, permuting **within each node group only**.
+    ///
+    /// Node-local by construction: the loop walks one node's worker range at a
+    /// time, so a row range never migrates to a different node and
+    /// [`Self::place_rows`] still first-touches it on its owner. Because the
+    /// permutation only reorders existing entries, the segment *set* -- and
+    /// therefore coverage of `0..n` and the numerics -- is unchanged.
+    fn permute_segments(&self, segments: &mut [(usize, usize)]) {
+        if self.chunk_permutation.is_identity() || segments.len() <= 1 {
+            return;
+        }
+        let mut base = 0;
+        for &count in &self.node_worker_counts {
+            let end = (base + count).min(segments.len());
+            if end > base + 1 {
+                let group = &segments[base..end];
+                let order = self.chunk_permutation.indices(end - base);
+                let relabeled: Vec<(usize, usize)> =
+                    order.iter().map(|&chunk| group[chunk]).collect();
+                segments[base..end].copy_from_slice(&relabeled);
+            }
+            base = end;
+        }
+    }
+
+    /// [`Self::worker_row_segments_canonical`] with the configured chunk
+    /// permutation applied. This is what dispatch and `place_rows` both read, so
+    /// a lane touches and computes the same rows.
+    fn worker_row_segments(&self, n: usize) -> Vec<(usize, usize)> {
+        let mut segments = self.worker_row_segments_canonical(n);
+        self.permute_segments(&mut segments);
+        segments
+    }
+
     /// [`Self::worker_row_segments`] with every interior boundary snapped to a
     /// multiple of `align`. The per-worker split is computed exactly as the
     /// unaligned version (so node-major ordering and weight placement still line
@@ -2499,8 +2704,10 @@ impl SpmdDecodePools {
     /// `align <= 1` is the identity (returns the unaligned segments): callers
     /// whose per-column arithmetic is partition-independent pass `1`.
     fn worker_row_segments_aligned(&self, n: usize, align: usize) -> Vec<(usize, usize)> {
-        let base = self.worker_row_segments(n);
+        let base = self.worker_row_segments_canonical(n);
         if align <= 1 {
+            let mut base = base;
+            self.permute_segments(&mut base);
             return base;
         }
         let mut segments = Vec::with_capacity(base.len());
@@ -2523,6 +2730,10 @@ impl SpmdDecodePools {
             segments.push((prev_boundary, boundary - prev_boundary));
             prev_boundary = boundary;
         }
+        // Applied *after* alignment, deliberately: permuting first would change
+        // which cumulative boundaries get rounded and so change the segment set
+        // rather than only its assignment.
+        self.permute_segments(&mut segments);
         segments
     }
 
@@ -3197,6 +3408,18 @@ impl DecodeWidth {
 /// chosen. A harness should run at least one decode step first and then assert;
 /// before that the fields read `None` / `"unresolved"` and
 /// [`DecodeWidth::is_as_requested`] is `false`.
+/// The lane->chunk permutation the **built pool** is using, if a pool exists.
+///
+/// `None` means no persistent pool was built, so there is no static assignment
+/// to permute and reporting one would be a claim about nothing. See
+/// [`CHUNK_PERMUTATION_ENV`] and [`SpmdDecodePools::chunk_permutation`].
+pub fn decode_chunk_permutation() -> Option<ChunkPermutation> {
+    match POOLS.get() {
+        Some(Some(pools)) => Some(pools.chunk_permutation()),
+        _ => None,
+    }
+}
+
 pub fn decode_width() -> DecodeWidth {
     let requested = REQUESTED_WIDTH.get().copied().flatten();
     let realized = match POOLS.get() {
@@ -4640,20 +4863,75 @@ mod tests {
             decode_schedule_from_raw(Some("fixed")),
             DecodeSchedule::Fixed
         );
-        let expected_steal = if cfg!(feature = "mlas") {
+        // The scheduling *policy* has no MLAS dependency -- the dynamic claim is
+        // an atomic cursor over the tile table dispatched on the native SPMD
+        // pool. Only the optional alternative executor is MLAS-provided, so
+        // `steal` must parse identically in a default build. Asserted
+        // unconditionally on purpose: a `cfg!(feature = "mlas")` expectation here
+        // is what let the selector go inert in production unnoticed.
+        assert_eq!(
+            decode_schedule_from_raw(Some("steal")),
             DecodeSchedule::Steal
-        } else {
-            DecodeSchedule::Fixed
-        };
-        assert_eq!(decode_schedule_from_raw(Some("steal")), expected_steal);
+        );
         assert_eq!(
             decode_schedule_from_raw(Some(" work-stealing ")),
-            expected_steal
+            DecodeSchedule::Steal
         );
         assert_eq!(
             decode_schedule_from_raw(Some("bogus")),
             DecodeSchedule::Fixed
         );
+    }
+
+    /// The dynamic claim must be reachable *and correct* in a default,
+    /// MLAS-free build. The other `work_stealing_*` tests construct
+    /// `DecodeSchedule::Steal` directly, which is precisely how the selector
+    /// came to be inert in production without any test noticing: the
+    /// implementation was covered, its reachability was not. This one starts
+    /// from the env string a user actually sets and asserts the whole chain --
+    /// parse, build, dispatch -- covers every output exactly once, with no gaps
+    /// from a cursor that overruns and no duplicates from two workers claiming
+    /// one tile.
+    #[test]
+    fn work_stealing_is_reachable_from_the_env_string_without_mlas() {
+        let schedule = decode_schedule_from_raw(Some("steal"));
+        assert_eq!(
+            schedule,
+            DecodeSchedule::Steal,
+            "the documented `steal` value must select the dynamic claim in a default build"
+        );
+        let pools = single_group_pool_with_schedule(4, schedule);
+        assert!(pools.uses_work_stealing());
+
+        let n = 8192;
+        let k = 4096;
+        // Control: a serial fallback would satisfy the coverage assertions below
+        // without ever exercising the claim loop, so refuse to pass vacuously.
+        assert!(
+            pools.total_workers > 1 && output_chunk_len_for(pools.total_workers, n, k) < n,
+            "test must reach the fan-out, not the serial threshold"
+        );
+
+        let mut result = vec![0.0f32; n];
+        let claims: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let claims = &claims;
+        pools.dispatch_output_rows(&mut result, k, &|start, outputs| {
+            for (offset, slot) in outputs.iter_mut().enumerate() {
+                let index = start + offset;
+                claims[index].fetch_add(1, Ordering::Relaxed);
+                *slot = index as f32;
+            }
+        });
+        pools.shutdown();
+
+        for index in 0..n {
+            let claimed = claims[index].load(Ordering::Relaxed);
+            assert_eq!(claimed, 1, "output {index} was claimed {claimed} times");
+            assert_eq!(
+                result[index], index as f32,
+                "output {index} holds a stale value"
+            );
+        }
     }
 
     #[test]
@@ -5028,14 +5306,26 @@ mod tests {
     /// single-CPU probe reports "pinning works" and the test then fails on the
     /// sandbox's virtual topology instead of on the pool.
     fn environment_can_pin(cpus: &[usize]) -> bool {
-        !cpus.is_empty()
+        let can = !cpus.is_empty()
             && cpus.iter().all(|&cpu| {
                 std::thread::spawn(move || {
                     crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
                 })
                 .join()
                 .unwrap_or(false)
-            })
+            });
+        // Every caller treats `false` as a skip, so on a lane that declared
+        // placement checks mandatory this one helper is the switch that turns
+        // seven of them off at once. Refusing to pin is a real property of a
+        // sandbox and a legitimate skip elsewhere; it is not a pass.
+        assert!(
+            can || !crate::core_topology::placement_tests_required(),
+            "{}=1 but this environment refuses to pin a thread to {cpus:?}, which turns every \
+             observed-placement check in this crate into a no-op that still reports success. \
+             Either the lane must not require placement tests or the confinement must be lifted.",
+            crate::core_topology::REQUIRE_PLACEMENT_ENV
+        );
+        can
     }
 
     /// Selects child mode for [`ready_leak_child`].
@@ -5812,8 +6102,12 @@ mod tests {
         };
         // A single-core budget cannot express "one worker per core" as a
         // distinguishable claim. That is a host fact and a legitimate skip;
-        // an unanswerable topology is not, and panics above.
-        if cores.core_count() < 2 {
+        // an unanswerable topology is not, and panics above. Stated rather than
+        // silent, and fatal in a lane that requires these checks.
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "the_planner_lays_out_one_worker_per_physical_core",
+        ) {
             return;
         }
         // Two full physical cores' worth of CPUs, spread the way the placement
@@ -5908,7 +6202,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pinned_pool_is_observed_one_worker_per_physical_core",
+        ) {
             return; // one core cannot express "one per core" distinguishably
         }
         // Stated, not implied. Today no target can pin without also being able
@@ -6118,7 +6415,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_pin_that_reports_success_without_the_syscall_fails_the_realized_check",
+        ) {
             return;
         }
         let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
@@ -6633,7 +6933,10 @@ mod tests {
                 return;
             }
         };
-        if cores.core_count() < 2 {
+        if !crate::core_topology::require_two_cores_for_placement(
+            cores,
+            "a_partially_pinned_pool_is_not_scored_on_its_pinned_half",
+        ) {
             return;
         }
         let spread = crate::decode_affinity::order_pin_targets(
@@ -6892,6 +7195,373 @@ mod tests {
                 assert_eq!(expected_start, n, "n={n} align={align}: must cover 0..n");
             }
         }
+    }
+
+    /// Set by the parent of [`chunk_permutation_child`] to the value under test.
+    const CHUNK_PERM_CHILD_ENV: &str = "ONNX_GENAI_TEST_CHUNK_PERMUTATION_CHILD";
+
+    /// Child half of [`the_chunk_permutation_env_string_reaches_dispatch`].
+    ///
+    /// Builds a real pool in a process where `CHUNK_PERMUTATION_ENV` is set,
+    /// dispatches real work through it, and reports the lane->chunk map it
+    /// actually used together with a coverage verdict computed from the dispatch
+    /// itself rather than from the table.
+    #[test]
+    #[ignore = "spawned by the chunk-permutation reachability test"]
+    fn chunk_permutation_child() {
+        if std::env::var(CHUNK_PERM_CHILD_ENV).is_err() {
+            return;
+        }
+        let workers = 8;
+        let pools = single_group_pool_with_schedule(workers, DecodeSchedule::Fixed);
+        let n = 4096;
+        let k = 512;
+
+        let label = pools.chunk_permutation().label();
+        let map = pools.worker_row_segments(n);
+        let claims: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+        let claims = &claims;
+        let mut result = vec![0.0f32; n];
+        pools.dispatch_output_rows(&mut result, k, &|start, outputs| {
+            for (offset, slot) in outputs.iter_mut().enumerate() {
+                let index = start + offset;
+                claims[index].fetch_add(1, Ordering::Relaxed);
+                // Row value depends only on the row, exactly as a real decode
+                // output row does: it is computed wholly by whichever lane owns
+                // it, so a permutation cannot perturb it.
+                *slot = (index % 1024) as f32 * 0.5;
+            }
+        });
+        pools.shutdown();
+
+        let covered_once = (0..n).all(|index| claims[index].load(Ordering::Relaxed) == 1);
+        let values_ok = (0..n).all(|index| result[index] == (index % 1024) as f32 * 0.5);
+        let checksum: f64 = result.iter().map(|&value| f64::from(value)).sum();
+        let rendered: Vec<String> = map
+            .iter()
+            .map(|&(start, len)| format!("{start}:{len}"))
+            .collect();
+        println!(
+            "CHUNK_PERM_REPORT map={} covered_once={} values_ok={} checksum={checksum:.6} \
+             label={label}",
+            rendered.join(","),
+            usize::from(covered_once),
+            usize::from(values_ok),
+        );
+    }
+
+    fn chunk_permutation_child_report(value: Option<&str>) -> (String, f64, String) {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--exact")
+            .arg("decode_spmd::tests::chunk_permutation_child")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .arg("--ignored")
+            .env(CHUNK_PERM_CHILD_ENV, "1")
+            .env(PERSISTENT_POOL_ENV, "1")
+            .env_remove(DECODE_SCHEDULE_ENV)
+            .env_remove(crate::decode_affinity::DECODE_AFFINITY_ENV);
+        match value {
+            Some(value) => cmd.env(CHUNK_PERMUTATION_ENV, value),
+            // The unset case must be genuinely unset, or the default would be
+            // tested against itself spelled differently.
+            None => cmd.env_remove(CHUNK_PERMUTATION_ENV),
+        };
+        let output = cmd.output().expect("run chunk-permutation child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "chunk-permutation child failed for {value:?}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report = stdout
+            .lines()
+            .find_map(|line| line.split_once("CHUNK_PERM_REPORT ").map(|(_, rest)| rest))
+            .unwrap_or_else(|| panic!("child emitted no report for {value:?}:\n{stdout}"));
+        let field = |key: &str| -> &str {
+            let needle = format!("{key}=");
+            report
+                .split_whitespace()
+                .find_map(|pair| pair.strip_prefix(&needle))
+                .unwrap_or_else(|| panic!("report is missing `{key}`: {report}"))
+        };
+        assert_eq!(
+            field("covered_once"),
+            "1",
+            "{value:?}: dispatch did not cover every output row exactly once"
+        );
+        assert_eq!(
+            field("values_ok"),
+            "1",
+            "{value:?}: dispatch produced wrong row values"
+        );
+        (
+            field("map").to_string(),
+            field("checksum").parse().expect("checksum"),
+            field("label").to_string(),
+        )
+    }
+
+    /// The env string must reach dispatch, and must change what dispatch does.
+    ///
+    /// This is the assertion that #2014 taught: the `steal` schedule was covered
+    /// by tests that constructed `DecodeSchedule::Steal` directly, so the
+    /// implementation was verified while its *reachability* was not, and the
+    /// knob was inert in every shipped build for as long as it existed. A knob
+    /// is not verified until an observable changes when you turn it. So this
+    /// starts from the documented string, not from a `ChunkPermutation` value.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
+    fn the_chunk_permutation_env_string_reaches_dispatch() {
+        let (default_map, default_sum, default_label) = chunk_permutation_child_report(None);
+        let (identity_map, identity_sum, identity_label) =
+            chunk_permutation_child_report(Some("identity"));
+        let (rotated_map, rotated_sum, rotated_label) =
+            chunk_permutation_child_report(Some("rotate:3"));
+        let (seeded_map, seeded_sum, seeded_label) = chunk_permutation_child_report(Some("seed:7"));
+
+        // The label the pool reports about itself is the observable a benchmark
+        // harness reads, so it has to agree with what was asked for -- otherwise
+        // an arm that silently ran the default would look like a valid arm.
+        assert_eq!(default_label, "identity", "unset must report `identity`");
+        assert_eq!(identity_label, "identity");
+        assert_eq!(
+            rotated_label, "rotate:3",
+            "the pool must report the rotation it built with"
+        );
+        assert_eq!(seeded_label, "seed:7");
+
+        // Default is the identity, and `identity` spells the default.
+        assert_eq!(
+            default_map, identity_map,
+            "unset must behave exactly as `identity`"
+        );
+
+        // The observable changed when the knob was turned: without this the test
+        // would pass against a build where the env read was dead code.
+        assert_ne!(
+            identity_map, rotated_map,
+            "`rotate:3` did not change the lane->chunk map, so the env string \
+             never reached dispatch"
+        );
+        assert_ne!(
+            identity_map, seeded_map,
+            "`seed:7` did not change the lane->chunk map"
+        );
+
+        // ...and it changed only the assignment: same segments, same numerics.
+        let sorted = |map: &str| {
+            let mut parts: Vec<&str> = map.split(',').collect();
+            parts.sort_unstable();
+            parts.join(",")
+        };
+        assert_eq!(
+            sorted(&identity_map),
+            sorted(&rotated_map),
+            "`rotate:3` changed the segment set, not just its assignment"
+        );
+        assert_eq!(
+            sorted(&identity_map),
+            sorted(&seeded_map),
+            "`seed:7` changed the segment set, not just its assignment"
+        );
+        for (label, sum) in [
+            ("default", default_sum),
+            ("rotate:3", rotated_sum),
+            ("seed:7", seeded_sum),
+        ] {
+            assert_eq!(
+                sum, identity_sum,
+                "{label}: permuting the lane->chunk map changed the result"
+            );
+        }
+    }
+
+    /// The parser, exhaustively, without `set_var`.
+    #[test]
+    fn chunk_permutation_parses_env_values() {
+        use ChunkPermutation::{Identity, Rotate, Seed};
+        let cases: &[(Option<&str>, ChunkPermutation)] = &[
+            (None, Identity),
+            (Some(""), Identity),
+            (Some("   "), Identity),
+            (Some("off"), Identity),
+            (Some("OFF"), Identity),
+            (Some("identity"), Identity),
+            (Some("rotate:0"), Rotate(0)),
+            (Some("rotate:3"), Rotate(3)),
+            (Some(" rotate:3 "), Rotate(3)),
+            (Some("seed:0"), Seed(0)),
+            (Some("seed:42"), Seed(42)),
+            // A typo must not change numerics, so it falls back to the default.
+            (Some("rotate:"), Identity),
+            (Some("rotate:-1"), Identity),
+            (Some("seed:x"), Identity),
+            (Some("nonsense"), Identity),
+        ];
+        for &(raw, want) in cases {
+            assert_eq!(
+                chunk_permutation_from_raw(raw),
+                want,
+                "chunk permutation for {raw:?}"
+            );
+        }
+    }
+
+    /// The reported label must round-trip back to the same permutation.
+    ///
+    /// The benchmark width line prints this label, and a harness that records an
+    /// arm by its label must be able to reproduce that arm from the record. A
+    /// label that did not parse back would make every published row unrepeatable.
+    #[test]
+    fn chunk_permutation_label_round_trips() {
+        for mode in [
+            ChunkPermutation::Identity,
+            ChunkPermutation::Rotate(0),
+            ChunkPermutation::Rotate(4),
+            ChunkPermutation::Seed(0),
+            ChunkPermutation::Seed(7),
+        ] {
+            let label = mode.label();
+            assert_eq!(
+                chunk_permutation_from_raw(Some(&label)),
+                mode,
+                "label {label:?} did not round-trip"
+            );
+        }
+    }
+
+    /// Every mode must produce a genuine permutation of `0..count`.
+    ///
+    /// This is the property the whole instrument rests on: coverage of the
+    /// output rows stays exact only because nothing is dropped or duplicated
+    /// here. A shuffle with an off-by-one would silently compute some rows twice
+    /// and others never.
+    #[test]
+    fn chunk_permutation_is_always_a_permutation() {
+        let modes = [
+            ChunkPermutation::Identity,
+            ChunkPermutation::Rotate(1),
+            ChunkPermutation::Rotate(7),
+            ChunkPermutation::Rotate(64),
+            ChunkPermutation::Seed(0),
+            ChunkPermutation::Seed(1),
+            ChunkPermutation::Seed(9_999),
+        ];
+        for mode in modes {
+            for count in 0..=33 {
+                let order = mode.indices(count);
+                assert_eq!(order.len(), count, "{mode:?} count={count}: wrong length");
+                let mut sorted = order.clone();
+                sorted.sort_unstable();
+                let expected: Vec<usize> = (0..count).collect();
+                assert_eq!(
+                    sorted, expected,
+                    "{mode:?} count={count}: not a permutation ({order:?})"
+                );
+                if count <= 1 {
+                    assert_eq!(order, expected, "{mode:?} must be identity for count<=1");
+                }
+            }
+        }
+        // Determinism: the same seed must give the same permutation, or a
+        // reported `seed:<n>` is not reproducible evidence.
+        assert_eq!(
+            ChunkPermutation::Seed(42).indices(16),
+            ChunkPermutation::Seed(42).indices(16)
+        );
+        assert_ne!(
+            ChunkPermutation::Seed(42).indices(16),
+            ChunkPermutation::Seed(43).indices(16),
+            "different seeds must give different permutations at this width"
+        );
+    }
+
+    /// Permuting relabels the table without changing the segment *set*, and
+    /// never moves a row range across a node boundary.
+    #[test]
+    fn chunk_permutation_preserves_the_segment_set_and_stays_node_local() {
+        let mut pool = two_group_pool();
+        let canonical: Vec<Vec<(usize, usize)>> = [0usize, 1, 37, 100, 101, 4096]
+            .iter()
+            .map(|&n| pool.worker_row_segments_canonical(n))
+            .collect();
+
+        for mode in [
+            ChunkPermutation::Rotate(1),
+            ChunkPermutation::Rotate(3),
+            ChunkPermutation::Seed(7),
+        ] {
+            pool.chunk_permutation = mode;
+            for (index, &n) in [0usize, 1, 37, 100, 101, 4096].iter().enumerate() {
+                let base = &canonical[index];
+                let permuted = pool.worker_row_segments(n);
+                assert_eq!(permuted.len(), base.len(), "{mode:?} n={n}: length changed");
+
+                // Same multiset of segments: only the assignment moved.
+                let mut want = base.clone();
+                let mut got = permuted.clone();
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(got, want, "{mode:?} n={n}: the segment set changed");
+
+                // Coverage of 0..n is still exact.
+                let mut covered = vec![0u8; n];
+                for &(start, len) in &permuted {
+                    for slot in covered.iter_mut().skip(start).take(len) {
+                        *slot += 1;
+                    }
+                }
+                assert!(
+                    covered.iter().all(|&hits| hits == 1),
+                    "{mode:?} n={n}: rows not covered exactly once"
+                );
+
+                // Node-local: each node group's lanes hold exactly that node's
+                // canonical segments, so `place_rows` first-touches on the same
+                // node it would have without the knob.
+                let mut lane = 0;
+                for &count in &pool.node_worker_counts {
+                    let end = lane + count;
+                    let mut want_group = base[lane..end].to_vec();
+                    let mut got_group = permuted[lane..end].to_vec();
+                    want_group.sort_unstable();
+                    got_group.sort_unstable();
+                    assert_eq!(
+                        got_group, want_group,
+                        "{mode:?} n={n}: a segment crossed a node boundary"
+                    );
+                    lane = end;
+                }
+            }
+        }
+        pool.shutdown();
+    }
+
+    /// Alignment must be computed on the canonical order, so that turning the
+    /// knob on cannot change *which* boundaries exist -- only who gets them.
+    #[test]
+    fn chunk_permutation_does_not_move_aligned_boundaries() {
+        let mut pool = two_group_pool();
+        let align = 16;
+        let baseline: Vec<Vec<(usize, usize)>> = [64usize, 100, 4096, 4099]
+            .iter()
+            .map(|&n| pool.worker_row_segments_aligned(n, align))
+            .collect();
+        for mode in [ChunkPermutation::Rotate(3), ChunkPermutation::Seed(11)] {
+            pool.chunk_permutation = mode;
+            for (index, &n) in [64usize, 100, 4096, 4099].iter().enumerate() {
+                let mut want = baseline[index].clone();
+                let mut got = pool.worker_row_segments_aligned(n, align);
+                want.sort_unstable();
+                got.sort_unstable();
+                assert_eq!(
+                    got, want,
+                    "{mode:?} n={n}: permuting changed the aligned segment set"
+                );
+            }
+        }
+        pool.shutdown();
     }
 
     #[test]
@@ -8851,6 +9521,20 @@ mod dispatch_claim_tests {
     /// to discriminate at all. A deadline that has already expired when the
     /// yield phase starts exits on yield 1 in both worlds.
     #[test]
+    // Miri makes this test's premise false rather than its assertion wrong,
+    // exactly as it does for the `task_runtime::pool` sibling this one is
+    // modelled on. The test needs the spin phase short against the deadline --
+    // 4096 `spin_loop`s measure 130us natively against `BLOCKTIME` of 200ms --
+    // but under the interpreter those iterations outlast the deadline, so the
+    // yield phase is entered already expired and the strided and every-yield
+    // forms both exit on yield 1. Verified, not assumed: run under the lane's
+    // own flags it fails on its own non-vacuity assertion, "left the yield
+    // phase after 1 yield(s) ... it is not a pass". It is green today only
+    // because `miri.yml` selects `decode_spmd::tests::a_panic_in_the_dispatcher`
+    // and not `decode_spmd::dispatch_claim_tests::`, i.e. it escapes by filter
+    // rather than by design -- so widening that filter would red the lane with
+    // a message that reads like a defect in the code under test.
+    #[cfg_attr(miri, ignore = "spin-vs-deadline ratio is wall-clock, not emulated")]
     fn the_blocktime_deadline_is_evaluated_on_every_yield_not_on_a_stride() {
         /// Cost of one injected yield: the contended regime, where a yield
         /// costs microseconds to milliseconds rather than ~1.2us.

@@ -74,3 +74,84 @@ jobs:
           echo "::error::the 'bulk-delete-approved' label to record that decision, and say in the PR"
           echo "::error::description what is being removed and why."
           exit 1
+
+  # A stray file at the repository root is the other change review reliably misses:
+  # not too large to read, but a single added line in a diff of hundreds, and the
+  # root is exactly where `git add -A` in a working tree picks up scratch. Four have
+  # reached `main` this way -- .commitmsg/ (490b846c3), .commitmsg (#1881, removed by
+  # #1999), .pris_v4.log (#1951, removed by #1975) and .body.md (#2026). Each repair
+  # added one more pattern to .gitignore, and each time the next file was named
+  # outside every pattern written for the previous one; .body.md landed hours after
+  # two such fixes. Enumerating what belongs is the only form of this check that does
+  # not have to predict the next filename.
+  root-files:
+    name: Root file allowlist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail on root-level files that are not on the allowlist
+        run: |
+          set -euo pipefail
+
+          allow=.github/root-file-allowlist.txt
+          if [ ! -f "$allow" ]; then
+            echo "::error::$allow is missing. This check cannot run without it, and a"
+            echo "::error::pass without it would be vacuous, so it fails instead."
+            exit 1
+          fi
+
+          # Tracked files at the repository root: no directory separator in the path.
+          #
+          # core.quotePath=false because git's default renders a non-ASCII name in an
+          # octal-escaped, quoted form ("caf\303\251.txt"). Under the default a
+          # contributor who adds the real name to the allowlist -- the documented way
+          # to add a root file -- is told both that their file is unlisted and that
+          # their entry is stale. The escape hatch has to work for the names people
+          # actually use, not just for ASCII.
+          actual=$(git -c core.quotePath=false ls-files | { grep -v '/' || true; } | LC_ALL=C sort)
+
+          # Strip CR (a CRLF checkout would otherwise mismatch every entry), then
+          # surrounding whitespace, then comments and blanks. Trailing whitespace on
+          # an entry is invisible in review and would silently never match.
+          allowed=$(sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$allow" \
+                    | { grep -vE '^(#|$)' || true; } | LC_ALL=C sort)
+
+          # Explicit, rather than letting `set -e` abort on the empty grep above: an
+          # empty list cannot express "the root is correct", and failing silently
+          # gives a red X with no diagnostic. It must also never reach `comm`, where
+          # two empty inputs would compare equal and pass vacuously.
+          if [ -z "$allowed" ]; then
+            echo "::error::$allow has no entries. Every root file would be reported as"
+            echo "::error::unlisted, and an empty list cannot express 'the root is"
+            echo "::error::correct', so this fails rather than guessing which was meant."
+            exit 1
+          fi
+
+          unlisted=$(LC_ALL=C comm -23 <(printf '%s\n' "$actual") <(printf '%s\n' "$allowed"))
+          stale=$(LC_ALL=C comm -13 <(printf '%s\n' "$actual") <(printf '%s\n' "$allowed"))
+
+          rc=0
+
+          if [ -n "$unlisted" ]; then
+            rc=1
+            echo "::error::Root-level file(s) not on the allowlist:"
+            printf '%s\n' "$unlisted" | while IFS= read -r f; do echo "::error::  $f"; done
+            echo "::error::If this is scratch: 'git rm --cached' it and add it to .gitignore."
+            echo "::error::If it belongs at the root: add it to $allow in this PR."
+          fi
+
+          if [ -n "$stale" ]; then
+            rc=1
+            echo "::error::Allowlist entr(ies) for files not present at the root:"
+            printf '%s\n' "$stale" | while IFS= read -r f; do echo "::error::  $f"; done
+            echo "::error::Remove them from $allow. A stale entry pre-approves that exact"
+            echo "::error::filename, so an allowlist that outlives what it describes is not a"
+            echo "::error::record of decisions but a rubber stamp."
+          fi
+
+          if [ "$rc" -eq 0 ]; then
+            n=$(printf '%s\n' "$allowed" | { grep -c . || true; })
+            echo "Root is exactly the $n allowlisted file(s)."
+          fi
+          exit "$rc"

@@ -167,21 +167,40 @@
 #   begins after the opening sample and ends before the closing one. His A/A
 #   null was 52% -- the same binary against itself, disagreeing by half.
 #
-# --min-efficiency measures the thing itself rather than a proxy for it: a
-# process that owns its cores spends ~1.00 CPU-seconds per core per wall
-# second, and anything less means it did not have them, whatever the runnable
-# count said at either end. It needs no quiet host; it tells you which reps to
-# throw away.
+# --min-efficiency measures something closer to the thing itself than the
+# runnable count is: a process that owns its cores spends ~1.00 CPU-seconds
+# per core per wall second, and anything less means it did not have them,
+# whatever the runnable count said at either end. It integrates the whole
+# interval instead of sampling its ends, and it took that same collection from
+# a 52% A/A null to 0.04-0.56%.
+#
+# It is still SUPPLEMENTARY, and it does not license running unlocked. What it
+# measures is how much of the wall clock the process spent SCHEDULED, which is
+# not how much work it got done, and there are two ordinary ways to lose the
+# second without losing the first:
+#
+#   An SMT sibling never deschedules you. A competitor on the other hyperthread
+#   shares the front end and the execution ports, so you keep running,
+#   efficiency sits at ~1.00, and throughput falls anyway.
+#
+#   Neither does a neighbour off-core. Memory bandwidth, LLC occupancy and
+#   turbo headroom are shared box-wide; a process saturating DRAM elsewhere
+#   slows you without ever touching your runqueue.
+#
+# The A/A null has the mirror-image blind spot: it is a VARIANCE measurement,
+# so contention that is steady across both arms depresses both equally, the
+# null comes out small, and the published ratio is a ratio of two equally
+# contaminated numbers. Neither instrument can establish exclusivity, because
+# exclusivity is a declaration, not a measurement -- which is what the lock is
+# and why it is the one that is mandatory.
 #
 # It measures "did not have the cores", which is NOT the same claim as
 # "somebody stole them": a benchmark that sleeps, blocks on I/O, or leaves a
 # deliberate inter-token gap is legitimately below 1.0 and is not contended.
 # Only you know which your workload is, which is why the threshold is yours to
 # set and why there is no default. Set it from a measured quiet-host run, not
-# from an ideal. With it, that same collection went from a 52%
-# null to 0.04-0.56%. The two compose -- the gate decides whether to start,
-# this decides whether to believe -- and the credit for the technique is
-# Roy's.
+# from an ideal. The two compose -- the gate decides whether to start, this
+# decides whether to disbelieve -- and the credit for the technique is Roy's.
 #
 #   hostlock.sh run --owner leon --reason "moe 6-width matrix" \
 #       --expect-cores 16 --min-efficiency 0.90 -- ./bench.sh
