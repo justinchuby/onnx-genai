@@ -4923,6 +4923,21 @@ pub(crate) fn decode_pool_active() -> bool {
 static SPMD_TEST_DISPATCHES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Which backend served the last flat fan-out issued *on this thread*.
+    ///
+    /// `None` until one is issued, and `None` again for a call that never
+    /// reached [`crate::task_runtime::for_each_range`] at all -- a NUMA or SPMD
+    /// dispatch, a partition that declined to split, or a route to the wide
+    /// Rayon pool. Thread-local rather than global because the point of it is
+    /// attribution: [`crate::task_runtime::testing::counters`] is process-wide
+    /// on purpose, so a test reading a delta across its own call cannot tell
+    /// its dispatch from a concurrent test's.
+    static FLAT_FAN_OUT_TEST_BACKEND: Cell<Option<crate::task_runtime::Backend>> =
+        const { Cell::new(None) };
+}
+
 /// Fan a projection's output rows out across the decode workers.
 ///
 /// With `numa-split` active, the rows are sharded across the per-node sub-pools
@@ -4999,7 +5014,7 @@ where
     // partition can only get coarser, never finer, than the one Rayon used.
     let total = result.len();
     let base = result.as_mut_ptr() as usize;
-    crate::task_runtime::for_each_range(total, chunk, |start, end| {
+    let _backend = crate::task_runtime::for_each_range(total, chunk, |start, end| {
         // SAFETY: `for_each_range` covers `0..total` with disjoint half-open
         // ranges and blocks until every one has been run exactly once, so this
         // task is the only holder of `result[start..end]`. A raw pointer is
@@ -5008,6 +5023,12 @@ where
             unsafe { std::slice::from_raw_parts_mut((base as *mut f32).add(start), end - start) };
         compute(start, outputs);
     });
+    // Which executor served *this* call, for the thread that made it. The
+    // pool's counters are process-global by design, so they cannot tell a test
+    // its own dispatch from a concurrent one; `Backend` is returned precisely
+    // so scheduling can be asserted without that ambiguity.
+    #[cfg(test)]
+    FLAT_FAN_OUT_TEST_BACKEND.with(|cell| cell.set(Some(_backend)));
 }
 
 /// Fan `num_rows` fixed-width output rows (each `row_len` elements of `result`)
@@ -23580,38 +23601,45 @@ mod tests {
     /// oversubscription is what makes a dispatcher hold its slot long enough
     /// for the rest of the suite to take the other seven.
     ///
-    /// Retrying is sound because that decline is transient by construction: a
-    /// slot is released as soon as its dispatcher returns. A missing dispatch
-    /// the slot counter does *not* account for is a routing failure and is
-    /// reported as one, so the tolerance is narrow rather than a blanket retry.
-    /// Like every assertion on these counters it stays directional -- they are
-    /// process-global on purpose -- and this does not change that.
+    /// The verdict comes from [`FLAT_FAN_OUT_TEST_BACKEND`], not from the pool
+    /// counters. Counters cannot answer this: they are process-global on
+    /// purpose, so a concurrent test's dispatch can satisfy a delta the caller
+    /// never earned, and a concurrent test's slot exhaustion can excuse a
+    /// decline the caller never suffered. `Backend` is per call and per thread,
+    /// so `Native` means *this* fan-out reached the pool and `None` means it
+    /// never got as far as the runtime -- a routing failure, reported as one
+    /// rather than retried.
     ///
-    /// The bound is wall-clock rather than a retry count because the thing
-    /// being waited out is a descheduled dispatcher: under the oversubscription
-    /// that produces the decline at all, one scheduler quantum is milliseconds,
-    /// while a few dozen declined fan-outs and yields are microseconds. A count
-    /// alone would expire before the condition it is meant to outlast.
+    /// Retrying `Serial` is sound because that decline is transient by
+    /// construction: a slot is released as soon as its dispatcher returns. The
+    /// bound is wall-clock rather than a retry count because the thing being
+    /// waited out is a descheduled dispatcher: under the oversubscription that
+    /// produces the decline at all, one scheduler quantum is milliseconds,
+    /// while a few dozen declined fan-outs are microseconds. A count alone
+    /// would expire before the condition it is meant to outlast.
     fn fan_out_until_dispatched(what: &str, mut fan_out: impl FnMut()) {
+        use crate::task_runtime::Backend;
         const PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
         let first = crate::task_runtime::testing::counters();
         let deadline = std::time::Instant::now() + PATIENCE;
         let mut attempts = 0u64;
         loop {
-            let before = crate::task_runtime::testing::counters();
+            FLAT_FAN_OUT_TEST_BACKEND.with(|cell| cell.set(None));
             fan_out();
-            let after = crate::task_runtime::testing::counters();
             attempts += 1;
-            if after.dispatches > before.dispatches {
-                return;
+            match FLAT_FAN_OUT_TEST_BACKEND.with(Cell::get) {
+                Some(Backend::Native) => return,
+                Some(Backend::Serial) => {}
+                Some(Backend::Host) => panic!(
+                    "{what} was served by the host pool; this path must not \
+                     borrow ORT's threads"
+                ),
+                None => panic!(
+                    "{what} never reached the task runtime: it took the wide \
+                     Rayon path, a decode pool, or a partition that declined \
+                     to split"
+                ),
             }
-            assert!(
-                after.slot_exhausted > before.slot_exhausted,
-                "{what} published no dispatch and the pool declined none for \
-                 want of a slot, so it never reached the task runtime (pool \
-                 width {})",
-                crate::task_runtime::testing::pool_width()
-            );
             if std::time::Instant::now() >= deadline {
                 break;
             }
@@ -23621,7 +23649,7 @@ mod tests {
         panic!(
             "{what}: the task runtime declined {attempts} consecutive fan-outs \
              over {PATIENCE:?} for want of a free slot (pool width {}, \
-             slot_exhausted +{})",
+             process-wide slot_exhausted +{})",
             crate::task_runtime::testing::pool_width(),
             last.slot_exhausted - first.slot_exhausted
         );
