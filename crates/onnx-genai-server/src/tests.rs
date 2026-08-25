@@ -5392,38 +5392,74 @@ async fn a_cancelled_client_does_not_leak_its_session_lease() {
     let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
     assert_eq!(status, StatusCode::OK, "{first}");
 
-    let start = Arc::new(tokio::sync::Barrier::new(2));
-    let abandoned = tokio::spawn({
-        let router = router.clone();
-        let start = start.clone();
-        async move {
-            start.wait().await;
-            chat_turn(router, Some(session), "hello world").await
-        }
-    });
-    start.wait().await;
-    abandoned.abort();
-    assert!(
-        abandoned.await.unwrap_err().is_cancelled(),
-        "the client went away mid-turn"
-    );
-
-    // The turn it abandoned may still be running on the worker. What must be
-    // true is that it ends, and that ending gives the lease back — so the next
-    // turn is admitted rather than refused forever.
+    // The abort has to land while the lease is held, which is the window the
+    // guard exists to survive. Hitting that window from outside is racy — a turn
+    // this small can finish before `abort` is delivered — so wait for the lease
+    // to appear before aborting and retry when the turn wins anyway. Retrying is
+    // what makes the test deterministic without making it a timing assertion:
+    // the invariant below is checked on every attempt, and the loop only exists
+    // to guarantee at least one attempt was a real mid-turn cancellation.
+    let mut cancelled_mid_turn = false;
     let mut admitted = None;
-    for _ in 0..200 {
-        let (status, body) = chat_turn(router.clone(), Some(session), "hello world").await;
-        match status {
-            StatusCode::OK => {
-                admitted = Some(body);
+    for attempt in 0..32 {
+        let abandoned = tokio::spawn({
+            let router = router.clone();
+            async move { chat_turn(router, Some(session), "hello world").await }
+        });
+
+        for _ in 0..1_000 {
+            if leases_held(&state) == 1 {
                 break;
             }
-            StatusCode::CONFLICT => tokio::time::sleep(Duration::from_millis(25)).await,
-            other => panic!("unexpected {other}: {body}"),
+            tokio::task::yield_now().await;
+        }
+        abandoned.abort();
+
+        match abandoned.await {
+            Err(joined) if joined.is_cancelled() => cancelled_mid_turn = true,
+            Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+            // The turn beat the abort. Not the case under test, but the lease
+            // still has to have come back, so fall through and check it.
+            Ok((status, body)) => {
+                assert_eq!(status, StatusCode::OK, "attempt {attempt}: {body}");
+            }
+        }
+
+        // The turn that was abandoned may still be running on the worker. What
+        // must be true is that it ends, and that ending gives the lease back —
+        // so the next turn is admitted rather than refused forever.
+        let mut next = None;
+        for _ in 0..200 {
+            let (status, body) = chat_turn(router.clone(), Some(session), "hello world").await;
+            match status {
+                StatusCode::OK => {
+                    next = Some(body);
+                    break;
+                }
+                StatusCode::CONFLICT => tokio::time::sleep(Duration::from_millis(25)).await,
+                other => panic!("attempt {attempt}: unexpected {other}: {body}"),
+            }
+        }
+        let next = next.unwrap_or_else(|| {
+            panic!("attempt {attempt}: the abandoned turn never released its lease")
+        });
+        assert_eq!(
+            leases_held(&state),
+            0,
+            "attempt {attempt} left a lease behind",
+        );
+        admitted = Some(next);
+
+        if cancelled_mid_turn {
+            break;
         }
     }
-    let admitted = admitted.expect("the abandoned turn released its lease");
+
+    assert!(
+        cancelled_mid_turn,
+        "no attempt managed to abort a turn while its lease was held",
+    );
+    let admitted = admitted.expect("at least one attempt ran");
     assert!(session_tokens(&admitted) > 0, "{admitted}");
     assert_eq!(leases_held(&state), 0, "nothing is left leased");
     assert!(
