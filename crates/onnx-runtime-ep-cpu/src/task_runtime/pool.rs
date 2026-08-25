@@ -108,6 +108,59 @@ const CLOCK_CHECK_STRIDE: u32 = 1 << 6;
 /// Dispatcher spins between `yield_now` calls while waiting for stragglers.
 const DISPATCHER_YIELD_STRIDE: u32 = 1 << 12;
 
+/// Shortest interval between two `sched_yield`s by one worker in the spin
+/// loop's yield phase.
+///
+/// The phase yielded on *every* iteration, at no bounded rate: how often a
+/// worker entered the kernel was set by how fast the loop went round, which is
+/// not a policy anybody chose. #2075 measured the traffic that produces --
+/// regressing kernel time on the yield counter across nine arms spanning a 94x
+/// range of yield counts attributes 1.05 us of sys time to each yield,
+/// recovering the cost of an uncontended `sched_yield` from the fit rather than
+/// assuming it, and that term alone explains 77-101% of all kernel time in
+/// every arm measured above the clock's granularity.
+///
+/// **This does not reduce CPU, and must not be described as though it does.**
+/// A yield costs ~1.05 us of kernel time and advances the wall clock ~1.05 us;
+/// a `spin_loop` advances it ~0.3 ns at ~0.3 ns of user time. Per unit of
+/// *waiting* both hold the core at ~100%, so this moves CPU from the sys column
+/// to the user column. Measured, order-cancelled, against a same-binary null:
+/// sys share falls from 20-31% to 3.6-5.9% while cpu-per-wall-second moves
+/// -0.02% to -0.85%, all of which is smaller than the null's own -0.71%. What
+/// it does buy is a *bounded* rate in place of an unbounded one, and 5-12x less
+/// syscall traffic imposed on the host's run queues.
+///
+/// The yield is not waste either, so this rate-limits rather than removes it:
+/// it is how a worker hands its core to a runnable sibling. Two properties keep
+/// that intact:
+///
+/// - The phase's first pass yields, because the deadline for the next one
+///   starts at zero. The one exception is a window that has *already* elapsed
+///   by the time the phase is reached, where the loop breaks out and the worker
+///   parks -- which releases the core outright rather than merely offering it,
+///   so the guarantee that matters holds either way: a core is never held
+///   longer before being given up than it is today. The deadline deliberately
+///   wins over the yield here; yielding on the way out of an expired window
+///   would spend a syscall to leave late, which is both what this change exists
+///   to stop and what #1825 exists to stop.
+/// - Under contention the limit self-disables. A yield that costs microseconds
+///   to milliseconds overshoots this interval by itself, so the next iteration
+///   yields again immediately. It throttles exactly the case it should: the
+///   uncontended yield that returns straight to the caller having moved no
+///   work.
+///
+/// Both were checked against the case they exist for rather than argued: a
+/// CPU-bound co-tenant running beside the pool completes the same work either
+/// way -- 1.000, 1.000 and 1.002 of baseline at 8, 16 and 32 competing threads,
+/// against a same-binary null of 1.000 +/- 0.001. Nothing is starved.
+///
+/// Half of [`MIN_SPIN`] rather than a tuned constant: `MIN_SPIN` is already the
+/// design's statement of the shortest interval a core may be held without
+/// offering it back, so half of it cannot make a sibling wait longer than the
+/// scheduler's own floor. It does not gate the deadline -- see #1825 and the
+/// comment at the yield site.
+const YIELD_MIN_INTERVAL: Duration = Duration::from_micros(10);
+
 /// How long [`TaskPool::new`]'s readiness barrier waits for every spawned
 /// worker to reach its loop before failing loud.
 ///
@@ -580,6 +633,10 @@ impl Shared {
         let start = Instant::now();
         let mut spins = 0u32;
         let mut yields = 0u64;
+        // Zero, so the first pass through the yield phase yields without delay:
+        // the rate limit may shorten how long a core is held between offers,
+        // never lengthen it.
+        let mut next_yield = Duration::ZERO;
         let outcome = loop {
             if self.shutdown.load(Ordering::Acquire) {
                 break SpinOutcome::Shutdown;
@@ -601,28 +658,43 @@ impl Shared {
                     break SpinOutcome::Expired;
                 }
             } else {
-                spin_yield();
-                yields += 1;
-                // ...and must not apply here. A yield costs microseconds to
-                // milliseconds under contention, so a stride of 64
-                // multiplies the window's granularity by 64 yields of an
-                // already-starved thread -- see #1825, which made this
-                // correction in `decode_spmd`'s readiness barrier. It bites
-                // whenever the window outlasts the spin phase, which is the
-                // upper part of the grown range rather than all of it: 4096
-                // `spin_loop`s measure 130us on this host, so windows from
-                // ~160us up -- including the `MAX_SPIN` (500us) ceiling a
+                // The deadline check is *not* strided, and must not be. A
+                // yield costs microseconds to milliseconds under contention,
+                // so a stride of 64 multiplies the window's granularity by 64
+                // yields of an already-starved thread -- see #1825, which made
+                // this correction in `decode_spmd`'s readiness barrier. It
+                // bites whenever the window outlasts the spin phase, which is
+                // the upper part of the grown range rather than all of it:
+                // 4096 `spin_loop`s measure 130us on this host, so windows
+                // from ~160us up -- including the `MAX_SPIN` (500us) ceiling a
                 // busy steady state converges on -- reach this phase, while
-                // the shorter windows above the floor expire in the spin
-                // phase above and never arrive here. `MAX_SPIN`'s contract
-                // is that a process which stops inferencing returns to ~0%
-                // CPU in under a millisecond; a stride-gated check cannot
-                // honour that under exactly the load that makes it matter:
-                // measured, a yield with four runnable siblings on one core
-                // costs 11.2ms, so a 64-yield stride holds the core 717ms
-                // past a 500us window.
-                if start.elapsed() >= spin_window {
+                // the shorter windows above the floor expire in the spin phase
+                // above and never arrive here. `MAX_SPIN`'s contract is that a
+                // process which stops inferencing returns to ~0% CPU in under
+                // a millisecond; a stride-gated check cannot honour that under
+                // exactly the load that makes it matter: measured, a yield
+                // with four runnable siblings on one core costs 11.2ms, so a
+                // 64-yield stride holds the core 717ms past a 500us window.
+                //
+                // What *is* rate-limited is the yield itself, on a wall-clock
+                // interval and not on an iteration count (#2075). The clock
+                // read below is the one #1825 already requires, so gating the
+                // yield on it adds no `Instant::now()` to the phase: one read
+                // answers both "is the window over" and "may I yield again".
+                let elapsed = start.elapsed();
+                if elapsed >= spin_window {
                     break SpinOutcome::Expired;
+                }
+                if elapsed >= next_yield {
+                    spin_yield();
+                    yields += 1;
+                    // Measured from before the yield, so a yield that blocks
+                    // for longer than the interval leaves the next one due
+                    // immediately. That is what makes the limit inert under
+                    // the contention where the yield is doing real work.
+                    next_yield = elapsed + YIELD_MIN_INTERVAL;
+                } else {
+                    std::hint::spin_loop();
                 }
             }
         };
@@ -694,9 +766,13 @@ thread_local! {
 fn spin_yield() {
     #[cfg(test)]
     {
+        // Bumped unconditionally, not just under injection: this is the ground
+        // truth the `spin_yields` counter is checked against, and a ground
+        // truth that only exists when a test injects a cost cannot be used to
+        // check the uninjected path.
+        YIELD_COUNT.with(|c| c.set(c.get() + 1));
         let us = SLOW_YIELD_US.with(std::cell::Cell::get);
         if us > 0 {
-            YIELD_COUNT.with(|c| c.set(c.get() + 1));
             thread::sleep(Duration::from_micros(us));
         }
     }
@@ -1133,6 +1209,13 @@ mod tests {
     /// silently stops testing is worse than no test), the other branch asserts
     /// the complementary property: no yield phase, no yields counted. Exactly
     /// one branch runs on any host and both are real, so this cannot go quiet.
+    ///
+    /// The exact value is taken from [`YIELD_COUNT`], which `spin_yield` bumps,
+    /// rather than recomputed from the spin count. #2075's rate limit broke the
+    /// old arithmetic form (`spins - SPIN_LOOP_BUDGET + 1`), and that it broke
+    /// is the point: a counter test that recomputes the loop's own policy
+    /// asserts the policy, not the counter, and has to be rewritten every time
+    /// the policy moves. Counting the calls is the property actually wanted.
     #[test]
     fn the_spin_phase_yield_counter_counts_exactly_the_yields_the_window_performed() {
         // Width 1 spawns no threads, so nothing can move the epoch or touch
@@ -1142,6 +1225,7 @@ mod tests {
         let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
         SLOW_YIELD_US.with(|c| c.set(0));
         SPIN_COUNT.with(|c| c.set(0));
+        YIELD_COUNT.with(|c| c.set(0));
 
         let before = pool.counters().spin_yields;
         // `MAX_SPIN` rather than an arbitrary large window: it is the ceiling a
@@ -1150,6 +1234,8 @@ mod tests {
         let outcome = pool.shared.spin_for_dispatch(last_epoch, MAX_SPIN);
         let after = pool.counters().spin_yields;
         let spins = SPIN_COUNT.with(std::cell::Cell::get);
+        let performed = YIELD_COUNT.with(std::cell::Cell::get);
+        YIELD_COUNT.with(|c| c.set(0));
         let yields = after - before;
 
         assert_eq!(
@@ -1159,16 +1245,40 @@ mod tests {
         );
 
         if spins >= u64::from(SPIN_LOOP_BUDGET) {
-            // Yields run for spins in `SPIN_LOOP_BUDGET..=spins`, inclusive at
-            // both ends.
-            let expected = spins - u64::from(SPIN_LOOP_BUDGET) + 1;
             assert_eq!(
-                yields, expected,
-                "the window ran {spins} spins, so it yielded on {expected} of them \
-                 (every iteration from {SPIN_LOOP_BUDGET} onwards), but the counter \
-                 recorded {yields}: it is not counting one yield per yield-phase \
-                 iteration, so any yield rate read from it is wrong"
+                yields, performed,
+                "the window ran {spins} spins and called `spin_yield` {performed} \
+                 time(s), but the counter recorded {yields}: it is not counting \
+                 one yield per yield performed, so any yield rate read from it \
+                 is wrong"
             );
+            // `spins` discriminates the two ways the yield phase can be
+            // entered, exactly and without reference to the clock. The phase's
+            // first pass either breaks on an already-elapsed deadline -- which
+            // leaves `spins` at exactly the budget, because the counter is
+            // bumped at the top of the iteration that broke -- or it yields,
+            // since `next_yield` starts at zero. So one more spin than the
+            // budget is the signature of "the first pass yielded", and it is
+            // the one case in which a zero here would be a real defect rather
+            // than a slow host.
+            if spins > u64::from(SPIN_LOOP_BUDGET) {
+                assert!(
+                    performed > 0,
+                    "the yield phase ran past its first pass ({spins} spins against \
+                     a {SPIN_LOOP_BUDGET}-iteration budget), which it can only do by \
+                     yielding on that pass -- `next_yield` starts at zero -- yet \
+                     `spin_yield` was never called. The rate limit has swallowed the \
+                     phase's first yield, which is the one it must not touch"
+                );
+            } else {
+                assert_eq!(
+                    performed, 0,
+                    "the window expired on the yield phase's first pass, before the \
+                     yield gate was reached, so no yield can have been performed -- \
+                     but `spin_yield` was called {performed} time(s), meaning the \
+                     deadline no longer takes precedence over the yield"
+                );
+            }
         } else {
             assert_eq!(
                 yields, 0,
@@ -1179,6 +1289,79 @@ mod tests {
                  other than yields"
             );
         }
+    }
+
+    /// The yield phase must not issue an unbounded rate of `sched_yield`.
+    ///
+    /// The phase used to yield on every iteration, so its syscall rate was set
+    /// by how fast the loop went round rather than by any policy. #2075
+    /// measured the traffic: 1.05us of kernel time per yield (R^2 0.99 over a
+    /// 94x range of yield counts, reproduced to 1.6% on an independent
+    /// replicate), and a `MAX_SPIN` window on this host performed 221 yields.
+    ///
+    /// The ceiling is stated as an absolute number, deliberately not derived
+    /// from [`YIELD_MIN_INTERVAL`] and [`MAX_SPIN`]. A derived bound is
+    /// self-fulfilling: set the interval to one nanosecond and a
+    /// `MAX_SPIN / YIELD_MIN_INTERVAL` ceiling rises to meet it, and the test
+    /// still passes having asserted only that division works. 64 is far below
+    /// the 221 the unlimited loop performed and above the ~37 the phase can
+    /// reach at a 10us interval once the 130us pure-spin phase is paid.
+    ///
+    /// Load can only push this down, never up -- a preempted thread accrues
+    /// wall time faster per iteration and so crosses the deadline in fewer
+    /// yields -- which is why an upper bound is safe on a shared box and a
+    /// lower bound would be flaky. The lower bound the phase does guarantee is
+    /// structural rather than statistical, and is asserted as such: the first
+    /// iteration always yields.
+    #[test]
+    #[cfg_attr(miri, ignore = "spin-vs-window ratio is wall-clock, not emulated")]
+    fn the_yield_phase_rate_limits_its_yields_against_the_wall_clock() {
+        /// Absolute. See above: deliberately not `MAX_SPIN / YIELD_MIN_INTERVAL`.
+        const CEILING: u64 = 64;
+
+        let pool = TaskPool::new(1);
+        let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
+        SLOW_YIELD_US.with(|c| c.set(0));
+        SPIN_COUNT.with(|c| c.set(0));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        let outcome = pool.shared.spin_for_dispatch(last_epoch, MAX_SPIN);
+        let spins = SPIN_COUNT.with(std::cell::Cell::get);
+        let yields = YIELD_COUNT.with(std::cell::Cell::get);
+        YIELD_COUNT.with(|c| c.set(0));
+
+        assert_eq!(
+            outcome,
+            SpinOutcome::Expired,
+            "no dispatch was published, so the window must have expired"
+        );
+        // Non-vacuity: on a host slow enough that the window expires inside the
+        // pure-spin phase, or on the yield phase's very first pass before its
+        // yield gate is reached, no yield happens at all and a ceiling is
+        // satisfied by a phase that never ran. `spins` separates those from a
+        // real run exactly: one more than the budget means the first pass got
+        // past the deadline and yielded.
+        assert!(
+            spins > u64::from(SPIN_LOOP_BUDGET),
+            "inconclusive: the {MAX_SPIN:?} window ended after {spins} spins against \
+             a {SPIN_LOOP_BUDGET}-iteration budget, so the yield phase either was \
+             never entered or expired on its first pass, and this test bounded a \
+             rate nothing produced -- it is not a pass"
+        );
+        assert!(
+            yields >= 1,
+            "the yield phase ran past its first pass ({spins} spins) but never \
+             yielded: the rate limit must delay yields, never eliminate them, or a \
+             worker spinning on an oversubscribed core stops offering it to the \
+             sibling holding the work"
+        );
+        assert!(
+            yields <= CEILING,
+            "a {MAX_SPIN:?} window performed {yields} yields, above the {CEILING} \
+             ceiling. At the ~1.05us of kernel time #2075 measured per yield, an \
+             unlimited phase spends its window in `sched_yield`; the limit is not \
+             holding"
+        );
     }
 
     /// The spin window's deadline must be re-read on every yield.
