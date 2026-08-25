@@ -27,6 +27,26 @@ and are driven by typed workflow values rather than model-family dispatch. Metad
 declares only semantic state kinds, geometry, graph ABI facts, and reuse/rollback
 bounds; it never selects a storage mode, an allocator, or a device.
 
+## Encoder and media batching
+
+The v1.1 workflow schema can describe generalized image, video, audio, and text
+encoder batches. `batch_capacity` is the component's sole authored claim that a
+valid group is equivalent to per-item execution. Dense rows use
+`request_aligned`; right-padded dimensions name `valid_lengths`; ragged item
+counts use one axis-0 `token_packed` run with one or two ownership levels.
+Uniformity and static footprint bounds are keyed by shape symbol.
+
+Compatibility and request-local spans are derived from those contracts.
+Whether to group, the target size, device-memory limits, and backend readiness
+are runtime policy/evidence. The old profile/model/capability batching hints are
+retired rather than kept as competing sources of truth.
+
+Current status is metadata-only: parsing and semantic validation are shipped,
+but the interpreter, preprocessors, scheduler, and backends do not yet assemble
+or execute generalized encoder groups. See
+[ENCODER_BATCHING.md](ENCODER_BATCHING.md) for the acceptance matrix and
+explicit runtime gaps.
+
 ## Batched policy islands
 
 Sampler and termination components may enter an execution island only through their

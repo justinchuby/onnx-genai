@@ -306,6 +306,33 @@ thread_local! {
     /// is what makes "slow is not the same as broken" an actual assertion.
     static DELAY_WORKER_BEFORE_READY_MS: Cell<u64> = const { Cell::new(0) };
 
+    /// Test override for [`SHUTDOWN_JOIN_TIMEOUT`], in milliseconds; `0` means
+    /// "use the real one". Scoped to the thread that calls `shutdown`, which is
+    /// where [`shutdown_join_timeout`] reads it.
+    static SHUTDOWN_JOIN_TIMEOUT_MS: Cell<u64> = const { Cell::new(0) };
+
+    /// Test fault injection: the global worker index that must refuse to leave
+    /// after shutdown is flagged, or `usize::MAX` for none. Reproduces the one
+    /// failure a `join` cannot distinguish from a slow exit -- a worker that
+    /// will never finish leaving.
+    ///
+    /// Latched on the builder thread like its neighbours, so the fault belongs
+    /// to the injecting test's pool and no other. The *release* it waits on is
+    /// [`WEDGED_WORKER_RELEASED`], a process-global, which is safe precisely
+    /// because reaching it requires having been selected by this thread-scoped
+    /// knob first: no pool that was not injected ever reads it.
+    static WEDGE_WORKER_AT_SHUTDOWN: Cell<usize> = const { Cell::new(usize::MAX) };
+
+    /// Set by the spawned worker on *its own* thread when
+    /// [`WEDGE_WORKER_AT_SHUTDOWN`] selected it. The selection is latched on the
+    /// builder thread (so it belongs to one pool) and relayed here by the
+    /// closure, which already runs on the worker -- that is what lets the wedge
+    /// live inside [`worker_loop`], where it can hold the worker *before*
+    /// `ExitCount` counts it out. Wedging after the count would test nothing:
+    /// teardown would see its target reached and join a thread that is still
+    /// alive, which no production path does.
+    static WEDGE_THIS_WORKER: Cell<bool> = const { Cell::new(false) };
+
     /// Test injection of a *contended* yield, in microseconds; `0` means "yield
     /// normally". The readiness backstop's stride defect is invisible when
     /// yields are cheap: an uncontended `yield_now` costs ~1.2us, so a stride of
@@ -361,6 +388,31 @@ fn slow_yield() {
     let us = SLOW_YIELD_US.with(Cell::get);
     if us > 0 {
         thread::sleep(Duration::from_micros(us));
+    }
+}
+
+/// Released by the injecting test to let a wedged worker finish. See
+/// [`WEDGE_WORKER_AT_SHUTDOWN`].
+///
+/// A process-global, unlike the knob that selects the victim: only a worker
+/// already selected by that thread-scoped knob ever loads this, so no
+/// uninjected pool can observe it. Making it global is what lets the injecting
+/// test release the worker *after* `shutdown` has already returned, which is
+/// the whole point -- the assertion is that teardown does not wait for it.
+#[cfg(test)]
+static WEDGED_WORKER_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// Hold this worker inside the pool until the injecting test releases it.
+///
+/// Sleeps rather than spins. A spinning wedge would reproduce the production
+/// symptom more faithfully -- a core held at 100% -- but it would hold that
+/// core inside our own test suite on a shared host, which is the exact harm
+/// this fix exists to prevent. The bound under test is on the *joiner*, and it
+/// cannot tell a sleeping wedge from a spinning one.
+#[cfg(test)]
+fn wedge_until_released() {
+    while !WEDGED_WORKER_RELEASED.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -799,6 +851,16 @@ struct SharedState {
     /// One `fetch_add` per worker per process, so the cost is not on any path
     /// that runs more than once.
     workers_exited: AtomicUsize,
+    /// Workers [`SpmdDecodePools::shutdown`] gave up waiting for and left
+    /// unjoined, because they had not counted themselves out of
+    /// [`Self::workers_exited`] before [`shutdown_join_timeout`] expired.
+    ///
+    /// Nonzero means the pool is torn down but some thread of it is still
+    /// alive, so it is the observable a teardown test asserts the give-up path
+    /// on -- and, just as importantly, the observable a *healthy* teardown test
+    /// asserts is zero. A give-up branch reported only by a log line is one
+    /// nobody can prove was not taken.
+    workers_abandoned: AtomicUsize,
     /// Whether the per-worker ns timings are collected. Latched per *pool*, not
     /// per process (see [`parse_worker_profile`]), and immutable after build so
     /// every read is a plain load of a shared read-only word.
@@ -1262,6 +1324,36 @@ struct DispatchClaim<'a> {
 /// up degrades to the pre-existing behaviour (a possibly stranded dispatcher),
 /// which is strictly better than hanging every shutdown behind one bad op.
 const SHUTDOWN_DISPATCH_QUIESCE: Duration = Duration::from_secs(5);
+
+/// How long [`SpmdDecodePools::shutdown`] waits for every worker to count
+/// itself out before it stops waiting and abandons the unjoined ones.
+///
+/// This bounds the *last* wait in the pool's life, which until #2123 had no
+/// bound at all: `shutdown` ended in `handle.join()` per worker, so one worker
+/// that never left its loop hung teardown forever. That hang is worse than a
+/// deadlock, because the pool's other workers keep spinning in their blocktime
+/// window while the joiner blocks -- the process pins cores and never exits,
+/// which reads as work rather than as a fault.
+///
+/// Generous on purpose. Workers leave within microseconds of observing the stop
+/// flag, so a teardown that reaches this deadline is reporting a broken pool,
+/// not a slow one -- the same reasoning as [`POOL_READY_TIMEOUT`] at the other
+/// end of the pool's life. It is a liveness backstop, not a performance bound.
+const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Read on the thread calling [`SpmdDecodePools::shutdown`], which is where the
+/// test override below is set, for the same reason [`pool_ready_timeout`] is
+/// read on the builder thread.
+fn shutdown_join_timeout() -> Duration {
+    #[cfg(test)]
+    {
+        let ms = SHUTDOWN_JOIN_TIMEOUT_MS.with(Cell::get);
+        if ms > 0 {
+            return Duration::from_millis(ms);
+        }
+    }
+    SHUTDOWN_JOIN_TIMEOUT
+}
 
 impl<'a> DispatchClaim<'a> {
     /// Take exclusive ownership, or `None` if another thread already holds it.
@@ -1872,6 +1964,7 @@ impl SpmdDecodePools {
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
             workers_exited: AtomicUsize::new(0),
+            workers_abandoned: AtomicUsize::new(0),
             profile_workers: worker_profile_enabled(),
             worker_counters: (0..total_threads)
                 .map(|_| Padded(WorkerCounters::default()))
@@ -1904,6 +1997,8 @@ impl SpmdDecodePools {
         let stub_pin_syscall = STUB_PIN_SYSCALL.with(Cell::get);
         #[cfg(test)]
         let delay_worker_before_ready = DELAY_WORKER_BEFORE_READY_MS.with(Cell::get);
+        #[cfg(test)]
+        let wedge_worker_at_shutdown = WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get);
         for (global_index, (node_position, cpu)) in assignment.into_iter().enumerate() {
             let shared = Arc::clone(&shared);
             let placements = Arc::clone(&placements);
@@ -1955,6 +2050,10 @@ impl SpmdDecodePools {
                     #[cfg(test)]
                     if delay_worker_before_ready > 0 {
                         thread::sleep(Duration::from_millis(delay_worker_before_ready));
+                    }
+                    #[cfg(test)]
+                    if wedge_worker_at_shutdown == global_index {
+                        WEDGE_THIS_WORKER.with(|slot| slot.set(true));
                     }
                     worker_loop(shared, global_index);
                 })
@@ -2169,6 +2268,20 @@ impl SpmdDecodePools {
         self.shared
             .as_ref()
             .map_or(0, |shared| shared.workers_exited.load(Ordering::Acquire))
+    }
+
+    /// How many workers [`Self::shutdown`] stopped waiting for and left
+    /// unjoined. Zero for every healthy teardown.
+    ///
+    /// Nonzero is a pool bug, not a tuning outcome: it means a worker was still
+    /// inside the pool [`SHUTDOWN_JOIN_TIMEOUT`] after the stop flag was
+    /// published and futex-woken. Exposed so the give-up branch is assertable
+    /// in both directions -- taken when a worker is wedged, and *not* taken
+    /// otherwise, which is the half a log line cannot supply.
+    pub fn workers_abandoned(&self) -> usize {
+        self.shared
+            .as_ref()
+            .map_or(0, |shared| shared.workers_abandoned.load(Ordering::Acquire))
     }
 
     /// The CPU each spawned worker is *actually* pinned to, in global worker
@@ -2477,9 +2590,73 @@ impl SpmdDecodePools {
             sense.0.wake.fetch_add(1, Ordering::Release);
             atomic_wait::wake_all(&sense.0.wake);
         }
-        for handle in handles {
-            let _ = handle.join();
+        Self::join_workers_bounded(shared, handles);
+    }
+
+    /// Wait for every worker to count itself out, then join; or give up.
+    ///
+    /// `join` has no timeout, so joining a worker that will never leave hangs
+    /// teardown forever (#2123). `workers_exited` does have a bound we can
+    /// impose, and it is the right thing to wait on: its `ExitCount` guard
+    /// fires however a worker leaves, including a panic unwind, and it is
+    /// incremented *before* the thread's epilogue. So once the count is
+    /// reached, every `join` below has only that epilogue left to wait for and
+    /// completes promptly -- the wait is bounded in fact, not by hope.
+    ///
+    /// If the count is not reached in time we do **not** join. A worker that
+    /// has not counted itself out is the exact case that hangs, and joining it
+    /// would reinstate the defect at the moment it is diagnosed. Detaching is
+    /// memory-safe: each worker owns an `Arc<SharedState>` (see `worker_loop`),
+    /// so an abandoned worker cannot outlive the state it reads.
+    ///
+    /// Returns the number abandoned, which is also recorded in
+    /// `workers_abandoned` so a test can assert on the branch rather than on a
+    /// log line.
+    fn join_workers_bounded(shared: &SharedState, handles: Vec<JoinHandle<()>>) -> usize {
+        let expected = handles.len();
+        let timeout = shutdown_join_timeout();
+        let started = Instant::now();
+        // Yield rather than spin. The threads this waits on need a core to
+        // reach their own exit, so spinning here starves the very workers whose
+        // departure is the exit condition -- the same argument the readiness
+        // barrier makes, and the same one that makes a busy hang worse than a
+        // quiet one.
+        while shared.workers_exited.load(Ordering::Acquire) < expected {
+            if started.elapsed() >= timeout {
+                break;
+            }
+            thread::yield_now();
         }
+        // Re-read once, after the loop: a worker can count out between the last
+        // load and the deadline check, and abandoning a pool that just became
+        // joinable would report a fault that no longer exists.
+        let exited = shared.workers_exited.load(Ordering::Acquire);
+        if exited >= expected {
+            for handle in handles {
+                let _ = handle.join();
+            }
+            return 0;
+        }
+        let abandoned = expected - exited;
+        shared.workers_abandoned.store(abandoned, Ordering::Release);
+        // Dropped, not joined: `JoinHandle`'s `Drop` detaches.
+        drop(handles);
+        #[cfg(feature = "tracing")]
+        tracing_crate::warn!(
+            abandoned,
+            expected,
+            timeout = ?timeout,
+            "cpu decode pool shutdown abandoned workers that never exited"
+        );
+        #[cfg(not(feature = "tracing"))]
+        eprintln!(
+            "onnx-genai: persistent SPMD decode pool: shutdown gave up on {abandoned} of \
+             {expected} workers that did not exit within {timeout:?}; they are left running \
+             and unjoined rather than hanging teardown on them. This is a bug in the pool, \
+             not a tuning problem -- a healthy worker leaves within microseconds of the stop \
+             flag."
+        );
+        abandoned
     }
 
     /// Run every shard of `job` on this thread, in global worker order.
@@ -3295,6 +3472,22 @@ fn worker_loop(shared: Arc<SharedState>, global_index: usize) {
         }
     }
     let _exit_count = ExitCount(&shared);
+    // Declared *after* `_exit_count`, so it drops *before* it: drop order is
+    // reverse of declaration. That places the injected wedge in the one state
+    // teardown must survive -- worker still alive, not yet counted out -- on
+    // every exit path this function has, including a panic unwind.
+    #[cfg(test)]
+    struct WedgeOnExit;
+    #[cfg(test)]
+    impl Drop for WedgeOnExit {
+        fn drop(&mut self) {
+            if WEDGE_THIS_WORKER.with(Cell::get) {
+                wedge_until_released();
+            }
+        }
+    }
+    #[cfg(test)]
+    let _wedge_on_exit = WedgeOnExit;
     let node = shared.worker_node[global_index];
     // Track this node's sense line: 0 until the first op is published. Announce
     // readiness only after establishing the baseline; the dispatcher blocks in
@@ -6069,6 +6262,188 @@ mod tests {
              delay could have elapsed, so it never reached the deadline path"
         );
         pools.shutdown();
+    }
+
+    /// A worker that never leaves must be abandoned, not joined forever.
+    ///
+    /// This is #2123, and it is the readiness barrier's defect (#2027) at the
+    /// other end of the pool's life. `shutdown` ended in `handle.join()` per
+    /// worker, and `join` has no timeout, so one worker that never returned
+    /// hung teardown permanently -- with the pool's *other* workers still
+    /// spinning out their blocktime window, so the process pinned cores and
+    /// never exited. As with the barrier, the failure presents as a busy
+    /// machine rather than as a fault, which is what makes it expensive: a
+    /// deadlock announces itself, a hang that burns cores looks like work.
+    ///
+    /// The wedge is injected inside `worker_loop` while `ExitCount` is still
+    /// alive, so the worker is in the exact state a `join` cannot distinguish
+    /// from a slow exit: still running, not yet counted out. Wedging *after*
+    /// the count would prove nothing -- teardown would see its target reached
+    /// and join a live thread, which no production path does.
+    ///
+    /// Both assertions are load-bearing and neither implies the other. The
+    /// elapsed bound alone would pass on an implementation that joined
+    /// successfully because the wedge never fired; the abandoned count alone
+    /// would pass on one that reported correctly after hanging for an hour.
+    #[test]
+    fn a_worker_that_never_exits_is_abandoned_instead_of_hanging_shutdown() {
+        const WEDGED: usize = 1;
+        // Releases the wedge on *every* exit from this test, including a failed
+        // assertion. Released inline, an assertion that fires before the
+        // release leaves the injected worker sleeping in the pool for the life
+        // of the test process -- a test whose failure mode is a leaked thread
+        // teaches the wrong lesson about leaked threads.
+        struct ReleaseWedge;
+        impl Drop for ReleaseWedge {
+            fn drop(&mut self) {
+                WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+                WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
+                SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+            }
+        }
+        WEDGED_WORKER_RELEASED.store(false, Ordering::Release);
+        WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(WEDGED));
+        // Far above any plausible deschedule of a *healthy* sibling on a
+        // contended host, and far below the harness bound below. At 250ms a
+        // sibling starved past the deadline would be abandoned too, and while
+        // that direction only produces a false red, the same tightness lets a
+        // future broken wedge relay be masked by a coincidentally slow sibling
+        // that keeps the count at 1.
+        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(2_000));
+        let _release = ReleaseWedge;
+
+        let pools = SpmdDecodePools::build_with_schedule(
+            &[NodeShard {
+                index: 0,
+                cpus: Vec::new(),
+                workers: 3,
+            }],
+            DecodeSchedule::Fixed,
+            false,
+        );
+        WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
+        // A pool that spawned no worker cannot wedge one, and would satisfy
+        // every assertion below by doing nothing at all.
+        assert!(
+            pools.spawned_workers() > WEDGED,
+            "the wedged index {WEDGED} is not a spawned worker (spawned {}), so the \
+             fault could not have been injected",
+            pools.spawned_workers()
+        );
+
+        let started = Instant::now();
+        pools.shutdown();
+        let elapsed = started.elapsed();
+
+        // Bounds the *test*, and with it the claim: the unbounded join fails
+        // this by never returning at all rather than by returning late.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "shutdown returned, but took {elapsed:?} to give up on a wedged worker"
+        );
+        assert_eq!(
+            pools.workers_abandoned(),
+            1,
+            "shutdown must report the worker it stopped waiting for; a give-up that \
+             is indistinguishable from a clean teardown is not a diagnostic"
+        );
+
+        // Release it and let it leave, so the wedge does not outlive the test
+        // that injected it.
+        WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+        let draining = Instant::now();
+        while pools.workers_exited() < pools.spawned_workers()
+            && draining.elapsed() < Duration::from_secs(10)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            pools.workers_exited(),
+            pools.spawned_workers(),
+            "the released worker must leave; if it does not, the abandonment above \
+             was permanent rather than a deferral"
+        );
+    }
+
+    /// The give-up path must not be reachable by a healthy teardown.
+    ///
+    /// The other half of the pair, and the half a log line cannot supply. A
+    /// backstop that fires on a correct pool converts every clean shutdown into
+    /// a leaked thread and a false bug report, which is a worse failure than
+    /// the one it guards -- and one that no test asserting only the wedged case
+    /// can see.
+    ///
+    /// Both arms are needed, and the second is the point. The wait target is
+    /// `handles.len()`, and the only count in this type that differs from it is
+    /// [`SpmdDecodePools::total_workers`], which includes the inline dispatcher
+    /// shard -- a participant that never runs [`worker_loop`] and so can never
+    /// be counted out. "Tidying" the target to `total_workers` would make the
+    /// wait unsatisfiable and abandon exactly one worker on *every* real
+    /// shutdown, and with a `dispatcher_shard: false` arm alone that regression
+    /// is invisible: the two counts are equal there, so both arms of this test
+    /// and every existing teardown test would stay green while production leaked
+    /// a thread per shutdown. This file has paid for that exact off-by-one
+    /// before -- see `shutdown_pools_is_a_barrier_not_a_request`, which was
+    /// wrong by one in the inline-shard regime, invisible on a 32-CPU host and a
+    /// hard failure on a 2-core runner.
+    ///
+    /// The deadline override is deliberately short rather than absent. With the
+    /// production 30s bound a regression that hangs teardown would be reported
+    /// by this test as a 30s pass followed by an assertion failure, or by the
+    /// harness timing out with no attribution; 5s makes the same defect fail
+    /// here, quickly, and named.
+    #[test]
+    fn a_healthy_teardown_never_abandons_a_worker() {
+        assert_eq!(
+            WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get),
+            usize::MAX,
+            "no fault may be injected on the thread building a healthy pool"
+        );
+        let mut saw_inline_shard = false;
+        for dispatcher_shard in [false, true] {
+            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(5_000));
+            let pools = SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 4,
+                }],
+                DecodeSchedule::Fixed,
+                dispatcher_shard,
+            );
+            let spawned = pools.spawned_workers();
+            assert!(
+                spawned > 0,
+                "a pool that spawned nothing cannot demonstrate a clean teardown"
+            );
+            saw_inline_shard |= spawned != pools.total_workers();
+
+            pools.shutdown();
+            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+
+            assert_eq!(
+                pools.workers_abandoned(),
+                0,
+                "a healthy pool's teardown must join every worker (dispatcher_shard \
+                 {dispatcher_shard}); abandoning one means the backstop fires on \
+                 correct pools"
+            );
+            assert_eq!(
+                pools.workers_exited(),
+                spawned,
+                "shutdown returned without every worker counted out \
+                 (dispatcher_shard {dispatcher_shard}), so the join it reported was \
+                 not the barrier it claims to be"
+            );
+        }
+        // Without this the `true` arm can silently degrade into a second copy of
+        // the `false` arm -- and it is the *only* arm in which the wait target
+        // and `total_workers` disagree, which is the whole reason it is here.
+        assert!(
+            saw_inline_shard,
+            "no arm reached the inline-dispatcher-shard regime, so the count this \
+             test exists to pin was never exercised"
+        );
     }
 
     /// The backstop must fire *within* its deadline, not a stride of yields
@@ -9660,6 +10035,7 @@ mod dispatch_claim_tests {
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
             workers_exited: AtomicUsize::new(0),
+            workers_abandoned: AtomicUsize::new(0),
             profile_workers: false,
             worker_counters: Vec::new(),
             dispatch_counters: Padded(DispatchCounters::default()),
@@ -9680,6 +10056,7 @@ mod dispatch_claim_tests {
             dispatching: Padded(AtomicBool::new(false)),
             shutdown: AtomicBool::new(false),
             workers_exited: AtomicUsize::new(0),
+            workers_abandoned: AtomicUsize::new(0),
             profile_workers: false,
             worker_counters: vec![Padded(WorkerCounters::default())],
             dispatch_counters: Padded(DispatchCounters::default()),

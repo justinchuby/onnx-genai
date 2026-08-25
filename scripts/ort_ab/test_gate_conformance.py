@@ -33,6 +33,16 @@ checked in both directions: a gap that has since been gated **fails as
 stale**, so closing one is a one-line ledger edit and the record cannot drift
 into fiction.
 
+That root is also read in shell. It was not, for as long as this file has
+existed, because the enumeration globbed `*.py` -- and the one shell harness
+there claimed the lock in its own header comment while calling nothing. The
+shell rule is categorical rather than behavioural (every `*.sh` gates or is
+recorded), for the reason written at `EP_SHELL_LEDGER`. The thirteen Rust
+`[[bench]]` targets in the same directory are still uncovered, deliberately
+and with the reason written down in the same place (#2129), because what must
+hold the lock for those is the `cargo bench` invocation rather than the
+source.
+
 Both lock idioms in the tree count as held: `hostlock_gate.require` in
 `scripts/ort_ab/`, and the `HostLock` context manager in `acc0_gap_matrix.py`
 that shells out to `scripts/hostlock.sh`. A checker that knew only its
@@ -611,6 +621,172 @@ def dead_records(
             out.append(
                 f"{name}: recorded, but it no longer starts anything -- delete "
                 "the record"
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# The same root, in another language
+# ---------------------------------------------------------------------------
+#
+# `ep_sources` globs `*.py`, so every non-Python harness sitting beside those
+# files was never read at all -- not classified, not exempted, invisible. The
+# directory holds two shell harnesses and thirteen Rust `[[bench]]` targets.
+#
+# That is not a corner. `decode_gap_park_ab --bench` is one of the three
+# processes that collided on the box in #1803, the incident this whole file
+# exists to make visible, and it is a Rust bench. `decode_placement_census.sh`
+# carried the sentence "it still runs under the hostlock" in its own header
+# while containing no call to `scripts/hostlock.sh` at all -- a declaration
+# with nothing behind it, which is the failure mode the ledger was built to
+# end, one file extension out of reach.
+#
+# Shell is covered here. **Rust is not**, and the reason is structural rather
+# than an oversight: `cargo bench` compiles on every core for minutes before
+# the binary runs, so the thing that must hold the lock is the *invocation*,
+# not the target's source. Checking that is a documentation-conformance
+# question about the benches README, a different check with a different
+# failure mode, and it is deliberately a separate change (#2129) rather than
+# bolted on here.
+#
+# The rule for shell is categorical -- every `*.sh` under the benches root
+# holds the lock or carries a recorded reason -- where the Python rule is
+# behavioural. That asymmetry is deliberate. `looks_like_a_harness` reads a
+# Python AST; the standard library has no shell parser, so the equivalent
+# behavioural test would be a regex guessing at intent, and a guess that
+# reports somebody else's quiet script as a saturating harness is exactly the
+# false alarm that gets a check deleted. A shell file in a benchmark
+# directory is a benchmark until its author writes down that it is not, and
+# writing that down is one ledger line.
+#
+# `decode_placement_census.sh` is not here because it now gates. Editing it
+# rather than recording it is the one asymmetry with #2043's treatment of
+# other people's Python, and the reason is that its header already declared
+# the lock -- the change makes the author's own stated intent true and
+# deletes a false sentence, rather than imposing a policy on their file.
+# `int4_modulo_arms.sh` declares nothing of the kind, so it is recorded.
+EP_SHELL_LEDGER: dict[str, str] = {
+    "int4_modulo_arms.sh": (
+        "known-gap:#2043 - three release builds saturate every core for "
+        "minutes, owner to gate it (int4 modulo A/B arms, #1809)"
+    ),
+}
+
+# `hostlock.sh` subcommands that actually take the lock. `status`,
+# `provenance`, `wait` and `release` all name the script without claiming the
+# host, and a substring check for "hostlock.sh" would count every one of them
+# -- the #2106 lesson, where a custody guard keyed on the word `acquire`
+# missed `run`, which acquires too and is the idiom the docs recommend.
+SHELL_ACQUIRING = ("run", "acquire")
+
+
+def strip_shell_comments(source: str) -> str:
+    """Drop `#` comments, conservatively and in the fail-closed direction.
+
+    There is no shell parser to borrow, so this is an approximation and its
+    errors are chosen rather than accepted:
+
+    * A `#` that is not at the start of a word is kept, so `${x#-}` and
+      `$#` survive intact and do not truncate the line.
+    * A `#` preceded by an odd number of `'` or `"` is kept, so a literal
+      `"# 1"` inside a string does not truncate it either.
+    * Anything this gets wrong truncates a line, which can only *lose* an
+      acquisition and therefore can only report a file as ungated. A file
+      this cannot read is a file it cannot certify, and the answer is a
+      ledger line, not a silent pass.
+    """
+    out = []
+    for line in source.splitlines():
+        cut = None
+        for i, ch in enumerate(line):
+            if ch != "#":
+                continue
+            if i and line[i - 1] not in " \t":
+                continue
+            if line[:i].count("'") % 2 or line[:i].count('"') % 2:
+                continue
+            cut = i
+            break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def shell_holds_the_lock(source: str) -> bool:
+    """The script invokes `scripts/hostlock.sh` with an acquiring subcommand.
+
+    Keyed on the *subcommand*, which is the word after the script name, so
+    `hostlock.sh status` in a progress message does not count as custody. The
+    remainder of the file is searched rather than the remainder of the line,
+    which is what makes a backslash line continuation work: the subcommand is
+    the first word after the name wherever it lands.
+    """
+    code = strip_shell_comments(source).replace("\\\n", " ")
+    for m in re.finditer(r"hostlock\.sh\b", code):
+        rest = code[m.end() :].replace('"', " ").replace("'", " ")
+        word = next(iter(rest.split()), "")
+        if word in SHELL_ACQUIRING:
+            return True
+    return False
+
+
+def ep_shell_sources() -> dict[str, str]:
+    if not EP_BENCHES.is_dir():
+        return {}
+    return {
+        p.relative_to(EP_BENCHES).as_posix(): p.read_text()
+        for p in sorted(EP_BENCHES.rglob("*.sh"))
+    }
+
+
+def ep_shell_failures(
+    sources: dict[str, str], ledger: dict[str, str] | None = None
+) -> list[str]:
+    """Shell files in the benches root that neither gate nor say why."""
+    ledger = EP_SHELL_LEDGER if ledger is None else ledger
+    out = []
+    for name, source in sorted(sources.items()):
+        if shell_holds_the_lock(source):
+            continue
+        reason = ledger.get(name)
+        if reason is None:
+            out.append(
+                f"{name}: shell harness in the benches root, does not hold the "
+                "host lock, and carries no recorded reason"
+            )
+        elif not reason.startswith(EP_REASONS):
+            out.append(
+                f"{name}: recorded with an unrecognised reason {reason!r} -- "
+                f"expected one of {EP_REASONS}"
+            )
+    return out
+
+
+def dead_shell_records(
+    sources: dict[str, str], ledger: dict[str, str] | None = None
+) -> list[str]:
+    """Shell entries naming a file that is gone."""
+    ledger = EP_SHELL_LEDGER if ledger is None else ledger
+    return [
+        f"{name}: recorded, but no such file -- delete the record"
+        for name in sorted(ledger)
+        if name not in sources
+    ]
+
+
+def stale_shell_records(
+    sources: dict[str, str], ledger: dict[str, str] | None = None
+) -> list[str]:
+    """Shell gaps whose file now gates -- the record has to go with the fix."""
+    ledger = EP_SHELL_LEDGER if ledger is None else ledger
+    out = []
+    for name, reason in sorted(ledger.items()):
+        source = sources.get(name)
+        if source is None or not reason.startswith(EP_GAP):
+            continue
+        if shell_holds_the_lock(source):
+            out.append(
+                f"{name}: recorded as known-gap but it now holds the lock -- "
+                "delete the record"
             )
     return out
 
@@ -1404,6 +1580,164 @@ class EpBenches(unittest.TestCase):
         # the run and have to be reaped.
         self.assertTrue(EP_LEDGER["acc0_nothp_exec.py"].startswith(EP_WRAPPER))
         self.assertFalse(holds_the_lock(ep_sources()["acc0_nothp_exec.py"]))
+
+
+class EpShellHarnesses(unittest.TestCase):
+    """The same root, read in the other language it is written in.
+
+    Every cell here would have passed vacuously before the enumeration
+    existed, because the glob that fed it returned nothing. The live positive
+    control below is what makes a green run mean something.
+    """
+
+    def test_every_shell_harness_there_gates_or_says_why(self):
+        self.assertEqual(ep_shell_failures(ep_shell_sources()), [])
+
+    def test_the_shell_files_are_actually_found(self):
+        # The vacuity that would make this whole class free: a `*.sh` glob
+        # over a directory it cannot see returns `{}`, and `ep_shell_failures`
+        # is happiest with nothing to check.
+        found = ep_shell_sources()
+        self.assertGreater(len(found), 0, "benches root has no shell files")
+        self.assertIn("decode_placement_census.sh", found)
+
+    def test_the_census_is_read_as_gated(self):
+        # The live positive control, and the file that motivated the check:
+        # its header claimed the lock for weeks while the script never called
+        # `hostlock.sh`. If a future edit drops the re-exec, this fails by
+        # name rather than the ledger quietly growing a line.
+        source = ep_shell_sources()["decode_placement_census.sh"]
+        self.assertTrue(shell_holds_the_lock(source))
+        self.assertNotIn("decode_placement_census.sh", EP_SHELL_LEDGER)
+
+    def test_the_census_takes_it_once_around_every_arm(self):
+        # #1803's property, checked structurally as far as shell allows: the
+        # acquisition must not sit inside `run()`, which is called three
+        # times. A lock taken per arm is released between them, which is the
+        # window a peer sampled the host in and read it as clear.
+        lines = strip_shell_comments(
+            ep_shell_sources()["decode_placement_census.sh"]
+        ).splitlines()
+        taken = [i for i, ln in enumerate(lines) if "hostlock.sh" in ln]
+        self.assertEqual(len(taken), 1, taken)
+        arms = [
+            i
+            for i, ln in enumerate(lines)
+            if re.match(r"\s*run\s*(\(\)|\")", ln)
+        ]
+        self.assertEqual(len(arms), 4, arms)  # the definition and three calls
+        self.assertLess(taken[0], min(arms))
+
+    def test_a_new_ungated_shell_harness_there_is_a_failure(self):
+        fail = ep_shell_failures({"knee.sh": "#!/bin/sh\ncargo bench --bench x\n"})
+        self.assertEqual(len(fail), 1)
+        self.assertIn("carries no recorded reason", fail[0])
+
+    def test_a_shell_file_one_directory_down_is_still_read(self):
+        # Planted rather than asserted, for the reason the Python cell gives:
+        # a non-recursive glob passes a pure-function test just as well while
+        # the directory has no subdirectory, and the workflow filter is `**`.
+        planted = EP_BENCHES / "acc0_shell_tmp" / "sweep.sh"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            planted.write_text("#!/bin/sh\ncargo bench --bench x\n")
+            found = ep_shell_sources()
+            self.assertIn("acc0_shell_tmp/sweep.sh", found)
+            fail = ep_shell_failures(found)
+            self.assertEqual(len(fail), 1)
+            self.assertIn("acc0_shell_tmp/sweep.sh", fail[0])
+        finally:
+            planted.unlink(missing_ok=True)
+            planted.parent.rmdir()
+
+    def test_naming_the_script_is_not_holding_the_lock(self):
+        # The #2106 defect, in the other direction: a substring check for
+        # `hostlock.sh` counts every one of these as custody, and each of
+        # them is a script reading or waiting on the host without claiming it.
+        for sub in ("status", "provenance", "wait", "release", "status --porcelain"):
+            self.assertFalse(
+                shell_holds_the_lock(f"./scripts/hostlock.sh {sub}\n"), sub
+            )
+        self.assertFalse(shell_holds_the_lock("echo see scripts/hostlock.sh\n"))
+
+    def test_both_acquiring_subcommands_count(self):
+        for sub in SHELL_ACQUIRING:
+            self.assertTrue(shell_holds_the_lock(f"scripts/hostlock.sh {sub} --wait\n"))
+
+    def test_a_commented_out_acquisition_does_not_count(self):
+        # The exact shape of the defect this class was written for: the claim
+        # lived in a comment and the call did not exist.
+        for line in (
+            "# it runs under scripts/hostlock.sh run as a courtesy\n",
+            "  # ./scripts/hostlock.sh acquire --wait\n",
+            "echo hi  # scripts/hostlock.sh run -- x\n",
+        ):
+            self.assertFalse(shell_holds_the_lock(line), line)
+
+    def test_a_quoted_path_or_a_continuation_still_counts(self):
+        for source in (
+            '"$REPO/scripts/hostlock.sh" run --reason x -- ./bench\n',
+            "./scripts/hostlock.sh \\\n  run \\\n  --wait -- ./bench\n",
+            "exec ./scripts/hostlock.sh 'run' --wait -- \"$SELF\"\n",
+        ):
+            self.assertTrue(shell_holds_the_lock(source), source)
+
+    def test_comment_stripping_keeps_the_shell_that_needs_a_hash(self):
+        # `${x#-}` and `$#` are not comments. Truncating there would drop a
+        # real acquisition below them and report a gated file as ungated --
+        # a false alarm in somebody else's lane, which is how a check gets
+        # deleted rather than obeyed.
+        source = 'n=$#\narg=${1#-}\n./scripts/hostlock.sh run -- ./bench\n'
+        self.assertIn("${1#-}", strip_shell_comments(source))
+        self.assertTrue(shell_holds_the_lock(source))
+        quoted = 'echo "# not a comment"\nscripts/hostlock.sh run -- x\n'
+        self.assertTrue(shell_holds_the_lock(quoted))
+
+    def test_an_unrecognised_reason_does_not_suppress_the_finding(self):
+        source = "#!/bin/sh\ncargo bench --bench x\n"
+        self.assertEqual(
+            len(ep_shell_failures({"x.sh": source}, {"x.sh": "known-gap:#2043 - later"})),
+            0,
+        )
+        for reason in ("later", "", "wontfix", "gap:#2043"):
+            fail = ep_shell_failures({"x.sh": source}, {"x.sh": reason})
+            self.assertEqual(len(fail), 1, reason)
+            self.assertIn("unrecognised reason", fail[0])
+
+    def test_a_wrapper_or_a_non_benchmark_can_say_so(self):
+        source = "#!/bin/sh\nexec \"$@\"\n"
+        self.assertEqual(
+            ep_shell_failures({"w.sh": source}, {"w.sh": "wrapper:#1 - caller gates"}),
+            [],
+        )
+        self.assertEqual(
+            ep_shell_failures({"t.sh": source}, {"t.sh": "no-bench:#1 - reads lscpu"}),
+            [],
+        )
+
+    def test_the_readme_says_what_is_true_of_these_two_files(self):
+        # The doc names both files and states opposite things about them. A
+        # doc claim nothing checks is the defect this class was written for,
+        # so if either file changes side the paragraph fails with it.
+        doc = (ORT_AB / "README.md").read_text()
+        sources = ep_shell_sources()
+        self.assertIn("decode_placement_census.sh", doc)
+        self.assertTrue(shell_holds_the_lock(sources["decode_placement_census.sh"]))
+        self.assertIn("int4_modulo_arms.sh", doc)
+        self.assertTrue(EP_SHELL_LEDGER["int4_modulo_arms.sh"].startswith(EP_GAP))
+        self.assertFalse(shell_holds_the_lock(sources["int4_modulo_arms.sh"]))
+
+    def test_the_shell_ledger_is_checked_in_both_directions(self):
+        self.assertEqual(dead_shell_records(ep_shell_sources()), [])
+        self.assertEqual(stale_shell_records(ep_shell_sources()), [])
+        self.assertEqual(
+            dead_shell_records({}, {"gone.sh": "known-gap:#1 - x"}),
+            ["gone.sh: recorded, but no such file -- delete the record"],
+        )
+        gated = {"g.sh": "scripts/hostlock.sh run -- x\n"}
+        fail = stale_shell_records(gated, {"g.sh": "known-gap:#1 - x"})
+        self.assertEqual(len(fail), 1)
+        self.assertIn("delete the record", fail[0])
 
 
 class Staleness(unittest.TestCase):

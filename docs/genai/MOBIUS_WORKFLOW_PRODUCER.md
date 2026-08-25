@@ -266,7 +266,6 @@ profiles:
     outputs: { last_hidden_state: last_hidden_state }
     pooling: { kind: mean, source: last_hidden_state,
                mask: request.attention_mask, time_axis: 1, feature_axis: 2 }
-    batch_invariance: row_independent
 steps:
   - kind: invoke
     component: encoder
@@ -282,11 +281,10 @@ The declared inputs are read from the artifact, not from the task signature:
 ESM-2 has no token-type embedding, so its graph exposes only `input_ids` and
 `attention_mask`, while ProtBert's also exposes `token_type_ids`.
 
-`batch_invariance: row_independent` is claimed only when the graph consumes an
-attention mask, because that is what makes a row's values independent of the
-width the batch happened to be padded to. It is also what makes
-`pooling.kind: mean` well defined — a reader reduces each row over its own
-valid region rather than over the padded extent.
+The encoder declares `batch_capacity` only after grouped-versus-solo parity is
+established for the graph. Consuming the attention mask is necessary for this
+example but is not by itself proof. `pooling.kind: mean` uses the same mask so a
+reader reduces each row over its valid region rather than the padded extent.
 
 ### Decoder
 

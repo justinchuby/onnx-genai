@@ -10,8 +10,7 @@
     },
     "max_sequence_length": 131072,
     "runtime_configurable": {
-      "prefix_cache": true,
-      "continuous_batching": true
+      "prefix_cache": true
     }
   },
   "hardware_requirements": {

@@ -76,6 +76,7 @@ pub mod mod_op;
 pub mod movement;
 pub mod multi_head_attention;
 pub mod nary;
+pub mod non_max_suppression;
 pub mod nonzero;
 pub mod normalization;
 pub mod onehot;
@@ -333,6 +334,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "DequantizeLinear",
     "Dropout",
     "NonZero",
+    "NonMaxSuppression",
     "Unique",
     "AffineGrid",
     "BatchNormalization",
@@ -485,6 +487,7 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 
 /// Bounded CUDA Unique consumes f32 and returns f32 Y plus i64 metadata.
 static CUDA_UNIQUE_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
+static CUDA_NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 
 /// Element types the CUDA EP advertises for `(op_type, domain)`.
 ///
@@ -501,6 +504,7 @@ pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [Da
         ("DFT", "") => CUDA_DFT_DTYPES,
         ("STFT", "") => CUDA_STFT_DTYPES,
         ("Unique", "") => CUDA_UNIQUE_DTYPES,
+        ("NonMaxSuppression", "") => CUDA_NMS_DTYPES,
 
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
@@ -921,6 +925,12 @@ pub fn build_cuda_registry_with_metrics(
     reg.register(
         OpKey::new("Unique", "", 11),
         Box::new(unique::UniqueFactory {
+            runtime: runtime.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("NonMaxSuppression", "", 10),
+        Box::new(non_max_suppression::NonMaxSuppressionFactory {
             runtime: runtime.clone(),
         }),
     );
@@ -1686,7 +1696,7 @@ pub fn build_cuda_registry_with_metrics(
 #[cfg(test)]
 mod tests {
     use super::{
-        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_STFT_DTYPES,
+        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_NMS_DTYPES, CUDA_STFT_DTYPES,
         cuda_supported_dtypes_for_op,
     };
 
@@ -1886,6 +1896,15 @@ mod tests {
             cuda_supported_dtypes_for_op("STFT", ""),
             CUDA_STFT_DTYPES,
             "STFT must advertise f32 data/window plus Int32/Int64 scalar inputs"
+        );
+    }
+
+    #[test]
+    fn nms_registration_advertises_only_implemented_input_types() {
+        assert!(CUDA_COVERED_OPS.contains(&"NonMaxSuppression"));
+        assert_eq!(
+            cuda_supported_dtypes_for_op("NonMaxSuppression", ""),
+            CUDA_NMS_DTYPES
         );
     }
 

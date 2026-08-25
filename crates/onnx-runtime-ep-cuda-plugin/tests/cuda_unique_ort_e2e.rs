@@ -332,6 +332,18 @@ fn verify_fixture(name: &str, model: &onnx_std::Model) {
         Some(24),
         "{name}: ai.onnx opset"
     );
+    if name == "nms_device_workspace" {
+        assert_eq!(model.graph.inputs.len(), 5);
+        let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].op_type, "NonMaxSuppression");
+        assert_eq!(model.graph.outputs.len(), 1);
+        assert_eq!(
+            model.graph.value(model.graph.outputs[0]).dtype,
+            DataType::Int64
+        );
+        return;
+    }
     assert!(model.graph.initializers.is_empty(), "{name}: initializers");
     assert_eq!(model.graph.inputs.len(), 1, "{name}: graph inputs");
     let input = model.graph.value(model.graph.inputs[0]);
@@ -404,7 +416,12 @@ fn verify_fixture(name: &str, model: &onnx_std::Model) {
     }
 }
 
-unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtValue {
+unsafe fn tensor<T>(
+    api: *const ort::OrtApi,
+    values: &mut [T],
+    shape: &[i64],
+    dtype: ort::ONNXTensorElementDataType,
+) -> *mut ort::OrtValue {
     let mut memory_info = ptr::null_mut();
     unsafe {
         check(
@@ -417,7 +434,6 @@ unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtVal
             "CreateCpuMemoryInfo",
         )
     };
-    let shape = [values.len() as i64];
     let mut value = ptr::null_mut();
     unsafe {
         check(
@@ -427,8 +443,8 @@ unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtVal
                 values.as_mut_ptr().cast(),
                 std::mem::size_of_val(values),
                 shape.as_ptr(),
-                1,
-                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+                shape.len(),
+                dtype,
                 &mut value,
             ),
             "CreateTensorWithDataAsOrtValue",
@@ -436,6 +452,18 @@ unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtVal
         ((*api).ReleaseMemoryInfo.unwrap())(memory_info);
     }
     value
+}
+
+unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtValue {
+    let shape = [values.len() as i64];
+    unsafe {
+        tensor(
+            api,
+            values,
+            &shape,
+            ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+        )
+    }
 }
 
 unsafe fn output_bytes(
@@ -686,5 +714,134 @@ fn cuda_unique_optional_outputs_stay_positional_through_real_ort_plugin() {
             ((*session.api).ReleaseValue.unwrap())(output);
         }
         ((*session.api).ReleaseValue.unwrap())(input);
+    }
+}
+
+#[test]
+fn cuda_nms_dynamic_output_runs_through_real_ort_plugin() {
+    let _lock = lock_ort();
+    let Some(session) = (unsafe { session("nms_device_workspace", "cuda_nms") }) else {
+        if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
+            panic!("CUDA plugin or ORT unavailable");
+        }
+        return;
+    };
+    unsafe {
+        let compiled: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+            session.plugin.get(b"nxrt_ep_compiled_node_count").unwrap();
+        let reset_executed: libloading::Symbol<'_, unsafe extern "C" fn()> = session
+            .plugin
+            .get(b"nxrt_ep_reset_executed_node_count")
+            .unwrap();
+        let executed: libloading::Symbol<'_, unsafe extern "C" fn() -> usize> =
+            session.plugin.get(b"nxrt_ep_executed_node_count").unwrap();
+        let reset_stats: libloading::Symbol<'_, unsafe extern "C" fn()> = session
+            .plugin
+            .get(b"nxrt_ep_reset_nms_execution_stats")
+            .unwrap();
+        let prepare: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> =
+            session.plugin.get(b"nxrt_ep_nms_prepare_launches").unwrap();
+        let count: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> =
+            session.plugin.get(b"nxrt_ep_nms_count_launches").unwrap();
+        let materialize: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = session
+            .plugin
+            .get(b"nxrt_ep_nms_materialize_launches")
+            .unwrap();
+        let d2h: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> =
+            session.plugin.get(b"nxrt_ep_nms_d2h_bytes").unwrap();
+        let full_d2h: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = session
+            .plugin
+            .get(b"nxrt_ep_nms_full_input_d2h_bytes")
+            .unwrap();
+        reset_executed();
+        reset_stats();
+
+        let mut boxes: [f32; 12] = [
+            0., 0., 1., 1., //
+            0., 0., 0.9, 0.9, //
+            2., 2., 3., 3.,
+        ];
+        let mut scores: [f32; 6] = [0.9, 0.8, 0.7, 0.1, 0.95, 0.2];
+        let mut max_output = [2_i64];
+        let mut iou = [0.5_f32];
+        let mut score = [0.15_f32];
+        let values = [
+            tensor(
+                session.api,
+                &mut boxes,
+                &[1, 3, 4],
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            ),
+            tensor(
+                session.api,
+                &mut scores,
+                &[1, 2, 3],
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            ),
+            tensor(
+                session.api,
+                &mut max_output,
+                &[],
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+            ),
+            tensor(
+                session.api,
+                &mut iou,
+                &[],
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            ),
+            tensor(
+                session.api,
+                &mut score,
+                &[],
+                ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT,
+            ),
+        ];
+        let input_names: Vec<CString> = [
+            "boxes",
+            "scores",
+            "max_output",
+            "iou_threshold",
+            "score_threshold",
+        ]
+        .into_iter()
+        .map(|name| CString::new(name).unwrap())
+        .collect();
+        let input_ptrs: Vec<_> = input_names.iter().map(|name| name.as_ptr()).collect();
+        let value_ptrs: Vec<_> = values
+            .iter()
+            .map(|value| *value as *const ort::OrtValue)
+            .collect();
+        let output_name = CString::new("selected_indices").unwrap();
+        let mut output = ptr::null_mut();
+        check(
+            session.api,
+            ((*session.api).Run.unwrap())(
+                session.session,
+                ptr::null(),
+                input_ptrs.as_ptr(),
+                value_ptrs.as_ptr(),
+                values.len(),
+                [output_name.as_ptr()].as_ptr(),
+                1,
+                &mut output,
+            ),
+            "Run CUDA NMS",
+        );
+        assert_eq!(compiled(), 1);
+        assert_eq!(executed(), 1);
+        let got = output_bytes(session.api, output);
+        assert_eq!(got.0, [4, 3]);
+        assert_eq!(got.1, ort::ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64);
+        assert_eq!(i64s(&got.2), [0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]);
+        assert_eq!(prepare(), 1);
+        assert_eq!(count(), 1);
+        assert_eq!(materialize(), 1);
+        assert_eq!(d2h(), 8);
+        assert_eq!(full_d2h(), 0);
+        ((*session.api).ReleaseValue.unwrap())(output);
+        for value in values {
+            ((*session.api).ReleaseValue.unwrap())(value);
+        }
     }
 }

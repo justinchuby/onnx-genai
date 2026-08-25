@@ -2490,6 +2490,17 @@ impl ExecutionProvider for CudaExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "NonMaxSuppression"
+            && (op.domain.is_empty() || op.domain == "ai.onnx")
+            && let Some(reason) = crate::kernels::non_max_suppression::unsupported_reason(
+                op,
+                shapes,
+                input_dtypes,
+                layouts,
+            )
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "BlockQuantizedMatMul"
             && op.domain == "pkg.nxrt"
             && let Some(reason) = crate::kernels::block_quantized_matmul::unsupported_reason(op)

@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 use anyhow::Context;
 use image::DynamicImage;
@@ -224,11 +227,30 @@ impl ImagePreprocessor {
         shape: &[i64],
         program: &VisionPreprocessingProgram,
     ) -> anyhow::Result<Self> {
+        Self::from_typed_program(shape, program, None)
+    }
+
+    pub(super) fn from_input_and_grouped_program(
+        shape: &[i64],
+        program: &VisionPreprocessingProgram,
+        synthesized_outputs: &BTreeSet<String>,
+    ) -> anyhow::Result<Self> {
+        Self::from_typed_program(shape, program, Some(synthesized_outputs))
+    }
+
+    fn from_typed_program(
+        shape: &[i64],
+        program: &VisionPreprocessingProgram,
+        synthesized_outputs: Option<&BTreeSet<String>>,
+    ) -> anyhow::Result<Self> {
         Self::from_metadata_document(
             shape,
             Some(MetadataDocument {
                 preprocessing: Some(PreprocessingMetadata {
-                    image: Some(Self::image_metadata_from_program(program)),
+                    image: Some(Self::image_metadata_from_program(
+                        program,
+                        synthesized_outputs,
+                    )),
                 }),
             }),
         )
@@ -251,7 +273,10 @@ impl ImagePreprocessor {
         Self::from_metadata_document(shape, document)
     }
 
-    fn image_metadata_from_program(program: &VisionPreprocessingProgram) -> ImageMetadata {
+    fn image_metadata_from_program(
+        program: &VisionPreprocessingProgram,
+        synthesized_outputs: Option<&BTreeSet<String>>,
+    ) -> ImageMetadata {
         ImageMetadata {
             resize: None,
             tiling: None,
@@ -264,6 +289,9 @@ impl ImagePreprocessor {
             outputs: program
                 .outputs
                 .iter()
+                .filter(|output| {
+                    synthesized_outputs.is_none_or(|names| !names.contains(&output.name))
+                })
                 .map(Self::image_output_metadata)
                 .collect(),
         }
