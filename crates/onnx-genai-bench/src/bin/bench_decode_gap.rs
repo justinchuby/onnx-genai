@@ -335,7 +335,7 @@ struct ArmResult {
     steady_pool: task_runtime::PoolCounters,
     /// Iterations the counter deltas above actually span.
     ///
-    /// Counters are only sampled every `--snapshot-every` iterations, so the
+    /// Counters are only sampled every `--steady-window` iterations, so the
     /// nearest snapshot at or before the steady boundary is generally *earlier*
     /// than the boundary. Dividing a counter delta by the sample-window length
     /// would then overstate every per-iteration figure, so per-iteration
@@ -423,7 +423,7 @@ fn assemble(samples: Vec<f64>, snapshots: Vec<Snapshot>, args: &Args) -> ArmResu
     let first = snapshots.first().expect("a snapshot at iteration zero");
     let last = snapshots.last().expect("a snapshot at the final iteration");
     // The latest snapshot at or before the steady boundary. Counters are only
-    // sampled every `--snapshot-every` iterations, so this is generally
+    // sampled every `--steady-window` iterations, so this is generally
     // *earlier* than the boundary and the counter window is correspondingly
     // wider than the sample window -- and when steady state is reached before
     // the first interior snapshot there is no qualifying snapshot at all, so
@@ -792,17 +792,25 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_pool.spin_hits as f64 / iterations,
         result.steady_pool.slot_exhausted
     );
-    println!(
-        "  counter window: {} iters (samples above cover {}; counters are sampled every \
-         --snapshot-every iters, so the two differ)",
-        result.counter_iters,
-        result.steady_samples().len()
-    );
+    let sample_iters = result.steady_samples().len();
+    if result.counter_iters == sample_iters {
+        println!(
+            "  counter window: {} iters, same span as the samples above",
+            result.counter_iters
+        );
+    } else {
+        println!(
+            "  counter window: {} iters, WIDER than the {} the samples above cover -- \
+             counters are only sampled every --steady-window iters, so per-iter figures \
+             here are divided by {}, not by {}",
+            result.counter_iters, sample_iters, result.counter_iters, sample_iters
+        );
+    }
     if result.counters_include_warmup {
         println!(
             "  WARNING: steady state was reached before the first interior counter \
              snapshot, so every counter and cpu figure above spans the whole run and \
-             INCLUDES the warm-up transient. Lower --snapshot-every to separate them."
+             INCLUDES the warm-up transient. Lower --steady-window to separate them."
         );
     }
     // A zero-dispatch row has two very different causes and the reader cannot
