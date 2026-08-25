@@ -562,6 +562,7 @@ pub mod onehot;
 pub mod packed_multi_head_attention;
 pub mod packed_varlen_attention;
 pub mod pad;
+pub mod planar_block_quant;
 pub(crate) mod qgemm_native;
 pub mod qlinear_matmul;
 pub mod qmoe;
