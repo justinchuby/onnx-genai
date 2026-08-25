@@ -23,6 +23,8 @@ mod ir;
 mod package;
 mod pipeline;
 
+pub use schema_vocabulary::{LENGTH_CONTENT_ROLES, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT};
+
 pub use decoder_abi::*;
 pub use generation::*;
 pub use hardware::*;
@@ -44,12 +46,36 @@ pub use pipeline::*;
     transform = schema_helpers::inference_metadata_constraints
 )]
 pub struct InferenceMetadata {
-    /// Schema version of this inference-metadata document, e.g. `"v1"`.
+    /// Schema version of this inference-metadata document, e.g. `"v1.1"`.
     ///
-    /// Absent means the initial `"v1"` contract (readers default to `v1`).
-    /// Bump this only for breaking schema changes; additive fields keep the
-    /// same major version and rely on the forward-compatible "ignore unknown
-    /// fields" rule.
+    /// Canonically `"v<major>.<minor>"`, matching the `v1` that every writer in
+    /// this repository already stamps. Absence means the initial `v1.0`
+    /// contract, as do the spellings `"v1"`, `"1"`, `"1.0"` and `"v1.0"` that
+    /// predate a canonical form; readers normalize before comparing, so all of
+    /// them keep loading and `"1.1"` is an accepted synonym for `"v1.1"`. A
+    /// document that uses nothing new keeps stamping what it already stamped —
+    /// rewriting an existing spelling would change the package's semantic
+    /// identity to say something no reader distinguishes. Bump the major only
+    /// for breaking schema changes, and the minor whenever a document may carry
+    /// a field an older reader would not know.
+    ///
+    /// An additive field keeps the same major version, but note what that does
+    /// and does not buy: the v1 surface is closed — every structure here denies
+    /// unknown fields — so a reader built before a field was added rejects a
+    /// document that uses it rather than ignoring it. Compatibility with older
+    /// readers therefore comes from a new field being *absent by default*, not
+    /// from tolerance of unknown keys. A producer that emits one is declaring
+    /// that the package needs a reader which understands it, and a package that
+    /// does not emit it keeps loading everywhere it loaded before.
+    ///
+    /// That is a statement about *additive* fields, and it is not a promise that
+    /// this schema never reshapes one it already had. It does, while it is
+    /// pre-release: `token_packed` moved its `offsets` and `owner` into a
+    /// `levels` chain in v1.1, and a document written against the flat spelling
+    /// does not load at any version. A version says which fields a reader must
+    /// understand; it is not a compatibility guarantee spanning a reshape, and
+    /// nothing here silently reads an old spelling as a new one. See
+    /// `reject_flat_token_packed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_version: Option<String>,
 
@@ -88,11 +114,12 @@ pub struct InferenceMetadata {
 
     /// Declared, architecture-neutral input preprocessing programs.
     ///
-    /// Carries the typed multimodal preprocessing contract (currently the image
-    /// transform program and its named tensor outputs). Every operation and
-    /// output is generic, parameterized data — never a model family, vendor
-    /// string, or baked-in shape. Absent means the model declares no native
-    /// preprocessing program and a runtime must obtain it elsewhere or fail.
+    /// Carries the typed multimodal preprocessing contracts: the still-image,
+    /// video, and audio transform programs and their named tensor outputs.
+    /// Every operation and output is generic, parameterized data — never a
+    /// model family, vendor string, or baked-in shape. Absent means the model
+    /// declares no native preprocessing program and a runtime must obtain it
+    /// elsewhere or fail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preprocessing: Option<PreprocessingSpec>,
 
@@ -270,14 +297,20 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic image transform-operation vocabulary.
-        ImageTransformOp,
-        image_transform_op,
-        IMAGE_TRANSFORM_OP,
+        /// Generic pixel transform-operation vocabulary.
+        ///
+        /// One vocabulary spans stills and clips. A still-image program never
+        /// selects frames; a clip program samples and pads them and then does
+        /// the same spatial work. `sample_frames` and `pad_frames` are the two
+        /// operations a temporal axis adds, not a second program dialect.
+        VisionTransformOp,
+        vision_transform_op,
+        VISION_TRANSFORM_OP,
         [
             "decode",
             "decode_rgb",
             "convert_rgb",
+            "sample_frames",
             "resize",
             "rescale",
             "normalize",
@@ -285,6 +318,7 @@ mod schema_vocabulary {
             "flatten",
             "patchify",
             "pad",
+            "pad_frames",
             "emit_original_size",
             "emit_transformed_size",
             "emit_validity_mask",
@@ -294,19 +328,63 @@ mod schema_vocabulary {
     );
 
     extensible_string!(
-        /// Generic image-output content-role vocabulary.
-        ImageOutputContent,
-        image_output_content,
-        IMAGE_OUTPUT_CONTENT,
+        /// Generic pixel-output content-role vocabulary.
+        ///
+        /// A program that packs the media of several requests into one batch
+        /// emits the values that map packed entries back to request rows,
+        /// alongside the pixels themselves. Two roles cover every level:
+        /// `pack_offsets` and `pack_owner`. Which level a value serves is
+        /// stated by the ownership chain that references it, not by its role,
+        /// so a frames-to-clips pair and a clips-to-rows pair carry the same
+        /// two roles and a runtime resolves both the same way whatever the
+        /// medium calls its levels. `valid_lengths` says how much of a padded
+        /// dimension is real, and is shared with the audio vocabulary rather
+        /// than duplicated.
+        ///
+        /// They are content roles like any other: the runtime reads what a
+        /// tensor means from here, never from the name a producer chose. What
+        /// each value must structurally satisfy is stated by its tensor
+        /// contract — `batch_layout` and `padding` — which is what the
+        /// validator enforces.
+        VisionOutputContent,
+        vision_output_content,
+        VISION_OUTPUT_CONTENT,
         [
             "pixels",
             "patch_coordinates",
             "grid_dimensions",
             "original_size",
             "transformed_size",
-            "validity_mask"
+            "validity_mask",
+            "valid_lengths",
+            "pack_offsets",
+            "pack_owner"
         ]
     );
+
+    /// Content roles that state how much of a padded dimension is real.
+    ///
+    /// `valid_lengths` is the medium-independent spelling, added because a
+    /// padded video, a padded image grid, and a padded text segment all need one
+    /// and none of them is audio. The two audio names that predate it say the
+    /// same thing about a particular unit and remain correct, so a program that
+    /// already emits `frame_lengths` points its `padding` entry at that value
+    /// rather than emitting a second copy under a new name.
+    ///
+    /// This list is *informative*: a `padding` entry names its length value by
+    /// name, and nothing dispatches on which of these spellings the value
+    /// carries. Deciding validity by role would refuse correct audio programs
+    /// and would put two statements where the reference already makes one.
+    /// `valid_frames` and `valid_samples` are deliberately absent — those are
+    /// counts a graph consumes as ordinary inputs, not statements about padding.
+    pub const LENGTH_CONTENT_ROLES: [&str; 3] =
+        ["valid_lengths", "sample_lengths", "frame_lengths"];
+
+    /// Content role of the exclusive prefix offsets of an ownership level.
+    pub const PACK_OFFSETS_CONTENT: &str = "pack_offsets";
+
+    /// Content role of the owner map of an ownership level.
+    pub const PACK_OWNER_CONTENT: &str = "pack_owner";
 
     extensible_string!(
         /// Optional-thumbnail ordering vocabulary.
@@ -349,6 +427,16 @@ mod schema_vocabulary {
 
     extensible_string!(
         /// Generic audio-output content-role vocabulary.
+        ///
+        /// Audio arrived at lengths first and named them for what they count:
+        /// `sample_lengths` counts raw samples, `frame_lengths` counts frames
+        /// after framing, and `valid_frames`/`valid_samples` are the same fact
+        /// spelled as a count of the real entries. They stay, because a program
+        /// that already emits one keeps loading and because the finer name is
+        /// worth reading. `valid_lengths` joins them as the medium-independent
+        /// spelling, and all five are one role to the validator: the value a
+        /// `padding` entry names must carry one of them, whichever the producer
+        /// chose. See [`LENGTH_CONTENT_ROLES`].
         AudioOutputContent,
         audio_output_content,
         AUDIO_OUTPUT_CONTENT,
@@ -360,7 +448,10 @@ mod schema_vocabulary {
             "valid_samples",
             "sample_lengths",
             "frame_lengths",
-            "validity_mask"
+            "valid_lengths",
+            "validity_mask",
+            "pack_offsets",
+            "pack_owner"
         ]
     );
 
@@ -521,12 +612,12 @@ mod schema_helpers {
         extensible_string_enum(schema, super::schema_vocabulary::PRECISION);
     }
 
-    pub(super) fn image_transform_op(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_TRANSFORM_OP);
+    pub(super) fn vision_transform_op(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_TRANSFORM_OP);
     }
 
-    pub(super) fn image_output_content(schema: &mut Schema) {
-        extensible_string_enum(schema, super::schema_vocabulary::IMAGE_OUTPUT_CONTENT);
+    pub(super) fn vision_output_content(schema: &mut Schema) {
+        extensible_string_enum(schema, super::schema_vocabulary::VISION_OUTPUT_CONTENT);
     }
 
     pub(super) fn audio_transform_op(schema: &mut Schema) {

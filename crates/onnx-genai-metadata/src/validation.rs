@@ -343,8 +343,14 @@ fn collect_workflow_capabilities(node: &WorkflowNode, capabilities: &mut BTreeSe
 pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>> {
     let mut errors = Vec::new();
 
+    // An unreadable version is reported once, by `validate_schema_version`
+    // below. Falling back to the initial version here validates the rest of the
+    // document at the most permissive strictness rather than adding a second,
+    // derived complaint about the same missing fact.
+    let version = crate::version::normalize(metadata.schema_version.as_deref())
+        .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
     if let Some(pipeline) = &metadata.pipeline
-        && let Err(error) = validate_pipeline_spec(pipeline)
+        && let Err(error) = validate_pipeline_spec(pipeline, version)
     {
         errors.extend(error.errors);
     }
@@ -368,6 +374,7 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
             }
         }
     }
+    validate_schema_version(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
@@ -379,6 +386,127 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
     } else {
         Err(errors)
     }
+}
+
+/// A document declares the version whose fields it actually uses.
+///
+/// Absence is the compatibility mechanism in a schema that denies unknown
+/// fields: a package that uses no *added* field keeps loading on every runtime
+/// it loaded on before, and one that uses something new needs a reader that
+/// knows it. That only works if the declared version tells the truth, so a
+/// document carrying a `1.1` field while claiming `1.0` is refused here rather
+/// than discovered by an older runtime as a mystery unknown-field error.
+///
+/// The emphasis is load-bearing: absence buys nothing for a field that was
+/// *reshaped* rather than added, because the old spelling is absent from the
+/// new reader by construction. `token_packed` is this schema's one such case
+/// while it is pre-release, and it is refused by name in
+/// [`crate::parser`] instead of being read as a version mismatch it is not.
+fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    let declared = match crate::version::normalize(metadata.schema_version.as_deref()) {
+        Ok(version) => version,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+    if declared > crate::version::SUPPORTED_SCHEMA_VERSION {
+        errors.push(format!(
+            "this package declares inference-metadata schema version {declared}, and this build \
+             reads up to {}",
+            crate::version::SUPPORTED_SCHEMA_VERSION
+        ));
+        return;
+    }
+    let Some(feature) = batching_schema_feature(metadata) else {
+        return;
+    };
+    let required = crate::version::BATCHING_SCHEMA_VERSION;
+    if declared < required {
+        let spelled = metadata.schema_version.as_deref().unwrap_or("<absent>");
+        errors.push(format!(
+            "this package {feature}, which schema version {required} introduced, but declares \
+             schema_version '{spelled}' ({declared}). Every structure in this schema refuses \
+             fields it does not know, so a reader built for {declared} would reject this document \
+             with a puzzled unknown-field error; declare schema_version '{required}' so it is \
+             refused for the reason that is true"
+        ));
+    }
+}
+
+/// The first `1.1` field this document uses, described the way a document
+/// writer would recognize it.
+fn batching_schema_feature(metadata: &InferenceMetadata) -> Option<String> {
+    let mut sites: Vec<(String, &crate::schema::TensorContract)> = Vec::new();
+    if let Some(preprocessing) = &metadata.preprocessing {
+        if preprocessing.video.is_some() {
+            return Some("declares preprocessing.video".to_string());
+        }
+        if let Some(program) = &preprocessing.image {
+            for binding in &program.outputs {
+                if let Some(contract) = &binding.contract {
+                    sites.push((
+                        format!("preprocessing.image output '{}'", binding.name),
+                        contract,
+                    ));
+                }
+            }
+        }
+        if let Some(program) = &preprocessing.audio {
+            for binding in &program.outputs {
+                if let Some(contract) = &binding.contract {
+                    sites.push((
+                        format!("preprocessing.audio output '{}'", binding.name),
+                        contract,
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    {
+        for (name, component) in &workflow.components {
+            if component.batch_capacity.is_some() {
+                return Some(format!(
+                    "declares batch_capacity on workflow component '{name}'"
+                ));
+            }
+        }
+        for (name, input) in &workflow.inputs {
+            sites.push((format!("workflow input '{name}'"), &input.contract));
+        }
+        for (name, output) in &workflow.outputs {
+            sites.push((format!("workflow output '{name}'"), &output.contract));
+        }
+        for (name, state) in &workflow.state {
+            sites.push((format!("workflow state '{name}'"), &state.contract));
+        }
+        for (component, spec) in &workflow.components {
+            for (direction, ports) in [
+                ("input", &spec.ports.inputs),
+                ("output", &spec.ports.outputs),
+            ] {
+                for (port, contract) in ports {
+                    sites.push((
+                        format!("workflow component '{component}' {direction} '{port}'"),
+                        contract,
+                    ));
+                }
+            }
+        }
+    }
+    for (path, contract) in sites {
+        if !contract.padding.is_empty() {
+            return Some(format!("declares padding on {path}"));
+        }
+        if !contract.batch_layout.levels().is_empty() {
+            return Some(format!("declares a token_packed ownership chain on {path}"));
+        }
+    }
+    None
 }
 
 /// Generation overrides must be structural: every overridable field binds a
@@ -713,14 +841,122 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
 
 /// One preprocessing output binding, viewed independently of its modality.
 ///
-/// Image and audio programs bind processor-local values to typed SSA names
-/// under identical rules, so the workflow checks below are written once against
-/// this view rather than duplicated per modality.
+/// Image, video, and audio programs bind processor-local values to typed SSA
+/// names under identical rules, so the workflow checks below are written once
+/// against this view rather than duplicated per modality.
 struct PreprocessingOutputView<'a> {
     name: &'a str,
     dtype: &'a str,
+    content: &'a str,
     contract: Option<&'a crate::schema::TensorContract>,
     optional: bool,
+}
+
+impl<'a> PreprocessingOutputView<'a> {
+    fn pixels(program: &'a crate::schema::VisionPreprocessingProgram) -> Vec<Self> {
+        program
+            .outputs
+            .iter()
+            .map(|output| PreprocessingOutputView {
+                name: &output.name,
+                dtype: &output.dtype,
+                content: &output.content,
+                contract: output.contract.as_ref(),
+                optional: output.optional.unwrap_or(false),
+            })
+            .collect()
+    }
+
+    fn audio(program: &'a crate::schema::AudioPreprocessingProgram) -> Vec<Self> {
+        program
+            .outputs
+            .iter()
+            .map(|output| PreprocessingOutputView {
+                name: &output.name,
+                dtype: &output.dtype,
+                content: &output.content,
+                contract: output.contract.as_ref(),
+                optional: output.optional.unwrap_or(false),
+            })
+            .collect()
+    }
+}
+
+/// A companion a program emits carries the role that says what it is.
+///
+/// The reference in an ownership level says *that* a value describes a packed
+/// tensor; the content role says *what a runtime may do with it*. There are two
+/// ownership roles for every level and every modality — `pack_offsets` and
+/// `pack_owner` — so a program that emitted an owner map under the role `pixels`
+/// would be handing its caller a tensor it could only guess at.
+///
+/// This reaches only declarations that have a role to check, which is what makes
+/// it enforceable rather than merely desirable. A preprocessing program declares
+/// what each of its outputs *is*, so a program that wires some other plausible
+/// int64 rank-1 vector into a level is caught here instead of at the first
+/// split. A companion a component's graph produces has no such declaration — it
+/// is an ONNX output port, and a port contract has nowhere to carry a content
+/// role — so a level whose extent is `produced` is not asked for something its
+/// half of the schema does not have.
+///
+/// Padding deliberately does not get the same treatment, and the difference is
+/// not an inconsistency. A length vector already has established modality
+/// spellings that programs legitimately emit, so no single role could be
+/// demanded without breaking a program that predates the generic name. The two
+/// ownership roles are new, with no legacy to accommodate, so requiring them
+/// rejects nothing that exists. Both rules resolve the *reference* by name; this
+/// one additionally constrains what the referenced declaration may claim to be.
+fn validate_program_companion_roles(
+    kind: &str,
+    outputs: &[PreprocessingOutputView<'_>],
+    errors: &mut Vec<String>,
+) {
+    let role_of: BTreeMap<&str, &str> = outputs
+        .iter()
+        .map(|output| (output.name, output.content))
+        .collect();
+    let mut require = |referrer: &str, companion: &str, allowed: &[&str], what: &str| {
+        let Some(role) = role_of.get(companion) else {
+            return;
+        };
+        if allowed.contains(role) {
+            return;
+        }
+        errors.push(format!(
+            "preprocessing.{kind} output '{referrer}' names '{companion}' as its {what}, but that \
+             output carries content role '{role}'; a companion says what it is by its role, and \
+             the roles that say this are {}",
+            allowed
+                .iter()
+                .map(|role| format!("'{role}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    };
+    for output in outputs {
+        let Some(contract) = output.contract else {
+            continue;
+        };
+        // A `padding` entry names its length value by name, not by role. The
+        // audio vocabulary already spells a length `frame_lengths` and
+        // `sample_lengths`, and a program pointing its padding entry at the one
+        // it already emits is right rather than in need of a second output, so
+        // nothing here dispatches on which spelling it chose.
+        for level in contract.batch_layout.levels() {
+            require(
+                output.name,
+                &level.offsets,
+                &[crate::schema::PACK_OFFSETS_CONTENT],
+                "ownership offsets",
+            );
+            require(
+                output.name,
+                &level.owner,
+                &[crate::schema::PACK_OWNER_CONTENT],
+                "ownership owner map",
+            );
+        }
+    }
 }
 
 fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
@@ -732,46 +968,32 @@ fn validate_preprocessing_workflow(metadata: &InferenceMetadata, errors: &mut Ve
         return;
     };
     let preprocessing = metadata.preprocessing.as_ref();
-    validate_preprocessing_program(
-        workflow,
-        "image",
-        "onnx-genai.image-preprocess",
-        preprocessing
-            .and_then(|spec| spec.image.as_ref())
-            .map(|program| {
-                program
-                    .outputs
-                    .iter()
-                    .map(|output| PreprocessingOutputView {
-                        name: &output.name,
-                        dtype: &output.dtype,
-                        contract: output.contract.as_ref(),
-                        optional: output.optional.unwrap_or(false),
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        errors,
-    );
-    validate_preprocessing_program(
-        workflow,
-        "audio",
-        "onnx-genai.audio-preprocess",
-        preprocessing
-            .and_then(|spec| spec.audio.as_ref())
-            .map(|program| {
-                program
-                    .outputs
-                    .iter()
-                    .map(|output| PreprocessingOutputView {
-                        name: &output.name,
-                        dtype: &output.dtype,
-                        contract: output.contract.as_ref(),
-                        optional: output.optional.unwrap_or(false),
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        errors,
-    );
+    let programs = [
+        (
+            "image",
+            "onnx-genai.image-preprocess",
+            preprocessing
+                .and_then(|spec| spec.image.as_ref())
+                .map(PreprocessingOutputView::pixels),
+        ),
+        (
+            "video",
+            "onnx-genai.video-preprocess",
+            preprocessing
+                .and_then(|spec| spec.video.as_ref())
+                .map(PreprocessingOutputView::pixels),
+        ),
+        (
+            "audio",
+            "onnx-genai.audio-preprocess",
+            preprocessing
+                .and_then(|spec| spec.audio.as_ref())
+                .map(PreprocessingOutputView::audio),
+        ),
+    ];
+    for (kind, abi, program_outputs) in programs {
+        validate_preprocessing_program(workflow, kind, abi, program_outputs, errors);
+    }
 }
 
 fn validate_preprocessing_program(
@@ -804,6 +1026,7 @@ fn validate_preprocessing_program(
     let Some(program_outputs) = program_outputs else {
         return;
     };
+    validate_program_companion_roles(kind, &program_outputs, errors);
     if adapters.len() != 1 {
         errors.push(format!(
             "preprocessing.{kind} requires exactly one workflow adapter component using \
@@ -933,13 +1156,15 @@ fn require_compatible_tensor_contracts(
             other => other,
         }
     }
-    // batch_layout is part of the contract: a preprocessing output that claims a
-    // different row correspondence than the port it feeds would let per-request
-    // rows drift out of alignment with the rest of the workflow.
+    // batch_layout and padding are part of the contract: a preprocessing output
+    // that claims a different row correspondence, or a different notion of which
+    // entries are real, than the port it feeds would let per-request rows drift
+    // out of alignment with the rest of the workflow.
     if normalize(&source.dtype) != normalize(&target.dtype)
         || source.rank != target.rank
         || source.shape != target.shape
         || source.batch_layout != target.batch_layout
+        || source.padding != target.padding
     {
         errors.push(format!(
             "{path} has a contract incompatible with its adapter output port"
@@ -955,9 +1180,18 @@ pub struct PipelineValidationError {
 }
 
 /// Validate the pipeline DAG and component references.
-pub fn validate_pipeline_spec(spec: &PipelineSpec) -> Result<(), PipelineValidationError> {
+///
+/// `version` is the schema version the document declares, normalized. Almost
+/// every rule here is version-independent, because almost every rule describes a
+/// document that never worked. A rule that instead tightens what a *working*
+/// document must say is scoped to the version that introduced it, so a package
+/// on the shelf keeps loading: see [`validate_emit_axis`].
+pub fn validate_pipeline_spec(
+    spec: &PipelineSpec,
+    version: crate::version::SchemaVersion,
+) -> Result<(), PipelineValidationError> {
     let mut errors = Vec::new();
-    validate_workflow(&spec.workflow, &mut errors);
+    validate_workflow(&spec.workflow, version, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1465,7 +1699,11 @@ fn validate_adapter_service(
     }
 }
 
-fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+fn validate_workflow(
+    workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
+    errors: &mut Vec<String>,
+) {
     let compiled = match crate::compile_workflow(workflow) {
         Ok(compiled) => compiled,
         Err(error) => {
@@ -2060,6 +2298,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
                     shape: Some(Vec::new()),
                     optional: false,
                     batch_layout: crate::schema::BatchLayout::Shared,
+                    padding: Vec::new(),
                 },
             );
         }
@@ -2069,6 +2308,7 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     validate_workflow_node(
         &compiled.graph,
         workflow,
+        version,
         &mut values,
         &mut value_contracts,
         &mut effects,
@@ -2091,6 +2331,9 @@ fn validate_workflow(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     );
     validate_effect_declarations(workflow, errors);
     validate_row_scoped_components(workflow, errors);
+    validate_batch_layout_references(workflow, errors);
+    validate_shared_companions(workflow, errors);
+    validate_batch_capacity(workflow, errors);
     validate_state_lifetimes(workflow, errors);
     validate_session_continuity(workflow, errors);
     if let Some(serving) = &workflow.serving {
@@ -2322,12 +2565,1292 @@ fn validate_row_scoped_components(workflow: &WorkflowSpec, errors: &mut Vec<Stri
     }
 }
 
-/// State the runtime or an external service owns must say when it may be freed.
+/// Values a packed layout or a pad mask may name from one declaration site.
 ///
-/// An ordinary tensor's lifetime is SSA liveness: the runtime frees it when
-/// nothing can read it again. Runtime-managed and external state has no such
-/// bound — nothing in the dataflow says the last reader has run — so the
-/// document must name the boundary at which it becomes releasable.
+/// A workflow-level contract may only name workflow values. A component port
+/// contract may additionally name a sibling port of the same component, because
+/// the component's own ABI is what pairs a padded tensor with its lengths or a
+/// packed tensor with its offsets; which SSA value reaches that port is the
+/// invocation's business, not the port's.
+#[derive(Clone, Copy)]
+struct LayoutReferenceScope<'a> {
+    declared: &'a BTreeSet<String>,
+    contracts: &'a BTreeMap<String, crate::schema::TensorContract>,
+    ports: Option<&'a crate::schema::ComponentPorts>,
+}
+
+impl LayoutReferenceScope<'_> {
+    fn is_declared(&self, value: &str) -> bool {
+        self.declared.contains(value)
+            || self.ports.is_some_and(|ports| {
+                ports.inputs.contains_key(value) || ports.outputs.contains_key(value)
+            })
+    }
+
+    /// The contract of a referenced value, when the document states one.
+    ///
+    /// A value produced by control flow or by a component with inferred ports
+    /// has no stated contract; such a reference is checked for existence only,
+    /// which is all the document can support.
+    fn contract(&self, value: &str) -> Option<&crate::schema::TensorContract> {
+        self.ports
+            .and_then(|ports| ports.inputs.get(value).or_else(|| ports.outputs.get(value)))
+            .or_else(|| self.contracts.get(value))
+    }
+}
+
+fn is_integer_dtype(dtype: &str) -> bool {
+    matches!(
+        dtype,
+        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
+    )
+}
+
+/// Every value name the workflow declares, with the contracts it states directly.
+fn workflow_declared_values(
+    workflow: &WorkflowSpec,
+) -> (
+    BTreeSet<String>,
+    BTreeMap<String, crate::schema::TensorContract>,
+) {
+    fn collect_invoke_contracts(
+        steps: &[WorkflowStep],
+        workflow: &WorkflowSpec,
+        contracts: &mut BTreeMap<String, crate::schema::TensorContract>,
+    ) {
+        for step in steps {
+            match step {
+                WorkflowStep::Sequence { steps } => {
+                    collect_invoke_contracts(steps, workflow, contracts)
+                }
+                WorkflowStep::Invoke {
+                    component, outputs, ..
+                } => {
+                    let Some(declaration) = workflow.components.get(component) else {
+                        continue;
+                    };
+                    for (port, value) in outputs {
+                        if let Some(contract) = declaration.ports.outputs.get(port) {
+                            contracts.insert(value.clone(), contract.clone());
+                        }
+                    }
+                }
+                WorkflowStep::Loop { setup, steps, .. } => {
+                    collect_invoke_contracts(setup, workflow, contracts);
+                    collect_invoke_contracts(steps, workflow, contracts);
+                }
+                WorkflowStep::Branch { cases, default, .. } => {
+                    for case in cases.values() {
+                        collect_invoke_contracts(std::slice::from_ref(case), workflow, contracts);
+                    }
+                    if let Some(default) = default {
+                        collect_invoke_contracts(
+                            std::slice::from_ref(default),
+                            workflow,
+                            contracts,
+                        );
+                    }
+                }
+                WorkflowStep::Emit { .. } => {}
+            }
+        }
+    }
+
+    let mut declared = workflow_step_produced_values(&workflow.steps);
+    let mut contracts = BTreeMap::new();
+    for (name, input) in &workflow.inputs {
+        declared.insert(name.clone());
+        contracts.insert(name.clone(), input.contract.clone());
+        if let Some(present_as) = &input.present_as {
+            declared.insert(present_as.clone());
+        }
+    }
+    for (name, state) in &workflow.state {
+        declared.insert(name.clone());
+        contracts.insert(name.clone(), state.contract.clone());
+    }
+    for (name, output) in &workflow.outputs {
+        declared.insert(name.clone());
+        contracts
+            .entry(name.clone())
+            .or_insert_with(|| output.contract.clone());
+    }
+    collect_invoke_contracts(&workflow.steps, workflow, &mut contracts);
+    (declared, contracts)
+}
+
+/// A packed layout and a validity companion are references, and a reference
+/// that resolves to nothing — or to a value that cannot carry what it is asked
+/// to carry — is a contract no runtime can execute.
+///
+/// `token_packed` is the only layout whose meaning lives in other values: the
+/// offsets say how many items each owner contributed and the owner map says
+/// which owner each item came from. Together they are what lets a runtime split
+/// a packed result back into per-request pieces without any serialized row
+/// identity, so they must be values that exist, are integers, and are shaped
+/// the way that mapping requires. `padding` is the same kind of fact for a
+/// padded batch.
+fn validate_batch_layout_references(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let (declared, contracts) = workflow_declared_values(workflow);
+    let workflow_scope = LayoutReferenceScope {
+        declared: &declared,
+        contracts: &contracts,
+        ports: None,
+    };
+    for (name, input) in &workflow.inputs {
+        validate_contract_references(
+            &format!("workflow input '{name}'"),
+            Some(name),
+            &input.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, output) in &workflow.outputs {
+        validate_contract_references(
+            &format!("workflow output '{name}'"),
+            Some(name),
+            &output.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, state) in &workflow.state {
+        validate_contract_references(
+            &format!("workflow state '{name}'"),
+            Some(name),
+            &state.contract,
+            &workflow_scope,
+            errors,
+        );
+    }
+    for (name, component) in &workflow.components {
+        let scope = LayoutReferenceScope {
+            declared: &declared,
+            contracts: &contracts,
+            ports: Some(&component.ports),
+        };
+        for (direction, ports) in [
+            ("input", &component.ports.inputs),
+            ("output", &component.ports.outputs),
+        ] {
+            for (port, contract) in ports {
+                let path = format!("workflow component '{name}' {direction} '{port}'");
+                validate_contract_references(&path, Some(port), contract, &scope, errors);
+                validate_packed_extent(&path, direction, contract, &component.ports, errors);
+            }
+        }
+    }
+}
+
+/// Where a packed component port's extent comes from, and who produces the
+/// companions that state it.
+///
+/// An output of the same rank and symbols as its input may be a per-item
+/// transform or a token merger, and the two split at completely different
+/// boundaries. Nothing in the contract distinguishes them, so the package
+/// declares which — and a runtime that had to guess would slice the payload at
+/// the wrong places and report nothing at all.
+fn validate_packed_extent(
+    path: &str,
+    direction: &str,
+    contract: &crate::schema::TensorContract,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let levels = contract.batch_layout.levels();
+    if levels.is_empty() {
+        return;
+    }
+    for (index, level) in levels.iter().enumerate() {
+        if direction == "input" {
+            if let Some(extent) = level.extent {
+                errors.push(format!(
+                    "{path} declares level {index} extent {}; every count of a value a component \
+                     consumes is one its caller assembled, so only an output states where a level \
+                     came from",
+                    extent.name()
+                ));
+            }
+            continue;
+        }
+        let Some(extent) = level.extent else {
+            errors.push(format!(
+                "{path} packs items but declares no extent for level {index}; a level either \
+                 preserves an input level's units one for one or produces its own, and a runtime \
+                 that guessed would split the result at the wrong boundaries"
+            ));
+            continue;
+        };
+        // Each level answers for itself. The mixed chain — an inner level the
+        // graph produced sitting under an outer one it left exactly as it found
+        // it — is the ordinary shape of a token-merging encoder, and a single
+        // answer for the whole chain could only be wrong at one end.
+        for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
+            match extent {
+                // Preserving a count means reusing the companions that already
+                // describe it. A companion the component's own graph emits
+                // describes units that did not exist when the call was
+                // assembled, so it cannot be the one being preserved.
+                crate::schema::PackedExtent::Preserved => {
+                    if ports.outputs.contains_key(companion) {
+                        errors.push(format!(
+                            "{path} declares level {index} extent preserved but its {role} \
+                             '{companion}' is an output port of the same component; preserving a \
+                             level means reusing the companions that already described it, and \
+                             one the graph emits describes units the caller never assembled"
+                        ));
+                    }
+                }
+                // A count the graph decides is described by companions the graph
+                // emits. Reusing an input's offsets here would describe a length
+                // the output does not have, and the split would land between
+                // items.
+                crate::schema::PackedExtent::Produced => {
+                    if !ports.outputs.contains_key(companion) {
+                        errors.push(format!(
+                            "{path} declares level {index} extent produced but its {role} \
+                             '{companion}' is not an output port of the same component; a level \
+                             the graph decides is described by companions the graph emits"
+                        ));
+                    }
+                }
+            }
+        }
+        // Correspondence is by the pair, not by the position. An output that
+        // consumed its inner level carries the surviving pair at index zero
+        // while the input carries it at index one, so matching by index would
+        // reject the ordinary token-merging encoder and accept an output that
+        // claims to preserve a grouping nothing handed it.
+        if extent == crate::schema::PackedExtent::Preserved
+            && !ports.inputs.values().any(|input| {
+                input.batch_layout.levels().iter().any(|candidate| {
+                    candidate.offsets == level.offsets && candidate.owner == level.owner
+                })
+            })
+        {
+            errors.push(format!(
+                "{path} declares level {index} extent preserved but no input port of the \
+                 component declares an ownership level pairing offsets '{}' with owner map '{}'; \
+                 a level is preserved by reusing the very pair that described it, and levels \
+                 correspond by that pair rather than by their position, since an output may drop \
+                 an inner level it consumed",
+                level.offsets, level.owner
+            ));
+        }
+    }
+}
+
+/// Two packed values that share a level's offsets share its grouping.
+///
+/// An `offsets` vector is a complete description of how many units each parent
+/// owns, so two values naming the same one at the same level are claiming the
+/// same grouping. If they pair it with different owner maps, one of the two is
+/// packed against a grouping that does not describe it, and a runtime would
+/// split whichever it read second at the wrong boundaries.
+/// The two counts a companion pair carries, and the site that first stated them.
+struct PairExtents<'a> {
+    offsets: Option<&'a str>,
+    owner: Option<&'a str>,
+    first: String,
+}
+
+fn validate_shared_companions(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    let (declared, contracts) = workflow_declared_values(workflow);
+    let workflow_scope = LayoutReferenceScope {
+        declared: &declared,
+        contracts: &contracts,
+        ports: None,
+    };
+    let mut sites: Vec<(
+        String,
+        &crate::schema::TensorContract,
+        LayoutReferenceScope<'_>,
+    )> = Vec::new();
+    for (name, input) in &workflow.inputs {
+        sites.push((
+            format!("workflow input '{name}'"),
+            &input.contract,
+            workflow_scope,
+        ));
+    }
+    for (name, output) in &workflow.outputs {
+        sites.push((
+            format!("workflow output '{name}'"),
+            &output.contract,
+            workflow_scope,
+        ));
+    }
+    for (name, state) in &workflow.state {
+        sites.push((
+            format!("workflow state '{name}'"),
+            &state.contract,
+            workflow_scope,
+        ));
+    }
+    for (component, spec) in &workflow.components {
+        let scope = LayoutReferenceScope {
+            declared: &declared,
+            contracts: &contracts,
+            ports: Some(&spec.ports),
+        };
+        for (direction, ports) in [
+            ("input", &spec.ports.inputs),
+            ("output", &spec.ports.outputs),
+        ] {
+            for (port, contract) in ports {
+                sites.push((
+                    format!("workflow component '{component}' {direction} '{port}'"),
+                    contract,
+                    scope,
+                ));
+            }
+        }
+    }
+    // A level is identified by the pair it names, never by where it sits in a
+    // chain. An output that consumed its inner level carries the surviving pair
+    // at index zero while its input carries the same pair at index one, so a
+    // check keyed on position would call two spellings of one grouping a
+    // conflict and would miss a genuine one a level apart.
+    let mut pairings: BTreeMap<&str, (&str, String)> = BTreeMap::new();
+    let mut owners: BTreeMap<&str, String> = BTreeMap::new();
+    let mut extents: BTreeMap<(&str, &str), PairExtents<'_>> = BTreeMap::new();
+    for (path, contract, scope) in &sites {
+        for level in contract.batch_layout.levels() {
+            owners
+                .entry(level.owner.as_str())
+                .or_insert_with(|| path.clone());
+            if let Some((previous, first)) = pairings.get(level.offsets.as_str())
+                && *previous != level.owner.as_str()
+            {
+                errors.push(format!(
+                    "{path} pairs offsets '{}' with owner map '{}', but {first} pairs the same \
+                     offsets with '{previous}'; one offsets vector describes one grouping, so the \
+                     two cannot both be right",
+                    level.offsets, level.owner
+                ));
+                continue;
+            }
+            pairings.insert(level.offsets.as_str(), (level.owner.as_str(), path.clone()));
+            // The pair is a mapping from child units to parent units, so the two
+            // numbers it carries — the child count and the parent count plus one
+            // — are properties of the mapping and not of the port that names it.
+            // A port that resolved either to a different symbol would be reading
+            // the same vectors as a different grouping.
+            let key = (level.offsets.as_str(), level.owner.as_str());
+            let stated = (
+                scope.contract(&level.offsets).and_then(extent_symbol),
+                scope.contract(&level.owner).and_then(extent_symbol),
+            );
+            match extents.get(&key) {
+                Some(seen) => {
+                    let first = &seen.first;
+                    for (role, previous, now, companion) in [
+                        ("offsets", &seen.offsets, &stated.0, &level.offsets),
+                        ("owner map", &seen.owner, &stated.1, &level.owner),
+                    ] {
+                        if let (Some(previous), Some(now)) = (previous, now)
+                            && previous != now
+                        {
+                            errors.push(format!(
+                                "{path} resolves the {role} '{companion}' of the level pairing \
+                                 '{}' with '{}' to extent '{now}', but {first} resolves the same \
+                                 companion to '{previous}'; a pair is one mapping wherever it is \
+                                 named, so its counts cannot differ by the port that names it",
+                                level.offsets, level.owner
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    extents.insert(
+                        key,
+                        PairExtents {
+                            offsets: stated.0,
+                            owner: stated.1,
+                            first: path.clone(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    // An owner map indexes into a batch the caller never sees. Its positions
+    // exist only once a group has been formed, and the per-request view of a
+    // packed value is derived by rebasing that request's offsets to zero — not
+    // by reading an owner vector back. So an owner companion is runtime-internal
+    // plumbing, and an application cannot hand one in.
+    //
+    // This reaches the owner and nothing else. Offsets are per-request
+    // meaningful and are delivered rebased, and a `valid_lengths` is already
+    // relative to the item it measures — it means the same number in any group,
+    // so a request states its own and receives the slice that indexes its own
+    // items, with nothing to rebase and no group position to leak.
+    for (name, first) in &owners {
+        let Some(input) = workflow.inputs.get(*name) else {
+            continue;
+        };
+        if input.externally_suppliable {
+            errors.push(format!(
+                "workflow input '{name}' is externally_suppliable but {first} names it as an \
+                 ownership owner map; an owner map indexes into a batch the application never \
+                 sees, and the per-request view is derived by rebasing that request's offsets, so \
+                 an owner map is runtime-internal and cannot be supplied"
+            ));
+        }
+    }
+}
+
+fn validate_contract_references(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    if let crate::schema::BatchLayout::TokenPacked { axis, levels, .. } = &contract.batch_layout {
+        validate_token_packed_layout(path, value, contract, *axis, levels, scope, errors);
+    }
+    validate_padding(path, value, contract, scope, errors);
+}
+
+/// What a packed value's ownership chain must satisfy for a runtime to be able
+/// to fold the packed run back into per-request pieces.
+///
+/// Everything here is a statement about the graph: names resolve, dtypes and
+/// ranks can carry what they are asked to carry, and no two declarations
+/// contradict each other. What the companions *contain* — that offsets start at
+/// zero, rise monotonically, and end at the packed extent, and that every owner
+/// position is in range — is a property of the values themselves. Those are
+/// checked where the values live, at invocation time on the device that holds
+/// them; reading them at load time would mean copying device memory back to the
+/// host to answer a question the document cannot answer anyway.
+#[allow(clippy::too_many_arguments)]
+fn validate_token_packed_layout(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    axis: usize,
+    levels: &[crate::schema::OwnershipLevel],
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    if axis >= contract.rank {
+        errors.push(format!(
+            "{path} packs items along axis {axis}, outside its rank {}",
+            contract.rank
+        ));
+        return;
+    }
+    // A per-request piece of a packed value is a contiguous element window only
+    // when the items are the outermost stride. An inner packed axis would make
+    // every split a strided gather — a full device-side copy of the payload, per
+    // row, per invocation — which is the cost packing exists to avoid. This holds
+    // wherever `token_packed` appears, not only where a component declares a
+    // capacity: an emit rebases offsets and derives per-request owners with no
+    // capacity in sight and wants the same contiguity, so a component that
+    // declared none has simply not said it could pay for a gather.
+    if axis != 0 {
+        errors.push(format!(
+            "{path} packs items along axis {axis}; a packed axis must be axis 0, because only \
+             then is each request's span a contiguous range that can be aliased rather than \
+             gathered"
+        ));
+    }
+    if levels.is_empty() {
+        errors.push(format!(
+            "{path} packs items but declares no ownership levels; a packed run is only \
+             attributable to requests through at least one offsets/owner pair"
+        ));
+        return;
+    }
+    if levels.len() > MAX_OWNERSHIP_LEVELS {
+        errors.push(format!(
+            "{path} declares {} ownership levels, more than the {MAX_OWNERSHIP_LEVELS} a packed \
+             value may carry; parts in items in rows is the deepest chain this schema states, and \
+             a deeper one is a schema change rather than something a package asserts into \
+             existence",
+            levels.len()
+        ));
+        return;
+    }
+    // Every companion is a different vector with a different length, so one
+    // value cannot serve two of these roles. Naming it twice is a contradiction
+    // the runtime would resolve silently by reading the wrong lengths.
+    let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+    for (level, role, companion) in contract.batch_layout.companions() {
+        let role = format!("level {level} {role}");
+        if let Some(previous) = seen.insert(companion, role.clone())
+            && previous != role
+        {
+            errors.push(format!(
+                "{path} names '{companion}' as both its {previous} and its {role}; the two are \
+                 different vectors of different lengths, so one value cannot be both"
+            ));
+        }
+    }
+    let packed_symbol = contract
+        .shape
+        .as_ref()
+        .and_then(|shape| shape.get(axis))
+        .and_then(symbol_of);
+    for (index, level) in levels.iter().enumerate() {
+        let owner = validate_ownership_level(path, value, index, level, scope, errors);
+        // Level zero's owner has one entry per packed position, so the two are
+        // the same count and the document has to say so with one symbol. Two
+        // symbols is two numbers for one quantity, and a runtime that trusted
+        // either would split the payload at the wrong boundaries.
+        if index == 0
+            && let (Some(packed), Some(owner)) = (packed_symbol, owner.and_then(extent_symbol))
+            && packed != owner
+        {
+            errors.push(format!(
+                "{path} packs '{packed}' items on axis {axis} but its level 0 owner map '{}' is \
+                 '{owner}' long; the owner map has exactly one entry per packed item, so both \
+                 must name the same extent",
+                level.owner
+            ));
+        }
+        // A level's offsets is one longer than the count of its parents, which
+        // is the count its own owner map indexes into. Reusing the child count
+        // there would be an off-by-one the runtime cannot detect.
+        if let (Some(offsets), Some(owner)) = (
+            scope.contract(&level.offsets).and_then(extent_symbol),
+            scope.contract(&level.owner).and_then(extent_symbol),
+        ) && offsets == owner
+        {
+            errors.push(format!(
+                "{path} declares level {index} offsets '{}' and owner map '{}' with the same \
+                 extent '{offsets}'; offsets carries one entry per parent plus a final total \
+                 while the owner map carries one entry per unit, so the two are never equal",
+                level.offsets, level.owner
+            ));
+        }
+    }
+}
+
+/// Deepest ownership chain a packed value may declare.
+///
+/// Parts in items in rows — frames in clips in requests, tokens in segments in
+/// requests — is what every known workload needs, and each further level
+/// multiplies the chain a runtime walks on every split and the corruption cases
+/// that have to be tested.
+const MAX_OWNERSHIP_LEVELS: usize = 2;
+
+/// Check one level's companions and hand back the owner map's contract.
+///
+/// Both companions are `shared` rather than `request_aligned`, and that is
+/// structural rather than conservative: an exclusive prefix sum is not
+/// permutation-followable. Permuting rows does not permute a prefix-offset
+/// vector, it invalidates it, so a runtime that compacts rebuilds the chain. A
+/// document that labelled either companion request-aligned would be inviting a
+/// gather that silently produces nonsense.
+fn validate_ownership_level<'a>(
+    path: &str,
+    value: Option<&str>,
+    index: usize,
+    level: &crate::schema::OwnershipLevel,
+    scope: &'a LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) -> Option<&'a crate::schema::TensorContract> {
+    let mut owner_contract = None;
+    for (role, companion) in [("offsets", &level.offsets), ("owner map", &level.owner)] {
+        if Some(companion.as_str()) == value {
+            errors.push(format!(
+                "{path} names itself as its own level {index} {role}; a packed value and the \
+                 vector that describes its packing are different values"
+            ));
+            continue;
+        }
+        if !scope.is_declared(companion) {
+            errors.push(format!(
+                "{path} names '{companion}' as its level {index} {role}, which is not a declared \
+                 value or port in that scope"
+            ));
+            continue;
+        }
+        let Some(companion_contract) = scope.contract(companion) else {
+            continue;
+        };
+        if role == "owner map" {
+            owner_contract = Some(companion_contract);
+        }
+        if companion_contract.dtype != "int64" {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' is {} but must be int64; offsets and \
+                 owner positions are indices, and a narrower or floating type cannot address a \
+                 group the runtime has already assembled",
+                companion_contract.dtype
+            ));
+        }
+        if companion_contract.rank != 1 {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' has rank {} but must be rank 1; it \
+                 carries one entry per unit and nothing else",
+                companion_contract.rank
+            ));
+        }
+        if !companion_contract.batch_layout.is_shared() {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' declares {} but must declare shared; \
+                 an exclusive prefix sum is not permutation-followable, so a runtime that \
+                 compacts rebuilds it rather than gathering it",
+                companion_contract.batch_layout.kind_name()
+            ));
+        }
+        if !companion_contract.padding.is_empty() {
+            errors.push(format!(
+                "{path} level {index} {role} '{companion}' declares padding of its own; a \
+                 companion has exactly one entry per unit, so there is nothing in it to pad"
+            ));
+        }
+    }
+    owner_contract
+}
+
+/// The shape symbol of a dimension, when it has one.
+fn symbol_of(dimension: &crate::schema::TensorDimension) -> Option<&str> {
+    match dimension {
+        crate::schema::TensorDimension::Symbol(symbol) => Some(symbol.as_str()),
+        crate::schema::TensorDimension::Fixed(_) => None,
+    }
+}
+
+/// The extent symbol of a rank-1 companion.
+fn extent_symbol(contract: &crate::schema::TensorContract) -> Option<&str> {
+    contract
+        .shape
+        .as_ref()
+        .filter(|shape| shape.len() == 1)
+        .and_then(|shape| shape.first())
+        .and_then(symbol_of)
+}
+
+/// Position of a shape symbol in a contract's declared shape.
+fn axis_of_symbol(contract: &crate::schema::TensorContract, symbol: &str) -> Option<usize> {
+    contract
+        .shape
+        .as_ref()?
+        .iter()
+        .position(|dimension| symbol_of(dimension) == Some(symbol))
+}
+
+/// What a padded value's validity companions must satisfy.
+///
+/// Padding is appended, so how much of an entry is real is one number per
+/// enclosing position rather than a tensor of booleans. That is what keeps the
+/// truth host-resident and cheap: a runtime reads these numbers to assemble and
+/// to split every group, and a payload-shaped mask would put that read on the
+/// device and turn a free arithmetic check into a hidden transfer.
+fn validate_padding(
+    path: &str,
+    value: Option<&str>,
+    contract: &crate::schema::TensorContract,
+    scope: &LayoutReferenceScope<'_>,
+    errors: &mut Vec<String>,
+) {
+    let mut covered: BTreeSet<&str> = BTreeSet::new();
+    for entry in &contract.padding {
+        let crate::schema::PaddedDimension {
+            dimension,
+            valid_lengths,
+        } = entry;
+        if !covered.insert(dimension.as_str()) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}' more than once; one dimension \
+                 has one padded extent, so two companions would be two truths about one fact"
+            ));
+            continue;
+        }
+        let Some(axis) = axis_of_symbol(contract, dimension) else {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is not a shape symbol \
+                 of the value it pads"
+            ));
+            continue;
+        };
+        // Packed items are contiguous by construction, which is the whole point
+        // of packing instead of padding. Padding that same dimension would
+        // leave two contradictory accounts of where a unit's entries end.
+        if contract.batch_layout.packed_axis() == Some(axis) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is the axis it packs \
+                 items along; packed items are contiguous and carry no padding, so their extent \
+                 is already given by the packing's offsets"
+            ));
+            continue;
+        }
+        // A compacted batch has no padding rows: the runtime drops a finished
+        // row rather than blanking it. A companion that claimed otherwise would
+        // describe a batch the runtime never builds.
+        if contract.batch_layout.request_axis() == Some(axis) {
+            errors.push(format!(
+                "{path} declares padding on dimension '{dimension}', which is the axis its \
+                 request rows stack along; padding bounds an extent within a row, and the batch \
+                 itself carries no padding rows"
+            ));
+            continue;
+        }
+        if Some(valid_lengths.as_str()) == value {
+            errors.push(format!(
+                "{path} names itself as the valid_lengths of its own dimension '{dimension}'; a \
+                 padded value and the vector that bounds it are different values"
+            ));
+            continue;
+        }
+        if !scope.is_declared(valid_lengths) {
+            errors.push(format!(
+                "{path} names '{valid_lengths}' as the valid_lengths of dimension '{dimension}', \
+                 which is not a declared value or port in that scope"
+            ));
+            continue;
+        }
+        let Some(companion) = scope.contract(valid_lengths) else {
+            continue;
+        };
+        if companion.dtype != "int64" {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' is {} but must be int64; it counts real \
+                 entries of dimension '{dimension}'",
+                companion.dtype
+            ));
+        }
+        if !companion.batch_layout.is_shared() {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' declares {} but must declare shared; it \
+                 has one entry per position of the axes outer to '{dimension}', which is not a \
+                 request row count",
+                companion.batch_layout.kind_name()
+            ));
+        }
+        validate_valid_lengths_shape(
+            path,
+            contract,
+            dimension,
+            axis,
+            valid_lengths,
+            companion,
+            errors,
+        );
+    }
+}
+
+/// A validity companion has exactly one entry per position of the axes outer to
+/// the dimension it bounds.
+///
+/// Axes inner to the padded one are not indexed — a length applies to the whole
+/// slice — so the companion's shape is the value's shape truncated at the padded
+/// axis. Stating that exactly is what lets a runtime index it without knowing
+/// what the value means.
+#[allow(clippy::too_many_arguments)]
+fn validate_valid_lengths_shape(
+    path: &str,
+    contract: &crate::schema::TensorContract,
+    dimension: &str,
+    axis: usize,
+    valid_lengths: &str,
+    companion: &crate::schema::TensorContract,
+    errors: &mut Vec<String>,
+) {
+    if companion.rank != axis {
+        errors.push(format!(
+            "{path} valid_lengths '{valid_lengths}' has rank {} but dimension '{dimension}' is \
+             axis {axis}, so it must have rank {axis}: one entry per position of the axes outer \
+             to '{dimension}'",
+            companion.rank
+        ));
+        return;
+    }
+    let (Some(outer), Some(declared)) = (contract.shape.as_ref(), companion.shape.as_ref()) else {
+        return;
+    };
+    if outer.len() <= axis || declared.len() != axis {
+        return;
+    }
+    for (index, expected) in outer.iter().take(axis).enumerate() {
+        let Some(actual) = declared.get(index) else {
+            continue;
+        };
+        if actual != expected {
+            errors.push(format!(
+                "{path} valid_lengths '{valid_lengths}' declares {} on axis {index} but the value \
+                 it bounds declares {} there; the companion carries one entry per position of the \
+                 axes outer to '{dimension}'",
+                describe_dimension(actual),
+                describe_dimension(expected)
+            ));
+        }
+    }
+}
+
+fn describe_dimension(dimension: &crate::schema::TensorDimension) -> String {
+    match dimension {
+        crate::schema::TensorDimension::Fixed(fixed) => fixed.to_string(),
+        crate::schema::TensorDimension::Symbol(symbol) => format!("'{symbol}'"),
+    }
+}
+
+/// A declared batching capacity is a promise about the artifact's own shape, so
+/// it must agree with the ports that carry the group.
+///
+/// Absence of `batch_capacity` already has a meaning — one request row per
+/// invocation — so a declared capacity only ever adds claims: these symbols must
+/// already agree, the assembled call materializes no more than this, and every
+/// dimension left free is reconciled by a declared padding or packing. A
+/// capacity that no port can honour would let a scheduler build an invocation
+/// the component cannot execute, which is exactly the kind of contradiction that
+/// has to fail at load time.
+///
+/// Everything is keyed by shape symbol. Ports of one component differ in rank —
+/// a rank-3 payload, a rank-1 companion, a rank-2 pooled output — so an axis
+/// index would name whichever port the author happened to be looking at, while a
+/// symbol names the same quantity on all of them.
+fn validate_batch_capacity(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
+    for (name, component) in &workflow.components {
+        let Some(capacity) = &component.batch_capacity else {
+            continue;
+        };
+        let path = format!("workflow component '{name}' batch_capacity");
+        let ports = &component.ports;
+        let declared = declared_symbols(ports);
+        let counts = ownership_count_symbols(ports);
+        let rooted = group_rooted_symbols(ports);
+        let budgeted = validate_budgets(&path, capacity, &declared, &rooted, errors);
+        validate_uniform_dimensions(&path, capacity, &declared, &counts, errors);
+        validate_level_budgets(&path, ports, &budgeted, errors);
+        validate_free_dimensions(&path, capacity, ports, errors);
+        if let Some(row_scope) = &component.row_scope {
+            validate_capacity_row_scope(&path, row_scope, ports, errors);
+        }
+    }
+}
+
+/// Every shape symbol any port of a component declares, with a port that
+/// declares it.
+///
+/// A level's unit count is often named only by its `owner` companion's extent,
+/// and a padded extent only by the payload, so a capacity may legitimately name
+/// a symbol that appears on exactly one port.
+fn declared_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, &str> {
+    let mut symbols = BTreeMap::new();
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        for dimension in shape {
+            if let Some(symbol) = symbol_of(dimension) {
+                symbols.entry(symbol).or_insert(port.as_str());
+            }
+        }
+    }
+    symbols
+}
+
+/// Check the footprint bounds and hand back the symbols they bind.
+///
+/// A `dimensions` list is a nesting path read outermost first, so `[frames,
+/// patches]` bounds "for each packed frame, its materialized patch slots". The
+/// first symbol is what roots the entry in the group, which is why it must be a
+/// quantity the scheduler chooses rather than a property of one item.
+fn validate_budgets<'a>(
+    path: &str,
+    capacity: &'a crate::schema::ComponentBatchCapacity,
+    declared: &BTreeMap<&str, &str>,
+    rooted: &BTreeMap<&str, String>,
+    errors: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let mut budgeted: BTreeSet<&str> = BTreeSet::new();
+    let mut bounded: BTreeSet<Vec<&str>> = BTreeSet::new();
+    for budget in &capacity.budgets {
+        let entry = describe_symbols(&budget.dimensions);
+        if budget.dimensions.is_empty() {
+            errors.push(format!(
+                "{path} declares a budgets entry naming no dimension; a bound with nothing to \
+                 bind cannot be evaluated against a group"
+            ));
+            continue;
+        }
+        if budget.max_total == 0 {
+            errors.push(format!(
+                "{path} budgets {entry} at 0; every budget is an upper bound on an assembled \
+                 group, and a bound of zero forbids the single-item invocation the component is \
+                 otherwise required to serve"
+            ));
+        }
+        // Bounding a per-item extent on its own bounds nothing about the
+        // invocation being assembled: `patches` alone counts patches per frame,
+        // which is a fact about one item and is the same whether the group holds
+        // one of them or a thousand.
+        if let Some(first) = budget.dimensions.first()
+            && declared.contains_key(first.as_str())
+            && !rooted.contains_key(first.as_str())
+        {
+            errors.push(format!(
+                "{path} budgets {entry}, whose outermost dimension '{first}' is a property of one \
+                 item rather than a count of them; a budget is a nesting path read outermost \
+                 first, and one that never reaches a quantity the scheduler chooses bounds \
+                 nothing about the group. Root it at {}, or compose it as a path beginning there",
+                describe_declared(
+                    &rooted
+                        .keys()
+                        .map(|symbol| (*symbol, "a group count"))
+                        .collect::<BTreeMap<_, _>>()
+                )
+            ));
+        }
+        let mut within: BTreeSet<&str> = BTreeSet::new();
+        for dimension in &budget.dimensions {
+            if !within.insert(dimension.as_str()) {
+                errors.push(format!(
+                    "{path} budgets {entry}, which names '{dimension}' twice; a composed budget \
+                     multiplies distinct extents, and squaring one is not a footprint"
+                ));
+                continue;
+            }
+            if !declared.contains_key(dimension.as_str()) {
+                errors.push(format!(
+                    "{path} budgets '{dimension}', which no port of the component declares; \
+                     declared symbols are {}",
+                    describe_declared(declared)
+                ));
+                continue;
+            }
+            budgeted.insert(dimension.as_str());
+        }
+        let key: Vec<&str> = budget.dimensions.iter().map(String::as_str).collect();
+        if !bounded.insert(key) {
+            errors.push(format!(
+                "{path} budgets {entry} more than once; two bounds on one footprint is two \
+                 numbers for one fact, and a runtime honouring either would be honouring neither"
+            ));
+        }
+    }
+    budgeted
+}
+
+/// Symbols that count what a scheduler put in a group, so a budget rooted at one
+/// bounds the invocation rather than one item.
+///
+/// Three things count a group: the extent a layout packs, the unit count of each
+/// declared ownership level — the `owner` companion's extent — and the batch
+/// axis of a row-shaped layout, which is how many rows the scheduler put
+/// together. A level's `offsets` extent is the parent count plus one, which
+/// counts a group too but is a derived spelling of the level above it, so it
+/// never roots a budget.
+fn group_rooted_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
+    let mut rooted: BTreeMap<&str, String> = BTreeMap::new();
+    fn axis_symbol(contract: &crate::schema::TensorContract, axis: usize) -> Option<&str> {
+        contract
+            .shape
+            .as_ref()
+            .and_then(|shape| shape.get(axis))
+            .and_then(symbol_of)
+    }
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        match &contract.batch_layout {
+            crate::schema::BatchLayout::TokenPacked { axis, levels } => {
+                if let Some(symbol) = axis_symbol(contract, *axis) {
+                    rooted
+                        .entry(symbol)
+                        .or_insert_with(|| format!("the packed extent of port '{port}'"));
+                }
+                for (index, level) in levels.iter().enumerate() {
+                    if let Some(symbol) = ports
+                        .inputs
+                        .get(&level.owner)
+                        .or_else(|| ports.outputs.get(&level.owner))
+                        .and_then(extent_symbol)
+                    {
+                        rooted.entry(symbol).or_insert_with(|| {
+                            format!("the units of ownership level {index} of port '{port}'")
+                        });
+                    }
+                }
+            }
+            // A component that pads rather than packs still assembles a group,
+            // and what it assembles is rows. Its row axis is therefore the item
+            // count a budget roots at, exactly as a packed extent is.
+            crate::schema::BatchLayout::RequestAligned { axis }
+            | crate::schema::BatchLayout::RequestExpanded { axis, .. } => {
+                if let Some(symbol) = axis_symbol(contract, *axis) {
+                    rooted
+                        .entry(symbol)
+                        .or_insert_with(|| format!("the row count of port '{port}'"));
+                }
+            }
+            _ => {}
+        }
+    }
+    rooted
+}
+
+/// Symbols that count units rather than describe one.
+///
+/// A packed extent, and the extents of the companions of an ownership chain,
+/// are exactly the numbers that change when a scheduler forms a group. Each is
+/// mapped to the site that made it a count, so a refusal can say which
+/// declaration it is arguing with.
+fn ownership_count_symbols(ports: &crate::schema::ComponentPorts) -> BTreeMap<&str, String> {
+    let mut counts: BTreeMap<&str, String> = BTreeMap::new();
+    let resolve = |name: &str| {
+        ports
+            .inputs
+            .get(name)
+            .or_else(|| ports.outputs.get(name))
+            .and_then(extent_symbol)
+    };
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        let levels = contract.batch_layout.levels();
+        if levels.is_empty() {
+            continue;
+        }
+        if let Some(axis) = contract.batch_layout.packed_axis()
+            && let Some(symbol) = contract
+                .shape
+                .as_ref()
+                .and_then(|shape| shape.get(axis))
+                .and_then(symbol_of)
+        {
+            counts
+                .entry(symbol)
+                .or_insert_with(|| format!("the packed extent of port '{port}'"));
+        }
+        for (index, level) in levels.iter().enumerate() {
+            for (role, companion) in [("units", &level.owner), ("run count", &level.offsets)] {
+                if let Some(symbol) = resolve(companion) {
+                    counts.entry(symbol).or_insert_with(|| {
+                        format!("the {role} of ownership level {index} of port '{port}'")
+                    });
+                }
+            }
+        }
+    }
+    counts
+}
+
+/// Symbols pinned across a group are stated once and name a property of an item
+/// rather than a count of them.
+///
+/// Pinning is not the opposite of budgeting. A pinned symbol has one extent
+/// *within* a group and may differ between groups, so a composed budget that
+/// multiplies it by a count is the only thing that bounds the footprint it
+/// contributes to; what it may never be is the symbol a layout packs or a
+/// level's unit count, because those are what the scheduler chose.
+fn validate_uniform_dimensions(
+    path: &str,
+    capacity: &crate::schema::ComponentBatchCapacity,
+    declared: &BTreeMap<&str, &str>,
+    counts: &BTreeMap<&str, String>,
+    errors: &mut Vec<String>,
+) {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for symbol in &capacity.uniform_dimensions {
+        if !seen.insert(symbol.as_str()) {
+            errors.push(format!(
+                "{path} lists uniform dimension '{symbol}' twice; the list states which extents \
+                 must agree, and stating one twice states nothing further"
+            ));
+            continue;
+        }
+        if !declared.contains_key(symbol.as_str()) {
+            errors.push(format!(
+                "{path} requires uniform dimension '{symbol}', which no port of the component \
+                 declares; declared symbols are {}",
+                describe_declared(declared)
+            ));
+            continue;
+        }
+        // Pinning a count is pinning the raggedness away. `uniform_dimensions`
+        // says which properties of an *item* must agree for items to share an
+        // invocation; how many items a request contributes is the thing a
+        // packed layout exists to let vary, and a package that pinned it would
+        // be describing a fixed-shape batch it did not declare.
+        if let Some(reason) = counts.get(symbol.as_str()) {
+            errors.push(format!(
+                "{path} requires uniform dimension '{symbol}', which is {reason} rather than a \
+                 property of one item; a uniform dimension says what must agree between items for \
+                 them to share an invocation, and pinning a count would forbid the very \
+                 raggedness the packed layout declares. Bound it with a budget instead, or drop \
+                 the ownership level and declare a fixed group"
+            ));
+        }
+    }
+}
+
+/// Every ownership level a component's inputs pack is bounded.
+///
+/// The units of a level are exactly what a scheduler chooses when it forms a
+/// group, so a level with no budget leaves the group unbounded in the one
+/// quantity the scheduler controls. Output levels are not budgeted: an extent
+/// the graph decides cannot be a precondition on forming the group, and the
+/// package could not check a bound on it either.
+fn validate_level_budgets(
+    path: &str,
+    ports: &crate::schema::ComponentPorts,
+    budgeted: &BTreeSet<&str>,
+    errors: &mut Vec<String>,
+) {
+    for (port, contract) in &ports.inputs {
+        for (index, level) in contract.batch_layout.levels().iter().enumerate() {
+            let Some(symbol) = ports
+                .inputs
+                .get(&level.owner)
+                .or_else(|| ports.outputs.get(&level.owner))
+                .and_then(extent_symbol)
+            else {
+                continue;
+            };
+            if !budgeted.contains(symbol) {
+                errors.push(format!(
+                    "{path} declares no budget for '{symbol}', the units input '{port}' packs at \
+                     ownership level {index}; a scheduler chooses how many of those to group, so \
+                     an unbudgeted level is unbounded in exactly the quantity it controls"
+                ));
+            }
+        }
+    }
+}
+
+/// A dimension items may differ on is declared free everywhere, and is
+/// reconciled somewhere.
+///
+/// A fixed literal on a dimension the package has said may vary is a
+/// contradiction: the group would have to change a shape the artifact pinned.
+/// And a free dimension with neither a padding entry nor a packed axis to
+/// consume it is a promise a runtime cannot honour — it would have to invent a
+/// reconciliation, which is the silent-wrong-answer class this schema exists to
+/// prevent.
+fn validate_free_dimensions(
+    path: &str,
+    capacity: &crate::schema::ComponentBatchCapacity,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let companions = port_companions(ports);
+    let uniform: BTreeSet<&str> = capacity
+        .uniform_dimensions
+        .iter()
+        .map(String::as_str)
+        .collect();
+    for (port, contract) in &ports.inputs {
+        if companions.contains(port.as_str()) {
+            continue;
+        }
+        let Some(shape) = &contract.shape else {
+            continue;
+        };
+        let padded: BTreeSet<&str> = contract
+            .padding
+            .iter()
+            .map(|entry| entry.dimension.as_str())
+            .collect();
+        for (axis, dimension) in shape.iter().enumerate() {
+            if contract.batch_layout.request_axis() == Some(axis) {
+                continue;
+            }
+            if contract.batch_layout.packed_axis() == Some(axis) {
+                if symbol_of(dimension).is_none() {
+                    errors.push(format!(
+                        "{path} groups input '{port}', which packs items along axis {axis} but \
+                         fixes that axis at {}; a packed extent is the sum of the group's items \
+                         and cannot be a literal",
+                        describe_dimension(dimension)
+                    ));
+                }
+                continue;
+            }
+            let Some(symbol) = symbol_of(dimension) else {
+                continue;
+            };
+            if uniform.contains(symbol) || padded.contains(symbol) {
+                continue;
+            }
+            errors.push(format!(
+                "{path} leaves '{symbol}' free on input '{port}' axis {axis} but declares neither \
+                 a padding entry on it nor a packed axis that consumes it; a dimension items may \
+                 differ on has to say how the difference is reconciled"
+            ));
+        }
+    }
+}
+
+/// Ports named by another port's layout or padding rather than carrying a
+/// payload of their own.
+fn port_companions(ports: &crate::schema::ComponentPorts) -> BTreeSet<&str> {
+    let mut companions = BTreeSet::new();
+    for contract in ports.inputs.values().chain(ports.outputs.values()) {
+        for (_, _, companion) in contract.batch_layout.companions() {
+            companions.insert(companion);
+        }
+        for entry in &contract.padding {
+            companions.insert(entry.valid_lengths.as_str());
+        }
+    }
+    companions
+}
+
+/// Row scope counts rows, and a packed axis counts items.
+///
+/// One request contributing eight clips makes the two different numbers, so a
+/// runtime that compacted per-request state with an item-indexed selection would
+/// address the wrong entries entirely. The axis therefore has to be a row axis
+/// some port actually declares, and never a packed one.
+fn validate_capacity_row_scope(
+    path: &str,
+    row_scope: &crate::schema::ComponentRowScope,
+    ports: &crate::schema::ComponentPorts,
+    errors: &mut Vec<String>,
+) {
+    let mut packed_on: Option<&str> = None;
+    let mut rows_on = false;
+    for (port, contract) in ports.inputs.iter().chain(ports.outputs.iter()) {
+        if contract.batch_layout.request_axis() == Some(row_scope.axis) {
+            rows_on = true;
+        }
+        if contract.batch_layout.packed_axis() == Some(row_scope.axis) && packed_on.is_none() {
+            packed_on = Some(port.as_str());
+        }
+    }
+    if let Some(port) = packed_on
+        && !rows_on
+    {
+        errors.push(format!(
+            "{path} declares row_scope on axis {}, which port '{port}' packs items along; items \
+             are not rows — one request contributes many — so per-row state selected by an item \
+             position would address the wrong entries",
+            row_scope.axis
+        ));
+        return;
+    }
+    if !rows_on {
+        errors.push(format!(
+            "{path} declares row_scope on axis {}, which no port of the component declares as its \
+             request axis; per-row state is selected by row position, so the axis has to be one \
+             the component's rows actually stack along",
+            row_scope.axis
+        ));
+    }
+}
+
+/// A symbol list, spelled for an error message.
+fn describe_symbols(symbols: &[String]) -> String {
+    let listed: Vec<String> = symbols.iter().map(|symbol| format!("'{symbol}'")).collect();
+    format!("[{}]", listed.join(", "))
+}
+
+/// The symbols a component's ports declare, spelled for an error message.
+fn describe_declared(declared: &BTreeMap<&str, &str>) -> String {
+    let listed: Vec<String> = declared
+        .keys()
+        .map(|symbol| format!("'{symbol}'"))
+        .collect();
+    if listed.is_empty() {
+        "none".to_string()
+    } else {
+        listed.join(", ")
+    }
+}
+
 fn validate_state_lifetimes(workflow: &WorkflowSpec, errors: &mut Vec<String>) {
     // Runtime-owned state is private: its storage layout, paging and precision
     // are the runtime's business and are not part of any contract. Such a cell
@@ -3301,6 +4824,16 @@ fn validate_compaction_derivability(
                      a declared row axis so the runtime can associate result rows with requests"
                 ));
             }
+            validate_emit_length_authority(
+                path,
+                value,
+                output,
+                valid_length.as_deref(),
+                declared,
+                errors,
+            );
+            validate_packed_emit_companions(path, value, output, declared, workflow, errors);
+            validate_padded_emit_companions(path, value, output, declared, workflow, errors);
             let Some(contract) = value_contracts.get(value) else {
                 return;
             };
@@ -3310,15 +4843,71 @@ fn validate_compaction_derivability(
                      the emitted value and the declared output must agree"
                 ));
             }
+            // The carve-out is deliberately narrow: a `shared` emitted value is
+            // admitted only when it is one of the int64 vectors some other
+            // emitted value's contract names as the description of its own shape
+            // — an ownership offsets or owner map, or the valid_lengths of a
+            // padded dimension — and only at the rank that naming requires of
+            // it. All of that is decidable from the declared outputs alone.
+            // Anything else `shared` and rank > 0 is still a per-request result
+            // with no way back to a request.
+            let expectations = output_companions(workflow);
+            let claimed = expectations.get(output.as_str());
+            let is_shape_companion = contract.dtype == "int64"
+                && claimed.is_some_and(|roles| roles.iter().any(|role| role.admits(contract.rank)));
             if contract.rank > 0
                 && matches!(contract.batch_layout, crate::schema::BatchLayout::Shared)
                 && workflow.serving.is_some()
+                && !is_shape_companion
             {
-                errors.push(format!(
-                    "{path} emits per-request value '{value}' without a declared batch_layout; a \
-                     serving workflow must declare request_aligned or token_packed so the runtime \
-                     can associate result rows with requests"
-                ));
+                // A value that is named as a companion but does not have a
+                // companion's shape, or is named only by a declaration nothing
+                // writes, gets the reason it was not admitted. The generic
+                // message would tell its author to declare a row axis, which is
+                // precisely what a companion must not do.
+                let unwritten = claimed.map(|roles| {
+                    roles
+                        .iter()
+                        .filter(|role| !role.claimant_emitted)
+                        .map(|role| role.claimed_by)
+                        .collect::<BTreeSet<_>>()
+                });
+                if let Some(roles) = claimed
+                    && roles.iter().any(|role| role.claimant_emitted)
+                {
+                    let expected = roles
+                        .iter()
+                        .filter(|role| role.claimant_emitted)
+                        .map(|role| match role.rank {
+                            Some(rank) => format!("{} at rank {rank}", role.role.describe()),
+                            None => role.role.describe().to_string(),
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    errors.push(format!(
+                        "{path} emits '{value}' into output '{output}', which another emitted \
+                         output names as {expected}, but it is {} at rank {}; a companion is \
+                         admitted into a serving workflow only at the shape the declaration \
+                         naming it requires",
+                        contract.dtype, contract.rank
+                    ));
+                } else if let Some(unwritten) = unwritten.filter(|names| !names.is_empty()) {
+                    errors.push(format!(
+                        "{path} emits '{value}' into output '{output}', which only output '{}' \
+                         names as a shape companion, and that output is never emitted; a \
+                         companion describes a result the caller receives, so it is admitted into \
+                         a serving workflow only alongside the value it describes",
+                        unwritten.iter().copied().collect::<Vec<_>>().join("', '")
+                    ));
+                } else {
+                    errors.push(format!(
+                        "{path} emits per-request value '{value}' without a declared \
+                         batch_layout; a serving workflow must declare request_aligned or \
+                         token_packed so the runtime can associate result rows with requests"
+                    ));
+                }
             }
         }
         WorkflowNode::Invoke { .. }
@@ -3327,10 +4916,311 @@ fn validate_compaction_derivability(
     }
 }
 
+/// What some declared output's contract claims about a value it names as the
+/// description of its own shape.
+///
+/// The three companion kinds do not have the same shape, and a carve-out keyed
+/// on the name alone cannot tell them apart. Offsets and owner maps are always
+/// rank one: one entry per parent boundary and one per child. A validity length
+/// has one entry per position of the axes *outer* to the dimension it bounds, so
+/// its rank is that dimension's axis index — rank one for a padded axis 1, rank
+/// two for a padded axis 2, and so on. Carrying the expectation beside the name
+/// is what lets the carve-out admit each of them at its own shape instead of at
+/// whichever shape happened to be written down first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct CompanionExpectation<'a> {
+    role: CompanionRole,
+    /// Rank the naming declaration requires, when the declaration determines it.
+    ///
+    /// `None` where the bounded value's shape does not resolve the padded
+    /// dimension to an axis. That is itself an error, reported against the
+    /// padding declaration; the carve-out must not add a second, misleading
+    /// complaint about a rank nothing was able to compute.
+    rank: Option<usize>,
+    /// Output whose contract names this companion.
+    claimed_by: &'a str,
+    /// Whether some step actually emits that output.
+    ///
+    /// A declaration that is never written describes a result the caller never
+    /// receives, so it cannot be the reason another value is admitted. Demanding
+    /// that a companion be emitted while letting an unemitted payload confer the
+    /// carve-out on it would be two answers to one question.
+    claimant_emitted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum CompanionRole {
+    Offsets,
+    Owner,
+    ValidLengths,
+}
+
+impl CompanionRole {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::Offsets => "an ownership level's offsets",
+            Self::Owner => "an ownership level's owner map",
+            Self::ValidLengths => "a padded dimension's valid_lengths",
+        }
+    }
+}
+
+impl CompanionExpectation<'_> {
+    fn admits(self, rank: usize) -> bool {
+        self.claimant_emitted && self.rank.is_none_or(|expected| expected == rank)
+    }
+}
+
+/// Every value a declared output's contract names as a description of its own
+/// shape, with the shape that naming requires of it.
+///
+/// These are `shared` by construction — a prefix-offset vector describes a whole
+/// packing, and a length vector describes one entry per position outside the
+/// dimension it bounds — so they are exactly the values the per-request emission
+/// rule above would otherwise reject. Publishing them is what makes a packed or
+/// padded result readable, so the rule that demands a row correspondence has to
+/// know which values are the mechanism by which that correspondence is stated.
+///
+/// A name can be claimed by more than one declaration — one length vector may
+/// bound the same dimension of two outputs — so the expectations are collected
+/// rather than overwritten, and a value satisfies the carve-out by matching any
+/// one of them. Two declarations that demand different ranks of one value are a
+/// contradiction, but it is `validate_padding`'s to report against the
+/// declaration that is wrong, not this rule's to report as a missing row axis.
+///
+/// The claiming output must itself be emitted. A declared output no step writes
+/// describes a result the caller never receives, so it cannot be the reason
+/// another value is admitted — and the companion obligations demand that a
+/// companion be emitted, so letting an unemitted payload confer the carve-out
+/// would be two answers to one question. The claimant is carried so a value
+/// admitted by nothing but an unwritten declaration can be told that, rather
+/// than told to declare a row axis.
+fn output_companions<'a>(
+    workflow: &'a WorkflowSpec,
+) -> BTreeMap<&'a str, BTreeSet<CompanionExpectation<'a>>> {
+    let emitted = emitted_outputs(workflow);
+    let mut companions: BTreeMap<&str, BTreeSet<CompanionExpectation<'_>>> = BTreeMap::new();
+    for (name, output) in &workflow.outputs {
+        let contract = &output.contract;
+        let claimant_emitted = emitted.contains(name.as_str());
+        for (_, role, companion) in contract.batch_layout.companions() {
+            let role = if role == "offsets" {
+                CompanionRole::Offsets
+            } else {
+                CompanionRole::Owner
+            };
+            companions
+                .entry(companion)
+                .or_default()
+                .insert(CompanionExpectation {
+                    role,
+                    rank: Some(1),
+                    claimed_by: name.as_str(),
+                    claimant_emitted,
+                });
+        }
+        for entry in &contract.padding {
+            companions
+                .entry(entry.valid_lengths.as_str())
+                .or_default()
+                .insert(CompanionExpectation {
+                    role: CompanionRole::ValidLengths,
+                    rank: axis_of_symbol(contract, &entry.dimension),
+                    claimed_by: name.as_str(),
+                    claimant_emitted,
+                });
+        }
+    }
+    companions
+}
+
+/// A padded output has one account of its raggedness, and it is the declared one.
+///
+/// An emit's `valid_length` truncates what the step writes: it is a step-local
+/// instruction, invisible in the output contract, and the caller never receives
+/// it. A `padding` entry is the opposite — part of the contract the caller reads,
+/// naming a length vector that rule 8 requires the workflow to publish. When an
+/// emit sets `valid_length` into an output that declares `padding`, the document
+/// states how much of the result is real twice, in two places that nothing
+/// reconciles, and only one of them reaches whoever has to decode the tensor.
+///
+/// Two spellings of one fact is the duplicated state RULES.md rule 10 exists to
+/// prevent, and here the duplication is worse than untidy: the two can disagree,
+/// and the reader that a caller depends on is the one the emit can silently
+/// contradict. So the declared `padding` is authoritative and the emit does not
+/// also limit its own prefix.
+///
+/// This needs no version scoping. `padding` is a `1.1` field, so a document that
+/// can express this contradiction has already been required to declare `1.1` by
+/// [`validate_schema_version`]; an older document has no way to say the thing at
+/// all. It is also a rule about values a document *did* state rather than a
+/// demand that it state something new, which is the half of the version split in
+/// [`validate_emit_axis`] that stays unconditional at every version.
+fn validate_emit_length_authority(
+    path: &str,
+    value: &str,
+    output: &str,
+    valid_length: Option<&str>,
+    declared: &crate::schema::WorkflowOutput,
+    errors: &mut Vec<String>,
+) {
+    let Some(valid_length) = valid_length else {
+        return;
+    };
+    if declared.contract.padding.is_empty() {
+        return;
+    }
+    let declared_padding = declared
+        .contract
+        .padding
+        .iter()
+        .map(|entry| {
+            format!(
+                "'{}' on dimension '{}'",
+                entry.valid_lengths, entry.dimension
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    errors.push(format!(
+        "{path} emits '{value}' into output '{output}' with valid_length '{valid_length}', but \
+         '{output}' declares padding whose valid_lengths {declared_padding} already says how much \
+         of it is real; a padded output has one account of its raggedness and it is the declared \
+         padding, which is the only one the caller receives, so drop the emit's valid_length"
+    ));
+}
+
+/// A packed result is only usable by whoever receives it if the companions that
+/// describe the packing come with it.
+///
+/// The caller of a workflow sees its declared outputs and nothing else. A packed
+/// output whose offsets and owner maps are internal SSA values is a flat run of
+/// items with no way to say which request any of them belongs to, which is the
+/// exact failure the packed layout exists to prevent. So every level's
+/// companions are declared outputs too, and the serving rule that would
+/// otherwise reject them as `shared` admits them for exactly that reason.
+fn validate_packed_emit_companions(
+    path: &str,
+    value: &str,
+    output: &str,
+    declared: &crate::schema::WorkflowOutput,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let emitted = emitted_outputs(workflow);
+    for (level, role, companion) in declared.contract.batch_layout.companions() {
+        if !workflow.outputs.contains_key(companion) {
+            errors.push(format!(
+                "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
+                 {role} '{companion}' is not itself a declared workflow output; a caller can only \
+                 split a packed result with the companions that describe it, so a packed emit \
+                 publishes every level of them"
+            ));
+            continue;
+        }
+        if !emitted.contains(companion) {
+            errors.push(format!(
+                "{path} emits '{value}' into token_packed output '{output}' whose level {level} \
+                 {role} '{companion}' is declared as a workflow output but never emitted; a \
+                 declared output no step writes is delivered empty, so a caller would receive the \
+                 packed result and nothing to split it with"
+            ));
+        }
+    }
+}
+
+/// A padded result is only readable by whoever receives it if the lengths that
+/// say where the padding starts come with it.
+///
+/// This is the same obligation `validate_packed_emit_companions` states for a
+/// packing, for the other way a contract describes a shape the payload does not
+/// carry. A padded output whose valid_lengths is an internal SSA value hands the
+/// caller a tensor with trailing entries that mean nothing and no way to know
+/// how many — and the schema deliberately refuses a payload-shaped validity mask
+/// as the alternative, so the length vector is the only account there is.
+fn validate_padded_emit_companions(
+    path: &str,
+    value: &str,
+    output: &str,
+    declared: &crate::schema::WorkflowOutput,
+    workflow: &WorkflowSpec,
+    errors: &mut Vec<String>,
+) {
+    let emitted = emitted_outputs(workflow);
+    for entry in &declared.contract.padding {
+        if !workflow.outputs.contains_key(&entry.valid_lengths) {
+            errors.push(format!(
+                "{path} emits '{value}' into output '{output}', which declares padding on \
+                 dimension '{}' whose valid_lengths '{}' is not itself a declared workflow \
+                 output; a caller can only tell a padded result's real entries from its padding \
+                 with the lengths that bound them, so a padded emit publishes them",
+                entry.dimension, entry.valid_lengths
+            ));
+            continue;
+        }
+        if !emitted.contains(entry.valid_lengths.as_str()) {
+            errors.push(format!(
+                "{path} emits '{value}' into output '{output}', which declares padding on \
+                 dimension '{}' whose valid_lengths '{}' is declared as a workflow output but \
+                 never emitted; a declared output no step writes is delivered empty, so a caller \
+                 would receive the padded result and no account of its padding",
+                entry.dimension, entry.valid_lengths
+            ));
+        }
+    }
+}
+
+/// Outputs some step of the workflow actually writes.
+///
+/// Declaring an output and never emitting into it are different facts, and only
+/// the second one delivers anything. A companion obligation satisfied by the
+/// declaration alone would be satisfied by a package that hands its caller a
+/// ragged payload and an empty vector, which is the failure the obligation
+/// exists to prevent.
+///
+/// This is deliberately the whole workflow rather than the path the payload's
+/// own emit sits on. Whether two emits reach the caller together depends on a
+/// branch predicate, and this crate does not evaluate predicates, so a
+/// path-sensitive rule would either reject correct packages whose companion is
+/// written in a sibling branch or pretend to a precision it does not have.
+/// "Somewhere" is what can be decided soundly from the declared steps, and it
+/// catches the case that actually occurs: a companion declared to satisfy the
+/// contract and then never produced.
+fn emitted_outputs(workflow: &WorkflowSpec) -> BTreeSet<&str> {
+    fn walk<'a>(steps: &'a [crate::schema::WorkflowStep], emitted: &mut BTreeSet<&'a str>) {
+        for step in steps {
+            match step {
+                crate::schema::WorkflowStep::Emit { output, .. } => {
+                    emitted.insert(output.as_str());
+                }
+                crate::schema::WorkflowStep::Sequence { steps } => walk(steps, emitted),
+                crate::schema::WorkflowStep::Loop { setup, steps, .. } => {
+                    walk(setup, emitted);
+                    walk(steps, emitted);
+                }
+                crate::schema::WorkflowStep::Branch { cases, default, .. } => {
+                    for case in cases.values() {
+                        walk(std::slice::from_ref(case), emitted);
+                    }
+                    if let Some(default) = default {
+                        walk(std::slice::from_ref(default), emitted);
+                    }
+                }
+                crate::schema::WorkflowStep::Invoke { .. } => {}
+            }
+        }
+    }
+
+    let mut emitted = BTreeSet::new();
+    walk(&workflow.steps, &mut emitted);
+    emitted
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_workflow_node(
     node: &WorkflowNode,
     workflow: &WorkflowSpec,
+    version: crate::version::SchemaVersion,
     values: &mut BTreeSet<String>,
     value_contracts: &mut BTreeMap<String, crate::schema::TensorContract>,
     effects: &mut BTreeMap<String, String>,
@@ -3347,6 +5237,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     node,
                     workflow,
+                    version,
                     values,
                     value_contracts,
                     effects,
@@ -3443,6 +5334,7 @@ fn validate_workflow_node(
             validate_workflow_node(
                 setup,
                 workflow,
+                version,
                 values,
                 value_contracts,
                 effects,
@@ -3594,6 +5486,7 @@ fn validate_workflow_node(
             validate_workflow_node(
                 body,
                 workflow,
+                version,
                 &mut body_values,
                 &mut body_contracts,
                 &mut body_effects,
@@ -3675,6 +5568,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     node,
                     workflow,
+                    version,
                     &mut case_values,
                     &mut case_contracts,
                     &mut case_effects,
@@ -3695,6 +5589,7 @@ fn validate_workflow_node(
                 validate_workflow_node(
                     default,
                     workflow,
+                    version,
                     &mut default_values,
                     &mut default_contracts,
                     &mut default_effects,
@@ -3924,11 +5819,21 @@ fn validate_workflow_node(
             when,
             valid_length,
             output,
+            mode,
+            axis,
             effect_name,
             effect,
-            ..
         } => {
             require_workflow_value(value, values, &format!("{path}.value"), errors);
+            validate_emit_axis(
+                value_contracts.get(value),
+                mode,
+                *axis,
+                valid_length.is_some(),
+                version,
+                path,
+                errors,
+            );
             if let Some(when) = when {
                 require_workflow_value(when, values, &format!("{path}.when"), errors);
                 if let Some(contract) = value_contracts.get(when) {
@@ -4017,6 +5922,71 @@ fn validate_workflow_node(
             }
         }
         WorkflowNode::ExecutionIsland { .. } => {}
+    }
+}
+
+/// An incremental emit grows one axis of the output, and which axis that is has
+/// to be knowable from the document.
+///
+/// The default - the final axis - is right for a token sequence and wrong for
+/// anything whose growth axis sits inside the shape. A rank-four or deeper value
+/// is the shape a media tensor takes, `[batch, channels, frames, height, width]`
+/// or `[batch, frames, height, width]`, where the final axis is a spatial extent
+/// that must never be concatenated. Rather than guess which of several plausible
+/// axes was meant, such an emit names it.
+///
+/// Naming it is a requirement of the version that introduced video, not a
+/// retroactive judgement on the documents written before it. A diffusion package
+/// that appends latents along a rank-four final axis is correct and always was:
+/// the default is what it meant, and it had no way to say so explicitly because
+/// nothing asked. Refusing it now would be this crate deciding that shipped
+/// packages became invalid the day a video model was added. So the demand starts
+/// at [`BATCHING_SCHEMA_VERSION`](crate::version::BATCHING_SCHEMA_VERSION) —
+/// which is also the first version in which the ambiguity is real, since a
+/// rank-four media tensor is what that version introduced — and an older
+/// document keeps the final-axis default it was written against. An explicitly
+/// named axis is checked against the rank at every version.
+///
+/// The general shape of that split is worth stating, because the two halves look
+/// alike in a validator and are opposites in effect: a version may gate what a
+/// document must *say*, but it never gates what a document may say *wrongly*. A
+/// demand to state intent explicitly starts at the version that made the default
+/// ambiguous, because a document written earlier meant the default it was
+/// written against. Range checks, well-formedness, and every rule about a value
+/// a document did state stay unconditional at every version, because relaxing
+/// those would let an older spelling assert something false rather than merely
+/// leave something unsaid.
+fn validate_emit_axis(
+    contract: Option<&crate::schema::TensorContract>,
+    mode: &crate::schema::WorkflowEmitMode,
+    axis: Option<usize>,
+    length_limited: bool,
+    version: crate::version::SchemaVersion,
+    path: &str,
+    errors: &mut Vec<String>,
+) {
+    let Some(contract) = contract else {
+        return;
+    };
+    if let Some(axis) = axis {
+        if axis >= contract.rank {
+            errors.push(format!(
+                "{path}.axis is {axis}, outside the rank {} of value it emits",
+                contract.rank
+            ));
+        }
+        return;
+    }
+    if version < crate::version::BATCHING_SCHEMA_VERSION {
+        return;
+    }
+    let incremental = matches!(mode, crate::schema::WorkflowEmitMode::Append) || length_limited;
+    if incremental && contract.rank >= 4 {
+        errors.push(format!(
+            "{path} grows a rank-{} output but names no axis; the default final axis is a \
+             spatial extent for a value of this rank, so the axis it grows along must be stated",
+            contract.rank
+        ));
     }
 }
 
@@ -4374,10 +6344,7 @@ fn validate_integer_control_contract(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if !matches!(
-        contract.dtype.as_str(),
-        "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-    ) {
+    if !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have an integer dtype"));
     }
     if !matches!(contract.rank, 0 | 1) {
@@ -4403,12 +6370,7 @@ fn validate_predicate_contract(
     path: &str,
     errors: &mut Vec<String>,
 ) {
-    if contract.dtype != "bool"
-        && !matches!(
-            contract.dtype.as_str(),
-            "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64"
-        )
-    {
+    if contract.dtype != "bool" && !is_integer_dtype(&contract.dtype) {
         errors.push(format!("{path} must have a bool or integer dtype"));
     }
     if !matches!(contract.rank, 0 | 1) {

@@ -2,9 +2,17 @@
 //!
 //! Implements the spec from <https://github.com/onnx/onnx/issues/8184>
 
-/// Current inference-metadata schema version. Emitters should stamp this into
-/// [`schema::InferenceMetadata::schema_version`]; readers treat an absent value
-/// as this version.
+/// The spelling of the base schema version that emitters stamp.
+///
+/// It stays `v1` because that is what every writer in this repository already
+/// stamps and what 19 in-tree documents already say. Readers normalize the
+/// spellings in the wild — absent, `v1`, `1`, `1.0` — onto
+/// [`INITIAL_SCHEMA_VERSION`], so changing what is emitted would rewrite bytes
+/// and semantic identities to say something no reader distinguishes.
+///
+/// A package that uses a field a later version introduced states that later
+/// version instead, and must: see [`version`] and
+/// [`BATCHING_SCHEMA_VERSION`].
 pub const SCHEMA_VERSION: &str = "v1";
 
 /// Built-in serialized capability identifiers.
@@ -108,6 +116,7 @@ pub mod parser;
 pub mod schema;
 pub mod session_state;
 pub mod validation;
+pub mod version;
 
 pub use cache::{CacheDependencies, cache_dependencies};
 pub use decoder_abi::decoder_abi;
@@ -121,7 +130,7 @@ pub use parser::{
     MtpProposerSpec, SpeculatorConfigSource, SpeculatorDescriptor, SpeculatorProposerKind,
     SpeculatorProposerStatus, detect_speculator, find_metadata_path, load_metadata,
     load_metadata_from_dir, load_metadata_package, load_metadata_with_identity, load_pipeline_spec,
-    resolve_package_artifact,
+    parse_metadata, parse_metadata_json, resolve_package_artifact,
 };
 pub use schema::*;
 pub use session_state::{
@@ -130,6 +139,9 @@ pub use session_state::{
 pub use validation::{
     CapabilityReport, PipelineValidationError, RuntimeCapabilities, derived_capabilities, validate,
     validate_metadata, validate_pipeline_spec, validate_structure_and_capabilities,
+};
+pub use version::{
+    BATCHING_SCHEMA_VERSION, INITIAL_SCHEMA_VERSION, SUPPORTED_SCHEMA_VERSION, SchemaVersion,
 };
 
 /// Generates the inference-metadata JSON Schema with deterministic object-key ordering.

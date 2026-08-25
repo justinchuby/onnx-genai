@@ -205,25 +205,89 @@ const METADATA_FILE_NAMES: [&str; 3] = [
 /// Load inference metadata from a file (YAML or JSON based on extension).
 pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataError> {
     let content = std::fs::read_to_string(path).map_err(crate::MetadataError::Io)?;
-    reject_retired_model_io(&content)?;
+    parse_metadata(&content, path.extension().and_then(|e| e.to_str()))
+}
 
-    let metadata: InferenceMetadata = match path.extension().and_then(|e| e.to_str()) {
-        Some("yaml" | "yml") => serde_yaml::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
-        Some("json") => serde_json::from_str(&content)
-            .map_err(|e| crate::MetadataError::Parse(e.to_string()))?,
+/// The one way a document becomes an [`InferenceMetadata`].
+///
+/// Every loader goes through here rather than calling `serde` itself, because
+/// two things have to happen before a typed reader sees the bytes. The retired
+/// `model.io` block has to be recognized so a package that still declares one
+/// gets told how to convert it instead of failing later with a puzzled "declares
+/// no workflow". And the schema version has to be compared, because every
+/// structure in this schema denies unknown fields: a document from a newer
+/// runtime is not malformed, and reporting the first field this build happens
+/// not to know would send a reader hunting for a typo that is not there.
+///
+/// `extension` is a hint, not a requirement — `None` tries YAML and then JSON,
+/// which is what a document with no filename gets.
+pub fn parse_metadata(
+    content: &str,
+    extension: Option<&str>,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    preparse(content)?;
+    match extension {
+        Some("yaml" | "yml") => {
+            serde_yaml::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
+        Some("json") => {
+            serde_json::from_str(content).map_err(|e| crate::MetadataError::Parse(e.to_string()))
+        }
         _ => {
-            // Try YAML first, then JSON
-            if let Ok(m) = serde_yaml::from_str::<InferenceMetadata>(&content) {
-                m
+            // YAML is a superset of JSON, but its error for a JSON document that
+            // is wrong in a JSON way is worse, so fall back rather than insist.
+            if let Ok(metadata) = serde_yaml::from_str::<InferenceMetadata>(content) {
+                Ok(metadata)
             } else {
-                serde_json::from_str::<InferenceMetadata>(&content)
-                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))?
+                serde_json::from_str::<InferenceMetadata>(content)
+                    .map_err(|e| crate::MetadataError::Parse(e.to_string()))
             }
         }
-    };
+    }
+}
 
-    Ok(metadata)
+/// Like [`parse_metadata`], for a document a caller already holds as JSON.
+///
+/// A lowering that builds a document in memory gets the same two checks a file
+/// gets. It would otherwise be the one path on which a package could declare a
+/// version nothing verified.
+pub fn parse_metadata_json(
+    document: &serde_json::Value,
+) -> Result<InferenceMetadata, crate::MetadataError> {
+    let value = serde_yaml::to_value(document)
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    gate_document(&value)?;
+    serde_json::from_value(document.clone())
+        .map_err(|error| crate::MetadataError::Parse(error.to_string()))
+}
+
+/// Checks that read a document as a tree, before anything reads it as a type.
+fn preparse(content: &str) -> Result<(), crate::MetadataError> {
+    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
+        // Not parseable as a tree at all; the typed reader reports why.
+        return Ok(());
+    };
+    gate_document(&document)
+}
+
+fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    reject_retired_model_io(document)?;
+    let declared = crate::version::declared_in(document).map_err(crate::MetadataError::Parse)?;
+    crate::version::gate(declared)
+        .map(|_| ())
+        .map_err(crate::MetadataError::Parse)?;
+    // After the version, deliberately. The flat packed spelling is a reshape
+    // within the v1 line, so refusing it presumes the document belongs to that
+    // line. A document from a version this build does not support is refused for
+    // being from that version, and this crate does not tell its author what a
+    // spelling it has never read is supposed to mean.
+    //
+    // It also cannot become part of the gate, which is the tempting
+    // simplification to reach for later. A stale document here is well-formed
+    // and declares a version this reader supports; both spellings belong to the
+    // same line, so no comparison of version numbers can tell them apart. A
+    // retired spelling is only ever found by recognizing its shape.
+    reject_flat_token_packed(document, String::new())
 }
 
 /// Refuse a document that still declares the retired `model.io` block.
@@ -233,11 +297,7 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
 /// the retired shape here — and *only* to explain it — turns that into an
 /// actionable error naming the conversion. This is the one place the old spelling
 /// appears, and it never produces a value: it produces a refusal.
-fn reject_retired_model_io(content: &str) -> Result<(), crate::MetadataError> {
-    let Ok(document) = serde_yaml::from_str::<serde_yaml::Value>(content) else {
-        // Not parseable as YAML at all; the real parser reports why.
-        return Ok(());
-    };
+fn reject_retired_model_io(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
     let declares_retired_io = document
         .get("model")
         .and_then(|model| model.get("io"))
@@ -253,6 +313,78 @@ fn reject_retired_model_io(content: &str) -> Result<(), crate::MetadataError> {
          with `migrate_model_io <package-dir>`."
             .to_string(),
     ))
+}
+
+/// Refuse a document that still spells `token_packed` as one flat pair.
+///
+/// The layout used to carry `offsets` and `owner` directly on the batch layout,
+/// which could say only that a packed axis had exactly one level of ownership.
+/// It now carries `levels`, because an item can itself be a group -- frames in
+/// clips in rows -- and a single pair cannot say that.
+///
+/// A one-level chain is exactly what the old spelling meant, so a shim would be
+/// expressible. It is refused rather than translated because this schema is
+/// pre-release and [rule 3](../../../RULES.md) is to reshape it completely
+/// rather than keep a second spelling alive: no in-tree package uses
+/// `token_packed`, so nothing is being broken except a document written against
+/// an unreleased shape, and the alternative is two ways to say one thing for as
+/// long as the crate exists.
+///
+/// What that costs is a good error, which is why this is here. `serde` reports
+/// the old shape as an unknown field, and an unknown field reads like a typo --
+/// a reader goes looking for a misspelling rather than for a migration. Like
+/// `model.io`, this recognizer never produces a value; it produces a refusal
+/// that names the change.
+fn reject_flat_token_packed(
+    document: &serde_yaml::Value,
+    path: String,
+) -> Result<(), crate::MetadataError> {
+    match document {
+        serde_yaml::Value::Mapping(mapping) => {
+            let is_packed = mapping
+                .get(serde_yaml::Value::from("kind"))
+                .and_then(serde_yaml::Value::as_str)
+                == Some("token_packed");
+            let retired = ["offsets", "owner"]
+                .into_iter()
+                .filter(|field| mapping.contains_key(serde_yaml::Value::from(*field)))
+                .collect::<Vec<_>>();
+            if is_packed && !retired.is_empty() {
+                let at = if path.is_empty() {
+                    String::new()
+                } else {
+                    format!(" at `{path}`")
+                };
+                return Err(crate::MetadataError::Parse(format!(
+                    "the `token_packed` batch layout{at} declares `{}` directly, which is the \
+                     retired flat spelling of ownership. A packed axis now declares `levels`, an \
+                     ownership chain innermost first, because an item can itself be a group. The \
+                     flat pair is the one-level case: replace `offsets: <o>, owner: <w>` with \
+                     `levels: [{{ offsets: <o>, owner: <w> }}]`, and add an outer entry if the \
+                     items are themselves grouped. An emitted level also states `extent`. This \
+                     spelling is not read, and no document is converted for you.",
+                    retired.join("` and `")
+                )));
+            }
+            for (key, value) in mapping {
+                let segment = key.as_str().unwrap_or("?");
+                let child = if path.is_empty() {
+                    segment.to_string()
+                } else {
+                    format!("{path}.{segment}")
+                };
+                reject_flat_token_packed(value, child)?;
+            }
+            Ok(())
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for (index, item) in items.iter().enumerate() {
+                reject_flat_token_packed(item, format!("{path}[{index}]"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Load inference metadata together with its canonical semantic identity.
@@ -298,8 +430,12 @@ pub fn load_metadata_package(path: &Path) -> Result<InferenceMetadata, crate::Me
             "metadata has no pipeline section".to_string(),
         ));
     };
-    crate::validation::validate_pipeline_spec(pipeline)
-        .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
+    crate::validation::validate_pipeline_spec(
+        pipeline,
+        crate::version::normalize(metadata.schema_version.as_deref())
+            .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION),
+    )
+    .map_err(|error| crate::MetadataError::Parse(error.to_string()))?;
     // Document-level invariants are not pipeline-scoped, so `validate_pipeline_spec`
     // cannot see them. Without this call they hold only for callers who reach for
     // `validate_metadata` directly — which is nobody loading a package from disk,
@@ -430,10 +566,12 @@ fn validate_package_artifacts(
 /// Load and validate a metadata file's `pipeline` section.
 pub fn load_pipeline_spec(path: &Path) -> Result<PipelineSpec, crate::MetadataError> {
     let metadata = load_metadata(path)?;
+    let version = crate::version::normalize(metadata.schema_version.as_deref())
+        .unwrap_or(crate::version::INITIAL_SCHEMA_VERSION);
     let spec = metadata
         .pipeline
         .ok_or_else(|| crate::MetadataError::Parse("metadata has no pipeline section".into()))?;
-    crate::validation::validate_pipeline_spec(&spec)
+    crate::validation::validate_pipeline_spec(&spec, version)
         .map_err(|err| crate::MetadataError::Parse(err.to_string()))?;
     Ok(spec)
 }

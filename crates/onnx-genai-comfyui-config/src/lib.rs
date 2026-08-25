@@ -229,7 +229,11 @@ pub fn convert(
     }
     let document = lowering.build(adapters.as_ref().map(|(value, _)| value))?;
 
-    let metadata: InferenceMetadata = serde_json::from_value(document.clone())?;
+    // Through the shared entry point, not `serde` directly: a lowering that
+    // built its own document is exactly as capable of stamping a version it does
+    // not mean as a file on disk is.
+    let metadata: InferenceMetadata = onnx_genai_metadata::parse_metadata_json(&document)
+        .map_err(|error| ComfyUiConfigError::InvalidMetadata(error.to_string()))?;
     onnx_genai_metadata::validate_metadata(&metadata)
         .map_err(|errors| ComfyUiConfigError::InvalidMetadata(errors.join("; ")))?;
 
