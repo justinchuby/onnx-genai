@@ -316,33 +316,7 @@ jobs:
       - name: Clippy Linux offline crates
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p mlas-sys
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
           -- -D warnings
 
   rust-quality:
@@ -482,41 +456,26 @@ jobs:
       - name: Check CUDA tests are ignored, not deleted by a cfg
         run: python3 .github/scripts/verify_cuda_test_honesty.py --source-scan
 
-      # Rust warnings are errors: clippy is blocking for every pure/offline crate.
-      # To add a crate, first confirm its normal+dev dependency tree contains no
-      # ort-sys/CUDA dependency, then add it here and to the portable test lane.
+      # Rust warnings are errors: clippy is blocking for every crate CI tests.
+      # The package list is derived, not maintained here. It used to be a
+      # hand-written -p list repeated verbatim in three places, and the
+      # instruction above it said to first "confirm its normal+dev dependency
+      # tree contains no ort-sys/CUDA dependency". That premise was false, and
+      # measurably so: `onnx-runtime-ep-cpu` and `onnx-runtime-ep-api` were both
+      # on that list and both pull `onnx-genai-ort-sys`. It does not matter,
+      # because `cargo clippy` only ever *checks* -- it never links and never
+      # runs a test binary -- so the constraint that splits the test lanes into
+      # offline/ort-backed has no force here. The rule cost 21 tested crates
+      # their lint coverage for a reason that did not apply (#2058).
+      #
+      # `workspace_test_packages.py verify` now fails if any tested package is
+      # linted by nothing, so this list cannot silently fall behind again.
       # mlas-sys is also checked by the Windows ARM64 job so MSVC/native
       # build-script regressions do not hide behind the Linux quality lane.
       - name: Run clippy on all offline crates
         run: >-
           cargo clippy --locked --all-targets
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p mlas-sys
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-ir
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-quantization
-          -p onnx-runtime-tracer
-          -p onnx-runtime-session
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args lint)
           -- -D warnings
 
       # Wrapped in `run_test_step` because the selector is a bare test NAME,
@@ -646,11 +605,17 @@ jobs:
           -- -D warnings
 
       # The mirror image of the step above, and the other half of the same hole.
-      # That one turns the feature *on*, and it is the only `-D warnings` gate in
-      # this file that names these crates -- `Run clippy on all offline crates`
-      # cannot list them because they pull in `ort-sys`, and `CLI ORT`'s clippy
-      # steps name `onnx-genai-cli`, so `-D warnings` does not reach a dependency
-      # and dependencies do not build test targets anyway.
+      # That one turns the feature *on*; this one checks what actually ships.
+      #
+      # This step used to be the only `-D warnings` gate in this file naming
+      # these crates, because `Run clippy on all offline crates` was a
+      # hand-written list that excluded anything pulling in `ort-sys`. That is
+      # no longer true: it selects `cargo-args lint`, which includes both. The
+      # reason to keep this step is now a different one -- with `resolver = "2"`
+      # features unify across every package selected in a single invocation, so
+      # the 55-package `lint` run can turn features on for engine/server that
+      # neither crate enables by itself. Naming the two in isolation is the only
+      # way to lint the default resolve that ships.
       #
       # So the *default* configuration of both crates was compiled by
       # `Test ORT-backed workspace crates` and linted by nothing. Measured, not
@@ -899,33 +864,7 @@ jobs:
         run: >-
           cargo clippy --locked --all-targets
           --target aarch64-pc-windows-msvc
-          -p onnx-genai-comfyui-config
-          -p onnx-genai-metadata
-          -p onnx-genai-genai-config
-          -p onnx-genai-kv
-          -p onnx-genai-runtime-config
-          -p onnx-genai-scheduler
-          -p onnx-runtime-protocol-trace
-          -p mlas-sys
-          -p onnx-runtime-ir
-          -p onnx-runtime-ep-api
-          -p onnx-runtime-ep-cpu
-          -p onnx-runtime-loader
-          -p onnx-runtime-shape-inference
-          -p onnx-runtime-optimizer
-          -p onnx-runtime-quantization
-          -p onnx-runtime-session
-          -p onnx-runtime-tracer
-          -p onnx-genai-preprocess
-          -p onnx-std
-          -p onnx-genai-router
-          -p onnx-runtime-memory -p onnx-runtime-virtual-memory -p onnx-runtime-memory-api -p onnx-runtime-memory-governor -p onnx-runtime-cuda-memory
-          -p onnx-runtime-cpuinfo
-          -p onnx-runtime-eager
-          -p onnx-runtime-capi
-          -p onnx-runtime-dlpack
-          -p onnx-runtime-comm
-          -p onnx-std-python
+          $(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)
           -- -D warnings
 
   ep-conformance:
