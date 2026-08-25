@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::session_owner::OrtSessionOwner;
 use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
 
 /// Introspected MTP-head graph signature.
@@ -117,22 +118,8 @@ struct MtpKvPair {
 ///
 /// Holds the head's own single-layer KV state (when growing) and runs one
 /// forward step at a time. It does not select tokens or drive a proposal loop.
-enum MtpSessionHandle<'a> {
-    Borrowed(&'a Session),
-    Owned(Arc<Session>),
-}
-
-impl MtpSessionHandle<'_> {
-    fn session(&self) -> &Session {
-        match self {
-            Self::Borrowed(session) => session,
-            Self::Owned(session) => session,
-        }
-    }
-}
-
 pub struct MtpDecodeSession<'a> {
-    session: MtpSessionHandle<'a>,
+    session: OrtSessionOwner<'a>,
     binding: IoBinding<'a>,
     signature: MtpHeadSignature,
     mode: MtpDraftKvMode,
@@ -158,7 +145,7 @@ impl<'a> MtpDecodeSession<'a> {
 
     /// Create an MTP decode session from a head graph.
     pub fn new(session: &'a Session, options: MtpDecodeOptions) -> Result<Self> {
-        Self::new_with_handle(MtpSessionHandle::Borrowed(session), options)
+        Self::new_with_owner(OrtSessionOwner::borrowed(session), options)
     }
 
     /// Create an MTP decode session that owns a shared session handle.
@@ -166,11 +153,11 @@ impl<'a> MtpDecodeSession<'a> {
         session: Arc<Session>,
         options: MtpDecodeOptions,
     ) -> Result<MtpDecodeSession<'static>> {
-        MtpDecodeSession::new_with_handle(MtpSessionHandle::Owned(session), options)
+        MtpDecodeSession::new_with_owner(OrtSessionOwner::shared(session), options)
     }
 
-    fn new_with_handle(
-        session_handle: MtpSessionHandle<'a>,
+    fn new_with_owner(
+        session_owner: OrtSessionOwner<'a>,
         options: MtpDecodeOptions,
     ) -> Result<Self> {
         if options.hc_mult == 0 {
@@ -178,7 +165,7 @@ impl<'a> MtpDecodeSession<'a> {
                 "MTP hc_mult must be greater than zero".into(),
             ));
         }
-        let session = session_handle.session();
+        let session = &*session_owner;
         let (signature, kv_pairs, io) = detect_mtp_head(
             session,
             &options.hidden_output,
@@ -203,15 +190,12 @@ impl<'a> MtpDecodeSession<'a> {
                 io.hidden_rank
             )));
         }
-        // The handle decides how the binding keeps its session alive: a
+        // The owner decides how the binding keeps its session alive: a
         // borrowed head is outlived by the caller's session, an owned one has
         // to hold its own strong reference.
-        let binding = match &session_handle {
-            MtpSessionHandle::Borrowed(session) => IoBinding::new(session)?,
-            MtpSessionHandle::Owned(session) => IoBinding::for_shared_session(Arc::clone(session))?,
-        };
+        let binding = session_owner.binding()?;
         Ok(Self {
-            session: session_handle,
+            session: session_owner,
             binding,
             signature,
             mode: options.kv_mode,
@@ -403,11 +387,11 @@ impl<'a> MtpDecodeSession<'a> {
         }
         self.bind_kv_inputs()?;
 
-        for output in self.session.session().output_names() {
+        for output in self.session.output_names() {
             self.binding
                 .bind_output_to_device(output, &MemoryInfo::cpu()?)?;
         }
-        self.session.session().run_with_binding(&self.binding)?;
+        self.session.run_with_binding(&self.binding)?;
 
         let outputs = self.binding.output_values()?;
         let mut mtp_hidden = None;
@@ -418,7 +402,7 @@ impl<'a> MtpDecodeSession<'a> {
             .map(|pair| (pair.present.as_str(), pair.past.as_str()))
             .collect::<HashMap<_, _>>();
         let mut next_kv = HashMap::with_capacity(self.kv_pairs.len());
-        for (name, value) in self.session.session().output_names().iter().zip(outputs) {
+        for (name, value) in self.session.output_names().iter().zip(outputs) {
             if *name == self.hidden_output {
                 mtp_hidden = Some(value.to_vec_f32_lossy()?);
             } else if self.state_output.as_deref() == Some(name.as_str()) {

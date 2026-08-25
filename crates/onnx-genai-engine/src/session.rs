@@ -7,6 +7,7 @@ use crate::logits::{ProcessorChain, TokenId};
 use crate::sampling::SamplingRng;
 use onnx_genai_kv::PagedKvCache;
 use onnx_genai_ort::Session;
+use std::sync::Arc;
 
 pub(crate) struct EngineSession {
     /// Logical token context retained across turns.
@@ -47,7 +48,7 @@ pub(crate) struct ActiveGenerate {
 }
 
 pub(crate) struct DraftModel {
-    pub(crate) session: Box<Session>,
+    pub(crate) session: Arc<Session>,
     pub(crate) decode_path: ModelDecodePath,
     pub(crate) io: Option<onnx_genai_metadata::DecoderAbi>,
     pub(crate) kv_model: Option<KvModelInfo>,

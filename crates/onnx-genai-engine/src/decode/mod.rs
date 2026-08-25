@@ -23,6 +23,7 @@ use onnx_genai_ort::{
     Session, StaticCacheDecodeOptions, StaticCacheDecodeSession, TensorInfo, Value,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 mod logits;
 mod metadata;

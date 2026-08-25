@@ -1684,7 +1684,7 @@ impl Engine {
     fn new_target_decode_state(&self) -> anyhow::Result<DecodeState> {
         let session = self
             .session
-            .as_deref()
+            .as_ref()
             .context("ORT decoder session is unavailable")?;
         // Bind ports from explicit metadata or unambiguous tensor shapes.
         let io = self.metadata.decoder_io();
@@ -1694,7 +1694,7 @@ impl Engine {
             SpeculativeMode::Mtp(_) | SpeculativeMode::Eagle3(_)
         ) {
             DecodeState::new_with_io_positions_and_state_budget(
-                session,
+                session.as_ref(),
                 io,
                 None,
                 fixed_state_budget_bytes,

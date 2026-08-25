@@ -1,4 +1,5 @@
 use super::*;
+use crate::session_owner::OrtSessionOwner;
 
 pub(super) struct StaticCachePair {
     pub(super) key_input: TensorInfo,
@@ -60,7 +61,7 @@ fn logits_output_by_exclusion(
 /// `updated_*` outputs are bound back onto those buffers; the graph scatter is a
 /// write hint, not the source of truth for cache ownership.
 pub struct StaticCacheDecodeSession<'a> {
-    session: &'a Session,
+    session: OrtSessionOwner<'a>,
     binding: IoBinding<'a>,
     signature: StaticCacheSignature,
     batch_size: i64,
@@ -108,6 +109,24 @@ impl<'a> StaticCacheDecodeSession<'a> {
         options: StaticCacheDecodeOptions,
         io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
+        Self::new_with_owner(OrtSessionOwner::borrowed(session), options, io)
+    }
+
+    /// Create a static-cache decode session that co-owns a shared ORT session.
+    pub fn new_owned(
+        session: Arc<Session>,
+        options: StaticCacheDecodeOptions,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
+    ) -> Result<StaticCacheDecodeSession<'static>> {
+        StaticCacheDecodeSession::new_with_owner(OrtSessionOwner::shared(session), options, io)
+    }
+
+    fn new_with_owner(
+        session_owner: OrtSessionOwner<'a>,
+        options: StaticCacheDecodeOptions,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
+    ) -> Result<Self> {
+        let session = &*session_owner;
         let (signature, pairs, abi) = detect_static_cache(session, io)?.ok_or_else(|| {
             OrtError::InvalidArgument(
                 "model does not expose static-cache key_cache/write_indices inputs".into(),
@@ -115,9 +134,10 @@ impl<'a> StaticCacheDecodeSession<'a> {
         })?;
         let buffers = allocate_static_cache_buffers(options.batch_size, &pairs)?;
         let logits_output = resolve_static_cache_logits_output(session, &buffers)?;
+        let binding = session_owner.binding()?;
         Ok(Self {
-            session,
-            binding: IoBinding::new(session)?,
+            session: session_owner,
+            binding,
             signature,
             batch_size: options.batch_size,
             current_len: 0,
