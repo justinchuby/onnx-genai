@@ -1316,9 +1316,14 @@ fn a_video_program_needs_its_adapter() {
         "      adapter_abis: { onnx-genai.video-preprocess: \"1\" }\n",
         "",
     );
-    assert!(
-        !errors(&document).is_empty(),
-        "a video program with no declared adapter must be rejected"
+    // Asserting only that *something* rejected cannot detect this rule being
+    // narrowed away: any other refusal the fixture happens to trigger would
+    // keep the test green while it stopped testing adapters. Pin the rule that
+    // must do the rejecting, not the fact of rejection.
+    assert_reports(
+        &document,
+        "requires adapter ABI onnx-genai.video-preprocess@1, but the manifest does not pin that \
+         exact version",
     );
 }
 
