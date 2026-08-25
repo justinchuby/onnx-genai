@@ -11,8 +11,8 @@ use onnx_genai_engine::KvDType;
 
 use crate::types::ReasoningEffort;
 use crate::{
-    AppState, ModelSpec, ModelsConfig, ServerConfig, default_node_id, from_models_dir,
-    parse_kv_cache_dtype,
+    AppState, ModelSpec, ModelsConfig, OrtSessionWorkerCount, ServerConfig, default_node_id,
+    from_models_dir, parse_kv_cache_dtype,
     runtime_args::{CpuArgs, EngineArgs},
     serve,
 };
@@ -84,6 +84,13 @@ pub struct ServeArgs {
     #[arg(long, env = "ONNX_GENAI_MAX_QUEUE_DEPTH", default_value_t = 256)]
     pub max_queue_depth: usize,
 
+    /// Number of owner-thread ORT engines used to run distinct sessions in
+    /// parallel. This is not an ORT intra-op/inter-op thread count. Values above
+    /// 1 are accepted only for supported ORT sessions and fail closed otherwise.
+    /// Falls back to ONNX_GENAI_ORT_SESSION_WORKERS.
+    #[arg(long, env = "ONNX_GENAI_ORT_SESSION_WORKERS", default_value = "1")]
+    pub ort_session_workers: OrtSessionWorkerCount,
+
     /// Maximum number of sequences decoded concurrently in one continuous batch.
     /// Omit to let the server pick a default and clamp it to what the model's
     /// decode path can honor. Setting a value greater than 1 on a backend that
@@ -149,6 +156,7 @@ fn server_config_from_args(args: &ServeArgs) -> ServerConfig {
         default_reasoning_effort: args.default_reasoning_effort,
         max_sessions: args.max_sessions,
         max_queue_depth: args.max_queue_depth,
+        ort_session_workers: args.ort_session_workers,
         max_batch: args.max_batch,
         enable_debug_endpoints: args.enable_debug_endpoints,
         enable_admin_endpoints: args.enable_admin_endpoints,
@@ -231,6 +239,20 @@ mod tests {
     fn a_second_model_path_is_refused_rather_than_ignored() {
         TestCli::try_parse_from(["test", "one", "two"])
             .expect_err("two different models were named");
+    }
+
+    #[test]
+    fn ort_session_worker_count_is_explicit_bounded_and_defaults_to_one() {
+        let default = TestCli::parse_from(["test", "model-dir"]);
+        assert_eq!(default.serve.ort_session_workers.get(), 1);
+
+        let parallel = TestCli::parse_from(["test", "model-dir", "--ort-session-workers", "2"]);
+        assert_eq!(parallel.serve.ort_session_workers.get(), 2);
+
+        for invalid in ["0", "65"] {
+            TestCli::try_parse_from(["test", "model-dir", "--ort-session-workers", invalid])
+                .expect_err("worker count outside 1..=64 must be refused");
+        }
     }
 
     /// `--model-id` names *the* model, so a multi-model source has nothing for

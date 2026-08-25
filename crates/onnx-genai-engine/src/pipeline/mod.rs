@@ -186,6 +186,32 @@ pub(crate) struct WorkflowRuntime {
     _ort_environment: Option<Arc<onnx_genai_ort::Environment>>,
 }
 
+/// Immutable construction plan for another hosted single-decoder worker.
+///
+/// It contains only the frozen workflow plan and the session-free hosted model
+/// directory. Calling [`Self::build`] creates fresh worker state and backend
+/// holders on the calling thread.
+pub(crate) struct HostedWorkflowWorkerFactory {
+    plan: Arc<runtime_state::WorkflowPlan>,
+    directory: PipelineModelDirectory,
+}
+
+impl HostedWorkflowWorkerFactory {
+    pub(crate) fn build(&self) -> WorkflowRuntime {
+        WorkflowRuntime {
+            plan: Arc::clone(&self.plan),
+            worker: runtime_state::WorkerRuntimeState::default(),
+            backend: runtime_state::WorkerBackend::new(
+                PipelineModels::hosted(self.directory.clone(), SessionOptions::default(), None),
+                Vec::new(),
+                #[cfg(feature = "native-backend")]
+                None,
+            ),
+            _ort_environment: None,
+        }
+    }
+}
+
 /// Release ORT state that outranks its owner's field order.
 ///
 /// Bindings and session-derived allocators now co-own their `Arc<Session>`, so
@@ -377,6 +403,17 @@ impl WorkflowRuntime {
             ),
             _ort_environment: None,
         })
+    }
+
+    /// Capture the immutable pieces needed to construct another hosted worker.
+    pub(crate) fn hosted_worker_factory(
+        &self,
+        directory: PipelineModelDirectory,
+    ) -> HostedWorkflowWorkerFactory {
+        HostedWorkflowWorkerFactory {
+            plan: Arc::clone(&self.plan),
+            directory,
+        }
     }
 
     fn build(

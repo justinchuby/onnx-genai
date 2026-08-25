@@ -1662,6 +1662,8 @@ if ! command -v taskset >/dev/null 2>&1 || [ -z "$bind_cpu" ]; then
         "$(echo "$out" | grep -c 'efficiency_cores=[0-9]')" "1"
     chk "and the run still reports the wall and cpu the figure came from" \
         "$(echo "$out" | grep -c 'wall=[0-9].*cpu=[0-9]')" "1"
+    chk "and it is still the cores form, since no denominator was given" \
+        "$(echo "$out" | grep -c 'efficiency_frac=')" "0"
 else
     # Two spinners under a 1-cpu bound, applied OUTERMOST so it covers every
     # process the accounting can see. The figure then cannot exceed 1 core no
@@ -1673,22 +1675,38 @@ else
     chk "and a bound applied outermost cannot exceed its bound" \
         "$(awk -v e="${outer:-99}" 'BEGIN { print (e <= 1.05) ? "yes" : "no" }')" "yes"
 
-    # Same bound, same spinners, but the taskset is applied INSIDE, with four
-    # more spinners outside it in the same tree. If the accounting covered only
-    # the bounded set this would also report <= ~1 core; it does not, because
-    # it covers the tree. The direction is what is asserted, not a magnitude.
+    # Same bound, applied INSIDE, with a spinner outside it in the same tree.
+    # If the accounting covered only the bounded set this would report ~1 core;
+    # it does not, because it covers the tree.
     #
-    # The 1.05 floor is not a quiet-host assumption: six runnable spinners on
-    # this host are granted 6/R of its cpus under CFS, so this fails only if R
-    # exceeds roughly 6*ncpu/1.05 -- a load average in the hundreds. It is
+    # Six spinners under the bound and one outside, so the bound accounts for
+    # 6 of 7 rather than 1 of 6. That margin is what lets the pair below tell
+    # "bound applied to a subset" from "no bound at all". With the 2-of-6 split
+    # this cell used previously, deleting the taskset outright still reported
+    # 5.98 against a 1.05 threshold -- i.e. the assertion passed with the
+    # mechanism it names entirely absent. Measured, not supposed.
+    #
+    # The 1.05 floor is not a quiet-host assumption: seven runnable spinners on
+    # this host are granted 7/R of its cpus under CFS, so this fails only if R
+    # exceeds roughly 7*ncpu/1.05 -- a load average in the hundreds. It is
     # stated that way rather than as "the host was quiet", which is a claim
     # nobody here can make: an unannounceable co-tenant is always possible.
-    # shellcheck disable=SC2016  # likewise: the spinner bodies expand in the children
-    inside='taskset -c '"$bind_cpu"' bash -c '"'"'for i in 1 2; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'"'"' & for i in 1 2 3 4; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
-    out=$($HL run --owner leon --reason "bound inside" -- bash -c "$inside" 2>&1)
-    inner=$(echo "$out" | sed -n 's/.*efficiency_cores=\([0-9.]*\).*/\1/p' | head -1)
+    # shellcheck disable=SC2016  # the spinner bodies must expand in the children
+    six='for i in 1 2 3 4 5 6; do ( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) & done; wait'
+    # shellcheck disable=SC2016
+    one='( end=$((SECONDS+2)); while [ $SECONDS -lt $end ]; do :; done ) &'
+    eff_of() { $HL run --owner leon --reason "$1" -- bash -c "$2" 2>&1 \
+        | sed -n 's/.*efficiency_cores=\([0-9.]*\).*/\1/p' | head -1; }
+    inner=$(eff_of "bound inside" "taskset -c $bind_cpu bash -c '$six' & $one wait")
     chk "but a bound applied inside the command does not cap the measurement" \
         "$(awk -v e="${inner:-0}" 'BEGIN { print (e > 1.05) ? "yes" : "no" }')" "yes"
+    # The control. Identical processes, no bound anywhere: if the assertion
+    # above reads the bound rather than merely reading seven spinners, these
+    # two must differ -- and the ratio, unlike either figure alone, does not
+    # assume a quiet host.
+    plain=$(eff_of "no bound control" "bash -c '$six' & $one wait")
+    chk "and the bound did bite, so the figure above is not just seven spinners" \
+        "$(awk -v i="${inner:-99}" -v p="${plain:-1}" 'BEGIN { print (i / p < 0.6) ? "yes" : "no" }')" "yes"
 fi
 cleanup
 
@@ -2510,7 +2528,7 @@ cleanup
 # the inert R1 block and the vacuous STALE arm that this PR exists to fix.
 # Every probe branch asserts something, so the total is invariant across
 # environments; if a refactor drops a check, this fails and says so.
-chk "every assertion in this file ran" "$((pass + fail + 1))" "377"
+chk "every assertion in this file ran" "$((pass + fail + 1))" "378"
 
 echo
 echo "passed=${pass} failed=${fail}"

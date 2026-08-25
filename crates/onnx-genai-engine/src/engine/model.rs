@@ -51,7 +51,7 @@ pub struct Engine {
     /// Exactly one exists per runtime — a second would double-count every
     /// reservation — which is why the workflow interpreter beside it holds
     /// none and this is not an `Option`.
-    pub(crate) governor: EngineResourceGovernor,
+    pub(crate) governor: Arc<EngineResourceGovernor>,
     /// Persistent multi-turn session state, keyed by session id.
     pub(crate) sessions: HashMap<SessionId, EngineSession>,
     /// Conversations continued through the interpreter's session-scoped state.
@@ -62,12 +62,9 @@ pub struct Engine {
     /// id handed out here. The value is the logical token count so far, which
     /// is what a caller asking about a session wants to know.
     pub(crate) workflow_sessions: HashMap<SessionId, usize>,
-    /// Mints interpreter session ids.
-    ///
-    /// The ids leave the engine — a caller holds one, and the server routes on
-    /// it — so this is the shared namespace of `engine::ids`, not a worker-local
-    /// counter. A second worker minting from a second counter would hand the
-    /// same id to two conversations.
+    /// Mints worker-local interpreter session ids. The server qualifies these
+    /// with `WorkerId`, so different workers may intentionally mint the same
+    /// local id without aliasing conversations.
     pub(crate) workflow_session_ids: SharedSessionIds,
     /// Immutable ORT decoder model resource.
     ///
@@ -124,7 +121,7 @@ pub struct Engine {
     /// pipeline, for instance): such a package never reaches the token decode
     /// path, and inventing an empty tokenizer would make that a runtime
     /// surprise instead of a load-time fact.
-    pub(crate) tokenizer: Option<Tokenizer>,
+    pub(crate) tokenizer: Option<Arc<Tokenizer>>,
     /// Auto-detected fill-in-the-middle token configuration.
     pub(crate) fim_config: Option<FimConfig>,
     /// Default speculative draft width K.
@@ -136,6 +133,10 @@ pub struct Engine {
     /// Optional distributed KV connector bridge (DESIGN §38, K3). Inert when
     /// configured as `Null` (the default), preserving in-process-only behavior.
     pub(crate) connector: ConnectorBridge,
+    /// Keeps the one fixed-weight memory reservation alive until every engine
+    /// sharing the immutable ORT session has dropped.
+    pub(crate) _shared_memory_plan:
+        Option<Arc<std::sync::Mutex<crate::engine::memory_plan::ModelMemoryPlan>>>,
     /// ORT environment — MUST be the LAST field so it (and the plugin EP factory it owns via
     /// RegisterExecutionProviderLibrary) drops AFTER every Session/draft/mtp/eagle3 field above.
     /// Rust drops struct fields in declaration order; if the env dropped first, ORT would tear down
@@ -144,7 +145,7 @@ pub struct Engine {
     ///
     /// Tests that exercise pre-session validation may set this to `None` so they
     /// stay model-free and do not touch the local ORT library.
-    pub(crate) _environment: Option<Environment>,
+    pub(crate) _environment: Option<Arc<Environment>>,
 }
 
 impl Engine {
@@ -182,7 +183,7 @@ impl Engine {
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor,
+            governor: Arc::new(governor),
             sessions: HashMap::new(),
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),
@@ -215,6 +216,7 @@ impl Engine {
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
+            _shared_memory_plan: None,
             _environment: None,
         })
     }
@@ -225,16 +227,6 @@ pub(crate) struct NativePrefixSnapshot {
     pub(crate) snapshot: crate::native_decode::NativePastSnapshot,
     pub(crate) _lease: onnx_runtime_memory_governor::MemoryLease,
 }
-
-// SAFETY: `Engine` owns every ORT or native-runtime handle reachable through
-// its sessions and decode state. Moving the engine transfers exclusive
-// ownership without invoking its worker-local handles; mutation still requires
-// `&mut Engine`, and the ORT affinity guards remain idle during the move.
-// Persistent ORT decode runners co-own `Arc<Session>` allocations, whose pointee
-// addresses remain stable when the owning `Engine` moves or clones a session
-// handle. This would stop being sound if an execution provider introduced a
-// non-migratable handle or a field gained unsynchronized shared mutation.
-unsafe impl Send for Engine {}
 
 /// Per-conversation state for native session-persistent KV reuse.
 /// The authoritative token history lives here; the `NativeDecodeSession`'s

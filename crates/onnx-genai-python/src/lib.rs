@@ -6,8 +6,13 @@
 //! is ONNX Runtime compatible; `nxrt.genai` provides the same API backed by the
 //! native nxrt runtime.
 
-use std::path::Path;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::path::{Path, PathBuf};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc as std_mpsc,
+};
+use std::thread;
 
 use onnx_genai_engine::{
     Engine as RustEngine, EngineConfig, FinishReason, GenerateOptions, GenerateRequest,
@@ -173,19 +178,122 @@ fn generation_error(err: impl std::fmt::Display) -> PyErr {
 const ENGINE_IN_USE: &str = "engine is in use by another thread — onnx_genai Engine is not \
 re-entrant; serialize calls or use one Engine per thread";
 
-fn try_lock_engine<T>(inner: &Mutex<T>) -> PyResult<MutexGuard<'_, T>> {
-    inner.try_lock().map_err(|err| match err {
-        TryLockError::WouldBlock => PyRuntimeError::new_err(ENGINE_IN_USE),
-        TryLockError::Poisoned(_) => PyRuntimeError::new_err(
-            "onnx_genai Engine state is unavailable because a previous generation panicked; \
-             create a new Engine instance",
-        ),
-    })
+fn owner_stopped() -> PyErr {
+    PyRuntimeError::new_err(
+        "onnx_genai Engine owner thread stopped unexpectedly; create a new Engine instance",
+    )
+}
+
+type EngineOperation = Box<dyn FnOnce(&mut RustEngine) + Send + 'static>;
+
+enum EngineCommand {
+    Run(EngineOperation),
+    Shutdown,
+}
+
+#[derive(Debug)]
+struct EngineCallGuard<'a> {
+    in_use: &'a AtomicBool,
+}
+
+impl Drop for EngineCallGuard<'_> {
+    fn drop(&mut self) {
+        self.in_use.store(false, Ordering::Release);
+    }
+}
+
+struct EngineOwner {
+    commands: std_mpsc::Sender<EngineCommand>,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+    in_use: AtomicBool,
+}
+
+impl EngineOwner {
+    fn start(model_dir: PathBuf, config: EngineConfig) -> Result<Self, String> {
+        let (commands, rx) = std_mpsc::channel();
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
+        let join = thread::Builder::new()
+            .name("onnx-genai-python-engine".to_string())
+            .spawn(move || match RustEngine::from_dir(&model_dir, config) {
+                Ok(mut engine) => {
+                    if ready_tx.send(Ok(())).is_err() {
+                        return;
+                    }
+                    while let Ok(command) = rx.recv() {
+                        match command {
+                            EngineCommand::Run(operation) => operation(&mut engine),
+                            EngineCommand::Shutdown => break,
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
+            })
+            .map_err(|error| format!("failed to spawn Python engine owner: {error}"))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                commands,
+                join: Mutex::new(Some(join)),
+                in_use: AtomicBool::new(false),
+            }),
+            Ok(Err(error)) => {
+                let _ = join.join();
+                Err(error)
+            }
+            Err(_) => {
+                let panic = join.join().is_err();
+                if panic {
+                    return Err("Python engine owner panicked during initialization".to_string());
+                }
+                Err("Python engine owner exited before reporting initialization".to_string())
+            }
+        }
+    }
+
+    fn begin_call(&self) -> PyResult<EngineCallGuard<'_>> {
+        self.in_use
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| PyRuntimeError::new_err(ENGINE_IN_USE))?;
+        Ok(EngineCallGuard {
+            in_use: &self.in_use,
+        })
+    }
+
+    fn call<R>(
+        &self,
+        operation: impl FnOnce(&mut RustEngine) -> PyResult<R> + Send + 'static,
+    ) -> PyResult<R>
+    where
+        R: Send + 'static,
+    {
+        let (reply, response) = std_mpsc::sync_channel(1);
+        self.commands
+            .send(EngineCommand::Run(Box::new(move |engine| {
+                let _ = reply.send(operation(engine));
+            })))
+            .map_err(|_| owner_stopped())?;
+        response.recv().map_err(|_| owner_stopped())?
+    }
+}
+
+impl Drop for EngineOwner {
+    fn drop(&mut self) {
+        let _ = self.commands.send(EngineCommand::Shutdown);
+        if let Some(join) = self
+            .join
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            let _ = join.join();
+        }
+    }
 }
 
 #[pyclass(module = "onnx_genai", name = "Engine")]
 struct Engine {
-    inner: Mutex<RustEngine>,
+    owner: EngineOwner,
 }
 
 #[pymethods]
@@ -224,16 +332,14 @@ impl Engine {
             }
             config.page_size = value;
         }
-        let engine = RustEngine::from_dir(path_ref, config).map_err(|err| {
+        let owner = EngineOwner::start(path_ref.to_path_buf(), config).map_err(|err| {
             PyValueError::new_err(format!(
                 "failed to load genai model from {path:?}: {err}. Verify the directory \
                  contains compatible ONNX graph(s), tokenizer.json, and \
                  inference_metadata.yaml or genai_config.json."
             ))
         })?;
-        Ok(Self {
-            inner: Mutex::new(engine),
-        })
+        Ok(Self { owner })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -252,15 +358,16 @@ impl Engine {
         let (mut request, overrides) =
             request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
-            let mut engine = try_lock_engine(&self.inner)?;
-            // Inference metadata no longer carries generation defaults, so only
-            // the caller's explicit keyword arguments select sampling; the
-            // runtime greedy default applies to everything they omitted.
-            request.options.resolve_sampling_defaults(None, &overrides);
-            engine
-                .generate(request)
-                .map(GenerateResult::from)
-                .map_err(generation_error)
+            let _call = self.owner.begin_call()?;
+            self.owner.call(move |engine| {
+                // Inference metadata no longer carries generation defaults, so
+                // only explicit kwargs select sampling.
+                request.options.resolve_sampling_defaults(None, &overrides);
+                engine
+                    .generate(request)
+                    .map(GenerateResult::from)
+                    .map_err(generation_error)
+            })
         })
     }
 
@@ -286,54 +393,54 @@ impl Engine {
         let (mut request, overrides) =
             request(prompt, max_tokens, temperature, top_p, top_k, seed, stop)?;
         py.detach(|| {
-            let mut callback_error: Option<PyErr> = None;
-            let mut callback_fn = |token: GenerateToken| {
-                let call = Python::attach(|py| {
-                    callback.call1(
-                        py,
-                        (
-                            token.text,
-                            token.token_id,
-                            token.finish_reason.as_ref().map(finish_reason_name),
-                        ),
-                    )
-                });
-                match call {
-                    Ok(_) => Ok(()),
-                    Err(err) => {
-                        callback_error = Some(err);
-                        Err(
-                            std::io::Error::other("Python streaming callback raised an exception")
-                                .into(),
+            let _call = self.owner.begin_call()?;
+            self.owner.call(move |engine| {
+                let mut callback_error: Option<PyErr> = None;
+                let mut callback_fn = |token: GenerateToken| {
+                    let call = Python::attach(|py| {
+                        callback.call1(
+                            py,
+                            (
+                                token.text,
+                                token.token_id,
+                                token.finish_reason.as_ref().map(finish_reason_name),
+                            ),
                         )
+                    });
+                    match call {
+                        Ok(_) => Ok(()),
+                        Err(err) => {
+                            callback_error = Some(err);
+                            Err(std::io::Error::other(
+                                "Python streaming callback raised an exception",
+                            )
+                            .into())
+                        }
                     }
+                };
+                request.options.resolve_sampling_defaults(None, &overrides);
+                let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> =
+                    &mut callback_fn;
+                let result = engine.generate_with_callback(request, Some(callback_fn));
+                if let Some(err) = callback_error {
+                    return Err(err);
                 }
-            };
-            // The guard remains held while Rust generates, including callback
-            // invocations. Re-entry is safe because every method uses try_lock
-            // and therefore fails immediately instead of waiting on this mutex.
-            let mut engine = try_lock_engine(&self.inner)?;
-            // Inference metadata no longer carries generation defaults, so only
-            // the caller's explicit keyword arguments select sampling; the
-            // runtime greedy default applies to everything they omitted.
-            request.options.resolve_sampling_defaults(None, &overrides);
-            let callback_fn: &mut onnx_genai_engine::GenerateTokenCallback<'_> = &mut callback_fn;
-            let result = engine.generate_with_callback(request, Some(callback_fn));
-            if let Some(err) = callback_error {
-                return Err(err);
-            }
-            result.map(GenerateResult::from).map_err(generation_error)
+                result.map(GenerateResult::from).map_err(generation_error)
+            })
         })
     }
 
     fn tokenize(&self, py: Python<'_>, text: &str) -> PyResult<Vec<u32>> {
+        let text = text.to_string();
         py.detach(|| {
-            let engine = try_lock_engine(&self.inner)?;
-            engine.tokenize(text).map_err(|err| {
-                PyValueError::new_err(format!(
-                    "failed to tokenize input text: {err}. Verify the model directory contains \
-                     a valid tokenizer.json compatible with the loaded model."
-                ))
+            let _call = self.owner.begin_call()?;
+            self.owner.call(move |engine| {
+                engine.tokenize(&text).map_err(|err| {
+                    PyValueError::new_err(format!(
+                        "failed to tokenize input text: {err}. Verify the model directory contains \
+                         a valid tokenizer.json compatible with the loaded model."
+                    ))
+                })
             })
         })
     }
@@ -352,9 +459,9 @@ fn _onnx_genai(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
-    use super::{ENGINE_IN_USE, Engine, build_options, sampling_overrides, try_lock_engine};
+    use super::{ENGINE_IN_USE, EngineOwner, build_options, sampling_overrides};
     use onnx_genai_engine::{GenerateOptions, GenerationDefaults};
 
     #[test]
@@ -425,22 +532,50 @@ mod tests {
     }
 
     #[test]
-    fn engine_pyclass_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Engine>();
-    }
-
-    #[test]
     fn engine_lock_contention_returns_actionable_python_error() {
         pyo3::Python::initialize();
-        let inner = Arc::new(Mutex::new(()));
-        let guard = inner.lock().unwrap();
-        let contender = Arc::clone(&inner);
-        let error = std::thread::spawn(move || try_lock_engine(&contender).unwrap_err())
+        let model_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let owner = Arc::new(
+            EngineOwner::start(model_dir, onnx_genai_engine::EngineConfig::default()).unwrap(),
+        );
+        let guard = owner.begin_call().unwrap();
+        let contender = Arc::clone(&owner);
+        let error = std::thread::spawn(move || contender.begin_call().unwrap_err())
             .join()
             .expect("contending thread panicked");
         drop(guard);
 
         assert_eq!(error.to_string(), format!("RuntimeError: {ENGINE_IN_USE}"));
+    }
+
+    #[test]
+    fn engine_owner_is_cross_thread_safe_and_keeps_engine_on_owner_thread() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<EngineOwner>();
+        pyo3::Python::initialize();
+        let caller = std::thread::current().id();
+        let model_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let owner = Arc::new(
+            EngineOwner::start(model_dir, onnx_genai_engine::EngineConfig::default()).unwrap(),
+        );
+        let operation_owner = Arc::clone(&owner);
+        let (operation_thread, tokens) = std::thread::spawn(move || {
+            let _guard = operation_owner.begin_call().unwrap();
+            operation_owner
+                .call(|engine| {
+                    Ok((
+                        std::thread::current().id(),
+                        engine.tokenize("hello").unwrap(),
+                    ))
+                })
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+
+        assert_ne!(operation_thread, caller);
+        assert!(!tokens.is_empty());
     }
 }

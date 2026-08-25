@@ -372,6 +372,24 @@ impl ModelRegistry {
             .collect())
     }
 
+    pub(crate) fn worker_statuses(
+        &self,
+    ) -> Result<Vec<(String, crate::driver::WorkerRuntimeStatus)>, RegistryError> {
+        let inner = self.read()?;
+        let mut model_ids = inner.models.keys().cloned().collect::<Vec<_>>();
+        model_ids.sort();
+        Ok(model_ids
+            .into_iter()
+            .flat_map(|model_id| {
+                inner.models[&model_id]
+                    .engine
+                    .worker_statuses()
+                    .into_iter()
+                    .map(move |status| (model_id.clone(), status))
+            })
+            .collect())
+    }
+
     /// Build a registry from a list of specs, loading the eager ones immediately.
     ///
     /// All specs (eager or not) are recorded in `available`.  Eager specs are also
@@ -953,13 +971,14 @@ mod tests {
             // asserted not-applicable: nothing here has determined a
             // decode path, and "pending" is the only claim that holds.
             kv_telemetry: Default::default(),
+            worker_kv_telemetry: Arc::new(vec![Default::default()]),
             resource_snapshot: Default::default(),
             memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
                 0,
                 None,
                 "registry test stub",
             )),
-            device_authority: None,
+            memory_accounting: None,
             // A stub drives no engine, so it advertises the honest "no
             // batching" report used by every non-batching backend.
             batching: Arc::new(crate::driver::BatchingReport::single_sequence_stub()),
@@ -1046,14 +1065,14 @@ mod tests {
         let registry = ModelRegistry::from_specs(&specs, ServerConfig::default()).unwrap();
         let first = registry.resolve("first").unwrap().unwrap();
         let second = registry.resolve("second").unwrap().unwrap();
-        let first_authority = first.engine.device_authority.as_ref().unwrap().clone();
-        let second_authority = second.engine.device_authority.as_ref().unwrap().clone();
+        let first_accounting = first.engine.memory_accounting.as_ref().unwrap().clone();
+        let second_accounting = second.engine.memory_accounting.as_ref().unwrap().clone();
 
         assert_eq!(
-            first_authority.authority_id(),
-            second_authority.authority_id()
+            first_accounting.device_authority_id(),
+            second_accounting.device_authority_id()
         );
-        let aggregate_used = first_authority.used_bytes();
+        let aggregate_used = first_accounting.device_snapshot().used;
         assert!(aggregate_used > 0);
         assert_eq!(
             first.engine.resource_snapshot().await.unwrap().vram.used,
@@ -1067,28 +1086,26 @@ mod tests {
         drop(first);
         registry.unload("first").unwrap();
         for _ in 0..100 {
-            if first_authority.used_bytes() < aggregate_used {
+            if first_accounting.device_snapshot().used < aggregate_used {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(first_authority.used_bytes() < aggregate_used);
-        assert!(first_authority.used_bytes() > 0);
+        assert!(first_accounting.device_snapshot().used < aggregate_used);
+        assert!(first_accounting.device_snapshot().used > 0);
         assert_eq!(
             second.engine.resource_snapshot().await.unwrap().vram.used,
-            first_authority.used_bytes()
+            first_accounting.device_snapshot().used
         );
         let metrics_snapshot = registry
             .aggregate_resource_snapshot()
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(metrics_snapshot.vram.used, first_authority.used_bytes());
-        assert_eq!(metrics_snapshot.vram.limit, first_authority.limit_bytes());
-        assert_eq!(
-            metrics_snapshot.vram.headroom,
-            first_authority.headroom_bytes()
-        );
+        let live_device = first_accounting.device_snapshot();
+        assert_eq!(metrics_snapshot.vram.used, live_device.used);
+        assert_eq!(metrics_snapshot.vram.limit, live_device.limit);
+        assert_eq!(metrics_snapshot.vram.headroom, live_device.headroom);
     }
 
     #[tokio::test]
