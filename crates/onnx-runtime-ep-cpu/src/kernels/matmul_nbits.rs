@@ -23580,10 +23580,23 @@ mod tests {
             "a decode-shaped {n}x{k} fan-out at wide={wide} lanes={lanes} was \
              routed to the wide pool"
         );
+        // Everything that makes `for_each_range` return `Serial` other than the
+        // pool declining a dispatch: an empty range, a forced-serial guard, an
+        // already-running task, a host task, or a partition that would not
+        // split. All are permanent for the rest of this test, and all are
+        // visible without running the fan-out. Ruling them out here is what
+        // lets `fan_out_until_dispatched` attribute a later `Serial` to a busy
+        // slot by elimination instead of by assumption.
+        assert_eq!(
+            crate::task_runtime::testing::planned_backend(n, output_chunk_len(n, k)),
+            crate::task_runtime::Backend::Native,
+            "a {n}x{k} fan-out plans to the serial path before it is even run, \
+             so a serial result would say nothing about the pool"
+        );
     }
 
     /// Run `fan_out` until the task runtime actually publishes a dispatch for
-    /// it, tolerating only the one decline the pool documents.
+    /// it, tolerating the transient decline the pool documents.
     ///
     /// Routing a fan-out to the pool does not oblige the pool to take it:
     /// `TaskPool::dispatch` returns `false` -- running the body inline and
@@ -23610,11 +23623,19 @@ mod tests {
     /// never got as far as the runtime -- a routing failure, reported as one
     /// rather than retried.
     ///
-    /// Retrying `Serial` is sound because that decline is transient by
-    /// construction: a slot is released as soon as its dispatcher returns. The
-    /// bound is wall-clock rather than a retry count because the thing being
-    /// waited out is a descheduled dispatcher: under the oversubscription that
-    /// produces the decline at all, one scheduler quantum is milliseconds,
+    /// Retrying `Serial` is sound because the caller has already eliminated
+    /// every *permanent* cause of it. `for_each_range` also returns `Serial`
+    /// for an empty range, a forced-serial guard, a nested task, a host task,
+    /// and a partition that would not split -- none of which a retry could ever
+    /// clear -- so [`assert_routed_to_the_task_runtime`] rules all five out up
+    /// front via `planned_backend`, which answers exactly that question without
+    /// running anything. What is left is the pool declining a dispatch, and
+    /// that is transient by construction: a slot is released as soon as its
+    /// dispatcher returns.
+    ///
+    /// The bound is wall-clock rather than a retry count because the thing
+    /// being waited out is a descheduled dispatcher: under the oversubscription
+    /// that produces the decline at all, one scheduler quantum is milliseconds,
     /// while a few dozen declined fan-outs are microseconds. A count alone
     /// would expire before the condition it is meant to outlast.
     fn fan_out_until_dispatched(what: &str, mut fan_out: impl FnMut()) {
@@ -23646,12 +23667,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let last = crate::task_runtime::testing::counters();
+        let declined = last.slot_exhausted - first.slot_exhausted;
+        // Report what was observed, not a mechanism. `Serial` has several
+        // causes; `assert_routed_to_the_task_runtime` has already ruled out
+        // every one of them that lives in `for_each_range`, which leaves
+        // `TaskPool::dispatch` returning false -- and that splits again into a
+        // busy slot, no workers, or a shut-down pool. Only the first is
+        // transient, and only the counter can tell them apart. It is
+        // process-wide, so it is evidence here rather than a verdict: over
+        // thousands of attempts a pool that never had threads to give is the
+        // one case that leaves it completely still.
+        let cause = if declined == 0 {
+            "and the pool recorded no slot exhaustion at all, which points at a \
+             pool with no workers or a shut-down pool rather than a busy one"
+        } else {
+            "while the pool was recording slot exhaustion, so the slots stayed \
+             busy for the whole window"
+        };
         panic!(
-            "{what}: the task runtime declined {attempts} consecutive fan-outs \
-             over {PATIENCE:?} for want of a free slot (pool width {}, \
-             process-wide slot_exhausted +{})",
+            "{what}: the task runtime ran {attempts} consecutive fan-outs \
+             inline over {PATIENCE:?} {cause} (pool width {}, process-wide \
+             slot_exhausted +{declined})",
             crate::task_runtime::testing::pool_width(),
-            last.slot_exhausted - first.slot_exhausted
         );
     }
 
