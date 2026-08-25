@@ -359,13 +359,16 @@ fn device_source_declares_required_symbols() {
 /// hardware and matches the CPU oracle, the `BlockQuantizedMoE` claim gate MUST
 /// keep typed-rejecting `block_fp8`/`fp4_planar`. It is `#[ignore]`d (no device
 /// here) and fails loudly if force-run without implementing the real launch, so
-/// it can never masquerade as a passed parity proof.
+/// it can never masquerade as a passed parity proof. The on-hardware follow-up
+/// must also add reserved-code (E4M3 NaN / UE8M0 `0xff`) validation to preserve
+/// the CPU oracle's fail-closed contract before the gate may flip.
 #[test]
 #[ignore = "requires a CUDA device + NVRTC to launch planar_linear_f32 and compare to the CPU oracle; the BlockQuantizedMoE claim gate stays typed-reject until this passes on hardware"]
 fn planar_decode_gpu_parity_placeholder() {
     panic!(
         "planar CUDA on-device parity is unproven without a GPU; implement the real \
-         NVRTC compile + launch of `{PLANAR_LINEAR_ENTRY}` and compare against \
-         onnx_runtime_ep_cpu planar_block_matmul before flipping the claim gate"
+         NVRTC compile + launch of `{PLANAR_LINEAR_ENTRY}` (plus reserved-code \
+         validation) and compare against onnx_runtime_ep_cpu planar_block_matmul \
+         before flipping the claim gate"
     );
 }

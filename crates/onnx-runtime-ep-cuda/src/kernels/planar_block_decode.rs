@@ -22,6 +22,20 @@
 //! compared against the CPU oracle) passes on hardware. Until then this module
 //! is the verified-by-mirror foundation, not an executable GPU path.
 //!
+//! ## Reserved-code contract (before any GPU claim)
+//!
+//! The CPU oracle
+//! [`onnx_runtime_ep_cpu::kernels::planar_block_quant`]'s `decode_element`
+//! *fail-closes* (returns `Err`) on reserved E4M3 NaN codes and reserved UE8M0
+//! `0xff` scale exponents. The device decode here (and its host mirror)
+//! deliberately mirror only the *arithmetic*, so a reserved code would decode to
+//! a propagating `NaN` rather than a typed error. That is safe while the claim
+//! gate typed-rejects these formats and the parity fixtures contain no reserved
+//! codes. **Before the claim gate may flip**, the GPU path must add host-side
+//! reserved-code validation (`PlanarLayout::validate_tensors` only checks
+//! shapes/dtypes/lengths, not individual codes) or a kernel-side guard, so the
+//! oracle's fail-closed contract is preserved on-device.
+//!
 //! ## Formats
 //!
 //! * `block_fp8` (`format = 0`): `F8_E4M3` weight, logical `[out, in]`, one byte
