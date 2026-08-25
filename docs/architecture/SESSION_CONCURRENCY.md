@@ -14,11 +14,11 @@ the worker abstraction, `WorkerId`/`SessionPlacement`, and a `WorkerPool` of one
 — §1.1 and §4 are written on top of it.
 [#2019](https://github.com/justinchuby/onnx-genai/pull/2019) (`27b8945e2` +
 `f3c89255a`) gave session-derived ORT handles a structural `Arc<Session>`
-ownership edge and shipped `crates/onnx-genai-ort/src/thread_affinity.rs` — so
-§3.4's two rules, and §13's Phase 1 prerequisite, are **partly done** for the ORT
-layer rather than pending. Sections that were written against the pre-#2019 code
-have been rewritten to say what shipped, what it means, and what is left; §1.4
-in particular is now a past-tense account of the defect that motivated it.
+ownership edge and shipped `crates/onnx-genai-ort/src/thread_affinity.rs`. The
+remaining engine primary/draft/EAGLE-3 holders and their persistent runners now
+use that shared ownership too, so §3.4 Rule A's holder conversion is complete.
+The explicit `Value`→allocator and environment ordering caveats remain, and the
+native-affinity half of §13 Phase 1 is still pending.
 
 Related: [`DESIGN.md`](DESIGN.md) for the execution architecture,
 [`../genai/SCHEDULING.md`](../genai/SCHEDULING.md) for inter-session scheduling
@@ -579,8 +579,11 @@ The three categories above say *where* state lives. This section says how the
 type system is made to enforce it, because §1.4 is proof that a categorisation
 maintained by convention does not survive contact with a refactor.
 
-Two rules, both structural. **Both are now partly shipped**, by #2019, for the
-ORT layer. What follows states each rule, then what remains.
+Two rules, both structural. **Both are now shipped for the ORT layer.** #2019
+established the derived-handle edge and affinity vocabulary; the remaining
+engine holder/runner conversion completes Rule A for every current ORT session
+holder. What follows states each rule and the narrower ordering caveats that
+remain.
 
 **Rule A — ownership, not adjacency.** Every resource derived from a `Session`
 holds an `Arc<Session>`.
@@ -617,40 +620,30 @@ allocator), then the `Allocator`, then …"* (`value.rs:2443-2448`). §4.3 there
 carries "release values before their allocator" as an explicit worker obligation
 rather than treating Rule A as complete.
 
-**What remains for Rule A is the `Box<Session>` holders.** `Arc<Session>` is a
-partial precedent in this codebase, and it is worth being accurate about how
-partial, because the change is larger than "one more `Arc`". Today:
+**The remaining `Box<Session>` holders are converted.** Today:
 
 | Holder | Type | Citation |
 |---|---|---|
-| `Engine::session` | `Option<Box<Session>>` | `engine/model.rs:68` |
-| `Eagle3Model::session` | `Box<Session>` | `engine/model.rs:255` |
-| `DraftModel::session` | `Box<Session>` | `crates/onnx-genai-engine/src/session.rs:50` |
-| `MtpModel::session` | `Arc<Session>` | `engine/model.rs:245` |
-| `MtpSession::Owned` | `Arc<Session>` | `crates/onnx-genai-ort/src/mtp.rs:122`, `:166` |
-| speculative head | `Arc<Session>` | `speculative/mod.rs:1056` |
+| `Engine::session` | `Option<Arc<Session>>` | `engine/model.rs` |
+| `Eagle3Model::session` | `Arc<Session>` | `engine/model.rs` |
+| `DraftModel::session` | `Arc<Session>` | `crates/onnx-genai-engine/src/session.rs` |
+| `MtpModel::session` | `Arc<Session>` | `engine/model.rs` |
+| stored runner session owner | `OrtSessionOwner::Shared(Arc<Session>)` | `crates/onnx-genai-ort/src/session_owner.rs` |
 
-So the engine's own session and both draft-model sessions are still `Box`; the
-MTP and speculative paths, and everything #2019 converted, use `Arc`.
-`Box<Session>` is deliberate — it is
-what gives the ORT decode runners the stable address their self-references need,
-which `Engine`'s safety comment states explicitly: *"Self-references in ORT
-decode runners point into boxed `Session` allocations, whose addresses remain
-stable when the owning `Engine` moves"* (`engine/model.rs:225-226`). `Arc`
-preserves that stable address, so the conversion is sound, but it is a
-conversion, not an extension of an existing pattern.
+The engine no longer extends a borrowed `&Session` to `'static` for persistent
+decode runners. `DecodeSession`, `StaticCacheDecodeSession`,
+`MtpDecodeSession`, and `Eagle3DecodeSession` use the same named borrowed/shared
+session owner: the shared form retains `Arc<Session>`, while each runner still
+owns its own mutable `IoBinding`, allocator, device values, KV/cache state, and
+graph-capture state. `Arc` preserves the stable pointee address that the old box
+choice supplied, including when an engine moves or another immutable session
+handle is cloned, without making any mutable worker resource shared.
 
-**Therefore Rule A's scope is stated explicitly rather than left implied.** Every
-holder that can hand out a session-derived `IoBinding`, `Allocator` or `Value`
-must move from `Box<Session>` to `Arc<Session>` in the same phase that adds the
-ownership edge — that is `Engine::session`, `Eagle3Model::session` and
-`DraftModel::session`, together with the already-`Arc` MTP and speculative
-holders. §13 Phase 1 lists them. If a future holder cannot be converted, the rule
-narrows to the holders that can, and the resources derived from an unconverted
-holder keep their current ordering discipline and keep the compensating `Drop`
-that goes with it — but it is not permitted to convert *some* holders, delete the
-compensating teardown, and leave the rest relying on an invariant that no longer
-has a keeper.
+This is shared **ownership**, not a concurrency decision. The capability remains
+`Session::supports_concurrent_run()` / `concurrent_run_support()`, and `W = 1`
+continues to issue runs serially. A future holder must use the same shared owner
+before it stores a derived handle; it is not permitted to reintroduce a raw or
+borrow-extended session pointer.
 
 The payoff, where the edge exists, is that teardown order stops being a property
 of source-file layout. `ExecutionIsland` now says so in its own field doc:
@@ -2181,22 +2174,16 @@ form (§3.4, Rule B), and §12.1's tests 13–15 exist in
 `crates/onnx-genai-ort/tests/session_thread_contract.rs`. Phase 1 no longer
 blocks on it, and Phase 2 no longer waits for it.
 
-⚠️ **Still open, and the phase is not done without it: the `Box<Session>`
-holders.** #2019 converted the holders it needed (`PipelineModels::sessions`,
-`ExecutionIsland::session`); it did not convert the engine's. The phase is not
-done until every holder in §3.4's table is converted or the rule is narrowed in
-writing, because a session-derived binding whose parent is still a `Box` on some
-other path reintroduces exactly the defect the ORT crate just removed. Today the
-holders are mixed: `Engine::session` is
-`Option<Box<Session>>` (`engine/model.rs:68`), `Eagle3Model::session` and
-`DraftModel::session` are `Box<Session>` (`engine/model.rs:255`,
-`engine/session.rs:50`), and only `MtpModel::session` is already `Arc<Session>`
-(`engine/model.rs:245`). The `Box` choices are deliberate — self-referential
-runners point into the boxed allocation for a stable address
-(`engine/model.rs:224-226`) — and `Arc` preserves that property, so the
-conversion is mechanical but must be exhaustive. If some holder cannot be
-converted, §3.4 Rule A is amended to name that holder as out of scope rather than
-left implying coverage it does not have.
+✅ **Done: the remaining engine session holders and persistent runners now use
+shared ownership.** `Engine::session`, `DraftModel::session`, and
+`Eagle3Model::session` are `Arc<Session>` alongside MTP. Stateful primary,
+static-cache, MTP, and EAGLE-3 runners retain a named borrowed/shared session
+owner; the engine uses the shared constructor, so each stored binding co-owns
+its session and no lifetime cast supplies a synthetic `'static` borrow. The Arc
+pointee stays stable across holder moves/clones, while mutable KV, bindings,
+allocators, device values, and graph-capture state remain runner/worker-local.
+`Session::supports_concurrent_run()` is preserved as the capability signal;
+`W = 1` remains serial and this prerequisite makes no concurrent-run claim.
 
 **What this phase must not do is delete a compensating teardown before the
 structural replacement exists.** Two are explicitly retained:
@@ -2250,10 +2237,10 @@ one id to two conversations. Externally observed ids are unchanged. Both `Drop`
 retentions above are kept verbatim; the clears moved into
 `WorkerRuntimeState::release_ort_state`, called from the same `Drop`.
 
-⚠️ **The rest of Phase 1 is untouched by that change:** the `Box<Session>`
-holders above, and extending the shipped `thread_affinity` vocabulary to the
-native handles §4.3 lists. The state split is a structural prerequisite at
-`W = 1` — it moves ownership into types; it does not make anything concurrent.
+⚠️ **The remaining Phase 1 work is native affinity:** extending the shipped
+`thread_affinity` vocabulary to the native handles §4.3 lists. The state split
+and ORT shared-ownership conversion are structural prerequisites at `W = 1` —
+they move ownership into types; they do not make anything concurrent.
 
 **Phase 2 — the routing lease, on the worker pool of one that already exists.**
 PR #2012 (merged as `1bf87c86`) already built the worker thread, the

@@ -9,20 +9,6 @@ use super::values::{
 };
 use super::*;
 
-pub(super) fn stable_session_ref(session: &Session) -> &'static Session {
-    // SAFETY: This lifetime extension is sound only because the referenced
-    // `Session` is owned by a `Box<Session>` stored in `Engine.session` or
-    // `DraftModel.session`, while all `DecodeRunner`s that receive the returned
-    // reference stay inside `EngineSession`s owned by the same `Engine` (or are
-    // short-lived locals under `&mut Engine`). `Engine.sessions` is declared
-    // before `_environment`, `session`, and `draft`, so persistent runners are
-    // dropped before the boxed sessions and ORT environment; moving `Engine` does
-    // not move the boxed allocation. This would become unsound if runners escaped
-    // their owning `Engine`, were sent to background tasks, or if field/drop order
-    // changed so the target/draft sessions could be dropped before sessions.
-    unsafe { std::mem::transmute::<&Session, &'static Session>(session) }
-}
-
 pub(crate) fn run_decode_session_logits(
     decode_state: &mut DecodeState,
     token_ids: &[TokenId],

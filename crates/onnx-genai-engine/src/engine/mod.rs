@@ -1842,6 +1842,58 @@ mod tests {
     }
 
     #[test]
+    fn arc_owned_session_preserves_w1_generation_and_continuation_parity() -> anyhow::Result<()> {
+        fn request(tokens: Vec<TokenId>) -> GenerateRequest {
+            let mut request = GenerateRequest::new(GeneratePrompt::TokenIds(tokens));
+            request.options.max_new_tokens = 2;
+            request.options.temperature = 0.0;
+            request.options.stop_on_eos = false;
+            request
+        }
+
+        fn two_turns(engine: &mut Engine) -> anyhow::Result<(Vec<TokenId>, Vec<TokenId>, usize)> {
+            let session = engine.create_session()?;
+            let first = engine.generate_in_session(session, request(vec![2, 4, 3]))?;
+            let second = engine.generate_in_session(session, request(vec![5, 7]))?;
+            let count = engine.session_token_count(session)?;
+            engine.close_session(session)?;
+            Ok((first.token_ids, second.token_ids, count))
+        }
+
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm")
+            .canonicalize()?;
+        let mut baseline = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let candidate = Engine::from_dir(&fixture, EngineConfig::default())?;
+        let shared_session = std::sync::Arc::clone(
+            candidate
+                .session
+                .as_ref()
+                .context("ORT candidate must own a decoder session")?,
+        );
+        let session_address = std::sync::Arc::as_ptr(&shared_session);
+        let concurrent_run_support = shared_session.concurrent_run_support();
+
+        // Moving the holder and cloning only the immutable session resource must
+        // not move the pointee or change its provider capability signal.
+        let mut candidate = candidate;
+        let moved_session = candidate
+            .session
+            .as_ref()
+            .context("moved ORT candidate must retain its decoder session")?;
+        assert_eq!(std::sync::Arc::as_ptr(moved_session), session_address);
+        assert_eq!(
+            moved_session.concurrent_run_support(),
+            concurrent_run_support
+        );
+        assert!(std::sync::Arc::ptr_eq(moved_session, &shared_session));
+        drop(shared_session);
+
+        assert_eq!(two_turns(&mut candidate)?, two_turns(&mut baseline)?);
+        Ok(())
+    }
+
+    #[test]
     fn scatter_fixture_does_not_select_static_cache_from_metadata() -> anyhow::Result<()> {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm-scatter")
