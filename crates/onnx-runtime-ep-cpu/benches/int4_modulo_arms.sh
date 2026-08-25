@@ -13,6 +13,19 @@
 # the value the q = 0 iteration legitimately uses -- but wrong for every q > 0,
 # so any row whose route reaches this line moves its checksum, and any row that
 # does not is left bit-identical as a built-in control.
+#
+# INDEPENDENT LAYOUT. One pair of binaries has one code layout, and the layout
+# component of a source-level A/B on this tree reaches ~2% -- larger than most
+# results it is used to measure, and invisible to a same-binary A/A. To get a
+# second, independent layout on demand, rebuild every arm with function
+# alignment forced. It changes nothing an instruction executes; it moves where
+# functions start (~50% -> ~91% of FUNC symbols on a 32-byte boundary here):
+#
+#   RUSTFLAGS=-Cllvm-args=-align-all-functions=5 \
+#   MOD_ARMS_OUT=target/int4-modulo-arms-align32 \
+#       crates/onnx-runtime-ep-cpu/benches/int4_modulo_arms.sh
+#
+# A sub-2% result that does not survive that is layout, not a kernel change.
 set -euo pipefail
 
 cd "$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"

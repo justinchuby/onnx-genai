@@ -2,7 +2,8 @@
 
 **Date:** 2026-08-25 · **Refs:** #1809 (merged `71bbec062`), #1676
 **Reproduce:** `crates/onnx-runtime-ep-cpu/benches/int4_modulo_arms.sh`, then
-`int4_modulo_matrix.py`
+`int4_modulo_matrix.py`. For an independent layout, rebuild the arms with
+`RUSTFLAGS=-Cllvm-args=-align-all-functions=5 MOD_ARMS_OUT=...`
 
 ## What this corrects
 
@@ -17,9 +18,12 @@ sweep had a hole exactly where the answer was.
 
 Three corrections come out of filling it in.
 
-1. **Prefill is not a null.** At block 16 the elimination is worth
-   1.0067/1.0060/1.0046 at `m = 1/8/16`, decaying to an exact null by `m = 64`.
-   Block 32 agrees. Every A/A interval in both sweeps brackets 1.000.
+1. **Prefill is not a null.** The elimination saves a roughly *fixed*
+   **0.017–0.033 ms per packed panel**, independent of `m`, which is 0.5%–1.4%
+   at `m = 1/8/16` and disappears into the noise floor by `m ≈ 64`. It
+   reproduces in **three independently built pairs of binaries**, one of them
+   deliberately perturbed in layout only. Every A/A interval in every sweep
+   brackets 1.000.
 2. **Decode is ~1.010x, not 1.015x**, and the instrument is worse than either
    number's interval suggests: the decode-loop A/A null **excludes 1.000 in
    both sweeps taken here, with opposite signs** (+0.63% at 21 launches, −0.28%
@@ -27,7 +31,8 @@ Three corrections come out of filling it in.
 3. **A source-level A/B on this codebase carries a per-build code-layout
    component that reaches ~2%, and no same-binary A/A can see it.** Found by a
    control that was supposed to be boring. Detailed below, because it bears on
-   every A/B in this directory and not just this one.
+   every A/B in this directory and not just this one — and because it is the
+   reason a single build pair is not enough to establish a sub-2% result.
 
 ## Matrix
 
@@ -85,12 +90,13 @@ floor is around ±0.6% rather than the ±0.2% either interval advertises.
 The defensible decode statement is therefore **≈1.01x**, not #1809's 1.015x —
 and it is corroborated by an instrument that *does* pass its own null: block-16
 `m = 1` in the single-op harness above is the same route, and reads
-1.0067 [1.0038, 1.0096] with a clean A/A.
+1.0067 [1.0038, 1.0096] here and 1.0115 [1.0076, 1.0134] on the
+layout-perturbed build pair, both with a clean A/A.
 
-## Why the shape of the curve is the result
+## What the curve does and does not prove
 
-Both block sizes give a monotone decay in `1/m`, reaching an exact null and
-staying there for four consecutive rows:
+Both block sizes give a monotone decay in `1/m`, reaching a null and staying
+there:
 
 ```
 block 16   1.0067  1.0060  1.0046  1.0020  1.0000  1.0003  1.0002  0.9995
@@ -98,17 +104,86 @@ block 32      —    1.0096  1.0060  1.0044  1.0001  1.0003  1.0005  1.0002
 m              1       8      16      32      64     128     256     512
 ```
 
-That is not sixteen independent measurements that happened to include six
-positive ones. It is the amortization curve the mechanism predicts, sampled at
-eight points, in two block sizes, from the same pair of binaries.
+An earlier draft of this document claimed that shape **rules out** code layout,
+on the grounds that the same `quant_prefill_gebp` runs at every row of the
+block-16 sweep, so a layout difference in it could not be +0.6% at `m = 1` and
+0.0% at `m = 512`. **That argument is wrong and is withdrawn.** A layout
+difference in any *fixed-cost* region — setup, allocation, the pack itself —
+costs a constant number of milliseconds regardless of `m`, and a constant
+absolute cost divided by a total that grows with `m` produces exactly this
+1/m ratio decay. The curve is consistent with the mechanism; it does not
+discriminate between the mechanism and layout, because both predict it.
 
-It is also the argument that rules out code layout, which is the one competing
-explanation a rebuild-between-arms A/B cannot dismiss by construction. **The
-same `quant_prefill_gebp` runs at every row of the block-16 sweep.** A layout
-difference between the two binaries is a fixed property of that code; it cannot
-be +0.6% at `m = 1` and exactly 0.0% at `m = 64` through `m = 512`. What does
-scale that way is the pack, which runs once per panel however many rows are
-multiplied against it.
+Worse, the two are the same *size* here. Read the table in milliseconds
+instead of ratios:
+
+| block | m = 1 | m = 8 | m = 16 | m = 32 | m = 64 | m = 512 |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 | +0.014 | +0.016 | +0.015 | +0.010 | 0.000 | −0.024 |
+| 32 | **−0.014** | +0.023 | +0.018 | +0.021 | +0.001 | +0.012 |
+
+The claimed saving is ~0.015 ms. The layout artifact on the route-not-taken row
+is −0.014 ms. One build pair cannot separate them.
+
+## Three build pairs, one perturbed in layout only
+
+What separates them is that layout does not survive a rebuild and the saving
+does. Three pairs of arms, built from the same one-line change:
+
+* **A** — against a `main` three commits older, and a bench source without the
+  checksum assertions. 61 launches/arm.
+* **B** — against current `main`. 61 launches/arm. The pair the tables above
+  are taken from.
+* **C** — current `main`, built with
+  `RUSTFLAGS=-Cllvm-args=-align-all-functions=5` applied identically to every
+  arm. 41 launches/arm. This changes nothing an instruction executes; it moves
+  where functions start. 50.6% → 90.8% of `FUNC` symbols land on a 32-byte
+  boundary, and the executable grows 33 KB of padding. **A designed layout
+  perturbation**, rather than an accidental one.
+
+Block 32, `speedup` and the same figure in absolute ms:
+
+| m | A | B | C | A ms | B ms | C ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 *(route-null control)* | 1.0028 | **0.9807** | 1.0028 | +0.002 | **−0.014** | +0.002 |
+| 8 | 1.0071 | 1.0096 | **1.0137** | +0.017 | +0.023 | +0.033 |
+| 16 | 1.0064 | 1.0060 | 1.0090 | +0.019 | +0.018 | +0.027 |
+| 32 | 1.0034 | 1.0044 | 1.0068 | +0.016 | +0.021 | +0.032 |
+| 64 | 1.0000 | 1.0001 | 1.0048 | 0.000 | +0.001 | +0.037 |
+
+Block 16, pair B against pair C:
+
+| m | B | C | B ms | C ms |
+|---:|---:|---:|---:|---:|
+| 1 | 1.0067 | 1.0115 | +0.014 | +0.024 |
+| 8 | 1.0060 | 1.0045 | +0.016 | +0.012 |
+| 16 | 1.0046 | 1.0077 | +0.015 | +0.025 |
+| 32 | 1.0020 | 1.0042 | +0.010 | +0.021 |
+| 64 | 1.0000 | 1.0013 | 0.000 | +0.010 |
+
+Route proof passes identically on pair C, `m = 1` through 512, both block
+sizes, including the `poison == after` control at block 32 `m = 1`. Every A/A
+interval in both pair-C sweeps brackets 1.000; 0 launches discarded.
+
+Three readings of the same experiment, and they separate cleanly:
+
+* **The row the change provably never executes swings.** +0.28%, −1.93%,
+  +0.28%. A 2.2-point range on a row where the two binaries differ only in code
+  that does not run.
+* **Every row the change does execute keeps its sign in all three pairs**, at
+  the same absolute magnitude to within a factor of two: `m = 8` is
+  +0.017/+0.023/+0.033 ms, `m = 16` is +0.019/+0.018/+0.027 ms. Deliberately
+  moving every function in the binary did not remove it, flip it, or leave it
+  unchanged — it made it slightly larger, which is what a per-call saving does
+  when the loop around it is realigned.
+* **The saving is flat in `m` where it is resolvable.** Pair C reads
+  +0.033/+0.027/+0.032/+0.037 ms at `m = 8/16/32/64` — a constant, which is
+  what a once-per-panel cost looks like. Pairs A and B lose it at `m = 64`
+  because 0.02 ms against 7.6 ms is 0.26% and those rows' intervals are ±0.3%
+  wide: at the resolution limit, not absent.
+
+That is the argument. Not the shape of the curve — the fact that the
+route-not-taken row is the only one that moves when the layout does.
 
 ## The control that was supposed to be boring
 
@@ -122,10 +197,11 @@ It reads **0.9807, CI [0.9794, 0.9835]** — a 1.9% *loss*, reproduced at
 0.9821 [0.9807, 0.9862] under `ONNX_GENAI_CPU_MM_INT4_GEBP=0`, with its own
 A/A sitting at 1.0000 [0.9973, 1.0014].
 
-**An earlier pair of binaries, built from the same source change against a
-main from three commits earlier, read 1.0000 and 1.0028 [0.9986, 1.0042] on
-that same row.** Same change, same row, same route-not-taken: +0.3% one build,
-−1.9% the next.
+**Two other pairs of binaries, built from the same source change — one against
+a `main` three commits earlier, one against current `main` with every function
+32-byte aligned — read 1.0000 / 1.0028 [0.9986, 1.0042] and 1.0028
+[0.9986, 1.0070] on that same row.** Same change, same row, same
+route-not-taken: +0.3%, −1.9%, +0.3%.
 
 So this is code layout, not a property of the change — and that is the finding,
 because:
@@ -142,9 +218,12 @@ because:
 
 The practical rule: **include a row the change provably cannot reach, prove it
 with a poisoned build, and read it as the experiment's real floor.** Where no
-such row exists — which is the usual case — a sub-2% single-block-size result
-should be treated as unconfirmed until it reproduces with a different
-amortization slope, as this one does across two block sizes.
+such row exists — which is the usual case — a sub-2% result is unconfirmed
+until it reproduces across **independently built pairs of binaries**, and the
+cheapest way to get an independent pair on demand is to rebuild every arm under
+`-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
+Reproducing across two block sizes, or two amortization slopes, from a *single*
+pair does not substitute for it: one pair of binaries has one layout.
 
 ## Route proof, per row
 
@@ -233,14 +312,20 @@ external competitor on this host and cpu 1 is its SMT sibling.
 **No kernel change.** #1809's code is correct and already on main; what was
 incomplete was its account of where the change pays. Corrected scope:
 
-* **prefill `m = 1/8/16`: 1.005x–1.010x**, both block sizes, A/A clean
-* **prefill `m >= 64`: null**, now bounded rather than asserted
+* **prefill: a fixed ~0.017–0.033 ms per packed panel**, independent of `m`,
+  reproduced in three independently built pairs of binaries including one
+  perturbed in layout only. As a ratio that is **1.004x–1.014x at
+  `m = 1/8/16`** (block 16 at `m = 1`; block 32's `m = 1` is off-route), and it
+  is the *absolute* figure that is the result — the ratio is just that constant
+  over a total that grows with `m`
+* **prefill `m >= 64`: at or below the instrument's resolution**, ~0.3% at
+  those rows, so bounded rather than shown to be zero
 * **block-16 decode: ≈1.010x**, against an instrument floor of ~0.6% — real,
   but smaller than the 1.015x #1809 reported
-* **an incidental ~1.9% layout loss on the block-32 `m = 1` decode route in
-  this build**, which is not attributable to the change and will not survive
-  the next unrelated commit, but which bounds what any sub-2% A/B in this
-  directory can claim
+* **an incidental ~1.9% layout loss on the block-32 `m = 1` decode route in one
+  of the three builds**, not attributable to the change, absent from the other
+  two, and the reason the claim above rests on three build pairs rather than
+  one
 
 Shipped here: the per-row `fnv` route fingerprint in `int4_prefill_route_ab`,
 the bootstrap and A/A self-check in the harness, and the two scripts that make

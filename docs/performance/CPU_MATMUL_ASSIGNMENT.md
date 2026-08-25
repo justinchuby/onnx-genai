@@ -3160,25 +3160,35 @@ Full report:
   having **withheld `m = 1` and `m = 8`** because their A/A null came back at
   5.31% and 4.62%. The pack is amortized over `m` rows, so the mechanism puts
   the effect at *small* `m` — the sweep had a hole exactly where the answer
-  was. Filling it in: **1.005x–1.010x at `m = 1/8/16` in both block 16 and
-  block 32**, decaying to an exact null by `m = 64`.
+  was. Filling it in: **a fixed ~0.02–0.03 ms saved per packed panel,
+  independent of `m`** — 1.004x–1.014x at `m = 1/8/16`, fading below the
+  instrument's ~0.3% resolution by `m = 64`.
   A withheld row is honest; it is not neutral. It removes the reader's ability
   to tell "no effect" from "not looked at", and here those were different.
 * **A control that was supposed to be boring is the most important number in
   the sweep.** Block 32 at `m = 1` never calls the pack — the poisoned build is
   bit-identical there — so the two binaries differ on that row only in code
   that does not execute. It read **0.9807, CI [0.9794, 0.9835]**: a 1.9% loss
-  from code layout alone. The *same source change built against a main three
-  commits earlier* read +0.3% on that row. So the layout component of a
-  source-level A/B here reaches ~2%, is not stable across rebuilds, and **is
-  structurally invisible to an A/A**, which compares a file with itself. Every
-  A/A in that document brackets 1.000 while the 1.9% artifact sits in the same
-  table.
+  from code layout alone. **Two other pairs of arms built from the same source
+  change read +0.28% on that row** — one against a main three commits earlier,
+  one against the same main with `-Cllvm-args=-align-all-functions=5` applied
+  identically to every arm. So the layout component of a source-level A/B here
+  reaches ~2%, is not stable across rebuilds, and **is structurally invisible
+  to an A/A**, which compares a file with itself. Every A/A in that document
+  brackets 1.000 while the 1.9% artifact sits in the same table.
   Standing consequence: a sub-2% source-level A/B with no route-not-taken row
   is not confirmed. Where a route-not-taken row exists, prove it with a
   poisoned build and read it as the experiment's floor. Where it does not,
-  require the result to reproduce with a *different amortization slope* — this
-  one does, across two block sizes, which is what rules layout out.
+  **require the result to reproduce across independently built pairs of
+  binaries** — cheapest on demand by rebuilding every arm under
+  `-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
+  Reproducing across two block sizes from one pair does *not* substitute:
+  a single pair of binaries has a single layout, and I initially argued
+  otherwise in this document. The 1/m decay of the ratio does not distinguish
+  the mechanism from layout either — a constant-absolute layout cost over a
+  total that grows with `m` produces the identical curve. What distinguishes
+  them is that the route-not-taken row is the only one that moves when the
+  layout does.
 * **The decode headline was overstated, by my own instrument's rules.** #1809
   said 1.015x; two sweeps here give 1.0116 and 1.0095, and in both the
   decode-loop **A/A interval excludes 1.000, with opposite signs** (+0.63% at

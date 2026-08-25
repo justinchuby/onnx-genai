@@ -860,13 +860,18 @@ impl Int4Weight<'_> {
                 // runtime field, and a `#[target_feature]` function is never
                 // inlined into a caller that might have narrowed it.
                 //
-                // Scope, measured rather than assumed: 1.005x-1.010x at
-                // prefill `m = 1/8/16` in both block 16 and block 32, decaying
-                // to a bounded null by `m = 64` because the pack is amortized
-                // over `m` rows, and ~1.010x on the block-16 decode route.
-                // #1809 reported prefill as a flat null; it had withheld
-                // `m = 1` and `m = 8` for failing their A/A null, and those
-                // were the rows the effect lived in. Full matrix in
+                // Scope, measured rather than assumed: a fixed ~0.02-0.03 ms
+                // per packed panel, independent of `m`, reproduced in three
+                // independently built pairs of binaries. As a ratio that is
+                // 1.004x-1.014x at prefill `m = 1/8/16` (block 32's `m = 1`
+                // does not reach this line at all -- it routes to
+                // `borrowed_affine_int4_matmul_nblock` -- and is used as the
+                // A/B's route-not-taken control), fading below the
+                // instrument's ~0.3% resolution by `m = 64` because the pack
+                // is amortized over `m` rows, and ~1.010x on the block-16
+                // decode route. #1809 reported prefill as a flat null; it had
+                // withheld `m = 1` and `m = 8` for failing their A/A null, and
+                // those were the rows the effect lived in. Full matrix in
                 // `docs/benchmarks/2026-08-25-int4-pack-modulo-elimination-matrix.md`.
                 let offset_in_block = offset_base + q;
                 let mut vecs = [_mm256_setzero_ps(); DEQUANT_GROUP];
