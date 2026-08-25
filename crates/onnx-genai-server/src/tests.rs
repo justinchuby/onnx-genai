@@ -2143,8 +2143,11 @@ async fn explicit_max_batch_above_one_is_refused_on_non_batching_backend() {
         Err(error) => format!("{error:#}"),
     };
     assert!(
-        error.contains("--max-batch 4") && error.contains("cannot be honored"),
-        "refusal must name the flag and the reason: {error}"
+        error.contains("failed to start engine worker 0")
+            && error.contains("engine worker initialization failed")
+            && error.contains("--max-batch 4")
+            && error.contains("cannot be honored"),
+        "the worker's typed initialization failure must reach model loading with context: {error}"
     );
 }
 
@@ -2529,8 +2532,12 @@ async fn queue_depth_admission_limit_returns_429_with_retry_after() {
 #[tokio::test]
 async fn stalled_output_route_does_not_block_another_completion() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
-    let engine = Engine::from_dir(&model_dir, EngineConfig::default()).unwrap();
-    let driver = EngineDriver::start(engine, 2, 2);
+    let (driver, ()) = EngineDriver::start(
+        move || Ok((Engine::from_dir(&model_dir, EngineConfig::default())?, ())),
+        2,
+        2,
+    )
+    .unwrap();
     let slow_request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "tiny-llm",
         "messages": [{"role": "user", "content": "hello"}],
@@ -2585,16 +2592,25 @@ async fn stalled_output_route_does_not_block_another_completion() {
 async fn native_driver_sessions_generate_through_server_path() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/tiny-native-sub4-engine");
-    let engine = Engine::from_dir(
-        &model_dir,
-        EngineConfig {
-            decode_backend: EngineDecodeBackend::Native,
-            ..EngineConfig::default()
+    let (driver, ()) = EngineDriver::start(
+        move || {
+            Ok((
+                Engine::from_dir(
+                    &model_dir,
+                    EngineConfig {
+                        decode_backend: EngineDecodeBackend::Native,
+                        ..EngineConfig::default()
+                    },
+                )?,
+                (),
+            ))
         },
+        2,
+        4,
     )
     .unwrap();
-    let driver = EngineDriver::start(engine, 2, 4);
     let session_id = driver.create_session().await.unwrap();
+    let leases = crate::lease::SessionLeases::with_shards(1);
 
     let mut request =
         onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
@@ -2602,7 +2618,15 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
     let generation = driver
-        .generate(Some(session_id), request, None)
+        .generate(
+            Some(
+                leases
+                    .acquire(driver.binding(session_id), "native-session")
+                    .expect("a session with no turn in flight is leasable"),
+            ),
+            request,
+            None,
+        )
         .await
         .unwrap();
     let result = timeout(
@@ -2615,7 +2639,23 @@ async fn native_driver_sessions_generate_through_server_path() {
 
     assert_eq!(result.token_ids, vec![1, 1]);
     assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
-    driver.close_session(session_id).await.unwrap();
+    // The route that holds the turn's lease is dropped by the driver *after*
+    // it sends `Finished`, so a returned result does not by itself imply a
+    // released lease — it only implies the release is imminent. Poll rather
+    // than assume: this still fails if the release never happens, without
+    // racing the driver thread when it does.
+    let mut lease = None;
+    for _ in 0..200 {
+        match leases.acquire(driver.binding(session_id), "native-session-close") {
+            Ok(guard) => {
+                lease = Some(guard);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let lease = lease.expect("the finished turn never released its lease");
+    driver.close_session(lease).await.unwrap();
 }
 
 // ── KV cache dtype CLI/env surface tests ─────────────────────────────────────

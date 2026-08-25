@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -20,7 +21,9 @@ use crate::image_generation::{ImageExecutionRequest, ProducedImage};
 use crate::lease::{ModelKey, ModelSessionPlacement, SessionLeaseGuard};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
-use crate::worker::{SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerUnavailable};
+use crate::worker::{
+    SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerStartError, WorkerUnavailable,
+};
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
 const MICROBATCH_MIN_WAIT: Duration = Duration::from_millis(2);
@@ -256,14 +259,6 @@ impl DriverFailure {
     }
 }
 
-/// The driver owns exactly one runtime.
-///
-/// There used to be two variants here because there were two runtime types and
-/// the server had to know which one it held. There is one type now, so the
-/// owner is one box and the *runtime* resolves how to execute a request from the
-/// package's own declaration.
-struct EngineOwner(Box<Engine>);
-
 #[derive(Debug)]
 pub(crate) enum GenerateSubmitError {
     Overloaded,
@@ -295,89 +290,179 @@ struct MicrobatchAdmission<'a> {
     generation_capacity: &'a Semaphore,
 }
 
-// SAFETY: The engine is moved exactly once into the dedicated driver thread.
-// All ORT runners, sessions, KV state, and the continuous batch manager stay
-// owned by that thread and are accessed only by processing channel commands.
-unsafe impl Send for EngineOwner {}
+/// State constructed, used, and destroyed entirely inside one worker thread.
+///
+/// `DropProbe` is `()` in production. Tests use the final field to observe that
+/// the preceding `Engine` has already been dropped on the worker thread.
+struct EngineWorkerState<DropProbe> {
+    engine: Engine,
+    commands: Option<mpsc::Receiver<DriverCommand>>,
+    continuous_batch_supported: bool,
+    max_batch: usize,
+    max_queue_depth: usize,
+    generation_capacity: Arc<Semaphore>,
+    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    _drop_probe: DropProbe,
+}
+
+struct EngineWorkerReady {
+    batching: Arc<BatchingReport>,
+    kv_telemetry: Arc<KvTelemetry>,
+    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    memory_strategy_plan: Arc<MemoryStrategyPlan>,
+    device_authority: Option<DeviceMemoryAuthority>,
+    workflow_facts: WorkflowFacts,
+}
 
 impl EngineDriver {
-    pub(crate) fn start(engine: Engine, max_batch: usize, max_queue_depth: usize) -> Self {
+    /// Start one worker and construct its engine inside that OS thread.
+    ///
+    /// The construction closure may return a small, `Send`-safe payload derived
+    /// from the engine for the surrounding model handle. The engine itself
+    /// never crosses the thread boundary.
+    pub(crate) fn start<Ready, Build>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+    {
+        Self::start_inner(build_engine, max_batch, max_queue_depth, ())
+    }
+
+    fn start_inner<Ready, Build, DropProbe>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+        drop_probe: DropProbe,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+        DropProbe: Send + 'static,
+    {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
-        // Attach before the engine moves onto the driver thread: this is the
-        // last point at which it is reachable from here, and the mirror must
-        // outlive that move because reading it is the whole reason it exists.
-        let mut engine = engine;
-        // Resolve the honest batching capability from the decode path (not from
-        // whether an ORT session exists) while the engine is still borrowable,
-        // then clamp the requested width to what the path can actually honor.
-        let batching = Arc::new(BatchingReport::from_capability(
-            &engine.batching_capability(),
-            max_batch,
-        ));
-        let effective_max_batch = batching.effective_max_batch;
-        tracing::info!(
-            batch_supported = batching.supported,
-            requested_max_batch = batching.requested_max_batch,
-            effective_max_batch = batching.effective_max_batch,
-            reason = %batching.reason,
-            "resolved batching capability",
-        );
-        let device_authority = Some(engine.governor().device_authority());
-        let kv_telemetry = Arc::new(KvTelemetry::default());
-        if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
-            kv_telemetry.set_applicable();
-        } else {
-            kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
-        }
-        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-        let owner = EngineOwner(Box::new(engine));
-        let workflow_facts = WorkflowFacts {
-            components: owner.0.workflow_component_count(),
-            graph_components: owner.0.workflow_graph_component_count(),
-            declares_generation_loop: owner.0.workflow_declares_generation_loop(),
-        };
-        let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
-        let driver_snapshot = Arc::clone(&resource_snapshot);
         // One worker owns the engine for the whole life of this driver. The
         // pool exists so a command names the worker it is going to, not so the
         // engine can move between them: it cannot.
         let worker_id = WorkerId::PRIMARY;
-        let worker = WorkerHandle::spawn(
+        let (worker, (ready_payload, worker_ready)) = WorkerHandle::spawn(
             worker_id,
             format!("onnx-genai-batch-driver-{worker_id}"),
             commands,
-            move || {
-                run_engine_driver(
-                    owner,
-                    rx,
-                    effective_max_batch,
-                    max_queue_depth,
-                    driver_capacity,
-                    driver_snapshot,
-                )
+            move || -> anyhow::Result<_> {
+                let (mut engine, ready_payload) = build_engine()
+                    .with_context(|| format!("failed to construct engine on worker {worker_id}"))?;
+                let batching = Arc::new(BatchingReport::from_capability(
+                    &engine.batching_capability(),
+                    max_batch,
+                ));
+                let effective_max_batch = batching.effective_max_batch;
+                let continuous_batch_supported =
+                    engine.continuous_batch_manager(effective_max_batch).is_ok();
+                let device_authority = Some(engine.governor().device_authority());
+                let kv_telemetry = Arc::new(KvTelemetry::default());
+                if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
+                    kv_telemetry.set_applicable();
+                } else {
+                    kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
+                }
+                let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
+                let workflow_facts = WorkflowFacts {
+                    components: engine.workflow_component_count(),
+                    graph_components: engine.workflow_graph_component_count(),
+                    declares_generation_loop: engine.workflow_declares_generation_loop(),
+                };
+                let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
+                let worker_ready = EngineWorkerReady {
+                    batching,
+                    kv_telemetry,
+                    resource_snapshot: Arc::clone(&resource_snapshot),
+                    memory_strategy_plan,
+                    device_authority,
+                    workflow_facts,
+                };
+                Ok((
+                    EngineWorkerState {
+                        engine,
+                        commands: Some(rx),
+                        continuous_batch_supported,
+                        max_batch: effective_max_batch,
+                        max_queue_depth,
+                        generation_capacity: driver_capacity,
+                        resource_snapshot,
+                        _not_send: std::marker::PhantomData,
+                        _drop_probe: drop_probe,
+                    },
+                    (ready_payload, worker_ready),
+                ))
             },
+            run_engine_driver,
+        )
+        .map_err(|error| match error {
+            WorkerStartError::ThreadSpawn(error) => {
+                anyhow::Error::new(error).context("failed to spawn engine worker thread")
+            }
+            WorkerStartError::Initialization(error) => {
+                error.context("engine worker initialization failed")
+            }
+            WorkerStartError::InitializationPanicked(message) => {
+                anyhow::anyhow!("engine worker initialization panicked: {message}")
+            }
+            WorkerStartError::InitializationChannelClosed => {
+                anyhow::anyhow!("engine worker exited before reporting initialization")
+            }
+        })
+        .with_context(|| format!("failed to start engine worker {worker_id}"))?;
+        tracing::info!(
+            batch_supported = worker_ready.batching.supported,
+            requested_max_batch = worker_ready.batching.requested_max_batch,
+            effective_max_batch = worker_ready.batching.effective_max_batch,
+            reason = %worker_ready.batching.reason,
+            "resolved batching capability",
         );
         let workers = WorkerPool::single(worker);
         tracing::info!(
             workers = workers.len(),
             "engine worker pool started (one worker owns the engine)",
         );
-        Self {
-            // Rebound by `ModelHandle::new`, which is the first thing that
-            // knows the id this engine was loaded as.
-            model: ModelKey::new(""),
-            workers,
-            generation_capacity,
-            generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
-            kv_telemetry,
-            resource_snapshot,
-            memory_strategy_plan,
-            device_authority,
-            batching,
-            workflow_facts,
-        }
+        Ok((
+            Self {
+                // Rebound by `ModelHandle::new`, which is the first thing that
+                // knows the id this engine was loaded as.
+                model: ModelKey::new(""),
+                workers,
+                generation_capacity,
+                generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
+                kv_telemetry: worker_ready.kv_telemetry,
+                resource_snapshot: worker_ready.resource_snapshot,
+                memory_strategy_plan: worker_ready.memory_strategy_plan,
+                device_authority: worker_ready.device_authority,
+                batching: worker_ready.batching,
+                workflow_facts: worker_ready.workflow_facts,
+            },
+            ready_payload,
+        ))
+    }
+
+    #[cfg(test)]
+    fn start_with_drop_probe<Ready, Build, DropProbe>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+        drop_probe: DropProbe,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+        DropProbe: Send + 'static,
+    {
+        Self::start_inner(build_engine, max_batch, max_queue_depth, drop_probe)
     }
 
     /// Stop every worker and wait for the engine to be destroyed.
@@ -833,30 +918,28 @@ impl EngineDriver {
     }
 }
 
-fn run_engine_driver(
-    owner: EngineOwner,
-    rx: mpsc::Receiver<DriverCommand>,
-    max_batch: usize,
-    max_queue_depth: usize,
-    generation_capacity: Arc<Semaphore>,
-    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
-) {
-    let mut engine = *owner.0;
+fn run_engine_driver<DropProbe>(mut worker: EngineWorkerState<DropProbe>) {
+    let commands = worker
+        .commands
+        .take()
+        .expect("engine worker command receiver is present");
     // Which driver runs is a capability question the engine answers: a package
     // whose decode path can advance several rows per forward pass gets the
     // continuous-batch driver, and everything else — including a package whose
     // components own separate caches — gets the per-request one. Neither driver
     // asks what kind of package it holds.
-    let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-    if continuous_batch_supported {
-        tracing::info!(max_batch, "continuous batch driver enabled");
+    if worker.continuous_batch_supported {
+        tracing::info!(
+            max_batch = worker.max_batch,
+            "continuous batch driver enabled"
+        );
         run_static_engine_driver(
-            &mut engine,
-            rx,
-            max_batch,
-            max_queue_depth,
-            &generation_capacity,
-            &resource_snapshot,
+            &mut worker.engine,
+            commands,
+            worker.max_batch,
+            worker.max_queue_depth,
+            &worker.generation_capacity,
+            &worker.resource_snapshot,
         );
     } else {
         tracing::info!(
@@ -864,7 +947,7 @@ fn run_engine_driver(
             effective_max_batch = 1,
             "continuous batch driver disabled; using per-request engine path (single-sequence decode)"
         );
-        run_fallback_engine_driver(&mut engine, rx, &resource_snapshot);
+        run_fallback_engine_driver(&mut worker.engine, commands, &worker.resource_snapshot);
     }
 }
 
@@ -1904,6 +1987,34 @@ fn run_fim_generation(
 mod admission_tests {
     use super::*;
 
+    struct IsSend<T: ?Sized>(std::marker::PhantomData<T>);
+    trait SendFallback {
+        const VALUE: bool = false;
+    }
+    impl<T: ?Sized> SendFallback for IsSend<T> {}
+    #[allow(dead_code)]
+    impl<T: ?Sized + Send> IsSend<T> {
+        const VALUE: bool = true;
+    }
+
+    struct EngineDropThread(std::sync::mpsc::SyncSender<thread::ThreadId>);
+
+    impl Drop for EngineDropThread {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
+    }
+
+    #[test]
+    fn engine_worker_state_is_structurally_not_send() {
+        const {
+            assert!(
+                !IsSend::<EngineWorkerState<()>>::VALUE,
+                "engine worker state must not cross threads"
+            );
+        }
+    }
+
     fn pending_route() -> (
         DriverRoute,
         oneshot::Receiver<Result<(), DriverFailure>>,
@@ -2207,9 +2318,31 @@ mod admission_tests {
     async fn shutdown_joins_the_engine_worker_and_is_idempotent() {
         let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm");
-        let engine = Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())
-            .expect("load tiny fixture");
-        let driver = EngineDriver::start(engine, 1, 2);
+        let caller_thread = thread::current().id();
+        let (constructed_tx, constructed_rx) = std::sync::mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        let (driver, ()) = EngineDriver::start_with_drop_probe(
+            move || {
+                constructed_tx
+                    .send(thread::current().id())
+                    .expect("record construction thread");
+                Ok((
+                    Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())?,
+                    (),
+                ))
+            },
+            1,
+            2,
+            EngineDropThread(dropped_tx),
+        )
+        .expect("load tiny fixture on worker");
+        let construction_thread = constructed_rx
+            .recv()
+            .expect("worker reports construction thread");
+        assert_ne!(
+            construction_thread, caller_thread,
+            "the engine must be constructed on the worker, not the caller"
+        );
         assert_eq!(driver.workers.len(), 1, "phase one runs a pool of one");
         let worker = Arc::clone(driver.workers.primary());
         assert!(worker.is_running());
@@ -2226,6 +2359,11 @@ mod admission_tests {
         driver.shutdown();
         assert!(worker.is_joined(), "shutdown must join the worker thread");
         assert!(!worker.is_running());
+        assert_eq!(
+            dropped_rx.recv().expect("record engine teardown thread"),
+            construction_thread,
+            "the engine must be destroyed on the thread that constructed it",
+        );
 
         // Idempotent: a second shutdown neither panics nor waits on anything.
         driver.shutdown();
@@ -2245,6 +2383,27 @@ mod admission_tests {
             driver.session_token_count(session).await,
             Err(error) if error.to_string() == "engine driver stopped"
         ));
+    }
+
+    #[test]
+    fn initialization_panic_is_returned_as_a_driver_start_error() {
+        let error = match EngineDriver::start(
+            || -> anyhow::Result<(Engine, ())> {
+                panic!("fixture engine initializer panicked");
+            },
+            1,
+            1,
+        ) {
+            Ok(_) => panic!("a panicked initializer must not produce a driver"),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(
+            error.contains("failed to start engine worker 0")
+                && error.contains("engine worker initialization panicked")
+                && error.contains("fixture engine initializer panicked"),
+            "panic must retain worker and initialization context: {error}",
+        );
     }
 
     /// A session-bound command addressed to a worker the pool does not have is

@@ -8,6 +8,8 @@
 //! native-runtime, and execution-provider spans when available. OTLP span export
 //! is intentionally deferred (see issue #13).
 
+#![forbid(unsafe_code)]
+
 use std::{net::SocketAddr, time::Instant};
 
 use axum::{
