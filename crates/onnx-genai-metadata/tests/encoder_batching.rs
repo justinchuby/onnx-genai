@@ -2940,6 +2940,23 @@ fn a_declared_companion_that_no_step_writes_is_not_published() {
         &document,
         "whose valid_lengths 'patch_lengths' is declared as a workflow output but never emitted",
     );
+    // The negative half, guarding a different narrowing than the unwritten
+    // -claimant case above: a carve-out that stopped recognizing valid_lengths
+    // as a companion kind -- a revert of the widening, not a new mistake --
+    // would leave this rejection standing and send `tile_lengths`, which is
+    // emitted and does describe an emitted result, to the generic message,
+    // whose advice is the row axis a companion may not declare.
+    //
+    // Checked by mutation, and the first narrowing tried did not do it: keying
+    // admission on the claimant having published *every* companion also refuses
+    // `tile_lengths`, but through the wrong-shape message, so it is not what
+    // this assertion holds.
+    assert!(
+        !errors(&document)
+            .iter()
+            .any(|error| error.contains("without a declared batch_layout")),
+        "withholding one companion must not unadmit the companion beside it"
+    );
 }
 
 #[test]
@@ -2954,6 +2971,16 @@ fn a_declared_ownership_companion_that_no_step_writes_is_not_published_either() 
     assert_reports(
         &document,
         "owner 'image_owner' is declared as a workflow output but never emitted",
+    );
+    // The packing-side analogue: dropping offsets and owner maps from the
+    // carve-out sends `image_offsets` to the generic message the same way.
+    // Leaving one half of an established pair without the negative is how the
+    // next outcome-only assertion gets written.
+    assert!(
+        !errors(&document)
+            .iter()
+            .any(|error| error.contains("without a declared batch_layout")),
+        "withholding the owner map must not unadmit the offsets beside it"
     );
 }
 
@@ -2998,6 +3025,17 @@ fn a_companion_of_a_result_nobody_produces_describes_nothing() {
         &document,
         "which only output 'features' names as a shape companion, and that output is never \
          emitted",
+    );
+    // The negative half. A carve-out that dropped the unwritten-claimant branch
+    // would still refuse this document -- through the generic message, whose
+    // advice is to declare a row axis, which is the one layout a companion may
+    // not have. Asserting only that it was rejected would certify that
+    // narrowing, since the rejection survives it and only the reason is lost.
+    assert!(
+        !errors(&document)
+            .iter()
+            .any(|error| error.contains("without a declared batch_layout")),
+        "a companion of a result nobody produces must not be advised toward a row axis"
     );
 }
 
