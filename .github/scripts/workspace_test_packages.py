@@ -66,6 +66,8 @@ def package_args(packages: list[str]) -> str:
     # One argument per line makes command substitution work in both bash and
     # PowerShell. A single space-separated line becomes one native argument in
     # PowerShell, so `cargo` sees an invalid package name containing spaces.
+    # Callers must receive LF-only separators; see the newline handling in
+    # `main`, which bash depends on and PowerShell hides.
     return "\n".join(arg for package in packages for arg in ("-p", package))
 
 
@@ -145,6 +147,13 @@ def main() -> int:
 
     if args.command == "verify":
         return verify(args.simulate_missing)
+    # Windows Python writes stdout in text mode and translates "\n" into
+    # "\r\n". bash splits command substitution on IFS, which contains newline
+    # but not carriage return, so each token would keep a trailing "\r" and
+    # cargo would reject the package name. PowerShell strips CRLF when it
+    # splits native output into an array, which is why this stayed invisible
+    # while the Windows lanes ran pwsh.
+    sys.stdout.reconfigure(newline="\n")
     print(package_args(lane_packages(args.lane)))
     return 0
 

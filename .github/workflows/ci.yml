@@ -323,7 +323,10 @@ jobs:
       # Windows lanes, where the default shell is pwsh, and `set -e` plus
       # `test -n` are bash semantics. The inline form happened to work under
       # both shells only because the resolver prints one token per line, which
-      # pwsh splats as an argument array -- an accident, not a contract.
+      # pwsh splats as an argument array -- an accident, not a contract. The
+      # resolver forces LF separators for the same reason: pwsh strips CRLF
+      # when it splits native output, bash does not, and a trailing "\r" on
+      # each token reaches cargo as part of the package name.
       - name: Test Linux offline crates
         shell: bash
         run: |
