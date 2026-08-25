@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::Context;
 
+use crate::lease::{SessionLeaseGuard, SessionLeases};
 use crate::worker::SessionPlacement;
 
 #[derive(Clone)]
@@ -20,13 +21,18 @@ struct SessionRegistryInner {
 }
 
 /// The outcome of binding a client id to an engine session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum SessionClaim {
     /// Another request bound this client id first; use its session and release
     /// the one this caller opened.
     Existing(SessionPlacement),
     /// This caller's session is now the client id's session.
-    Claimed { evicted: Option<SessionPlacement> },
+    ///
+    /// `evicted` is the binding dropped to make room, handed back *holding its
+    /// exclusive lease* so the caller can close it on the worker that owns it
+    /// without racing a turn: nothing else can start one while the guard lives,
+    /// and the guard is released when the close returns.
+    Claimed { evicted: Option<SessionLeaseGuard> },
 }
 
 /// One client id's binding: where its conversation lives, and when it was last
@@ -51,18 +57,25 @@ impl SessionRegistry {
         }
     }
 
+    /// Bind a client id to an engine session, evicting under pressure.
+    ///
+    /// Takes the lease map because eviction is a *mutation of somebody else's
+    /// conversation*: the victim is chosen from the bindings no turn is in
+    /// flight on, and is returned holding its lease so the close that follows
+    /// cannot race a turn that starts in between.
     pub(crate) fn insert(
         &self,
         client_id: String,
         placement: SessionPlacement,
-    ) -> anyhow::Result<Option<SessionPlacement>> {
+        leases: &Arc<SessionLeases>,
+    ) -> anyhow::Result<Option<SessionLeaseGuard>> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
         let previous_len = inner.sessions.len();
         let evicted = if previous_len >= self.max_sessions {
-            evict_lru(&mut inner)
+            evict_lru(&mut inner, leases)
         } else {
             None
         };
@@ -93,6 +106,7 @@ impl SessionRegistry {
         &self,
         client_id: String,
         placement: SessionPlacement,
+        leases: &Arc<SessionLeases>,
     ) -> anyhow::Result<SessionClaim> {
         let mut inner = self
             .inner
@@ -110,7 +124,7 @@ impl SessionRegistry {
         }
         let previous_len = inner.sessions.len();
         let evicted = if previous_len >= self.max_sessions {
-            evict_lru(&mut inner)
+            evict_lru(&mut inner, leases)
         } else {
             None
         };
@@ -197,19 +211,55 @@ impl Drop for SessionRegistry {
     }
 }
 
-/// Drop the least recently accessed binding and return where its session lives,
-/// so the caller can close it on the worker that owns it.
+/// Drop the least recently accessed binding that has no turn in flight, and
+/// return it holding its exclusive lease so the caller can close it on the
+/// worker that owns it.
 ///
 /// One implementation for both `insert` and `claim`: the two make the same
 /// eviction decision, and a second copy of it is a second answer waiting to
 /// drift.
-fn evict_lru(inner: &mut SessionRegistryInner) -> Option<SessionPlacement> {
-    let victim = inner
+///
+/// **The victim is chosen by taking its lease, not by asking whether it is
+/// free.** Asking first and closing after would leave the window this whole
+/// design exists to shut: a turn could take the lease in between, and the close
+/// would then destroy the conversation that turn is writing. The candidates are
+/// therefore walked oldest-first and the first one whose lease can be taken is
+/// the victim.
+///
+/// If every binding is mid-turn there is no victim, and the registry is left one
+/// over its bound rather than a live conversation being closed under its caller.
+/// The overshoot is bounded by the number of turns in flight, which the
+/// generation-capacity semaphore already bounds, and it resolves at the next
+/// insert once any turn ends.
+fn evict_lru(
+    inner: &mut SessionRegistryInner,
+    leases: &Arc<SessionLeases>,
+) -> Option<SessionLeaseGuard> {
+    let mut candidates: Vec<(u64, &str, SessionPlacement)> = inner
         .sessions
         .iter()
-        .min_by_key(|(_, entry)| entry.last_access)
-        .map(|(id, _)| id.clone())?;
-    inner.sessions.remove(&victim).map(|entry| entry.placement)
+        .map(|(id, entry)| (entry.last_access, id.as_str(), entry.placement))
+        .collect();
+    candidates.sort_unstable_by_key(|(last_access, _, _)| *last_access);
+    let victim = candidates.into_iter().find_map(|(_, id, placement)| {
+        leases
+            .acquire(placement, id)
+            .ok()
+            .map(|lease| (id.to_string(), lease))
+    });
+    let (client_id, lease) = match victim {
+        Some(victim) => victim,
+        None => {
+            tracing::warn!(
+                bound = inner.sessions.len(),
+                "every registered session has a turn in flight; admitting one over the session \
+                 bound rather than closing a live conversation",
+            );
+            return None;
+        }
+    };
+    inner.sessions.remove(&client_id);
+    Some(lease)
 }
 
 fn hex_token(bytes: &[u8]) -> String {
@@ -250,12 +300,28 @@ mod tests {
         SessionPlacement::new(WorkerId::PRIMARY, engine_session_id)
     }
 
+    fn leases() -> Arc<SessionLeases> {
+        SessionLeases::with_shards(1)
+    }
+
+    /// What was evicted, by placement, so a test can assert on it after the
+    /// guard that carried it has been released.
+    fn evicted_placement(evicted: &Option<SessionLeaseGuard>) -> Option<SessionPlacement> {
+        evicted.as_ref().map(SessionLeaseGuard::placement)
+    }
+
     #[test]
     fn a_bound_session_remembers_the_worker_that_owns_it() {
         let registry = SessionRegistry::new(4);
+        let leases = leases();
         let bound = SessionPlacement::new(WorkerId::new(0), 7);
 
-        assert_eq!(registry.insert("sess-a".to_string(), bound).unwrap(), None);
+        assert!(
+            registry
+                .insert("sess-a".to_string(), bound, &leases)
+                .unwrap()
+                .is_none()
+        );
 
         let found = registry.get("sess-a").unwrap().expect("session is bound");
         assert_eq!(found, bound);
@@ -273,7 +339,9 @@ mod tests {
     #[test]
     fn removing_a_session_returns_its_placement_once() {
         let registry = SessionRegistry::new(4);
-        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+        registry
+            .insert("sess-a".to_string(), placement(1), &leases())
+            .unwrap();
 
         assert_eq!(registry.remove("sess-a").unwrap(), Some(placement(1)));
         assert_eq!(registry.remove("sess-a").unwrap(), None);
@@ -285,14 +353,31 @@ mod tests {
     #[test]
     fn insert_evicts_the_least_recently_accessed_session() {
         let registry = SessionRegistry::new(2);
-        registry.insert("sess-a".to_string(), placement(1)).unwrap();
-        registry.insert("sess-b".to_string(), placement(2)).unwrap();
+        let leases = leases();
+        registry
+            .insert("sess-a".to_string(), placement(1), &leases)
+            .unwrap();
+        registry
+            .insert("sess-b".to_string(), placement(2), &leases)
+            .unwrap();
 
         // Touching "a" makes "b" the least recently accessed binding.
         registry.get("sess-a").unwrap().expect("a is bound");
 
-        let evicted = registry.insert("sess-c".to_string(), placement(3)).unwrap();
-        assert_eq!(evicted, Some(placement(2)), "LRU 'b' must be evicted");
+        let evicted = registry
+            .insert("sess-c".to_string(), placement(3), &leases)
+            .unwrap();
+        assert_eq!(
+            evicted_placement(&evicted),
+            Some(placement(2)),
+            "LRU 'b' must be evicted"
+        );
+        assert!(
+            leases.is_held(placement(2)),
+            "an evicted session is handed back leased, so its close cannot race a turn",
+        );
+        drop(evicted);
+        assert!(!leases.is_held(placement(2)));
         assert_eq!(registry.get("sess-b").unwrap(), None);
         assert_eq!(registry.get("sess-a").unwrap(), Some(placement(1)));
         assert_eq!(registry.get("sess-c").unwrap(), Some(placement(3)));
@@ -303,38 +388,113 @@ mod tests {
     #[test]
     fn claim_returns_the_existing_binding_and_refreshes_it() {
         let registry = SessionRegistry::new(2);
-        registry.insert("sess-a".to_string(), placement(1)).unwrap();
-        registry.insert("sess-b".to_string(), placement(2)).unwrap();
+        let leases = leases();
+        registry
+            .insert("sess-a".to_string(), placement(1), &leases)
+            .unwrap();
+        registry
+            .insert("sess-b".to_string(), placement(2), &leases)
+            .unwrap();
 
-        let claim = registry.claim("sess-a".to_string(), placement(9)).unwrap();
-        assert_eq!(claim, SessionClaim::Existing(placement(1)));
+        let claim = registry
+            .claim("sess-a".to_string(), placement(9), &leases)
+            .unwrap();
+        assert!(matches!(claim, SessionClaim::Existing(existing) if existing == placement(1)));
 
         // The losing claim also counts as an access, so "b" is now the LRU.
-        let evicted = registry.insert("sess-c".to_string(), placement(3)).unwrap();
-        assert_eq!(evicted, Some(placement(2)));
+        let evicted = registry
+            .insert("sess-c".to_string(), placement(3), &leases)
+            .unwrap();
+        assert_eq!(evicted_placement(&evicted), Some(placement(2)));
     }
 
     #[test]
     fn claim_binds_a_new_client_id_and_evicts_under_pressure() {
         let registry = SessionRegistry::new(1);
-        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+        let leases = leases();
+        registry
+            .insert("sess-a".to_string(), placement(1), &leases)
+            .unwrap();
 
-        let claim = registry.claim("sess-b".to_string(), placement(2)).unwrap();
-        assert_eq!(
-            claim,
-            SessionClaim::Claimed {
-                evicted: Some(placement(1)),
-            }
-        );
+        let claim = registry
+            .claim("sess-b".to_string(), placement(2), &leases)
+            .unwrap();
+        let SessionClaim::Claimed { evicted } = claim else {
+            panic!("an unbound client id is claimed, not matched to an existing session");
+        };
+        assert_eq!(evicted_placement(&evicted), Some(placement(1)));
         assert_eq!(registry.get("sess-b").unwrap(), Some(placement(2)));
         assert_eq!(registry.get("sess-a").unwrap(), None);
+    }
+
+    /// A binding with a turn in flight is not the one eviction takes.
+    ///
+    /// The LRU binding is the obvious victim right up until it is the one being
+    /// generated into: closing it would destroy the conversation its own caller
+    /// is mid-way through writing, and the caller would see the turn fail for a
+    /// reason it never asked about. Eviction skips it and takes the next oldest
+    /// binding that is idle.
+    #[test]
+    fn eviction_skips_a_session_with_a_turn_in_flight() {
+        let registry = SessionRegistry::new(2);
+        let leases = leases();
+        registry
+            .insert("sess-busy".to_string(), placement(1), &leases)
+            .unwrap();
+        registry
+            .insert("sess-idle".to_string(), placement(2), &leases)
+            .unwrap();
+
+        // "busy" is the least recently accessed binding, and is mid-turn.
+        let turn = leases
+            .acquire(placement(1), "sess-busy")
+            .expect("a turn on the oldest session");
+
+        let evicted = registry
+            .insert("sess-new".to_string(), placement(3), &leases)
+            .unwrap();
+        assert_eq!(
+            evicted_placement(&evicted),
+            Some(placement(2)),
+            "the idle binding is evicted, not the one being generated into",
+        );
+        assert_eq!(registry.get("sess-busy").unwrap(), Some(placement(1)));
+        drop(turn);
+    }
+
+    /// When every binding is mid-turn there is no victim, and the registry
+    /// admits one over its bound rather than closing a live conversation.
+    #[test]
+    fn eviction_refuses_to_close_the_only_sessions_that_are_all_busy() {
+        let registry = SessionRegistry::new(1);
+        let leases = leases();
+        registry
+            .insert("sess-busy".to_string(), placement(1), &leases)
+            .unwrap();
+        let turn = leases.acquire(placement(1), "sess-busy").expect("a turn");
+
+        let evicted = registry
+            .insert("sess-new".to_string(), placement(2), &leases)
+            .unwrap();
+        assert!(evicted.is_none(), "a live conversation is not evictable");
+        assert_eq!(registry.get("sess-busy").unwrap(), Some(placement(1)));
+        assert_eq!(registry.get("sess-new").unwrap(), Some(placement(2)));
+
+        // And the overshoot resolves as soon as the turn ends.
+        drop(turn);
+        let evicted = registry
+            .insert("sess-later".to_string(), placement(3), &leases)
+            .unwrap();
+        assert_eq!(evicted_placement(&evicted), Some(placement(1)));
     }
 
     #[test]
     fn claimed_sessions_are_listed_redacted() {
         let registry = SessionRegistry::new(4);
         let client_id = registry.next_client_id().unwrap();
-        registry.insert(client_id.clone(), placement(1)).unwrap();
+        registry
+            .insert(client_id.clone(), placement(1), &leases())
+            .unwrap();
 
         let listed = registry.client_ids_redacted().unwrap();
         assert_eq!(listed.len(), 1);

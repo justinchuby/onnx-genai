@@ -17,7 +17,7 @@ use axum::{
 use onnx_genai::engine::EngineDecodeBackend;
 use onnx_genai::{Engine, EngineConfig};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io::Cursor, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::timeout};
 use tower::ServiceExt;
 
@@ -1600,7 +1600,7 @@ async fn status_active_sessions_reflect_real_state() {
     let client_id = state.sessions.next_client_id().unwrap();
     state
         .sessions
-        .insert(client_id, engine_session)
+        .insert(client_id, engine_session, handle.engine.session_leases())
         .expect("register session");
 
     let response = app(state)
@@ -2557,6 +2557,7 @@ async fn stalled_output_route_does_not_block_another_completion() {
         .send(DriverCommand::Generate {
             input: None,
             session_id: None,
+            lease: None,
             request: Box::new(build_generate_request(&slow_request)),
             admission: slow_admission,
             events: slow_tx,
@@ -4216,53 +4217,370 @@ async fn sessions_still_open_for_a_package_that_publishes_no_tokens() {
 ///
 /// Two turns that both read the conversation before either writes it would
 /// leave the loser's prompt and generation nowhere, and nothing would report
-/// that they were lost. The conversation after N turns is therefore checked to
-/// be exactly what N serialized turns produce, whatever order the server ran
-/// them in.
-#[tokio::test]
+/// that they were lost. The routing lease settles it by refusing, so each
+/// racing turn either ran or said out loud that it did not: the conversation is
+/// exactly what the *admitted* turns produce in series, and every turn that was
+/// not admitted answered with a typed conflict naming the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_turns_on_one_session_do_not_lose_a_conversation() {
     let scratch = tempfile::tempdir().expect("scratch directory");
     let package = workflow_session_package(&scratch);
     let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
         .expect("load interpreted package");
-    let router = app(state);
+    let router = app(state.clone());
     let session = "sess-concurrent";
 
-    // The same prompt every time, so each turn contributes an identical number
-    // of request tokens and the expected total is exact arithmetic rather than
-    // a bound.
+    // The same prompt every time, so each admitted turn contributes an
+    // identical number of request tokens and the expected total is exact
+    // arithmetic rather than a bound.
     const TURNS: usize = 4;
+    // A barrier rather than four spawns in a row: every task is released into
+    // the router at the same instant, on a runtime with real threads, so the
+    // race the lease exists to settle is actually run.
+    let start = Arc::new(tokio::sync::Barrier::new(TURNS));
     let mut inflight = Vec::new();
     for _ in 0..TURNS {
-        inflight.push(tokio::spawn(chat_turn(
-            router.clone(),
-            Some(session),
-            "hello world",
-        )));
+        let router = router.clone();
+        let start = start.clone();
+        inflight.push(tokio::spawn(async move {
+            start.wait().await;
+            chat_turn(router, Some(session), "hello world").await
+        }));
     }
     let mut generated = 0u64;
     let mut first_turn_prefill = u64::MAX;
     let mut conversation = 0u64;
+    let mut admitted = 0u64;
+    let mut refused = 0u64;
     for handle in inflight {
         let (status, body) = handle.await.expect("turn completed");
-        assert_eq!(status, StatusCode::OK, "{body}");
-        generated += body["usage"]["completion_tokens"]
-            .as_u64()
-            .expect("generated");
-        // Whichever turn ran first was prefilled with its own request alone.
-        first_turn_prefill =
-            first_turn_prefill.min(body["usage"]["prompt_tokens"].as_u64().expect("prefill"));
-        conversation = conversation.max(session_tokens(&body));
+        match status {
+            StatusCode::OK => {
+                admitted += 1;
+                generated += body["usage"]["completion_tokens"]
+                    .as_u64()
+                    .expect("generated");
+                // Whichever turn ran first was prefilled with its own request
+                // alone.
+                first_turn_prefill = first_turn_prefill
+                    .min(body["usage"]["prompt_tokens"].as_u64().expect("prefill"));
+                conversation = conversation.max(session_tokens(&body));
+            }
+            StatusCode::CONFLICT => {
+                refused += 1;
+                assert_eq!(body["error"]["type"], "conflict_error", "{body}");
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .expect("a refusal explains itself")
+                        .contains(session),
+                    "a refusal names the conversation it is about: {body}"
+                );
+            }
+            other => panic!("a racing turn is admitted or refused, not {other}: {body}"),
+        }
     }
+    assert!(admitted >= 1, "somebody has to win the race");
+    assert_eq!(admitted + refused, TURNS as u64);
 
-    // Every turn's request is in the conversation exactly once, and so is every
-    // token any of them generated. A lost update leaves the total short by the
-    // turn whose write was overwritten.
+    // Every admitted turn's request is in the conversation exactly once, and so
+    // is every token it generated. A lost update leaves the total short by the
+    // turn whose write was overwritten; a silently queued turn leaves it long.
     assert_eq!(
         conversation,
-        first_turn_prefill * TURNS as u64 + generated,
-        "the conversation is every turn's request and every turn's generation, once each"
+        first_turn_prefill * admitted + generated,
+        "the conversation is every admitted turn's request and generation, once each"
     );
+
+    // The race is over, so nothing may still be holding a lease.
+    assert_eq!(leases_held(&state), 0, "a finished race leaves no lease");
+    assert!(
+        state.sessions.get(session).expect("registry").is_some(),
+        "a refused turn does not take the conversation with it"
+    );
+}
+
+/// How many sessions of the default model currently hold a turn lease.
+fn leases_held(state: &AppState) -> usize {
+    state
+        .registry
+        .resolve("")
+        .expect("resolve default model")
+        .expect("a model is loaded")
+        .engine
+        .session_leases()
+        .held()
+}
+
+/// The placement a client id currently resolves to.
+fn placement_of(state: &AppState, client_id: &str) -> crate::worker::SessionPlacement {
+    state
+        .sessions
+        .get(client_id)
+        .expect("registry")
+        .unwrap_or_else(|| panic!("{client_id} is registered"))
+}
+
+/// A turn already in flight refuses the next one instead of queueing it.
+///
+/// This is the whole of Phase 2 in one assertion. The lease a live turn holds
+/// is taken here directly, which is exactly the guard a live turn carries, and
+/// a second turn is raced against it on another thread: it must come back 409
+/// *while the first is still holding*, not later and not 200. Queueing it
+/// behind the first would be the pre-Phase-2 behaviour — a slow success that
+/// reads a conversation the first turn is part-way through replacing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_turn_on_a_busy_session_is_refused_rather_than_queued() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+    let session = "sess-busy";
+
+    // One sequential turn establishes the conversation and its placement.
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let established = session_tokens(&first);
+
+    let engine = state
+        .registry
+        .resolve("")
+        .expect("resolve default model")
+        .expect("a model is loaded")
+        .engine
+        .clone();
+    // Stand in for a turn in flight: this is the same guard `generate` carries.
+    let held = engine
+        .acquire_session_lease(placement_of(&state, session), session)
+        .expect("an idle session is leasable");
+
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let racer = tokio::spawn({
+        let router = router.clone();
+        let start = start.clone();
+        async move {
+            start.wait().await;
+            chat_turn(router, Some(session), "hello world").await
+        }
+    });
+    start.wait().await;
+    let (status, body) = racer.await.expect("the racing turn answered");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a busy session refuses, it does not queue: {body}"
+    );
+    assert_eq!(body["error"]["type"], "conflict_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("a refusal explains itself")
+            .contains(session),
+        "{body}"
+    );
+
+    // And the refused turn did no work on its way to being refused: it never
+    // charged an admission permit, which is what distinguishes a refusal taken
+    // before enqueue from one taken after the request was already queued.
+    assert_eq!(
+        engine.generation_capacity.available_permits(),
+        usize::try_from(engine.generation_capacity_size).expect("capacity fits"),
+        "a refused turn occupies no queue slot"
+    );
+
+    // The refusal cost the conversation nothing.
+    assert_eq!(
+        state
+            .sessions
+            .get(session)
+            .expect("registry")
+            .map(|placement| placement.engine_session_id),
+        Some(held.placement().engine_session_id),
+        "a refused turn leaves the binding exactly where it was"
+    );
+
+    // And when the turn that held it ends, the session is ordinary again.
+    drop(held);
+    assert_eq!(leases_held(&state), 0);
+    let (status, resumed) = chat_turn(router, Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{resumed}");
+    assert!(
+        session_tokens(&resumed) > established,
+        "the conversation continued from where it was: {resumed}"
+    );
+}
+
+/// Two different conversations do not refuse each other.
+///
+/// The lease is keyed by session, so distinct sessions are behaviour-identical
+/// to before: both are admitted. They may still execute one after the other —
+/// this phase adds no parallelism — but neither is ever told it conflicts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turns_on_distinct_sessions_are_all_admitted() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+
+    const SESSIONS: [&str; 4] = ["sess-a", "sess-b", "sess-c", "sess-d"];
+    let start = Arc::new(tokio::sync::Barrier::new(SESSIONS.len()));
+    let mut inflight = Vec::new();
+    for session in SESSIONS {
+        let router = router.clone();
+        let start = start.clone();
+        inflight.push(tokio::spawn(async move {
+            start.wait().await;
+            chat_turn(router, Some(session), "hello world").await
+        }));
+    }
+    for handle in inflight {
+        let (status, body) = handle.await.expect("turn completed");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "distinct conversations never conflict: {body}"
+        );
+    }
+    assert_eq!(leases_held(&state), 0);
+    for session in SESSIONS {
+        assert!(
+            state.sessions.get(session).expect("registry").is_some(),
+            "{session} kept its binding"
+        );
+    }
+}
+
+/// A stateless request is untouched by any of this.
+///
+/// Requests that carry no session take no lease, so racing them cannot refuse
+/// them — including while a session on the same engine is mid-turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stateless_requests_take_no_lease_and_are_never_refused() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+
+    let (status, first) =
+        chat_turn(router.clone(), Some("sess-stateless-peer"), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let engine = state
+        .registry
+        .resolve("")
+        .expect("resolve default model")
+        .expect("a model is loaded")
+        .engine
+        .clone();
+    let held = engine
+        .acquire_session_lease(
+            placement_of(&state, "sess-stateless-peer"),
+            "sess-stateless-peer",
+        )
+        .expect("an idle session is leasable");
+
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let mut inflight = Vec::new();
+    for _ in 0..2 {
+        let router = router.clone();
+        let start = start.clone();
+        inflight.push(tokio::spawn(async move {
+            start.wait().await;
+            chat_turn(router, None, "hello world").await
+        }));
+    }
+    start.wait().await;
+    for handle in inflight {
+        let (status, body) = handle.await.expect("turn completed");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a stateless turn is never refused: {body}"
+        );
+    }
+    assert_eq!(leases_held(&state), 1, "only the held session has a lease");
+    drop(held);
+    assert_eq!(leases_held(&state), 0);
+}
+
+/// Deleting a session mid-turn is refused, not raced.
+///
+/// Close is a mutation of the conversation, so it takes the same lease a turn
+/// does. A delete that raced a live turn would free the engine session the turn
+/// is still writing, and would let the client id be handed to a new
+/// conversation while the old one was still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_session_during_a_turn_is_refused_and_the_session_survives() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+    let session = "sess-delete-race";
+
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let engine = state
+        .registry
+        .resolve("")
+        .expect("resolve default model")
+        .expect("a model is loaded")
+        .engine
+        .clone();
+    let held = engine
+        .acquire_session_lease(placement_of(&state, session), session)
+        .expect("an idle session is leasable");
+
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let deleter = tokio::spawn({
+        let router = router.clone();
+        let start = start.clone();
+        async move {
+            start.wait().await;
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/v1/sessions/{session}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            (status, body)
+        }
+    });
+    start.wait().await;
+    let (status, body) = deleter.await.expect("the delete answered");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["type"], "conflict_error", "{body}");
+    assert!(
+        state.sessions.get(session).expect("registry").is_some(),
+        "a refused delete does not remove the binding"
+    );
+
+    // Once the turn ends the delete goes through, and the id is free again.
+    drop(held);
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/v1/sessions/{session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(state.sessions.get(session).expect("registry").is_none());
+    assert_eq!(leases_held(&state), 0);
 }
 
 /// A request that fails admission must not open a session, and must not evict
@@ -4659,6 +4977,124 @@ async fn a_conversation_past_its_bound_is_a_typed_client_error() {
     );
 }
 
+/// A turn that fails gives the lease back.
+///
+/// The refusal a failed turn deserves is the one it failed for. If the guard
+/// leaked on the error path, the *next* turn on that session would be answered
+/// 409 forever, and the conversation would be unusable without a delete.
+#[tokio::test]
+async fn a_failed_turn_releases_its_lease() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    // Narrow the conversation's own bound so the second turn cannot fit.
+    let metadata = package.join("inference_metadata.yaml");
+    let mut document: Value =
+        serde_yaml::from_str(&std::fs::read_to_string(&metadata).expect("read metadata"))
+            .expect("parse metadata");
+    document["pipeline"]["workflow"]["inputs"]["package.conversation_limit"] = json!({
+        "contract": {"dtype": "int64", "rank": 1, "shape": [1]},
+        "role": {"kind": "opaque"},
+        "source": {"kind": "literal"},
+        "required": false,
+        "default": 6
+    });
+    document["pipeline"]["workflow"]["state"]["conversation"]["recurrence"]["max"] =
+        Value::String("package.conversation_limit".into());
+    std::fs::write(
+        &metadata,
+        serde_yaml::to_string(&document).expect("serialize metadata"),
+    )
+    .expect("write metadata");
+
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+    let session = "sess-failing";
+
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(leases_held(&state), 0, "a finished turn holds nothing");
+
+    for attempt in 0..3 {
+        let (status, body) = chat_turn(router.clone(), Some(session), "hello").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "attempt {attempt} must fail for the bound it broke, not for a leaked lease: {body}"
+        );
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "{body}"
+        );
+        assert_eq!(
+            leases_held(&state),
+            0,
+            "attempt {attempt} left a lease behind"
+        );
+    }
+}
+
+/// A client that walks away does not lock its own conversation out.
+///
+/// Dropping the request future is the cancellation path: the guard is not held
+/// by that future, it rides in the command, so the worker that is part-way
+/// through the turn still releases it exactly once when the turn ends. A guard
+/// held by the route future instead would either leak here or — worse — be
+/// released while the engine was still writing the conversation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_client_does_not_leak_its_session_lease() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let package = workflow_session_package(&scratch);
+    let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
+        .expect("load interpreted package");
+    let router = app(state.clone());
+    let session = "sess-cancelled";
+
+    // Establish the conversation so the abandoned turn is a continuation.
+    let (status, first) = chat_turn(router.clone(), Some(session), "hello world").await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let abandoned = tokio::spawn({
+        let router = router.clone();
+        let start = start.clone();
+        async move {
+            start.wait().await;
+            chat_turn(router, Some(session), "hello world").await
+        }
+    });
+    start.wait().await;
+    abandoned.abort();
+    assert!(
+        abandoned.await.unwrap_err().is_cancelled(),
+        "the client went away mid-turn"
+    );
+
+    // The turn it abandoned may still be running on the worker. What must be
+    // true is that it ends, and that ending gives the lease back — so the next
+    // turn is admitted rather than refused forever.
+    let mut admitted = None;
+    for _ in 0..200 {
+        let (status, body) = chat_turn(router.clone(), Some(session), "hello world").await;
+        match status {
+            StatusCode::OK => {
+                admitted = Some(body);
+                break;
+            }
+            StatusCode::CONFLICT => tokio::time::sleep(Duration::from_millis(25)).await,
+            other => panic!("unexpected {other}: {body}"),
+        }
+    }
+    let admitted = admitted.expect("the abandoned turn released its lease");
+    assert!(session_tokens(&admitted) > 0, "{admitted}");
+    assert_eq!(leases_held(&state), 0, "nothing is left leased");
+    assert!(
+        state.sessions.get(session).expect("registry").is_some(),
+        "and the conversation is still registered"
+    );
+}
+
 /// A busy exclusive session is a 409 a client can retry; an over-bound
 /// conversation is a 400 it cannot.
 ///
@@ -4836,11 +5272,11 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
     .expect("write metadata");
     let state = AppState::load(&package, Some("workflow-multi-turn".to_string()))
         .expect("load interpreted package");
-    let router = app(state);
+    let router = app(state.clone());
 
     let (status, first) = chat_turn(router.clone(), Some("sess-bound"), "hello").await;
     assert_eq!(status, StatusCode::OK, "{first}");
-    let (status, second) = chat_turn(router, Some("sess-bound"), "hello").await;
+    let (status, second) = chat_turn(router.clone(), Some("sess-bound"), "hello").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{second}");
     assert_eq!(
         second["error"]["type"].as_str(),
@@ -4855,16 +5291,33 @@ async fn every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_o
         "{second}"
     );
 
-    // 3. ExclusiveLeaseConflict — the driver serializes passes, so this is
-    //    raised where it is decided and mapped where it is answered.
-    let conflict = crate::routes::generation_failure(
-        crate::driver::DriverFailure::from_engine_error(&anyhow::Error::from(
-            onnx_genai_engine::PackageCapabilityError::ExclusiveLeaseConflict {
-                session: "sess-busy".to_string(),
-            },
-        )),
+    // 3. ExclusiveLeaseConflict — a real turn on a session that already has
+    //    one, answered over HTTP rather than constructed by hand. This is the
+    //    variant that used to be unreachable, and the same session is used on
+    //    purpose: an over-bound conversation answers 400 when it is idle and
+    //    409 when it is busy, because the lease is decided in the routing layer
+    //    before the turn is ever evaluated against the package.
+    let busy = state
+        .registry
+        .resolve("")
+        .expect("resolve default model")
+        .expect("a model is loaded")
+        .engine
+        .acquire_session_lease(placement_of(&state, "sess-bound"), "sess-bound")
+        .expect("an idle session is leasable");
+    let (status, conflict) = chat_turn(router, Some("sess-bound"), "hello").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(
+        conflict["error"]["type"].as_str(),
+        Some("conflict_error"),
+        "{conflict}"
     );
-    assert_eq!(conflict.status, StatusCode::CONFLICT);
-    assert_eq!(conflict.kind, "conflict_error");
-    assert!(conflict.message.contains("sess-busy"));
+    assert!(
+        conflict["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("sess-bound"),
+        "{conflict}"
+    );
+    drop(busy);
 }

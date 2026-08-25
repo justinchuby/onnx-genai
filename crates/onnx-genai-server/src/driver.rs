@@ -17,6 +17,7 @@ use onnx_genai_engine::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::image_generation::{ImageExecutionRequest, ProducedImage};
+use crate::lease::{SessionLeaseGuard, SessionLeases};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 use crate::worker::{SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerUnavailable};
@@ -32,6 +33,11 @@ pub(crate) struct EngineDriver {
     /// The worker threads that own the engine. Exactly one today; every command
     /// names the worker it must reach rather than assuming there is only one.
     pub(crate) workers: WorkerPool,
+    /// Which sessions have a turn in flight. Held here, in the routing façade,
+    /// because it has to be consulted *before* a command is built — a map on
+    /// the worker could only be read once the turn was already queued behind
+    /// the one it conflicts with.
+    pub(crate) session_leases: Arc<SessionLeases>,
     pub(crate) generation_capacity: Arc<Semaphore>,
     pub(crate) generation_capacity_size: u32,
     /// Lock-free mirror of the KV page pool, readable during a generation.
@@ -121,6 +127,12 @@ pub(crate) enum DriverCommand {
     /// which is the point: a route no longer has to know.
     Generate {
         session_id: Option<SessionId>,
+        /// The exclusive turn lease this generation holds, for a session-bound
+        /// turn. It travels with the command rather than being released by the
+        /// submitting task, so every way this command can end — accepted and
+        /// run, never accepted because the channel closed, dropped because the
+        /// worker stopped — releases the lease by dropping the guard.
+        lease: Option<SessionLeaseGuard>,
         request: Box<GenerateRequest>,
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -259,11 +271,15 @@ struct DriverRoute {
     admission: Option<oneshot::Sender<Result<(), DriverFailure>>>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
+    /// Held for as long as the row is: a route that is retired, rejected, or
+    /// abandoned mid-stream drops it, and the session is leasable again.
+    _lease: Option<SessionLeaseGuard>,
     metrics: GenerationMetrics,
 }
 
 struct PendingGeneration {
     request: GenerateRequest,
+    lease: Option<SessionLeaseGuard>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     permit: OwnedSemaphorePermit,
@@ -345,6 +361,7 @@ impl EngineDriver {
             "engine worker pool started (one worker owns the engine)",
         );
         Self {
+            session_leases: SessionLeases::for_pool(&workers),
             workers,
             generation_capacity,
             generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
@@ -402,6 +419,26 @@ impl EngineDriver {
         &self.batching
     }
 
+    /// Take the exclusive turn lease for a session, or refuse by name.
+    ///
+    /// Called by the routing layer *before* a command is built, before the
+    /// admission permit is charged, and before anything is enqueued: a turn
+    /// that cannot take the lease never becomes work. `session` is the identity
+    /// the caller used, and appears in the refusal.
+    pub(crate) fn acquire_session_lease(
+        &self,
+        session: SessionPlacement,
+        client_id: &str,
+    ) -> Result<SessionLeaseGuard, onnx_genai_engine::PackageCapabilityError> {
+        self.session_leases.acquire(session, client_id)
+    }
+
+    /// The lease map, for the registry decisions that must not disturb a live
+    /// conversation (LRU eviction picks an unleased victim).
+    pub(crate) fn session_leases(&self) -> &Arc<SessionLeases> {
+        &self.session_leases
+    }
+
     /// Open an engine session and report where it lives.
     ///
     /// The placement, not the bare id, is what a caller stores: an engine
@@ -421,7 +458,14 @@ impl EngineDriver {
         Ok(SessionPlacement::new(worker, engine_session_id))
     }
 
-    pub(crate) async fn close_session(&self, session: SessionPlacement) -> anyhow::Result<()> {
+    /// Close a session, under the lease that proves no turn is in flight on it.
+    ///
+    /// Taking the guard by value rather than a placement is the point: closing
+    /// a conversation is a mutation, and a close that raced a live turn would
+    /// destroy the state that turn is mid-way through writing. The lease is
+    /// released when this returns, and never before the engine has answered.
+    pub(crate) async fn close_session(&self, lease: SessionLeaseGuard) -> anyhow::Result<()> {
+        let session = lease.placement();
         let (response, rx) = tokio::sync::oneshot::channel();
         self.session_commands(session)
             .map_err(anyhow::Error::new)?
@@ -477,9 +521,14 @@ impl EngineDriver {
     /// has (ignored by a workflow package, which owns no engine sessions) and
     /// the multimodal attachments it has (ignored by a decoder package, which
     /// takes its prompt from the request).
+    ///
+    /// A session-bound turn arrives holding its exclusive lease, taken by the
+    /// routing layer before this call. Nothing here can take it: by the time a
+    /// command is being built the caller has already occupied a queue slot, and
+    /// a refusal decided here would be a refusal decided too late.
     pub(crate) async fn submit_generation(
         &self,
-        session: Option<SessionPlacement>,
+        session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
@@ -488,28 +537,34 @@ impl EngineDriver {
 
     pub(crate) async fn generate(
         &self,
-        session: Option<SessionPlacement>,
+        session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
         // A session-bound generation goes to the worker holding its KV state;
         // a stateless one goes to the worker that serves unbound work.
+        let placement = session.as_ref().map(SessionLeaseGuard::placement);
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let commands = match session {
-            Some(session) => self.session_commands(session),
+        let commands = match placement {
+            Some(placement) => self.session_commands(placement),
             None => self.commands(),
         }
         .map_err(|_| GenerateSubmitError::DriverStopped)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
+        // The guard moves into the command, and the command moves into `send`.
+        // A send that fails hands both back on this task, where the guard drops
+        // and the session is immediately leasable again — no release call to
+        // forget on the one exit path that never reaches the worker.
         if commands
             .send(DriverCommand::Generate {
-                session_id: session.map(|session| session.engine_session_id),
+                session_id: placement.map(|placement| placement.engine_session_id),
+                lease: session,
                 request: Box::new(request),
                 input,
                 admission,
@@ -540,6 +595,7 @@ impl EngineDriver {
         let (admission, _admission_rx) = oneshot::channel();
         let command = DriverCommand::Generate {
             session_id: None,
+            lease: None,
             request: Box::new(request),
             input: None,
             admission,
@@ -835,6 +891,7 @@ fn run_static_engine_driver(
         match first {
             DriverCommand::Generate {
                 session_id: None,
+                lease,
                 request,
                 input: None,
                 admission,
@@ -853,6 +910,7 @@ fn run_static_engine_driver(
                     resource_snapshot,
                     PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -895,6 +953,7 @@ fn run_static_batch_until_idle(
             match deferred.pop_front() {
                 Some(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -903,6 +962,7 @@ fn run_static_batch_until_idle(
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -920,6 +980,7 @@ fn run_static_batch_until_idle(
             match rx.try_recv() {
                 Ok(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -928,6 +989,7 @@ fn run_static_batch_until_idle(
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -996,15 +1058,7 @@ fn run_static_batch_until_idle(
         let pending = initial
             .pop()
             .expect("the first generation request was queued");
-        run_generation(
-            engine,
-            None,
-            pending.request,
-            None,
-            pending.admission,
-            pending.events,
-            pending.permit,
-        );
+        run_generation(engine, None, None, pending);
         return;
     }
 
@@ -1030,15 +1084,7 @@ fn run_static_batch_until_idle(
     let mut abandoned = HashMap::new();
     let mut reported_occupancy = onnx_genai_engine::BatchOccupancy::default();
     for pending in initial {
-        submit_to_continuous_manager(
-            &mut manager,
-            &mut routes,
-            &mut abandoned,
-            pending.request,
-            pending.admission,
-            pending.events,
-            pending.permit,
-        );
+        submit_to_continuous_manager(&mut manager, &mut routes, &mut abandoned, pending);
     }
 
     loop {
@@ -1046,6 +1092,7 @@ fn run_static_batch_until_idle(
             match deferred.pop_front() {
                 Some(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -1056,10 +1103,13 @@ fn run_static_batch_until_idle(
                         &mut manager,
                         &mut routes,
                         &mut abandoned,
-                        *request,
-                        admission,
-                        events,
-                        permit,
+                        PendingGeneration {
+                            request: *request,
+                            lease,
+                            admission,
+                            events,
+                            permit,
+                        },
                     );
                 }
                 Some(command) => {
@@ -1073,6 +1123,7 @@ fn run_static_batch_until_idle(
             match command {
                 DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -1084,14 +1135,18 @@ fn run_static_batch_until_idle(
                             &mut manager,
                             &mut routes,
                             &mut abandoned,
-                            *request,
-                            admission,
-                            events,
-                            permit,
+                            PendingGeneration {
+                                request: *request,
+                                lease,
+                                admission,
+                                events,
+                                permit,
+                            },
                         );
                     } else {
                         deferred.push_back(DriverCommand::Generate {
                             session_id: None,
+                            lease,
                             request,
                             input: None,
                             admission,
@@ -1299,11 +1354,15 @@ fn submit_to_continuous_manager(
     manager: &mut ContinuousBatchManager<'_>,
     routes: &mut HashMap<usize, DriverRoute>,
     abandoned: &mut HashMap<usize, DriverRoute>,
-    request: GenerateRequest,
-    admission: oneshot::Sender<Result<(), DriverFailure>>,
-    events: mpsc::Sender<DriverEvent>,
-    permit: OwnedSemaphorePermit,
+    pending: PendingGeneration,
 ) {
+    let PendingGeneration {
+        request,
+        lease,
+        admission,
+        events,
+        permit,
+    } = pending;
     match manager.submit(request) {
         Ok(handle) => {
             routes.insert(
@@ -1312,6 +1371,10 @@ fn submit_to_continuous_manager(
                     admission: Some(admission),
                     events,
                     _permit: permit,
+                    // The row now owns the lease: whichever way it is retired —
+                    // finished, rejected, or abandoned by a disconnected client —
+                    // the route is dropped and the session becomes leasable again.
+                    _lease: lease,
                     metrics: GenerationMetrics::start(),
                 },
             );
@@ -1450,13 +1513,23 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         }
         DriverCommand::Generate {
             session_id,
+            lease,
             request,
             input,
             admission,
             events,
             permit,
         } => run_generation(
-            engine, session_id, *request, input, admission, events, permit,
+            engine,
+            session_id,
+            input,
+            PendingGeneration {
+                request: *request,
+                lease,
+                admission,
+                events,
+                permit,
+            },
         ),
         DriverCommand::GenerateFim {
             prefix,
@@ -1680,12 +1753,16 @@ impl std::error::Error for DriverDeliveryError {}
 fn run_generation(
     engine: &mut Engine,
     session_id: Option<SessionId>,
-    request: GenerateRequest,
     input: Option<MultimodalInput>,
-    admission: oneshot::Sender<Result<(), DriverFailure>>,
-    events: mpsc::Sender<DriverEvent>,
-    _permit: OwnedSemaphorePermit,
+    pending: PendingGeneration,
 ) {
+    let PendingGeneration {
+        request,
+        lease,
+        admission,
+        events,
+        permit: _permit,
+    } = pending;
     let mut metrics = GenerationMetrics::start();
     let bound = match input
         .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
@@ -1735,6 +1812,14 @@ fn run_generation(
             }
         }
     };
+    // The engine has committed whatever this turn wrote to the session, so the
+    // conversation is consistent and the next turn may take the lease. Released
+    // *before* the terminal event rather than after this function returns: a
+    // client that reads "finished" and immediately sends the next turn would
+    // otherwise race the guard's drop and be told its own completed turn is
+    // still in flight. A turn admitted at this instant still runs after this
+    // one — the worker that would run it is this thread, and it is here.
+    drop(lease);
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
@@ -1812,6 +1897,7 @@ mod admission_tests {
                 admission: Some(admission),
                 events,
                 _permit: permit,
+                _lease: None,
                 metrics: GenerationMetrics::start(),
             },
             admission_rx,
@@ -1972,6 +2058,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            session_leases: SessionLeases::with_shards(1),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2071,11 +2158,14 @@ mod admission_tests {
         run_generation(
             &mut engine,
             None,
-            request,
             Some(input),
-            admission,
-            events,
-            permit,
+            PendingGeneration {
+                request,
+                lease: None,
+                admission,
+                events,
+                permit,
+            },
         );
 
         let admitted = admission_rx
@@ -2107,7 +2197,10 @@ mod admission_tests {
         // A session is opened on, and named by, the pool's only worker.
         let session = driver.create_session().await.expect("open session");
         assert_eq!(session.worker, WorkerId::PRIMARY);
-        driver.close_session(session).await.expect("close session");
+        let lease = driver
+            .acquire_session_lease(session, "sess-shutdown")
+            .expect("an idle session is leasable");
+        driver.close_session(lease).await.expect("close session");
 
         driver.shutdown();
         assert!(worker.is_joined(), "shutdown must join the worker thread");
@@ -2145,6 +2238,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            session_leases: SessionLeases::with_shards(1),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2159,13 +2253,95 @@ mod admission_tests {
         };
         let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
 
+        let lease = driver
+            .acquire_session_lease(elsewhere, "sess-elsewhere")
+            .expect("a lease is taken before the worker is even consulted");
         let error = driver
-            .close_session(elsewhere)
+            .close_session(lease)
             .await
             .expect_err("worker 4 is not in a pool of one");
         assert_eq!(
             error.to_string(),
             "engine worker 4 is not in this pool (1 worker(s) loaded)"
+        );
+        assert!(
+            !driver.session_leases().is_held(elsewhere),
+            "a close that failed still gave the lease back"
+        );
+    }
+
+    /// A turn that never reaches a worker leaves nothing leased.
+    ///
+    /// The guard travels *inside* the command, which is what makes every
+    /// terminal path release it without a release call to remember. This pins
+    /// the two exits that never reach the engine at all: a full admission
+    /// gate, and a send onto a channel whose worker is gone. Leaking either
+    /// would make the session permanently unusable — every later turn on it
+    /// would be refused 409 forever, with no turn in flight to justify it.
+    #[tokio::test]
+    async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
+        let (commands, rx) = mpsc::channel(1);
+        let driver = EngineDriver {
+            workflow_facts: WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
+            workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            session_leases: SessionLeases::with_shards(1),
+            // One permit, so the second acquisition below finds the gate shut.
+            generation_capacity: Arc::new(Semaphore::new(1)),
+            generation_capacity_size: 1,
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+            resource_snapshot: Arc::new(Mutex::new(None)),
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                0,
+                None,
+                "driver test stub",
+            )),
+            device_authority: None,
+            batching: Arc::new(BatchingReport::single_sequence_stub()),
+        };
+        let session = SessionPlacement::new(WorkerId::PRIMARY, 7);
+
+        // 1. Refused by the admission gate, before a command is ever built.
+        let hog = Arc::clone(&driver.generation_capacity)
+            .try_acquire_owned()
+            .expect("the only permit");
+        let lease = driver
+            .acquire_session_lease(session, "sess-overloaded")
+            .expect("an idle session is leasable");
+        assert!(driver.session_leases().is_held(session));
+        assert!(matches!(
+            driver.generate(Some(lease), warmup_request(), None).await,
+            Err(GenerateSubmitError::Overloaded)
+        ));
+        assert!(
+            !driver.session_leases().is_held(session),
+            "a turn refused admission is not a turn in flight"
+        );
+        drop(hog);
+
+        // 2. Accepted by the gate, then handed to a worker that is gone.
+        drop(rx);
+        let lease = driver
+            .acquire_session_lease(session, "sess-stopped")
+            .expect("still leasable");
+        assert!(matches!(
+            driver.generate(Some(lease), warmup_request(), None).await,
+            Err(GenerateSubmitError::DriverStopped)
+        ));
+        assert_eq!(
+            driver.session_leases().held(),
+            0,
+            "a stopped driver leaves no session leased forever"
+        );
+
+        // And the session is ordinary again: the refusals cost it nothing.
+        drop(
+            driver
+                .acquire_session_lease(session, "sess-after")
+                .expect("leasable after both refusals"),
         );
     }
 
@@ -2359,6 +2535,7 @@ mod driver_delivery_tests {
                 admission: None,
                 events,
                 _permit: permit,
+                _lease: None,
                 metrics: GenerationMetrics::start(),
             },
             events_rx,
