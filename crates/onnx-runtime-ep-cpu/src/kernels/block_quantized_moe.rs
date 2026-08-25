@@ -1051,6 +1051,7 @@ fn error(message: impl Into<String>) -> EpError {
 mod tests {
     use super::*;
     use crate::CpuExecutionProvider;
+    use crate::kernels::block_quantized_matmul::DEFAULT_DENSE_WEIGHT_CACHE_BYTES;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::ExecutionProvider;
     use onnx_runtime_ir::{Attribute, Dim, Graph, NodeId, SymbolId, static_shape};
@@ -1434,7 +1435,14 @@ mod tests {
             formats,
             constant_inputs: [false; 9],
             weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
-            weight_cache: DenseWeightCache::new(),
+            // The default ceiling, pinned rather than inherited: `new()` reads
+            // `ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES` through a process-wide
+            // `OnceLock`, so an ambient `=0` turns every resolve into
+            // `MissNotStored` and this cell would be reporting the environment
+            // instead of the kernel. It fails loudly there rather than
+            // silently, but a cell about cache accounting should not depend on
+            // the box it runs on.
+            weight_cache: DenseWeightCache::with_limit(DEFAULT_DENSE_WEIGHT_CACHE_BYTES),
         };
         kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
 
