@@ -147,7 +147,7 @@ Every stress run writes one artifact directory under `target/integration-stress/
 - `transcript.txt`: redacted enough for logs if needed, but complete for local runs.
 - `failure.json`: invariant name, turn index, threshold, observed values, and the minimal command to reproduce.
 
-Determinism rule: every stochastic scenario has an explicit seed and records the sampler parameters. Reproduction is `cargo test ... -- --exact <scenario>` or an emitted `onnx-genai run/generate/profile_native` command with the same seed, model, backend, EP, and feature flags.
+Determinism rule: every stochastic scenario has an explicit seed and records the sampler parameters. Reproduction is `cargo test ... -- --exact <module::path::to::scenario>` or an emitted `onnx-genai run/generate/profile_native` command with the same seed, model, backend, EP, and feature flags. The filter has to be the scenario's *full* module path: `--exact` against a bare name matches nothing, runs zero tests, and still exits 0, so a renamed or mistyped scenario reproduces as a green run that measured nothing (see [`measurement-discipline`](../../../.github/skills/measurement-discipline/SKILL.md) §9).
 
 ## Cost and cadence
 

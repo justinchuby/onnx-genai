@@ -79,6 +79,7 @@ See [`docs/architecture/CRATE_RESERVATION.md`](docs/architecture/CRATE_RESERVATI
 - Cover changed success and failure paths, including error text when actionability is part of the contract.
 - Update fixtures, expected counts, snapshots, conformance checks, and documentation examples with the API or behavior they describe.
 - Run the smallest relevant test/lint set before landing; do not leave known CI cleanup to the next contributor.
+- Prove a test filter selected something before reading its result: a filter matching nothing runs zero tests and still exits 0, so a renamed test reports as a pass to CI and as *uncovered* to a mutation battery ([`measurement-discipline`](.github/skills/measurement-discipline/SKILL.md) §9).
 
 ## 9. Run portably across hardware tiers
 
