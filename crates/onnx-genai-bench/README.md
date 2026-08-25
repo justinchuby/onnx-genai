@@ -112,7 +112,7 @@ cargo run --release -p onnx-genai-bench \
   --no-default-features --features session-concurrency \
   --bin session_concurrency -- \
   --mode synthetic --workers 1,2,4 --concurrency 1,2,4,8 \
-  --warmups 3 --iterations 100 --work-units 1000000 \
+  --warmups 3 --iterations 100 --work-units 5000000 \
   --output docs/benchmarks/session-concurrency-synthetic.json
 ```
 
@@ -126,7 +126,7 @@ cargo run --release -p onnx-genai-bench \
   --bin session_concurrency -- \
   --mode ort --provider cpu --intra-op-threads 1 \
   --workers 1,2,4 --concurrency 1,2,4,8 \
-  --warmups 3 --iterations 50 --max-new-tokens 4 \
+  --warmups 10 --iterations 10000 --max-new-tokens 4 \
   --output docs/benchmarks/session-concurrency-ort-cpu.json
 ```
 
@@ -139,6 +139,6 @@ cargo run --release -p onnx-genai-bench \
   --bin session_concurrency -- \
   --mode ort --provider cuda --intra-op-threads 1 \
   --workers 1,2,4 --concurrency 1,2,4,8 \
-  --warmups 3 --iterations 50 --max-new-tokens 4 \
+  --warmups 10 --iterations 10000 --max-new-tokens 4 \
   --output docs/benchmarks/session-concurrency-ort-cuda.json
 ```
