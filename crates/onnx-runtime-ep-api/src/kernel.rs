@@ -469,6 +469,23 @@ pub struct KernelSizedOutput {
     pub bytes: Vec<u8>,
 }
 
+/// Where an opted-in kernel produces data-dependent output payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelSizedOutputPolicy {
+    /// The kernel returns owned host bytes from [`Kernel::execute_kernel_sized`].
+    HostOwned,
+    /// The kernel prepares metadata and device-resident state in governed
+    /// workspace, then writes directly into final device outputs.
+    DeviceWorkspace,
+}
+
+/// Concrete facts for one device-resident kernel-sized output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelSizedOutputMetadata {
+    pub shape: Vec<usize>,
+    pub dtype: DataType,
+}
+
 /// An executor-delivered kernel input. Existing EPs receive `Tensor` variants;
 /// an EP advertising the `nxrt` capability may receive a lazy `Weight` at the
 /// `pkg.nxrt::BlockQuantizedMoE` boundary.
@@ -597,6 +614,15 @@ pub trait Kernel: Send {
         false
     }
 
+    /// Select the payload policy for this opted-in kernel.
+    ///
+    /// Host-owned is the compatibility default used by CPU `Unique`. Device
+    /// kernels override this explicitly; the adapter never infers a transfer
+    /// policy from pointer placement.
+    fn kernel_sized_output_policy(&self) -> KernelSizedOutputPolicy {
+        KernelSizedOutputPolicy::HostOwned
+    }
+
     /// Execute once into owned host buffers and report concrete output facts.
     ///
     /// `requested_outputs` preserves node output-slot positions. A `false`
@@ -615,6 +641,41 @@ pub trait Kernel: Send {
         let _ = (inputs, requested_outputs);
         Err(crate::EpError::KernelFailed(
             "kernel does not implement kernel-sized outputs".into(),
+        ))
+    }
+
+    /// Run the metadata phase of a device-workspace kernel-sized operation.
+    ///
+    /// The kernel may launch device work and copy only compact metadata to the
+    /// host. Any state needed by [`Kernel::materialize_kernel_sized_device`]
+    /// must live in the governed `workspace`, whose lifetime covers both calls.
+    fn prepare_kernel_sized_device(
+        &self,
+        inputs: &[TensorView],
+        requested_outputs: &[bool],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<Vec<Option<KernelSizedOutputMetadata>>> {
+        let _ = (inputs, requested_outputs, workspace);
+        Err(crate::EpError::KernelFailed(
+            "kernel does not implement device-workspace kernel-sized outputs".into(),
+        ))
+    }
+
+    /// Materialize a prepared device-workspace operation into final outputs.
+    ///
+    /// `outputs` preserves positional optional slots; omitted slots are marked
+    /// absent and must not be written. This phase must reuse the state produced
+    /// by [`Kernel::prepare_kernel_sized_device`] rather than rerunning the full
+    /// algorithm.
+    fn materialize_kernel_sized_device(
+        &self,
+        inputs: &[TensorView],
+        outputs: &mut [TensorMut],
+        workspace: Option<WorkspaceView>,
+    ) -> Result<()> {
+        let _ = (inputs, outputs, workspace);
+        Err(crate::EpError::KernelFailed(
+            "kernel does not implement device-workspace materialization".into(),
         ))
     }
 

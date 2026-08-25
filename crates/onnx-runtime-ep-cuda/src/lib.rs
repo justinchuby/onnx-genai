@@ -23,6 +23,9 @@
 //!   tensor-core specialization and retained decode/unsupported-shape baselines.
 //! * **Signal** — f32 `DFT`/`STFT` through cuFFT with governed execution
 //!   workspace, arbitrary-axis DFT packing, and fused STFT frame/window packing.
+//! * **Selection** — bounded flattened f32 `Unique` via one device
+//!   sort/grouping phase, an 8-byte count D2H, and direct device
+//!   materialization into dynamically allocated ORT outputs.
 //!
 //! The full op → backend mapping matrix, remaining coverage, and the
 //! prioritised custom-kernel candidate list live in `docs/execution/CUDA_COVERAGE.md`.
@@ -129,6 +132,9 @@ pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSITION;
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::stft::{StftExecutionStats, stft_last_execution_stats};
+pub use kernels::unique::{
+    MAX_UNIQUE_ELEMENTS, UniqueExecutionStats, reset_unique_execution_stats, unique_execution_stats,
+};
 pub use kernels::{
     CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,
     build_cuda_registry_with_metrics, cuda_supported_dtypes_for_op,

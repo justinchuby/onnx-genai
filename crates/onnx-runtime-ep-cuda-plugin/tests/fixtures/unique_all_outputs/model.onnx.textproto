@@ -1,0 +1,82 @@
+ir_version: 11
+graph {
+  node {
+    input: "X"
+    output: "Y"
+    output: "indices"
+    output: "inverse_indices"
+    output: "counts"
+    op_type: "Unique"
+    attribute {
+      name: "sorted"
+      i: 0
+      type: INT
+    }
+  }
+  name: "cuda_unique_all_outputs"
+  input {
+    name: "X"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+            dim_value: 6
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "Y"
+    type {
+      tensor_type {
+        elem_type: 1
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "inverse_indices"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+  output {
+    name: "counts"
+    type {
+      tensor_type {
+        elem_type: 7
+        shape {
+          dim {
+          }
+        }
+      }
+    }
+  }
+}
+opset_import {
+  domain: ""
+  version: 24
+}
