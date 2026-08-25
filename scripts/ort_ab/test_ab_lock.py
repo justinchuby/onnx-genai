@@ -33,6 +33,10 @@ from ab import (  # noqa: E402
 )
 
 AB = Path(__file__).resolve().parent / "ab.py"
+SWEEP = Path(__file__).resolve().parent / "sweep_decode.py"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import sweep_decode  # noqa: E402
 HOSTLOCK = Path(__file__).resolve().parents[1] / "hostlock.sh"
 
 # A stub arm: prints the line `ab.py` parses and exits. Using a real benchmark
@@ -320,6 +324,41 @@ class EndToEnd(unittest.TestCase):
             self.assertNotEqual(row["lock_anchor_pid"], "none", row)
             self.assertTrue(row["runnable_at_start"].isdigit(), row)
 
+    def test_an_arm_with_env_overrides_still_runs(self):
+        """The gate refactor deleted `import os`, and only this path uses it.
+
+        Every other cell passes an arm with an empty override dict, which is
+        falsy, so the `dict(os.environ)` line is never reached and a missing
+        import is invisible. `--arm-env` is the documented way to A/B a
+        feature flag with one binary in both arms -- the most common use of
+        this harness -- and it raised `NameError` after taking the lock and
+        before writing a single row.
+        """
+        args = [*self.ab_args(), "--arm-env", "a=ONNX_GENAI_TEST_FLAG=1"]
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "arm-env regression",
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertNotIn("NameError", out.stderr)
+        with self.csv.open() as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["host_lock"], "mine:leon", rows[0])
+
     def test_unlocked_does_not_override_a_peers_declaration(self):
         """The escape hatch protects our labels, not their run.
 
@@ -380,6 +419,183 @@ class EndToEnd(unittest.TestCase):
                 "unlocked:free",
                 "the escape hatch must leave the rows self-identifying",
             )
+
+
+STUB_BENCH = """#!/bin/sh
+# Emits one line in `bench_generic`'s paired format. The numbers are fixed:
+# nothing here measures anything, it only has to parse.
+echo "shape=decode native=1.000 ms ort=2.000 ms native/ort=0.500 \\
+native_p90=1.100 ort_p90=2.200 native_min=0.900 ort_min=1.800"
+"""
+
+
+class EndOfWindow(unittest.TestCase):
+    """A streamed driver cannot relabel printed rows, so the exit code is it."""
+
+    def test_a_handoff_is_a_failure_and_says_to_discard(self):
+        code, msg = sweep_decode.end_of_window_verdict("mine:leon", "changed")
+        self.assertEqual(code, 4)
+        self.assertIn("discard", msg)
+
+    def test_an_unreadable_end_is_reported_without_claiming_a_handoff(self):
+        # The distinction `window_label` exists to preserve: a failed read is
+        # not evidence of a takeover, and telling someone to throw away a
+        # sound matrix on that basis is its own defect.
+        code, msg = sweep_decode.end_of_window_verdict("mine:leon", "unverified-end")
+        self.assertEqual(code, 5)
+        self.assertNotIn("discard", msg)
+        self.assertNotIn("spans the change", msg)
+        self.assertIn("unverified", msg)
+
+    def test_an_unchanged_window_is_silent(self):
+        self.assertEqual(
+            sweep_decode.end_of_window_verdict("mine:leon", "mine:leon"), (0, None)
+        )
+
+
+class SweepDecodeGate(unittest.TestCase):
+    """The thread sweep is the most saturating thing we run.
+
+    It is therefore the one driver where "somebody forgot the wrapper" costs
+    the most, both to the run and to whoever else is on the box.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(dir=str(SWEEP.parent))
+        self.bench = Path(self.tmp) / "bench.sh"
+        self.bench.write_text(STUB_BENCH)
+        self.bench.chmod(0o755)
+        self.env = dict(
+            os.environ, HOSTLOCK_DIR=f"{self.tmp}/hl", HOSTLOCK_PRIVATE_OK="1"
+        )
+
+    def tearDown(self):
+        subprocess.run(["rm", "-rf", self.tmp], check=False)
+
+    def args(self):
+        return [
+            sys.executable,
+            str(SWEEP),
+            "--binary",
+            str(self.bench),
+            "--models",
+            "m.onnx",
+            "--threads",
+            "1",
+            "--trials",
+            "1",
+            "--runs",
+            "1",
+            "--warmups",
+            "0",
+        ]
+
+    def test_a_sweep_whose_lock_changed_hands_reports_it_and_fails(self):
+        """The rows are already printed, so the only honest move is to fail.
+
+        A sweep whose custody moved is not half-good data: the thread counts
+        above and below the change were compared across it. The fixture
+        rewrites `owner=` in the scratch lock while the stub bench runs, which
+        is what a real takeover looks like to the end-of-window read.
+        """
+        handoff = Path(self.tmp) / "handoff.sh"
+        handoff.write_text(
+            "#!/bin/sh\n"
+            'sed -i "s/^owner=.*/owner=someone-else/" "$HOSTLOCK_DIR/meta"\n'
+            + STUB_BENCH.split("\n", 1)[1]
+        )
+        handoff.chmod(0o755)
+        args = self.args()
+        args[args.index("--binary") + 1] = str(handoff)
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "handoff fixture",
+                "--",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertIn("host_lock=changed", out.stderr)
+        self.assertIn("discard", out.stderr)
+        # 4 exactly. A caller running several matrices has to tell "the lock
+        # changed hands" from "the binary crashed" (1) and from "the host was
+        # not mine" (3), and `!= 0` pins none of that.
+        self.assertEqual(out.returncode, 4, out.stdout + out.stderr)
+
+    def test_the_sweeps_escape_hatch_runs_and_stamps_every_row(self):
+        """Otherwise hard-wiring `unlocked=False` would be invisible.
+
+        The flag is what makes an unprotected smoke test *say* it was
+        unprotected, so a suite that never exercises it cannot tell the
+        difference between "refuses correctly" and "refuses always".
+        """
+        out = subprocess.run(
+            [*self.args(), "--unlocked"],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=300,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("WARNING: running unlocked", out.stderr)
+        row = next(
+            l for l in out.stdout.splitlines() if l.split() and l.split()[0] == "m"
+        )
+        self.assertEqual(row.split()[-1], "unlocked:free")
+
+    def test_an_unlocked_sweep_refuses_before_it_starts_any_child(self):
+        out = subprocess.run(
+            self.args(), capture_output=True, text=True, env=self.env, timeout=300
+        )
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
+        self.assertIn("refusing to measure", out.stderr)
+        self.assertIn("sweep_decode.py", out.stderr)
+        # The remedy has to name the driver, not ab.py -- a wrapper someone
+        # pastes for the wrong script is a wrapper that does not span the arms.
+        self.assertNotIn("ab.py", out.stderr)
+        self.assertEqual(out.stdout, "")
+
+    def test_a_locked_sweep_runs_and_every_row_carries_the_label(self):
+        out = subprocess.run(
+            [
+                "bash",
+                str(HOSTLOCK),
+                "run",
+                "--owner",
+                "leon",
+                "--reason",
+                "sweep gate test",
+                "--",
+                *self.args(),
+            ],
+            capture_output=True,
+            text=True,
+            env=self.env,
+            timeout=600,
+        )
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        # `hostlock.sh run` prints its own outcome first, so the driver's
+        # output is found by content rather than by position.
+        lines = [l for l in out.stdout.splitlines() if l.strip()]
+        banner = next(l for l in lines if l.startswith("host_lock="))
+        self.assertIn("host_lock=mine:leon", banner)
+        self.assertIn("lock_owner=leon", banner)
+        header = next(l for l in lines if "ratio_min" in l).split()
+        self.assertEqual(header[-1], "host_lock")
+        # The label is on the DATA row, not only in a banner: a banner is lost
+        # the moment somebody pastes one interesting row into a doc.
+        row = next(l for l in lines if l.split()[0] == "m")
+        self.assertEqual(row.split()[-1], "mine:leon")
+        self.assertEqual(len(row.split()), len(header))
 
 
 if __name__ == "__main__":
