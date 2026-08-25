@@ -1,7 +1,7 @@
 # Metadata capability model
 
 Status: **normative proposal**. This document audits the current tree at
-`f55520de9ec6160962a6a7532729119ff1279c1a` and proposes a simplification. It
+`6705b0f55cbdfd8d5538a3c8a8d8f46019e6979c` and proposes a simplification. It
 does not change the metadata schema, parser, validator, generated schema, or
 runtime.
 
@@ -9,18 +9,19 @@ The central rule is:
 
 > A package describes what its authored graphs and workflow require. A runtime
 > proves what a concrete backend deployment can execute. An operator chooses
-> policy. Measurements justify performance claims. None of those four answers
-> substitutes for another.
+> policy. A backend derives optimization plans. Measurements justify performance
+> claims. None of those five answers substitutes for another.
 
 ## 1. Terms and conceptual model
 
-### 1.1 Four kinds of statement
+### 1.1 Five kinds of statement
 
 | Kind | Meaning | Authority | Examples |
 | --- | --- | --- | --- |
 | **Derived structural fact** | A fact recoverable from authored graphs, workflow dataflow, tensor contracts, operator attributes, initializers, or state contracts. | Package artifacts plus deterministic derivation. | Decoder ports, position-input presence and rank, append versus indexed-scatter cache updates, graph KV dtype, image/video/audio workflow shape, control flow. |
 | **Authored model requirement** | A semantic fact required for correct execution but not safely inferable from tensor shape or graph topology. | Typed package contract. | Aliasing legality, prefix-reuse legality, rollback bounds, component grouping equivalence, effect retry/speculation semantics, equivalence class, session mutation semantics. |
-| **Deployment policy** | A choice about cost, risk, placement, or service behavior. | Operator/runtime configuration, never portable model metadata. | Backend/provider selection, page size, KV mirror dtype, cache/tier budgets, graph capture, fallback permission, batch size, worker count and placement. |
+| **Deployment/QoS policy** | A choice about cost, risk, placement, or service behavior. | Operator/runtime configuration, never portable model metadata. | Backend/provider selection, page size, KV mirror dtype, cache/tier budgets, graph-capture enablement/fallback, batch size, worker count and placement. |
+| **Backend-derived execution plan** | An automatic optimizer plan computed after artifact inspection and resource admission. | Backend compiler/planner; never authored package metadata. | ORT execution islands, `IoBinding` groups, capture segments, buffer-reuse schedules. |
 | **Runtime evidence** | A result observed for one artifact and one runtime environment. | Generated admission, conformance, profile, or benchmark record. | ORT session loaded with no fallback, native operator coverage passed, capture replayed, concurrent `Run` was admitted, throughput met a threshold. |
 
 ### 1.2 Capability, support, readiness, and performance
@@ -51,6 +52,10 @@ performance evidence. A model-family label is evidence of none of them.
 6. Declining an optional optimization is valid. Executing a requirement
    incorrectly, silently changing backend, or returning base-model output for
    an adapter package is not.
+7. Package-authored policy graphs, deployment/QoS knobs, and backend-derived
+   execution plans **MUST NOT** share a generic `capabilities` bucket. A
+   real enable/disable or fallback knob is policy; the generated plan itself
+   remains derived.
 
 ### 1.4 “Policy graph” means executable semantics
 
@@ -65,9 +70,9 @@ The distinction is ownership, not naming:
 - `temperature`, logits filtering, RNG counter advancement, and the selected
   token change the mathematical result, so the package authors them and the
   workflow runtime executes them;
-- provider choice, queue priority, batching delay, capture, cache capacity, and
-  worker placement change where or when the same semantics run, so deployment
-  configuration owns them.
+- provider choice, queue priority, batching delay, capture
+  enablement/fallback, cache capacity, and worker placement change where or
+  when the same semantics run, so deployment configuration owns them.
 
 Compact decoder example:
 
@@ -116,7 +121,10 @@ steps:
 The example is intentionally annotated rather than serializer output. Production
 generators that cannot preserve YAML comments should publish an adjacent
 annotated reference and validate that both documents parse to the same typed
-metadata; they must not claim comments survive generation.
+metadata; they must not claim comments survive generation. A backend may fuse
+the `decoder` and `sampler` invocations into an ORT `IoBinding`/CUDA-graph
+execution island. That island is derived optimizer output: it changes neither
+the package-authored sampling equation nor the operator's deployment policy.
 
 ## 2. Current inventory
 
@@ -155,6 +163,7 @@ contradict its source.
 | [`EngineConfig`](../../crates/onnx-genai-engine/src/config.rs) | Backend/device, batch extent, scheduler, speculation, KV page/dtype/connector, budgets, placement, and caches. | Deployment policy; this is the proper home for most of these choices. |
 | [`RuntimeConfig`](../../crates/onnx-genai-runtime-config/src/lib.rs) | EP priority, attention mode, threads, capture, fallback, device KV, provider/plugin options. | Deployment policy and environment selection. |
 | [`ServeArgs`](../../crates/onnx-genai-server/src/cli.rs) | Session/queue/batch limits and KV mirror dtype. | Service deployment policy. |
+| [`plan_execution_islands`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) and [`ExecutionIslandDiagnostic`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) | Automatically group compatible workflow components for ORT `IoBinding`/CUDA-graph optimization and report the resulting plan. | Backend-derived execution plan, not package semantics or deployment policy. |
 | [`BatchingCapability`](../../crates/onnx-genai-engine/src/batched.rs) | Result derived from the resolved backend and decode path. | Runtime admission evidence; stronger than a package boolean. |
 | [`ConcurrentRunSupport`](../../crates/onnx-genai-ort/src/session/mod.rs) | Result derived from resolved providers plus capture state. | Runtime admission evidence. |
 | [`MemoryStrategyPlan`](../../crates/onnx-genai-engine/src/config.rs) | Inferred and effective memory strategy, source, evidence, and advisory status. | Useful shape for generated evidence, though ORT plans may be advisory only. |
@@ -170,11 +179,13 @@ Upstream Hugging Face sources that contain no inference metadata are provenance,
 not hosted metadata examples. The resulting fleet is 28 packages.
 
 Every revision below was downloaded by immutable SHA and checked with the
-`f55520de9` `validate_metadata --metadata-only --shape` binary. **Valid** means
+`6705b0f55` `validate_metadata --metadata-only --shape` binary. **Valid** means
 the metadata parses and passes semantic validation. Direct ORT evidence means a
 model card or evidence file exercises graphs directly; workflow ORT evidence
 means the generic workflow engine executed the package. Neither is native
-readiness or performance proof unless stated separately.
+readiness or performance proof unless stated separately. A card-reported run is
+accepted here only when it names the artifact/runtime/result; a maintained test
+that can silently skip does not independently upgrade that claim.
 
 | Hosted package and exact metadata revision | Model form | Schema | Validation and evidence status |
 | --- | --- | --- | --- |
@@ -196,7 +207,7 @@ readiness or performance proof unless stated separately.
 | [`onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/88352734dc2d8c352c58be5450cc5c2dd7521aef/inference_metadata.yaml) `88352734dc2d8c352c58be5450cc5c2dd7521aef` | Image VLM with hybrid decoder and policy graphs | v1.0 | Valid; direct ORT graph evidence. A full generic multimodal or native package run is not recorded. |
 | [`onnx-genai-example-qwen2-5-1-5b-lora-selection`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/5ca5336b04f0c778f83c0083ee41203dd36961d2/inference_metadata.yaml) `5ca5336b04f0c778f83c0083ee41203dd36961d2` | Decoder with LoRA selection and policy graphs | v1.0 | Valid; direct ORT CUDA adapter evidence. Heterogeneous logical rows ran separately; accelerated heterogeneous workflow batching is not proved. |
 | [`onnx-genai-example-mistral-7b-v0-1-sliding-window`](https://huggingface.co/justinchuby/onnx-genai-example-mistral-7b-v0-1-sliding-window/blob/9d1e328848ab57e665d29ad4acb1182621775143/inference_metadata.yaml) `9d1e328848ab57e665d29ad4acb1182621775143` | Sliding-window decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA boundary-crossing evidence. |
-| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/0341cd47a8882c1fcbae0840613972321a007371/inference_metadata.yaml) `0341cd47a8882c1fcbae0840613972321a007371` | EAGLE-3 proposer/target workflow | v1.0 | Valid; generic workflow ORT CUDA correctness/acceptance evidence. Native request admission rejects EAGLE-3. |
+| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/0341cd47a8882c1fcbae0840613972321a007371/inference_metadata.yaml) `0341cd47a8882c1fcbae0840613972321a007371` | EAGLE-3 proposer/target workflow | v1.0 | Valid. The card reports ORT CUDA correctness/acceptance, but the maintained real-package gate returns success without executing when its environment variable is absent; this proposal therefore records implementation but no accepted project execution evidence. Native request admission rejects EAGLE-3. |
 | [`onnx-genai-stable-diffusion-bk-sdm-small`](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/2d30ae2ebfacf5c071693836d70ebd14d8fd84d3/inference_metadata.yaml) `2d30ae2ebfacf5c071693836d70ebd14d8fd84d3` | Text-to-image diffusion workflow | v1.0 | Valid; generic workflow ORT CUDA and A1111 API evidence. No accepted end-to-end performance gate. |
 | [`onnx-genai-cogvideox-2b`](https://huggingface.co/justinchuby/onnx-genai-cogvideox-2b/blob/29da9103c4517f8026155c0d97e195c26ee56758/inference_metadata.yaml) `29da9103c4517f8026155c0d97e195c26ee56758` | Text-to-video diffusion workflow with temporal recurrence | v1.0 | Valid; generic workflow ORT CUDA video evidence. No native video proof. |
 | [`act-aloha-policy-onnx-catalogue`](https://huggingface.co/justinchuby/act-aloha-policy-onnx-catalogue/blob/ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57/inference_metadata.yaml) `ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57` | Action-rollout policy graph | v1.0 | Valid; direct ORT CUDA/PyTorch parity and timing record. Generic workflow/native readiness is not separately keyed. |
@@ -278,7 +289,8 @@ Ordered annotated references:
 | --- | --- | --- |
 | Can it be recovered deterministically from the authored graph/workflow/contracts? | Derived | Do not serialize a second answer. Cache the derivation if necessary. |
 | Does a wrong answer change model semantics, state correctness, or request interpretation? | Authored requirement | Typed field or versioned contract with validation. Silence means the conservative behavior. |
-| Does an operator choose it differently for cost, latency, memory, trust, or risk? | Deployment policy | Runtime/server configuration outside portable inference metadata. |
+| Does an operator choose it differently for cost, latency, memory, trust, or risk? | Deployment/QoS policy | Runtime/server configuration outside portable inference metadata. |
+| Does a backend planner compute it from the admitted artifact, aliases, provider, shapes, and resources? | Backend-derived execution plan | Generated optimizer plan and diagnostics; do not serialize it as package semantics or label the generated topology as policy. |
 | Does the answer depend on artifact bytes, runtime build, EP, device, driver, options, or measurement? | Runtime evidence | Generated record with identity, environment, result, and timestamp. |
 
 Examples:
@@ -287,8 +299,11 @@ Examples:
   position input, and an authored RoPE initializer are derived facts.
 - `StateAliasing`, `StateReuse`, rollback bounds, `ComponentBatchCapacity`,
   `EquivalenceClass`, and `SessionMutationPolicy` are authored requirements.
-- physical paging, prefix-cache capacity, tiering, connector choice, graph
-  capture, EP fallback, batch width, and worker placement are deployment policy.
+- physical paging, prefix-cache capacity, tiering, connector choice,
+  graph-capture enablement/fallback, EP fallback, batch width, and worker
+  placement are deployment/QoS policy.
+- execution islands, capture segments, and backend buffer-reuse schedules are
+  backend-derived execution plans.
 - “ORT CUDA 1.29 executes this FP8 cache,” “native supports this operator set,”
   “this session may run concurrently,” and “speculation is faster” are evidence.
 
@@ -423,7 +438,8 @@ same artifact under named conditions.
 
 ### 4.12 Graph capture changes correctness and concurrency constraints
 
-Capture is runtime policy, not a model capability.
+Capture enablement/fallback is runtime policy, not a model capability. The
+capture regions or segments selected after admission are backend-derived plans.
 
 - ORT capture withdraws concurrent `Run` support for the session.
 - Shared-buffer batched decode explicitly runs uncaptured because mask width
@@ -437,15 +453,21 @@ A field that says only “graph capture supported” would conceal all four fact
 
 ### 4.13 Functional workflow execution is not a performance claim
 
-The universal interpreter and execution islands have broad functional tests.
+The universal interpreter has recorded functional execution for named
+fixtures/artifacts. Execution-island code and CUDA-gated tests establish
+implementation, but the tests may return without executing when CUDA is
+unavailable; this audit therefore does not treat them as a recorded island run.
 The current published CUDA synthetic measurements fail at least one acceptance
 criterion: decoder-policy throughput is `0.903` of the direct composite and
 min-p warm TTFT regresses. The record explicitly does not cover production KV,
 per-row serving, or the overridable sampler path; see
 [Current measured baseline](../benchmarks/2026-08-21-mobius-workflow-conformance.md#current-measured-baseline).
 
-Speculative decoding similarly has strong correctness evidence, while the
-speedup test is ignored and environment-gated. `distribution_preserving` is a
+Selected chained/shared-KV speculation has exact and fixture correctness
+records. MTP's full generation test is ignored, and the EAGLE-3 real-package
+gate can return success without execution when its artifact variable is absent.
+Neither receives a generic execution claim. The speedup test is also
+ignored/environment-gated. `distribution_preserving` is a
 correctness/equivalence assertion, never a speed claim.
 
 ## 5. Proposed minimal representation
@@ -460,7 +482,8 @@ Keep only typed package facts and requirements:
    aliasing legality, reuse/eviction legality, rollback/snapshot/fork bounds,
    checkpoint ABI, scope, management, and session continuation.
 3. **Request/task contracts:** package facts, generation defaults and override
-   surface, task profiles, pooling/decoding semantics, batch invariance.
+   surface, task profiles, pooling/decoding semantics, and component-scoped
+   grouping equivalence through `ComponentBatchCapacity`.
 4. **Composition contracts:** speculative proposer/target compatibility and
    adapter target/artifact bindings.
 5. **Non-derivable hard bounds:** for example a semantic maximum context length
@@ -505,13 +528,34 @@ Keep a separate runtime/server configuration for:
 - KV physical form, page size, mirror dtype, tiering, connector, budgets, and
   eviction;
 - prefix reuse enablement and capacity;
-- graph capture, execution islands, and stable-buffer strategy;
+- graph-capture enablement/fallback and stable-buffer strategy;
 - adapter caching, normalization, bucketing, and fallback permission;
 - session limits, TTL policy, and observability.
 
 Policy may choose less than the package permits. It may not choose more.
 
-### 5.4 Evidence record
+### 5.4 Backend-derived execution plans
+
+Keep automatic optimizer output out of both package metadata and deployment
+policy:
+
+- ORT execution islands and their `IoBinding` groups;
+- CUDA-graph capture segmentation;
+- buffer alias/reuse schedules chosen after backend inspection; and
+- native or ORT fallback boundaries chosen from actual operator coverage.
+
+[`plan_execution_islands`](../../crates/onnx-genai-engine/src/pipeline/islands.rs)
+derives islands from the compiled workflow, model sessions, aliasable outputs,
+and speculative live values.
+[`WorkflowRuntime`](../../crates/onnx-genai-engine/src/pipeline/mod.rs) describes
+the result as the ORT `IoBinding`/CUDA-graph optimization and leaves native
+components unfused.
+[`ExecutionIslandDiagnostic`](../../crates/onnx-genai-engine/src/pipeline/islands.rs)
+reports the generated result; it is not an authored enablement claim. Resource
+admission may decline fusion and a deployment knob may permit fallback, but
+neither fact turns the generated island topology into deployment policy.
+
+### 5.5 Evidence record
 
 Generate, rather than author, an `AdmissionEvidence` record:
 
@@ -559,8 +603,12 @@ Performance evidence is optional and separate; absence means “not proven,” n
    authored sin/cos cache use from operator edges and initializers.
 7. **Batching:** derive whether values can be permuted, packed, padded, or
    compacted from `BatchLayout`, padding companions, serving controls, state
-   row scope, and update discipline. `ComponentBatchCapacity` states an upper
-   structural bound, not that the runtime should group.
+   row scope, and update discipline. `ComponentBatchCapacity` is the sole
+   authored grouping-permission and semantic-invariance authority. Its
+   presence asserts grouped component execution is equivalent to solo
+   execution within the declared bounds; absence requires per-item execution.
+   Whether a service actually groups requests, and its target/delay below the
+   bound, remains deployment policy.
 8. **Speculation:** derive all state/effect rollback obligations from the
    speculative region. Keep equivalence and vocabulary compatibility authored.
    Enablement, proposal width, and tree/scheduling strategy are policy.
@@ -577,74 +625,79 @@ Performance evidence is optional and separate; absence means “not proven,” n
 
 ## 7. Current feature-status matrix
 
-Legend:
+The columns intentionally do not overload “support”:
 
-- **Yes**: the current tree contains the representation/check or at least one
-  non-vacuous execution test.
-- **Artifact**: proven only for named artifacts/environments, not generally.
-- **Partial**: a narrower path exists, or execution bypasses part of the
-  represented contract.
-- **No**: absent, rejected, or not demonstrated.
-- **N/A**: deliberately not a portable package field.
+- **Represented/validated:** `Yes`, `Partial`, `No`, or `N/A`.
+- **Implementation:** `Yes` means backend code exists for the stated scope;
+  `Partial` means a narrower path exists; `No` means it does not. Source code or
+  a test body proves only implementation.
+- **Recorded execution:** `Recorded artifact` names an exact package/runtime
+  result; `Recorded fixture` names a non-skipped backend fixture and a recorded
+  passing run; `Recorded refusal` is a negative execution/admission result;
+  `No record` means no accepted non-skipped execution record was found; `N/A`
+  means the question is not backend execution.
+- **Performance evidence:** `Pass (scope)` or `Fail (scope)` requires a
+  controlled record with a stated gate. `No accepted record` is neither a
+  performance failure nor a functional failure.
 
-“Executed” does not mean every operator/provider combination works.
-“Performance-proven” requires an accepted controlled record, not a benchmark
-harness or functional test.
+`Yes` is therefore never an execution-evidence status, and an ignored,
+environment-gated, or early-returning test cannot create one. Every positive
+recorded-execution cell below names its evidence and is intentionally narrower
+than the implementation column.
 
 ### 7.1 Workloads and composition
 
-| Form | Represented | Validated | Executed ORT | Executed native | Performance-proven | Evidence and limits |
-| --- | --- | --- | --- | --- | --- | --- |
-| Standard autoregressive decoder | Yes | Yes | Yes | Yes | Artifact | Canonical decoder lowering and extensive direct decode tests; performance records are artifact/hardware specific. |
-| Encoder-only embedding | Yes | Yes | Yes | No | No | Profiles and hidden-output roles exist; `Engine::embed_with_options` is explicitly ORT-only and does not dispatch from `TaskProfile`. |
-| Encoder-only reranking/classification/reward | Yes | Yes | No | No | No | Profile kinds are accepted by validation; no profile executor was found. |
-| Encoder-only CTC transcription | Yes | Yes | No | No | No | CTC decoding and vocabulary are validated, but no engine profile-driven CTC interpreter was found. |
-| Encoder-decoder / cross-attention | Yes | Yes | Artifact | No | No | Cross-attention and audio ports/state are represented; Whisper ORT evidence is environment-gated. Native end-to-end parity is not established. |
-| Image multimodal preprocessing + VLM | Yes | Yes | Yes | Partial | No | Image adapter and ORT workflow tests execute. Native component execution exists, but general real image-path readiness and native grouped vision remain unproven. |
-| Encoded-video preprocessing | Yes | Yes | No | No | No | The adapter is registered but encoded container decode/temporal sampling fails closed. Ordered encoded-frame grouping executes in preprocessing, not as an ORT/native encoder invocation. |
-| Video-producing workflow/diffusion | Yes | Yes | Yes | No | No | Hermetic and real-package-gated ORT tests exist; no native video workflow proof was found. |
-| Audio preprocessing + multimodal/audio workflow | Yes | Yes | Yes | Partial | No | Audio preprocessing and buffered WAV conformance execute; no general native real-audio record was found. |
-| Image diffusion/workflow | Yes | Yes | Yes | Yes | No | Hermetic ORT/native diffusion parity and smoke tests exist; no accepted end-to-end performance record. |
-| Nested/general workflow IR | Yes | Yes | Yes | Partial | No | ORT has broad interpreter conformance; native has component parity and selected end-to-end workflows, not a universal corpus proof. |
-| Legacy external draft-model speculation | Partial | Partial | Yes | No | No | ORT direct path exists. Native rejects per-request draft-model speculation. Speedup test is ignored/env-gated. |
-| Workflow-native chained/shared-KV speculation | Yes | Yes | Artifact | Yes | No | Real H200 ORT correctness/acceptance record plus native fixture parity; no accepted speedup record. |
-| MTP | Yes | Yes | Yes | Partial | No | ORT MTP executes. Native target execution can use an ORT MTP head; that is not pure-native proposer readiness. |
-| EAGLE-3 | Yes | Yes | Yes | No | No | ORT implementation exists; native request admission explicitly rejects EAGLE-3. |
-| LoRA/adapters | Yes | Yes | Partial | No | No | Portable host float32 JSON overlay and heterogeneous-row tests exist. Represented PEFT/safetensors/ORT formats do not prove accelerated backend execution. |
+| Form | Rep. | Val. | ORT impl. | ORT recorded execution | Native impl. | Native recorded execution | Performance evidence | Evidence and limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Standard autoregressive decoder | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | Pass (named decoder/hardware) | Canonical `decoder_io()` lowering plus the exact ORT/native runs in [the CUDA comparison record](../benchmarks/2026-07-23-ort-vs-native-cuda.md). No family-wide claim. |
+| Encoder-only embedding | Yes | Yes | Yes | Recorded artifact | No | No record | No accepted record | Exact hosted CPU workflow results are inventoried in [§2.3](#23-hosted-hugging-face-examples). `Engine::embed_with_options` is ORT-only and does not dispatch from every `TaskProfile`. |
+| Encoder-only reranking/classification/reward | Yes | Yes | No | No record | No | No record | No accepted record | Profile kinds validate, but no profile executor or non-skipped backend result was found. |
+| Encoder-only CTC transcription | Yes | Yes | No | No record | No | No record | No accepted record | CTC decoding/vocabulary validate; the refreshed Wav2Vec2 package proves schema validity, not an engine CTC interpreter. |
+| Encoder-decoder / cross-attention | Yes | Yes | Yes | Recorded artifact | Partial | No record | No accepted record | Exact hosted Whisper/translation CPU workflow results are listed in [§2.3](#23-hosted-hugging-face-examples). No accepted native end-to-end record was found. |
+| Image multimodal preprocessing + VLM | Yes | Yes | Yes | Recorded artifact | Partial | No record | No accepted record | Hosted Qwen vision packages record ORT execution; generic native component coverage is not a real image-package result. |
+| Encoded-video preprocessing | Yes | Yes | Partial | No record | Partial | No record | No accepted record | Container decode/temporal sampling still fails closed. Ordered frame preprocessing is not an ORT/native encoder execution record. |
+| Video-producing workflow/diffusion | Yes | Yes | Yes | Recorded fixture | Partial | No record | No accepted record | [`mobius_video_diffusion_workflow_publishes_causal_temporal_chunks`](../../crates/onnx-genai-engine/tests/onnx_genai_workflow_conformance.rs) is the maintained ORT fixture. No native video record was found. |
+| Audio preprocessing + multimodal/audio workflow | Yes | Yes | Yes | Recorded artifact | Partial | No record | No accepted record | Exact hosted audio workflow results are listed in [§2.3](#23-hosted-hugging-face-examples); no general native real-audio record was found. |
+| Image diffusion/workflow | Yes | Yes | Yes | Recorded fixture | Yes | Recorded fixture | No accepted record | ORT: [`mobius_euler_diffusion_workflow_executes_complete_path`](../../crates/onnx-genai-engine/tests/onnx_genai_workflow_conformance.rs). Native: [`native_runs_diffusion_loop_package`](../../crates/onnx-genai-engine/tests/native_workflow_smoke.rs) and [`diffusion_loop_parity`](../../crates/onnx-genai-engine/tests/native_workflow_parity.rs). |
+| Nested/general workflow IR | Yes | Yes | Yes | Recorded fixture | Partial | Recorded fixture (subset) | No accepted record | ORT interpreter conformance covers nested workflow fixtures; native records selected workflows, not a universal corpus. |
+| Legacy external draft-model speculation | Partial | Partial | Yes | No record | No | No record | No accepted record | ORT code exists and native request admission rejects this mode. No accepted non-skipped artifact result or speedup record was found. |
+| Workflow-native chained/shared-KV speculation | Yes | Yes | Yes | Recorded artifact | Yes | Recorded fixture | No accepted record | The exact Gemma4 composite in [§2.3](#23-hosted-hugging-face-examples) records ORT equivalence/acceptance/rejection. [`chained_speculative_proposal_parity`](../../crates/onnx-genai-engine/tests/native_workflow_parity.rs) records only the hermetic native scope. |
+| MTP | Yes | Yes | Yes | No record | Partial | No record | No accepted record | Implementation exists, but [`mtp_speculative_generation_matches_plain_greedy`](../../crates/onnx-genai-engine/tests/mtp_full.rs) is `#[ignore]`; the normally run test checks only a configuration literal. A native target with an ORT MTP head is not pure-native execution. |
+| EAGLE-3 | Yes | Yes | Yes | No record | No | No record | No accepted record | Implementation exists, but [`real_chained_proposer_matches_target_and_accepts_and_rejects`](../../crates/onnx-genai-engine/tests/chained_proposer_real.rs) returns success without executing when its package variable is absent. Native request admission rejects EAGLE-3. |
+| LoRA/adapters | Yes | Yes | Partial | Recorded artifact (portable overlay) | No | No record | No accepted record | The exact LoRA package in [§2.3](#23-hosted-hugging-face-examples) records ORT CUDA adapter output for the portable overlay path. Heterogeneous logical rows ran separately, and represented PEFT/safetensors/ORT formats are not accelerated batching evidence. |
 
 ### 7.2 Batching and cache forms
 
-| Form | Represented | Validated | Executed ORT | Executed native | Performance-proven | Evidence and limits |
-| --- | --- | --- | --- | --- | --- | --- |
-| ORT continuous batching, static cache | Yes | Yes | Yes | N/A | No | `ContinuousBatchManager` and static-cache functional evidence include divergent row cursors. |
-| ORT continuous batching, shared past/present buffer | Yes | Yes | Yes | N/A | No | Requires package aliasing permission, max length, and provider fixed-capacity binding. Capture replay is disabled because mask width changes. |
-| Native continuous batching | Yes | Yes | N/A | Yes | Artifact | Requires a persistent session pinned to batch N; recorded native batch measurements are artifact/hardware specific. |
-| Encoder/component batching | Yes | Yes | No | No | No | Component grouping contracts validate and grouped image/ordered-frame preprocessing executes. Scheduler-driven grouped component invocation, backend parity/readiness, and performance evidence remain incomplete in [ENCODER_BATCHING.md](ENCODER_BATCHING.md). |
-| Dynamic/growing KV | Yes | Yes | Yes | Yes | Artifact | Append discipline and past/present paths execute. Performance is model/backend specific. |
-| Fixed/static indexed-scatter KV | Yes | Yes | Artifact | Yes | No | Real ORT Qwen2 evidence and native static-cache fixture execution exist. Ragged prefill is not claimed. |
-| Physical paged KV storage | N/A | Runtime | Partial | Partial | No | `PagedKvCache` exists; physical paging is correctly runtime-owned. Backend handoff and device residency remain path-specific. |
-| Prefix reuse | Semantic legality only | Yes | Yes | Yes | Artifact | `StateReuse` states legality; runtime prefix tries/snapshots execute. A small benchmark is not a portable claim. |
-| Quantized host paged-KV mirror | N/A | Runtime | Partial | Partial | No | `EngineConfig::kv_cache_dtype` and paged-store codecs exist; this is not graph-native quantized KV execution. |
-| Graph-authored FP8 KV | Yes | Yes | No on recorded ORT CUDA 1.29 | No evidence | No | Valid package, unavailable shipped CUDA GQA type support. |
-| Local hot/warm/cold tiering | N/A | Runtime | Partial | No | No | Local tiered connector executes, but materialized engine reuse is limited to compatible ORT paths; native rejects connectors. |
-| External/distributed KV connector | N/A | Runtime | Partial | No | No | Lookup/store/fetch APIs exist; actual prefill shortening is byte-exact f32 `ZeroCopyRebind` only, otherwise reporting-only. |
+| Form | Rep. | Val. | ORT impl. | ORT recorded execution | Native impl. | Native recorded execution | Performance evidence | Evidence and limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Single-item decoder | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | Pass (named decoder/hardware) | Baseline evidence is the same exact decoder record cited in §7.1. |
+| Continuous/dynamic decoder batching | Yes | Yes | Yes | Recorded fixture | Yes | Recorded artifact | Pass (named native batches) | [`a_continuous_batch_row_stops_on_a_non_first_declared_end_token`](../../crates/onnx-genai-engine/tests/authored_iteration_e2e.rs) executes ORT width 2. Native grouping/capture measurements are recorded in [batch decode segmentation](../benchmarks/2026-08-19-batch-decode-mge2-capture-segmentation.md). `batch_capacity` permits grouping; it does not mandate it. |
+| Component/encoder grouping capacity | Yes | Yes | Partial | No record | Partial | No record | No accepted record | `ComponentBatchCapacity` is the only authored grouping-equivalence authority. Planner/validator tests are not backend execution evidence. |
+| Dynamic append KV | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | Pass (named decoder/hardware) | Exact standard-decoder records exercise dynamic KV for their named packages only. |
+| Static indexed KV | Yes | Yes | Yes | Recorded artifact | Yes | Recorded fixture | No accepted record | Exact static hosted packages are listed in [§2.3](#23-hosted-hugging-face-examples); [`native_runs_static_cache_ar_package`](../../crates/onnx-genai-engine/tests/native_workflow_smoke.rs) records the hermetic native path. |
+| Physical paged KV | N/A | N/A | Partial | No record | Partial | No record | No accepted record | Physical paging is policy. [`GQA_KV_MATERIALIZATION_DESIGN.md`](../memory/GQA_KV_MATERIALIZATION_DESIGN.md) explicitly defers live-session wiring and CUDA GQA Tier B; page-pool primitives/unit tests are not live decoder execution. |
+| Prefix reuse | Yes | Yes | Yes | No record | Yes | No record | No accepted record | Semantic legality and stores exist, but no accepted backend-specific live artifact/result was found. Capacity and eviction remain policy. |
+| Quantized host/paged KV mirror | N/A | N/A | Partial | No record | Partial | No record | No accepted record | Codecs and host page-store tests do not prove live decoder integration. [`local_tiered.rs`](../../crates/onnx-genai-kv/src/local_tiered.rs) says actual stored-payload FP8 compression is deferred. |
+| Graph-visible FP8 KV | Yes | Yes | No | Recorded refusal | No | No record | N/A | Metadata can validate while ORT CUDA rejects the required GQA FP8 path; this is the canonical representable-but-not-ready case. |
+| Tiered KV | N/A | N/A | Partial | No record | Partial | No record | No accepted record | Tiering is runtime policy. Connector/local-store code exists, but live end-to-end tiered decoder execution is not established; stored-payload FP8 remains deferred. |
+| External KV connector | N/A | N/A | Partial | No record | No | No record | No accepted record | Connector selection is runtime policy. [`connector_bridge.rs`](../../crates/onnx-genai-engine/src/connector_bridge.rs) materially injects only compatible byte-exact f32 `ZeroCopyRebind`; other paths can report opportunity without shortening prefill. |
 
 ### 7.3 Positions, backends, capture, and concurrency
 
-| Form | Represented | Validated | Executed ORT | Executed native | Performance-proven | Evidence and limits |
-| --- | --- | --- | --- | --- | --- | --- |
-| No external position input | Derived | Yes | Yes | Yes | N/A | Absence is supported; it means graph-internal or unused, not a guessed position algorithm. |
-| Rank-2 linear position input | Derived | Yes | Yes | Yes | N/A | Port role and graph shape determine the contract. |
-| Rank-3 multi-axis position input | Derived | Yes | Artifact | Artifact | No | Native derives the static coordinate rank from graph I/O; readiness remains artifact/operator specific. |
-| Authored internal position generation | Graph only | Graph load | Artifact | Artifact | No | Execute the graph as authored; no generic metadata flag proves the internal algorithm. |
-| Authored sin/cos RoPE caches | Graph only | Operator/load | Artifact | Artifact | No | Initializers/edges are the authority; operator coverage is backend specific. |
-| ORT/native interchangeability | No evidence model | No | Artifact | Artifact | No | Both backends execute overlapping corpora, but no durable paired readiness record exists. Auto-selection is not proof. |
-| ORT graph capture | N/A | Runtime | Yes | N/A | Artifact | Policy plus provider capability; capture withdraws concurrent `Run`, and some paths deliberately run uncaptured. |
-| Native whole-step graph capture | N/A | Runtime | N/A | Yes | Artifact | Structural predicates and decline reasons exist; results are shape/artifact/device specific. |
-| Concurrent `Run` on one ORT session | N/A | Runtime | Yes when admitted | N/A | No | Allowed only when every resolved EP declares it and capture is off. |
-| Same-session concurrent turns | Authored mutation rule | Yes | Refused | Refused | N/A | Routing-layer leases enforce single-flight for exclusive session mutation. |
-| Worker placement and multi-worker serving | N/A | Runtime | One worker | One worker | No | Session placement includes worker identity, but the production pool contains exactly one worker. |
-| Workflow sampler/interpreter optimization | Yes | Yes | Yes | Partial | No | Functional execution exists. Published CUDA policy-chain results do not meet all acceptance gates. |
+| Form | Rep. | Val. | ORT impl. | ORT recorded execution | Native impl. | Native recorded execution | Performance evidence | Evidence and limits |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Position input absent / graph-internal | Yes | Yes | Yes | No record | Yes | No record | No accepted record | Absence is derivable; internal semantics remain opaque. A generic decoder run does not prove which internal position algorithm was used. |
+| Rank-2 position IDs | Yes | Yes | Yes | Recorded artifact | Yes | Recorded artifact | No accepted position-specific record | Exact standard-decoder records cover named rank-2 artifacts. |
+| Rank-3 multi-coordinate position IDs | Yes | Yes | Yes | Recorded artifact | Partial | No record | No accepted record | Exact Qwen3.5-VL hosted metadata/execution is in [§2.3](#23-hosted-hugging-face-examples). The real native gate can skip on a known model mismatch, so it is not accepted evidence. |
+| Authored sin/cos RoPE cache inputs | Yes | Yes | Yes | No record | Yes | No record | No accepted record | Role-derived graph edges are implementation capability; no specific non-skipped artifact result was found. |
+| ORT/native interchangeability | Partial | Yes | Partial | No paired record | Partial | No paired record | No accepted record | The backend domains overlap but are unequal. Readiness requires a paired certificate for the exact artifact, not two optimistic implementation flags. |
+| ORT CUDA graph capture | N/A | N/A | Yes | Recorded artifact | N/A | N/A | Pass (named Qwen/CUDA) | [The ORT/native CUDA record](../benchmarks/2026-07-23-ort-vs-native-cuda.md) names capture success and rejection by artifact. Eligibility is provider/shape/allocation specific. |
+| Native graph capture / single-flight | N/A | N/A | N/A | N/A | Yes | Recorded artifact | Pass (named native decoders) | The same record measures native capture; mutable captured buffers require one in-flight owner. |
+| Backend-derived execution islands | N/A | N/A | Yes | No record | No | No record | No accepted record | [`plan_execution_islands`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) is automatic optimizer planning. CUDA tests may return without executing when CUDA is unavailable, so code/tests alone do not establish a record. |
+| Concurrent ORT `Session::Run` | N/A | N/A | Yes | Recorded fixture | N/A | N/A | No accepted performance record | [`a_concurrently_runnable_session_can_actually_be_run_from_two_threads`](../../crates/onnx-genai-ort/tests/session_thread_contract.rs) is non-skipped and executes one admitted session from two threads. |
+| Same-session overlapping turns | Yes | Yes | N/A | N/A | N/A | N/A | N/A | Shared routing-layer [`SessionLeases`](../../crates/onnx-genai-server/src/lease.rs) serialize or reject overlap before backend execution unless isolated state is proven; a backend concurrency flag cannot override this. |
+| Worker placement | N/A | N/A | N/A | N/A | N/A | N/A | No accepted record | Pure deployment policy; default placement is same-thread unless explicitly configured. |
+| Workflow policy interpreter/sampler | Yes | Yes | Yes | Recorded artifact | Partial | Recorded fixture (subset) | Fail (current scoped gate) | Functional policy-graph execution does not establish an optimized sampler. [The current measured baseline](../benchmarks/2026-08-21-mobius-workflow-conformance.md#current-measured-baseline) records `0.903x` direct-composite throughput and min-p TTFT regression, and excludes production KV/per-row serving. |
 
 ## 8. Fail-closed rules and examples
 
@@ -688,9 +741,9 @@ fields indefinitely.
 | `WorkflowManifest.capabilities` | Remove | Workflow structure, contracts, effects, state, batch layouts, and emits. |
 | `RuntimeCapabilities.supported` global strings | Replace | Typed implementation registry plus artifact/backend admission report. |
 | `model.runtime_configurable.prefix_cache` | Remove | `StateReuse::prefix_reusable` states legality; runtime policy enables/caps reuse. |
-| `model.runtime_configurable.continuous_batching` | Keep removed | Merged main rejects it; derive batchability from component/decode/state ABI and concrete backend session, while policy selects width. |
-| `profiles.*.batch_invariance` | Keep removed | Merged main rejects it; `ComponentBatchCapacity` is the sole authored grouping-equivalence assertion. |
-| Built-in `continuous_batching` capability string | Keep removed | Merged main rejects it as an optimization, not a correctness requirement. |
+| `model.runtime_configurable.continuous_batching` | Already retired; preserve targeted rejection | [`reject_retired_batching_hints`](../../crates/onnx-genai-metadata/src/parser.rs) explains that `ComponentBatchCapacity` is the sole authored grouping permission/equivalence assertion and runtime policy decides whether to group. |
+| `profiles.*.batch_invariance` | Already retired; preserve targeted rejection | [`reject_retired_batching_hints`](../../crates/onnx-genai-metadata/src/parser.rs) directs authors to component-scoped `batch_capacity`; absence means per-item execution. |
+| Built-in `continuous_batching` capability string | Already retired; preserve targeted rejection | Merged main rejects it as an optimization, not a correctness requirement; the parser names the typed migration instead of emitting a generic unknown-capability error. |
 | `model.runtime_configurable.chunked_prefill.chunk_size` | Move | Runtime policy/default profile. Keep only a typed hard graph bound if one exists. |
 | `hardware_requirements.supports_tensor_parallel` | Remove | `model.sharding.tensor_parallel` legal shard facts. |
 | `hardware_requirements.min_tp_degree` | Move | Distribution/performance recommendation with evidence. |
@@ -714,20 +767,23 @@ fields indefinitely.
    `DerivedRequirements`/admission diagnostic in a later runtime PR without
    changing schema behavior.
 2. **Make derivation authoritative:** make all loaders consume the same derived
-   view. Add contradiction tests against old fields while they still exist.
+   view. Preserve targeted migration diagnostics for fields already retired;
+   do not regress them to generic unknown-field errors.
 3. **Separate policy:** move runtime-configurable, hardware-placement, adapter
    cache/planning, and fallback choices to runtime/server configuration.
 4. **Add evidence keys and gates:** persist backend admission and conformance
    results; make auto-selection consume exact matching evidence or probe by
    loading.
-5. **Delete redundant schema fields and strings:** now that the batching schema
-   work is merged, update parser, validation, generated schema, fixtures, and
-   canonical docs in one dedicated follow-up PR. No compatibility aliases.
+5. **Delete remaining redundant schema fields and strings:** update parser,
+   validation, generated schema, fixtures, and canonical docs in one dedicated
+   follow-up PR. The batching fields above are already retired and are not work
+   for this stage. No compatibility aliases.
 6. **Republish hosted instances:** regenerate the pinned Hub fleet from the
    authoritative typed source, validate exact uploaded bytes, and update this
    inventory. Do not preserve obsolete hosted fields as aliases.
 7. **Tighten claims:** make status APIs and documentation report represented,
-   validated, executed, and performance-proven separately.
+   validated, implemented, recorded execution, and performance evidence
+   separately.
 
 Stages 1–4 can land without editing the batching schema or its canonical design
 document. Stage 5 remains intentionally isolated from this proposal and from
@@ -737,8 +793,12 @@ the already-merged batching work.
 
 1. **Single-authority derivation:** mutate one workflow fact at a time and prove
    the derived view changes; there is no second writable answer.
-2. **Contradiction removal:** after field deletion, old spellings fail as
-   unknown fields rather than being silently translated.
+2. **Actionable retired-field diagnostics:** preserve
+   [`retired_profile_batch_invariance_explains_the_component_contract_migration`,
+   `retired_model_batching_hint_explains_derived_feasibility_and_policy`, and
+   `retired_continuous_batching_capability_is_not_a_correctness_requirement`](../../crates/onnx-genai-metadata/tests/encoder_batching.rs).
+   Old batching spellings must fail with the exact migration authority, not a
+   generic unknown-field error or silent translation.
 3. **Backend admission corpus:** for every committed artifact, record ORT and
    native parse/load/run verdicts keyed by exact build/provider/device.
 4. **Workload corpus:** standard decoder; encoder-only embedding and CTC;
@@ -754,8 +814,11 @@ the already-merged batching work.
    fetch. Separately assert `would_extend_tokens` and `fetched_tokens`.
 8. **Position corpus:** absent input, rank-2, rank-3, graph-internal positions,
    and authored sin/cos caches under every claimed backend.
-9. **Batching corpus:** ORT static/shared-buffer and native pinned batch, plus
-   encoder grouping only after the component/backend/artifact triple passes.
+9. **Batching corpus:** prove absence of `batch_capacity` forces per-item
+   execution; prove presence permits, but never mandates, grouped execution
+   within its bounds; then cover ORT static/shared-buffer, native pinned batch,
+   and encoder grouping only after the component/backend/artifact triple
+   passes.
 10. **Capture/concurrency matrix:** capture on/off × provider concurrent-run
     declaration × control flow × stable/dynamic shape. Every decline names the
     exact predicate.
@@ -800,6 +863,12 @@ the already-merged batching work.
     optimistic “distributed supported” flag?
 12. Which performance evidence may be generalized across devices, and which
     must remain exact-machine evidence?
+13. What durable run record turns a non-skipped repository test or hosted model
+    card into accepted execution evidence, and how must environment-gated tests
+    report “not run” so they cannot appear as passes?
+14. Which execution-island enable/fallback controls, if any, should be exposed
+    as deployment policy without exposing or serializing the generated island
+    topology?
 
 ## 12. Reader guide
 
@@ -816,17 +885,22 @@ Read in this order:
    and
    [`schema/decoder_abi.rs`](../../crates/onnx-genai-metadata/src/schema/decoder_abi.rs)
    — task/speculative/preprocessing/model surfaces.
-5. [`decoder_abi.rs`](../../crates/onnx-genai-metadata/src/decoder_abi.rs) and
-   [`validation.rs`](../../crates/onnx-genai-metadata/src/validation.rs) —
-   derivation versus duplicated capability enforcement.
+5. [`decoder_abi.rs`](../../crates/onnx-genai-metadata/src/decoder_abi.rs),
+   [`validation.rs`](../../crates/onnx-genai-metadata/src/validation.rs),
+   [`parser.rs`](../../crates/onnx-genai-metadata/src/parser.rs), and
+   [`encoder_batching.rs`](../../crates/onnx-genai-metadata/tests/encoder_batching.rs)
+   — derivation, validation, and targeted diagnostics for retired batching
+   spellings.
 6. [`engine/load.rs`](../../crates/onnx-genai-engine/src/engine/load.rs) and
    [`engine/decode_backend.rs`](../../crates/onnx-genai-engine/src/engine/decode_backend.rs)
    — actual admission, fallback, and backend selection.
-7. [`pipeline/workflow.rs`](../../crates/onnx-genai-engine/src/pipeline/workflow.rs),
+7. [`pipeline/mod.rs`](../../crates/onnx-genai-engine/src/pipeline/mod.rs),
+   [`pipeline/workflow.rs`](../../crates/onnx-genai-engine/src/pipeline/workflow.rs),
    [`pipeline/native_component.rs`](../../crates/onnx-genai-engine/src/pipeline/native_component.rs),
    and
    [`pipeline/islands.rs`](../../crates/onnx-genai-engine/src/pipeline/islands.rs)
-   — what the interpreter and both component backends actually execute.
+   — what the interpreter and both component backends implement, and which ORT
+   execution-island plan is derived automatically.
 8. [`batched.rs`](../../crates/onnx-genai-engine/src/batched.rs),
    [`connector_bridge.rs`](../../crates/onnx-genai-engine/src/connector_bridge.rs),
    and [`onnx-genai-kv`](../../crates/onnx-genai-kv/src/lib.rs) — batching and
@@ -855,10 +929,17 @@ Read in this order:
   deployment preference?
 - Can an unsupported requirement ever degrade to a warning or silent fallback?
 - Is readiness attached to exact artifact/runtime/provider identity?
-- Does a status distinguish validation, execution, and performance?
+- Does a status distinguish representation, validation, implementation,
+  recorded execution, and performance?
 - Does any cache field confuse model semantics with storage policy?
 - Does capture or concurrent execution change the admission result?
+- Is `batch_capacity` the only grouping-permission/equivalence authority, with
+  absence forcing per-item execution?
 - Does a batching claim name the exact artifact/backend/component combination?
+- Is an execution island treated as backend-derived optimizer output rather
+  than package semantics or deployment policy?
+- Can any ignored, environment-gated, or early-returning test be mistaken for
+  recorded execution?
 - Could an adapter or speculative fallback silently change output semantics?
 - Is every hosted example pinned, validated at that revision, and prevented from
   becoming a schema or readiness authority?
@@ -867,9 +948,11 @@ Read in this order:
 
 - [ ] No generic capability boolean/list duplicates typed structure.
 - [ ] No deployment choice is stored as portable model truth.
+- [ ] Package policy graphs, deployment/QoS knobs, and backend-derived plans are distinct.
 - [ ] Unsupported required behavior fails closed with an actionable source path.
-- [ ] ORT and native readiness are independently evidenced.
-- [ ] Functional and performance claims are separately labeled.
+- [ ] ORT/native implementation and recorded execution are independently labeled.
+- [ ] Functional and performance evidence are separately labeled.
+- [ ] Retired batching spellings retain targeted migration diagnostics.
 - [ ] Cache, position, batching, adapter, speculation, and session forms are all covered.
 - [ ] Migration deletions have one replacement authority and no compatibility alias.
 - [ ] Acceptance tests include negative and decline paths, not only successful execution.
