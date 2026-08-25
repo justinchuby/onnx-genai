@@ -20815,6 +20815,24 @@ mod tests {
             }
         );
 
+        // Deliberately kept as an unconditional claim here, even though the
+        // rest of this sweep no longer asserts one-per-core under the default
+        // policy (see #1802 and the long note in
+        // `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`).
+        // It is not a policy contract *in this arm*: the child narrowed itself
+        // to one CPU per physical core, `order_pin_targets_for` is a
+        // permutation of the allowed CPUs under every policy it implements --
+        // `Compact` dedups through `placed` and appends the remainder exactly
+        // once -- so on a leader-only cpuset compact and spread both land one
+        // worker per core. The mask shape forces the outcome, not the policy.
+        //
+        // The assumption that buys that, stated so it fails loudly rather than
+        // silently if it stops holding: the default must place *at most one
+        // worker per allowed CPU*. An oversubscribing shared-core default would
+        // realize `shared-core` here (and trip `workers == cores` above), and
+        // the right response then is to gate this arm on the policy, not to
+        // delete it -- the width claim it exists to make (#1780) is
+        // policy-neutral and still worth asserting.
         assert_eq!(
             report.realized, "one-per-core",
             "a default-width pool on a leader-only cpuset must realize one \
