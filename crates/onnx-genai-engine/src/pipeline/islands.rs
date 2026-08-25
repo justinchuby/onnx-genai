@@ -2493,40 +2493,158 @@ batch_layout:
     }
 
     #[test]
-    fn inferred_dynamic_axis_zero_fails_closed_as_request_batched() {
-        let inferred = onnx_genai_ort::TensorInfo {
-            name: "rows".into(),
-            dtype: onnx_genai_ort::DataType::Float32,
-            shape: vec![-1, 4],
-        };
-        let contract = session_tensor_contract(&inferred).expect("dynamic axis zero is classified");
-        assert!(matches!(
-            contract.batch_layout,
-            onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 }
-        ));
+    fn inferred_dynamic_axis_zero_fails_before_island_or_backend_execution() {
+        const IDENTITY: &str = r#"
+ir_version: 8
+graph {
+  node { input: "input" output: "output" op_type: "Identity" }
+  name: "dynamic_identity"
+  input { name: "input" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+  output { name: "output" type { tensor_type { elem_type: 1 shape {
+    dim { dim_param: "batch" } dim { dim_value: 4 }
+  }}}}
+}
+opset_import { domain: "" version: 13 }
+"#;
+        const METADATA: &str = r#"
+pipeline:
+  workflow:
+    manifest:
+      adapter_abis: {}
+      capabilities: [workflow_ssa, typed_emit]
+    inputs:
+      rows:
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [batch, 4]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        role: { kind: opaque }
+        source: { kind: application, name: rows }
+        required: true
+    outputs:
+      result:
+        contract:
+          dtype: float32
+          rank: 2
+          shape: [batch, 4]
+          batch_layout: { kind: request_aligned, axis: 0 }
+        role: tensor
+        stage: pre_adapter
+    components:
+      first:
+        implementation: { kind: onnx, artifact: first.onnx.textproto }
+        contract: { id: test.backend-sentinel, version: "1" }
+      second:
+        implementation: { kind: onnx, artifact: second.onnx.textproto }
+        contract: { id: test.backend-sentinel, version: "1" }
+    steps:
+      - kind: invoke
+        component: first
+        inputs: { input: rows }
+        outputs: { output: middle }
+      - kind: invoke
+        component: second
+        inputs: { input: middle }
+        outputs: { output: result_value }
+      - kind: emit
+        value: result_value
+        output: result
+        mode: replace
+"#;
 
-        let empty_component = component(ComponentImplementation::Onnx {
-            artifact: "inferred.onnx".into(),
-        });
-        let inferred_component = component_with_inferred_ports(&empty_component, &[inferred], &[])
-            .expect("dynamic axis zero has a fail-closed inferred contract");
-        assert!(requires_batch_admission_boundary(&inferred_component));
+        struct BackendSentinel {
+            invocations: usize,
+        }
 
-        let rows = Value::from_slice_f32(&[0.0; 8], &[2, 4]).unwrap();
-        let error = super::super::batching::validate_component_batch_before_enqueue(
-            "inferred",
-            &inferred_component,
-            &[("rows", &rows)],
-            &HashMap::from([("batch".into(), 2)]),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            super::super::batching::BatchContractError::UndeclaredCapacity {
-                request_count: 2,
-                ..
+        impl super::super::workflow::WorkflowNodeHost for BackendSentinel {
+            fn hosted_contracts(&self) -> &'static [&'static str] {
+                &["test.backend-sentinel"]
             }
+
+            fn execute_contract_node(
+                &mut self,
+                _request: super::super::workflow::WorkflowNodeRequest<'_>,
+            ) -> anyhow::Result<bool> {
+                self.invocations += 1;
+                anyhow::bail!("backend sentinel was invoked before admission")
+            }
+        }
+
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target/test-fixtures/inferred-island-admission");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inference_metadata.yaml"), METADATA).unwrap();
+        std::fs::write(root.join("first.onnx.textproto"), IDENTITY).unwrap();
+        std::fs::write(root.join("second.onnx.textproto"), IDENTITY).unwrap();
+
+        let models = onnx_genai_ort::PipelineModels::load(&root).unwrap();
+        let workflow = models.directory.spec.workflow.clone();
+        let mut graph = onnx_genai_metadata::compile_workflow(&workflow)
+            .unwrap()
+            .graph;
+        let islands = plan_execution_islands(
+            &mut graph,
+            &workflow,
+            &models,
+            &HashSet::new(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert!(
+            islands.is_empty(),
+            "dynamic axis-zero empty-port components must not be hidden in an island"
+        );
+
+        let runtime = WorkflowRuntime::hosted(
+            root.clone(),
+            workflow,
+            crate::EngineDecodeBackend::Ort,
+            crate::MemoryStrategyPlan::unknown(0, None, "inferred island admission test"),
+            models,
+            None,
+        )
+        .unwrap();
+        let request = crate::pipeline::PipelineGenerateRequest::new(crate::GenerateRequest::new(
+            crate::GeneratePrompt::TokenIds(Vec::new()),
+        ))
+        .with_input("rows", Value::from_slice_f32(&[0.0; 8], &[2, 4]).unwrap());
+        let mut plan = super::super::workflow::WorkflowExecutionPlan::new_hosted(
+            &runtime,
+            request,
+            &["test.backend-sentinel"],
+        )
+        .unwrap();
+        let mut sentinel = BackendSentinel { invocations: 0 };
+        let error = {
+            let mut host: Option<&mut dyn super::super::workflow::WorkflowNodeHost> =
+                Some(&mut sentinel);
+            match plan.execute_retained_with_host(&mut host) {
+                Ok(_) => panic!("W=2 without batch_capacity reached backend execution"),
+                Err(error) => error,
+            }
+        };
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(
+                super::super::batching::BatchContractError::UndeclaredCapacity {
+                    request_count: 2,
+                    ..
+                }
+            )
         ));
+        assert_eq!(
+            sentinel.invocations, 0,
+            "admission must reject before the backend sentinel can execute"
+        );
+
+        drop(plan);
+        drop(runtime);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
