@@ -124,11 +124,22 @@ fn allowlisted_unconditional_syncs() -> BTreeSet<String> {
         // returning it to the pool. Same shape as packed_varlen_attention below.
         "multi_head_attention.rs::execute".to_string(),
         "nary.rs::run".to_string(),
+        // Drains the materialization launch before returning, so the governed
+        // workspace holding `selected`/`counts` is not recycled while the
+        // kernel still reads it. The kernel declares CaptureSupport::unsupported
+        // for a different sync -- the 8-byte count D2H that precedes dynamic ORT
+        // output allocation -- which is what puts the whole path outside capture.
+        "non_max_suppression.rs::materialize".to_string(),
         "nonzero.rs::execute".to_string(),
         "packed_varlen_attention.rs::execute".to_string(),
         "pooling.rs::execute".to_string(),
         "pooling.rs::run".to_string(),
         "sparse_kv_gather.rs::execute".to_string(),
+        // Same shape as non_max_suppression above: the trailing sync drains the
+        // materialization launch before the workspace is returned, and the
+        // kernel declares CaptureSupport::unsupported for its 8-byte count D2H
+        // ahead of dynamic ORT output allocation.
+        "unique.rs::materialize".to_string(),
         "varlen_attention.rs::execute".to_string(),
     ])
 }
