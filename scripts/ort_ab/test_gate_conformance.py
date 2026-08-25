@@ -73,6 +73,8 @@ from __future__ import annotations
 import ast
 import functools
 import re
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -780,6 +782,82 @@ class Classification(unittest.TestCase):
         both = {"driver": {"x.py": "gated"}, "generator": {"x.py": "fixtures"}}
         self.assertEqual(unclassified(["x.py"], both), ["x.py"])
         self.assertEqual(declared_roles(["ab.py"])["ab.py"], ["driver"])
+
+
+class GateReuse(unittest.TestCase):
+    """The recipe for closing one of those nineteen gaps has to still work.
+
+    The ledger asks nineteen files to gate. If gating means writing a lock
+    client, we get nineteen subtly different ones -- which is how this root
+    came to have two already. So `hostlock_gate` is usable from another root
+    with a path insert, and the three properties that makes true are pinned
+    here rather than left to the first person who tries it.
+    """
+
+    GATE = ORT_AB / "hostlock_gate.py"
+
+    def module_level_names(self) -> set[str]:
+        tree = ast.parse(self.GATE.read_text())
+        return {
+            n.name
+            for n in tree.body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        } | {
+            t.id
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Name)
+        }
+
+    def test_the_documented_recipe_names_only_things_that_exist(self):
+        # Doc drift with a safety instruction in it is worse than no doc: the
+        # reader concludes the gate is broken and writes their own client,
+        # which is the outcome the shared module exists to prevent.
+        docs = self.GATE.read_text() + (ORT_AB / "README.md").read_text()
+        # `(?!py)` so the filename `hostlock_gate.py` is not read as a call.
+        named = set(re.findall(r"hostlock_gate\.(?!py\b)([a-z_]+)", docs))
+        self.assertTrue(named, "the recipe named nothing -- did the docs move?")
+        missing = sorted(named - self.module_level_names())
+        self.assertEqual(missing, [])
+
+    def test_the_path_depth_in_the_recipe_reaches_the_repo_root(self):
+        # `parents[3]` from a file in the benches root. An off-by-one here
+        # inserts a directory that does not contain the gate, and the import
+        # fails at the top of somebody's harness with a bare ImportError.
+        text = self.GATE.read_text()
+        depth = int(re.search(r"parents\[(\d+)\] / \"scripts\"", text).group(1))
+        planted = EP_BENCHES / "a_harness.py"
+        self.assertEqual(planted.parents[depth], ORT_AB.parents[1])
+        self.assertTrue((planted.parents[depth] / "scripts" / "ort_ab").is_dir())
+
+    def test_the_gate_does_not_read_the_working_directory(self):
+        # The property that makes reuse possible at all, checked by running
+        # it from somewhere else entirely: `hostlock.sh` is resolved from the
+        # module's own file, so a harness invoked from any directory finds
+        # the same lock. A CWD-relative path would work in every test here
+        # and fail for every caller in that other root.
+        probe = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "import hostlock_gate as g\n"
+            "print(g.HOSTLOCK.is_file())\n" % str(ORT_AB)
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            cwd=str(ORT_AB.parents[1].anchor),
+        )
+        self.assertEqual(out.stdout.strip(), "True", out.stderr[-400:])
+
+    def test_the_gate_checks_custody_rather_than_taking_the_lock(self):
+        # A driver that takes the lock itself releases it when it exits, so
+        # a matrix run as several processes is certified arm by arm and
+        # protected across none of them -- #1803's mechanism. `require` must
+        # therefore never call `acquire`.
+        source = self.GATE.read_text()
+        self.assertNotIn('"acquire"', source)
+        self.assertIn("hostlock.sh run --owner", source)
 
 
 class Vacuity(unittest.TestCase):

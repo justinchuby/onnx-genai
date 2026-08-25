@@ -31,6 +31,32 @@ to catch a lock that changed hands mid-run, then `lock_columns` to stamp the
 result onto every emitted row. A driver that does not emit rows should still
 print the label: a console line is worth less than a column, but it is worth
 more than nothing.
+
+Usable from outside this directory, and deliberately so: the #2043 ledger
+records nineteen ungated harnesses in `crates/onnx-runtime-ep-cpu/benches/`,
+and asking their owners to write a lock client each is asking for nineteen
+subtly different ones. Nothing here reads the working directory --
+`hostlock.sh` is resolved from this file -- so a harness in another root
+needs a path insert and the same two calls:
+
+    import pathlib
+    import sys
+
+    sys.path.insert(
+        0, str(pathlib.Path(__file__).resolve().parents[3] / "scripts" / "ort_ab")
+    )
+    import hostlock_gate
+
+    label, prov = hostlock_gate.require(
+        "python3 crates/onnx-runtime-ep-cpu/benches/<this file> <args>",
+        unlocked=args.unlocked,
+    )
+
+`parents[3]` is the repo root from that directory. The gate *checks* custody;
+it never takes the lock, because a lock taken by the driver is released when
+the driver exits and certifies nothing about a matrix run as several
+processes. `scripts/hostlock.sh run -- <driver>` is what holds it, and
+`remedy()` prints that line with the caller's own command in it.
 """
 
 from __future__ import annotations

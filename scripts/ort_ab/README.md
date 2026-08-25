@@ -415,6 +415,54 @@ here, and the ledger cannot decay into a description of the tree as it was —
 which matters most in the case nobody plans for, a file that stops gating and
 is then quietly covered by an exemption nobody meant to still grant.
 
+### Closing a gap: gating a harness in another root
+
+The ledger asks nineteen files to gate. If gating meant writing a lock client,
+we would get nineteen subtly different ones — that root already has two. So
+`hostlock_gate.py` is reusable from anywhere: nothing in it reads the working
+directory, `scripts/hostlock.sh` is resolved from the module's own file, and a
+harness in `crates/onnx-runtime-ep-cpu/benches/` needs a path insert and two
+calls:
+
+```python
+import pathlib
+import sys
+
+sys.path.insert(
+    0, str(pathlib.Path(__file__).resolve().parents[3] / "scripts" / "ort_ab")
+)
+import hostlock_gate
+
+label, prov = hostlock_gate.require(
+    "python3 crates/onnx-runtime-ep-cpu/benches/<this file> <args>",
+    unlocked=args.unlocked,
+)
+...
+label = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
+row.update(hostlock_gate.lock_columns(label, prov))
+```
+
+Then delete that file's line from `EP_LEDGER` — the check **fails on a stale
+record**, so the deletion is forced rather than remembered.
+
+The gate *checks custody*; it never takes the lock. A lock taken by the driver
+is released when the driver exits, so a matrix run as several processes would
+be certified arm by arm and protected across none of them. What holds it is
+the outer wrapper, which `remedy()` prints with your own command already in
+it:
+
+```
+scripts/hostlock.sh run --owner <you> --reason "<what this measures>" -- \
+    python3 crates/onnx-runtime-ep-cpu/benches/<this file> <args>
+```
+
+Three properties of that recipe are pinned by cells rather than by this
+paragraph: every `hostlock_gate.*` name used in the docs exists, `parents[3]`
+really is the repo root from that directory, and importing the gate from an
+unrelated working directory still finds `hostlock.sh`. Doc drift in a safety
+instruction is worse than no doc — the reader concludes the gate is broken and
+writes their own client, which is how this started.
+
 One structural property of custody is checked with it: the lock must not be
 acquired **inside** an arm loop. A lock taken per arm is released between
 arms, so each arm is protected and the comparison between them is not — which
