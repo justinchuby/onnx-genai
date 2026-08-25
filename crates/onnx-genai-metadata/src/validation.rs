@@ -819,6 +819,9 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
                  not declare"
             ));
         }
+        if decoding.kind == "ctc" {
+            validate_ctc_padding_lengths(metadata, name, profile, decoding, errors);
+        }
         if let Some(vocabulary) = &decoding.vocabulary {
             if vocabulary.source == "inline" && vocabulary.tokens.is_empty() {
                 errors.push(format!(
@@ -867,6 +870,75 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
                 }
             }
         }
+    }
+}
+
+/// Bind padded CTC time logits to the padding contract's one validity truth.
+///
+/// `TensorContract::padding` already validates the companion's int64 dtype,
+/// shared layout, and exact outer-axis rank/shape. This cross-layer rule makes
+/// the CTC decoder consume that same value by name rather than permitting a
+/// missing or second, contradictory frame-count source.
+fn validate_ctc_padding_lengths(
+    metadata: &InferenceMetadata,
+    profile_name: &str,
+    profile: &crate::schema::TaskProfile,
+    decoding: &crate::schema::SequenceDecodingSpec,
+    errors: &mut Vec<String>,
+) {
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    let Some(logits_output) = profile.outputs.get("logits") else {
+        return;
+    };
+    let Some(logits) = workflow.outputs.get(logits_output) else {
+        return;
+    };
+    if decoding.time_axis >= logits.contract.rank {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.time_axis {} is outside workflow output \
+             '{logits_output}' rank {}",
+            decoding.time_axis, logits.contract.rank
+        ));
+        return;
+    }
+    if decoding.class_axis >= logits.contract.rank {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.class_axis {} is outside workflow output \
+             '{logits_output}' rank {}",
+            decoding.class_axis, logits.contract.rank
+        ));
+    }
+    let Some(padding) = logits.contract.padding.iter().find(|padding| {
+        axis_of_symbol(&logits.contract, &padding.dimension) == Some(decoding.time_axis)
+    }) else {
+        return;
+    };
+    let Some(lengths_role) = decoding.lengths.as_deref() else {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.lengths is required because workflow output \
+             '{logits_output}' pads decoded time axis {} ('{}') with valid_lengths '{}'; CTC \
+             must decode exactly that valid prefix",
+            decoding.time_axis, padding.dimension, padding.valid_lengths
+        ));
+        return;
+    };
+    let Some(bound_output) = profile.outputs.get(lengths_role) else {
+        return;
+    };
+    if bound_output != &padding.valid_lengths {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.lengths role '{lengths_role}' binds workflow output \
+             '{bound_output}', but workflow output '{logits_output}' pads decoded time axis {} \
+             ('{}') with valid_lengths '{}'; bind decoding.lengths to a profile output role \
+             mapping to '{}' so padding and CTC decoding have one source of truth",
+            decoding.time_axis, padding.dimension, padding.valid_lengths, padding.valid_lengths
+        ));
     }
 }
 

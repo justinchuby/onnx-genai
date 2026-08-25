@@ -22,7 +22,7 @@ fn errors(document: &str) -> Vec<String> {
 /// CTC. Model identity lives only in this comment and the artifact path; the
 /// schema and validator never see a model name.
 const CTC_ASR_DOCUMENT: &str = r#"
-schema_version: v1
+schema_version: v1.1
 preprocessing:
   audio:
     transforms:
@@ -93,6 +93,7 @@ pipeline:
           rank: 3
           shape: [batch, frames, vocab]
           batch_layout: { kind: request_aligned, axis: 0 }
+          padding: [{ dimension: frames, valid_lengths: frame_lengths }]
         role: tensor
         stage: pre_adapter
       frame_lengths:
@@ -100,7 +101,7 @@ pipeline:
           dtype: int64
           rank: 1
           shape: [batch]
-          batch_layout: { kind: request_aligned, axis: 0 }
+          batch_layout: { kind: shared }
         role: tensor
         stage: pre_adapter
     components:
@@ -148,6 +149,23 @@ fn ctc_asr_document_validates() {
     assert_eq!(decoding.blank_id, Some(0));
     assert!(decoding.collapse_repeats);
     assert_eq!(decoding.lengths.as_deref(), Some("frame_lengths"));
+    let lengths_role = decoding
+        .lengths
+        .as_deref()
+        .expect("padded CTC lengths role");
+    let lengths_output = &profile.outputs[lengths_role];
+    let padding = &metadata
+        .pipeline
+        .as_ref()
+        .expect("pipeline")
+        .workflow
+        .outputs["logits"]
+        .contract
+        .padding[0];
+    assert_eq!(
+        lengths_output, &padding.valid_lengths,
+        "CTC decoding and the padded time axis use one length source"
+    );
     let vocabulary = decoding.vocabulary.as_ref().expect("vocabulary");
     assert_eq!(vocabulary.source, "tokenizer");
     assert_eq!(vocabulary.size, Some(32));
@@ -475,24 +493,84 @@ profiles:
 }
 
 #[test]
-fn ctc_profile_without_lengths_binding_is_accepted() {
-    let document = r#"
-profiles:
-  transcription:
-    kind: transcription
-    version: "1.0"
-    outputs: { logits: logits }
-    decoding:
-      kind: ctc
-      blank_id: 0
-      time_axis: 1
-      class_axis: 2
-"#;
-    let reported = errors(document);
+fn padded_ctc_without_lengths_binding_is_rejected() {
+    let document = CTC_ASR_DOCUMENT.replace("      lengths: frame_lengths\n", "");
+    let reported = errors(&document);
     assert!(
-        !reported
-            .iter()
-            .any(|error| error.contains("decoding.lengths")),
+        reported.iter().any(|error| error.contains(
+            "profiles.transcription.decoding.lengths is required because workflow output \
+             'logits' pads decoded time axis 1 ('frames') with valid_lengths 'frame_lengths'"
+        )),
         "{reported:?}"
     );
+}
+
+#[test]
+fn padded_ctc_cannot_bind_a_different_length_source() {
+    let document =
+        CTC_ASR_DOCUMENT.replace("      lengths: frame_lengths", "      lengths: logits");
+    let reported = errors(&document);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "decoding.lengths role 'logits' binds workflow output 'logits', but workflow output \
+             'logits' pads decoded time axis 1 ('frames') with valid_lengths 'frame_lengths'"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn padded_ctc_length_companion_must_be_int64_at_the_time_prefix_rank() {
+    let wrong_dtype = CTC_ASR_DOCUMENT.replace(
+        "      frame_lengths:\n        contract:\n          dtype: int64",
+        "      frame_lengths:\n        contract:\n          dtype: float32",
+    );
+    let reported = errors(&wrong_dtype);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "workflow output 'logits' valid_lengths 'frame_lengths' is float32 but must be int64"
+        )),
+        "{reported:?}"
+    );
+
+    let wrong_rank = CTC_ASR_DOCUMENT.replace(
+        "          rank: 1\n          shape: [batch]\n          batch_layout: { kind: shared }",
+        "          rank: 2\n          shape: [batch, extra]\n          batch_layout: { kind: shared }",
+    );
+    let reported = errors(&wrong_rank);
+    assert!(
+        reported.iter().any(|error| error.contains(
+            "workflow output 'logits' valid_lengths 'frame_lengths' has rank 2 but dimension \
+             'frames' is axis 1, so it must have rank 1"
+        )),
+        "{reported:?}"
+    );
+}
+
+#[test]
+fn unpadded_ctc_needs_no_lengths_binding() {
+    let document = CTC_ASR_DOCUMENT
+        .replace(
+            "          padding: [{ dimension: frames, valid_lengths: frame_lengths }]\n",
+            "",
+        )
+        .replace("      lengths: frame_lengths\n", "");
+    validate_metadata(&parse(&document)).expect("an unpadded CTC time axis needs no lengths");
+}
+
+#[test]
+fn padding_a_non_time_dimension_does_not_require_ctc_lengths() {
+    let document = CTC_ASR_DOCUMENT
+        .replace(
+            "padding: [{ dimension: frames, valid_lengths: frame_lengths }]",
+            "padding: [{ dimension: vocab, valid_lengths: vocab_lengths }]",
+        )
+        .replace("frame_lengths", "vocab_lengths")
+        .replace(
+            "          rank: 1\n          shape: [batch]\n          batch_layout: { kind: shared }",
+            "          rank: 2\n          shape: [batch, frames]\n          batch_layout: { kind: shared }",
+        )
+        .replace("      lengths: vocab_lengths\n", "");
+    validate_metadata(&parse(&document))
+        .expect("padding outside the decoded time axis does not require frame lengths");
 }

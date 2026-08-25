@@ -882,7 +882,14 @@ declared on its own dimension and they never compete for one.
   (in `validate_compaction_derivability`,
   `crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
   padded output hears from both rules, which is correct — they answer different
-  questions. The exclusion is keyed on `padding` being non-empty rather than on
+  questions. For CTC, padding the logits dimension selected by
+  `decoding.time_axis` also requires `decoding.lengths`. That field names a
+  profile output role, and the role **MUST** map to the exact workflow output
+  named by the padding entry's `valid_lengths`; a missing or different source is
+  rejected. The generic padding rules above supply the companion's `int64`
+  dtype, `shared` layout, and outer-prefix rank and shape. Unpadded logits, or
+  padding only outside `time_axis`, need no CTC lengths binding. The exclusion
+  is keyed on `padding` being non-empty rather than on
   the layout, because a packed value may legally pad: the no-double-spelling rule
   in [§10.6](#106-packed-companions-must-validate) forbids a `padding` entry only
   on the dimension the layout *packs*. Scoping it to layouts with a request axis
@@ -2367,6 +2374,42 @@ profiles:
       class_axis: 2
       lengths: frame_lengths
 ```
+
+If the workflow `logits` contract pads the dimension selected by `time_axis`,
+its padding entry names the one authoritative frame-count output:
+
+```yaml
+pipeline:
+  workflow:
+    outputs:
+      logits:
+        contract:
+          shape: [batch, frames, vocab]
+          padding:
+            - { dimension: frames, valid_lengths: frame_lengths }
+      frame_lengths:
+        contract:
+          dtype: int64
+          rank: 1
+          shape: [batch]
+          batch_layout: { kind: shared }
+profiles:
+  transcription:
+    outputs:
+      logits: logits
+      frame_lengths: frame_lengths
+    decoding:
+      kind: ctc
+      time_axis: 1
+      class_axis: 2
+      lengths: frame_lengths
+```
+
+`decoding.lengths` is a profile role, not a second tensor name: resolving it
+through `profiles.transcription.outputs` must yield the exact
+`padding.valid_lengths` workflow output. This prevents padded frames from being
+decoded and prevents two contradictory length sources. Unpadded CTC remains
+valid without `decoding.lengths`.
 
 Embedding, reranking, classification, reward scoring, detection, and ordinary
 encoder inference are the same one-pass shape: preprocess if needed, invoke one

@@ -284,6 +284,8 @@ The metadata crate currently rejects:
 - a free input dimension with neither packing, padding, nor uniformity;
 - an invalid packed axis or more than two ownership levels;
 - missing, aliased, mis-typed, mis-ranked, or inconsistently shaped companions;
+- missing or contradictory CTC frame lengths when logits pad the decoded time
+  axis (the decoder role must resolve to that padding entry's exact companion);
 - a packed axis that is also padded;
 - a padded dimension with two validity truths;
 - a packed output level with missing or contradictory `extent`;
@@ -302,8 +304,8 @@ tensor extents require invocation-time runtime code and are not implemented.
 | --- | --- |
 | Schema and JSON schema | Implemented: v1.1 `batch_capacity`, `padding`, ownership levels, `extent`, and vision/audio companion roles |
 | Parser and migrations | Implemented: version gate, flat packed migration, and retired batching-hint errors |
-| Semantic validator | Implemented: structural rules listed above |
-| Metadata tests | Implemented for dense padding, one/two-level packing, video declarations, budgets, extents, serving companions, and modality-neutral audio/text renamings |
+| Semantic validator | Implemented: structural rules listed above, including exact padded-CTC length binding |
+| Metadata tests | Implemented for dense padding, one/two-level packing, video declarations, budgets, extents, serving companions, padded and unpadded CTC decoding, and modality-neutral audio/text renamings |
 | Image preprocessing schema | Implemented |
 | Video preprocessing schema | Implemented with the shared vision program and `sample_frames`/`pad_frames` vocabulary |
 | Audio preprocessing schema | Implemented |
