@@ -2395,6 +2395,26 @@ time. That figure is now stale; the re-measurement replaces it.
 > study of t=16 with launch distributions and a pre-registered A/A threshold is
 > the next action. Full record:
 > [`docs/benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md`](../benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md).
+>
+> **2026-08-24 — the width-16 straggler is a lane property, not a chunk
+> property.** Using the chunk-permutation knob (#2030) and the arm observable
+> (#2041), 832 trusted samples across three datasets on a quiet host. The
+> pre-registered primary rule returns NEITHER in all three: no single index
+> dominates in either frame. But the lane frame is significantly non-uniform in
+> every dataset (chi-square p<0.0001, three replications) while the chunk frame
+> never is (p=0.78/0.87/0.57) — pooling in the lane frame preserves the
+> structure, pooling in the chunk frame destroys it. An arm-set defect found
+> mid-analysis (all-even rotations make odd-lane and odd-chunk the same claim)
+> was fixed with odd-`k` arms, which settle it: odd lane p=0.00018, odd chunk
+> p=0.99989. The victim is core-anchored, drawn from a biased distribution over
+> lanes (concentrated in the first 32 MiB L3 and on cpus = 2 mod 4), not fixed
+> to one. Within a process it holds a median 74.8% of last-arrivals, 11.2x
+> chance. This retires the whole data-property class (cache colouring, page
+> interleave, NUMA placement of the weight range) as the selector — the 8th
+> rejection and the first to close a class rather than a candidate. Remaining
+> limit: placement is one map, so lane and cpu are still the same claim; the
+> analogous lane->cpu permutation is the next instrument. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md`](../benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md).
 
 Full record for the acc4 table above:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).

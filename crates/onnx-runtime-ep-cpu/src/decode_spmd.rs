@@ -1623,6 +1623,18 @@ impl ChunkPermutation {
     fn is_identity(self) -> bool {
         matches!(self, Self::Identity)
     }
+
+    /// How this permutation prints in the benchmark width line.
+    ///
+    /// Round-trips through [`chunk_permutation_from_raw`], so a harness can feed
+    /// the reported label back in and get the same permutation.
+    pub fn label(self) -> String {
+        match self {
+            Self::Identity => "identity".to_string(),
+            Self::Rotate(k) => format!("rotate:{k}"),
+            Self::Seed(n) => format!("seed:{n}"),
+        }
+    }
 }
 
 fn chunk_permutation_from_raw(raw: Option<&str>) -> ChunkPermutation {
@@ -2103,6 +2115,18 @@ impl SpmdDecodePools {
     /// See [`Self::planned_placement_is_one_worker_per_physical_core`].
     pub fn worker_cpus(&self) -> &[Option<usize>] {
         &self.worker_cpus
+    }
+
+    /// The lane->chunk permutation this pool was **built with**.
+    ///
+    /// Read from the pool's own field rather than from the environment on
+    /// purpose: an env read would report what was *requested*, and the whole
+    /// reason this is reported at all is that a knob which is requested and not
+    /// honoured is the defect class of #1792 and #2014. Reporting the pool's
+    /// state makes "the binary ignored the knob" a visible disagreement between
+    /// the harness's env and this label, rather than an invisible one.
+    pub fn chunk_permutation(&self) -> ChunkPermutation {
+        self.chunk_permutation
     }
 
     /// The allowed CPU that the dispatcher reservation freed, if any.
@@ -3384,6 +3408,18 @@ impl DecodeWidth {
 /// chosen. A harness should run at least one decode step first and then assert;
 /// before that the fields read `None` / `"unresolved"` and
 /// [`DecodeWidth::is_as_requested`] is `false`.
+/// The lane->chunk permutation the **built pool** is using, if a pool exists.
+///
+/// `None` means no persistent pool was built, so there is no static assignment
+/// to permute and reporting one would be a claim about nothing. See
+/// [`CHUNK_PERMUTATION_ENV`] and [`SpmdDecodePools::chunk_permutation`].
+pub fn decode_chunk_permutation() -> Option<ChunkPermutation> {
+    match POOLS.get() {
+        Some(Some(pools)) => Some(pools.chunk_permutation()),
+        _ => None,
+    }
+}
+
 pub fn decode_width() -> DecodeWidth {
     let requested = REQUESTED_WIDTH.get().copied().flatten();
     let realized = match POOLS.get() {
@@ -6770,23 +6806,26 @@ mod tests {
         // then refuses, and the control skips -- on the *most common* way this
         // suite is run. A skip that is invisible and environment-triggered is
         // the same fail-open shape this change exists to remove.
+        //
+        // Selecting from the allowed set does not finish the job: a run bound
+        // to one sibling per core (`taskset -c 16,18,20,22`) has no shared core
+        // to build, so the control still returns green while testing nothing.
+        // `placement_cpus_or_fail_closed` separates that -- a binding artifact,
+        // which a lane declaring placement mandatory must fail on -- from a
+        // host with no SMT at all, where the layout is genuinely unrepresentable
+        // and a skip is the honest answer.
         let allowed: std::collections::BTreeSet<usize> = crate::decode_affinity::allowed_cpus()
             .unwrap_or_else(|| (0..cores.logical_count()).collect())
             .into_iter()
             .collect();
-        let shared = cores.cores().iter().find_map(|group| {
-            let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
-            match (inside.next(), inside.next()) {
-                (Some(first), Some(second)) => Some([first, second]),
-                _ => None,
-            }
-        });
+        let shared = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::SharedCore,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "actual-mask control",
+        );
         let Some(shared) = shared else {
-            eprintln!(
-                "skipping actual-mask control: no physical core has two SMT siblings inside \
-                 this process's allowed set {allowed:?}, so the bad layout is unrepresentable \
-                 here"
-            );
             return;
         };
         if !environment_can_pin(&shared) {
@@ -6834,14 +6873,20 @@ mod tests {
 
         // Positive arm: two genuinely distinct cores must not be reported as a
         // defect, otherwise the assertion above is satisfied by a predicate
-        // that is simply always false.
-        let distinct: Vec<usize> = cores
-            .cores()
-            .iter()
-            .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
-            .take(2)
-            .collect();
-        if distinct.len() < 2 || !environment_can_pin(&distinct) {
+        // that is simply always false. Same gate: a run bound to a single
+        // physical core cannot supply this arm, and in a lane that requires
+        // placement that is a defect in the lane, not a platform fact.
+        let distinct = crate::core_topology::placement_cpus_or_fail_closed(
+            crate::core_topology::PlacementLayout::DistinctCores,
+            cores,
+            &allowed,
+            crate::core_topology::placement_tests_required(),
+            "the positive arm of the actual-mask control",
+        );
+        let Some(distinct) = distinct else {
+            return;
+        };
+        if !environment_can_pin(&distinct) {
             eprintln!(
                 "skipping the positive arm of the actual-mask control: two distinct physical \
                  cores are not pinnable inside {allowed:?}"
@@ -7181,6 +7226,7 @@ mod tests {
         let n = 4096;
         let k = 512;
 
+        let label = pools.chunk_permutation().label();
         let map = pools.worker_row_segments(n);
         let claims: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
         let claims = &claims;
@@ -7205,14 +7251,15 @@ mod tests {
             .map(|&(start, len)| format!("{start}:{len}"))
             .collect();
         println!(
-            "CHUNK_PERM_REPORT map={} covered_once={} values_ok={} checksum={checksum:.6}",
+            "CHUNK_PERM_REPORT map={} covered_once={} values_ok={} checksum={checksum:.6} \
+             label={label}",
             rendered.join(","),
             usize::from(covered_once),
             usize::from(values_ok),
         );
     }
 
-    fn chunk_permutation_child_report(value: Option<&str>) -> (String, f64) {
+    fn chunk_permutation_child_report(value: Option<&str>) -> (String, f64, String) {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.arg("--exact")
             .arg("decode_spmd::tests::chunk_permutation_child")
@@ -7260,6 +7307,7 @@ mod tests {
         (
             field("map").to_string(),
             field("checksum").parse().expect("checksum"),
+            field("label").to_string(),
         )
     }
 
@@ -7274,10 +7322,23 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot spawn the child process this needs")]
     fn the_chunk_permutation_env_string_reaches_dispatch() {
-        let (default_map, default_sum) = chunk_permutation_child_report(None);
-        let (identity_map, identity_sum) = chunk_permutation_child_report(Some("identity"));
-        let (rotated_map, rotated_sum) = chunk_permutation_child_report(Some("rotate:3"));
-        let (seeded_map, seeded_sum) = chunk_permutation_child_report(Some("seed:7"));
+        let (default_map, default_sum, default_label) = chunk_permutation_child_report(None);
+        let (identity_map, identity_sum, identity_label) =
+            chunk_permutation_child_report(Some("identity"));
+        let (rotated_map, rotated_sum, rotated_label) =
+            chunk_permutation_child_report(Some("rotate:3"));
+        let (seeded_map, seeded_sum, seeded_label) = chunk_permutation_child_report(Some("seed:7"));
+
+        // The label the pool reports about itself is the observable a benchmark
+        // harness reads, so it has to agree with what was asked for -- otherwise
+        // an arm that silently ran the default would look like a valid arm.
+        assert_eq!(default_label, "identity", "unset must report `identity`");
+        assert_eq!(identity_label, "identity");
+        assert_eq!(
+            rotated_label, "rotate:3",
+            "the pool must report the rotation it built with"
+        );
+        assert_eq!(seeded_label, "seed:7");
 
         // Default is the identity, and `identity` spells the default.
         assert_eq!(
@@ -7352,6 +7413,29 @@ mod tests {
                 chunk_permutation_from_raw(raw),
                 want,
                 "chunk permutation for {raw:?}"
+            );
+        }
+    }
+
+    /// The reported label must round-trip back to the same permutation.
+    ///
+    /// The benchmark width line prints this label, and a harness that records an
+    /// arm by its label must be able to reproduce that arm from the record. A
+    /// label that did not parse back would make every published row unrepeatable.
+    #[test]
+    fn chunk_permutation_label_round_trips() {
+        for mode in [
+            ChunkPermutation::Identity,
+            ChunkPermutation::Rotate(0),
+            ChunkPermutation::Rotate(4),
+            ChunkPermutation::Seed(0),
+            ChunkPermutation::Seed(7),
+        ] {
+            let label = mode.label();
+            assert_eq!(
+                chunk_permutation_from_raw(Some(&label)),
+                mode,
+                "label {label:?} did not round-trip"
             );
         }
     }

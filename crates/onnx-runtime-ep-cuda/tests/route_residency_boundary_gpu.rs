@@ -48,16 +48,21 @@ use onnx_runtime_cuda_memory::virtual_memory::{PhysicalHandlePool, PhysicalLocat
 use onnx_runtime_cuda_memory::vmm_allocator::{
     CUDA_PHYSICAL_HANDLE_POOL_BYTES_ENV, CudaVmmAllocator,
 };
-use onnx_runtime_ep_api::{ExecutionProvider, ExpertWeightGroup, LazyWeightBoundary, Result};
+use onnx_runtime_ep_api::{
+    ExecutionProvider, ExpertWeightGroup, LazyWeightBoundary, Result, expert_weight_groups,
+};
 use onnx_runtime_ep_cuda::CudaExecutionProvider;
 use onnx_runtime_ep_cuda::coarse_residency::COARSE_RESIDENCY_ENABLE_ENV;
 use onnx_runtime_ep_cuda::kernels::expert_route_telemetry::{
     H_COUNT, H_DEVICE, H_EPOCH, H_OVERFLOW, H_POISON, H_REQUEST, HEADER_LEN, TelemetrySnapshot,
     cpu_bitmap,
 };
-use onnx_runtime_ep_cuda::route_residency::{RouteResidencyBoundary, RouteTelemetrySource};
-use onnx_runtime_ep_cuda::weight_paging::CudaWeightResidency;
-use onnx_runtime_ir::{DataType, NodeId, ValueId, WeightRef};
+use onnx_runtime_ep_cuda::route_residency::{
+    RouteResidencyBoundary, RouteResidencyInstallOutcome, RouteTelemetrySource,
+    build_route_residency_boundary,
+};
+use onnx_runtime_ep_cuda::weight_paging::{CudaWeightResidency, DeviceOffloadPolicy};
+use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
 use onnx_runtime_loader::{
     ExpertQuantization, ExpertStorageOrder, ExpertTensorLayout, WeightRegionCatalog,
 };
@@ -1011,4 +1016,574 @@ fn boundary_injected_fault_rolls_back_through_caller() {
         assert_eq!(*pattern, got, "expert {i} content changed despite rollback");
     }
     println!("driver-fault transition rolled back through the caller, content preserved ✓");
+}
+
+// ===========================================================================
+// #1810 Slice 7D — production *binding* construction/installation.
+//
+// Slice 7C (above) drove an already-installed `RouteResidencyBoundary` through
+// the production request caller. Slice 7D constructs that binding by
+// property-based discovery over a *loaded model graph's* expert banks and
+// installs it through the real CUDA-EP install seam
+// (`CudaExecutionProvider::try_install_route_residency_binding`), so the merged
+// live caller has a production binding when the feature is enabled.
+//
+// These tests never call `build_route_residency_boundary`'s inner helper
+// directly for the reachability proof: they build a shape-faithful QMoE graph,
+// let discovery find the bank identities, install through the EP, then drive
+// the same trait method the executor calls — asserting the binding is actually
+// installed (via `route_residency_diagnostics().installs()`) and fires.
+// ===========================================================================
+
+/// A `u8` initializer-backed weight value (an expert bank tensor).
+fn inline_bank_initializer(graph: &mut Graph, name: &str) -> ValueId {
+    let value = graph.create_named_value(name, DataType::Uint8, static_shape([4]));
+    graph.set_initializer(
+        value,
+        WeightRef::Inline(TensorData::from_raw(DataType::Uint8, vec![4], vec![0u8; 4])),
+    );
+    value
+}
+
+/// A shape-faithful `com.microsoft::QMoE` node whose only initializer-backed
+/// inputs are two expert weight banks (fc1/fc2). Property-based discovery
+/// (`expert_weight_groups`) must therefore yield exactly one group with those
+/// two members, in input order — the identities the production builder binds.
+/// The hidden-state and router-probs inputs are graph values, not initializers,
+/// so they are never mistaken for banks.
+fn two_bank_qmoe_graph() -> (Graph, NodeId, ValueId, ValueId) {
+    let mut graph = Graph::new();
+    let hidden = graph.create_named_value("hidden", DataType::Float32, static_shape([4]));
+    let router = graph.create_named_value("router_probs", DataType::Float32, static_shape([4]));
+    let fc1 = inline_bank_initializer(&mut graph, "fc1_experts_weights");
+    let fc2 = inline_bank_initializer(&mut graph, "fc2_experts_weights");
+    let output = graph.create_named_value("output", DataType::Float32, static_shape([4]));
+    let mut node = onnx_runtime_ir::Node::new(
+        NodeId(0),
+        "QMoE",
+        vec![Some(hidden), Some(router), Some(fc1), Some(fc2)],
+        vec![output],
+    );
+    node.domain = "com.microsoft".to_string();
+    let node_id = graph.insert_node(node);
+    (graph, node_id, fc1, fc2)
+}
+
+/// A dense-only graph (a single `MatMul`): property-based discovery finds no
+/// routed expert group, so a binding attempt must fail-closed.
+fn dense_only_graph() -> Graph {
+    let mut graph = Graph::new();
+    let w = inline_bank_initializer(&mut graph, "dense_weight");
+    let x = graph.create_named_value("x", DataType::Float32, static_shape([4]));
+    let y = graph.create_named_value("y", DataType::Float32, static_shape([4]));
+    graph.insert_node(onnx_runtime_ir::Node::new(
+        NodeId(0),
+        "MatMul",
+        vec![Some(x), Some(w)],
+        vec![y],
+    ));
+    graph
+}
+
+/// Build the two committed bank allocators + aligned catalogs + a producer
+/// window source keyed by the *discovered* member/node identities, so the maps
+/// the builder consumes are addressed exactly as production would key them.
+#[allow(clippy::type_complexity)]
+fn wire_two_bank_artifacts(
+    provider: &CudaExecutionProvider,
+    node: NodeId,
+    fc1: ValueId,
+    fc2: ValueId,
+    n_experts: usize,
+    gran: usize,
+    pool_bytes: usize,
+    governor: &'static LedgerGovernor,
+    request: u32,
+    holder_base: u64,
+) -> (
+    HashMap<ValueId, WeightRegionCatalog>,
+    HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
+    Arc<WindowSource>,
+    (u64, u64),
+) {
+    let runtime = provider.runtime();
+    let total_bytes = n_experts * gran;
+    let (allocator_fc1, base_fc1) = build_precommitted_allocator(
+        provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(holder_base),
+    );
+    let (allocator_fc2, base_fc2) = build_precommitted_allocator(
+        provider,
+        n_experts,
+        gran,
+        pool_bytes,
+        governor,
+        HolderId::new(holder_base + 1),
+    );
+    let pat_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    let pat_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 91) & 0xFF) as u8).collect();
+    unsafe {
+        runtime.htod(&pat_fc1, base_fc1).expect("htod fc1");
+        runtime.htod(&pat_fc2, base_fc2).expect("htod fc2");
+    }
+
+    let mut catalogs = HashMap::new();
+    catalogs.insert(fc1, make_aligned_catalog(n_experts, gran, 0));
+    catalogs.insert(fc2, make_aligned_catalog(n_experts, gran, total_bytes));
+    let mut allocators: HashMap<ValueId, Arc<CudaVmmAllocator>> = HashMap::new();
+    allocators.insert(fc1, Arc::clone(&allocator_fc1));
+    allocators.insert(fc2, Arc::clone(&allocator_fc2));
+
+    let source = WindowSource::with_window(window_snapshot(
+        &[&[0, 2], &[2, 3], &[5, 0], &[3, 5]],
+        n_experts,
+        1,
+        request,
+        runtime.ordinal(),
+    ));
+    let mut sources: HashMap<NodeId, Arc<dyn RouteTelemetrySource>> = HashMap::new();
+    sources.insert(node, Arc::clone(&source) as Arc<dyn RouteTelemetrySource>);
+
+    (catalogs, allocators, sources, source, (base_fc1, base_fc2))
+}
+
+// ---------------------------------------------------------------------------
+// Slice 7D Test 1: the production builder assembles a *firing* binding purely
+// from graph-property discovery. Build a shape-faithful two-bank QMoE graph,
+// let `expert_weight_groups` discover the bank identities, construct the
+// binding with `build_route_residency_boundary`, install it through the EP, and
+// drive the executor's trait method: the routed union transitions both
+// discovered members atomically, the window advances once, the next boundary is
+// empty, and draining removes the binding so no further boundary work occurs.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn builder_assembles_firing_binding_from_graph_banks() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== builder_assembles_firing_binding_from_graph_banks ===");
+    let provider = match provider_or_skip("builder") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+    let gran = match gran_or_skip() {
+        Some(g) => g,
+        None => return,
+    };
+
+    let n_experts = 8_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+
+    // Property-based discovery is the sole source of bank identity/membership.
+    let (graph, node, fc1, fc2) = two_bank_qmoe_graph();
+    let discovered = expert_weight_groups(&graph);
+    assert_eq!(discovered.len(), 1, "one QMoE node -> one bindable group");
+    assert_eq!(
+        discovered[0].members,
+        vec![fc1, fc2],
+        "discovery yields the exact fc1/fc2 bank members in input order"
+    );
+
+    let request = 11_u32;
+    let (catalogs, allocators, sources, source, (base_fc1, base_fc2)) = wire_two_bank_artifacts(
+        &provider, node, fc1, fc2, n_experts, gran, pool_bytes, governor, request, 150,
+    );
+    let pat_fc1: Vec<u8> = (0..total_bytes).map(|j| (j & 0xFF) as u8).collect();
+    let pat_fc2: Vec<u8> = (0..total_bytes).map(|j| ((j + 91) & 0xFF) as u8).collect();
+    let residency = Arc::new(CudaWeightResidency::new(
+        Arc::clone(runtime),
+        pool_bytes as u64,
+    ));
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // The production builder: no op/name allowlist — it consumes the discovered
+    // group and the EP's existing catalog/allocator/pool authorities.
+    let binding = build_route_residency_boundary(
+        &graph,
+        Arc::clone(&residency),
+        &sources,
+        catalogs,
+        allocators,
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        1,
+        0,
+        request,
+        runtime.ordinal(),
+        1,
+    )
+    .expect("builder must assemble a binding from a valid two-bank graph");
+    assert_eq!(
+        binding.bank_value_count(),
+        2,
+        "binding covers exactly the two discovered banks"
+    );
+    provider.install_route_residency_boundary(Arc::new(binding));
+
+    gate_on();
+    // Boundary 1: the discovered banks transition atomically to the routed set.
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("boundary 1 Ok");
+    let diag = provider.route_residency_diagnostics();
+    assert_eq!(diag.applied(), 1, "the routed union is applied once");
+    assert_eq!(source.snapshot_calls(), 1, "one snapshot per boundary");
+    assert_eq!(source.reset_calls(), 1, "consumed window advanced once");
+
+    // Boundary 2: the window advanced, so the next boundary is empty.
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("boundary 2 Ok");
+    assert_eq!(diag.empty(), 1, "next window empty after the reset");
+    assert_eq!(source.snapshot_calls(), 2);
+    assert_eq!(source.reset_calls(), 1, "empty window does not reset again");
+    gate_off();
+
+    // Both discovered banks' bytes survive (stable VA preserved). Read back
+    // while the binding — the sole owner of the bank allocators — is still
+    // installed, so the arena's stable VA is still mapped.
+    let mut got_fc1 = vec![0u8; total_bytes];
+    let mut got_fc2 = vec![0u8; total_bytes];
+    unsafe {
+        runtime.dtoh(&mut got_fc1, base_fc1).expect("dtoh fc1");
+        runtime.dtoh(&mut got_fc2, base_fc2).expect("dtoh fc2");
+    }
+    assert_eq!(pat_fc1, got_fc1, "fc1 content corrupted");
+    assert_eq!(pat_fc2, got_fc2, "fc2 content corrupted");
+
+    // Draining removes the binding: the consumer is inert again.
+    gate_on();
+    provider.drain_route_residency_boundary();
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("drained boundary Ok");
+    assert_eq!(
+        source.snapshot_calls(),
+        2,
+        "a drained binding is not snapshotted"
+    );
+    gate_off();
+    println!("builder assembled a firing binding from graph discovery, drained clean ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Slice 7D Test 2: the real EP install seam fail-closes and installs *nothing*
+// when it is not a valid binding authority. On a default provider (no
+// coarse-residency authority) `try_install_route_residency_binding` returns
+// `OffloadDisabled` with the gate on and `GateDisabled` with the gate off; both
+// record a decline and leave the boundary consumer inert (no binding to drive).
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn try_install_fail_closed_installs_nothing() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== try_install_fail_closed_installs_nothing ===");
+    let provider = match provider_or_skip("decline") {
+        Some(p) => p,
+        None => return,
+    };
+    let gran = match gran_or_skip() {
+        Some(g) => g,
+        None => return,
+    };
+    let n_experts = 8_usize;
+    let pool_bytes = n_experts * gran * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+    let (graph, node, _fc1, _fc2) = two_bank_qmoe_graph();
+    let mut sources: HashMap<NodeId, Arc<dyn RouteTelemetrySource>> = HashMap::new();
+    sources.insert(
+        node,
+        WindowSource::with_window(window_snapshot(&[&[0]], n_experts, 1, 5, 0))
+            as Arc<dyn RouteTelemetrySource>,
+    );
+    let diag = provider.route_residency_diagnostics();
+
+    // Gate on, but this EP has no coarse-residency authority -> OffloadDisabled.
+    gate_on();
+    let outcome = provider.try_install_route_residency_binding(
+        &graph,
+        &sources,
+        HashMap::new(),
+        HashMap::new(),
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        5,
+        1,
+    );
+    assert_eq!(outcome, RouteResidencyInstallOutcome::OffloadDisabled);
+    assert_eq!(diag.declines(), 1, "offload-disabled decline recorded");
+    // Nothing installed: a gate-on boundary runs no consumer.
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("no-binding boundary Ok");
+    assert_eq!(diag.boundaries(), 0, "no binding was installed");
+
+    // Gate off -> GateDisabled before any discovery/allocation.
+    gate_off();
+    let outcome = provider.try_install_route_residency_binding(
+        &graph,
+        &sources,
+        HashMap::new(),
+        HashMap::new(),
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        5,
+        1,
+    );
+    assert_eq!(outcome, RouteResidencyInstallOutcome::GateDisabled);
+    assert_eq!(diag.declines(), 2, "gate-disabled decline recorded");
+    assert_eq!(diag.installs(), 0, "no binding ever installed");
+    println!("try_install fail-closed to no binding on a non-authority EP ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Slice 7D Test 3: the real EP install seam on a coarse-residency authority
+// (offload-enabled provider). A dense-only graph is a typed `Rejected`
+// (`NoExpertGroups`) that installs nothing; a valid two-bank graph is
+// `Installed`, is counted in diagnostics, and fires through the production
+// caller. Proves the *installed* binding — not a direct helper — drives the
+// transition, then drains clean.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn try_install_on_offload_authority_installs_and_fires() {
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== try_install_on_offload_authority_installs_and_fires ===");
+    let gran = match gran_or_skip() {
+        Some(g) => g,
+        None => return,
+    };
+    let n_experts = 8_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+
+    let policy = DeviceOffloadPolicy {
+        enabled: true,
+        device_budget_bytes: Some(pool_bytes as u64),
+        ..DeviceOffloadPolicy::default()
+    };
+    let provider = match CudaExecutionProvider::new_with_offload_policy(0, policy) {
+        Ok(p) => p,
+        Err(e) => {
+            println!("SKIP [offload]: cannot build offload-enabled EP: {e}");
+            return;
+        }
+    };
+    let runtime = provider.runtime();
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+    let diag = provider.route_residency_diagnostics();
+
+    // A dense-only graph is a typed reject that installs nothing.
+    let dense = dense_only_graph();
+    let empty_sources: HashMap<NodeId, Arc<dyn RouteTelemetrySource>> = HashMap::new();
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+    gate_on();
+    let rejected = provider.try_install_route_residency_binding(
+        &dense,
+        &empty_sources,
+        HashMap::new(),
+        HashMap::new(),
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        13,
+        1,
+    );
+    assert!(
+        matches!(rejected, RouteResidencyInstallOutcome::Rejected(_)),
+        "dense-only graph must be a typed reject, got {rejected:?}"
+    );
+    assert_eq!(diag.installs(), 0, "reject installs nothing");
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("post-reject boundary Ok");
+    assert_eq!(diag.boundaries(), 0, "no binding installed after reject");
+
+    // A valid two-bank graph installs a real binding through the EP seam.
+    let (graph, node, fc1, fc2) = two_bank_qmoe_graph();
+    let request = 13_u32;
+    let (catalogs, allocators, sources, source, _) = wire_two_bank_artifacts(
+        &provider, node, fc1, fc2, n_experts, gran, pool_bytes, governor, request, 160,
+    );
+    let installed = provider.try_install_route_residency_binding(
+        &graph,
+        &sources,
+        catalogs,
+        allocators,
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        request,
+        1,
+    );
+    assert_eq!(
+        installed,
+        RouteResidencyInstallOutcome::Installed { banks: 2 },
+        "valid graph installs a two-bank binding through the EP seam"
+    );
+    assert_eq!(diag.installs(), 1, "one binding installed");
+
+    // The *installed* binding fires through the executor's trait method.
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("installed boundary Ok");
+    assert_eq!(diag.applied(), 1, "the installed binding applied a hot-set");
+    assert_eq!(
+        source.snapshot_calls(),
+        1,
+        "installed binding was snapshotted"
+    );
+    assert_eq!(
+        source.reset_calls(),
+        1,
+        "installed binding advanced its window"
+    );
+
+    // Teardown drains the binding (mirrors `shutdown`).
+    provider.drain_route_residency_boundary();
+    provider
+        .consume_route_residency_at_boundary()
+        .expect("drained boundary Ok");
+    assert_eq!(
+        source.snapshot_calls(),
+        1,
+        "drained binding not snapshotted"
+    );
+    gate_off();
+    let _ = runtime;
+    println!("try_install installed a firing binding on the offload EP, drained clean ✓");
+}
+
+// ---------------------------------------------------------------------------
+// Slice 7D Test 4: coarse host-overhead of the per-boundary hook, gate ON vs
+// OFF, on the steady-state empty-window path (no transition). This is a host-
+// only micro-measurement of the boundary caller — NOT a full-model or tok/s
+// claim. Serial on an idle GPU; warm up, then take the median of n>=5 samples.
+// The disabled path is a single env read; the enabled empty path adds only the
+// safe-point check + a snapshot that returns `None`.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires idle CUDA device; CUDA_VISIBLE_DEVICES=<idle> --ignored"]
+fn boundary_host_overhead_on_vs_off() {
+    use std::time::Instant;
+
+    let _guard = GPU_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    println!("\n=== boundary_host_overhead_on_vs_off ===");
+    if ambient_gate_is_on() {
+        println!("SKIP: {COARSE_RESIDENCY_ENABLE_ENV} is truthy in the ambient env");
+        return;
+    }
+    let provider = match provider_or_skip("overhead") {
+        Some(p) => p,
+        None => return,
+    };
+    let runtime = provider.runtime();
+    let gran = match gran_or_skip() {
+        Some(g) => g,
+        None => return,
+    };
+    let n_experts = 8_usize;
+    let total_bytes = n_experts * gran;
+    let pool_bytes = total_bytes * 8;
+    let governor = make_governor(pool_bytes as u64, pool_bytes as u64);
+    let (graph, node, fc1, fc2) = two_bank_qmoe_graph();
+    let (catalogs, allocators, sources, source, _) = wire_two_bank_artifacts(
+        &provider, node, fc1, fc2, n_experts, gran, pool_bytes, governor, 21, 170,
+    );
+    // Drain the single armed window so every measured boundary takes the
+    // steady-state *empty* path (safe-point check + snapshot -> None).
+    source
+        .reset_route_telemetry_boundary()
+        .expect("drain window");
+    let residency = Arc::new(CudaWeightResidency::new(
+        Arc::clone(runtime),
+        pool_bytes as u64,
+    ));
+    let pools = match make_pools(&provider, pool_bytes, governor) {
+        Some(p) => p,
+        None => return,
+    };
+    let binding = build_route_residency_boundary(
+        &graph,
+        residency,
+        &sources,
+        catalogs,
+        allocators,
+        Arc::clone(&pools.device_pool),
+        Arc::clone(&pools.host_pool),
+        1,
+        0,
+        21,
+        runtime.ordinal(),
+        1,
+    )
+    .expect("binding");
+    provider.install_route_residency_boundary(Arc::new(binding));
+
+    let sample = |gate_enabled: bool| -> f64 {
+        if gate_enabled {
+            gate_on();
+        } else {
+            gate_off();
+        }
+        // Warm up (clock ramp) before timing.
+        for _ in 0..64 {
+            provider
+                .consume_route_residency_at_boundary()
+                .expect("warm");
+        }
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let iters = 1000u32;
+            let start = Instant::now();
+            for _ in 0..iters {
+                provider
+                    .consume_route_residency_at_boundary()
+                    .expect("timed");
+            }
+            samples.push(start.elapsed().as_nanos() as f64 / f64::from(iters));
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        samples[samples.len() / 2]
+    };
+
+    let off_ns = sample(false);
+    let on_ns = sample(true);
+    gate_off();
+    // The empty path must never have consumed/advanced the window.
+    assert_eq!(
+        source.reset_calls(),
+        1,
+        "overhead sampling must stay on the empty path (no extra reset)"
+    );
+    let delta_us = (on_ns - off_ns).max(0.0) / 1000.0;
+    println!(
+        "boundary host overhead: OFF median {off_ns:.0} ns, ON median {on_ns:.0} ns, delta {delta_us:.3} us/boundary (host-only, empty-window path; no full-model claim)"
+    );
+    // Coarse non-flaky guard against a gross host regression; the design intent
+    // is <= ~2 us/boundary, reported above for the record.
+    assert!(
+        delta_us <= 50.0,
+        "per-boundary host overhead {delta_us:.3} us exceeds the coarse guard"
+    );
+    println!("boundary host overhead measured ON vs OFF ✓");
 }

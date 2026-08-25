@@ -98,9 +98,9 @@ use onnx_runtime_cuda_memory::virtual_memory::PhysicalHandlePool;
 use onnx_runtime_cuda_memory::vmm_allocator::CudaVmmAllocator;
 use onnx_runtime_ep_api::{
     ExpertWeightGroup, LazyWeightBoundary, ResidencyPlan, Result, StaticProfileResidencyPolicy,
-    plan_residency,
+    expert_weight_groups, plan_residency,
 };
-use onnx_runtime_ir::ValueId;
+use onnx_runtime_ir::{Graph, NodeId, ValueId};
 use onnx_runtime_loader::WeightRegionCatalog;
 
 use crate::coarse_residency::{BoundaryApplicationOutcome, coarse_residency_profile_enabled};
@@ -434,8 +434,10 @@ pub trait RouteTelemetrySource: Send + Sync {
 /// field is a handle to an existing authority (the residency is the EP's own
 /// [`CudaWeightResidency`], the source is a live `QMoEKernel`). It is installed
 /// on the CUDA EP via `CudaExecutionProvider::install_route_residency_boundary`.
-/// Production wiring that constructs one from a live session's expert banks is a
-/// later slice, so today it is populated only by the Slice-7C GPU tests.
+/// [`build_route_residency_boundary`] constructs one by property-based
+/// discovery over a loaded graph's expert banks; the CUDA EP calls it through
+/// `CudaExecutionProvider::try_install_route_residency_binding` after weights
+/// are loaded and before decode capture.
 pub struct RouteResidencyBoundary {
     source: Arc<dyn RouteTelemetrySource>,
     residency: Arc<CudaWeightResidency>,
@@ -500,9 +502,175 @@ impl RouteResidencyBoundary {
         self.expected_epoch.load(Ordering::Relaxed)
     }
 
+    /// Number of bank values this binding covers (for install diagnostics).
+    pub fn bank_value_count(&self) -> usize {
+        self.bank_values.len()
+    }
+
     fn advance_epoch(&self) {
         self.expected_epoch.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Why a production route-residency binding could not be constructed from a
+/// loaded graph. Every variant is fail-closed: the EP installs *nothing* and
+/// ordinary inference is untouched. There is no silent partial binding — the
+/// reason is carried so diagnostics can surface exactly what was missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteResidencyBindingReject {
+    /// Property-based discovery found no routed expert group (no QMoE/
+    /// BlockQuantizedMoE node with initializer-backed weight inputs). Dense-only
+    /// or non-MoE graphs land here; there is nothing to tier.
+    NoExpertGroups,
+    /// More than one routed expert group was discovered. The single-binding
+    /// install authority (one producer window source per EP/request/device)
+    /// cannot yet cover multiple banks, so binding is refused rather than
+    /// silently covering only one. Multi-bank binding is a later slice.
+    MultipleBanksUnsupported { groups: usize },
+    /// The discovered group's node has no armed route-telemetry producer source
+    /// (its kernel never surfaced a window source to the EP). Without a producer
+    /// there is no window to consume, so no binding is installed.
+    NoTelemetrySource { node: NodeId },
+    /// A group member weight has no region catalog — it was not classified/
+    /// loaded, so the boundary consumer could not map its regions.
+    MissingCatalog { value: ValueId },
+    /// A group member weight has no backing VMM allocator — it was not paged/
+    /// committed, so the boundary consumer had no allocator to tier against.
+    MissingAllocator { value: ValueId },
+}
+
+impl RouteResidencyBindingReject {
+    /// A stable human reason for diagnostics/decision surfaces.
+    pub fn reason(&self) -> String {
+        match self {
+            RouteResidencyBindingReject::NoExpertGroups => {
+                "no routed expert group discovered".to_string()
+            }
+            RouteResidencyBindingReject::MultipleBanksUnsupported { groups } => {
+                format!("{groups} expert groups; single-binding authority covers one bank")
+            }
+            RouteResidencyBindingReject::NoTelemetrySource { node } => {
+                format!("expert group node {node:?} has no armed telemetry source")
+            }
+            RouteResidencyBindingReject::MissingCatalog { value } => {
+                format!("bank value {value:?} has no region catalog")
+            }
+            RouteResidencyBindingReject::MissingAllocator { value } => {
+                format!("bank value {value:?} has no VMM allocator")
+            }
+        }
+    }
+}
+
+/// The outcome of a CUDA-EP attempt to install a production route-residency
+/// binding. Only [`Installed`](Self::Installed) creates any boundary state; the
+/// other three variants install nothing and add no overhead — the shipped
+/// default-off path always lands on [`GateDisabled`](Self::GateDisabled).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteResidencyInstallOutcome {
+    /// The default-off coarse-residency gate is disabled (the shipped default).
+    /// Nothing is discovered, built, or installed.
+    GateDisabled,
+    /// The gate is on but this EP has no weight-offload/coarse-residency
+    /// authority (no `CudaWeightResidency`), so there is nothing to tier
+    /// against. Nothing is installed.
+    OffloadDisabled,
+    /// The gate is on and residency is present, but property-based binding
+    /// fail-closed with a typed reason. Nothing is installed.
+    Rejected(RouteResidencyBindingReject),
+    /// A real binding was installed over `banks` bank values.
+    Installed { banks: usize },
+}
+
+/// Property-based validation of a bindable expert bank against the artifacts an
+/// install would supply, with no GPU handles required (so it is unit-testable).
+///
+/// Uses the typed [`expert_weight_groups`] discovery (via
+/// [`LazyWeightBoundary::for_op`], never op/name allowlists) and fail-closes on
+/// the exact reason nothing can be bound. `has_source`/`has_catalog`/
+/// `has_allocator` are membership predicates over the maps the real builder
+/// holds, so the pure classification here matches what
+/// [`build_route_residency_boundary`] would construct.
+pub(crate) fn validate_route_residency_binding(
+    graph: &Graph,
+    has_source: impl Fn(NodeId) -> bool,
+    has_catalog: impl Fn(ValueId) -> bool,
+    has_allocator: impl Fn(ValueId) -> bool,
+) -> std::result::Result<ExpertWeightGroup, RouteResidencyBindingReject> {
+    let mut groups = expert_weight_groups(graph);
+    if groups.is_empty() {
+        return Err(RouteResidencyBindingReject::NoExpertGroups);
+    }
+    if groups.len() > 1 {
+        return Err(RouteResidencyBindingReject::MultipleBanksUnsupported {
+            groups: groups.len(),
+        });
+    }
+    let group = groups.pop().expect("exactly one group");
+    if !has_source(group.node) {
+        return Err(RouteResidencyBindingReject::NoTelemetrySource { node: group.node });
+    }
+    for member in &group.members {
+        if !has_catalog(*member) {
+            return Err(RouteResidencyBindingReject::MissingCatalog { value: *member });
+        }
+        if !has_allocator(*member) {
+            return Err(RouteResidencyBindingReject::MissingAllocator { value: *member });
+        }
+    }
+    Ok(group)
+}
+
+/// Construct a production [`RouteResidencyBoundary`] from a loaded graph's
+/// expert banks by property-based discovery.
+///
+/// The bank identity, membership (fc1/fc2/fc3/scales/bias) and boundary kind
+/// come entirely from [`expert_weight_groups`] — no model/layer/op-name
+/// allowlist. The producer `source`, `catalogs`, `allocators`, and pools are
+/// the EP's existing authorities, keyed by the discovered node/values; the
+/// builder only *binds* them (it maps nothing and owns no new allocator). On
+/// any missing artifact it fail-closes with a typed
+/// [`RouteResidencyBindingReject`] so the caller installs nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn build_route_residency_boundary(
+    graph: &Graph,
+    residency: Arc<CudaWeightResidency>,
+    sources: &HashMap<NodeId, Arc<dyn RouteTelemetrySource>>,
+    catalogs: HashMap<ValueId, WeightRegionCatalog>,
+    allocators: HashMap<ValueId, Arc<CudaVmmAllocator>>,
+    device_pool: Arc<PhysicalHandlePool>,
+    host_pool: Arc<PhysicalHandlePool>,
+    device_count: usize,
+    device_ordinal: i32,
+    expected_request: u32,
+    expected_device: u32,
+    initial_epoch: u32,
+) -> std::result::Result<RouteResidencyBoundary, RouteResidencyBindingReject> {
+    let group = validate_route_residency_binding(
+        graph,
+        |node| sources.contains_key(&node),
+        |value| catalogs.contains_key(&value),
+        |value| allocators.contains_key(&value),
+    )?;
+    let source = Arc::clone(&sources[&group.node]);
+    let bank_values = group.members.clone();
+    let boundary = group.boundary;
+    Ok(RouteResidencyBoundary::new(
+        source,
+        residency,
+        bank_values,
+        boundary,
+        catalogs,
+        allocators,
+        device_pool,
+        host_pool,
+        device_count,
+        device_ordinal,
+        expected_request,
+        expected_device,
+        initial_epoch,
+        vec![group],
+    ))
 }
 
 /// Observability for the boundary consumer. Every boundary records its typed
@@ -518,6 +686,9 @@ pub struct RouteResidencyDiagnostics {
     whole_bank: AtomicU64,
     empty: AtomicU64,
     last_reason: Mutex<Option<String>>,
+    installs: AtomicU64,
+    declines: AtomicU64,
+    last_install_reason: Mutex<Option<String>>,
 }
 
 impl RouteResidencyDiagnostics {
@@ -551,6 +722,41 @@ impl RouteResidencyDiagnostics {
     /// The human reason of the most recent boundary (for diagnostics surfaces).
     pub fn last_reason(&self) -> Option<String> {
         self.last_reason.lock().unwrap().clone()
+    }
+
+    /// Bindings actually installed on the EP (gate on, a bindable bank found).
+    /// The reachability counter the install-wiring tests assert on.
+    pub fn installs(&self) -> u64 {
+        self.installs.load(Ordering::Relaxed)
+    }
+
+    /// Install attempts that fail-closed to *no* binding (gate off, offload
+    /// disabled, or a typed [`RouteResidencyBindingReject`]). Nothing is
+    /// installed and no boundary work is created — there is no silent partial
+    /// binding.
+    pub fn declines(&self) -> u64 {
+        self.declines.load(Ordering::Relaxed)
+    }
+
+    /// The human reason of the most recent install/decline (for diagnostics).
+    pub fn last_install_reason(&self) -> Option<String> {
+        self.last_install_reason.lock().unwrap().clone()
+    }
+
+    fn set_install_reason(&self, reason: String) {
+        *self.last_install_reason.lock().unwrap() = Some(reason);
+    }
+
+    /// Record that a real binding was installed for `banks` bank values.
+    pub(crate) fn record_install(&self, banks: usize) {
+        self.installs.fetch_add(1, Ordering::Relaxed);
+        self.set_install_reason(format!("installed binding over {banks} bank value(s)"));
+    }
+
+    /// Record that install fail-closed to no binding, carrying the reason.
+    pub(crate) fn record_decline(&self, reason: &str) {
+        self.declines.fetch_add(1, Ordering::Relaxed);
+        self.set_install_reason(format!("declined: {reason}"));
     }
 
     fn set_reason(&self, reason: String) {
@@ -729,4 +935,174 @@ pub fn run_route_residency_boundary_with_phase8_faults(
 fn _assert_qmoe_is_route_telemetry_source() {
     fn is_source<T: RouteTelemetrySource>() {}
     is_source::<crate::kernels::qmoe::QMoEKernel>();
+}
+
+#[cfg(test)]
+mod binding_tests {
+    //! CPU-only tests for the property-based binding *builder*'s discovery and
+    //! typed fail-closed rejects. These need no GPU handles because
+    //! [`validate_route_residency_binding`] classifies purely from the graph
+    //! and membership predicates — the exact predicates
+    //! [`build_route_residency_boundary`] evaluates against its real
+    //! source/catalog/allocator maps. The successful *construction* (which does
+    //! need a real residency/allocator) is proven by the GPU harness.
+    use std::collections::HashSet;
+
+    use onnx_runtime_ep_api::LazyWeightBoundary;
+    use onnx_runtime_ir::{DataType, Graph, NodeId, TensorData, ValueId, WeightRef, static_shape};
+
+    use super::{RouteResidencyBindingReject, validate_route_residency_binding};
+
+    fn shape1(n: usize) -> onnx_runtime_ir::Shape {
+        static_shape([n])
+    }
+
+    fn inline_initializer(graph: &mut Graph, name: &str) -> ValueId {
+        let value = graph.create_named_value(name, DataType::Uint8, shape1(4));
+        graph.set_initializer(
+            value,
+            WeightRef::Inline(TensorData::from_raw(DataType::Uint8, vec![4], vec![0u8; 4])),
+        );
+        value
+    }
+
+    /// A shape-faithful single-layer QMoE node: two graph values (hidden state,
+    /// router probs) plus initializer-backed fc1/fc2/fc3 weights+scales+bias —
+    /// exactly the input arity `expert_weight_groups` classifies.
+    fn qmoe_node(graph: &mut Graph) -> (NodeId, Vec<ValueId>) {
+        let input = graph.create_named_value("input", DataType::Float32, shape1(4));
+        let router = graph.create_named_value("router_probs", DataType::Float32, shape1(4));
+        let fc1_w = inline_initializer(graph, "fc1_experts_weights");
+        let fc1_s = inline_initializer(graph, "fc1_scales");
+        let fc1_b = inline_initializer(graph, "fc1_experts_bias");
+        let fc2_w = inline_initializer(graph, "fc2_experts_weights");
+        let fc2_s = inline_initializer(graph, "fc2_scales");
+        let fc3_w = inline_initializer(graph, "fc3_experts_weights");
+        let fc3_s = inline_initializer(graph, "fc3_scales");
+        let output = graph.create_named_value("output", DataType::Float32, shape1(4));
+        let mut node = onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "QMoE",
+            vec![
+                Some(input),
+                Some(router),
+                Some(fc1_w),
+                Some(fc1_s),
+                Some(fc1_b),
+                Some(fc2_w),
+                Some(fc2_s),
+                None,
+                Some(fc3_w),
+                Some(fc3_s),
+            ],
+            vec![output],
+        );
+        node.domain = "com.microsoft".to_string();
+        let node_id = graph.insert_node(node);
+        (
+            node_id,
+            vec![fc1_w, fc1_s, fc1_b, fc2_w, fc2_s, fc3_w, fc3_s],
+        )
+    }
+
+    fn always(_: NodeId) -> bool {
+        true
+    }
+    fn always_v(_: ValueId) -> bool {
+        true
+    }
+
+    #[test]
+    fn binds_single_qmoe_bank_with_all_artifacts_present() {
+        let mut graph = Graph::new();
+        let (node, members) = qmoe_node(&mut graph);
+        let group = validate_route_residency_binding(&graph, always, always_v, always_v)
+            .expect("bindable bank");
+        assert_eq!(group.node, node);
+        assert_eq!(group.boundary, LazyWeightBoundary::QMoe);
+        assert_eq!(group.members, members, "exact fc1/fc2/fc3 membership bound");
+    }
+
+    #[test]
+    fn rejects_graph_with_no_expert_group() {
+        // Dense-only graph: a MatMul is not a routed multi-tensor expert group.
+        let mut graph = Graph::new();
+        let w = inline_initializer(&mut graph, "dense_weight");
+        let x = graph.create_named_value("x", DataType::Float32, shape1(4));
+        let y = graph.create_named_value("y", DataType::Float32, shape1(4));
+        graph.insert_node(onnx_runtime_ir::Node::new(
+            NodeId(0),
+            "MatMul",
+            vec![Some(x), Some(w)],
+            vec![y],
+        ));
+        assert_eq!(
+            validate_route_residency_binding(&graph, always, always_v, always_v),
+            Err(RouteResidencyBindingReject::NoExpertGroups)
+        );
+    }
+
+    #[test]
+    fn rejects_multiple_banks_as_single_binding_unsupported() {
+        let mut graph = Graph::new();
+        qmoe_node(&mut graph);
+        qmoe_node(&mut graph);
+        assert_eq!(
+            validate_route_residency_binding(&graph, always, always_v, always_v),
+            Err(RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 2 })
+        );
+    }
+
+    #[test]
+    fn rejects_when_group_node_has_no_telemetry_source() {
+        let mut graph = Graph::new();
+        let (node, _) = qmoe_node(&mut graph);
+        let err = validate_route_residency_binding(&graph, |_| false, always_v, always_v)
+            .expect_err("no source");
+        assert_eq!(err, RouteResidencyBindingReject::NoTelemetrySource { node });
+    }
+
+    #[test]
+    fn rejects_when_a_bank_member_has_no_catalog() {
+        let mut graph = Graph::new();
+        let (_, members) = qmoe_node(&mut graph);
+        // Every member classified except the first, which lacks a catalog.
+        let with_catalog: HashSet<ValueId> = members[1..].iter().copied().collect();
+        let err = validate_route_residency_binding(
+            &graph,
+            always,
+            |v| with_catalog.contains(&v),
+            always_v,
+        )
+        .expect_err("missing catalog");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::MissingCatalog { value: members[0] }
+        );
+    }
+
+    #[test]
+    fn rejects_when_a_bank_member_has_no_allocator() {
+        let mut graph = Graph::new();
+        let (_, members) = qmoe_node(&mut graph);
+        let with_alloc: HashSet<ValueId> = members[1..].iter().copied().collect();
+        let err =
+            validate_route_residency_binding(&graph, always, always_v, |v| with_alloc.contains(&v))
+                .expect_err("missing allocator");
+        assert_eq!(
+            err,
+            RouteResidencyBindingReject::MissingAllocator { value: members[0] }
+        );
+    }
+
+    #[test]
+    fn reject_reasons_are_non_empty_and_carry_context() {
+        assert!(
+            !RouteResidencyBindingReject::NoExpertGroups
+                .reason()
+                .is_empty()
+        );
+        let r = RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 3 }.reason();
+        assert!(r.contains('3'), "reason carries the group count: {r}");
+    }
 }

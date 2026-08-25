@@ -1,4 +1,5 @@
-//! CUDA implementation of the frozen `pkg.nxrt::BlockQuantizedMoE` v1 operator.
+//! CUDA implementation of the `pkg.nxrt::BlockQuantizedMoE` operator
+//! (mixed-projection ABI).
 //!
 //! This is the CUDA counterpart to the CPU parity oracle
 //! ([`onnx_runtime_ep_cpu::kernels::block_quantized_moe`]). Expert weights stay
@@ -8,6 +9,14 @@
 //! [`super::block_quantized_matmul`], so the numeric semantics match the oracle
 //! block-for-block; only the reduction/accumulation order differs (both
 //! accumulate in f32).
+//!
+//! The mixed-projection ABI lets `fc1_format`, `fc2_format` and `fc3_format`
+//! differ per projection (real GLM-5.2 GGUF experts pack gate/up and down at
+//! different qtypes). The current device kernel decodes a single **uniform**
+//! format across all projections, so mixed-projection nodes are typed-rejected
+//! at the claim gate and fall back to the CPU oracle. A per-projection CUDA
+//! decoder is an explicit follow-up — this file makes **no** success claim for
+//! mixed-projection execution.
 //!
 //! The pipeline mirrors the CPU reference: host-free top-k routing, per-route
 //! expert GEMV for FC1 (and the optional FC3 gate), a fused
@@ -396,11 +405,13 @@ impl MoeAttributes {
                     | "activation_alpha"
                     | "activation_beta"
                     | "swiglu_limit"
-                    | "format"
+                    | "fc1_format"
+                    | "fc2_format"
+                    | "fc3_format"
                     | "block_layout_version"
             ) {
                 return Err(error(format!(
-                    "attribute '{name}' is not part of the frozen v1 ABI"
+                    "attribute '{name}' is not part of the BlockQuantizedMoE ABI"
                 )));
             }
         }
@@ -458,12 +469,139 @@ fn parse_layout_version(node: &Node) -> Result<()> {
     Ok(())
 }
 
-fn parse_format(node: &Node) -> Result<BlockFormat> {
-    node.attr("format")
-        .ok_or_else(|| error("missing required string attribute 'format'"))?
+/// Per-projection native formats for the CUDA claim gate.
+///
+/// The mixed-projection ABI allows `fc1_format`, `fc2_format` and `fc3_format`
+/// to differ. The current device kernel decodes a single **uniform** format, so
+/// [`ProjectionFormats::uniform`] typed-rejects any mixed combination — those
+/// nodes fall back to the CPU oracle. This is an explicit CUDA follow-up with
+/// no success claim for mixed-projection execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProjectionFormats {
+    fc1: BlockFormat,
+    fc2: BlockFormat,
+    fc3: Option<BlockFormat>,
+}
+
+impl ProjectionFormats {
+    /// The single format the uniform-projection device kernel decodes, or an
+    /// error describing the mixed-projection combination CUDA cannot yet run.
+    fn uniform(self) -> std::result::Result<BlockFormat, String> {
+        let mut mixed = self.fc1 != self.fc2;
+        if let Some(fc3) = self.fc3 {
+            mixed |= fc3 != self.fc1;
+        }
+        if mixed {
+            return Err(format!(
+                "CUDA does not yet support mixed per-projection block formats \
+                 (fc1={:?}, fc2={:?}, fc3={:?}); the CPU oracle owns this node",
+                self.fc1, self.fc2, self.fc3
+            ));
+        }
+        Ok(self.fc1)
+    }
+}
+
+fn parse_format_attr(node: &Node, name: &str) -> Result<BlockFormat> {
+    node.attr(name)
+        .ok_or_else(|| error(format!("missing required string attribute '{name}'")))?
         .as_str()
-        .ok_or_else(|| error("attribute 'format' must be a UTF-8 string"))
+        .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
         .and_then(BlockFormat::parse)
+}
+
+fn optional_format_attr(node: &Node, name: &str) -> Result<Option<BlockFormat>> {
+    match node.attr(name) {
+        None => Ok(None),
+        Some(attribute) => attribute
+            .as_str()
+            .ok_or_else(|| error(format!("attribute '{name}' must be a UTF-8 string")))
+            .and_then(BlockFormat::parse)
+            .map(Some),
+    }
+}
+
+/// Parse the per-projection formats. `fc3_format` must be present exactly when
+/// the `fc3_experts_weights` input (index 6) is wired on the node.
+fn parse_projection_formats(node: &Node) -> Result<ProjectionFormats> {
+    let fc1 = parse_format_attr(node, "fc1_format")?;
+    let fc2 = parse_format_attr(node, "fc2_format")?;
+    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
+    let fc3_attr = optional_format_attr(node, "fc3_format")?;
+    match (fc3_wired, fc3_attr) {
+        (true, Some(fc3)) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        }),
+        (true, None) => Err(error(
+            "fc3_experts_weights is wired but the required fc3_format attribute is missing",
+        )),
+        (false, Some(_)) => Err(error(
+            "fc3_format is only valid when fc3_experts_weights is wired",
+        )),
+        (false, None) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        }),
+    }
+}
+
+/// Claim-gate variant of [`parse_projection_formats`] that yields
+/// `Cow<'static, str>` rejection reasons (with the CUDA re-export guidance) so
+/// [`unsupported_reason`] can decline a node without constructing an [`EpError`].
+fn claim_projection_formats(
+    node: &Node,
+) -> std::result::Result<ProjectionFormats, Cow<'static, str>> {
+    let fc1 = claim_format_attr(node, "fc1_format")?.ok_or(Cow::Borrowed(
+        "BlockQuantizedMoE: missing required string attribute 'fc1_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+    ))?;
+    let fc2 = claim_format_attr(node, "fc2_format")?.ok_or(Cow::Borrowed(
+        "BlockQuantizedMoE: missing required string attribute 'fc2_format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
+    ))?;
+    let fc3 = claim_format_attr(node, "fc3_format")?;
+    let fc3_wired = node.inputs.get(6).is_some_and(Option::is_some);
+    match (fc3_wired, fc3) {
+        (true, Some(fc3)) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: Some(fc3),
+        }),
+        (true, None) => Err(Cow::Borrowed(
+            "BlockQuantizedMoE: fc3_experts_weights is wired but the required fc3_format attribute is missing",
+        )),
+        (false, Some(_)) => Err(Cow::Borrowed(
+            "BlockQuantizedMoE: fc3_format is only valid when fc3_experts_weights is wired",
+        )),
+        (false, None) => Ok(ProjectionFormats {
+            fc1,
+            fc2,
+            fc3: None,
+        }),
+    }
+}
+
+/// Parse one projection-format attribute for the claim gate. `Ok(None)` means
+/// the attribute is absent; a present-but-invalid value is a typed rejection.
+fn claim_format_attr(
+    node: &Node,
+    name: &str,
+) -> std::result::Result<Option<BlockFormat>, Cow<'static, str>> {
+    let Some(attribute) = node.attr(name) else {
+        return Ok(None);
+    };
+    let Some(text) = attribute.as_str() else {
+        return Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: attribute '{name}' must be a string naming a CUDA-supported block format"
+        )));
+    };
+    match BlockFormat::parse(text) {
+        Ok(format) => Ok(Some(format)),
+        Err(_) => Err(Cow::Owned(format!(
+            "BlockQuantizedMoE: CUDA does not support format '{text}' for '{name}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
+        ))),
+    }
 }
 
 pub struct BlockQuantizedMoEFactory {
@@ -490,7 +628,9 @@ impl BlockQuantizedMoEFactory {
     ) -> Result<BlockQuantizedMoEKernel> {
         parse_layout_version(node)?;
         let attributes = MoeAttributes::from_node(node)?;
-        let format = parse_format(node)?;
+        // The device kernel decodes a single uniform format; mixed-projection
+        // nodes are typed-rejected at the claim gate before reaching here.
+        let format = parse_projection_formats(node)?.uniform().map_err(error)?;
         Ok(BlockQuantizedMoEKernel {
             runtime: self.runtime.clone(),
             attributes,
@@ -501,34 +641,26 @@ impl BlockQuantizedMoEFactory {
 }
 
 /// Placement declaration for the CUDA claim gate. The CUDA kernel implements the
-/// full frozen v1 ABI over the ten CUDA-supported GGUF block formats with f32
-/// activations. It declines any node the kernel cannot execute (unsupported
-/// format, wrong layout version, or non-f32 activation/router dtypes) so those
+/// BlockQuantizedMoE ABI over the ten CUDA-supported GGUF block formats with f32
+/// activations, but only for **uniform** per-projection formats. It declines any
+/// node the kernel cannot execute (unsupported format, mixed per-projection
+/// formats, wrong layout version, or non-f32 activation/router dtypes) so those
 /// nodes fall back to the CPU oracle rather than mis-executing.
 pub(crate) fn unsupported_reason(
     node: &Node,
     shapes: &[Shape],
     input_dtypes: &[DataType],
 ) -> Option<Cow<'static, str>> {
-    let format = match node.attr("format") {
-        Some(attribute) => match attribute.as_str() {
-            Some(format) => format,
-            None => {
-                return Some(Cow::Borrowed(
-                    "BlockQuantizedMoE: attribute 'format' must be a string naming a CUDA-supported block format",
-                ));
-            }
-        },
-        None => {
-            return Some(Cow::Borrowed(
-                "BlockQuantizedMoE: missing required string attribute 'format' — export one of mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m",
-            ));
-        }
+    let formats = match claim_projection_formats(node) {
+        Ok(formats) => formats,
+        Err(reason) => return Some(reason),
     };
-    if BlockFormat::parse(format).is_err() {
-        return Some(Cow::Owned(format!(
-            "BlockQuantizedMoE: CUDA does not support format '{format}' — re-export weights as mxfp4, iq4_nl, iq4_xs, iq2_xxs, iq3_xxs, iq2_xs, iq2_s, iq3_s, iq1_s, or iq1_m"
-        )));
+    // The device kernel decodes one uniform format; real GLM-5.2 GGUF experts
+    // carry different qtypes per projection. Typed-reject the mixed case (no
+    // success claim) so the CPU oracle owns it — a per-projection CUDA decoder
+    // is an explicit follow-up.
+    if let Err(reason) = formats.uniform() {
+        return Some(Cow::Owned(format!("BlockQuantizedMoE: {reason}")));
     }
     if let Some(attribute) = node.attr("block_layout_version") {
         match attribute.as_int() {
@@ -1571,5 +1703,108 @@ mod workspace_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeds usize limits"));
+    }
+}
+
+#[cfg(test)]
+mod claim_gate_tests {
+    use super::*;
+    use onnx_runtime_ir::{Attribute, NodeId, ValueId};
+
+    /// Build a minimal `BlockQuantizedMoE` node carrying only the attributes the
+    /// claim gate reads. `fc3` set means the `fc3_experts_weights` input (index
+    /// 6) is wired and an `fc3_format` attribute is emitted. These nodes are not
+    /// executable — they exist purely to exercise `unsupported_reason` /
+    /// `claim_projection_formats`, which are pure functions over node metadata
+    /// and never touch a CUDA device, so this runs on a host without a GPU.
+    fn claim_node(fc1: &str, fc2: &str, fc3: Option<&str>) -> Node {
+        let mut inputs: Vec<Option<ValueId>> = (0..6).map(|i| Some(ValueId(i as u32))).collect();
+        if fc3.is_some() {
+            // Indices 6..=8: fc3 weights wired, then two optional trailing slots.
+            inputs.push(Some(ValueId(6)));
+        }
+        let mut node = Node::new(NodeId(0), "BlockQuantizedMoE", inputs, vec![ValueId(100)]);
+        node.attributes.insert(
+            "fc1_format".into(),
+            Attribute::String(fc1.as_bytes().to_vec()),
+        );
+        node.attributes.insert(
+            "fc2_format".into(),
+            Attribute::String(fc2.as_bytes().to_vec()),
+        );
+        if let Some(fc3) = fc3 {
+            node.attributes.insert(
+                "fc3_format".into(),
+                Attribute::String(fc3.as_bytes().to_vec()),
+            );
+        }
+        node
+    }
+
+    #[test]
+    fn mixed_fc1_fc2_formats_are_typed_rejected_without_a_success_claim() {
+        // The real GLM-5.2 UD-IQ1_S combo: gate/up IQ1_S, down IQ3_XXS.
+        let node = claim_node("iq1_s", "iq3_xxs", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("mixed per-projection formats must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn mixed_fc3_gate_format_is_typed_rejected() {
+        // Unfused gate carried at a different qtype than fc1/fc2.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq2_xxs"));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("a mismatched fc3_format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("mixed per-projection block formats"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn uniform_projection_formats_remain_claimable() {
+        // Uniform format across every projection stays claimable by the device
+        // kernel — the mixed-rejection must not over-reject the supported case.
+        let node = claim_node("iq1_s", "iq1_s", Some("iq1_s"));
+        assert!(
+            unsupported_reason(&node, &[], &[]).is_none(),
+            "uniform-format node must not be declined by the CUDA claim gate"
+        );
+        let fused = claim_node("iq4_nl", "iq4_nl", None);
+        assert!(
+            unsupported_reason(&fused, &[], &[]).is_none(),
+            "uniform fused-projection node must not be declined by the CUDA claim gate"
+        );
+    }
+
+    #[test]
+    fn unsupported_native_format_is_typed_rejected_at_the_claim_gate() {
+        // A native GGUF qtype outside BlockFormat (e.g. Q2_K) is declined, not
+        // dequantized or dense-fallback executed.
+        let node = claim_node("q2_k", "q2_k", None);
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("an unsupported native format must be declined by the CUDA claim gate");
+        assert!(
+            reason.contains("q2_k"),
+            "unexpected rejection reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn fc3_format_without_wired_gate_is_typed_rejected() {
+        // fc3_format present but the fc3 weights input is not wired: reject.
+        let mut node = claim_node("iq1_s", "iq1_s", None);
+        node.attributes
+            .insert("fc3_format".into(), Attribute::String(b"iq1_s".to_vec()));
+        let reason = unsupported_reason(&node, &[], &[])
+            .expect("fc3_format without a wired gate must be declined");
+        assert!(
+            reason.contains("fc3_format is only valid when fc3_experts_weights is wired"),
+            "unexpected rejection reason: {reason}"
+        );
     }
 }
