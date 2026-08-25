@@ -504,65 +504,6 @@ impl AppState {
         })
     }
 
-    pub fn new(model_id: String, engine: Engine, tokenizer: Tokenizer) -> Self {
-        Self::new_with_template(model_id, engine, tokenizer, None)
-    }
-
-    pub fn new_with_template(
-        model_id: String,
-        engine: Engine,
-        tokenizer: Tokenizer,
-        chat_template: Option<ChatTemplate>,
-    ) -> Self {
-        Self::new_with_template_and_config(
-            model_id,
-            engine,
-            tokenizer,
-            chat_template,
-            ServerConfig::default(),
-            None,
-        )
-    }
-
-    fn new_with_template_and_config(
-        model_id: String,
-        engine: Engine,
-        tokenizer: Tokenizer,
-        chat_template: Option<ChatTemplate>,
-        config: ServerConfig,
-        model_max_context: Option<usize>,
-    ) -> Self {
-        let config = config.validate().expect("validated server config");
-        let fim_config = engine.fim_config().cloned();
-        let engine_driver = EngineDriver::start(
-            engine,
-            config.max_batch.unwrap_or(DEFAULT_MAX_BATCH),
-            config.max_queue_depth,
-        );
-        let handle = ModelHandle::new(ModelHandleParts {
-            id: model_id,
-            // Test-only constructor: the model was handed in already loaded, so
-            // there is no package directory to resolve files against.
-            model_dir: std::path::PathBuf::new(),
-            engine: engine_driver,
-            tokenizer: Arc::new(tokenizer),
-            chat_template: chat_template.map(Arc::new),
-            model_max_context,
-            generation_defaults: None,
-            fim_config,
-            multimodal: None,
-            speech: None,
-            image_pipeline: None,
-        })
-        .expect("test model handle");
-        let registry = ModelRegistry::from_handle(Arc::new(handle), config.clone());
-        Self {
-            registry,
-            sessions: SessionRegistry::new(config.max_sessions),
-            config,
-        }
-    }
-
     /// Returns the id of the first loaded model, for use in log messages and the CLI.
     pub fn model_id(&self) -> String {
         match self.registry.default_id() {
@@ -655,9 +596,10 @@ pub(crate) fn enforce_requested_max_batch(
 ///
 /// `config` must already be validated.  This is the single shared construction
 /// path used by both startup (`ModelRegistry::from_specs`) and runtime lazy
-/// loading (`ModelRegistry::load`).  It is a **blocking** function (it calls
-/// `Engine::from_dir`, which takes seconds) and must therefore be invoked from a
-/// blocking context (e.g. at startup or via `tokio::task::spawn_blocking`).
+/// loading (`ModelRegistry::load`). It blocks until the new worker reports its
+/// typed initialization result, so async callers must invoke it from a blocking
+/// context. The engine itself is constructed inside that worker, never on the
+/// caller's blocking-pool thread.
 pub(crate) fn build_handle_with_authorities(
     spec: &ModelSpec,
     config: &ServerConfig,
@@ -707,21 +649,29 @@ pub(crate) fn build_handle_with_authorities(
     let model_max_context = load_model_max_context(model_directory.metadata_path.as_deref())?;
     let tokenizer = Tokenizer::from_file(&model_directory.tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
-    let engine = Engine::from_dir_with_memory_authority_provider(
-        model_dir,
-        config.engine_config.clone(),
-        authorities,
-    )?;
-    let fim_config = engine.fim_config().cloned();
     let generation_defaults = None;
-    // Refuse an explicit `--max-batch > 1` the decode path cannot honor, rather
-    // than accepting it and silently falling back to per-request decoding. The
-    // check is sourced from the engine's decode path, not from whether an ORT
-    // session exists (issue #750).
-    enforce_requested_max_batch(&engine, config.max_batch)?;
     let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
-    let engine_driver = EngineDriver::start(engine, requested_max_batch, config.max_queue_depth);
-    ModelHandle::new(ModelHandleParts {
+    let engine_model_dir = model_dir.to_path_buf();
+    let engine_config = config.engine_config.clone();
+    let configured_max_batch = config.max_batch;
+    let (engine_driver, fim_config) = EngineDriver::start(
+        move || {
+            let engine = Engine::from_dir_with_memory_authority_provider(
+                &engine_model_dir,
+                engine_config,
+                authorities,
+            )?;
+            // Refuse an explicit `--max-batch > 1` the decode path cannot honor,
+            // rather than accepting it and silently falling back to per-request
+            // decoding. This runs beside the engine before readiness is reported.
+            enforce_requested_max_batch(&engine, configured_max_batch)?;
+            let fim_config = engine.fim_config().cloned();
+            Ok((engine, fim_config))
+        },
+        requested_max_batch,
+        config.max_queue_depth,
+    )?;
+    Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
         engine: engine_driver,
@@ -733,7 +683,7 @@ pub(crate) fn build_handle_with_authorities(
         multimodal: None,
         speech: None,
         image_pipeline: None,
-    })
+    }))
 }
 
 fn build_pipeline_handle(
@@ -749,13 +699,7 @@ fn build_pipeline_handle(
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Failed to load pipeline tokenizer: {e}"))?;
-
-    let engine = Engine::from_dir_with_memory_authority_provider(
-        model_dir,
-        config.engine_config.clone(),
-        authorities,
-    )?;
-    let multimodal = crate::multimodal::build(&directory, engine.models()?)?;
+    let multimodal = crate::multimodal::build(&directory)?;
     // Resolve one exact speech capability at load time: bind the single
     // text-assembly processor to the single compatible buffered PCM16 WAV audio
     // output that serving will encode. Fail closed on zero, ambiguous, or
@@ -789,14 +733,30 @@ fn build_pipeline_handle(
     // superseded generation metadata surfaces, so the pipeline path resolves
     // sampling from request options only — same as the non-pipeline path above.
     let generation_defaults = None;
-    // The same admission the decoder path applies: an explicit `--max-batch`
-    // the decode path cannot honor is refused rather than silently ignored.
-    enforce_requested_max_batch(&engine, config.max_batch)?;
     let requested_max_batch = config.max_batch.unwrap_or(DEFAULT_MAX_BATCH);
-    ModelHandle::new(ModelHandleParts {
+    let engine_model_dir = model_dir.to_path_buf();
+    let engine_config = config.engine_config.clone();
+    let configured_max_batch = config.max_batch;
+    let (engine_driver, ()) = EngineDriver::start(
+        move || {
+            let engine = Engine::from_dir_with_memory_authority_provider(
+                &engine_model_dir,
+                engine_config,
+                authorities,
+            )?;
+            // The same admission the decoder path applies: an explicit
+            // `--max-batch` the decode path cannot honor is refused rather than
+            // silently ignored.
+            enforce_requested_max_batch(&engine, configured_max_batch)?;
+            Ok((engine, ()))
+        },
+        requested_max_batch,
+        config.max_queue_depth,
+    )?;
+    Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
-        engine: EngineDriver::start(engine, requested_max_batch, config.max_queue_depth),
+        engine: engine_driver,
         tokenizer: Arc::new(tokenizer),
         chat_template: chat_template.map(Arc::new),
         model_max_context,
@@ -805,7 +765,7 @@ fn build_pipeline_handle(
         multimodal: Some(multimodal),
         speech,
         image_pipeline,
-    })
+    }))
 }
 
 #[cfg(test)]

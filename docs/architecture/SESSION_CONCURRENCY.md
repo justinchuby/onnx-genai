@@ -32,7 +32,7 @@ the refusals below must be typed.
 
 ## 1. What is true today
 
-### 1.1 The engine is `Send`, and is structurally not `Sync`
+### 1.1 The engine is `Send`, structurally not `Sync`, and server-owned on one thread
 
 `Engine` carries a hand-written `unsafe impl Send` whose safety argument is that
 moving it transfers exclusive ownership and that mutation still requires
@@ -47,15 +47,16 @@ That is the important fact, and it is easy to miss because the `unsafe impl
 Send` looks like the concurrency story. It is not. The concurrency story is that
 there is exactly one thread.
 
-The server makes that explicit. `EngineOwner(Box<Engine>)` carries a second
-`unsafe impl Send` (`crates/onnx-genai-server/src/driver.rs:278-281`) whose
-safety comment is a promise about scheduling rather than about the type:
+The server no longer moves an engine across a thread boundary.
+`EngineDriver::start` accepts a `Send` construction closure containing only the
+load plan, and `WorkerHandle::spawn` runs it after starting the OS thread. A
+typed readiness handshake returns only immutable summaries and shared
+telemetry; the `Engine` stays in structurally `!Send` worker state and is
+dropped there when the command loop exits. The server crate forbids unsafe
+code, so the former `EngineOwner(Box<Engine>)` and its `unsafe impl Send` cannot
+return unnoticed.
 
-> The engine is moved exactly once into the dedicated driver thread. All ORT
-> runners, sessions, KV state, and the continuous batch manager stay owned by
-> that thread and are accessed only by processing channel commands.
-
-`EngineDriver::start` spawns one OS thread and moves the owner into it. Since
+Since
 [#2012](https://github.com/justinchuby/onnx-genai/pull/2012) (merged as
 `1bf87c86`) that spawn goes through a worker abstraction rather than a bare
 channel: `WorkerHandle::spawn` names the thread `onnx-genai-batch-driver-{id}`
@@ -83,8 +84,9 @@ changes what remains:
 So the addressing model, the shutdown contract, and the id hygiene that §4
 depends on are **already merged**. `WorkerPool::single` is a pool of one
 (`worker.rs:261-265`), and `placement_worker` hands out the only id there is
-(`worker.rs:276-279`). What remains is `W > 1`, the state split that makes it
-sound, and — separately and more urgently — a lease that actually refuses.
+(`worker.rs:276-279`). The routing lease and interpreter state split described
+below have also landed; `W > 1` and the remaining Phase 1 holder/affinity work
+remain.
 
 **#2019 merged the other prerequisite: the backend layer beneath a worker.** A
 worker pool is only sound if the handles a worker owns cannot outlive their
@@ -94,9 +96,10 @@ detail. The consequence for this document is that §4's model no longer has to
 propose the ownership and affinity primitives it depends on; it consumes them,
 and §13 Phase 1 shrinks accordingly.
 
-`EngineOwner`'s `unsafe impl Send` survived #2012 deliberately: the engine is
-still thread-affine and still moved exactly once
-(`driver.rs:278-281`). §10 removes it; #2012 did not.
+The owner-thread lifecycle prerequisite now completes what #2012 deliberately
+left open: initialization failures are returned through the readiness
+handshake, successful engines enter the command loop without leaving their
+worker, and shutdown joins only after that worker has dropped the engine.
 
 The Python binding reaches the same conclusion by a different route: it holds
 `inner: Mutex<RustEngine>` (`crates/onnx-genai-python/src/lib.rs:187-188`) and
@@ -1659,9 +1662,10 @@ rate an acceptance metric and not an afterthought.
 
 ## 10. Removing the `unsafe impl Send`s
 
-Both hand-written impls exist to paper over the gap between "this type is not
-provably `Send`" and "we know it never leaves its thread". The worker model
-closes that gap structurally, so both are removed rather than re-justified.
+Both hand-written impls existed to paper over the gap between "this type is not
+provably `Send`" and "we know it never leaves its thread". The server wrapper is
+now gone because its worker constructs the engine in place. The engine crate's
+own impl remains until Phase 3 decomposes the public engine handle.
 
 **#2019 made this urgent rather than merely tidy.** `Engine`'s safety comment
 still reads *"Neither runtime's sessions, values, bindings, allocators, or CPU
@@ -1676,14 +1680,15 @@ reports it; §10's job is to make the violation unrepresentable, and until it is
 done the `unsafe impl` is the thing standing between the compiler and a bug it
 could otherwise reject outright.
 
-**`unsafe impl Send for EngineOwner` (`driver.rs:278-281`) is deleted.** Its
-entire safety argument is *"The engine is moved exactly once into the dedicated
-driver thread"*. Under §4.3 the backend state is constructed on the worker thread
-and never moves, so there is no cross-thread move to justify. The wrapper type
-goes with it.
+✅ **`unsafe impl Send for EngineOwner` is deleted.** Its entire safety argument
+was *"The engine is moved exactly once into the dedicated driver thread"*.
+`EngineDriver::start` now passes a `Send` load closure to `WorkerHandle::spawn`;
+the worker constructs the engine, reports a typed ready result, runs it, and
+drops it before exiting. There is no cross-thread engine move to justify, and
+`onnx-genai-server` now uses `#![forbid(unsafe_code)]`.
 
-**`unsafe impl Send for Engine` (`engine/model.rs:221-229`) is deleted, and
-`Engine` is decomposed.** What remains after the split is:
+**`unsafe impl Send for Engine` (`engine/model.rs:221-229`) remains until Phase
+3, where `Engine` is decomposed.** What remains after that split is:
 
 - an `Arc`-shared immutable plan (§3.1), naturally `Send + Sync` because it is
   frozen;
@@ -2318,12 +2323,13 @@ model that owns it — never the default model, and never a conversation that wa
 rebound between the read and the remove (§5). LRU eviction removes its victim
 under the same lock and rule.
 
-⚠️ **Not landed, and this phase is not complete without it: the `EngineOwner`
-deletion above.** It requires constructing the engine on the worker thread
-(§4.3), which is a change to where the engine is built rather than to how turns
-are routed, and it carries the §12.2 bit-identity gate with it. It is deliberately
-not bundled with the lease: the lease is a refusal contract that can be tested by
-itself, and the `unsafe impl` removal is an ownership change that cannot.
+✅ **Landed: the owner-thread lifecycle prerequisite.** `EngineOwner` and its
+`unsafe impl Send` are gone. Model paths, engine options, and the shared memory
+authority cross into the new worker as a `Send` load plan; the engine and its
+backend handles are constructed, run, unwound on failed initialization, and
+dropped there. The caller receives a typed ready/error handshake and keeps the
+same `W = 1` driver façade. This changes ownership only: it adds no parallel
+execution, batching, or multi-worker routing claim.
 
 ⚠️ **Also outstanding at the end of this phase:** §12.1's test 5 (reset racing a
 turn), which cannot be written until `reset_session` is routed at all — see §5 on

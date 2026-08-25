@@ -255,7 +255,7 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
     {
         return Ok(None);
     }
-    let models = PipelineModels::load_with_ort_session_filter(
+    let _models = PipelineModels::load_with_ort_session_filter(
         model_dir,
         onnx_genai_ort::SessionOptions::default(),
         |_| false,
@@ -275,7 +275,7 @@ pub fn load(model_dir: &Path) -> anyhow::Result<Option<PipelineSetup>> {
             .and_then(|metadata| metadata.generation.as_ref())
             .and_then(|generation| generation.defaults.clone()),
         tokenizer_path: tokenizer_path(model_dir, &directory)?,
-        multimodal: build(&directory, &models)?,
+        multimodal: build(&directory)?,
     }))
 }
 
@@ -320,10 +320,7 @@ pub fn audio_decoder_prompt(
     Ok(tokens)
 }
 
-pub fn build(
-    directory: &PipelineModelDirectory,
-    _models: &PipelineModels,
-) -> anyhow::Result<MultimodalSpecs> {
+pub fn build(directory: &PipelineModelDirectory) -> anyhow::Result<MultimodalSpecs> {
     derive_specs(
         &directory.spec.workflow,
         directory.preprocessing.as_ref(),
