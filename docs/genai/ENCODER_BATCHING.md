@@ -60,6 +60,16 @@ range is the block, because a block citation cannot be off by one. An editor
 who moves cited code should re-pin by locating the named symbol, not by
 adjusting the number until it lands inside the file.
 
+That instruction only works if the symbol is actually named, so a citation into
+a file under active change carries its enclosing item beside the line number —
+`` (in `validate_compaction_derivability`, `…/validation.rs:4858-4862`) `` rather
+than the range alone. The name is the durable half: line numbers are a
+coordinate into a tree the reader may not have checked out, while a symbol name
+survives every edit that does not rename it, and one `grep` recovers the range
+after any drift. A bare number that has gone stale leaves a reader nothing to
+search for, which is why a citation that still resolves is the most durable way
+to be wrong.
+
 ---
 
 ## 1. The question a package must be able to answer
@@ -215,7 +225,8 @@ either spelling. [§4](#4-strict-token_packed-validation) resolves it.
 implemented and the contradiction is gone — the companion roles are stated in
 one place, the fixture is migrated, and a packed or padded emit must publish the
 account of its raggedness
-(`crates/onnx-genai-metadata/src/validation.rs:5102-5130` and the padded
+(`validate_packed_emit_companions`,
+`crates/onnx-genai-metadata/src/validation.rs:5102-5130`, and the padded
 counterpart that follows it). The emit-trim exclusion this document adds in
 [§3.2](#32-tensorcontractpadding) is implemented as
 `validate_emit_length_authority` (`validation.rs:5059-5091`). What remains open
@@ -618,7 +629,8 @@ truth.
   `valid_length` into an output whose layout declares no request axis is *already*
   refused at load, by a rule that predates this design: ragged emission needs a
   declared row axis for the runtime to associate result rows with requests
-  (`crates/onnx-genai-metadata/src/validation.rs:4811-4825`). `request_axis()` is
+  (in `validate_compaction_derivability`,
+  `crates/onnx-genai-metadata/src/validation.rs:4811-4825`). `request_axis()` is
   `None` for `TokenPacked` (`ir.rs:194-199`), so a packed output refuses the
   combination whatever its padding says, and the interpreter's per-row trim path
   is unreachable for it (`workflow.rs:2183-2189`). A packed **and** padded output
@@ -1224,7 +1236,8 @@ profile and are listed separately for that reason.
    with an existing serving rule: a serving workflow rejects any emitted value of
    rank > 0 that declares `shared`, on the
    grounds that a per-request result must declare `request_aligned` or
-   `token_packed` (`crates/onnx-genai-metadata/src/validation.rs:4858-4862`), and
+   `token_packed` (in `validate_compaction_derivability`,
+   `crates/onnx-genai-metadata/src/validation.rs:4858-4862`), and
    companions are `shared` by rule 4. The **minimal coherent resolution** is a
    carve-out rather than a new layout: the serving rule admits a `shared` emitted
    value **iff** it is `int64`, carries **the rank that reference demands**, and
@@ -1965,7 +1978,8 @@ P2 validation                    │                          │
   the rule: an output that is `token_packed` on its packed axis **and** padded on
   axes it does not pack, emitted with a `valid_length`, **MUST** be refused by
   **both** the pre-existing no-row-axis rule
-  (`crates/onnx-genai-metadata/src/validation.rs:4811-4825`) and this exclusion,
+  (in `validate_compaction_derivability`,
+  `crates/onnx-genai-metadata/src/validation.rs:4811-4825`) and this exclusion,
   and the fixture **MUST** assert **both** messages. Asserting only the first
   would pass against a validator that scoped the exclusion to layouts declaring a
   request axis — a real and tempting narrowing, since the packed case is already

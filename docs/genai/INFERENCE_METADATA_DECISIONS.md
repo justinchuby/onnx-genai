@@ -859,7 +859,8 @@ declared on its own dimension and they never compete for one.
   output needs no separate rule, because an emit-level `valid_length` into a
   layout with no request axis is already refused at load as ragged emission
   lacking a row axis
-  (`crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
+  (in `validate_compaction_derivability`,
+  `crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
   padded output hears from both rules, which is correct — they answer different
   questions. The exclusion is keyed on `padding` being non-empty rather than on
   the layout, because a packed value may legally pad: the no-double-spelling rule
@@ -901,7 +902,8 @@ declared on its own dimension and they never compete for one.
   *emitted by some declared step*, since an output nothing writes delivers an
   empty vector beside a ragged payload. The serving rule that rejects an emitted
   rank > 0 `shared` value
-  (`crates/onnx-genai-metadata/src/validation.rs:4858-4862`) is carved out for
+  (in `validate_compaction_derivability`,
+  `crates/onnx-genai-metadata/src/validation.rs:4858-4862`) is carved out for
   exactly those referenced companions — `int64`, of the rank that reference
   demands, named by another emitted value's layout or `padding` entry in the same
   workflow — and for nothing else. The rank is per reference rather than a flat
@@ -1037,7 +1039,8 @@ silence.
 
 **Serving admits companions, and only companions.** A serving workflow rejects an
 emitted value of rank > 0 that declares `shared`
-(`crates/onnx-genai-metadata/src/validation.rs:4858-4862`), which would reject
+(in `validate_compaction_derivability`,
+`crates/onnx-genai-metadata/src/validation.rs:4858-4862`), which would reject
 the very companions a ragged emit is required to publish — a packed value's
 `offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
 minimal and decidable from the workflow's own declarations — its outputs and its
