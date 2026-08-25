@@ -48,6 +48,18 @@ The normative contract this extends is
 [§15](INFERENCE_METADATA_DECISIONS.md#15-preprocessing-and-generated-inputs)
 (preprocessing programs).
 
+**On the source citations in this document.** Every `path:line` reference is
+pinned against the merged tree and names a range whose **first** line is the
+symbol or comment the surrounding sentence claims. That is deliberate: a check
+that a line number is merely *in range* tests the file's length, not its
+content, so a citation can survive a refactor while pointing at unrelated code
+that reads plausibly. Anchoring on the first line makes every reference fail
+under a one-line drift instead of passing silently. Where a claim is about a
+block rather than a single item — a whole struct, a whole doc comment — the
+range is the block, because a block citation cannot be off by one. An editor
+who moves cited code should re-pin by locating the named symbol, not by
+adjusting the number until it lands inside the file.
+
 ---
 
 ## 1. The question a package must be able to answer
@@ -638,7 +650,7 @@ truth.
 `padding` is a structural fact and does **not** by itself make a component
 padding-invariant. Whether a row's values change when it is padded to the group
 width remains the profile-level declaration `batch_invariance`
-(`crates/onnx-genai-metadata/src/schema/package.rs:158-174`,
+(`crates/onnx-genai-metadata/src/schema/package.rs:162-174`,
 `row_independent` / `padding_sensitive`). The two compose: a validity truth is
 what lets an implementation *be* row-independent; `batch_invariance` is the
 package asserting that it *is*. A `padding_sensitive` component **MUST NOT** be
@@ -1097,7 +1109,7 @@ profile and are listed separately for that reason.
    the owner's allocation, and the aliasing API says so outright — "a slice along
    an inner axis is not a contiguous range, and asking for one here would silently
    return the wrong elements. Callers that need one must copy"
-   (`crates/onnx-genai-ort/src/value.rs:1526-1542`). With `axis: 0`, every row's
+   (`crates/onnx-genai-ort/src/value.rs:1524-1543`). With `axis: 0`, every row's
    and every unit's span is a contiguous range, so splitting is
    `alias_with_offset` and costs nothing. With an inner packed axis, every split
    is a strided gather — a full copy of the payload on the device, per row, on
@@ -1398,7 +1410,7 @@ Three rules follow:
   reason [§4](#4-strict-token_packed-validation) rule 2 pins the packed axis to 0
   and the ownership rules demand contiguity: a row's span is then a contiguous
   element range, so it is handed back as an alias over the same allocation
-  (`alias_with_offset`, `crates/onnx-genai-ort/src/value.rs:1543-1551`), not a
+  (`alias_with_offset`, `crates/onnx-genai-ort/src/value.rs:1544-1551`), not a
   per-row copy.
 - **Any copy that does happen is attributable.** Where an alias is impossible —
   and for companions on `extent: produced` levels, which must reach the host to be
