@@ -2310,6 +2310,60 @@ fn a_padded_emit_hands_back_the_lengths_that_read_it() {
 }
 
 #[test]
+fn a_padded_output_is_the_one_account_of_how_much_of_it_is_real() {
+    // The emit's `valid_length` and the output's `padding` both say how much of
+    // the result is real, and nothing reconciles them. Only the declared padding
+    // reaches the caller: `valid_length` truncates what the step writes and is
+    // invisible in the contract, so a document that sets both can ship a tensor
+    // whose published lengths describe a shape the emit did not produce.
+    let document = PADDED_EMIT_WORKFLOW.replace(
+        "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
+        "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
+    );
+    assert_reports(
+        &document,
+        "with valid_length 'accepted_len', but 'features' declares padding whose valid_lengths \
+         'tile_lengths' on dimension 'max_tiles' already says how much of it is real",
+    );
+}
+
+#[test]
+fn an_emit_into_a_padded_output_needs_no_length_of_its_own() {
+    // The control for the rejection above, and the reason it is a contradiction
+    // rather than a missing feature: the same workflow without the emit-level
+    // length is complete. The padded output already publishes `tile_lengths`,
+    // so nothing is left unsaid by dropping the second account of it.
+    let document = PADDED_EMIT_WORKFLOW;
+    assert!(
+        !document.contains("valid_length:"),
+        "this fixture is the no-valid_length control and must stay one"
+    );
+    validate_metadata(&parse(document))
+        .expect("a padded emit that publishes its lengths needs no emit-level valid_length");
+}
+
+#[test]
+fn a_packed_output_still_refuses_a_length_for_the_older_reason() {
+    // `token_packed` declares no request axis, so an emit-level length into one
+    // was already refused as ragged emission without a row axis. The padding
+    // rule does not replace that and does not need to: the two rules answer
+    // different questions, and a packed output that also declared padding would
+    // hear from both.
+    let document = PACKED_EMIT_WORKFLOW.replace(
+        "      - kind: emit\n        value: image_features\n        output: features\n        mode: replace\n",
+        "      - kind: emit\n        value: image_features\n        output: features\n        valid_length: accepted_len\n        mode: replace\n",
+    );
+    assert_ne!(
+        document, PACKED_EMIT_WORKFLOW,
+        "the emit must actually gain a valid_length"
+    );
+    assert_reports(
+        &document,
+        "with a per-row valid_length or guard, but 'features' does not declare request_aligned",
+    );
+}
+
+#[test]
 fn a_validity_companion_may_be_emitted_by_a_serving_workflow() {
     // A length vector is `shared` for the same reason an offsets vector is: it
     // has one entry per position outside the dimension it bounds, which is a

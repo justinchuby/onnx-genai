@@ -4824,6 +4824,14 @@ fn validate_compaction_derivability(
                      a declared row axis so the runtime can associate result rows with requests"
                 ));
             }
+            validate_emit_length_authority(
+                path,
+                value,
+                output,
+                valid_length.as_deref(),
+                declared,
+                errors,
+            );
             validate_packed_emit_companions(path, value, output, declared, workflow, errors);
             validate_padded_emit_companions(path, value, output, declared, workflow, errors);
             let Some(contract) = value_contracts.get(value) else {
@@ -5024,6 +5032,62 @@ fn output_companions<'a>(
         }
     }
     companions
+}
+
+/// A padded output has one account of its raggedness, and it is the declared one.
+///
+/// An emit's `valid_length` truncates what the step writes: it is a step-local
+/// instruction, invisible in the output contract, and the caller never receives
+/// it. A `padding` entry is the opposite — part of the contract the caller reads,
+/// naming a length vector that rule 8 requires the workflow to publish. When an
+/// emit sets `valid_length` into an output that declares `padding`, the document
+/// states how much of the result is real twice, in two places that nothing
+/// reconciles, and only one of them reaches whoever has to decode the tensor.
+///
+/// Two spellings of one fact is the duplicated state RULES.md rule 10 exists to
+/// prevent, and here the duplication is worse than untidy: the two can disagree,
+/// and the reader that a caller depends on is the one the emit can silently
+/// contradict. So the declared `padding` is authoritative and the emit does not
+/// also limit its own prefix.
+///
+/// This needs no version scoping. `padding` is a `1.1` field, so a document that
+/// can express this contradiction has already been required to declare `1.1` by
+/// [`validate_schema_version`]; an older document has no way to say the thing at
+/// all. It is also a rule about values a document *did* state rather than a
+/// demand that it state something new, which is the half of the version split in
+/// [`validate_emit_axis`] that stays unconditional at every version.
+fn validate_emit_length_authority(
+    path: &str,
+    value: &str,
+    output: &str,
+    valid_length: Option<&str>,
+    declared: &crate::schema::WorkflowOutput,
+    errors: &mut Vec<String>,
+) {
+    let Some(valid_length) = valid_length else {
+        return;
+    };
+    if declared.contract.padding.is_empty() {
+        return;
+    }
+    let declared_padding = declared
+        .contract
+        .padding
+        .iter()
+        .map(|entry| {
+            format!(
+                "'{}' on dimension '{}'",
+                entry.valid_lengths, entry.dimension
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    errors.push(format!(
+        "{path} emits '{value}' into output '{output}' with valid_length '{valid_length}', but \
+         '{output}' declares padding whose valid_lengths {declared_padding} already says how much \
+         of it is real; a padded output has one account of its raggedness and it is the declared \
+         padding, which is the only one the caller receives, so drop the emit's valid_length"
+    ));
 }
 
 /// A packed result is only usable by whoever receives it if the companions that
