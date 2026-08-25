@@ -1084,8 +1084,9 @@ profile and are listed separately for that reason.
    is named as an `offsets` or `owner` of some other emitted value's layout — or
    as the `valid_lengths` of some other emitted value's `padding` entry — **in
    the same workflow**. No new `BatchLayout` variant, no new companion kind, and
-   the admission condition is decidable from the declared outputs alone. Anything else `shared` and rank > 0
-   is still rejected with the existing message.
+   the admission condition is decidable from the workflow's own declarations —
+   its outputs and its steps — with no runtime information. Anything else
+   `shared` and rank > 0 is still rejected with the existing message.
 
    **The admitted rank is the one the reference demands, not uniformly 1.** An
    `offsets` and an `owner` are rank 1 by construction (rule 4), so for them the
@@ -1123,6 +1124,16 @@ profile and are listed separately for that reason.
    correct package whose companion is written in a sibling branch of the emit. The
    weaker check catches the case that occurs — a companion nothing produces — and
    never rejects a package for a path it cannot prove is taken.
+
+   **Both sides of the condition read "emitted", and they must.** The obligation
+   requires the companion to be emitted; the carve-out requires the value that
+   *names* it to be emitted too. Asking one side for an emit and the other only
+   for a declaration would be two answers to one question (Rule 10), and the
+   weaker half is exploitable: declare a padded output beside any `shared` vector,
+   never write either, and the vector walks past the serving rule on the strength
+   of a payload that does not exist. An expectation therefore carries both the
+   declaration that claims the value and whether anything writes that
+   declaration.
 
    The runtime side of the carve-out: a companion is **never compacted and never
    split like a payload**. A `valid_lengths` companion needs no rebasing — a
