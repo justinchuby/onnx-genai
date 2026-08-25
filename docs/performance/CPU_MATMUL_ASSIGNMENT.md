@@ -3216,3 +3216,66 @@ Full report:
   already on main. What shipped is the corrected scope, the per-row route
   fingerprint, the bootstrap and A/A self-check, and the two scripts that make
   the matrix reproducible.
+
+## Which of this file's rows #1729 and #1794 actually invalidate (2026-08-25)
+
+A cross-agent note asked for **every `t>=8` row published before `6e8c31ebd`
+(#1729, 2026-08-23 01:11 UTC) to be re-taken**, on the grounds that the default
+decode pool put 16 workers on cpus 0-15 — 8 physical cores with both SMT
+siblings loaded. The premise is correct and it is the same defect this file
+found independently and filed as #1680 (§24). The blanket conclusion is too
+broad for the rows *here*, and the difference is decidable from the source
+rather than by re-measuring, so it was decided that way.
+
+Every multi-thread timing in §23 and §25 is `taskset`-pinned to the even CPUs
+(§24's closing note), and on this host SMT siblings are adjacent pairs (§22), so
+that mask is 16 CPUs that are already 16 distinct physical cores.
+
+**The spread half of #1729 is provably the identity on that mask.** Pre-#1729
+the shard builder used `allowed_cpus()` in raw ascending order; post-#1729 it
+routes through `order_pin_targets`, whose `Spread` arm is
+`leaders_within(cpus)` plus the non-leader remainder. On an all-even mask each
+core group contributes its single allowed member, so the leader set *is* the
+mask, the remainder is empty, and `leaders_within` returns it
+`sort_unstable()`-ed — the same ascending list. `build_decode_pool` pins worker
+`i` to `cpus[i % len]` either way. Same set, same order, same pins: **#1729's
+placement change cannot move a number taken under this pin.**
+
+**The reserve half is not the identity, and it bites at exactly one width.**
+`reserve_single_group_headroom(total, allowed, cores)` with `allowed = cores =
+16` returns `total.min(15)`, so on this mask:
+
+| explicit width | workers pre-#1729 | workers post-#1729 |
+|---|---|---|
+| 1, 2, 4, 8 | 1, 2, 4, 8 | 1, 2, 4, 8 (unchanged) |
+| 16 | 16 | **15** + a free core for the inline dispatcher |
+
+**#1794 (`0652fdd2e`) does not touch these rows at all.** It fixed
+`default_persistent_threads` returning `available / 2`, which on a 16-CPU pin
+built 8 workers on 16 reserved cores. Every sweep in §23/§25 sets
+`ONNX_GENAI_CPU_DECODE_THREADS` explicitly, and an explicit count bypasses the
+default entirely. The rows this defect *did* corrupt are pinned runs that left
+the width to the default — of which this file has none, because the pin and the
+explicit width were adopted together in §24.
+
+So the disposition is narrow: **`t=8` and below survive unchanged; `t=16` does
+not.** And the `t=16` row was already withheld for an entirely independent
+reason — its A/A null spans 0.969-1.295 (+-30%) against 3.6% at `t=1` and 2.8%
+at `t=8`, so it was never claimed. That is the second time this week a figure
+has been retired by two unrelated arguments at once (the other being the "71%
+of one core" at `t=2`), and it is worth noticing that in both cases the
+*independent* reason arrived first. Re-taking `t=16` needs the dispatcher
+reserve held constant across arms, not just the pin.
+
+**`t=2` is closed, by agreement between two methods that share no apparatus.**
+This file measured 20.447 ms/token at `=2` against 40.039 at `=1` — **1.96x**,
+0.6% A/A null, both workers 99% busy by per-thread attribution — on a quiet
+host on 2026-08-22. The runtime owner independently reports **1.94x / 97%
+efficiency** at `t=2` on a post-#1729 baseline. Two instruments, two sessions,
+~1% apart. No dispatch defect was ever there, and the withdrawn 71% is now
+over-determined.
+
+One standing caveat is *reinforced* rather than revised: `t=1` runs
+`path=flat` and `t>=2` runs `path=spmd-pool`, so a `t=1` vs `t=2` comparison
+crosses routes as well as widths. This file already reads that row as "vs
+serial" rather than "vs a one-worker pool" (§20), and that phrasing stands.
