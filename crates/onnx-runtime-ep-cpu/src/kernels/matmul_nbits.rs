@@ -20432,7 +20432,54 @@ mod tests {
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
-    /// Narrow this process to one CPU per physical core, in place.
+    /// Choose one allowed leader CPU per physical core, confined to one NUMA
+    /// node when the host exposes more than one.
+    ///
+    /// The single-node constraint is part of the fixture, not production
+    /// policy. A multi-node pool deliberately reserves one control CPU per node
+    /// so an unpinned dispatcher cannot strand a node's completion counter;
+    /// therefore `workers == cores` is not the contract of a fully subscribed
+    /// NUMA split. This test isolates the default-width resolver from that
+    /// independently tested reservation policy.
+    fn leader_cpus_for_default_width_fixture(
+        allowed: &[usize],
+        topology: &crate::core_topology::CoreTopology,
+        node_cpus: Option<&[usize]>,
+    ) -> Vec<usize> {
+        let eligible: Vec<usize> = match node_cpus {
+            Some(node_cpus) => allowed
+                .iter()
+                .copied()
+                .filter(|cpu| node_cpus.contains(cpu))
+                .collect(),
+            None => allowed.to_vec(),
+        };
+        topology.leaders_within(&eligible)
+    }
+
+    #[test]
+    fn default_width_fixture_keeps_only_allowed_leaders_from_one_numa_node() {
+        let topology = crate::core_topology::CoreTopology::from_sibling_groups([
+            vec![0, 1],
+            vec![2, 3],
+            vec![4, 5],
+            vec![6, 7],
+            vec![8, 9],
+            vec![10, 11],
+        ]);
+        // A partially reserved, non-contiguous process mask spanning two NUMA
+        // nodes. The fixture must neither widen the process mask nor retain
+        // leaders from the other node.
+        let allowed = [1, 2, 5, 6, 9, 10];
+        let node = [0, 1, 4, 5, 8, 9];
+        let leaders = leader_cpus_for_default_width_fixture(&allowed, &topology, Some(&node));
+        assert_eq!(leaders, vec![1, 5, 9]);
+        assert!(leaders.iter().all(|cpu| allowed.contains(cpu)));
+        assert!(leaders.iter().all(|cpu| node.contains(cpu)));
+    }
+
+    /// Narrow this process to one CPU per physical core on one NUMA node, in
+    /// place.
     ///
     /// This is what `taskset -c 0,2,4,...` does to a benchmark run, and it is
     /// the cpuset shape that #1780 got wrong: every allowed CPU is already a
@@ -20493,7 +20540,16 @@ mod tests {
                 return false;
             }
         };
-        let leaders = topology.leaders_within(&allowed);
+        let node_cpus = crate::decode_affinity::NumaTopology::detect().and_then(|numa| {
+            numa.restrict_to_allowed(Some(&allowed))
+                .cpus_for(
+                    &crate::decode_affinity::DecodeAffinity::Compact,
+                    allowed.len(),
+                )
+                .expect("compact NUMA selection cannot reject a valid topology")
+        });
+        let leaders =
+            leader_cpus_for_default_width_fixture(&allowed, topology, node_cpus.as_deref());
         if leaders.is_empty() {
             eprintln!(
                 "leader-only narrowing skipped: the detected topology covers none of the \
@@ -20847,13 +20903,17 @@ mod tests {
         );
     }
 
-    /// A pinned run that does not name a width must still use every core it
-    /// was given.
+    /// A single-node pinned run that does not name a width must still use every
+    /// core it was given.
     ///
     /// #1780: `taskset -c 0,2,4,...` hands the process a cpuset in which every
     /// allowed CPU is already a distinct physical core. A resolver that
     /// approximates the core count as `available / 2` then halves it, so the
     /// pool builds on half the cores that were deliberately reserved for it.
+    /// The child confines this fixture to one NUMA node because the multi-node
+    /// pool intentionally reserves one control CPU per node; grading that
+    /// independent policy as missing workers produced the deterministic
+    /// 92-vs-96 failure on a four-node, 96-core host.
     /// #1794 fixed the resolver and covered
     /// [`default_persistent_threads`] with unit tests over
     /// `(available, allowed_physical_cores)`.
@@ -20951,6 +21011,12 @@ mod tests {
              cores={} -- the restriction did not take, and the width assertion \
              below would be testing nothing",
             report.allowed, report.cores
+        );
+        assert_eq!(
+            report.nodes, 1,
+            "the default-width fixture must build one worker group so its exact \
+             workers == cores assertion is about width resolution, not NUMA's \
+             per-node dispatcher reservation ({report:?})"
         );
 
         assert_eq!(
