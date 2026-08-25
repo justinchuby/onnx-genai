@@ -1,22 +1,57 @@
-# Files permitted at the repository root, one per line.
+# Entries permitted at the repository root -- files and directories alike, one
+# per line, no trailing slash on directories.
 #
 # Every entry here is deliberate. The root is where scratch artefacts land,
 # because `git add -A` in a worktree you have been working in does not care
 # what a file is for, and a one-line addition at the root is invisible in a
-# large diff. Four have reached `main` this way:
+# large diff. Six have reached `main` this way. The list was built by walking
+# every root path ever added on main and subtracting the ones still here, not
+# by collecting the ones somebody reported:
 #
-#   .commitmsg/  removed by 490b846c3
-#   .commitmsg   re-added by #1881, removed by #1999
-#   .pris_v4.log 1364-line cargo transcript, #1951, removed by #1975
-#   .body.md     PR body for #2026, removed by the PR that added this file
+#   .msg.txt      39675330b, ~1.5h on main
+#   .wa64.log     83a51bfa6, ~17h
+#   .commitmsg/   faedea4d1, ~3m -- a DIRECTORY (.commitmsg/m.txt)
+#   .commitmsg    #1881, ~37h, removed by #1999
+#   .pris_v4.log  #1951, 1364-line cargo transcript, removed by #1975
+#   .body.md      #2026, PR body, removed by #2036
 #
 # Each was repaired by adding one more pattern to .gitignore, and each time the
 # next one was named outside every pattern. .body.md landed *after* two such
-# fixes, hours after both. Enumerating what belongs is the only form of this
-# check that does not need to predict the next filename.
+# fixes, hours after both, and the name it should have had (.pr-body.md) was
+# already ignored. Enumerating what belongs is the only form of this check that
+# does not need to predict the next name.
 #
-# To add a root file legitimately: add it here in the same PR. That is the
+# Directories are listed because .commitmsg/ is one of the six, and a check that
+# compares only files cannot see it: `.commitmsg/m.txt` contains a separator, so
+# a files-only filter discards it as "not at the root". #2036 shipped that gap
+# while citing that very instance in its own header.
+#
+# To add a root entry legitimately: add it here in the same PR. That is the
 # escape hatch, and unlike a label it leaves a permanent record of the decision.
+
+# Directories
+.agents
+.cargo
+.copilot
+.github
+.squad
+bench-scripts
+bench-seqmajor
+bench-tokenmajor
+benchmarks
+conformance
+crates
+docs
+examples
+python
+schema
+scripts
+specs
+tests
+wiki
+xtask
+
+# Files
 .gitattributes
 .gitignore
 .gitmodules

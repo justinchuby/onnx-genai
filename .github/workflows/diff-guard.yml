@@ -75,22 +75,38 @@ jobs:
           echo "::error::description what is being removed and why."
           exit 1
 
-  # A stray file at the repository root is the other change review reliably misses:
+  # A stray entry at the repository root is the other change review reliably misses:
   # not too large to read, but a single added line in a diff of hundreds, and the
-  # root is exactly where `git add -A` in a working tree picks up scratch. Four have
-  # reached `main` this way -- .commitmsg/ (490b846c3), .commitmsg (#1881, removed by
-  # #1999), .pris_v4.log (#1951, removed by #1975) and .body.md (#2026). Each repair
-  # added one more pattern to .gitignore, and each time the next file was named
-  # outside every pattern written for the previous one; .body.md landed hours after
-  # two such fixes. Enumerating what belongs is the only form of this check that does
-  # not have to predict the next filename.
+  # root is exactly where `git add -A` in a working tree picks up scratch.
+  #
+  # Six have reached `main`, found by walking every root path ever added and
+  # subtracting the ones still here (`git log --diff-filter=A --name-only`), rather
+  # than by collecting the ones somebody happened to report:
+  #
+  #   .msg.txt         39675330b  ~1.5h on main
+  #   .wa64.log        83a51bfa6   ~17h
+  #   .commitmsg/      faedea4d1    ~3m   <- a DIRECTORY, not a file
+  #   .commitmsg       #1881        ~37h  (removed by #1999)
+  #   .pris_v4.log     #1951        ~1.3h (removed by #1975)
+  #   .body.md         #2026        ~2.8h (removed by #2036)
+  #
+  # Each repair added one more pattern to .gitignore, and each time the next name
+  # fell outside every pattern written for the previous one -- .body.md landed hours
+  # after two such fixes, and its intended name .pr-body.md was already ignored.
+  # Enumerating what belongs is the only form of this check that does not have to
+  # predict the next name.
+  #
+  # This compares root *entries*, files and directories alike. #2036 compared files
+  # only, so `.commitmsg/m.txt` -- an instance its own header cited -- passed: the
+  # path has a separator, so it was filtered out as "not at the root". Naming an
+  # instance is not the same as testing its shape.
   root-files:
     name: Root file allowlist
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fail on root-level files that are not on the allowlist
+      - name: Fail on root-level entries that are not on the allowlist
         run: |
           set -euo pipefail
 
@@ -101,15 +117,19 @@ jobs:
             exit 1
           fi
 
-          # Tracked files at the repository root: no directory separator in the path.
+          # Every tracked path's first segment: a root file contributes itself, a
+          # nested file contributes its top-level directory. Comparing entries rather
+          # than files is what makes a stray directory visible -- `.commitmsg/m.txt`
+          # reached main and a files-only check cannot see it, because the only thing
+          # at the root is a name that never appears in `ls-files` output at all.
           #
           # core.quotePath=false because git's default renders a non-ASCII name in an
           # octal-escaped, quoted form ("caf\303\251.txt"). Under the default a
           # contributor who adds the real name to the allowlist -- the documented way
-          # to add a root file -- is told both that their file is unlisted and that
+          # to add a root entry -- is told both that their entry is unlisted and that
           # their entry is stale. The escape hatch has to work for the names people
           # actually use, not just for ASCII.
-          actual=$(git -c core.quotePath=false ls-files | { grep -v '/' || true; } | LC_ALL=C sort)
+          actual=$(git -c core.quotePath=false ls-files | sed 's#/.*##' | LC_ALL=C sort -u)
 
           # Strip CR (a CRLF checkout would otherwise mismatch every entry), then
           # surrounding whitespace, then comments and blanks. Trailing whitespace on
@@ -135,15 +155,21 @@ jobs:
 
           if [ -n "$unlisted" ]; then
             rc=1
-            echo "::error::Root-level file(s) not on the allowlist:"
-            printf '%s\n' "$unlisted" | while IFS= read -r f; do echo "::error::  $f"; done
-            echo "::error::If this is scratch: 'git rm --cached' it and add it to .gitignore."
+            echo "::error::Root-level entr(ies) not on the allowlist:"
+            printf '%s\n' "$unlisted" | while IFS= read -r f; do
+              if [ -d "$f" ]; then
+                echo "::error::  $f/   (directory)"
+              else
+                echo "::error::  $f"
+              fi
+            done
+            echo "::error::If this is scratch: 'git rm -r --cached' it and add it to .gitignore."
             echo "::error::If it belongs at the root: add it to $allow in this PR."
           fi
 
           if [ -n "$stale" ]; then
             rc=1
-            echo "::error::Allowlist entr(ies) for files not present at the root:"
+            echo "::error::Allowlist entr(ies) for names not present at the root:"
             printf '%s\n' "$stale" | while IFS= read -r f; do echo "::error::  $f"; done
             echo "::error::Remove them from $allow. A stale entry pre-approves that exact"
             echo "::error::filename, so an allowlist that outlives what it describes is not a"
@@ -152,6 +178,6 @@ jobs:
 
           if [ "$rc" -eq 0 ]; then
             n=$(printf '%s\n' "$allowed" | { grep -c . || true; })
-            echo "Root is exactly the $n allowlisted file(s)."
+            echo "Root is exactly the $n allowlisted entr(ies)."
           fi
           exit "$rc"
