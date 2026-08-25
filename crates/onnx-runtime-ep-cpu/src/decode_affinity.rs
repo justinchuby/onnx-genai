@@ -1492,6 +1492,14 @@ mod tests {
     #[test]
     fn a_successful_affinity_call_is_never_reported_as_an_unsupported_target() {
         let Some(allowed) = allowed_cpus() else {
+            // Reported, not silent. This test's only failure mode is a target
+            // that masks successfully while the flag says it cannot, so a run
+            // that never reached the call proves nothing -- and a bare `return`
+            // is indistinguishable in a log from a check that ran and passed.
+            eprintln!(
+                "skipping the masking-capability check: this target cannot report its allowed \
+                 CPU set, so there is no mask to re-apply"
+            );
             return;
         };
         // Re-applying the mask already in force: a no-op on success, and it
