@@ -463,6 +463,12 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "STFT"
+            && op.domain.is_empty()
+            && let Some(reason) = crate::kernels::stft::unsupported_dtype_reason(input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         // Attribute-level capability limits for the attention and MoE family.
         //
         // Every one of these mirrors a rejection its kernel factory raises, and
@@ -1363,6 +1369,44 @@ mod tests {
         assert!(reason.contains("registers Gelu since opset 20"), "{reason}");
 
         assert!(ep.supports_op(&gelu, 20, &[], &[], &[]).is_supported());
+    }
+
+    #[test]
+    fn stft_claims_only_the_kernel_compute_dtypes() {
+        let ep = CpuExecutionProvider::new();
+        let stft = Node::new(onnx_runtime_ir::NodeId(0), "STFT", vec![], vec![]);
+        for dtype in [DataType::Float32, DataType::Float16, DataType::BFloat16] {
+            assert!(
+                ep.supports_op(
+                    &stft,
+                    17,
+                    &[],
+                    &[dtype, DataType::Int64, DataType::Undefined, DataType::Int64],
+                    &[],
+                )
+                .is_supported(),
+                "{dtype:?} STFT should be claimed"
+            );
+        }
+
+        let rejected = ep.supports_op(
+            &stft,
+            17,
+            &[],
+            &[
+                DataType::Float64,
+                DataType::Int64,
+                DataType::Undefined,
+                DataType::Int64,
+            ],
+            &[],
+        );
+        assert!(!rejected.is_supported());
+        assert!(
+            rejected.reason().unwrap().contains("computes in f32"),
+            "{:?}",
+            rejected.reason()
+        );
     }
 
     #[test]
