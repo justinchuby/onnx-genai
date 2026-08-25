@@ -263,11 +263,10 @@ fn positive_scalar(name: &str, input: &TensorView<'_>) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kernels::dft::DFT_FFT_TEST_HITS;
+    use crate::kernels::dft::dft_fast_path_hits;
     use crate::kernels::testutil::Owned;
     use onnx_runtime_ep_api::TensorView;
     use onnx_runtime_ir::{Attribute, NodeId};
-    use std::sync::atomic::Ordering;
 
     fn node(onesided: i64) -> Node {
         let mut node = Node::new(NodeId(0), "STFT", vec![], vec![]);
@@ -353,16 +352,21 @@ mod tests {
         let signal = Owned::f32(&[1, 8, 1], &values);
         let step = Owned::i64(&[], &[2]);
         let length = Owned::i64(&[], &[4]);
-        let before = DFT_FFT_TEST_HITS.load(Ordering::Relaxed);
+        let before = dft_fast_path_hits();
         let output = execute(&signal, &step, None, Some(&length), 0, &[1, 3, 4, 2]).unwrap();
-        let after = DFT_FFT_TEST_HITS.load(Ordering::Relaxed);
+        let after = dft_fast_path_hits();
 
         let input: Vec<f64> = values.iter().map(|&value| value as f64).collect();
         assert_close(&output.to_f32(), &reference(&input, 1, 2, 4, None, false));
         assert_eq!(output.shape[1], 3, "the last eligible frame must be kept");
+        // `>=` rather than `==` because the counters are process-global and the
+        // suite runs in parallel: a concurrent transform can only inflate the
+        // delta, and inflation cannot mask the failure this guards (a frame
+        // dropping to the naive path *reduces* the count).
         assert!(
             after >= before + 3,
-            "each power-of-two frame must use the radix-2 FFT path"
+            "each power-of-two frame must take a DFT fast path rather than the naive \
+             O(n^2) transform (before={before}, after={after})"
         );
         // The middle frame starts at sample 2. A non-overlapping increment
         // would instead transform samples 4..8 and fail this comparison.
