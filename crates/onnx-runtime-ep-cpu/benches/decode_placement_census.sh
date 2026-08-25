@@ -38,8 +38,11 @@
 # gives the ORT arm the same CPUs at each width, so the comparison is symmetric
 # -- but "twice the threads" is not all that changes.
 set -u
-SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-cd "$(dirname "$0")/../../.." || exit 1
+# `readlink -f` rather than `$0`, because both the re-exec target below and
+# the `cd` on the next line have to resolve to the real tree: invoked through
+# a symlink outside the repo, `dirname "$0"/../../..` names the wrong root.
+SELF=$(readlink -f "$0")
+cd "$(dirname "$SELF")/../../.." || exit 1
 
 # Take the host lock once, for the whole census, by re-executing under it.
 #

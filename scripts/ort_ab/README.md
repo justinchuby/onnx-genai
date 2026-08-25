@@ -532,11 +532,28 @@ directory is a benchmark until its author writes down that it is not.
 Custody is read from the **subcommand**, the word after `hostlock.sh`, not
 from the script's name appearing anywhere in the file. `status`, `provenance`,
 `wait` and `release` all name it without claiming the host; `run` and
-`acquire` take it. Comments are stripped first, and in the fail-closed
-direction — `${x#-}` and `$#` survive, a `#` inside an odd number of quotes
-survives, and anything the stripper gets wrong can only *lose* an acquisition
-and report a gated file as ungated, which costs a ledger line rather than a
-silent pass.
+`acquire` take it. Two things happen before that read, and both exist because
+the first version of this check was **fail-open** — which is the direction that
+matters, since a categorical rule *exempts* whatever it reads as gated, so a
+false positive is a silent pass with no ledger line:
+
+- Comments, heredoc bodies and multi-line quoted strings are blanked. Usage
+  text is a thoroughly plausible thing for a bench script to print, and
+  `echo "run this under: scripts/hostlock.sh run -- $0"` certified a file that
+  called nothing. `${x#-}`, `$#` and `a#b` survive, because a `#` only opens a
+  comment at the start of a word.
+- The match must be in **command position** — start of line or after
+  `;`, `|`, `&`, `(`, `)`, `{`, `}`, past any `VAR=` assignments and any of
+  `exec`, `env`, `sudo`, `then`, `do`. Single-line quoted regions are kept
+  verbatim on purpose, because a quoted word is frequently the command itself
+  (`exec "$ROOT/scripts/hostlock.sh" run`), and deciding path-versus-prose is
+  this test's job rather than the blanking pass's.
+
+What none of it sees is deliberate indirection — `eval`, the subcommand held
+in a variable, a `$LOCK` alias. That edge stays fail-open and cannot be closed
+by reading source; it is the same edge the Python side documents for
+`getattr(subprocess, "run")`, and it is why the ledger is a reviewed file and
+not only a program.
 
 Both properties came from real files. `decode_placement_census.sh` carried the
 sentence *"it still runs under the hostlock as a courtesy to whoever is
@@ -555,7 +572,10 @@ core for minutes *before* the binary starts, so a lock taken there covers the
 cheap half of the run. What must hold it is the invocation, which makes that a
 documentation-conformance check on `benches/README.md` — a different check
 with a different failure mode, and a separate change rather than one bolted on
-here.
+here. The thirteen target **names** are pinned in the meantime, so a
+fourteenth cannot be added silently while none of them gates: adding one fails
+the conformance check and forces the decision to be taken on #2129 rather than
+by default.
 
 ### Where the lock lives
 
