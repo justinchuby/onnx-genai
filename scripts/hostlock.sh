@@ -147,6 +147,11 @@
 #     1 because a misconfigured or unwritable host is not a bad argument and
 #     must not be retried as one, and separate from 2 and 3 because those two
 #     assert a peer holds the box. See lock_dir_problem.
+#   8 unsupported platform -- not Linux, or /proc is unreadable, so process
+#     liveness cannot be established at all. Separate from 7: a usable lock
+#     directory is not the problem, the host is. No lock is ever taken on this
+#     path, so the caller can treat it as "this box cannot participate" rather
+#     than as contention. See require_supported_platform.
 #
 # `run` otherwise does NOT use this table: it returns the wrapped command's
 # own status, so a command exiting 5 is indistinguishable from a gate failure.
@@ -278,6 +283,47 @@ die() {
     echo "hostlock: $*" >&2
     exit 1
 }
+
+# Refuse a platform this script cannot make its liveness claims on.
+#
+# The PORTABILITY note above says Linux only. Until now that was a comment,
+# and a comment does not stop anything: on a host without /proc every
+# `proc_start_time` call returns empty, so every lock would be published with
+# an empty `start_time` and the whole file would run permanently in the
+# degraded no-start_time mode -- the grace-window path meant for the rare
+# unreadable anchor, silently promoted to the normal case. That mode cannot
+# tell a recycled pid from the original, which is the one error this script
+# must never make. Failing is strictly better than holding a lock that cannot
+# be trusted, so this is a hard refusal with its own exit code rather than a
+# warning.
+#
+# The probe is a capability check, not a name check: `uname` says Linux on
+# WSL, which is genuinely fine, and a stripped container without /proc says
+# Linux while being unusable. Both are decided correctly by asking whether the
+# files this script actually reads are there.
+#
+# Windows (git-bash reports MINGW64_NT) and macOS (Darwin) therefore exit 8
+# with a message naming the missing capability, rather than failing later and
+# obscurely inside an arithmetic or `stat -c` error.
+require_supported_platform() {
+    local sys
+    sys=$(uname -s 2>/dev/null || echo unknown)
+    case "$sys" in
+        Linux) ;;
+        *)
+            echo "hostlock: unsupported platform '${sys}' -- this lock needs" \
+                 "Linux /proc for its liveness claims, and degrading them" \
+                 "would let it reap a live holder. No lock was taken." >&2
+            exit 8
+            ;;
+    esac
+    if [ ! -r /proc/self/stat ] || [ ! -r /proc/loadavg ]; then
+        echo "hostlock: /proc is not readable on this host, so process" \
+             "liveness cannot be verified. No lock was taken." >&2
+        exit 8
+    fi
+}
+require_supported_platform
 
 # WHERE THE LOCK LIVES, and why it is not simply $TMPDIR or simply a constant.
 #
@@ -566,6 +612,81 @@ meta_get() {
     [ -f "$META" ] || return 1
     grep -q "^$1=" "$META" 2>/dev/null || return 1
     sed -n "s/^$1=//p" "$META" | head -1
+}
+
+# Flatten a value so it cannot forge metadata.
+#
+# The store is one `key=value` per line and `meta_get` takes the FIRST match,
+# so a newline inside an operator-supplied value does not corrupt the file --
+# it *appends fields*, and any key written after the injection point wins over
+# the real one. Measured before this existed:
+#
+#   --reason $'x\nttl=999999'   with --ttl 5   ->   status reports ttl=999999
+#
+# `ttl` is not decoration: `holder_expired` reads it, so a reason string could
+# make a lock outlive its own declared expiry while every report looked
+# ordinary. `takeover`, `gate`, `runnable_at_acquire` and `acquired_epoch` sit
+# after `reason` too, and those are exactly the fields harnesses now copy into
+# published results as provenance -- a forged one is a benchmark row claiming
+# a quiet uncontended host it never had.
+#
+# The safety-critical anchor fields (`anchor_pid`, `start_time`, `anchor_uid`)
+# were never exposed, because they are written before any operator value and
+# first-match wins. So this is a provenance and expiry defect, not a way to
+# steal a lock -- which is the only reason it is a bug fix and not an
+# emergency.
+#
+# Newlines become spaces rather than being deleted, so a pasted multi-line
+# reason stays readable instead of silently welding two words together, and
+# NULs and CRs are dropped outright.
+meta_value() {
+    printf '%s' "$1" | tr -d '\000\r' | tr '\n' ' '
+}
+
+# The repo checkout the holder is working in.
+#
+# Several worktrees of this repo share one machine and therefore one lock, so
+# "who holds it" is only half an answer -- `owner=roy` does not say which tree
+# is being benchmarked, and the reason string is prose the operator typed
+# rather than an observed fact. This is observed.
+holder_worktree() {
+    local top
+    # Bounded, because this runs inside publish_lock's stage-and-rename
+    # critical section. `git rev-parse` is local and fast normally, but it
+    # walks parent directories looking for .git, and on a stalled NFS/FUSE
+    # mount that walk blocks without ever returning an exit code -- leaving a
+    # staging directory created and never published, by a process that cannot
+    # be reaped because the lock does not exist yet. A descriptive field is
+    # never worth that, so it gets two seconds and then we fall back.
+    top=$(timeout 2 git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) || top=""
+    [ -n "$top" ] || top="$PWD"
+    printf '%s' "$top"
+}
+
+# The command actually holding the lock.
+#
+# `run` knows its wrapped command exactly and sets HOLDER_CMD. `acquire`
+# anchors to the invoking shell, so the best available answer is that shell's
+# own argv, read from /proc -- NUL-separated, hence the tr. Either way this is
+# what is running, not what the operator said was running: a reason of "quick
+# smoke test" attached to a four-hour matrix is precisely the drift worth
+# catching, and it is the same argument as recording realized placement rather
+# than trusting a width label.
+#
+# This records argv, so do not put secrets on a benchmark command line. That
+# was already true of `ps` on a shared box -- every agent here runs as the same
+# unix user -- but this writes it to a file that outlives the process, so it is
+# worth saying rather than discovering.
+holder_cmd() {
+    if [ -n "${HOLDER_CMD:-}" ]; then
+        printf '%s' "$HOLDER_CMD"
+        return 0
+    fi
+    local c=""
+    if [ -n "${ANCHOR_PID:-}" ] && [ -r "/proc/${ANCHOR_PID}/cmdline" ]; then
+        c=$(tr '\000' ' ' <"/proc/${ANCHOR_PID}/cmdline" 2>/dev/null)
+    fi
+    printf '%s' "$c"
 }
 
 # Update one key in the metadata of a lock we hold.
@@ -921,8 +1042,10 @@ publish_lock() {
         echo "start_time=${start}"
         echo "anchor_uid=${uid}"
         echo "script_pid=$$"
-        echo "owner=${OWNER}"
-        echo "reason=${REASON}"
+        echo "owner=$(meta_value "${OWNER}")"
+        echo "reason=$(meta_value "${REASON}")"
+        echo "worktree=$(meta_value "$(holder_worktree)")"
+        echo "cmd=$(meta_value "$(holder_cmd)")"
         echo "acquired_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "acquired_epoch=$(date +%s)"
         echo "ttl=${TTL}"
@@ -1084,6 +1207,7 @@ remove_lock_if_mine() {
 # expectation the field is `unknown`, which is a fact, unlike a guess.
 cmd_provenance() {
     local state owner pid age reason takeover gate r r_acq contended uid legacy
+    local holder_wt=unknown holder_cl=unknown
     state=$(lock_state)
     r=$(runnable_now)
     legacy=$(legacy_holder) || legacy=""
@@ -1116,6 +1240,10 @@ cmd_provenance() {
         # describes. Emitting both lets a reader bracket the measurement for
         # the cost of one line.
         r_acq=$(meta_get runnable_at_acquire) || r_acq=unknown
+        # Absent on locks published before these fields existed. `unknown` is
+        # the honest answer; `none` would assert the holder was in no worktree.
+        holder_wt=$(meta_get worktree) || holder_wt=unknown
+        holder_cl=$(meta_get cmd) || holder_cl=unknown
     fi
     contended=unknown
     if [ -n "$EXPECT_RUNNABLE" ]; then
@@ -1166,6 +1294,11 @@ cmd_provenance() {
     else
         printf '%s\n' "${fields[@]}"
         printf 'reason=%s\n' "${reason:-}"
+        # Same rule as `reason`, for the same reason: a path can contain
+        # spaces and a command almost always does, so neither is safe among
+        # space-separated fields. One per line, newline-delimited.
+        printf 'held_worktree=%s\n' "${holder_wt:-unknown}"
+        printf 'held_cmd=%s\n' "${holder_cl:-unknown}"
     fi
 }
 
@@ -1227,6 +1360,10 @@ cmd_status() {
             echo "owner=$(meta_get owner || echo '?')"
             echo "anchor_pid=$(meta_get anchor_pid || echo '?')"
             echo "reason=$(meta_get reason || echo '')"
+            # `unknown` rather than empty for locks published before these
+            # fields existed: empty would read as "held from no worktree".
+            echo "worktree=$(meta_get worktree || echo 'unknown')"
+            echo "cmd=$(meta_get cmd || echo 'unknown')"
             echo "ttl=$(meta_get ttl || echo 0)"
             echo "age=$(lock_age)"
         fi
@@ -1492,6 +1629,7 @@ run_teardown() {
 
 cmd_run() {
     [ "$#" -gt 0 ] || die "run needs a command after --"
+    HOLDER_CMD="$*"
     DO_WAIT=1
     cmd_acquire || return $?
 
