@@ -75,13 +75,54 @@ jobs:
           # Only an explicit, fully-classified all-docs diff flips it to true.
           docs_only=false
 
+          # A file whose bytes are compiled into an artifact is source, whatever
+          # its extension. `include_str!`/`include_bytes!` make a markdown file
+          # part of the build, so a docs-only edit to one can break `cargo test`
+          # while classifying as docs and skipping the very checks that would
+          # catch it (#2077: renaming an HTML comment marker in
+          # docs/genai/INFERENCE_METADATA_DECISIONS.md panics
+          # capability_catalogue.rs, and dropping a table row fails its
+          # assert_eq -- both are pure markdown edits).
+          #
+          # Derived by scanning rather than listed, so it cannot go stale when a
+          # third embed is added (Rule 10). Only literal-path embeds are visible;
+          # a computed path (concat!/env!) is not, and stays classified as docs.
+          embed_scan_ok=true
+          embed_hits=""
+          # Assignment inside `if` so a no-match (rc 1) cannot trip `bash -e`.
+          # A dead `changes` job would SKIP fast-linux and rust-quality, and a
+          # skipped required check satisfies the ruleset -- failing here must
+          # never be quieter than failing loudly.
+          if embed_hits="$(git grep -I -n -oE 'include_(str|bytes)!\s*\(\s*"[^"]+"' -- '*.rs' 2>/dev/null)"; then
+            :
+          else
+            [ $? -eq 1 ] || embed_scan_ok=false
+          fi
+          embedded=""
+          if [ "$embed_scan_ok" = true ] && [ -n "$embed_hits" ]; then
+            embedded="$(
+              printf '%s\n' "$embed_hits" | while IFS= read -r hit; do
+                [ -z "$hit" ] && continue
+                src="${hit%%:*}"
+                target="${hit#*\"}"
+                target="${target%\"}"
+                realpath -m --relative-to="$PWD" "$(dirname "$src")/$target"
+              done | LC_ALL=C sort -u
+            )"
+          fi
+
           is_docs_path() {
             case "$1" in
               docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
-                return 0 ;;
+                ;;
               *)
                 return 1 ;;
             esac
+            # Compiled into an artifact => source, not docs.
+            if [ -n "$embedded" ] && printf '%s\n' "$embedded" | grep -qxF -- "$1"; then
+              return 1
+            fi
+            return 0
           }
 
           files=""
@@ -100,7 +141,10 @@ jobs:
               ;;
           esac
 
-          if [ -n "$files" ]; then
+          if [ "$embed_scan_ok" != true ]; then
+            echo "embedded-file scan failed; classifying as code (fail closed)"
+            docs_only=false
+          elif [ -n "$files" ]; then
             docs_only=true
             while IFS= read -r f; do
               [ -z "$f" ] && continue
