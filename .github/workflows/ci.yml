@@ -319,7 +319,13 @@ jobs:
       # `set -e`; the `test -n` covers a resolver that succeeds but prints
       # nothing. `verify` cannot catch this: it never reads this file, so a
       # lane name here that the resolver does not know stays invisible to it.
+      # `shell: bash` is required, not cosmetic: these steps also run on the
+      # Windows lanes, where the default shell is pwsh, and `set -e` plus
+      # `test -n` are bash semantics. The inline form happened to work under
+      # both shells only because the resolver prints one token per line, which
+      # pwsh splats as an argument array -- an accident, not a contract.
       - name: Test Linux offline crates
+        shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
           test -n "$packages" || { echo "::error::lane 'offline-linux' resolved to an empty package set"; exit 1; }
@@ -768,6 +774,7 @@ jobs:
         run: cargo build --locked -p onnx-runtime-ep-cpu-plugin --features mlas
 
       - name: Test cross-platform offline crates with coverage
+        shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
@@ -784,6 +791,7 @@ jobs:
       # validates that the native build script stays MSVC-compatible.
       - name: Test Linux-only offline crates with coverage
         if: runner.os == 'Linux'
+        shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
           test -n "$packages" || { echo "::error::lane 'linux-only' resolved to an empty package set"; exit 1; }
@@ -858,6 +866,7 @@ jobs:
       # offline crates is already reported by x64/macOS lanes, and ARM64
       # instrumentation owned the critical path.
       - name: Test cross-platform offline crates
+        shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-cross-platform)"
           test -n "$packages" || { echo "::error::lane 'offline-cross-platform' resolved to an empty package set"; exit 1; }
@@ -1074,6 +1083,7 @@ jobs:
       # Serialize because several integration tests temporarily select sessions
       # through process-wide environment variables.
       - name: Test ORT-backed workspace crates
+        shell: bash
         run: |
           packages="$(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)"
           test -n "$packages" || { echo "::error::lane 'ort-backed' resolved to an empty package set"; exit 1; }
