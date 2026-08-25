@@ -123,3 +123,19 @@ roy_validate.log
 # root deliberately -- /tmp is off-limits here -- and an aborted run leaves them)
 .hostlock-selftest*
 .scratch-paged/
+
+# Leon's PR-prep scratch: PR bodies, review responses, merge-gate logs and
+# mutation-battery drivers, written into a worktree root because /tmp is
+# off-limits here. `.body.md` reached main this way in #2026 -- `git add -A`
+# does not distinguish a dotfile at the root from repo content, and a name
+# like `.body.md` looks plausible enough in `git status` to skim past.
+.leon_*
+.body.md
+.resp*.md
+.prbody*.md
+# Root-anchored: these four are ordinary nouns, and a nested crate or fixture
+# could reasonably want one. The scratch only ever lands in a worktree root.
+/.merge.log
+/.mutate*
+/.suite.log
+/.selftest.log
