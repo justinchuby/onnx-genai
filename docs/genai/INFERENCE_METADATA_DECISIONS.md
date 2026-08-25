@@ -985,7 +985,8 @@ emitted value of rank > 0 that declares `shared`
 (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`), which would reject
 the very companions a ragged emit is required to publish — a packed value's
 `offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
-minimal and decidable from the declared outputs alone: a `shared` emitted value
+minimal and decidable from the workflow's own declarations — its outputs and its
+steps, with no runtime information: a `shared` emitted value
 is admitted **iff** it is `int64`, carries the rank that reference demands, and
 is named as an `offsets` or `owner` of another emitted value's layout, or as the
 `valid_lengths` of another emitted value's `padding` entry, in the same workflow;
@@ -995,12 +996,15 @@ not fixed at 1: an `offsets` and an `owner` are rank 1 by construction, while a
 fixes — the number of axes outer to the padded one — so a flat rank-1 admission
 would refuse a companion this design elsewhere requires, and would refuse it by
 advising the one layout a companion may not declare. A companion must also be
-**emitted**, not merely declared: an output no step writes is an empty vector
-beside a ragged payload, which is this rule's failure case wearing the appearance
-of compliance. That check is whole-workflow rather than path-sensitive, because
-"written by some declared step" is what is decidable without evaluating branch
-predicates. A companion is never compacted and never split like a payload — each
-request receives its own span plus **rebased**, zero-based offsets for that span,
+**emitted**, not merely declared, and so must the value that names it: an output
+no step writes is an empty vector beside a ragged payload, which is this rule's
+failure case wearing the appearance of compliance, and asking for an emit on one
+side while accepting a bare declaration on the other lets a `shared` vector walk
+past the serving rule beside a padded output nothing writes. That check is
+whole-workflow rather than path-sensitive, because "written by some declared
+step" is what is decidable without evaluating branch predicates. A companion is
+never compacted and never split like a payload — each request receives its own
+span plus **rebased**, zero-based offsets for that span,
 and the slice of any `valid_lengths` that indexes its own items, which needs no
 rebasing because a length is already relative to what it measures. A declared
 `owner` output is **internal**: it must be declared so the workflow validates and
