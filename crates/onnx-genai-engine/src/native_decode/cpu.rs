@@ -484,7 +484,13 @@ impl NativeDecodeSession {
                     .iter()
                     .find(|meta| &meta.name == past)
                     .is_some_and(|meta| is_recurrent_state_shape(&meta.shape));
-                if !recurrent {
+                // CompressedSparseAttention record buffers (compressed_kv /
+                // index_key) also skip the token-rate check: their growth axis
+                // is a backend-owned compressed-record cursor (~tokens / ratio),
+                // not the token count, and the ABI declares this because it is
+                // not inferable from the tensor shape alone.
+                let csa_record = self.csa_present_outputs.contains(&metadata.name);
+                if !recurrent && !csa_record {
                     let seq_axis = tensor.shape.len().checked_sub(2).with_context(|| {
                         format!("native present tensor '{}' rank is below 2", metadata.name)
                     })?;

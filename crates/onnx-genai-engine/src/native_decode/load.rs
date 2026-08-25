@@ -647,6 +647,7 @@ impl NativeDecodeSession {
         // free. A schedule that alternates ratio-4 and ratio-128 layers declares
         // one group per layer; absent means the graph threads no CSA state and
         // ordinary inference is byte-identical.
+        let mut csa_present_outputs: HashSet<String> = HashSet::new();
         if let Some(groups) = io.and_then(|io| io.csa_state_groups.as_ref()) {
             let occupied: HashSet<&str> = kv_inputs
                 .iter()
@@ -660,6 +661,7 @@ impl NativeDecodeSession {
                 &occupied,
             )?;
             for (past_input, present_output) in csa_edges {
+                csa_present_outputs.insert(present_output.clone());
                 kv_inputs.push(past_input.clone());
                 present_outputs.push(present_output.clone());
                 state_pairs.push((present_output, past_input));
@@ -940,6 +942,7 @@ impl NativeDecodeSession {
             hidden_output,
             kv_inputs,
             present_to_past,
+            csa_present_outputs,
             past: HashMap::new(),
             cuda,
             cpu_kv,

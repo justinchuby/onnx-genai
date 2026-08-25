@@ -113,6 +113,19 @@ pub struct NativeDecodeSession {
     hidden_output: Option<String>,
     kv_inputs: Vec<String>,
     present_to_past: HashMap<String, String>,
+    /// Present-output ports of resolved CSA/HCA state groups whose growth axis
+    /// is a backend-owned compressed-record cursor, not the token count.
+    ///
+    /// A growable KV cache present output has its sequence axis equal to the
+    /// running token length (`past_len + tokens`), which the CPU decode path
+    /// asserts to catch a mis-bound cache. A CompressedSparseAttention record
+    /// buffer (`compressed_kv`, `index_key`) instead grows by roughly
+    /// `tokens / compression_ratio` records — a cursor the op owns and the ABI
+    /// declares is not inferable from the token count. Those present outputs are
+    /// listed here so the token-rate length check skips them; they are threaded
+    /// present->past by name like any other state pair. Empty for a model with
+    /// no CSA state, so ordinary decoders are unaffected.
+    csa_present_outputs: HashSet<String>,
     past: HashMap<String, Tensor>,
     cuda: Option<DecodeCudaState>,
     cpu_kv: Option<DecodeCpuKvState>,
@@ -443,6 +456,36 @@ impl NativeDecodeSession {
             .collect()
     }
 
+    /// Past-input names of the CSA/HCA compressed-record buffers
+    /// (`past_compressed_kv.*`, `past_index_key.*`).
+    ///
+    /// These are the CSA present->past targets whose growth axis is the
+    /// backend-owned compressed-record cursor (a dynamic penultimate axis),
+    /// i.e. every CSA state input that is *not* a fixed-size carry (the carries
+    /// have a static penultimate axis and are already covered by
+    /// [`Self::recurrent_past_names`]). They are append-only but advance at the
+    /// per-layer compression rate (~tokens/ratio), so they cannot be
+    /// token-prefix-sliced like a dense KV cache; a rewind restores them from a
+    /// snapshot instead. Empty for a graph with no CSA state.
+    fn csa_record_past_names(&self) -> HashSet<String> {
+        let mut names = HashSet::new();
+        for present in &self.csa_present_outputs {
+            let Some(past) = self.present_to_past.get(present) else {
+                continue;
+            };
+            let is_record = self
+                .session
+                .inputs()
+                .iter()
+                .find(|meta| &meta.name == past)
+                .is_some_and(|meta| !is_recurrent_state_shape(&meta.shape));
+            if is_record {
+                names.insert(past.clone());
+            }
+        }
+        names
+    }
+
     pub(crate) fn has_recurrent_state(&self) -> bool {
         !self.recurrent_past_names().is_empty()
     }
@@ -523,13 +566,18 @@ impl NativeDecodeSession {
                  recurrent decoders keep their loop-carried state in the host past map"
             );
         }
-        let recurrent = self.recurrent_past_names();
-        let mut host = HashMap::with_capacity(recurrent.len());
-        for name in &recurrent {
+        // Fixed-size conv/SSM carries AND the CSA compressed-record buffers are
+        // all destructive/append-only state the ordinary token prefix-slice
+        // cannot rewind, so both are captured here and restored wholesale on
+        // rollback. The CSA carries are already in `recurrent_past_names`
+        // (static penultimate axis); the compressed-record buffers advance on
+        // the compression cursor and are added explicitly.
+        let mut snapshot_names = self.recurrent_past_names();
+        snapshot_names.extend(self.csa_record_past_names());
+        let mut host = HashMap::with_capacity(snapshot_names.len());
+        for name in &snapshot_names {
             let tensor = self.past.get(name).with_context(|| {
-                format!(
-                    "recurrent state '{name}' is not materialized yet; snapshot it after a step"
-                )
+                format!("state '{name}' is not materialized yet; snapshot it after a step")
             })?;
             host.insert(
                 name.clone(),
@@ -1096,6 +1144,21 @@ impl NativeDecodeSession {
         self.restore_recurrent_state(&snapshot.0)
     }
 
+    /// Speculative rollback for a compressed-state (CSA/HCA) or recurrent
+    /// decoder: rewind the dense KV to `base_len`, restore the snapshotted
+    /// conv/SSM carries and CSA compressed-record buffers, then deterministically
+    /// re-advance by exactly `accepted_tokens` (empty = roll fully back to the
+    /// snapshot). See [`Self::commit_recurrent_state_to_accepted`]. The snapshot
+    /// must have been taken at `base_len`.
+    pub fn rollback_recurrent_to_accepted(
+        &mut self,
+        snapshot: &NativeRecurrentSnapshot,
+        base_len: usize,
+        accepted_tokens: &[TokenId],
+    ) -> anyhow::Result<()> {
+        self.commit_recurrent_state_to_accepted(&snapshot.0, base_len, accepted_tokens)
+    }
+
     /// Batch-N greedy decode step (stage 2b-impl-4, #750). Steps the pinned
     /// `batch` sequences together — one token per sequence — and returns the
     /// `batch` selected token ids. Requires a CUDA decode session pinned at the
@@ -1358,7 +1421,31 @@ impl NativeDecodeSession {
     }
 
     /// Rewind by prefix-slicing every carried host KV tensor.
+    ///
+    /// A CSA/HCA compressed-record cache cannot be prefix-sliced to an
+    /// arbitrary non-zero token boundary (its cursor advances at the per-layer
+    /// compression rate and its compressor carry is not reconstructible mid
+    /// block), so a bare rewind to a non-zero length with CSA state present is
+    /// a typed refusal rather than a silent corruption. `rewind(0)` (a full
+    /// teardown via [`Self::reset`]) always clears it, and a speculative
+    /// rollback threads the compressed state through
+    /// [`Self::rollback_recurrent_to_accepted`] (snapshot -> draft ->
+    /// restore + re-advance).
     pub fn rewind(&mut self, target_len: usize) -> anyhow::Result<()> {
+        if target_len > 0 {
+            let csa = self.csa_record_past_names();
+            if !csa.is_empty() {
+                let mut names: Vec<String> = csa.into_iter().collect();
+                names.sort();
+                bail!(
+                    "native CompressedSparseAttention state cannot be prefix-rewound to a \
+                     non-zero length {target_len}: its compressed-record cache advances on a \
+                     backend-owned cursor (~tokens/ratio) with a compressor carry that is not \
+                     reconstructible at an arbitrary token boundary. Use reset() (rewind to 0), \
+                     or a snapshot/rollback speculative rollback. Compressed buffers: {names:?}"
+                );
+            }
+        }
         self.rewind_inner(target_len)
     }
 
