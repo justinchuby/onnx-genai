@@ -972,6 +972,32 @@ impl Drop for DeviceIoBinding {
 }
 
 impl Tensor {
+    pub(crate) fn copy_from_device_buffer(
+        source_allocator: &Arc<dyn ExecutionProvider>,
+        source: &DeviceBuffer,
+        dtype: DataType,
+        shape: Vec<usize>,
+    ) -> Result<Self> {
+        let mut tensor = Self::allocate_cpu(dtype, shape)?;
+        let destination = tensor.buffer.as_mut().ok_or_else(|| {
+            SessionError::Internal("new host output tensor has no backing buffer".into())
+        })?;
+        if source.len() != destination.len() {
+            return Err(SessionError::Internal(format!(
+                "device output has {} bytes but its host tensor allocation has {}",
+                source.len(),
+                destination.len()
+            )));
+        }
+        // SAFETY: `allocate_cpu` returned a live host-accessible allocation,
+        // exclusively borrowed here, with exactly `destination.len()` bytes.
+        let host = unsafe {
+            std::slice::from_raw_parts_mut(destination.as_mut_ptr().cast::<u8>(), destination.len())
+        };
+        source_allocator.copy_to_host(source, host)?;
+        Ok(tensor)
+    }
+
     pub(crate) fn allocate_cpu(dtype: DataType, shape: Vec<usize>) -> Result<Self> {
         let numel = shape.iter().try_fold(1usize, |product, &dim| {
             product.checked_mul(dim).ok_or_else(|| {

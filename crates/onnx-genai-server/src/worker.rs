@@ -15,8 +15,10 @@
 //! shape exists so a session can name the worker that owns its KV state, which
 //! is the fact a second worker would need and the current code cannot express.
 use std::{
+    any::Any,
     fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    panic::{self, AssertUnwindSafe},
+    sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc as std_mpsc},
     thread,
 };
 
@@ -62,7 +64,7 @@ impl fmt::Display for WorkerId {
 /// never travels alone. Carrying the pair means a later turn is routed back to
 /// the thread that holds the conversation's KV state instead of being sent to
 /// whichever worker answers first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionPlacement {
     /// The worker that owns this session.
     pub(crate) worker: WorkerId,
@@ -109,6 +111,51 @@ impl fmt::Display for WorkerUnavailable {
 
 impl std::error::Error for WorkerUnavailable {}
 
+/// Why an engine worker could not become ready.
+#[derive(Debug)]
+pub(crate) enum WorkerStartError<E> {
+    /// The worker thread could not be created.
+    ThreadSpawn(std::io::Error),
+    /// The worker thread ran the supplied initialization plan, which failed.
+    Initialization(E),
+    /// Initialization panicked after the worker thread started.
+    InitializationPanicked(String),
+    /// The worker exited without reporting either readiness or an error.
+    InitializationChannelClosed,
+}
+
+impl<E: fmt::Display> fmt::Display for WorkerStartError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ThreadSpawn(error) => write!(formatter, "failed to spawn engine worker: {error}"),
+            Self::Initialization(error) => {
+                write!(formatter, "engine worker initialization failed: {error}")
+            }
+            Self::InitializationPanicked(message) => {
+                write!(
+                    formatter,
+                    "engine worker initialization panicked: {message}"
+                )
+            }
+            Self::InitializationChannelClosed => formatter
+                .write_str("engine worker exited before reporting its initialization result"),
+        }
+    }
+}
+
+impl<E> std::error::Error for WorkerStartError<E>
+where
+    E: std::error::Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ThreadSpawn(error) => Some(error),
+            Self::Initialization(error) => Some(error),
+            Self::InitializationPanicked(_) | Self::InitializationChannelClosed => None,
+        }
+    }
+}
+
 /// One engine-owning thread, its command channel, and its `JoinHandle`.
 ///
 /// Held behind an `Arc` so every clone of the driver addresses the same thread.
@@ -128,30 +175,61 @@ pub(crate) struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    /// Spawn the worker thread that will own the engine.
+    /// Spawn a worker, initialize its thread-affine state there, and wait until
+    /// it reports ready.
     ///
-    /// `run` receives nothing and returns nothing on purpose: everything it
-    /// needs — the engine, the command receiver — is moved into it by the
-    /// caller, because that move is the point at which the engine becomes
-    /// thread-affine.
-    pub(crate) fn spawn<F>(
+    /// `State` has no `Send` bound: it is created and consumed inside the new
+    /// thread and therefore cannot cross the spawn boundary. Only the
+    /// construction plan and the small `Ready` payload cross threads.
+    pub(crate) fn spawn<State, Ready, Error, Initialize, Run>(
         id: WorkerId,
         thread_name: String,
         commands: mpsc::Sender<DriverCommand>,
-        run: F,
-    ) -> Arc<Self>
+        initialize: Initialize,
+        run: Run,
+    ) -> Result<(Arc<Self>, Ready), WorkerStartError<Error>>
     where
-        F: FnOnce() + Send + 'static,
+        Ready: Send + 'static,
+        Error: Send + 'static,
+        Initialize: FnOnce() -> Result<(State, Ready), Error> + Send + 'static,
+        Run: FnOnce(State) + Send + 'static,
     {
+        if thread_name.as_bytes().contains(&0) {
+            return Err(WorkerStartError::ThreadSpawn(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker thread name contains an interior NUL byte",
+            )));
+        }
+        let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name(thread_name)
-            .spawn(run)
-            .expect("failed to spawn onnx-genai engine driver");
-        Arc::new(Self {
-            id,
-            commands: Mutex::new(Some(commands)),
-            join: Mutex::new(Some(join)),
-        })
+            .spawn(
+                move || match panic::catch_unwind(AssertUnwindSafe(initialize)) {
+                    Ok(Ok((state, ready))) => {
+                        if ready_tx.send(Ok(ready)).is_ok() {
+                            run(state);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        let _ = ready_tx.send(Err(WorkerStartError::Initialization(error)));
+                    }
+                    Err(payload) => {
+                        let _ = ready_tx.send(Err(WorkerStartError::InitializationPanicked(
+                            panic_message(payload),
+                        )));
+                    }
+                },
+            )
+            .map_err(WorkerStartError::ThreadSpawn)?;
+        let (join, ready) = await_initialization(ready_rx, join)?;
+        Ok((
+            Arc::new(Self {
+                id,
+                commands: Mutex::new(Some(commands)),
+                join: Mutex::new(Some(join)),
+            }),
+            ready,
+        ))
     }
 
     /// A handle to a worker that was never spawned, for tests that drive the
@@ -326,11 +404,51 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn await_initialization<Ready, Error>(
+    ready_rx: std_mpsc::Receiver<Result<Ready, WorkerStartError<Error>>>,
+    join: thread::JoinHandle<()>,
+) -> Result<(thread::JoinHandle<()>, Ready), WorkerStartError<Error>> {
+    match ready_rx.recv() {
+        Ok(Ok(ready)) => Ok((join, ready)),
+        Ok(Err(error)) => {
+            let _ = join.join();
+            Err(error)
+        }
+        Err(_) => match join.join() {
+            Ok(()) => Err(WorkerStartError::InitializationChannelClosed),
+            Err(payload) => Err(WorkerStartError::InitializationPanicked(panic_message(
+                payload,
+            ))),
+        },
+    }
+}
+
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        convert::Infallible,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
+
+    struct DropThread(std_mpsc::SyncSender<thread::ThreadId>);
+
+    impl Drop for DropThread {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
+    }
 
     /// Spawn a worker whose "engine" is a counter, so a test can prove the
     /// thread ran and exited without loading a model.
@@ -338,17 +456,19 @@ mod tests {
         counter: Arc<AtomicUsize>,
     ) -> (Arc<WorkerHandle>, mpsc::Sender<DriverCommand>) {
         let (commands, mut rx) = mpsc::channel(4);
-        let worker = WorkerHandle::spawn(
+        let (worker, ()) = WorkerHandle::spawn(
             WorkerId::PRIMARY,
             "worker-test".to_string(),
             commands.clone(),
-            move || {
+            || Ok::<_, Infallible>(((), ())),
+            move |()| {
                 while rx.blocking_recv().is_some() {
                     counter.fetch_add(1, Ordering::SeqCst);
                 }
                 counter.fetch_add(100, Ordering::SeqCst);
             },
-        );
+        )
+        .expect("spawn counting worker");
         (worker, commands)
     }
 
@@ -452,5 +572,93 @@ mod tests {
             Err(WorkerUnavailable::Stopped(WorkerId::PRIMARY))
         ));
         pool.shutdown();
+    }
+
+    #[test]
+    fn initialization_error_is_returned_after_the_worker_exits() {
+        let (commands, _rx) = mpsc::channel(1);
+        let error = WorkerHandle::spawn(
+            WorkerId::PRIMARY,
+            "worker-init-error".to_string(),
+            commands,
+            || Err::<((), ()), _>("fixture initialization failed"),
+            |()| panic!("a failed worker must not enter its run loop"),
+        )
+        .expect_err("initialization failure must be returned to the caller");
+
+        assert!(matches!(
+            &error,
+            WorkerStartError::Initialization(message)
+                if *message == "fixture initialization failed"
+        ));
+        assert_eq!(
+            error.to_string(),
+            "engine worker initialization failed: fixture initialization failed"
+        );
+    }
+
+    #[test]
+    fn initialization_panic_unwinds_on_the_worker_and_is_returned() {
+        let caller_thread = thread::current().id();
+        let (dropped_tx, dropped_rx) = std_mpsc::sync_channel(1);
+        let (commands, _rx) = mpsc::channel(1);
+        let error = WorkerHandle::spawn(
+            WorkerId::PRIMARY,
+            "worker-init-panic".to_string(),
+            commands,
+            move || -> Result<((), ()), Infallible> {
+                let _partial_state = DropThread(dropped_tx);
+                panic!("fixture initializer panicked");
+            },
+            |()| panic!("a panicked worker must not enter its run loop"),
+        )
+        .expect_err("initialization panic must be returned to the caller");
+
+        assert!(matches!(
+            error,
+            WorkerStartError::InitializationPanicked(ref message)
+                if message == "fixture initializer panicked"
+        ));
+        assert_ne!(
+            dropped_rx
+                .recv()
+                .expect("partial initialization state must be dropped"),
+            caller_thread,
+            "partial state must unwind on the worker thread",
+        );
+    }
+
+    #[test]
+    fn invalid_thread_configuration_is_returned_as_startup_failure() {
+        let (commands, _rx) = mpsc::channel(1);
+        let error = WorkerHandle::spawn(
+            WorkerId::PRIMARY,
+            "invalid\0worker-name".to_string(),
+            commands,
+            || Ok::<_, Infallible>(((), ())),
+            |()| {},
+        )
+        .expect_err("a thread name containing NUL cannot be started");
+
+        assert!(
+            matches!(&error, WorkerStartError::ThreadSpawn(_)),
+            "unexpected startup error: {error}"
+        );
+    }
+
+    #[test]
+    fn closed_initialization_channel_is_not_reported_as_ready() {
+        let (ready_tx, ready_rx) =
+            std_mpsc::sync_channel::<Result<(), WorkerStartError<Infallible>>>(1);
+        drop(ready_tx);
+        let join = thread::spawn(|| {});
+
+        let error = await_initialization(ready_rx, join)
+            .expect_err("a worker that never handshakes is not ready");
+
+        assert!(matches!(
+            error,
+            WorkerStartError::InitializationChannelClosed
+        ));
     }
 }

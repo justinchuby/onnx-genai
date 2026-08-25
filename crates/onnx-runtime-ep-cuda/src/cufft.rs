@@ -83,9 +83,9 @@ fn api() -> Result<&'static CufftApi> {
         std::sync::OnceLock::new();
     API.get_or_init(CufftApi::load).as_ref().map_err(|message| {
         EpError::KernelFailed(format!(
-            "cuda_ep DFT: cuFFT could not be loaded: {message}. Install the CUDA 13.1 runtime \
+            "cuda_ep cuFFT: library could not be loaded: {message}. Install the CUDA 13.1 runtime \
              with 'pip install nvidia-cufft==12.1.0.78 nvidia-nvjitlink==13.1.115', or place \
-             cuFFT on the platform library search path; CPU DFT remains available"
+             cuFFT on the platform library search path; CPU FFT operators remain available"
         ))
     })
 }
@@ -119,7 +119,7 @@ fn check(operation: &str, status: CufftResult) -> Result<()> {
         Ok(())
     } else {
         Err(EpError::KernelFailed(format!(
-            "cuda_ep DFT: {operation} failed with {} ({status})",
+            "cuda_ep cuFFT: {operation} failed with {} ({status})",
             status_name(status)
         )))
     }
@@ -174,19 +174,19 @@ impl CufftPlan {
     fn new(runtime: Arc<CudaRuntime>, key: &CufftPlanKey) -> Result<Self> {
         if key.dtype != DataType::Float32 {
             return Err(EpError::KernelFailed(format!(
-                "cuda_ep DFT: cuFFT C2C plan supports Float32 only, got {:?}",
+                "cuda_ep cuFFT: C2C plans support Float32 only, got {:?}",
                 key.dtype
             )));
         }
         let length = c_int::try_from(key.length).map_err(|_| {
             EpError::KernelFailed(format!(
-                "cuda_ep DFT: dft_length {} exceeds cuFFT's 32-bit PlanMany limit",
+                "cuda_ep cuFFT: transform length {} exceeds PlanMany's 32-bit limit",
                 key.length
             ))
         })?;
         let batch = c_int::try_from(key.batch).map_err(|_| {
             EpError::KernelFailed(format!(
-                "cuda_ep DFT: batch {} exceeds cuFFT's 32-bit PlanMany limit",
+                "cuda_ep cuFFT: transform batch {} exceeds PlanMany's 32-bit limit",
                 key.batch
             ))
         })?;
@@ -325,7 +325,7 @@ impl CufftPlanCache {
         key: CufftPlanKey,
     ) -> Result<Arc<Mutex<CufftPlan>>> {
         let mut state = self.state.lock().map_err(|_| {
-            EpError::KernelFailed("cuda_ep DFT: cuFFT plan cache lock was poisoned".into())
+            EpError::KernelFailed("cuda_ep cuFFT: plan cache lock was poisoned".into())
         })?;
         state.clock = state.clock.wrapping_add(1);
         let now = state.clock;

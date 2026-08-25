@@ -8,6 +8,8 @@
 //! native-runtime, and execution-provider spans when available. OTLP span export
 //! is intentionally deferred (see issue #13).
 
+#![forbid(unsafe_code)]
+
 use std::{net::SocketAddr, time::Instant};
 
 use axum::{
@@ -27,6 +29,7 @@ mod cli;
 mod driver;
 mod image_generation;
 mod image_input;
+mod lease;
 mod metrics;
 mod models_config;
 pub mod multimodal;

@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use onnx_genai::{
     Engine, GenerateOptions, GenerateRequest, GenerateResult, GenerateToken, SessionId, TokenId,
 };
@@ -17,9 +18,12 @@ use onnx_genai_engine::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 use crate::image_generation::{ImageExecutionRequest, ProducedImage};
+use crate::lease::{ModelKey, ModelSessionPlacement, SessionLeaseGuard};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
-use crate::worker::{SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerUnavailable};
+use crate::worker::{
+    SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerStartError, WorkerUnavailable,
+};
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
 const MICROBATCH_MIN_WAIT: Duration = Duration::from_millis(2);
@@ -32,6 +36,15 @@ pub(crate) struct EngineDriver {
     /// The worker threads that own the engine. Exactly one today; every command
     /// names the worker it must reach rather than assuming there is only one.
     pub(crate) workers: WorkerPool,
+    /// Which model this engine was loaded as, bound once by
+    /// [`ModelHandle::new`](crate::registry::ModelHandle::new).
+    ///
+    /// The routing layer's lease and session maps span every loaded model, and
+    /// a placement is only unique within one engine, so every key they build
+    /// has to name the model too. Reading that name off the driver — rather
+    /// than off whatever id the caller was carrying — is what makes the key a
+    /// caller cannot get wrong.
+    pub(crate) model: ModelKey,
     pub(crate) generation_capacity: Arc<Semaphore>,
     pub(crate) generation_capacity_size: u32,
     /// Lock-free mirror of the KV page pool, readable during a generation.
@@ -121,6 +134,12 @@ pub(crate) enum DriverCommand {
     /// which is the point: a route no longer has to know.
     Generate {
         session_id: Option<SessionId>,
+        /// The exclusive turn lease this generation holds, for a session-bound
+        /// turn. It travels with the command rather than being released by the
+        /// submitting task, so every way this command can end — accepted and
+        /// run, never accepted because the channel closed, dropped because the
+        /// worker stopped — releases the lease by dropping the guard.
+        lease: Option<SessionLeaseGuard>,
         request: Box<GenerateRequest>,
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
@@ -240,14 +259,6 @@ impl DriverFailure {
     }
 }
 
-/// The driver owns exactly one runtime.
-///
-/// There used to be two variants here because there were two runtime types and
-/// the server had to know which one it held. There is one type now, so the
-/// owner is one box and the *runtime* resolves how to execute a request from the
-/// package's own declaration.
-struct EngineOwner(Box<Engine>);
-
 #[derive(Debug)]
 pub(crate) enum GenerateSubmitError {
     Overloaded,
@@ -259,11 +270,15 @@ struct DriverRoute {
     admission: Option<oneshot::Sender<Result<(), DriverFailure>>>,
     events: mpsc::Sender<DriverEvent>,
     _permit: OwnedSemaphorePermit,
+    /// Held for as long as the row is: a route that is retired, rejected, or
+    /// abandoned mid-stream drops it, and the session is leasable again.
+    _lease: Option<SessionLeaseGuard>,
     metrics: GenerationMetrics,
 }
 
 struct PendingGeneration {
     request: GenerateRequest,
+    lease: Option<SessionLeaseGuard>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
     permit: OwnedSemaphorePermit,
@@ -275,86 +290,179 @@ struct MicrobatchAdmission<'a> {
     generation_capacity: &'a Semaphore,
 }
 
-// SAFETY: The engine is moved exactly once into the dedicated driver thread.
-// All ORT runners, sessions, KV state, and the continuous batch manager stay
-// owned by that thread and are accessed only by processing channel commands.
-unsafe impl Send for EngineOwner {}
+/// State constructed, used, and destroyed entirely inside one worker thread.
+///
+/// `DropProbe` is `()` in production. Tests use the final field to observe that
+/// the preceding `Engine` has already been dropped on the worker thread.
+struct EngineWorkerState<DropProbe> {
+    engine: Engine,
+    commands: Option<mpsc::Receiver<DriverCommand>>,
+    continuous_batch_supported: bool,
+    max_batch: usize,
+    max_queue_depth: usize,
+    generation_capacity: Arc<Semaphore>,
+    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+    _drop_probe: DropProbe,
+}
+
+struct EngineWorkerReady {
+    batching: Arc<BatchingReport>,
+    kv_telemetry: Arc<KvTelemetry>,
+    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    memory_strategy_plan: Arc<MemoryStrategyPlan>,
+    device_authority: Option<DeviceMemoryAuthority>,
+    workflow_facts: WorkflowFacts,
+}
 
 impl EngineDriver {
-    pub(crate) fn start(engine: Engine, max_batch: usize, max_queue_depth: usize) -> Self {
+    /// Start one worker and construct its engine inside that OS thread.
+    ///
+    /// The construction closure may return a small, `Send`-safe payload derived
+    /// from the engine for the surrounding model handle. The engine itself
+    /// never crosses the thread boundary.
+    pub(crate) fn start<Ready, Build>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+    {
+        Self::start_inner(build_engine, max_batch, max_queue_depth, ())
+    }
+
+    fn start_inner<Ready, Build, DropProbe>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+        drop_probe: DropProbe,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+        DropProbe: Send + 'static,
+    {
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
-        // Attach before the engine moves onto the driver thread: this is the
-        // last point at which it is reachable from here, and the mirror must
-        // outlive that move because reading it is the whole reason it exists.
-        let mut engine = engine;
-        // Resolve the honest batching capability from the decode path (not from
-        // whether an ORT session exists) while the engine is still borrowable,
-        // then clamp the requested width to what the path can actually honor.
-        let batching = Arc::new(BatchingReport::from_capability(
-            &engine.batching_capability(),
-            max_batch,
-        ));
-        let effective_max_batch = batching.effective_max_batch;
-        tracing::info!(
-            batch_supported = batching.supported,
-            requested_max_batch = batching.requested_max_batch,
-            effective_max_batch = batching.effective_max_batch,
-            reason = %batching.reason,
-            "resolved batching capability",
-        );
-        let device_authority = Some(engine.governor().device_authority());
-        let kv_telemetry = Arc::new(KvTelemetry::default());
-        if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
-            kv_telemetry.set_applicable();
-        } else {
-            kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
-        }
-        let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-        let owner = EngineOwner(Box::new(engine));
-        let workflow_facts = WorkflowFacts {
-            components: owner.0.workflow_component_count(),
-            graph_components: owner.0.workflow_graph_component_count(),
-            declares_generation_loop: owner.0.workflow_declares_generation_loop(),
-        };
-        let resource_snapshot = Arc::new(Mutex::new(Some(owner.0.resource_snapshot())));
-        let driver_snapshot = Arc::clone(&resource_snapshot);
         // One worker owns the engine for the whole life of this driver. The
         // pool exists so a command names the worker it is going to, not so the
         // engine can move between them: it cannot.
         let worker_id = WorkerId::PRIMARY;
-        let worker = WorkerHandle::spawn(
+        let (worker, (ready_payload, worker_ready)) = WorkerHandle::spawn(
             worker_id,
             format!("onnx-genai-batch-driver-{worker_id}"),
             commands,
-            move || {
-                run_engine_driver(
-                    owner,
-                    rx,
-                    effective_max_batch,
-                    max_queue_depth,
-                    driver_capacity,
-                    driver_snapshot,
-                )
+            move || -> anyhow::Result<_> {
+                let (mut engine, ready_payload) = build_engine()
+                    .with_context(|| format!("failed to construct engine on worker {worker_id}"))?;
+                let batching = Arc::new(BatchingReport::from_capability(
+                    &engine.batching_capability(),
+                    max_batch,
+                ));
+                let effective_max_batch = batching.effective_max_batch;
+                let continuous_batch_supported =
+                    engine.continuous_batch_manager(effective_max_batch).is_ok();
+                let device_authority = Some(engine.governor().device_authority());
+                let kv_telemetry = Arc::new(KvTelemetry::default());
+                if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
+                    kv_telemetry.set_applicable();
+                } else {
+                    kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
+                }
+                let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
+                let workflow_facts = WorkflowFacts {
+                    components: engine.workflow_component_count(),
+                    graph_components: engine.workflow_graph_component_count(),
+                    declares_generation_loop: engine.workflow_declares_generation_loop(),
+                };
+                let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
+                let worker_ready = EngineWorkerReady {
+                    batching,
+                    kv_telemetry,
+                    resource_snapshot: Arc::clone(&resource_snapshot),
+                    memory_strategy_plan,
+                    device_authority,
+                    workflow_facts,
+                };
+                Ok((
+                    EngineWorkerState {
+                        engine,
+                        commands: Some(rx),
+                        continuous_batch_supported,
+                        max_batch: effective_max_batch,
+                        max_queue_depth,
+                        generation_capacity: driver_capacity,
+                        resource_snapshot,
+                        _not_send: std::marker::PhantomData,
+                        _drop_probe: drop_probe,
+                    },
+                    (ready_payload, worker_ready),
+                ))
             },
+            run_engine_driver,
+        )
+        .map_err(|error| match error {
+            WorkerStartError::ThreadSpawn(error) => {
+                anyhow::Error::new(error).context("failed to spawn engine worker thread")
+            }
+            WorkerStartError::Initialization(error) => {
+                error.context("engine worker initialization failed")
+            }
+            WorkerStartError::InitializationPanicked(message) => {
+                anyhow::anyhow!("engine worker initialization panicked: {message}")
+            }
+            WorkerStartError::InitializationChannelClosed => {
+                anyhow::anyhow!("engine worker exited before reporting initialization")
+            }
+        })
+        .with_context(|| format!("failed to start engine worker {worker_id}"))?;
+        tracing::info!(
+            batch_supported = worker_ready.batching.supported,
+            requested_max_batch = worker_ready.batching.requested_max_batch,
+            effective_max_batch = worker_ready.batching.effective_max_batch,
+            reason = %worker_ready.batching.reason,
+            "resolved batching capability",
         );
         let workers = WorkerPool::single(worker);
         tracing::info!(
             workers = workers.len(),
             "engine worker pool started (one worker owns the engine)",
         );
-        Self {
-            workers,
-            generation_capacity,
-            generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
-            kv_telemetry,
-            resource_snapshot,
-            memory_strategy_plan,
-            device_authority,
-            batching,
-            workflow_facts,
-        }
+        Ok((
+            Self {
+                // Rebound by `ModelHandle::new`, which is the first thing that
+                // knows the id this engine was loaded as.
+                model: ModelKey::new(""),
+                workers,
+                generation_capacity,
+                generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
+                kv_telemetry: worker_ready.kv_telemetry,
+                resource_snapshot: worker_ready.resource_snapshot,
+                memory_strategy_plan: worker_ready.memory_strategy_plan,
+                device_authority: worker_ready.device_authority,
+                batching: worker_ready.batching,
+                workflow_facts: worker_ready.workflow_facts,
+            },
+            ready_payload,
+        ))
+    }
+
+    #[cfg(test)]
+    fn start_with_drop_probe<Ready, Build, DropProbe>(
+        build_engine: Build,
+        max_batch: usize,
+        max_queue_depth: usize,
+        drop_probe: DropProbe,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+        DropProbe: Send + 'static,
+    {
+        Self::start_inner(build_engine, max_batch, max_queue_depth, drop_probe)
     }
 
     /// Stop every worker and wait for the engine to be destroyed.
@@ -402,6 +510,28 @@ impl EngineDriver {
         &self.batching
     }
 
+    /// Bind this engine to the id it was loaded as.
+    ///
+    /// Called once, by [`ModelHandle::new`](crate::registry::ModelHandle::new),
+    /// which is the only constructor of a routable model. Everything that keys
+    /// a session or a lease reads the model from here, so the handle's id and
+    /// the driver's are the same string by construction rather than by
+    /// convention.
+    pub(crate) fn bind_model(&mut self, id: &str) {
+        self.model = ModelKey::new(id);
+    }
+
+    /// The model whose sessions this engine owns.
+    pub(crate) fn model_key(&self) -> &ModelKey {
+        &self.model
+    }
+
+    /// A conversation in *this* engine, as the globally unique key the routing
+    /// layer's maps use.
+    pub(crate) fn binding(&self, placement: SessionPlacement) -> ModelSessionPlacement {
+        ModelSessionPlacement::new(self.model.clone(), placement)
+    }
+
     /// Open an engine session and report where it lives.
     ///
     /// The placement, not the bare id, is what a caller stores: an engine
@@ -421,7 +551,20 @@ impl EngineDriver {
         Ok(SessionPlacement::new(worker, engine_session_id))
     }
 
-    pub(crate) async fn close_session(&self, session: SessionPlacement) -> anyhow::Result<()> {
+    /// Close a session, under the lease that proves no turn is in flight on it.
+    ///
+    /// Taking the guard by value rather than a placement is the point: closing
+    /// a conversation is a mutation, and a close that raced a live turn would
+    /// destroy the state that turn is mid-way through writing. The lease is
+    /// released when this returns, and never before the engine has answered.
+    pub(crate) async fn close_session(&self, lease: SessionLeaseGuard) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            lease.model() == &self.model,
+            "session lease for model '{}' cannot be closed on model '{}'",
+            lease.model(),
+            self.model,
+        );
+        let session = lease.placement();
         let (response, rx) = tokio::sync::oneshot::channel();
         self.session_commands(session)
             .map_err(anyhow::Error::new)?
@@ -477,9 +620,14 @@ impl EngineDriver {
     /// has (ignored by a workflow package, which owns no engine sessions) and
     /// the multimodal attachments it has (ignored by a decoder package, which
     /// takes its prompt from the request).
+    ///
+    /// A session-bound turn arrives holding its exclusive lease, taken by the
+    /// routing layer before this call. Nothing here can take it: by the time a
+    /// command is being built the caller has already occupied a queue slot, and
+    /// a refusal decided here would be a refusal decided too late.
     pub(crate) async fn submit_generation(
         &self,
-        session: Option<SessionPlacement>,
+        session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
@@ -488,28 +636,40 @@ impl EngineDriver {
 
     pub(crate) async fn generate(
         &self,
-        session: Option<SessionPlacement>,
+        session: Option<SessionLeaseGuard>,
         request: GenerateRequest,
         input: Option<MultimodalInput>,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
         // A session-bound generation goes to the worker holding its KV state;
         // a stateless one goes to the worker that serves unbound work.
+        debug_assert!(
+            session
+                .as_ref()
+                .is_none_or(|lease| lease.model() == &self.model),
+            "a turn's lease names the engine it runs on",
+        );
+        let placement = session.as_ref().map(SessionLeaseGuard::placement);
         let permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let commands = match session {
-            Some(session) => self.session_commands(session),
+        let commands = match placement {
+            Some(placement) => self.session_commands(placement),
             None => self.commands(),
         }
         .map_err(|_| GenerateSubmitError::DriverStopped)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
+        // The guard moves into the command, and the command moves into `send`.
+        // A send that fails hands both back on this task, where the guard drops
+        // and the session is immediately leasable again — no release call to
+        // forget on the one exit path that never reaches the worker.
         if commands
             .send(DriverCommand::Generate {
-                session_id: session.map(|session| session.engine_session_id),
+                session_id: placement.map(|placement| placement.engine_session_id),
+                lease: session,
                 request: Box::new(request),
                 input,
                 admission,
@@ -540,6 +700,7 @@ impl EngineDriver {
         let (admission, _admission_rx) = oneshot::channel();
         let command = DriverCommand::Generate {
             session_id: None,
+            lease: None,
             request: Box::new(request),
             input: None,
             admission,
@@ -757,30 +918,28 @@ impl EngineDriver {
     }
 }
 
-fn run_engine_driver(
-    owner: EngineOwner,
-    rx: mpsc::Receiver<DriverCommand>,
-    max_batch: usize,
-    max_queue_depth: usize,
-    generation_capacity: Arc<Semaphore>,
-    resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
-) {
-    let mut engine = *owner.0;
+fn run_engine_driver<DropProbe>(mut worker: EngineWorkerState<DropProbe>) {
+    let commands = worker
+        .commands
+        .take()
+        .expect("engine worker command receiver is present");
     // Which driver runs is a capability question the engine answers: a package
     // whose decode path can advance several rows per forward pass gets the
     // continuous-batch driver, and everything else — including a package whose
     // components own separate caches — gets the per-request one. Neither driver
     // asks what kind of package it holds.
-    let continuous_batch_supported = engine.continuous_batch_manager(max_batch).is_ok();
-    if continuous_batch_supported {
-        tracing::info!(max_batch, "continuous batch driver enabled");
+    if worker.continuous_batch_supported {
+        tracing::info!(
+            max_batch = worker.max_batch,
+            "continuous batch driver enabled"
+        );
         run_static_engine_driver(
-            &mut engine,
-            rx,
-            max_batch,
-            max_queue_depth,
-            &generation_capacity,
-            &resource_snapshot,
+            &mut worker.engine,
+            commands,
+            worker.max_batch,
+            worker.max_queue_depth,
+            &worker.generation_capacity,
+            &worker.resource_snapshot,
         );
     } else {
         tracing::info!(
@@ -788,7 +947,7 @@ fn run_engine_driver(
             effective_max_batch = 1,
             "continuous batch driver disabled; using per-request engine path (single-sequence decode)"
         );
-        run_fallback_engine_driver(&mut engine, rx, &resource_snapshot);
+        run_fallback_engine_driver(&mut worker.engine, commands, &worker.resource_snapshot);
     }
 }
 
@@ -835,6 +994,7 @@ fn run_static_engine_driver(
         match first {
             DriverCommand::Generate {
                 session_id: None,
+                lease,
                 request,
                 input: None,
                 admission,
@@ -853,6 +1013,7 @@ fn run_static_engine_driver(
                     resource_snapshot,
                     PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -895,6 +1056,7 @@ fn run_static_batch_until_idle(
             match deferred.pop_front() {
                 Some(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -903,6 +1065,7 @@ fn run_static_batch_until_idle(
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -920,6 +1083,7 @@ fn run_static_batch_until_idle(
             match rx.try_recv() {
                 Ok(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -928,6 +1092,7 @@ fn run_static_batch_until_idle(
                 }) => {
                     initial.push(PendingGeneration {
                         request: *request,
+                        lease,
                         admission,
                         events,
                         permit,
@@ -996,15 +1161,7 @@ fn run_static_batch_until_idle(
         let pending = initial
             .pop()
             .expect("the first generation request was queued");
-        run_generation(
-            engine,
-            None,
-            pending.request,
-            None,
-            pending.admission,
-            pending.events,
-            pending.permit,
-        );
+        run_generation(engine, None, None, pending);
         return;
     }
 
@@ -1030,15 +1187,7 @@ fn run_static_batch_until_idle(
     let mut abandoned = HashMap::new();
     let mut reported_occupancy = onnx_genai_engine::BatchOccupancy::default();
     for pending in initial {
-        submit_to_continuous_manager(
-            &mut manager,
-            &mut routes,
-            &mut abandoned,
-            pending.request,
-            pending.admission,
-            pending.events,
-            pending.permit,
-        );
+        submit_to_continuous_manager(&mut manager, &mut routes, &mut abandoned, pending);
     }
 
     loop {
@@ -1046,6 +1195,7 @@ fn run_static_batch_until_idle(
             match deferred.pop_front() {
                 Some(DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -1056,10 +1206,13 @@ fn run_static_batch_until_idle(
                         &mut manager,
                         &mut routes,
                         &mut abandoned,
-                        *request,
-                        admission,
-                        events,
-                        permit,
+                        PendingGeneration {
+                            request: *request,
+                            lease,
+                            admission,
+                            events,
+                            permit,
+                        },
                     );
                 }
                 Some(command) => {
@@ -1073,6 +1226,7 @@ fn run_static_batch_until_idle(
             match command {
                 DriverCommand::Generate {
                     session_id: None,
+                    lease,
                     request,
                     input: None,
                     admission,
@@ -1084,14 +1238,18 @@ fn run_static_batch_until_idle(
                             &mut manager,
                             &mut routes,
                             &mut abandoned,
-                            *request,
-                            admission,
-                            events,
-                            permit,
+                            PendingGeneration {
+                                request: *request,
+                                lease,
+                                admission,
+                                events,
+                                permit,
+                            },
                         );
                     } else {
                         deferred.push_back(DriverCommand::Generate {
                             session_id: None,
+                            lease,
                             request,
                             input: None,
                             admission,
@@ -1299,11 +1457,15 @@ fn submit_to_continuous_manager(
     manager: &mut ContinuousBatchManager<'_>,
     routes: &mut HashMap<usize, DriverRoute>,
     abandoned: &mut HashMap<usize, DriverRoute>,
-    request: GenerateRequest,
-    admission: oneshot::Sender<Result<(), DriverFailure>>,
-    events: mpsc::Sender<DriverEvent>,
-    permit: OwnedSemaphorePermit,
+    pending: PendingGeneration,
 ) {
+    let PendingGeneration {
+        request,
+        lease,
+        admission,
+        events,
+        permit,
+    } = pending;
     match manager.submit(request) {
         Ok(handle) => {
             routes.insert(
@@ -1312,6 +1474,10 @@ fn submit_to_continuous_manager(
                     admission: Some(admission),
                     events,
                     _permit: permit,
+                    // The row now owns the lease: whichever way it is retired —
+                    // finished, rejected, or abandoned by a disconnected client —
+                    // the route is dropped and the session becomes leasable again.
+                    _lease: lease,
                     metrics: GenerationMetrics::start(),
                 },
             );
@@ -1450,13 +1616,23 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
         }
         DriverCommand::Generate {
             session_id,
+            lease,
             request,
             input,
             admission,
             events,
             permit,
         } => run_generation(
-            engine, session_id, *request, input, admission, events, permit,
+            engine,
+            session_id,
+            input,
+            PendingGeneration {
+                request: *request,
+                lease,
+                admission,
+                events,
+                permit,
+            },
         ),
         DriverCommand::GenerateFim {
             prefix,
@@ -1680,12 +1856,16 @@ impl std::error::Error for DriverDeliveryError {}
 fn run_generation(
     engine: &mut Engine,
     session_id: Option<SessionId>,
-    request: GenerateRequest,
     input: Option<MultimodalInput>,
-    admission: oneshot::Sender<Result<(), DriverFailure>>,
-    events: mpsc::Sender<DriverEvent>,
-    _permit: OwnedSemaphorePermit,
+    pending: PendingGeneration,
 ) {
+    let PendingGeneration {
+        request,
+        lease,
+        admission,
+        events,
+        permit: _permit,
+    } = pending;
     let mut metrics = GenerationMetrics::start();
     let bound = match input
         .map(|input| input.bind(PipelineGenerateRequest::new(request.clone())))
@@ -1735,6 +1915,14 @@ fn run_generation(
             }
         }
     };
+    // The engine has committed whatever this turn wrote to the session, so the
+    // conversation is consistent and the next turn may take the lease. Released
+    // *before* the terminal event rather than after this function returns: a
+    // client that reads "finished" and immediately sends the next turn would
+    // otherwise race the guard's drop and be told its own completed turn is
+    // still in flight. A turn admitted at this instant still runs after this
+    // one — the worker that would run it is this thread, and it is here.
+    drop(lease);
     match result {
         Ok(result) => {
             metrics.result(result.token_ids.len(), result.prefix_cache_hit_len);
@@ -1799,6 +1987,34 @@ fn run_fim_generation(
 mod admission_tests {
     use super::*;
 
+    struct IsSend<T: ?Sized>(std::marker::PhantomData<T>);
+    trait SendFallback {
+        const VALUE: bool = false;
+    }
+    impl<T: ?Sized> SendFallback for IsSend<T> {}
+    #[allow(dead_code)]
+    impl<T: ?Sized + Send> IsSend<T> {
+        const VALUE: bool = true;
+    }
+
+    struct EngineDropThread(std::sync::mpsc::SyncSender<thread::ThreadId>);
+
+    impl Drop for EngineDropThread {
+        fn drop(&mut self) {
+            let _ = self.0.send(thread::current().id());
+        }
+    }
+
+    #[test]
+    fn engine_worker_state_is_structurally_not_send() {
+        const {
+            assert!(
+                !IsSend::<EngineWorkerState<()>>::VALUE,
+                "engine worker state must not cross threads"
+            );
+        }
+    }
+
     fn pending_route() -> (
         DriverRoute,
         oneshot::Receiver<Result<(), DriverFailure>>,
@@ -1812,6 +2028,7 @@ mod admission_tests {
                 admission: Some(admission),
                 events,
                 _permit: permit,
+                _lease: None,
                 metrics: GenerationMetrics::start(),
             },
             admission_rx,
@@ -1972,6 +2189,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            model: ModelKey::new("stub"),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2071,11 +2289,14 @@ mod admission_tests {
         run_generation(
             &mut engine,
             None,
-            request,
             Some(input),
-            admission,
-            events,
-            permit,
+            PendingGeneration {
+                request,
+                lease: None,
+                admission,
+                events,
+                permit,
+            },
         );
 
         let admitted = admission_rx
@@ -2097,9 +2318,31 @@ mod admission_tests {
     async fn shutdown_joins_the_engine_worker_and_is_idempotent() {
         let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm");
-        let engine = Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())
-            .expect("load tiny fixture");
-        let driver = EngineDriver::start(engine, 1, 2);
+        let caller_thread = thread::current().id();
+        let (constructed_tx, constructed_rx) = std::sync::mpsc::sync_channel(1);
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+        let (driver, ()) = EngineDriver::start_with_drop_probe(
+            move || {
+                constructed_tx
+                    .send(thread::current().id())
+                    .expect("record construction thread");
+                Ok((
+                    Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())?,
+                    (),
+                ))
+            },
+            1,
+            2,
+            EngineDropThread(dropped_tx),
+        )
+        .expect("load tiny fixture on worker");
+        let construction_thread = constructed_rx
+            .recv()
+            .expect("worker reports construction thread");
+        assert_ne!(
+            construction_thread, caller_thread,
+            "the engine must be constructed on the worker, not the caller"
+        );
         assert_eq!(driver.workers.len(), 1, "phase one runs a pool of one");
         let worker = Arc::clone(driver.workers.primary());
         assert!(worker.is_running());
@@ -2107,11 +2350,20 @@ mod admission_tests {
         // A session is opened on, and named by, the pool's only worker.
         let session = driver.create_session().await.expect("open session");
         assert_eq!(session.worker, WorkerId::PRIMARY);
-        driver.close_session(session).await.expect("close session");
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let lease = leases
+            .acquire(driver.binding(session), "sess-shutdown")
+            .expect("an idle session is leasable");
+        driver.close_session(lease).await.expect("close session");
 
         driver.shutdown();
         assert!(worker.is_joined(), "shutdown must join the worker thread");
         assert!(!worker.is_running());
+        assert_eq!(
+            dropped_rx.recv().expect("record engine teardown thread"),
+            construction_thread,
+            "the engine must be destroyed on the thread that constructed it",
+        );
 
         // Idempotent: a second shutdown neither panics nor waits on anything.
         driver.shutdown();
@@ -2133,6 +2385,27 @@ mod admission_tests {
         ));
     }
 
+    #[test]
+    fn initialization_panic_is_returned_as_a_driver_start_error() {
+        let error = match EngineDriver::start(
+            || -> anyhow::Result<(Engine, ())> {
+                panic!("fixture engine initializer panicked");
+            },
+            1,
+            1,
+        ) {
+            Ok(_) => panic!("a panicked initializer must not produce a driver"),
+            Err(error) => format!("{error:#}"),
+        };
+
+        assert!(
+            error.contains("failed to start engine worker 0")
+                && error.contains("engine worker initialization panicked")
+                && error.contains("fixture engine initializer panicked"),
+            "panic must retain worker and initialization context: {error}",
+        );
+    }
+
     /// A session-bound command addressed to a worker the pool does not have is
     /// refused by name, not routed to whichever worker happens to exist.
     #[tokio::test]
@@ -2145,6 +2418,7 @@ mod admission_tests {
                 declares_generation_loop: false,
             },
             workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            model: ModelKey::new("stub"),
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
@@ -2159,13 +2433,97 @@ mod admission_tests {
         };
         let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
 
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let lease = leases
+            .acquire(driver.binding(elsewhere), "sess-elsewhere")
+            .expect("a lease is taken before the worker is even consulted");
         let error = driver
-            .close_session(elsewhere)
+            .close_session(lease)
             .await
             .expect_err("worker 4 is not in a pool of one");
         assert_eq!(
             error.to_string(),
             "engine worker 4 is not in this pool (1 worker(s) loaded)"
+        );
+        assert!(
+            !leases.is_held(&driver.binding(elsewhere)),
+            "a close that failed still gave the lease back"
+        );
+    }
+
+    /// A turn that never reaches a worker leaves nothing leased.
+    ///
+    /// The guard travels *inside* the command, which is what makes every
+    /// terminal path release it without a release call to remember. This pins
+    /// the two exits that never reach the engine at all: a full admission
+    /// gate, and a send onto a channel whose worker is gone. Leaking either
+    /// would make the session permanently unusable — every later turn on it
+    /// would be refused 409 forever, with no turn in flight to justify it.
+    #[tokio::test]
+    async fn a_turn_that_never_reaches_a_worker_releases_its_lease() {
+        let (commands, rx) = mpsc::channel(1);
+        let driver = EngineDriver {
+            workflow_facts: WorkflowFacts {
+                components: 0,
+                graph_components: 0,
+                declares_generation_loop: false,
+            },
+            workers: WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands)),
+            model: ModelKey::new("stub"),
+            // One permit, so the second acquisition below finds the gate shut.
+            generation_capacity: Arc::new(Semaphore::new(1)),
+            generation_capacity_size: 1,
+            kv_telemetry: Arc::new(KvTelemetry::default()),
+            resource_snapshot: Arc::new(Mutex::new(None)),
+            memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
+                0,
+                None,
+                "driver test stub",
+            )),
+            device_authority: None,
+            batching: Arc::new(BatchingReport::single_sequence_stub()),
+        };
+        let session = SessionPlacement::new(WorkerId::PRIMARY, 7);
+        let leases = crate::lease::SessionLeases::with_shards(1);
+
+        // 1. Refused by the admission gate, before a command is ever built.
+        let hog = Arc::clone(&driver.generation_capacity)
+            .try_acquire_owned()
+            .expect("the only permit");
+        let lease = leases
+            .acquire(driver.binding(session), "sess-overloaded")
+            .expect("an idle session is leasable");
+        assert!(leases.is_held(&driver.binding(session)));
+        assert!(matches!(
+            driver.generate(Some(lease), warmup_request(), None).await,
+            Err(GenerateSubmitError::Overloaded)
+        ));
+        assert!(
+            !leases.is_held(&driver.binding(session)),
+            "a turn refused admission is not a turn in flight"
+        );
+        drop(hog);
+
+        // 2. Accepted by the gate, then handed to a worker that is gone.
+        drop(rx);
+        let lease = leases
+            .acquire(driver.binding(session), "sess-stopped")
+            .expect("still leasable");
+        assert!(matches!(
+            driver.generate(Some(lease), warmup_request(), None).await,
+            Err(GenerateSubmitError::DriverStopped)
+        ));
+        assert_eq!(
+            leases.held(),
+            0,
+            "a stopped driver leaves no session leased forever"
+        );
+
+        // And the session is ordinary again: the refusals cost it nothing.
+        drop(
+            leases
+                .acquire(driver.binding(session), "sess-after")
+                .expect("leasable after both refusals"),
         );
     }
 
@@ -2359,6 +2717,7 @@ mod driver_delivery_tests {
                 admission: None,
                 events,
                 _permit: permit,
+                _lease: None,
                 metrics: GenerationMetrics::start(),
             },
             events_rx,
