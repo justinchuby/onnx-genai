@@ -1220,15 +1220,43 @@ mod tests {
 #[cfg(test)]
 mod ready_backstop_tests {
     use super::*;
+    use std::sync::MutexGuard;
 
     /// Sets the readiness knobs for the duration of a test and clears them
     /// afterwards, including on the unwinding path the fault tests take.
-    struct Injected;
+    ///
+    /// Also holds [`INJECTION`] for exactly that window. The knobs themselves
+    /// are thread-locals, but two things these tests depend on are not, so the
+    /// guard is bound to the injection rather than left to each call site to
+    /// remember.
+    struct Injected {
+        _serialise: MutexGuard<'static, ()>,
+    }
+
+    /// Serialises the readiness-injection tests against each other.
+    ///
+    /// Two process-global resources make them unsafe to interleave. First,
+    /// `std::panic::{take_hook, set_hook}` is process-wide, so a concurrent
+    /// test restores the default hook inside another's silenced window and the
+    /// expected panic escapes into the log attributed to the wrong test.
+    /// Second, an injected deadline is measured in milliseconds of wall clock:
+    /// a second test building its own pool at the same time competes for the
+    /// same cores, so a healthy worker can miss a 100 ms deadline because of
+    /// the *other* test's scheduling. That failure is indistinguishable from
+    /// the defect these tests exist to catch, which makes it the worst kind --
+    /// the cheapest way to make it stop is to raise the deadline until the
+    /// test can no longer fail.
+    static INJECTION: Mutex<()> = Mutex::new(());
 
     impl Injected {
         fn timeout_ms(ms: u64) -> Self {
+            let serialise = INJECTION
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(ms));
-            Self
+            Self {
+                _serialise: serialise,
+            }
         }
 
         fn hold_worker(self, index: usize) -> Self {
@@ -1343,7 +1371,25 @@ mod ready_backstop_tests {
     /// inside `SPIN_LOOP_BUDGET`, so without an injected delay this test never
     /// reaches the yield-and-check phase at all and would pass identically if
     /// that phase were deleted.
+    ///
+    /// Not run under Miri, and the guard is the reason. The claim being made
+    /// is a *race* between wall-clock delay and spin iterations: 150 ms must
+    /// outlast `SPIN_LOOP_BUDGET` spins. Miri's clock is virtual and its
+    /// scheduler is not the OS's, so a spin costs no time there, the delay
+    /// elapses inside the budget, and the workers announce before the builder
+    /// ever yields -- the guard fails on a perfectly healthy build. Weakening
+    /// it to accommodate that would delete the only thing keeping this test
+    /// from passing with the yield phase removed, so the test opts out of the
+    /// one environment where its precondition cannot hold instead.
+    ///
+    /// The sibling tests need no such opt-out and deliberately keep none: they
+    /// inject a *hold*, so the builder exhausts the spin budget no matter what
+    /// a spin costs, and reaching the yield path does not depend on the clock.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "races an injected wall-clock delay against the spin budget; Miri's virtual clock cannot represent that"
+    )]
     fn a_pool_whose_workers_are_merely_slow_still_builds() {
         let injected = Injected::timeout_ms(30_000).delay_ms(150).reset_yields();
         let pool = TaskPool::new(4);
