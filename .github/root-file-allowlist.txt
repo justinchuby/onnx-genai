@@ -4,7 +4,7 @@
 # Every entry here is deliberate. The root is where scratch artefacts land,
 # because `git add -A` in a worktree you have been working in does not care what
 # a file is for, and a one-line addition at the root is invisible in a large
-# diff. Seven entries have reached `main` this way, in six incidents. The list
+# diff. Eight entries have reached `main` this way, in seven incidents. The list
 # was built by walking every root path ever added on main and subtracting what
 # is still here -- not by collecting the ones somebody reported:
 #
@@ -17,6 +17,11 @@
 #   .commitmsg     e42fa9470 -> 398cff8e5   19.8h   (#1881, removed by #1999)
 #   .pris_v4.log   589d48ffd -> 7a6482c83    1.3h   (#1951, removed by #1975)
 #   .body.md       79196f89d -> 54625db9d    2.7h   (#2026, removed by #2036)
+#   .roy-scratch/  b054ff63e -> #2161        0.9h   (#2150, and a directory)
+#
+# The removal column holds a commit where the row was written after the fact,
+# and a PR number where the removal wrote its own row: a PR cannot know the
+# squash SHA it is about to be given.
 #
 # Excluded, because their removal commits say what they were: `site` (moved to
 # onnx-genai-wiki, #1488), `third_party` (oneDNN backend removal) and
@@ -29,10 +34,12 @@
 # already ignored. Enumerating what belongs is the only form of this check that
 # does not need to predict the next name.
 #
-# Directories are listed because two of the seven are directories, and a check
+# Directories are listed because three of the eight are directories, and a check
 # comparing only files cannot see one: `.commitmsg/m.txt` contains a separator,
 # so a files-only filter discards it as "not at the root". #2036 shipped that
-# gap while citing that very instance in its own header.
+# gap while citing that very instance in its own header. `.roy-scratch/pr.md` is
+# the first directory incident since the gap was closed, and the check named it:
+# that is the positive control the earlier fix never got.
 #
 # To add a root entry legitimately: add it here in the same PR. That is the
 # escape hatch, and unlike a label it leaves a permanent record of the decision.

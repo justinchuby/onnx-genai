@@ -82,6 +82,12 @@ PR*.md
 # .github/root-file-allowlist.txt for the half that does not have to guess what
 # the next one will be called.
 /.body.md
+# Per-agent scratch directories: .roy-scratch/pr.md reached main in #2150 as the
+# fifth artefact of this class, and the first one a directory since 490b846c3.
+# The wildcard is the guessing half of the repair -- the next one will be named
+# by whoever creates it, and only .github/root-file-allowlist.txt is able to
+# catch a name nobody predicted. Root-level only, per /*.log above.
+/.*-scratch/
 # Scratch buffers used when moving a block of code between files.
 .block.txt
 # Test/build output teed to a file while investigating. Root-level only, so a
