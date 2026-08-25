@@ -284,8 +284,11 @@ end = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 ```
 
 `sweep_decode.py` prints its rows as it goes, so a custody change cannot be
-stamped onto them retroactively; it exits **4** and says the rows above span
-the change rather than relabelling them. `ab.py` buffers, so it stamps.
+stamped onto them retroactively; the exit code carries it instead — **4** for
+a handoff (the rows above span the change: discard them) and **5** when the
+lock could not be re-read at the end (the rows may be sound, and nothing
+establishes that they are). Those are deliberately different answers.
+`ab.py` buffers, so it stamps the label on the rows.
 `crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are not wired up yet — see
 issue #2043 for the audit.
 

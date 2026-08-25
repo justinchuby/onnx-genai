@@ -64,6 +64,39 @@ def run_one(binary: Path, model: Path, threads: int, runs: int, warmups: int):
     raise RuntimeError(f"no result line for {model} t={threads}")
 
 
+def end_of_window_verdict(start: str, end: str) -> tuple[int, str | None]:
+    """What to say once the rows are already on the screen.
+
+    `ab.py` buffers, so it can stamp the end-of-window label onto every row.
+    This driver streams, so it cannot relabel what has been printed -- which
+    makes the exit code and one stderr line the only honest places left to
+    put the finding.
+
+    The three outcomes are kept distinct because they mean different things
+    to the person reading them. A handoff (`changed`) means the thread counts
+    above and below the change were compared across it: not half-good data,
+    discard it. A failed end-read (`unverified-end`) means we do not know --
+    the rows may be perfectly good, and telling someone to discard them would
+    assert a specific false fact about data that is probably fine. Collapsing
+    the second into the first is the exact conflation `window_label` and its
+    tests exist to prevent.
+    """
+    if end == "changed":
+        return 4, (
+            f"host_lock=changed: the declaration covering this sweep did not "
+            f"hold for the whole of it (started {start}). Every row above "
+            "spans the change -- discard them."
+        )
+    if end == "unverified-end":
+        return 5, (
+            f"host_lock=unverified-end: the lock could not be re-read when "
+            f"the sweep finished, so the {start} label on every row above is "
+            "unverified at the far end. The rows may be sound; nothing here "
+            "establishes that they are."
+        )
+    return 0, None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--binary", type=Path, default=Path("target/release/bench_generic"))
@@ -116,19 +149,13 @@ def main() -> int:
                 flush=True,
             )
 
-    # The rows have already been printed, so a handoff cannot be stamped onto
-    # them retroactively -- which is why this says so in a line of its own
-    # rather than quietly relabelling. A sweep whose custody moved is not
-    # half-good data; the arms above were compared across the change.
-    end_label = hostlock_gate.window_label(lock_label, prov, hostlock_gate.read_provenance())
-    if end_label != lock_label:
-        print(
-            f"host_lock={end_label}: the declaration covering this sweep did not "
-            f"hold for the whole of it (started {lock_label}). Every row above "
-            "spans the change -- discard them.",
-            file=sys.stderr,
-        )
-        return 4
+    end_label = hostlock_gate.window_label(
+        lock_label, prov, hostlock_gate.read_provenance()
+    )
+    code, complaint = end_of_window_verdict(lock_label, end_label)
+    if complaint:
+        print(complaint, file=sys.stderr)
+    return code
     return 0
 
 
