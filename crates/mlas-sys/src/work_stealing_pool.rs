@@ -591,15 +591,44 @@ mod tests {
 #[cfg(test)]
 mod ready_backstop_tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The deadline the wedge test and its negative control share.
+    ///
+    /// One constant rather than two literals: the control's entire claim is
+    /// that *the same* deadline builds a healthy pool, so if the two numbers
+    /// can drift apart the control silently stops controlling for anything.
+    const PAIRED_DEADLINE_MS: u64 = 1_000;
+
+    /// Serialises the readiness-injection tests against each other.
+    ///
+    /// The knobs are thread-locals, but the thing they measure is not: an
+    /// injected deadline is milliseconds of wall clock, and a second test
+    /// building its own pool at the same time competes for the same cores, so
+    /// a healthy worker can miss the deadline because of the *other* test's
+    /// scheduling. That red is indistinguishable from the defect these tests
+    /// exist to catch, which makes it the worst kind -- the cheapest way to
+    /// make it stop is to widen the deadline until the test cannot fail.
+    static INJECTION: Mutex<()> = Mutex::new(());
 
     /// Sets the readiness knobs for the test and clears them afterwards.
-    struct Injected;
+    ///
+    /// Holds [`INJECTION`] for exactly that window, bound to the guard rather
+    /// than left to each call site to remember.
+    struct Injected {
+        _serialise: MutexGuard<'static, ()>,
+    }
 
     impl Injected {
         fn new(timeout_ms: u64, held: usize) -> Self {
+            let serialise = INJECTION
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(timeout_ms));
             HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(held));
-            Self
+            Self {
+                _serialise: serialise,
+            }
         }
     }
 
@@ -618,22 +647,38 @@ mod ready_backstop_tests {
     /// indistinguishable from work.
     #[test]
     fn a_worker_that_never_announces_fails_the_build_instead_of_hanging() {
-        let injected = Injected::new(250, 0);
+        let injected = Injected::new(PAIRED_DEADLINE_MS, 0);
         let started = Instant::now();
         let err = WorkStealingThreadPool::new(4)
             .err()
             .expect("a pool with a worker that never announces was reported as built");
         let elapsed = started.elapsed();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
-        assert!(
-            err.to_string().contains("2 of 3 workers announced"),
-            "the diagnostic does not say how far the pool got, which is the only \
-             thing that distinguishes this from a spawn failure: {err}"
-        );
+        // "fewer than all of 3" rather than the exact "2 of 3": under emulation
+        // or contention a healthy worker can also still be short of announcing
+        // when the deadline fires, and a test that reds on that is reporting
+        // the host rather than the backstop.
+        let message = err.to_string();
+        let announced = message
+            .split(" of 3 workers announced")
+            .next()
+            .and_then(|head| head.rsplit(' ').next())
+            .and_then(|count| count.parse::<usize>().ok());
+        match announced {
+            Some(count) => assert!(
+                count < 3,
+                "the backstop fired reporting all 3 workers announced, which is \
+                 not a wedge at all: {err}"
+            ),
+            None => panic!(
+                "the diagnostic does not say how far the pool got, which is the \
+                 only thing that distinguishes this from a spawn failure: {err}"
+            ),
+        }
         assert!(
             elapsed < Duration::from_secs(30),
-            "the build took {elapsed:?} against a 250ms deadline, so it is not the \
-             deadline that ended it"
+            "the build took {elapsed:?} against a {PAIRED_DEADLINE_MS}ms deadline, \
+             so it is not the deadline that ended it"
         );
         drop(injected);
     }
@@ -643,7 +688,7 @@ mod ready_backstop_tests {
     /// build.
     #[test]
     fn the_same_deadline_builds_a_healthy_pool() {
-        let injected = Injected::new(250, usize::MAX);
+        let injected = Injected::new(PAIRED_DEADLINE_MS, usize::MAX);
         let pool = WorkStealingThreadPool::new(4).expect("healthy pool must build");
         assert_eq!(pool.thread_count(), 4);
         let calls = AtomicUsize::new(0);

@@ -142,6 +142,21 @@ thread_local! {
     static HOLD_WORKER_BEFORE_READY: std::cell::Cell<usize> =
         const { std::cell::Cell::new(usize::MAX) };
 
+    /// Test injection: how long the held worker ignores the shutdown flag, in
+    /// milliseconds; `0` honours it immediately.
+    ///
+    /// The held worker above parks on `shared.shutdown`, which
+    /// `abandon_unready_workers` sets. That makes it *cooperative*, so a
+    /// `join()` re-added to the abandon path would return promptly and every
+    /// test would still pass -- while in production, against the genuinely
+    /// wedged worker this backstop exists for, that same join reintroduces the
+    /// unbounded wait. This knob models the worker that does not cooperate, so
+    /// the no-join contract has an oracle. Bounded rather than permanent: a
+    /// thread that never exits would leak into the rest of the test binary and
+    /// trip Miri's remaining-threads check at exit, and a bounded stubbornness
+    /// discriminates just as sharply.
+    static HOLD_WORKER_IGNORES_SHUTDOWN_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
     /// Test injection of the *other* case: every worker announces, but late.
     /// Without it the healthy-pool assertion is vacuous, because real workers
     /// announce inside the spin budget and the deadline is never consulted --
@@ -664,6 +679,8 @@ impl TaskPool {
         #[cfg(test)]
         let held_worker = HOLD_WORKER_BEFORE_READY.with(std::cell::Cell::get);
         #[cfg(test)]
+        let hold_ignores_shutdown_ms = HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(std::cell::Cell::get);
+        #[cfg(test)]
         let ready_delay_ms = DELAY_WORKER_BEFORE_READY_MS.with(std::cell::Cell::get);
         for worker_id in 0..requested {
             let shared = Arc::clone(&shared);
@@ -682,7 +699,16 @@ impl TaskPool {
                             // worker that exists, holds its share of the pool,
                             // and never announces -- so park it until the
                             // builder's shutdown flag releases it.
-                            while !shared.shutdown.load(Ordering::Acquire) {
+                            //
+                            // `HOLD_WORKER_IGNORES_SHUTDOWN_MS` makes it
+                            // deaf to that flag for a bounded window first,
+                            // which is the only shape that can catch a `join()`
+                            // returning to the abandon path.
+                            let deaf_until =
+                                Instant::now() + Duration::from_millis(hold_ignores_shutdown_ms);
+                            while !shared.shutdown.load(Ordering::Acquire)
+                                || Instant::now() < deaf_until
+                            {
                                 thread::sleep(Duration::from_millis(1));
                             }
                             return;
@@ -1486,6 +1512,11 @@ mod ready_backstop_tests {
             self
         }
 
+        fn hold_ignores_shutdown_ms(self, ms: u64) -> Self {
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(ms));
+            self
+        }
+
         fn delay_ms(self, ms: u64) -> Self {
             DELAY_WORKER_BEFORE_READY_MS.with(|cell| cell.set(ms));
             self
@@ -1510,6 +1541,7 @@ mod ready_backstop_tests {
         fn drop(&mut self) {
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(0));
             HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(usize::MAX));
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(0));
             DELAY_WORKER_BEFORE_READY_MS.with(|cell| cell.set(0));
             READY_SLOW_YIELD_US.with(|cell| cell.set(0));
             READY_YIELDS.with(|cell| cell.set(0));
@@ -1545,7 +1577,7 @@ mod ready_backstop_tests {
     /// aarch64 suite could sit in it for hours.
     #[test]
     fn a_worker_that_never_announces_fails_the_build_instead_of_hanging() {
-        let injected = Injected::timeout_ms(250).hold_worker(0);
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS).hold_worker(0);
         let started = Instant::now();
         let message = build_expecting_failure(4).expect_err(
             "a pool with a worker that never announces was reported as successfully built",
@@ -1558,31 +1590,98 @@ mod ready_backstop_tests {
         // The count in the message is what tells a reader this was a wedged
         // worker rather than, say, a spawn failure. `4` means dispatcher plus
         // three workers, one of which is held.
-        assert!(
-            message.contains("2 of 3 workers announced"),
-            "the diagnostic does not say how far the pool got, which is the \
-             only thing that distinguishes this from a spawn failure: {message}"
-        );
+        //
+        // Asserted as "fewer than all of 3" rather than the exact "2 of 3":
+        // under emulation or contention a healthy worker can also still be
+        // short of announcing when the deadline fires, and a test that reds on
+        // that is reporting the host, not the backstop. The claim that
+        // separates a wedge from a spawn failure is that the pool had its
+        // workers and they did not all announce.
+        let announced = message
+            .split(" of 3 workers announced")
+            .next()
+            .and_then(|head| head.rsplit(' ').next())
+            .and_then(|count| count.parse::<usize>().ok());
+        match announced {
+            Some(count) => assert!(
+                count < 3,
+                "the backstop fired reporting all 3 workers announced, which is \
+                 not a wedge at all: {message}"
+            ),
+            None => panic!(
+                "the diagnostic does not say how far the pool got, which is the \
+                 only thing that distinguishes this from a spawn failure: {message}"
+            ),
+        }
         assert!(
             elapsed < Duration::from_secs(30),
-            "the build took {elapsed:?} against a 250ms deadline, so it is not \
-             the deadline that ended it"
+            "the build took {elapsed:?} against a {PAIRED_DEADLINE_MS}ms \
+             deadline, so it is not the deadline that ended it"
         );
         drop(injected);
     }
+
+    /// The deadline the wedge test and its negative control share.
+    ///
+    /// One constant rather than two literals: the control's entire claim is
+    /// that *the same* deadline builds a healthy pool, so if the two numbers
+    /// can drift apart the control silently stops controlling for anything.
+    /// Sized ~1000x a healthy announce (a `fetch_add` per worker) so cross-test
+    /// core contention cannot starve a healthy build past it, while staying
+    /// short enough that the wedge test does not pad the suite.
+    const PAIRED_DEADLINE_MS: u64 = 1_000;
 
     /// ...and the wait it does must actually be bounded by the deadline, not
     /// merely by the fault clearing itself.
     ///
     /// The negative control for the test above: without the hold, the same
-    /// 250 ms deadline must build a pool. A backstop that fired on every build
-    /// would pass the test above for the wrong reason.
+    /// deadline must build a pool. A backstop that fired on every build would
+    /// pass the test above for the wrong reason.
     #[test]
     fn the_same_deadline_builds_a_healthy_pool() {
-        let injected = Injected::timeout_ms(250);
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS);
         let pool = TaskPool::new(4);
         assert_eq!(pool.width(), 4);
         assert!(pool.dispatch(16, &|_| {}));
+        drop(injected);
+    }
+
+    /// The abandoned workers must not be joined, and a cooperative fault
+    /// cannot show that.
+    ///
+    /// `abandon_unready_workers` drops the handles unjoined on purpose:
+    /// joining would block on precisely the worker that is not coming, which
+    /// is the unbounded wait this whole change removes. Every other test here
+    /// injects a worker that parks on `shared.shutdown` -- the same flag the
+    /// abandon path sets -- so it *is* coming, and a `join()` restored to that
+    /// path would return promptly and leave the suite green while production
+    /// hung. This test makes the held worker deaf to shutdown for 4 s, an
+    /// order of magnitude past the deadline, so a restored join shows up as
+    /// the constructor taking seconds instead of milliseconds.
+    ///
+    /// The stubbornness is bounded rather than permanent so the thread is gone
+    /// by the end of the test rather than leaking into the rest of the binary.
+    /// That costs nothing: 4 s against a 250 ms deadline discriminates by 16x,
+    /// and the assertion is on the *builder*, which under the correct code
+    /// never waits for that thread at all.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "a 4s wall-clock stubbornness window against a 250ms deadline"
+    )]
+    fn an_abandoned_worker_that_ignores_shutdown_does_not_delay_the_builder() {
+        let injected = Injected::timeout_ms(250)
+            .hold_worker(0)
+            .hold_ignores_shutdown_ms(4_000);
+        let started = Instant::now();
+        build_expecting_failure(3).expect_err("the injected hold must fail the build");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the constructor took {elapsed:?} against a 250ms deadline while a \
+             worker ignored shutdown for 4s, which is the signature of the \
+             abandon path joining the handles it must only drop"
+        );
         drop(injected);
     }
 
@@ -1632,6 +1731,18 @@ mod ready_backstop_tests {
     /// under real contention costs milliseconds. The injected yield cost makes
     /// that regime deterministic -- 12 ms per yield against a 100 ms deadline
     /// means a stride of 64 would overrun by ~64x before noticing.
+    ///
+    /// The discriminator is the *yield count*, not elapsed time, and that is
+    /// deliberate. A wall-clock bound has to sit above the healthy path
+    /// (~9 yields x 12 ms ~= 110 ms, plus whatever the host adds) and below the
+    /// strided signature (~64 x 12 ms ~= 770 ms) -- an interval that contention
+    /// can close from below, at which point the test either reds on the host or
+    /// gets widened past 770 ms and silently stops catching the stride. The
+    /// yield count has no such window: the correct code leaves after
+    /// `deadline / yield_cost` yields, a stride of N cannot leave before its
+    /// first multiple of N, and a slow host only makes each yield cost *more*
+    /// wall clock, so the count falls further from the failing value rather
+    /// than towards it. It is the property itself rather than a proxy for it.
     #[test]
     fn the_deadline_is_checked_on_every_yield_not_on_a_stride() {
         let injected = Injected::timeout_ms(100)
@@ -1646,13 +1757,20 @@ mod ready_backstop_tests {
             yields > 0,
             "no yield happened, so the stride this test is about was never reached"
         );
-        // Generous by 10x against the deadline and still two orders of
-        // magnitude under what a 64-yield stride costs at 12ms/yield (~768ms
-        // of overrun per check).
         assert!(
-            elapsed < Duration::from_millis(1_000),
-            "the barrier overran its 100ms deadline by {elapsed:?} across {yields} \
-             yields, which is the signature of a strided clock check"
+            yields < u64::from(CLOCK_CHECK_STRIDE),
+            "the barrier yielded {yields} times at 12ms per yield against a \
+             100ms deadline, so it cannot have consulted the clock on each one; \
+             not leaving before yield {CLOCK_CHECK_STRIDE} is the signature of a \
+             strided check"
+        );
+        // Liveness only, deliberately far above both regimes: the claim about
+        // *granularity* is the assertion above, and duplicating it as a tight
+        // time bound would just reintroduce the window that bound cannot hold.
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the barrier never left its 100ms deadline at all ({elapsed:?} \
+             across {yields} yields)"
         );
         drop(injected);
     }
