@@ -678,7 +678,7 @@ invocation, and today nothing else does either:
   `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:67-72`),
   so the interpreter's three request-axis call sites never see a packed value;
 - the image preprocessing adapter passes exactly one encoded item per invocation
-  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3089`), even though the
+  (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3135`), even though the
   preprocessor underneath accepts many;
 - no declared preprocessing program can produce the `offsets`/`owner` pair that
   `token_packed` names, because the content-role vocabulary has no entry for
@@ -817,9 +817,20 @@ declared on its own dimension and they never compete for one.
   A component whose graph consumes a materialized mask declares that mask as an
   ordinary port and its program produces it; the lengths remain the single truth.
   One entry per dimension, and never on the dimension the layout packs: padding
-  and packing are two answers to one question. `padding` does not by itself make
-  a component padding-invariant — that remains the profile's `batch_invariance`
-  declaration.
+  and packing are two answers to one question. **Nor may an emit trim a padded
+  output:** `WorkflowNode::Emit.valid_length`
+  (`crates/onnx-genai-metadata/src/schema/ir.rs:900-916`) is honored by slicing
+  the payload (`crates/onnx-genai-engine/src/pipeline/workflow.rs:2215-2226` and
+  `4852-4882`), so an emit that both trims and declares `padding` publishes a
+  shorter tensor beside a length vector measuring the tensor it replaced —
+  either lengths that overrun the payload, or a value the runtime rewrote behind
+  the metadata that describes it. The rule is exclusion, not reconciliation: an
+  `Emit` whose output declares `padding` **MUST NOT** carry `valid_length`. A
+  `token_packed` output needs no separate rule, since per-row trimming routes
+  through `request_axis()` (`workflow.rs:2183-2189`), which is `None` for
+  `TokenPacked`, and a whole-tensor trim of the packed axis is already refused.
+  `padding` does not by itself make a component padding-invariant — that remains
+  the profile's `batch_invariance` declaration.
 - **Ownership is an ordered chain of levels over one physically packed axis.**
   `TokenPacked` declares `axis` — which **MUST** be `0` wherever `token_packed`
   appears, not only on a component that declares a capacity, because the runtime
