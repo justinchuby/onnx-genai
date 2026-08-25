@@ -639,7 +639,7 @@ image_features:
 An `offsets`/`owner` pair is the only fact needed to map packed items back to
 rows, and one level is the whole chain when items sit directly in rows. A second
 level expresses items that nest — the frames of a video clip
-([§10.5](#105-generic-component-batching--proposed)). This replaced the earlier
+([§10.5](#105-generic-component-batching)). This replaced the earlier
 flat `{ offsets, owner, axis }` spelling of the same fact; see
 [`ENCODER_BATCHING.md` §6.1](ENCODER_BATCHING.md#61-schema-evolution-what-actually-happens-to-an-old-runtime)
 for why the flat form was migrated rather than kept.
@@ -666,43 +666,60 @@ The decoder consumes encoder results through request-aligned splice descriptors
 splice is therefore correct under compaction for the same reason everything else
 is: it is request-aligned, so it permutes with its row.
 
-### 10.4 What §10.1 does not yet have
+### 10.4 What §10.1 did not have
+
+**Status.** This subsection records the state that motivated
+[§10.5](#105-generic-component-batching); the metadata half of it shipped in
+[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`) and
+is preserved in the past tense rather than deleted, because the reasons a field
+exists are not recoverable from the field. The runtime half — the interpreter,
+the preprocessor, and the scheduler — is still open.
 
 [§10.1](#101-independent-encoder-batching) states the layout of a packed encoder
-result. It does not state whether a component may *see* more than one item in one
-invocation, and today nothing else does either:
+result. It did not state whether a component may *see* more than one item in one
+invocation, and nothing else did either:
 
-- `WorkflowComponent` declares no batching capacity, bound, or co-batching
-  precondition (`crates/onnx-genai-metadata/src/schema/ir.rs:697-724`);
+- `WorkflowComponent` declared no batching capacity, bound, or co-batching
+  precondition. It now carries `batch_capacity`
+  (`crates/onnx-genai-metadata/src/schema/ir.rs:919`, within the struct at
+  `ir.rs:883-990`);
 - `token_packed` has no runtime consumer outside this crate —
-  `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:67-72`),
-  so the interpreter's three request-axis call sites never see a packed value;
+  `BatchLayout::request_axis` deliberately returns `None` for it (`ir.rs:194-199`),
+  so the interpreter's three request-axis call sites never see a packed value.
+  **This one is still true**, and it is the phase after the metadata surface;
 - the image preprocessing adapter passes exactly one encoded item per invocation
   (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3135`), even though the
   preprocessor underneath accepts many;
-- no declared preprocessing program can produce the `offsets`/`owner` pair that
-  `token_packed` names, because the content-role vocabulary has no entry for
-  either (`crates/onnx-genai-metadata/src/schema/mod.rs:296-309`);
-- validation checks nothing about `offsets`/`owner` beyond the serving-emit rule
-  in `validation.rs`, which accepts `request_aligned` or `token_packed` without
-  distinguishing them;
+- no declared preprocessing program could produce the `offsets`/`owner` pair that
+  `token_packed` names, because the content-role vocabulary had no entry for
+  either. `pack_offsets`, `pack_owner`, and `valid_lengths` are now in both the
+  vision and audio vocabularies
+  (`crates/onnx-genai-metadata/src/schema/mod.rs:349-363`, `mod.rs:449-456`),
+  though nothing *produces* them yet;
+- validation checked nothing about `offsets`/`owner` beyond the serving-emit rule
+  in `validation.rs`, which accepted `request_aligned` or `token_packed` without
+  distinguishing them. [§10.6](#106-packed-companions-must-validate) is now
+  implemented;
 - and nothing expresses *nesting*. A video clip is a sequence of frames inside an
   item, but the encoder-side vocabulary has no temporal validity value and no
   second ownership level, while `temporal_patch_size`
-  (`crates/onnx-genai-metadata/src/schema/pipeline.rs:180-183`) replicates one
+  (`crates/onnx-genai-metadata/src/schema/pipeline.rs:195-198`) replicates one
   frame rather than carrying a sequence. Video is fully expressible as a workflow
-  *output* (`WorkflowOutputRole::Video`, `ir.rs:636-643`) and absent as an
-  encoder input.
+  *output* (`WorkflowOutputRole::Video`, `ir.rs:822-829`) and absent as an
+  encoder input. `levels` supplies the nesting spelling (`ir.rs:109-118`); the
+  frame-sequence *producer* remains absent.
 
-The consequence of the last point is already visible: `ir.rs:52-53` calls
-`offsets` request-aligned, the canonical fixture declares it `shared`
-(`crates/onnx-genai-metadata/tests/redesign_invariants.rs:158-169`), and
-[§10.1](#101-independent-encoder-batching) describes it as a `cu_seqlens`-style
-`rows + 1` vector. Nothing rejects any of the three.
+The consequence of the last point was already visible: the schema doc comment
+called `offsets` request-aligned, the canonical fixture declared it `shared`,
+and [§10.1](#101-independent-encoder-batching) describes it as a
+`cu_seqlens`-style `rows + 1` vector. Nothing rejected any of the three. All
+three are reconciled by the surface below, which shipped in
+[#2009](https://github.com/justinchuby/onnx-genai/pull/2009).
 
-There is also no mechanism through which any of it could ship. The metadata
-structs are closed — `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
-(`crates/onnx-genai-metadata/src/schema/mod.rs:36-38`) and `schema/ir.rs` carries
+There was also no mechanism through which any of it could ship, and supplying one
+was a precondition rather than a detail. The metadata structs are closed —
+`InferenceMetadata` is `#[serde(deny_unknown_fields)]`
+(`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`) and `schema/ir.rs` carries
 45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
 `WorkflowComponent` — so an older runtime meeting a new field **rejects the whole
 document** rather than ignoring it, contrary to the "ignore unknown fields" claim
@@ -712,19 +729,27 @@ mentions it, so a document declaring a future version is accepted and then
 rejected field by field, which is the least actionable order in which to learn
 that a runtime upgrade is required.
 
-### 10.5 Generic component batching — proposed
+### 10.5 Generic component batching
 
-**Status: proposed, not normative.** The requirement keywords in this subsection
-describe rules that are *not yet* schema fields or validator rules. The design of
-record, with the evidence, phasing, and acceptance matrix, is
+**Status.** The metadata surface below — `batch_capacity`, `padding`, the
+`levels` ownership chain, the companion roles, and the version gate — shipped in
+[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`) and
+is validated at load. No runtime consumes it yet: nothing groups, nothing packs,
+and no preprocessing program produces the companions. Read the rules as
+normative and in force at load, and the runtime behaviour they describe as the
+contract the remaining phases are written against
+([`ENCODER_BATCHING.md`](ENCODER_BATCHING.md) §8).
+
+The requirement keywords in this subsection are schema fields and validator rules
+at load, and describe runtime behaviour that is not yet implemented. The design
+of record, with the evidence, phasing, and acceptance matrix, is
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Vision encoders — images and video — motivate the work; nothing about it is
 modality-specific. The contracts carry shape symbols, bounds, lengths, and
 ownership levels; a modality vocabulary only produces the semantic values those
 contracts point at, so audio windows and text segments reach the same path
-without a new concept. The proposed surface is three additions, each absent by
-default:
+without a new concept. The surface is three additions, each absent by default:
 
 ```yaml
 components:
@@ -819,7 +844,7 @@ declared on its own dimension and they never compete for one.
   One entry per dimension, and never on the dimension the layout packs: padding
   and packing are two answers to one question. **Nor may an emit trim a padded
   output:** `WorkflowNode::Emit.valid_length`
-  (`crates/onnx-genai-metadata/src/schema/ir.rs:900-916`) is honored by slicing
+  (`crates/onnx-genai-metadata/src/schema/ir.rs:1169-1186`) is honored by slicing
   the payload (`crates/onnx-genai-engine/src/pipeline/workflow.rs:2215-2226` and
   `4852-4882`), so an emit that both trims and declares `padding` publishes a
   shorter tensor beside a length vector measuring the tensor it replaced —
@@ -829,12 +854,12 @@ declared on its own dimension and they never compete for one.
   the refusal names `padding.valid_lengths` as the authoritative account, since
   a trim is invisible in the contract while a padding entry is part of what the
   caller reads. The exclusion does not ask which axis the trim is about: an
-  emit's growth axis is only a default (`ir.rs:909-915`), so narrowing it would
+  emit's growth axis is only a default (`ir.rs:1178-1185`), so narrowing it would
   mean guessing in the direction of admitting the ambiguous case. A `token_packed`
   output needs no separate rule, because an emit-level `valid_length` into a
   layout with no request axis is already refused at load as ragged emission
   lacking a row axis
-  (`crates/onnx-genai-metadata/src/validation.rs:3288-3302`); a packed **and**
+  (`crates/onnx-genai-metadata/src/validation.rs:4811-4825`); a packed **and**
   padded output hears from both rules, which is correct — they answer different
   questions.
   `padding` does not by itself make a component padding-invariant — that remains
@@ -855,9 +880,9 @@ declared on its own dimension and they never compete for one.
   name and treats the length role as descriptive, and deliberately so: length
   vectors have established modality spellings that predate this design, while the
   companion roles are new and have nothing to accommodate. A third role,
-  `valid_lengths`, is **new**: no such role exists today — the audio vocabulary
-  offers `valid_frames`, `valid_samples`, `sample_lengths`, `frame_lengths`, and
-  `validity_mask` (`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`) — and
+  `valid_lengths`, is **new**: no such role existed — the audio vocabulary
+  offered `valid_frames`, `valid_samples`, `sample_lengths`, `frame_lengths`, and
+  `validity_mask` (`crates/onnx-genai-metadata/src/schema/mod.rs:428-456`) — and
   an earlier revision's claim that it generalized an existing role is withdrawn.
   It coexists with those names rather than replacing them: a `padding` entry
   references a value **by name**, so an audio program may point at a
@@ -872,7 +897,7 @@ declared on its own dimension and they never compete for one.
   *emitted by some declared step*, since an output nothing writes delivers an
   empty vector beside a ragged payload. The serving rule that rejects an emitted
   rank > 0 `shared` value
-  (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`) is carved out for
+  (`crates/onnx-genai-metadata/src/validation.rs:4858-4862`) is carved out for
   exactly those referenced companions — `int64`, of the rank that reference
   demands, named by another emitted value's layout or `padding` entry in the same
   workflow — and for nothing else. The rank is per reference rather than a flat
@@ -884,7 +909,7 @@ declared on its own dimension and they never compete for one.
   only account of the padding that exists.
 - **A row selection is lifted, never applied to a packed axis.**
   `BatchLayout::request_axis()` returns `None` for `TokenPacked`
-  (`crates/onnx-genai-metadata/src/schema/ir.rs:67-72`) while `is_row_scoped()`
+  (`crates/onnx-genai-metadata/src/schema/ir.rs:194-199`) while `is_row_scoped()`
   reports true, so compaction resolves each destination row's unit range through
   the outer level, then each unit's positions through the inner level, producing
   an item permutation; companions are then **recomputed**, never gathered.
@@ -918,15 +943,17 @@ is a metadata field — residency and execution capability are runtime-owned
 ([§10.2](#102-externally-suppliable-results)) — and both are specified in
 [`ENCODER_BATCHING.md` §5.1](ENCODER_BATCHING.md#51-grouped-buffers-aliasing-residency-and-what-padding-costs).
 
-**Shipping this surface requires a version gate, not a compatibility claim.**
+**Shipping this surface required a version gate, not a compatibility claim, and
+the gate shipped with it** (`crates/onnx-genai-metadata/src/version.rs:78`,
+`SUPPORTED_SCHEMA_VERSION` `v1.1` at `version.rs:42`).
 `InferenceMetadata` and every struct this design extends are
-`#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:36-38`
+`#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`
 and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
 document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
 ignore them, and the forward-compatibility claim in the `schema_version` doc
 comment (`schema/mod.rs:47-52`) does not describe this codebase. Nothing
 validates `schema_version` today either
-([§10.4](#104-what-101-does-not-yet-have)). The mechanism this surface requires is
+([§10.4](#104-what-101-did-not-have)). The mechanism this surface requires is
 therefore a gate that reads `schema_version` from a generic parse and rejects an
 unsupported version with one actionable message **before** struct
 deserialization, with an exactly stated grammar:
@@ -961,9 +988,14 @@ parses the document and chooses not to group stays correct. Version gating says
 be wrong". This is also the general direction: a fact the workflow structure
 already determines is not additionally serialized as a flag.
 
-### 10.6 Packed companions must validate — proposed
+### 10.6 Packed companions must validate
 
-**Status: proposed, not normative.** Full rules and their negative fixtures are
+**Status.** Implemented in
+[#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`). The
+load-time half of this subsection is in force; the invocation-time checks it
+also specifies belong to the interpreter phase and are not implemented.
+
+Full rules and their negative fixtures are
 in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-strict-token_packed-validation).
 In summary, a `token_packed` value's companions are checked at **load**: every
 level's `offsets` and `owner` **MUST** resolve to declared values; each is
@@ -1001,7 +1033,7 @@ silence.
 
 **Serving admits companions, and only companions.** A serving workflow rejects an
 emitted value of rank > 0 that declares `shared`
-(`crates/onnx-genai-metadata/src/validation.rs:3313-3321`), which would reject
+(`crates/onnx-genai-metadata/src/validation.rs:4858-4862`), which would reject
 the very companions a ragged emit is required to publish — a packed value's
 `offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
 minimal and decidable from the workflow's own declarations — its outputs and its
@@ -1011,7 +1043,7 @@ is named as an `offsets` or `owner` of another emitted value's layout, or as the
 `valid_lengths` of another emitted value's `padding` entry, in the same workflow;
 anything else keeps the existing rejection. The rank is read from the reference,
 not fixed at 1: an `offsets` and an `owner` are rank 1 by construction, while a
-`valid_lengths` has the rank [§10.5](#105-generic-component-batching--proposed)
+`valid_lengths` has the rank [§10.5](#105-generic-component-batching)
 fixes — the number of axes outer to the padded one, equivalently `rank == axis`
 for the padded dimension's axis index — so a flat rank-1 admission
 would refuse a companion this design elsewhere requires, and would refuse it by
@@ -1036,8 +1068,8 @@ them, are **derived** by the runtime from the rebased offsets.
 `offsets` is `shared` rather than `request_aligned` for a structural reason: an
 exclusive prefix sum is not permutation-followable. Permuting rows does not
 permute a prefix-offset vector, it invalidates it, so a runtime that changes the
-grouping recomputes `offsets` instead of gathering it. The doc comment at
-`ir.rs:52-53` is corrected when the rule lands.
+grouping recomputes `offsets` instead of gathering it. The doc comment that
+called it request-aligned was corrected when the rule landed.
 
 At **invocation** the runtime verifies, at every level, that extents resolve
 consistently, `offsets[0] == 0`, monotonicity, that the last offset equals the
@@ -1733,15 +1765,16 @@ content-role vocabulary has no entry for per-item offsets or per-item ownership,
 so the `offsets`/`owner` pair that `token_packed` names
 ([§8.2](#82-declared-layout-facts)) has no declared producer. Nor can a program
 state how an item nests — the frames of a video clip, the windows of an
-utterance — or how much of a padded item is real. Two level-agnostic proposed
-roles, `pack_offsets` and `pack_owner`, close the first two gaps at any nesting
-level, and a third proposed role, `valid_lengths`, closes the third. That role is
-**new**, not a generalization of an existing one: the audio vocabulary offers
-`valid_frames`, `valid_samples`, `sample_lengths`, and `frame_lengths`
-(`crates/onnx-genai-metadata/src/schema/mod.rs:350-365`) but no `valid_lengths`,
-and since a padding contract references its length value by name, those
+utterance — or how much of a padded item is real. Two level-agnostic roles,
+`pack_offsets` and `pack_owner`, close the first two gaps at any nesting level,
+and a third role, `valid_lengths`, closes the third. That role is **new**, not a
+generalization of an existing one: the audio vocabulary offered `valid_frames`,
+`valid_samples`, `sample_lengths`, and `frame_lengths` and no `valid_lengths`,
+and all three roles are now declarable
+(`crates/onnx-genai-metadata/src/schema/mod.rs:449-456`) though nothing produces
+them. Since a padding contract references its length value by name, those
 modality-specific spellings keep working alongside the generic one
-— see [§10.5](#105-generic-component-batching--proposed) and
+— see [§10.5](#105-generic-component-batching) and
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request
