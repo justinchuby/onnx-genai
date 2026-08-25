@@ -361,9 +361,19 @@ Which drivers take the lock is now checked rather than remembered.
 directory to declare itself a driver, a generator, a library or a test: an
 undeclared file fails, a driver that never calls `hostlock_gate.require`
 fails, and a file declared harmless that imports `onnxruntime`, opens an
-`InferenceSession` or starts a binary out of `target/` fails as contradicted.
-It reads the parsed tree, not the text, because the first pass of the #2043
-audit counted `gen_gqa.py` as a harness for describing one in its docstring.
+`InferenceSession` or *names* a binary under `target/` fails as contradicted.
+Both halves read the parsed tree rather than the text: prose about a benchmark
+is not a benchmark (the first pass of the #2043 audit counted `gen_gqa.py` as
+a harness for describing one in its docstring), and a commented-out gate call
+is not a gate call — that error would be fail-open, reporting an unprotected
+driver as protected.
+
+It detects a *literal* path under `target/`, not the spawn itself, so a driver
+misdeclared as a generator that builds its path at runtime would pass; and it
+covers this directory only. Both limits are written down at the top of the
+file. A generator that legitimately loads the runtime declares
+`loads-runtime:` and keeps its reason, the same way an ungated driver
+declares `known-gap:`.
 
 A driver may be ungated *on purpose* — `ort_cuda_decode_bench.py` is, pending
 its owner — but only as a `known-gap:` entry naming the issue. The distinction

@@ -10,14 +10,25 @@ somebody else's matrix.
 So this file makes the classification explicit and checks it. Every `.py` in
 `scripts/ort_ab/` must be declared as a driver, a generator, a library or a
 test. A driver must call `hostlock_gate.require`. A file declared as anything
-else must not look like a driver -- if it spawns a benchmark or opens an
-inference session, the declaration is contradicted by the file itself and the
-suite fails.
+else must not look like a driver -- if it imports the runtime, opens an
+inference session, or names a binary under `target/`, the declaration is
+contradicted by the file itself and the suite fails.
 
 The point is not that this catches today's drivers; #2043 already listed
 those. It is that the *next* harness cannot ship ungated by accident, because
 an unclassified file is a failure and a misclassified one is a failure with a
 reason attached.
+
+**What it does not catch**, written down so nobody reads more into a green
+run than is there:
+
+- A driver **outside this directory**. `crates/onnx-runtime-ep-cpu/benches/
+  acc0_*.py` are ungated and are the rest of #2043.
+- A driver **misdeclared as a generator** whose binary path is built at
+  runtime (`os.path.join("target", "release", ...)`, an f-string, an env
+  var). The contradiction check reads literals, so it would not object --
+  `ab.py` itself has no `target/` literal. Declaring a driver a generator is
+  a false statement in a reviewed file, which is the layer that catches it.
 
 Run: `python3 scripts/ort_ab/test_gate_conformance.py`
 """
@@ -46,6 +57,12 @@ DRIVERS = {
 LIBRARIES = {
     "hostlock_gate.py": "the gate itself",
 }
+
+# A non-driver may legitimately touch the runtime -- a generator that checks
+# its fixture actually loads, say. `loads-runtime:` declares that, the same
+# way `known-gap:` declares an ungated driver: written down, not enforced out
+# of existence. Any other reason string does not suppress the finding.
+RUNTIME_OK = "loads-runtime:"
 
 TESTS = {
     "test_ab_lock.py": "admission cells for the gate",
@@ -87,22 +104,49 @@ SESSION_CALLS = ("InferenceSession",)
 BUILT_BINARY = re.compile(r"target/(?:release|debug)/")
 
 
-# Both import styles reach the same gate: `hostlock_gate.require(...)` and
-# the `from hostlock_gate import require` that `ab.py` uses. Matching only the
-# qualified form would have reported the one driver that has taken the lock
-# since #2032 as ungated.
-GATE_CALLS = (
-    re.compile(r"hostlock_gate\.require\("),
-    re.compile(r"from hostlock_gate import[^\n]*(?:\n[^)]*)?\brequire\b"),
-)
-
-
 def takes_the_lock(source: str) -> bool:
-    if not any(mark.search(source) for mark in GATE_CALLS):
+    """A call to the gate, found in the parsed tree.
+
+    Both import styles reach the same gate: `hostlock_gate.require(...)` and
+    the `from hostlock_gate import require` that `ab.py` uses, so matching
+    only the qualified form would report the one driver that has taken the
+    lock since #2032 as ungated.
+
+    From the tree rather than the text, and for the same reason the rest of
+    this file is: a regex matches a *commented-out* gate call, and that error
+    is fail-open -- it reports an unprotected driver as protected, which is
+    the one direction this check must never fail in.
+
+    Fails closed on an alias (`g = hostlock_gate.require; g(cmd)`): reported
+    ungated, which costs someone an argument rather than costing the box a
+    contended run.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
         return False
-    # The import alone is not the gate: a driver that imports `require` and
-    # never calls it is exactly as unprotected as one that does not import it.
-    return re.search(r"^\s*(?:lock_label|_)?[^\n]*\brequire\(", source, re.M) is not None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "require":
+            value = func.value
+            if getattr(value, "id", None) == "hostlock_gate":
+                return True
+        elif isinstance(func, ast.Name) and func.id == "require":
+            # The bare name only counts when it came from the gate: a file
+            # with a `require()` of its own has not taken the lock.
+            if imports_require_from_gate(tree):
+                return True
+    return False
+
+
+def imports_require_from_gate(tree: ast.Module) -> bool:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "hostlock_gate":
+            if any(a.name == "require" for a in node.names):
+                return True
+    return False
 
 
 def declared_roles(
@@ -202,6 +246,8 @@ def contradicted(sources: dict[str, str]) -> list[str]:
     for name, source in sorted(sources.items()):
         if name in DRIVERS:
             continue
+        if declared_reason(name).startswith(RUNTIME_OK):
+            continue
         if looks_like_a_driver(source, binary_paths=name not in TESTS):
             out.append(
                 f"{name}: declared not-a-driver, but it starts a benchmark or "
@@ -210,8 +256,25 @@ def contradicted(sources: dict[str, str]) -> list[str]:
     return out
 
 
+def declared_reason(name: str) -> str:
+    for members in (DRIVERS, LIBRARIES, TESTS, GENERATORS):
+        if name in members:
+            return members[name]
+    return ""
+
+
 def read_sources() -> dict[str, str]:
-    return {p.name: p.read_text() for p in sorted(ORT_AB.glob("*.py"))}
+    """Recursive, because the workflow filter is.
+
+    `paths: scripts/ort_ab/**` triggers the job for
+    `scripts/ort_ab/cuda/decode_bench.py`, so a non-recursive glob here would
+    run the check, see nothing, and go green -- the vacuity failure this file
+    warns about, one directory down.
+    """
+    return {
+        p.relative_to(ORT_AB).as_posix(): p.read_text()
+        for p in sorted(ORT_AB.rglob("*.py"))
+    }
 
 
 class Classification(unittest.TestCase):
@@ -219,6 +282,30 @@ class Classification(unittest.TestCase):
         # A new harness lands here as an unclassified file, which fails --
         # rather than as a silently ungated one, which does not.
         self.assertEqual(unclassified(sorted(read_sources())), [])
+
+    def test_a_driver_hidden_one_directory_down_is_still_seen(self):
+        # The workflow filter is `scripts/ort_ab/**`, so a push touching
+        # `cuda/decode_bench.py` runs this job. A non-recursive glob would
+        # have run it, seen nothing and gone green -- the cheapest bypass of
+        # all, needing no edit to any list here.
+        self.assertEqual(
+            unclassified(["cuda/decode_bench.py"]), ["cuda/decode_bench.py"]
+        )
+        # And discovery really descends: a pure-function assertion would
+        # pass just as well with a non-recursive glob, since the directory
+        # has no subdirectory today. This one puts a file there.
+        planted = ORT_AB / "cuda_probe_tmp" / "decode_bench.py"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            planted.write_text("import onnxruntime\n")
+            found = read_sources()
+            self.assertIn("cuda_probe_tmp/decode_bench.py", found)
+            self.assertEqual(
+                unclassified(sorted(found)), ["cuda_probe_tmp/decode_bench.py"]
+            )
+        finally:
+            planted.unlink(missing_ok=True)
+            planted.parent.rmdir()
 
     def test_a_new_unclassified_file_is_a_failure(self):
         self.assertEqual(unclassified(["brand_new_sweep.py"]), ["brand_new_sweep.py"])
@@ -242,11 +329,26 @@ class Vacuity(unittest.TestCase):
     WORKFLOW = ORT_AB.parents[1] / ".github" / "workflows" / "hostlock.yml"
 
     def test_the_workflow_runs_for_any_file_in_this_directory(self):
+        # Placement, not multiplicity: two copies of the filter both sitting
+        # under `pull_request` would count 2 and pass, while a direct push to
+        # main landed an ungated driver unchecked -- which is the thing the
+        # second copy is there to prevent.
+        pr_block, push_block = self.trigger_blocks()
+        self.assertEqual(pr_block.count('"scripts/ort_ab/**"'), 1)
+        self.assertEqual(push_block.count('"scripts/ort_ab/**"'), 1)
+
+    def trigger_blocks(self) -> tuple[str, str]:
+        """The `pull_request:` and `push:` halves of the trigger section.
+
+        Split on the text rather than parsed, because pyyaml is not in this
+        job's environment and adding a dependency to a conformance check is a
+        way to have it skipped.
+        """
         text = self.WORKFLOW.read_text()
-        self.assertIn('"scripts/ort_ab/**"', text)
-        # Both triggers: a pull_request-only filter would let a direct push
-        # to main land an ungated driver unchecked.
-        self.assertEqual(text.count('"scripts/ort_ab/**"'), 2)
+        body = text.split("\non:\n", 1)[1]
+        head, _, tail = body.partition("\n  push:\n")
+        self.assertTrue(tail, "workflow has no push: trigger")
+        return head, tail.split("\npermissions:", 1)[0]
 
     def test_the_workflow_actually_runs_this_file(self):
         self.assertIn("test_gate_conformance.py", self.WORKFLOW.read_text())
@@ -276,6 +378,27 @@ class Gating(unittest.TestCase):
         # A file that mentions the gate in a comment has not taken the lock.
         fail = gate_failures({"ab.py": "# see hostlock_gate for the admission rules\n"})
         self.assertEqual(len(fail), 1)
+
+    def test_a_commented_out_gate_call_is_not_a_gate_call(self):
+        # The fail-open direction, and the reason this reads the tree: a
+        # regex for `hostlock_gate.require(` matches inside a comment, so a
+        # driver whose only gate call is commented out would have reported as
+        # protected -- the exact "reads as gated while ungated" failure this
+        # file exists to prevent.
+        for source in (
+            "# hostlock_gate.require(cmd)\n",
+            '"""Call hostlock_gate.require(cmd) before any arm."""\n',
+        ):
+            self.assertFalse(takes_the_lock(source), source)
+            self.assertEqual(len(gate_failures({"ab.py": source})), 1)
+
+    def test_a_local_function_called_require_is_not_the_gate(self):
+        # The bare name counts only when it came from the gate's module.
+        source = "def require(x):\n    pass\n\nrequire(1)\n"
+        self.assertFalse(takes_the_lock(source))
+        self.assertTrue(
+            takes_the_lock("from hostlock_gate import require\nrequire(1)\n")
+        )
 
     def test_importing_the_gate_without_calling_it_is_not_gating(self):
         # The failure mode this exists for: a driver that imports `require`,
@@ -347,6 +470,34 @@ class Contradiction(unittest.TestCase):
         self.assertEqual(
             len(contradicted({"gen_gemm.py": "import onnxruntime as ort\n"})), 1
         )
+
+    def test_a_generator_may_declare_that_it_loads_the_runtime(self):
+        # The asymmetry the reviewer caught: drivers could record a gap, but a
+        # generator that legitimately checks its fixture loads in ORT had no
+        # way to say so and would have been failed into not doing it.
+        self.assertTrue(RUNTIME_OK.endswith(":"))
+        declared = dict(GENERATORS)
+        try:
+            GENERATORS["gen_moe.py"] = RUNTIME_OK + "#2043 - checks the fixture loads"
+            self.assertEqual(contradicted({"gen_moe.py": "import onnxruntime\n"}), [])
+            GENERATORS["gen_moe.py"] = "writes model fixtures, measures nothing"
+            self.assertEqual(
+                len(contradicted({"gen_moe.py": "import onnxruntime\n"})), 1
+            )
+        finally:
+            GENERATORS.clear()
+            GENERATORS.update(declared)
+
+    def test_both_spellings_of_a_runtime_import_are_seen(self):
+        # `from onnxruntime import InferenceSession` is the same behaviour as
+        # `import onnxruntime`, and neither had a cell.
+        self.assertTrue(looks_like_a_driver("from onnxruntime import InferenceSession\n"))
+        self.assertTrue(looks_like_a_driver("import onnxruntime as ort\n"))
+
+    def test_both_spellings_of_a_session_call_are_seen(self):
+        # The attribute form is what the real CUDA driver uses.
+        self.assertTrue(looks_like_a_driver("s = ort.InferenceSession(p)\n"))
+        self.assertTrue(looks_like_a_driver("s = InferenceSession(p)\n"))
 
     def test_a_declared_driver_is_not_reported_as_contradicted(self):
         # Otherwise every driver would be reported twice, and the two findings
