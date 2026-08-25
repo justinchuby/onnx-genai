@@ -19865,11 +19865,20 @@ mod tests {
 
     /// Value of [`SPMD_WIDTH_CHILD_ENV`] that means "resolve the width yourself".
     ///
-    /// The child restricts itself to one CPU per physical core and then builds
-    /// the pool with no explicit width, which is the shape every pinned
-    /// benchmark run on this host has. See
-    /// [`a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given`].
+    /// The child applies the exact CPU mask supplied through
+    /// [`SPMD_WIDTH_CHILD_MASK_ENV`] and then builds the pool with no explicit
+    /// width. See [`a_default_width_pool_obeys_runtime_masks_and_reservations`].
     const SPMD_WIDTH_CHILD_DEFAULT: &str = "default";
+
+    /// Exact comma-separated CPU mask the default-width child must apply before
+    /// it constructs the pool.
+    const SPMD_WIDTH_CHILD_MASK_ENV: &str = "ONNX_GENAI_TEST_SPMD_REALIZED_WIDTH_MASK";
+
+    /// Marker for a runtime topology premise that this host cannot express.
+    ///
+    /// Written directly to stderr so it survives libtest capture on a passing
+    /// test, unlike `eprintln!`.
+    const AFFINITY_FIXTURE_SKIP_MARKER: &str = "NXRT_AFFINITY_FIXTURE_SKIPPED:";
 
     /// Set on a realized-width child to make it misreport its own placement.
     /// See [`placement_is_honest`] and
@@ -20084,17 +20093,9 @@ mod tests {
         /// old name would have left the parent's escape hatch below checking a
         /// host fact that no longer has anything to do with it.
         worker_masks_readable: bool,
-        /// Whether the child successfully narrowed itself to one CPU per
-        /// physical core. Only the default arm asks for this; every other arm
-        /// reports `false` because it never tried.
-        ///
-        /// A separate field rather than an inference from `allowed == cores`,
-        /// because that equality is also what the arm *asserts*: deriving the
-        /// precondition from the conclusion is how a check comes to confirm
-        /// itself. On a target with no process-wide masking the two are
-        /// genuinely different facts -- narrowing did not happen, and the
-        /// equality may still hold on a machine without SMT.
-        narrowed_to_leaders: bool,
+        /// Whether the child successfully applied and read back the exact CPU
+        /// mask requested by the parent before constructing the pool.
+        affinity_mask_applied: bool,
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
         /// number is the only in-band trace of them (#1745).
@@ -20356,9 +20357,13 @@ mod tests {
         // `requested=0` marks the default-resolver arm in the report line: the
         // parent did not ask for a width, so there is no requested value to
         // echo and the only honest thing to print is "none".
-        let mut narrowed = false;
+        let mut affinity_mask_applied = false;
         let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
-            narrowed = restrict_self_to_leader_cpus();
+            let raw_mask = std::env::var(SPMD_WIDTH_CHILD_MASK_ENV)
+                .expect("the default-width child requires an exact CPU mask");
+            let requested_cpus = parse_test_cpu_mask(&raw_mask);
+            apply_exact_test_affinity_mask(&requested_cpus);
+            affinity_mask_applied = true;
             0
         } else {
             raw.parse().expect("the parent passes a decimal width")
@@ -20419,7 +20424,7 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={} realized={realized} policy={} narrowed={} cpulist={cpulist}",
+             pinned={} proc={} realized={realized} policy={} masked={} cpulist={cpulist}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
@@ -20427,153 +20432,244 @@ mod tests {
             u8::from(fully_pinned),
             u8::from(observed_ok),
             crate::decode_affinity::CorePlacement::from_env().as_str(),
-            u8::from(narrowed)
+            u8::from(affinity_mask_applied)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
-    /// Choose one allowed leader CPU per physical core, confined to one NUMA
-    /// node when the host exposes more than one.
-    ///
-    /// The single-node constraint is part of the fixture, not production
-    /// policy. A multi-node pool deliberately reserves one control CPU per node
-    /// so an unpinned dispatcher cannot strand a node's completion counter;
-    /// therefore `workers == cores` is not the contract of a fully subscribed
-    /// NUMA split. This test isolates the default-width resolver from that
-    /// independently tested reservation policy.
-    fn leader_cpus_for_default_width_fixture(
+    fn parse_test_cpu_mask(raw: &str) -> Vec<usize> {
+        let cpus: Vec<usize> = raw
+            .split(',')
+            .map(|cpu| {
+                cpu.parse()
+                    .unwrap_or_else(|_| panic!("`{raw}` is not a comma-separated CPU mask"))
+            })
+            .collect();
+        assert!(!cpus.is_empty(), "the requested CPU mask must not be empty");
+        assert!(
+            cpus.windows(2).all(|pair| pair[0] < pair[1]),
+            "the requested CPU mask must be sorted and unique: {cpus:?}"
+        );
+        cpus
+    }
+
+    /// Apply and read back the exact mask before any worker pool exists.
+    fn apply_exact_test_affinity_mask(requested: &[usize]) {
+        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
+            panic!(
+                "the exact affinity child is Linux-only; its parent test must be ignored on \
+                 targets without process-wide masking"
+            );
+        }
+        crate::decode_affinity::set_current_thread_affinity(requested)
+            .unwrap_or_else(|reason| panic!("apply exact child affinity {requested:?}: {reason}"));
+        let observed = crate::decode_affinity::allowed_cpus()
+            .expect("Linux applied an affinity mask but could not read it back");
+        assert_eq!(
+            observed, requested,
+            "sched_setaffinity reported success but sched_getaffinity did not return the \
+             exact requested set; the pool must not be constructed on a different mask"
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AffinityFixtureSkip {
+        reason: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum AffinityFixtureOutcome {
+        Ready(Vec<usize>),
+        Skipped(AffinityFixtureSkip),
+    }
+
+    fn record_affinity_fixture_skip(case: &str, skip: &AffinityFixtureSkip) {
+        use std::io::Write;
+        assert!(
+            !skip.reason.trim().is_empty(),
+            "an affinity fixture skip must state its missing premise"
+        );
+        let mut err = std::io::stderr();
+        let _ = writeln!(
+            err,
+            "{AFFINITY_FIXTURE_SKIP_MARKER} case={case} reason={}",
+            skip.reason
+        );
+        let _ = err.flush();
+    }
+
+    fn numa_node_cpu_sets(
+        allowed: &[usize],
+        numa: Option<&crate::decode_affinity::NumaTopology>,
+    ) -> Vec<Vec<usize>> {
+        numa.and_then(|numa| {
+            numa.restrict_to_allowed(Some(allowed))
+                .split_workers(allowed.len())
+        })
+        .map(|shards| shards.into_iter().map(|shard| shard.cpus).collect())
+        .unwrap_or_else(|| vec![allowed.to_vec()])
+    }
+
+    fn contiguous_default_width_mask(
+        node_cpu_sets: &[Vec<usize>],
+        topology: &crate::core_topology::CoreTopology,
+    ) -> AffinityFixtureOutcome {
+        const MAX_CPUS: usize = 8;
+        for node in node_cpu_sets {
+            let mut node = node.clone();
+            node.sort_unstable();
+            node.dedup();
+            let mut start = 0;
+            while start < node.len() {
+                let mut end = start + 1;
+                while end < node.len() && node[end] == node[end - 1] + 1 {
+                    end += 1;
+                }
+                let run = &node[start..end];
+                for width in (2..=run.len().min(MAX_CPUS)).rev() {
+                    for mask in run.windows(width) {
+                        if topology.physical_cores_within(mask) >= 2 {
+                            return AffinityFixtureOutcome::Ready(mask.to_vec());
+                        }
+                    }
+                }
+                start = end;
+            }
+        }
+        AffinityFixtureOutcome::Skipped(AffinityFixtureSkip {
+            reason: "the allowed set contains no numerically contiguous run spanning at least \
+                     two physical cores"
+                .to_string(),
+        })
+    }
+
+    fn one_cpu_per_core(
         allowed: &[usize],
         topology: &crate::core_topology::CoreTopology,
-        node_cpus: Option<&[usize]>,
+        prefer_non_leader: bool,
     ) -> Vec<usize> {
-        let eligible: Vec<usize> = match node_cpus {
-            Some(node_cpus) => allowed
+        let allowed: std::collections::BTreeSet<usize> = allowed.iter().copied().collect();
+        let mut represented = std::collections::BTreeSet::new();
+        let mut selected = Vec::new();
+        for core in topology.cores() {
+            let inside: Vec<usize> = core
                 .iter()
                 .copied()
-                .filter(|cpu| node_cpus.contains(cpu))
-                .collect(),
-            None => allowed.to_vec(),
-        };
-        topology.leaders_within(&eligible)
+                .filter(|cpu| allowed.contains(cpu))
+                .collect();
+            if let Some(&cpu) = if prefer_non_leader {
+                inside.last()
+            } else {
+                inside.first()
+            } {
+                selected.push(cpu);
+                represented.extend(inside);
+            }
+        }
+        selected.extend(
+            allowed
+                .iter()
+                .copied()
+                .filter(|cpu| !represented.contains(cpu)),
+        );
+        selected.sort_unstable();
+        selected
     }
 
-    #[test]
-    fn default_width_fixture_keeps_only_allowed_leaders_from_one_numa_node() {
-        let topology = crate::core_topology::CoreTopology::from_sibling_groups([
-            vec![0, 1],
-            vec![2, 3],
-            vec![4, 5],
-            vec![6, 7],
-            vec![8, 9],
-            vec![10, 11],
-        ]);
-        // A partially reserved, non-contiguous process mask spanning two NUMA
-        // nodes. The fixture must neither widen the process mask nor retain
-        // leaders from the other node.
-        let allowed = [1, 2, 5, 6, 9, 10];
-        let node = [0, 1, 4, 5, 8, 9];
-        let leaders = leader_cpus_for_default_width_fixture(&allowed, &topology, Some(&node));
-        assert_eq!(leaders, vec![1, 5, 9]);
-        assert!(leaders.iter().all(|cpu| allowed.contains(cpu)));
-        assert!(leaders.iter().all(|cpu| node.contains(cpu)));
+    fn sparse_multi_node_default_width_mask(
+        node_cpu_sets: &[Vec<usize>],
+        topology: &crate::core_topology::CoreTopology,
+    ) -> AffinityFixtureOutcome {
+        const MAX_NODES: usize = 4;
+        let mut mask = Vec::new();
+        let mut selected_nodes = 0;
+        for node in node_cpu_sets {
+            let representatives = one_cpu_per_core(node, topology, selected_nodes % 2 == 1);
+            if representatives.len() < 2 {
+                continue;
+            }
+            mask.push(representatives[0]);
+            mask.push(*representatives.last().unwrap());
+            selected_nodes += 1;
+            if selected_nodes == MAX_NODES {
+                break;
+            }
+        }
+        mask.sort_unstable();
+        mask.dedup();
+        if selected_nodes < 2 {
+            return AffinityFixtureOutcome::Skipped(AffinityFixtureSkip {
+                reason: "the allowed set does not expose two NUMA nodes with at least two \
+                         physical cores each"
+                    .to_string(),
+            });
+        }
+        if mask.windows(2).all(|pair| pair[1] == pair[0] + 1) {
+            return AffinityFixtureOutcome::Skipped(AffinityFixtureSkip {
+                reason: "the available multi-node representatives form only a contiguous CPU \
+                         range, so this host cannot express the sparse-mask premise"
+                    .to_string(),
+            });
+        }
+        AffinityFixtureOutcome::Ready(mask)
     }
 
-    /// Narrow this process to one CPU per physical core on one NUMA node, in
-    /// place.
-    ///
-    /// This is what `taskset -c 0,2,4,...` does to a benchmark run, and it is
-    /// the cpuset shape that #1780 got wrong: every allowed CPU is already a
-    /// distinct core, so a resolver that approximates cores as `available / 2`
-    /// silently halves the pool. Doing it from inside the child keeps the test
-    /// free of a `taskset` dependency and makes the mask an observable the
-    /// child reports (`allowed`/`cores`) rather than an assumption.
-    ///
-    /// Returns whether the narrowing actually happened, which the parent needs
-    /// in order to tell two different "no" answers apart:
-    ///
-    /// * **Unbuildable by construction.** `set_current_thread_affinity` is
-    ///   implemented on Linux only, so on Windows and macOS this shape cannot be
-    ///   created at all and the arm has nothing to measure. That is a skip, and
-    ///   it is stated on stderr rather than passed silently.
-    /// * **Supported and broken.** On a target that *has* masking, a failure
-    ///   leaves the child on the full cpuset, where the arm's `workers == cores`
-    ///   would be a claim about the host rather than about the resolver. That
-    ///   panics.
-    ///
-    /// The original version panicked on both, which is why #2059 merged with
-    /// both Windows lanes red: it read "this platform has no process-wide
-    /// masking" as a defect. Collapsing them the other way -- skipping on both
-    /// -- would have been worse, because it removes Linux coverage the moment
-    /// masking breaks there, and Linux is where this arm actually runs.
-    ///
-    /// #2078 fixed the red with the platform half of this, which is the part
-    /// that matters for a green lane. Reporting the *outcome* rather than the
-    /// platform is what closes the remainder: the parent then keys its skip on
-    /// what happened rather than on what it assumes must have happened, and the
-    /// three unanswerable paths below stop being silent `return`s.
-    fn restrict_self_to_leader_cpus() -> bool {
-        // Short-circuit before touching topology or cpuset state. On a target
-        // with no masking the answer is already settled, and probing on the way
-        // to a foregone conclusion only creates ways for this arm to fail for
-        // reasons that are not its subject -- `require_host_for_placement`
-        // below fails closed on Windows, which is right in general and wrong
-        // as a side effect of a call that was never going to narrow anything.
-        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
-            eprintln!(
-                "leader-only narrowing skipped: process-wide CPU affinity masking is \
-                 implemented only on Linux, so a leader-only cpuset cannot be constructed \
-                 on this target"
-            );
-            return false;
+    #[derive(Debug, PartialEq, Eq)]
+    enum DefaultPoolExpectation {
+        FlatSingleCpu {
+            cores: usize,
+        },
+        Pool {
+            cores: usize,
+            nodes: usize,
+            workers: usize,
+        },
+    }
+
+    /// Expected NUMA-split compute width after reserving one service CPU per
+    /// fully subscribed node for the unpinned dispatcher/control path.
+    fn expected_split_worker_width(shards: &[crate::decode_affinity::NodeShard]) -> usize {
+        const RESERVED_SERVICE_CPUS_PER_NODE: usize = 1;
+        shards
+            .iter()
+            .map(|shard| {
+                let cap = shard
+                    .cpus
+                    .len()
+                    .saturating_sub(RESERVED_SERVICE_CPUS_PER_NODE)
+                    .max(1);
+                shard.workers.min(cap)
+            })
+            .sum()
+    }
+
+    fn default_pool_expectation(
+        mask: &[usize],
+        topology: &crate::core_topology::CoreTopology,
+        numa: Option<&crate::decode_affinity::NumaTopology>,
+    ) -> DefaultPoolExpectation {
+        let cores = topology.physical_cores_within(mask);
+        assert!(
+            cores > 0,
+            "a selected affinity fixture must cover at least one physical core: {mask:?}"
+        );
+        if mask.len() == 1 {
+            return DefaultPoolExpectation::FlatSingleCpu { cores };
         }
-        let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
-            eprintln!(
-                "leader-only narrowing skipped: this target cannot report the CPUs it is \
-                 allowed to run on, so there is no set to narrow"
-            );
-            return false;
-        };
-        let topology = match crate::core_topology::require_host_for_placement() {
-            Ok(topology) => topology,
-            Err(reason) => {
-                eprintln!("leader-only narrowing skipped: {reason}");
-                return false;
-            }
-        };
-        let node_cpus = crate::decode_affinity::NumaTopology::detect().and_then(|numa| {
-            numa.restrict_to_allowed(Some(&allowed))
-                .cpus_for(
-                    &crate::decode_affinity::DecodeAffinity::Compact,
-                    allowed.len(),
-                )
-                .expect("compact NUMA selection cannot reject a valid topology")
-        });
-        let leaders =
-            leader_cpus_for_default_width_fixture(&allowed, topology, node_cpus.as_deref());
-        if leaders.is_empty() {
-            eprintln!(
-                "leader-only narrowing skipped: the detected topology covers none of the \
-                 {} allowed CPUs, so it names no leaders to narrow to",
-                allowed.len()
-            );
-            return false;
-        }
-        match crate::decode_affinity::set_current_thread_affinity(&leaders) {
-            Ok(()) => true,
-            // Fails closed exactly where the capability exists. `cfg!`-derived,
-            // so it cannot quietly become `false` on a host that should have
-            // answered -- the same reason `DETECTION_SUPPORTED` is not a
-            // runtime probe.
-            Err(reason) if crate::decode_affinity::AFFINITY_MASKING_SUPPORTED => panic!(
-                "restrict the child to leader CPUs: {reason}. This target implements \
-                 process-wide affinity masking, so this is a failure rather than an \
-                 absent capability, and continuing would leave the child on the full \
-                 cpuset where `workers == cores` holds for the wrong reason."
-            ),
-            Err(reason) => {
-                eprintln!("leader-only narrowing skipped: {reason}");
-                false
-            }
+        let split = numa.and_then(|numa| numa.restrict_to_allowed(Some(mask)).split_workers(cores));
+        match split {
+            Some(shards) => DefaultPoolExpectation::Pool {
+                cores,
+                nodes: shards.len(),
+                workers: expected_split_worker_width(&shards),
+            },
+            None => DefaultPoolExpectation::Pool {
+                cores,
+                nodes: 1,
+                // The single group reserves one spawned worker, but the inline
+                // dispatcher owns that shard and restores the compute width.
+                workers: cores,
+            },
         }
     }
 
@@ -20581,10 +20677,10 @@ mod tests {
         realized_width_report_with(requested, false, None)
     }
 
-    /// Spawn the child with **no** explicit width, on a leader-only cpuset, so
-    /// the default resolver is the thing under test.
-    fn realized_default_width_report() -> RealizedWidth {
-        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, None)
+    /// Spawn the child with **no** explicit width on an exact caller-supplied
+    /// CPU mask.
+    fn realized_default_width_report(mask: &[usize]) -> RealizedWidth {
+        realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, None, Some(mask))
     }
 
     /// The sweep's child, with the placement policy named rather than inherited.
@@ -20599,7 +20695,7 @@ mod tests {
         placement: Option<crate::decode_affinity::CorePlacement>,
     ) -> RealizedWidth {
         let width = requested.to_string();
-        realized_width_report_inner(&width, Some(&width), dishonest, placement)
+        realized_width_report_inner(&width, Some(&width), dishonest, placement, None)
     }
 
     fn realized_width_report_inner(
@@ -20607,6 +20703,7 @@ mod tests {
         explicit_width: Option<&str>,
         dishonest: bool,
         placement: Option<crate::decode_affinity::CorePlacement>,
+        affinity_mask: Option<&[usize]>,
     ) -> RealizedWidth {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
@@ -20627,6 +20724,19 @@ mod tests {
             // same way this spawn refuses to inherit an affinity override.
             .env_remove(crate::decode_spmd::DECODE_SCHEDULE_ENV)
             .env_remove(SPMD_PARITY_CHILD_ENV);
+        match affinity_mask {
+            Some(mask) => {
+                let mask = mask
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                command.env(SPMD_WIDTH_CHILD_MASK_ENV, mask);
+            }
+            None => {
+                command.env_remove(SPMD_WIDTH_CHILD_MASK_ENV);
+            }
+        }
         // An explicit width bypasses the default resolver entirely, so the
         // default arm has to remove both -- inheriting either one from the
         // parent's own test environment would quietly turn the default arm
@@ -20760,7 +20870,7 @@ mod tests {
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
             worker_masks_readable: field("proc") == 1,
-            narrowed_to_leaders: field("narrowed") == 1,
+            affinity_mask_applied: field("masked") == 1,
             attempts: attempts_used,
         };
 
@@ -20903,163 +21013,196 @@ mod tests {
         );
     }
 
-    /// A single-node pinned run that does not name a width must still use every
-    /// core it was given.
+    fn assert_default_width_mask_case(
+        case: &str,
+        mask: &[usize],
+        topology: &crate::core_topology::CoreTopology,
+        numa: Option<&crate::decode_affinity::NumaTopology>,
+    ) {
+        let expectation = default_pool_expectation(mask, topology, numa);
+        let report = realized_default_width_report(mask);
+        assert_eq!(
+            report.requested, 0,
+            "{case}: an explicit width leaked into the default-width child ({report:?})"
+        );
+        assert!(
+            report.affinity_mask_applied,
+            "{case}: the child did not report applying its exact affinity mask ({report:?})"
+        );
+        assert_eq!(
+            report.allowed_cpus, mask,
+            "{case}: the child constructed the pool on a different CPU set ({report:?})"
+        );
+        assert_eq!(
+            report.allowed,
+            mask.len(),
+            "{case}: the reported allowed count disagrees with the exact mask ({report:?})"
+        );
+        match expectation {
+            DefaultPoolExpectation::FlatSingleCpu { cores } => {
+                assert_eq!(report.cores, cores, "{case}: {report:?}");
+                assert!(
+                    !report.pool_built,
+                    "{case}: a single-CPU mask must take the documented flat fallback ({report:?})"
+                );
+                assert_eq!(
+                    (report.nodes, report.workers),
+                    (0, 0),
+                    "{case}: a declined pool must not report nodes or workers ({report:?})"
+                );
+            }
+            DefaultPoolExpectation::Pool {
+                cores,
+                nodes,
+                workers,
+            } => {
+                assert!(report.pool_built, "{case}: no pool was built ({report:?})");
+                assert_eq!(report.cores, cores, "{case}: {report:?}");
+                assert_eq!(report.nodes, nodes, "{case}: {report:?}");
+                assert_eq!(
+                    report.workers, workers,
+                    "{case}: the pool width must include the production service-core \
+                     reservation rather than assuming workers == requested CPUs ({report:?})"
+                );
+                assert_eq!(
+                    report.planned_distinct_cores,
+                    Some(true),
+                    "{case}: the selected default mask must plan at most one worker per core \
+                     ({report:?})"
+                );
+                assert!(
+                    report.fully_pinned && report.worker_masks_readable,
+                    "{case}: every worker must be pinned and read back its own mask ({report:?})"
+                );
+                assert_eq!(
+                    report.placement_honest,
+                    Some(true),
+                    "{case}: worker-observed masks must exactly match the requested placement \
+                     ({report:?})"
+                );
+                assert_eq!(
+                    report.realized, "one-per-core",
+                    "{case}: selected workers must realize one worker per physical core \
+                     ({report:?})"
+                );
+            }
+        }
+    }
+
+    /// Exercise the production default width on runtime-derived masks.
     ///
-    /// #1780: `taskset -c 0,2,4,...` hands the process a cpuset in which every
-    /// allowed CPU is already a distinct physical core. A resolver that
-    /// approximates the core count as `available / 2` then halves it, so the
-    /// pool builds on half the cores that were deliberately reserved for it.
-    /// The child confines this fixture to one NUMA node because the multi-node
-    /// pool intentionally reserves one control CPU per node; grading that
-    /// independent policy as missing workers produced the deterministic
-    /// 92-vs-96 failure on a four-node, 96-core host.
-    /// #1794 fixed the resolver and covered
-    /// [`default_persistent_threads`] with unit tests over
-    /// `(available, allowed_physical_cores)`.
-    ///
-    /// Those unit tests cannot catch the regression that matters. They call the
-    /// pure function with the right second argument already in hand; the defect
-    /// was in what reached it. Plumb `None` into that call site and every one of
-    /// them still passes, because none of them builds a pool. This one does, on
-    /// a real leader-only cpuset, and asserts the property the benchmark record
-    /// actually depends on: **workers == cores**.
-    ///
-    /// It is the same shape as the rest of this sweep -- assert what the kernel
-    /// did, not what the resolver said about itself. The EP's own line was
-    /// `requested=8 realized=8 as_requested` throughout #1780: honest, agreed
-    /// with by every guard, and wrong, because the defect sat upstream of the
-    /// report in what "default" resolved to.
+    /// The full leader mask reproduces the original four-node observation:
+    /// 96 requested physical cores realize 92 workers because production
+    /// intentionally reserves one service CPU on each node. The bounded
+    /// contiguous and sparse cases prevent that expectation from being fitted
+    /// only to the current host. A one-CPU case covers the flat fallback
+    /// separately.
     #[test]
-    // Reported as `ignored` rather than silently returning `ok`: libtest
-    // captures a passing test's output, so the `eprintln!` below is invisible
-    // in a default CI log and a skip on this target was indistinguishable from
-    // a pass. `ignored` prints its reason in the default output and, unlike a
-    // pass, is not counted as an executed test.
     #[cfg_attr(
         not(target_os = "linux"),
-        ignore = "process-wide CPU affinity masking is implemented only on Linux, so a \
-                  leader-only cpuset cannot be constructed on this target"
+        ignore = "process-wide CPU affinity masking is implemented only on Linux"
     )]
-    fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
-        // Process-wide affinity masking is Linux-only, so on every other target
-        // the leader-only cpuset this test asserts about cannot be built. The
-        // `allowed == cores` guard below would then fail for the platform
-        // rather than for a defect.
-        //
-        // The `#[cfg_attr(..., ignore)]` above is what makes that visible in a
-        // default CI log. This arm is the belt for a run that overrides it with
-        // `--ignored`: it must still not assert on an unrestricted cpuset. Its
-        // `eprintln!` is only rendered under `--nocapture`, which is why it is
-        // not the primary signal.
-        //
-        // Keyed on the same `cfg!`-derived constant the child uses, rather than
-        // on a third copy of `cfg!(target_os = "linux")`, so that the day
-        // Windows masking is implemented there is one place to change and a
-        // unit test (`a_successful_affinity_call_is_never_reported_as_an_unsupported_target`)
-        // that fails if it is not changed. The attribute
-        // above is unavoidably a second copy -- `ignore` takes a `cfg`, not a
-        // `const` -- but its drift failure mode is `ignored`, which is loud and
-        // is not counted as executed. This arm's would be a silent `ok`, so it
-        // is the one that must not have its own copy.
+    fn a_default_width_pool_obeys_runtime_masks_and_reservations() {
         if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
-            eprintln!(
-                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
-                 process-wide CPU affinity masking is implemented only on Linux, so a \
-                 leader-only cpuset cannot be constructed on this target"
-            );
-            return;
+            panic!("this test must stay ignored where exact process-wide affinity is unsupported");
         }
-
-        let report = realized_default_width_report();
-
-        // Past the platform gate, narrowing is not optional. This asserts what
-        // *happened* rather than re-deriving what the platform should have
-        // allowed: the child has three further paths on which it declines to
-        // narrow (no readable cpuset, undetectable topology, a topology
-        // covering none of the allowed CPUs), and every one of them used to be
-        // a silent `return` that left this arm measuring the full cpuset.
-        //
-        // `allowed == cores` below catches that only on an SMT host, where the
-        // two differ. On a machine without SMT it holds on the *un-narrowed*
-        // set too, and the arm would pass while testing nothing.
+        let allowed = crate::decode_affinity::allowed_cpus()
+            .expect("Linux must report the CPU set used to derive affinity fixtures");
         assert!(
-            report.narrowed_to_leaders,
-            "this target implements process-wide affinity masking, so the child must have \
-             narrowed itself to one CPU per physical core -- it reports that it did not, \
-             and every assertion below would then be about the host rather than about the \
-             default width resolver ({report:?})"
+            !allowed.is_empty(),
+            "Linux reported an empty sched_getaffinity mask"
+        );
+        let topology = crate::core_topology::require_host_for_placement()
+            .expect("Linux topology detection must succeed for an exact placement test");
+        let numa = crate::decode_affinity::NumaTopology::detect();
+        let node_cpu_sets = numa_node_cpu_sets(&allowed, numa.as_ref());
+        let leader_mask = topology.leaders_within(&allowed);
+        assert!(
+            !leader_mask.is_empty(),
+            "the detected topology produced no representative CPU inside {allowed:?}"
         );
 
-        if !report.pool_built {
-            // No persistent pool on this target: there is no placement to
-            // check, and inventing a pass here would be the vacuous case this
-            // sweep exists to avoid.
-            return;
-        }
-        if report.cores == 0 {
-            // Topology unreadable, so "one worker per core" is unanswerable.
-            return;
-        }
-
-        // The restriction has to have actually happened, or `workers == cores`
-        // below would hold for the wrong reason on the full cpuset.
-        assert_eq!(
-            report.allowed, report.cores,
-            "the child was asked to restrict itself to one CPU per physical \
-             core, so every allowed CPU must be a distinct core; allowed={} \
-             cores={} -- the restriction did not take, and the width assertion \
-             below would be testing nothing",
-            report.allowed, report.cores
-        );
-        assert_eq!(
-            report.nodes, 1,
-            "the default-width fixture must build one worker group so its exact \
-             workers == cores assertion is about width resolution, not NUMA's \
-             per-node dispatcher reservation ({report:?})"
-        );
-
-        assert_eq!(
-            report.workers,
-            report.cores,
-            "a default-width pool on a leader-only cpuset built {} workers on \
-             {} reserved cores. This is #1780: the run asked for no width, the \
-             resolver approximated the core count, and the pool silently used \
-             {} of the machine it was given. Every pinned benchmark that omits \
-             an explicit width measures this.",
-            report.workers,
-            report.cores,
-            if report.cores == 0 {
-                "part".to_string()
-            } else {
-                format!("{}/{}", report.workers, report.cores)
+        let cases = [
+            (
+                "full-runtime-leader-mask",
+                AffinityFixtureOutcome::Ready(leader_mask),
+            ),
+            (
+                "contiguous-runtime-mask",
+                contiguous_default_width_mask(&node_cpu_sets, topology),
+            ),
+            (
+                "sparse-multi-node-runtime-mask",
+                sparse_multi_node_default_width_mask(&node_cpu_sets, topology),
+            ),
+            (
+                "single-cpu-flat-fallback",
+                AffinityFixtureOutcome::Ready(vec![allowed[0]]),
+            ),
+        ];
+        for (case, outcome) in cases {
+            match outcome {
+                AffinityFixtureOutcome::Ready(mask) => {
+                    assert_default_width_mask_case(case, &mask, topology, numa.as_ref());
+                }
+                AffinityFixtureOutcome::Skipped(skip) => {
+                    record_affinity_fixture_skip(case, &skip);
+                }
             }
-        );
+        }
+    }
 
-        // Deliberately kept as an unconditional claim here, even though the
-        // rest of this sweep no longer asserts one-per-core under the default
-        // policy (see #1802 and the long note in
-        // `every_benchmarked_decode_width_realizes_the_worker_count_it_requests`).
-        // It is not a policy contract *in this arm*: the child narrowed itself
-        // to one CPU per physical core, `order_pin_targets_for` is a
-        // permutation of the allowed CPUs under every policy it implements --
-        // `Compact` dedups through `placed` and appends the remainder exactly
-        // once -- so on a leader-only cpuset compact and spread both land one
-        // worker per core. The mask shape forces the outcome, not the policy.
-        //
-        // The assumption that buys that, stated so it fails loudly rather than
-        // silently if it stops holding: the default must place *at most one
-        // worker per allowed CPU*. An oversubscribing shared-core default would
-        // realize `shared-core` here (and trip `workers == cores` above), and
-        // the right response then is to gate this arm on the policy, not to
-        // delete it -- the width claim it exists to make (#1780) is
-        // policy-neutral and still worth asserting.
+    #[test]
+    fn default_width_expectation_accounts_for_one_reserved_service_cpu_per_node() {
+        let shards: Vec<crate::decode_affinity::NodeShard> = (0..4)
+            .map(|node| crate::decode_affinity::NodeShard {
+                index: node,
+                cpus: (node * 24..(node + 1) * 24).collect(),
+                workers: 24,
+            })
+            .collect();
         assert_eq!(
-            report.realized, "one-per-core",
-            "a default-width pool on a leader-only cpuset must realize one \
-             worker per physical core, got `{}`",
-            report.realized
+            expected_split_worker_width(&shards),
+            92,
+            "four fully subscribed 24-core nodes reserve four service CPUs; the original \
+             92-vs-96 observation is the production invariant, not lost workers"
         );
+    }
+
+    #[test]
+    fn runtime_mask_planner_covers_contiguous_leader_and_non_leader_cpus() {
+        let topology = crate::core_topology::CoreTopology::from_sibling_groups([
+            vec![0, 8],
+            vec![1, 9],
+            vec![2, 10],
+            vec![3, 11],
+            vec![20, 28],
+            vec![21, 29],
+            vec![22, 30],
+            vec![23, 31],
+        ]);
+        let nodes = vec![vec![0, 1, 8, 9], vec![20, 21, 28, 29]];
+        assert_eq!(
+            contiguous_default_width_mask(&nodes, &topology),
+            AffinityFixtureOutcome::Ready(vec![0, 1])
+        );
+        assert_eq!(
+            sparse_multi_node_default_width_mask(&nodes, &topology),
+            AffinityFixtureOutcome::Ready(vec![0, 1, 28, 29]),
+            "the sparse case must use leaders where selected and remain valid when only \
+             non-leader SMT siblings are chosen on another node"
+        );
+    }
+
+    #[test]
+    fn an_unrepresentable_sparse_topology_is_a_typed_skip() {
+        let topology =
+            crate::core_topology::CoreTopology::from_sibling_groups([vec![0, 4], vec![1, 5]]);
+        let outcome = sparse_multi_node_default_width_mask(&[vec![0, 1, 4, 5]], &topology);
+        let AffinityFixtureOutcome::Skipped(skip) = outcome else {
+            panic!("one NUMA node cannot satisfy a multi-node fixture")
+        };
+        assert!(!skip.reason.trim().is_empty());
     }
 
     #[test]
