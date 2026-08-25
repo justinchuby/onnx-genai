@@ -3,7 +3,7 @@ name: "measurement-discipline"
 description: "Make a performance or memory number trustworthy before you report it — or believe it"
 domain: "quality"
 confidence: "high"
-source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption, #1619/#1982 selector vacuity)"
+source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption, #1619/#1982 selector vacuity, #1995/#2000 selector identity)"
 ---
 
 # Measurement discipline
@@ -244,6 +244,43 @@ test with the same `: test` suffix, so a test that gets ignored still resolves t
 `n = 1` while the run executes nothing (`0 passed; 0 failed; 1 ignored`). The
 listing proves the *name* resolves, never that the arm *ran* — which is why the
 run-output half is not optional.
+
+**All of the above is about cardinality, and cardinality is the weaker half.** A
+count answers *how many tests ran*; it never answers *whether they were the ones
+that cover the mutated code*. A filter can resolve to exactly one test, satisfy
+every check in this section, and still be pointed at the wrong test — and then a
+surviving mutant reads as a clean `PASS`. Measured on a two-test crate, filter
+`--exact` on a test that does not touch the mutated function:
+
+```
+precheck  n = 1                                    (guard satisfied)
+mutate    covered(a) -> a + 1  becomes  a + 99
+arm       expects FAIL, gets   1 passed; 0 failed  -> "survived"
+control   unfiltered            1 passed; 1 failed -> the mutant IS caught
+```
+
+A non-zero count is worse than a zero one here, because it *suppresses* the
+suspicion an empty result would have raised. #2000 (closing #1995) hit this: a
+substring filter on the word the arm was named after selected a double-digit
+number of tests — the battery's own output read `18 passed, 0 failed` — and not
+one of them covered the arm under test. The tests that did cover it are the
+streaming ones, and none of their names contains that word, which is checkable
+in the tree without rerunning anything. A `selected >= 1` guard passes that. So
+does `selected == 1`, when the one is wrong.
+
+**Check:** name the test, don't just count it. An arm that expects FAIL must
+state *which* test it expects to fail and assert that test appears in the
+failures; an arm that expects PASS needs it more, because it has no failure
+output to inspect and nothing else distinguishes "the guard held" from "nothing
+relevant ran". Cardinality proves the selector resolved; only identity proves it
+resolved to the subject.
+
+```sh
+# expect-FAIL arm: the named test must be among the failures, not just some test
+cargo test -q --lib "$FILTER" 2>&1 | tee out.txt | grep -qE '^test result: FAILED' \
+  && grep -qE "^ +$EXPECTED_TEST\$" out.txt \
+  || { echo "ARM-DRIFT: '$EXPECTED_TEST' did not fail under the mutation"; exit 2; }
+```
 
 **Check:** every battery carries a **vacuity arm** — a mutation so destructive
 that survival is impossible (refuse every request; empty the function body). Its
