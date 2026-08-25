@@ -1,7 +1,7 @@
 # Metadata capability model
 
 Status: **normative proposal**. This document audits the current tree at
-`e76fd489b8fbc6b5e14f536867b19952a5a73f06` and proposes a simplification. It
+`f55520de9ec6160962a6a7532729119ff1279c1a` and proposes a simplification. It
 does not change the metadata schema, parser, validator, generated schema, or
 runtime.
 
@@ -19,7 +19,7 @@ The central rule is:
 | Kind | Meaning | Authority | Examples |
 | --- | --- | --- | --- |
 | **Derived structural fact** | A fact recoverable from authored graphs, workflow dataflow, tensor contracts, operator attributes, initializers, or state contracts. | Package artifacts plus deterministic derivation. | Decoder ports, position-input presence and rank, append versus indexed-scatter cache updates, graph KV dtype, image/video/audio workflow shape, control flow. |
-| **Authored model requirement** | A semantic fact required for correct execution but not safely inferable from tensor shape or graph topology. | Typed package contract. | Aliasing legality, prefix-reuse legality, rollback bounds, batch invariance, effect retry/speculation semantics, equivalence class, session mutation semantics. |
+| **Authored model requirement** | A semantic fact required for correct execution but not safely inferable from tensor shape or graph topology. | Typed package contract. | Aliasing legality, prefix-reuse legality, rollback bounds, component grouping equivalence, effect retry/speculation semantics, equivalence class, session mutation semantics. |
 | **Deployment policy** | A choice about cost, risk, placement, or service behavior. | Operator/runtime configuration, never portable model metadata. | Backend/provider selection, page size, KV mirror dtype, cache/tier budgets, graph capture, fallback permission, batch size, worker count and placement. |
 | **Runtime evidence** | A result observed for one artifact and one runtime environment. | Generated admission, conformance, profile, or benchmark record. | ORT session loaded with no fallback, native operator coverage passed, capture replayed, concurrent `Run` was admitted, throughput met a threshold. |
 
@@ -52,6 +52,72 @@ performance evidence. A model-family label is evidence of none of them.
    incorrectly, silently changing backend, or returning base-model output for
    an adapter package is not.
 
+### 1.4 “Policy graph” means executable semantics
+
+A workflow **policy graph** is a tensor program that computes observable model
+semantics: sampling, termination, accepted-prefix selection, cache-length or
+position updates, classifier-free guidance, or a diffusion solver step. It is
+usually a small ONNX component and is invoked through the same typed SSA
+workflow as a learned decoder. It is not deployment, scheduling, or QoS policy.
+
+The distinction is ownership, not naming:
+
+- `temperature`, logits filtering, RNG counter advancement, and the selected
+  token change the mathematical result, so the package authors them and the
+  workflow runtime executes them;
+- provider choice, queue priority, batching delay, capture, cache capacity, and
+  worker placement change where or when the same semantics run, so deployment
+  configuration owns them.
+
+Compact decoder example:
+
+```yaml
+# Request tensors carry semantic controls; they are not server configuration.
+inputs:
+  request.temperature:
+    contract: {dtype: float32, rank: 1, shape: [batch]}
+    role: {kind: runtime, version: "1.0", role: sampling_temperature}
+    source: {kind: request}
+    required: false
+    default: 1.0  # Package default for the sampling equation.
+
+# This ONNX artifact computes a token and the next explicit RNG counter.
+components:
+  sampler:
+    implementation: {kind: onnx, artifact: policies/token_sampler.onnx}
+    contract:
+      id: onnx-genai.token-sampler
+      version: "2"
+      bindings:  # Stable meanings are independent of concrete graph port names.
+        logits: logits
+        temperature: temperature
+        seed: seed
+        counter: counter
+        token: token
+        next_counter: next_counter
+      parameters:
+        batching: per_row  # Semantic row independence, not a batching target.
+        inactive_rows: preserve
+
+# The workflow executes the equation; no host-side model-family sampler is implied.
+steps:
+  - kind: invoke
+    component: sampler
+    inputs:
+      logits: decoder.last_logits
+      temperature: request.temperature
+      seed: request.seed
+      counter: sampler.counter
+    outputs:
+      token: sample.token
+      next_counter: sample.next_counter
+```
+
+The example is intentionally annotated rather than serializer output. Production
+generators that cannot preserve YAML comments should publish an adjacent
+annotated reference and validate that both documents parse to the same typed
+metadata; they must not claim comments survive generation.
+
 ## 2. Current inventory
 
 The anchors below name symbols and fields, not transient line numbers.
@@ -63,13 +129,13 @@ The anchors below name symbols and fields, not transient line numbers.
 | [`InferenceMetadata::required_capabilities`](../../crates/onnx-genai-metadata/src/schema/mod.rs) | Open-ended manually authored strings used as load requirements. | Redundant when the same requirement is visible in typed metadata; otherwise too weakly typed. |
 | [`WorkflowManifest::{capabilities, adapter_abis}`](../../crates/onnx-genai-metadata/src/schema/ir.rs) | A second generic capability list plus versioned adapter ABIs. | `capabilities` is redundant; versioned adapter ABI selection is an authored requirement. |
 | [`ModelCapabilities`](../../crates/onnx-genai-metadata/src/schema/decoder_abi.rs) | Graph facts (`attention`, `vocab_size`, MoE, sharding), a semantic maximum, and runtime configurability. | Split by field; do not treat the object as one capability class. |
-| [`RuntimeConfigurable`](../../crates/onnx-genai-metadata/src/schema/decoder_abi.rs) | `prefix_cache`, `continuous_batching`, and `chunked_prefill`. | First two are obsolete booleans; chunk size is currently consumed as a runtime preference. |
+| [`RuntimeConfigurable`](../../crates/onnx-genai-metadata/src/schema/decoder_abi.rs) | `prefix_cache` and `chunked_prefill`. The former `continuous_batching` field is already rejected by the parser. | Prefix caching is an obsolete boolean; chunk size is currently consumed as a runtime preference. |
 | [`QuantizationIntent`](../../crates/onnx-genai-metadata/src/schema/decoder_abi.rs) | Desired weight recipe, not the graph's actual packed representation. | Distribution/provenance hint, not execution readiness. |
 | [`HardwareRequirements`](../../crates/onnx-genai-metadata/src/schema/hardware.rs) | Required and beneficial dtypes, memory estimates, and TP hints. | Graph-derived facts, distribution hints, and policy are mixed. |
-| [`WorkflowSpec`, `TensorContract`, `BatchLayout`, and `ComponentBatchCapacity`](../../crates/onnx-genai-metadata/src/schema/ir.rs) | Typed dataflow, padding/packing, and artifact invocation bounds. | Primarily structural facts; `batch_invariance` on a task profile remains authored semantics. |
+| [`WorkflowSpec`, `TensorContract`, `BatchLayout`, and `ComponentBatchCapacity`](../../crates/onnx-genai-metadata/src/schema/ir.rs) | Typed dataflow, padding/packing, and artifact invocation bounds. | Structural facts plus the component-scoped authored assertion that grouped and solo execution are equivalent. The former profile-wide `batch_invariance` field is rejected. |
 | [`WorkflowStateCell` and `StateGroupContract`](../../crates/onnx-genai-metadata/src/schema/ir.rs) | Lifetime, ownership, graph update discipline, semantic reuse, rollback/fork/snapshot, and checkpoint ABI. | Correctly contains both derived graph facts and authored semantic requirements; physical storage policy is explicitly excluded. |
 | [`PreprocessingSpec`](../../crates/onnx-genai-metadata/src/schema/pipeline.rs) | Typed image, video, and audio transform programs. | Authored executable contract whose presence and bindings are structurally validated. |
-| [`TaskProfile`](../../crates/onnx-genai-metadata/src/schema/package.rs) | Task kind, output roles, pooling/decoding, and batch invariance. | Typed authored task contract. Recognition by validation is not proof of an engine executor. |
+| [`TaskProfile`](../../crates/onnx-genai-metadata/src/schema/package.rs) | Task kind, output roles, and pooling/decoding semantics. | Typed authored task contract. Recognition by validation is not proof of an engine executor or grouping safety. |
 | [`SpeculativeContract`](../../crates/onnx-genai-metadata/src/schema/package.rs) | Proposer/target compatibility, shared state/weights, vocabulary, rollback, and equivalence. | Typed authored correctness requirements. Proposal width and enablement remain runtime policy. |
 | [`SpeculatorConfig`](../../crates/onnx-genai-metadata/src/schema/generation.rs) | Legacy/sidecar proposer description for EAGLE, MTP, D-Flash, and shared-KV forms. | Typed artifact contract, but overlaps the workflow-native speculative contract. |
 | [`AdapterServiceContract`](../../crates/onnx-genai-metadata/src/schema/ir.rs) | Target ABI, artifact loading, fallback permission, cache size/eviction, bucketing, stable buffers, and capture invalidation. | Model ABI, deployment policy, and implementation choice are mixed. |
@@ -95,6 +161,117 @@ contradict its source.
 | [`WorkerPool` and `SessionPlacement`](../../crates/onnx-genai-server/src/worker.rs) | Thread ownership and routing of session state. | Runtime topology and placement policy. |
 | [`SessionLeases`](../../crates/onnx-genai-server/src/lease.rs) | Same-session single-flight enforcement. | Runtime correctness enforcement of authored mutation semantics. |
 
+### 2.3 Hosted Hugging Face examples
+
+The 2026-08-25 audit searched current documentation, fixtures, scripts, tests,
+Git history, pull-request publication records, and every model owned by
+`justinchuby` whose exact Hub revision contains `inference_metadata.yaml`.
+Upstream Hugging Face sources that contain no inference metadata are provenance,
+not hosted metadata examples. The resulting fleet is 28 packages.
+
+Every revision below was downloaded by immutable SHA and checked with the
+`f55520de9` `validate_metadata --metadata-only --shape` binary. **Valid** means
+the metadata parses and passes semantic validation. Direct ORT evidence means a
+model card or evidence file exercises graphs directly; workflow ORT evidence
+means the generic workflow engine executed the package. Neither is native
+readiness or performance proof unless stated separately.
+
+| Hosted package and exact metadata revision | Model form | Schema | Validation and evidence status |
+| --- | --- | --- | --- |
+| [`qwen2.5-0.5b-instruct-onnx-genai`](https://huggingface.co/justinchuby/qwen2.5-0.5b-instruct-onnx-genai/blob/a61ca2e7e7a41db4c310b6a24479d768d6ab20ae/inference_metadata.yaml) `a61ca2e7e7a41db4c310b6a24479d768d6ab20ae` | Decoder plus ten semantic policy graphs | v1.0 | Valid; card records generic workflow CPU output. No accepted performance record. |
+| [`qwen3-0.6b-onnx-genai`](https://huggingface.co/justinchuby/qwen3-0.6b-onnx-genai/blob/38714511f57e01df01808b930168459a8e7aa9a3/inference_metadata.yaml) `38714511f57e01df01808b930168459a8e7aa9a3` | Decoder plus policy graphs and session conversation state | v1.0 | Valid; card records generic workflow CPU output and multi-turn use. |
+| [`deepseek-r1-distill-qwen-1.5b-onnx-genai`](https://huggingface.co/justinchuby/deepseek-r1-distill-qwen-1.5b-onnx-genai/blob/1427c4896f798893e58ffec91aef65c34de4503a/inference_metadata.yaml) `1427c4896f798893e58ffec91aef65c34de4503a` | Decoder plus policy graphs | v1.0 | Valid; card records generic workflow CPU output. |
+| [`Muse-Glimmer-30B-ONNX-INT4-CUDA`](https://huggingface.co/justinchuby/Muse-Glimmer-30B-ONNX-INT4-CUDA/blob/85a1f4b4ac24f1076be51a52e6c934aff4b9e40c/inference_metadata.yaml) `85a1f4b4ac24f1076be51a52e6c934aff4b9e40c` | Image multimodal decoder with full/sliding KV and policy graphs | v1.0 | Valid; card records generic workflow ORT CUDA execution on H200. It does not prove this repository's native backend. |
+| [`qwen2.5-14b-instruct-int4-zp-onnx`](https://huggingface.co/justinchuby/qwen2.5-14b-instruct-int4-zp-onnx/blob/753817320d232b0205a7971e8ea25068453fb393/inference_metadata.yaml) `753817320d232b0205a7971e8ea25068453fb393` | INT4 decoder plus policy graphs | v1.0 | Valid; card gives a run recipe and explicitly declines to treat one run as evidence. |
+| [`onnx-genai-example-gemma4-e2b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b/blob/79ca25afe326719e4daab79430c90195dfd28f3b/inference_metadata.yaml) `79ca25afe326719e4daab79430c90195dfd28f3b` | Dense hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/timing evidence, and this exact target revision participates in the recorded generic speculative run. No exact native-package record. |
+| [`onnx-genai-example-qwen-image-edit-2509`](https://huggingface.co/justinchuby/onnx-genai-example-qwen-image-edit-2509/blob/e859aef2289ad02e64812c43fd5e73b5e1c36a2f/inference_metadata.yaml) `e859aef2289ad02e64812c43fd5e73b5e1c36a2f` | Image-conditioned flow-matching workflow | v1.0 | Valid; generic workflow ORT CUDA and HTTP API image-edit evidence. Timings are artifact records, not a general performance proof. |
+| [`pangu-weather-1h-onnx-catalogue`](https://huggingface.co/justinchuby/pangu-weather-1h-onnx-catalogue/blob/82beb24f24169b88bb0f108e40fc35840d4a8d57/inference_metadata.yaml) `82beb24f24169b88bb0f108e40fc35840d4a8d57` | Stateless weather forecast graph | v1.0 | Valid; card records a direct ORT CUDA deterministic request. Generic workflow and native execution are not recorded. |
+| [`onnx-genai-example-whisper-tiny`](https://huggingface.co/justinchuby/onnx-genai-example-whisper-tiny/blob/a37efd017b049d697d690824618c0cded5cffa78/inference_metadata.yaml) `a37efd017b049d697d690824618c0cded5cffa78` | Audio encoder-decoder with cross-attention state and policy graphs | v1.0 | Valid; direct ORT load/output evidence. General profile-driven or native execution is not established. |
+| [`onnx-genai-example-wav2vec2-base-960h-ctc`](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml) `28480e393ad1b8fa2e0bb6939e5daded02f24014` | Audio preprocessing plus encoder-only CTC | v1.0 | **Refreshed and valid**; direct ORT evidence. No `batch_capacity`, so grouped execution is not claimed; no engine CTC-profile dispatcher is proved. |
+| [`onnx-genai-example-esm2-t6-8m`](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d9f1947f4973056fe287e498b0b0e9b675f1bb92/inference_metadata.yaml) `d9f1947f4973056fe287e498b0b0e9b675f1bb92` | Protein encoder with embedding profile | v1.0 | **Refreshed and valid**; direct ORT evidence. The retired profile batching hint was removed; profile execution and grouping remain unproved. |
+| [`onnx-genai-example-prot-bert`](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/916d8290b9108a3a6487ff4381ea9a66c32588c0/inference_metadata.yaml) `916d8290b9108a3a6487ff4381ea9a66c32588c0` | Protein encoder with embedding profile | v1.0 | **Refreshed and valid**; direct ORT evidence. The retired profile batching hint was removed; profile execution and grouping remain unproved. |
+| [`onnx-genai-example-qwen2-5-0-5b-portable-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-portable-f32/blob/65ef8d35466d402f5bfa5330bb48477e0b330415/inference_metadata.yaml) `65ef8d35466d402f5bfa5330bb48477e0b330415` | Portable f32 decoder plus policy graphs | v1.0 | Valid; direct ORT smoke/output records. Exact native readiness is not recorded. |
+| [`onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-cuda-gqa-f16/blob/ec8046b051a8f11e6d339a7d9d85dd1235053989/inference_metadata.yaml) `ec8046b051a8f11e6d339a7d9d85dd1235053989` | CUDA GQA f16 decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA smoke/output records. Provider-specific execution is not interchangeability evidence. |
+| [`onnx-genai-example-qwen2-5-0-5b-static-cache-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-0-5b-static-cache-f32/blob/bc6b427cbba8db42a1ec3616002a5efab87f6fd0/inference_metadata.yaml) `bc6b427cbba8db42a1ec3616002a5efab87f6fd0` | Fixed-capacity indexed-scatter decoder plus policy graphs | v1.0 | Valid; direct ORT static-cache records. No portable performance claim follows. |
+| [`onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-5-0-8b-hybrid-vlm-f32/blob/88352734dc2d8c352c58be5450cc5c2dd7521aef/inference_metadata.yaml) `88352734dc2d8c352c58be5450cc5c2dd7521aef` | Image VLM with hybrid decoder and policy graphs | v1.0 | Valid; direct ORT graph evidence. A full generic multimodal or native package run is not recorded. |
+| [`onnx-genai-example-qwen2-5-1-5b-lora-selection`](https://huggingface.co/justinchuby/onnx-genai-example-qwen2-5-1-5b-lora-selection/blob/5ca5336b04f0c778f83c0083ee41203dd36961d2/inference_metadata.yaml) `5ca5336b04f0c778f83c0083ee41203dd36961d2` | Decoder with LoRA selection and policy graphs | v1.0 | Valid; direct ORT CUDA adapter evidence. Heterogeneous logical rows ran separately; accelerated heterogeneous workflow batching is not proved. |
+| [`onnx-genai-example-mistral-7b-v0-1-sliding-window`](https://huggingface.co/justinchuby/onnx-genai-example-mistral-7b-v0-1-sliding-window/blob/9d1e328848ab57e665d29ad4acb1182621775143/inference_metadata.yaml) `9d1e328848ab57e665d29ad4acb1182621775143` | Sliding-window decoder plus policy graphs | v1.0 | Valid; direct ORT CUDA boundary-crossing evidence. |
+| [`onnx-genai-example-qwen3-0-6b-eagle3`](https://huggingface.co/justinchuby/onnx-genai-example-qwen3-0-6b-eagle3/blob/0341cd47a8882c1fcbae0840613972321a007371/inference_metadata.yaml) `0341cd47a8882c1fcbae0840613972321a007371` | EAGLE-3 proposer/target workflow | v1.0 | Valid; generic workflow ORT CUDA correctness/acceptance evidence. Native request admission rejects EAGLE-3. |
+| [`onnx-genai-stable-diffusion-bk-sdm-small`](https://huggingface.co/justinchuby/onnx-genai-stable-diffusion-bk-sdm-small/blob/2d30ae2ebfacf5c071693836d70ebd14d8fd84d3/inference_metadata.yaml) `2d30ae2ebfacf5c071693836d70ebd14d8fd84d3` | Text-to-image diffusion workflow | v1.0 | Valid; generic workflow ORT CUDA and A1111 API evidence. No accepted end-to-end performance gate. |
+| [`onnx-genai-cogvideox-2b`](https://huggingface.co/justinchuby/onnx-genai-cogvideox-2b/blob/29da9103c4517f8026155c0d97e195c26ee56758/inference_metadata.yaml) `29da9103c4517f8026155c0d97e195c26ee56758` | Text-to-video diffusion workflow with temporal recurrence | v1.0 | Valid; generic workflow ORT CUDA video evidence. No native video proof. |
+| [`act-aloha-policy-onnx-catalogue`](https://huggingface.co/justinchuby/act-aloha-policy-onnx-catalogue/blob/ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57/inference_metadata.yaml) `ebe2b9485d9f2e4ae9d0b181654e2d6d844fda57` | Action-rollout policy graph | v1.0 | Valid; direct ORT CUDA/PyTorch parity and timing record. Generic workflow/native readiness is not separately keyed. |
+| [`moshiko-full-duplex-onnx-catalogue`](https://huggingface.co/justinchuby/moshiko-full-duplex-onnx-catalogue/blob/426253a5a5822eb405e4ac214d6895427c64ef0c/inference_metadata.yaml) `426253a5a5822eb405e4ac214d6895427c64ef0c` | Full-duplex audio workflow with temporal and codec state | v1.0 | Valid; card records direct CUDA duplex output/timing. Generic workflow/native evidence is not separately keyed. |
+| [`sensenova-u1.5-8b-mot-onnx-canonical`](https://huggingface.co/justinchuby/sensenova-u1.5-8b-mot-onnx-canonical/blob/541afaea12e85222766b694cccc30153ea6dd3c1/inference_metadata.yaml) `541afaea12e85222766b694cccc30153ea6dd3c1` | Shared-prefix multimodal pixel-flow workflow | v1.0 | Valid; generic workflow ORT CUDA text, image generation, and image-edit evidence. Full autoregressive text decode remains absent. |
+| [`onnx-genai-example-gemma4-e2b-assistant`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-assistant/blob/4b6f1533fec1475ade9e3fa3d401ae00a2d7be67/inference_metadata.yaml) `4b6f1533fec1475ade9e3fa3d401ae00a2d7be67` | Target plus cacheless shared-KV assistant | v1.0 | Valid; direct ORT CUDA drafter parity/assisted evidence. The separately packaged composite carries the current generic real-package run. |
+| [`onnx-genai-example-minimax-music3`](https://huggingface.co/justinchuby/onnx-genai-example-minimax-music3/blob/5f95fbbfa01956626fc3170fc90a467666aebdd6/inference_metadata.yaml) `5f95fbbfa01956626fc3170fc90a467666aebdd6` | Hierarchical text-to-music/audio workflow | v1.0 | Valid; card records component L4 and audio L5 artifacts. Backend and performance claims are not keyed as project conformance records. |
+| [`onnx-genai-example-gemma4-26b-a4b`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-26b-a4b/blob/63e02e455bd835f75b096694ec31d5ad91800299/inference_metadata.yaml) `63e02e455bd835f75b096694ec31d5ad91800299` | MoE hybrid full/sliding decoder | v1.0 | Valid; direct ORT CUDA parity/generation/timing evidence. The card describes an ORT/native deterministic fixture, not an exact keyed portability certificate. |
+| [`onnx-genai-example-gemma4-e2b-speculative`](https://huggingface.co/justinchuby/onnx-genai-example-gemma4-e2b-speculative/blob/77a8161bc2a2c9de478dae50307f60e2a0c6beff/inference_metadata.yaml) `77a8161bc2a2c9de478dae50307f60e2a0c6beff` | Self-contained chained shared-KV speculative workflow | v1.0 | Valid; exact generic workflow ORT CUDA target-equivalence, acceptance, rejection, rollback, and residency evidence. No accepted speedup or exact native-package record. |
+
+Fleet-wide findings:
+
+- all 28 packages are workflow-only documents; none relies on retired
+  `model.io`;
+- all normalize to schema v1.0, which is correct because none authors a v1.1
+  `batch_capacity`, padding provenance, or packed ownership contract;
+- none uses top-level `required_capabilities`, but every workflow repeats
+  derived strings in `manifest.capabilities`;
+- none claims encoder/component grouping. Request-aligned tensor layouts alone
+  do not permit coalescing;
+- cache semantics are represented where applicable, including append,
+  replacement, sliding/full attention, and one indexed-scatter static-cache
+  package; physical paging/tiering remains runtime-owned;
+- hosted model cards contain useful direct and workflow execution records, but
+  those prose claims are not backend-readiness fields in the metadata and do
+  not become performance proof.
+
+The first audit found exactly three files rejected by merged main:
+Wav2Vec2 CTC, ESM-2, and ProtBERT still authored the retired
+`profiles.*.batch_invariance`. They were republished metadata-only at the
+revisions in the table. Their YAML now contains inline review comments and
+conservatively omits `batch_capacity`; graphs, weights, and unrelated files
+were not changed.
+
+#### Hosted-example governance
+
+1. The typed parser, semantic validator, generated schema, and canonical design
+   documents are authoritative. A Hub file is a deployed instance, never a
+   second schema or capability catalogue.
+2. Repository tests, evidence, and documentation **MUST** pin immutable Hub
+   revisions. `main` or an unpinned `resolve` URL is not review evidence.
+3. Publication **MUST** run metadata-only validation against the intended
+   runtime revision; artifact-backed execution evidence is a separate gate.
+4. A metadata revision change invalidates prior readiness evidence unless the
+   evidence key proves the semantic identity is unchanged. Model-card prose
+   alone is not such a key.
+5. Schema upgrades are need-driven. A v1.0 package does not become stale merely
+   because v1.1 exists; it becomes stale when it uses a retired field or needs a
+   v1.1 contract it cannot express.
+6. A publisher **MUST NOT** add `batch_capacity` merely to replace a removed
+   boolean. It must author exact component ports, padding/length provenance,
+   ownership, uniform dimensions, and budgets needed for safe grouping.
+7. Human review examples SHOULD retain explanatory YAML comments. When a
+   production serializer strips them, publish an adjacent annotated reference
+   and validate typed semantic equality instead of claiming comments survived.
+8. When generic capability lists are removed, the hosted fleet should be
+   regenerated from the canonical workflow source in one migration, validated,
+   and repinned here; hosted copies must not preserve obsolete fields as a
+   compatibility authority.
+
+Ordered annotated references:
+
+1. the compact decoder policy-graph example in
+   [§1.4](#14-policy-graph-means-executable-semantics);
+2. the in-tree [catalogue](../../examples/inference_metadata/catalogue/README.md),
+   especially decoder/static cache examples 1 and 18, multimodal/diffusion
+   examples 3 and 7–9, adapters/speculation examples 10–11 and 20–24, and
+   encoder/task examples 4–5 and 12–13;
+3. the refreshed, inline-annotated
+   [Wav2Vec2](https://huggingface.co/justinchuby/onnx-genai-example-wav2vec2-base-960h-ctc/blob/28480e393ad1b8fa2e0bb6939e5daded02f24014/inference_metadata.yaml),
+   [ESM-2](https://huggingface.co/justinchuby/onnx-genai-example-esm2-t6-8m/blob/d9f1947f4973056fe287e498b0b0e9b675f1bb92/inference_metadata.yaml),
+   and
+   [ProtBERT](https://huggingface.co/justinchuby/onnx-genai-example-prot-bert/blob/916d8290b9108a3a6487ff4381ea9a66c32588c0/inference_metadata.yaml)
+   production files.
+
 ## 3. Classification rules
 
 | Question | Classification | Required representation |
@@ -108,7 +285,7 @@ Examples:
 
 - `StateUpdate::IndexedScatter`, decoder port roles, graph KV dtype, a rank-3
   position input, and an authored RoPE initializer are derived facts.
-- `StateAliasing`, `StateReuse`, rollback bounds, `batch_invariance`,
+- `StateAliasing`, `StateReuse`, rollback bounds, `ComponentBatchCapacity`,
   `EquivalenceClass`, and `SessionMutationPolicy` are authored requirements.
 - physical paging, prefix-cache capacity, tiering, connector choice, graph
   capture, EP fallback, batch width, and worker placement are deployment policy.
@@ -131,9 +308,9 @@ manifest list. Neither list is needed for built-in structural features.
 
 ### 4.2 Runtime capability strings are neither backend nor artifact readiness
 
-`RuntimeCapabilities::default()` advertises `prefix_cache`,
-`continuous_batching`, and broad workflow behavior without selecting a decoder
-path, backend, provider, build feature, graph, or deployment option. In
+`RuntimeCapabilities::default()` advertises `prefix_cache` and broad workflow
+behavior without selecting a decoder path, backend, provider, build feature,
+graph, or deployment option. In
 contrast, `Engine::batching_capability()` derives an answer from the actual
 native batch extent or ORT cache path, and
 `Session::concurrent_run_support()` derives an answer from resolved EPs and
@@ -152,10 +329,11 @@ capability contract does not consistently mean “support or refuse.”
 
 Repository consumers of `model.runtime_configurable` read only
 `chunked_prefill.chunk_size` during native loading.
-`runtime_configurable.prefix_cache` and
-`runtime_configurable.continuous_batching` have no execution consumer.
-Actual prefix reuse and batching are selected from state/decode structure,
-provider behavior, and runtime policy.
+`runtime_configurable.prefix_cache` has no execution consumer. The former
+`runtime_configurable.continuous_batching`, profile `batch_invariance`, and
+`continuous_batching` capability spellings are already rejected with migration
+diagnostics. Actual prefix reuse and batching are selected from state/decode
+structure, component capacity, provider behavior, and runtime policy.
 
 ### 4.5 Hardware and quantization hints can contradict artifacts
 
@@ -187,10 +365,13 @@ graph-derived, not mirrored by metadata booleans.
 Validation recognizes `onnx-genai.image-preprocess`,
 `onnx-genai.video-preprocess`, and `onnx-genai.audio-preprocess` in
 [`validate_preprocessing_workflow`](../../crates/onnx-genai-metadata/src/validation.rs).
-The workflow adapter registry implements image and audio, but not video, in
+The workflow adapter registry now registers all three in
 [`workflow_adapter_registry`](../../crates/onnx-genai-engine/src/pipeline/workflow.rs).
-A video preprocessing document can therefore be represented and structurally
-validated without a runtime executor.
+Grouped image and ordered-frame preprocessing execute, but encoded
+video-container decode, temporal sampling, and `pad_frames` still fail closed
+with a diagnostic directing callers to the grouped frame-sequence API. A
+registered boundary therefore still does not imply complete execution of every
+program the schema can represent.
 
 ### 4.8 Recognized task profiles are not profile-driven execution
 
@@ -420,7 +601,7 @@ harness or functional test.
 | Encoder-only CTC transcription | Yes | Yes | No | No | No | CTC decoding and vocabulary are validated, but no engine profile-driven CTC interpreter was found. |
 | Encoder-decoder / cross-attention | Yes | Yes | Artifact | No | No | Cross-attention and audio ports/state are represented; Whisper ORT evidence is environment-gated. Native end-to-end parity is not established. |
 | Image multimodal preprocessing + VLM | Yes | Yes | Yes | Partial | No | Image adapter and ORT workflow tests execute. Native component execution exists, but general real image-path readiness and native grouped vision remain unproven. |
-| Encoded-video preprocessing | Yes | Yes | No | No | No | Validator requires `onnx-genai.video-preprocess@1`; runtime adapter registry has no executor. |
+| Encoded-video preprocessing | Yes | Yes | No | No | No | The adapter is registered but encoded container decode/temporal sampling fails closed. Ordered encoded-frame grouping executes in preprocessing, not as an ORT/native encoder invocation. |
 | Video-producing workflow/diffusion | Yes | Yes | Yes | No | No | Hermetic and real-package-gated ORT tests exist; no native video workflow proof was found. |
 | Audio preprocessing + multimodal/audio workflow | Yes | Yes | Yes | Partial | No | Audio preprocessing and buffered WAV conformance execute; no general native real-audio record was found. |
 | Image diffusion/workflow | Yes | Yes | Yes | Yes | No | Hermetic ORT/native diffusion parity and smoke tests exist; no accepted end-to-end performance record. |
@@ -438,7 +619,7 @@ harness or functional test.
 | ORT continuous batching, static cache | Yes | Yes | Yes | N/A | No | `ContinuousBatchManager` and static-cache functional evidence include divergent row cursors. |
 | ORT continuous batching, shared past/present buffer | Yes | Yes | Yes | N/A | No | Requires package aliasing permission, max length, and provider fixed-capacity binding. Capture replay is disabled because mask width changes. |
 | Native continuous batching | Yes | Yes | N/A | Yes | Artifact | Requires a persistent session pinned to batch N; recorded native batch measurements are artifact/hardware specific. |
-| Encoder/component batching | Yes | Yes | No | No | No | Metadata and version gate exist; interpreter, preprocessing, scheduler grouping, backend parity, and performance phases remain incomplete in [ENCODER_BATCHING.md](ENCODER_BATCHING.md). |
+| Encoder/component batching | Yes | Yes | No | No | No | Component grouping contracts validate and grouped image/ordered-frame preprocessing executes. Scheduler-driven grouped component invocation, backend parity/readiness, and performance evidence remain incomplete in [ENCODER_BATCHING.md](ENCODER_BATCHING.md). |
 | Dynamic/growing KV | Yes | Yes | Yes | Yes | Artifact | Append discipline and past/present paths execute. Performance is model/backend specific. |
 | Fixed/static indexed-scatter KV | Yes | Yes | Artifact | Yes | No | Real ORT Qwen2 evidence and native static-cache fixture execution exist. Ragged prefill is not claimed. |
 | Physical paged KV storage | N/A | Runtime | Partial | Partial | No | `PagedKvCache` exists; physical paging is correctly runtime-owned. Backend handoff and device residency remain path-specific. |
@@ -507,7 +688,9 @@ fields indefinitely.
 | `WorkflowManifest.capabilities` | Remove | Workflow structure, contracts, effects, state, batch layouts, and emits. |
 | `RuntimeCapabilities.supported` global strings | Replace | Typed implementation registry plus artifact/backend admission report. |
 | `model.runtime_configurable.prefix_cache` | Remove | `StateReuse::prefix_reusable` states legality; runtime policy enables/caps reuse. |
-| `model.runtime_configurable.continuous_batching` | Remove | Derive batchability from decode/state ABI and concrete backend session; policy selects width. |
+| `model.runtime_configurable.continuous_batching` | Keep removed | Merged main rejects it; derive batchability from component/decode/state ABI and concrete backend session, while policy selects width. |
+| `profiles.*.batch_invariance` | Keep removed | Merged main rejects it; `ComponentBatchCapacity` is the sole authored grouping-equivalence assertion. |
+| Built-in `continuous_batching` capability string | Keep removed | Merged main rejects it as an optimization, not a correctness requirement. |
 | `model.runtime_configurable.chunked_prefill.chunk_size` | Move | Runtime policy/default profile. Keep only a typed hard graph bound if one exists. |
 | `hardware_requirements.supports_tensor_parallel` | Remove | `model.sharding.tensor_parallel` legal shard facts. |
 | `hardware_requirements.min_tp_degree` | Move | Distribution/performance recommendation with evidence. |
@@ -537,14 +720,18 @@ fields indefinitely.
 4. **Add evidence keys and gates:** persist backend admission and conformance
    results; make auto-selection consume exact matching evidence or probe by
    loading.
-5. **Delete redundant schema fields and strings:** update parser, validation,
-   generated schema, fixtures, and canonical docs in one dedicated schema PR
-   after active batching schema work lands. No compatibility aliases.
-6. **Tighten claims:** make status APIs and documentation report represented,
+5. **Delete redundant schema fields and strings:** now that the batching schema
+   work is merged, update parser, validation, generated schema, fixtures, and
+   canonical docs in one dedicated follow-up PR. No compatibility aliases.
+6. **Republish hosted instances:** regenerate the pinned Hub fleet from the
+   authoritative typed source, validate exact uploaded bytes, and update this
+   inventory. Do not preserve obsolete hosted fields as aliases.
+7. **Tighten claims:** make status APIs and documentation report represented,
    validated, executed, and performance-proven separately.
 
 Stages 1–4 can land without editing the batching schema or its canonical design
-document. Stage 5 is intentionally isolated so other schema PRs can merge first.
+document. Stage 5 remains intentionally isolated from this proposal and from
+the already-merged batching work.
 
 ## 10. Recommended acceptance tests
 
@@ -578,6 +765,11 @@ document. Stage 5 is intentionally isolated so other schema PRs can merge first.
     [WORKFLOW_PERFORMANCE_CONFORMANCE.md](../WORKFLOW_PERFORMANCE_CONFORMANCE.md);
     retain raw samples and identities, and never accept an env-gated harness as
     a published pass without a recorded run.
+13. **Hosted fleet:** discover Hub files from repository references and the
+    publisher inventory, download immutable revisions, validate exact bytes,
+    reject retired fields, verify uploads byte-for-byte, and prove any
+    comment-free production document has a parse-equivalent annotated
+    reference.
 
 ## 11. Unresolved questions
 
@@ -594,8 +786,9 @@ document. Stage 5 is intentionally isolated so other schema PRs can merge first.
    versus forbidden semantic fallback?
 6. Who owns execution of task-profile pooling and CTC decoding: the universal
    workflow, a profile interpreter, or API-specific code?
-7. Should video preprocessing share the image executor implementation under a
-   second ABI, or gain a dedicated executor?
+7. Which runtime/service owns encoded video-container decode, frame sampling,
+   and `pad_frames`, and how is that implementation admitted independently from
+   the already-executable ordered-frame grouping path?
 8. What constitutes pure-native MTP readiness when the target is native but the
    proposer remains ORT?
 9. What compatibility identity is required before external KV bytes may be
@@ -650,6 +843,10 @@ Read in this order:
     and
     [the dated workflow evidence](../benchmarks/2026-08-21-mobius-workflow-conformance.md)
     — represented versus executed versus measured status.
+12. The pinned [hosted-example inventory](#23-hosted-hugging-face-examples),
+    followed by the compact annotated policy graph and the three refreshed
+    annotated production files — deployed instances versus their authoritative
+    schema and evidence.
 
 ### Invariants to scrutinize
 
@@ -663,6 +860,8 @@ Read in this order:
 - Does capture or concurrent execution change the admission result?
 - Does a batching claim name the exact artifact/backend/component combination?
 - Could an adapter or speculative fallback silently change output semantics?
+- Is every hosted example pinned, validated at that revision, and prevented from
+  becoming a schema or readiness authority?
 
 ### Short review checklist
 
@@ -674,3 +873,4 @@ Read in this order:
 - [ ] Cache, position, batching, adapter, speculation, and session forms are all covered.
 - [ ] Migration deletions have one replacement authority and no compatibility alias.
 - [ ] Acceptance tests include negative and decline paths, not only successful execution.
+- [ ] Hosted revisions, comments/annotated references, and evidence labels match exact bytes.
