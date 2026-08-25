@@ -369,6 +369,21 @@ impl ArmResult {
         self.steady_metrics.voluntary_ctxt_switches as f64 / self.counter_iters.max(1) as f64
     }
 
+    /// Fraction of CPU time spent in the kernel over the steady window, or
+    /// `None` when no CPU time was sampled at all.
+    ///
+    /// The `None` arm is not the same fact as `Some(0.0)`: the first means the
+    /// /proc instrument gave us nothing, the second means the run genuinely
+    /// spent no time in the kernel. Both callers go through here so they cannot
+    /// disagree about which one they are looking at.
+    fn sys_share(&self) -> Option<f64> {
+        let cpu_us = self.steady_metrics.cpu_us();
+        if cpu_us == 0 {
+            return None;
+        }
+        Some(self.steady_metrics.sys_us as f64 / cpu_us as f64)
+    }
+
     /// CPU-seconds burned per wall-second over the steady window. A spinning
     /// pool converts the gap into CPU and shows up here.
     fn cpu_per_wall(&self) -> f64 {
@@ -772,6 +787,19 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_metrics.cpu_us() as f64 / 1e6,
         result.cpu_per_wall()
     );
+    // Kernel time is where a scheduler's waiting shows up -- `sched_yield` and
+    // futex traffic land here and nowhere else -- so a pool that converts an
+    // idle gap into syscalls is visible as a sys share even when total CPU
+    // looks reasonable. Both halves were already being collected from
+    // /proc/self/stat and then discarded at the report.
+    if let Some(share) = result.sys_share() {
+        println!(
+            "  cpu split:     {:.3} s user  {:.3} s sys  ({:.1}% sys)",
+            result.steady_metrics.user_us as f64 / 1e6,
+            result.steady_metrics.sys_us as f64 / 1e6,
+            100.0 * share
+        );
+    }
     println!(
         "  ctxt switches: {:.1} vol/iter  {:.1} invol/iter  ({} vol total)",
         result.parks_per_iter(),
@@ -1000,12 +1028,16 @@ fn dump_csv(path: &std::path::Path, arm: &str, result: &ArmResult) -> Result<()>
 fn emit_result_line(arm: &str, result: &ArmResult) {
     let summary = result.summary();
     println!(
-        "result: arm={arm} p50={:.4} ms p90={:.4} ms cpu_per_wall={:.2} vol_ctxt_per_iter={:.2} \
+        "result: arm={arm} p50={:.4} ms p90={:.4} ms cpu_per_wall={:.2} sys_share={:.3} \
+         vol_ctxt_per_iter={:.2} \
          parks_per_iter={:.2} spin_hits_per_iter={:.2} spin_yields_per_iter={:.2} \
          steady_iters={} rss_kb={}",
         summary.p50,
         summary.p90,
         result.cpu_per_wall(),
+        // NaN rather than 0.0 when /proc gave us nothing: a parser that sees
+        // `sys_share=0.000` cannot tell "no kernel time" from "no measurement".
+        result.sys_share().unwrap_or(f64::NAN),
         result.parks_per_iter(),
         result.steady_pool.parks as f64 / summary.count.max(1) as f64,
         result.steady_pool.spin_hits as f64 / summary.count.max(1) as f64,
