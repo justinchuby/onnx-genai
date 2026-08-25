@@ -1065,19 +1065,7 @@ fn pure_onnx_device(
     }
     let declaration = workflow.components.get(component)?;
     let session = models.session(component)?;
-    let mut resolved = declaration.clone();
-    if resolved.ports.inputs.is_empty() && resolved.ports.outputs.is_empty() {
-        resolved.ports.inputs = session
-            .inputs()
-            .iter()
-            .map(|tensor| (tensor.name.clone(), session_tensor_contract(tensor)))
-            .collect();
-        resolved.ports.outputs = session
-            .outputs()
-            .iter()
-            .map(|tensor| (tensor.name.clone(), session_tensor_contract(tensor)))
-            .collect();
-    }
+    let resolved = component_with_inferred_ports(declaration, session.inputs(), session.outputs())?;
     if !is_fusible_component(&resolved) {
         return None;
     }
@@ -1096,6 +1084,25 @@ fn pure_onnx_device(
         Some(device) => format!("cuda:{device}"),
         None => "cpu".to_string(),
     })
+}
+
+fn component_with_inferred_ports(
+    declaration: &WorkflowComponent,
+    inputs: &[onnx_genai_ort::TensorInfo],
+    outputs: &[onnx_genai_ort::TensorInfo],
+) -> Option<WorkflowComponent> {
+    let mut resolved = declaration.clone();
+    if resolved.ports.inputs.is_empty() && resolved.ports.outputs.is_empty() {
+        resolved.ports.inputs = inputs
+            .iter()
+            .map(|tensor| Some((tensor.name.clone(), session_tensor_contract(tensor)?)))
+            .collect::<Option<_>>()?;
+        resolved.ports.outputs = outputs
+            .iter()
+            .map(|tensor| Some((tensor.name.clone(), session_tensor_contract(tensor)?)))
+            .collect::<Option<_>>()?;
+    }
+    Some(resolved)
 }
 
 fn requires_batch_admission_boundary(component: &WorkflowComponent) -> bool {
@@ -1134,10 +1141,11 @@ fn receives_fixed_capacity_destinations(workflow: &WorkflowSpec, component: &str
 /// The dtype spellings are the metadata vocabulary's, not the component ABI's:
 /// the result is compared against declared [`TensorContract`]s, so a value that
 /// spelled FP8 the component way would never match a package that spelled it the
-/// schema way.
+/// schema way. `None` means shape alone cannot prove a safe layout, so the
+/// component must remain outside an execution island.
 fn session_tensor_contract(
     tensor: &onnx_genai_ort::TensorInfo,
-) -> onnx_genai_metadata::TensorContract {
+) -> Option<onnx_genai_metadata::TensorContract> {
     use onnx_genai_ort::DataType;
     let dtype = match tensor.dtype {
         DataType::Float32 => "float32",
@@ -1155,6 +1163,19 @@ fn session_tensor_contract(
         DataType::Uint64 => "uint64",
         DataType::Bool => "bool",
     };
+    let batch_layout = match tensor.shape.first().copied() {
+        None => onnx_genai_metadata::BatchLayout::Shared,
+        Some(dimension) if dimension < 0 => {
+            onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 }
+        }
+        Some(0 | 1) if tensor.shape.iter().all(|dimension| *dimension >= 0) => {
+            onnx_genai_metadata::BatchLayout::Shared
+        }
+        // Without a declared layout, a fixed multi-row leading axis or a
+        // symbolic inner axis is semantically ambiguous. It may be request
+        // scoped, so fusion must fail closed instead of inventing Shared.
+        Some(_) => return None,
+    };
     let shape = tensor
         .shape
         .iter()
@@ -1171,14 +1192,14 @@ fn session_tensor_contract(
             }
         })
         .collect();
-    onnx_genai_metadata::TensorContract {
+    Some(onnx_genai_metadata::TensorContract {
         dtype: dtype.into(),
         rank: tensor.shape.len(),
         shape: Some(shape),
         optional: false,
-        batch_layout: onnx_genai_metadata::BatchLayout::Shared,
+        batch_layout,
         padding: Vec::new(),
-    }
+    })
 }
 
 fn is_fusible_component(component: &WorkflowComponent) -> bool {
@@ -2469,6 +2490,86 @@ batch_layout:
             .inputs
             .insert("constant".into(), singleton_tensor("int64"));
         assert!(!requires_batch_admission_boundary(&ordinary));
+    }
+
+    #[test]
+    fn inferred_dynamic_axis_zero_fails_closed_as_request_batched() {
+        let inferred = onnx_genai_ort::TensorInfo {
+            name: "rows".into(),
+            dtype: onnx_genai_ort::DataType::Float32,
+            shape: vec![-1, 4],
+        };
+        let contract = session_tensor_contract(&inferred).expect("dynamic axis zero is classified");
+        assert!(matches!(
+            contract.batch_layout,
+            onnx_genai_metadata::BatchLayout::RequestAligned { axis: 0 }
+        ));
+
+        let empty_component = component(ComponentImplementation::Onnx {
+            artifact: "inferred.onnx".into(),
+        });
+        let inferred_component = component_with_inferred_ports(&empty_component, &[inferred], &[])
+            .expect("dynamic axis zero has a fail-closed inferred contract");
+        assert!(requires_batch_admission_boundary(&inferred_component));
+
+        let rows = Value::from_slice_f32(&[0.0; 8], &[2, 4]).unwrap();
+        let error = super::super::batching::validate_component_batch_before_enqueue(
+            "inferred",
+            &inferred_component,
+            &[("rows", &rows)],
+            &HashMap::from([("batch".into(), 2)]),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::super::batching::BatchContractError::UndeclaredCapacity {
+                request_count: 2,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn inferred_shared_layout_requires_static_singleton_or_scalar_shape() {
+        for shape in [vec![], vec![1], vec![1, 4]] {
+            let inferred = onnx_genai_ort::TensorInfo {
+                name: "constant".into(),
+                dtype: onnx_genai_ort::DataType::Int64,
+                shape,
+            };
+            assert!(matches!(
+                session_tensor_contract(&inferred).map(|contract| contract.batch_layout),
+                Some(onnx_genai_metadata::BatchLayout::Shared)
+            ));
+            let resolved = component_with_inferred_ports(
+                &component(ComponentImplementation::Onnx {
+                    artifact: "static.onnx".into(),
+                }),
+                &[inferred],
+                &[],
+            )
+            .expect("static singleton shape has a known shared layout");
+            assert!(!requires_batch_admission_boundary(&resolved));
+        }
+
+        for shape in [vec![2, 4], vec![1, -1]] {
+            let inferred = onnx_genai_ort::TensorInfo {
+                name: "ambiguous".into(),
+                dtype: onnx_genai_ort::DataType::Float32,
+                shape,
+            };
+            assert!(session_tensor_contract(&inferred).is_none());
+            assert!(
+                component_with_inferred_ports(
+                    &component(ComponentImplementation::Onnx {
+                        artifact: "ambiguous.onnx".into(),
+                    }),
+                    &[inferred],
+                    &[],
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
