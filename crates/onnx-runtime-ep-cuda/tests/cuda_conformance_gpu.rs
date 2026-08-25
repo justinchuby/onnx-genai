@@ -2667,6 +2667,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "dft_gpu.rs",
         "cuFFT real/complex forward/inverse and arbitrary-axis parity",
     ));
+    p.push(dedicated(
+        "STFT",
+        "stft_gpu.rs",
+        "batched cuFFT framed/windowed real and complex parity",
+    ));
     p.push(dedicated("Gather", "movement_gpu.rs", "indexed gather"));
     p.push(dedicated("Shape", "movement_gpu.rs", "shape metadata"));
     p.push(dedicated(

@@ -75,6 +75,10 @@ pub(crate) struct Executor {
     /// dropped afterwards — no use-after-free regardless of field drop order.
     pub(super) weights: Arc<WeightStore>,
     pub(super) ep: Arc<dyn ExecutionProvider>,
+    /// Opt-in mixed-provider coordinator. When present, ordinary tensor runs
+    /// dispatch through its per-provider child executors; the legacy fields
+    /// remain an inert empty scaffold so default single-EP behavior is unchanged.
+    pub(super) heterogeneous: Option<Box<crate::hetero::HeterogeneousExecutor>>,
     /// Which of the EP's captured-graph slots this executor drives. Every
     /// executor gets its own independent CUDA-graph slot on the shared EP: the
     /// main/inline decode executors default to [`DeviceGraphSlot::Primary`]

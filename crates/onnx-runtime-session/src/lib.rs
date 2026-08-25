@@ -181,10 +181,10 @@ mod error {
         HeterogeneousPlacementRequired { unsupported_nodes: String },
 
         #[error(
-            "heterogeneous per-op execution is required but not yet wired into the stateful \
-             session executor (deferred, see issue #603): {placement_summary}. To proceed today, \
-             unset ONNX_GENAI_HETERO to use whole-session CPU fallback, or extend the accelerator's \
-             operator coverage so it can claim every node"
+            "the opt-in heterogeneous executor cannot run this graph or API safely: \
+             {placement_summary}. The first #603 execution slice supports fully-static, \
+             tensor-only acyclic graphs through ordinary run/run_outputs; unset \
+             ONNX_GENAI_HETERO for legacy whole-session CPU fallback"
         )]
         HeterogeneousExecutionUnsupported { placement_summary: String },
 
@@ -1693,6 +1693,12 @@ impl InferenceSession {
     /// CPU instead. `None` means the requested EP serves the whole graph.
     pub fn execution_provider_fallback_report(&self) -> Option<&ExecutionProviderFallbackReport> {
         self.exec.execution_provider_fallback_report()
+    }
+
+    /// Per-provider node counts and cross-provider transfer count for an
+    /// opt-in heterogeneous session. `None` for the unchanged single-EP path.
+    pub fn heterogeneous_placement_report(&self) -> Option<&str> {
+        self.exec.heterogeneous_placement_report()
     }
 
     /// Input metadata.
