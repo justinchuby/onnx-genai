@@ -286,6 +286,13 @@ impl ShapeInference {
             let fallback = match rule {
                 SharedNativeShapeRule::ConstantOfShape => Self::ConstantOfShape,
                 SharedNativeShapeRule::Expand => Self::Expand,
+                SharedNativeShapeRule::Stft => Self::Declined {
+                    op_type: "STFT".into(),
+                    domain: node.domain.clone(),
+                    reason: DeclineReason::NodeNotShapeable(
+                        "the shared native STFT rule did not resolve concrete extents",
+                    ),
+                },
                 SharedNativeShapeRule::Tile => Self::Tile,
             };
             return Self::SharedNative {

@@ -170,6 +170,8 @@ the following runtime libraries:
 |----------------------------|-----------|----------------|
 | `libcudart.so.13` | `nvidia-cuda-runtime>=13` | CUDA runtime (cudarc `runtime`). |
 | `libcublas.so.13`, `libcublasLt.so.13` | `nvidia-cublas>=13` | GEMM (landed). |
+| `libcufft.so.12` | `nvidia-cufft>=12,<13` | DFT (landed; cuFFT 12.x ships with CUDA 13). |
+| `libnvJitLink.so.13` | `nvidia-nvjitlink>=13,<14` | cuFFT plan JIT dependency. |
 | `libnvrtc.so.13` | `nvidia-cuda-nvrtc>=13` | runtime kernel compile (elementwise/norm/cast). |
 | `libcupti.so.13` | `nvidia-cuda-cupti>=13` | GPU tracing (tracer `cupti` feature). |
 | **`libcuda.so.1` (driver)** | **NOT on PyPI** | comes from the user's NVIDIA driver — the one documented prerequisite, same as torch. |
@@ -185,6 +187,8 @@ The `cuda` extra is:
 cuda = [
     "nvidia-cuda-runtime>=13",
     "nvidia-cublas>=13",
+    "nvidia-cufft>=12,<13",
+    "nvidia-nvjitlink>=13,<14",
     "nvidia-cuda-nvrtc>=13",
     "nvidia-cuda-cupti>=13",
 ]

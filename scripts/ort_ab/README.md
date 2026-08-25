@@ -356,6 +356,32 @@ disables).
 `crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are not wired up yet — see
 issue #2043 for the audit.
 
+Which drivers take the lock is now checked rather than remembered.
+`scripts/ort_ab/test_gate_conformance.py` requires every `.py` in this
+directory to declare itself a driver, a generator, a library or a test: an
+undeclared file fails, a driver that never calls `hostlock_gate.require`
+fails, and a file declared harmless that imports `onnxruntime`, opens an
+`InferenceSession` or *names* a binary under `target/` fails as contradicted.
+Both halves read the parsed tree rather than the text: prose about a benchmark
+is not a benchmark (the first pass of the #2043 audit counted `gen_gqa.py` as
+a harness for describing one in its docstring), and a commented-out gate call
+is not a gate call — that error would be fail-open, reporting an unprotected
+driver as protected.
+
+It detects a *literal* path under `target/`, not the spawn itself, so a driver
+misdeclared as a generator that builds its path at runtime would pass; and it
+covers this directory only. Both limits are written down at the top of the
+file. A generator that legitimately loads the runtime declares
+`loads-runtime:` and keeps its reason, the same way an ungated driver
+declares `known-gap:`.
+
+A driver may be ungated *on purpose* — `ort_cuda_decode_bench.py` is, pending
+its owner — but only as a `known-gap:` entry naming the issue. The distinction
+is the point: a gap somebody wrote down can be closed, while a gap that is
+merely absent is one nobody can see. The workflow triggers on
+`scripts/ort_ab/**` for the same reason: a filter listing today's files would
+have skipped the job for exactly the new harness the check exists to catch.
+
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
 that pid's start time, and the next acquirer reclaims it as soon as that
