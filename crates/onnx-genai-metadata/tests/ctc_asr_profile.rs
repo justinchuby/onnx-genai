@@ -64,7 +64,6 @@ profiles:
     kind: transcription
     version: "1.0"
     outputs: { logits: logits, frame_lengths: frame_lengths }
-    batch_invariance: padding_sensitive
     decoding:
       kind: ctc
       blank_id: 0
@@ -476,39 +475,13 @@ profiles:
 }
 
 #[test]
-fn padding_sensitive_profile_without_lengths_binding_is_rejected() {
+fn ctc_profile_without_lengths_binding_is_accepted() {
     let document = r#"
 profiles:
   transcription:
     kind: transcription
     version: "1.0"
     outputs: { logits: logits }
-    batch_invariance: padding_sensitive
-    decoding:
-      kind: ctc
-      blank_id: 0
-      time_axis: 1
-      class_axis: 2
-"#;
-    let reported = errors(document);
-    assert!(
-        reported.iter().any(|error| error.contains(
-            "profiles.transcription.decoding must bind a lengths output role because \
-             profiles.transcription.batch_invariance is 'padding_sensitive'"
-        )),
-        "{reported:?}"
-    );
-}
-
-#[test]
-fn row_independent_profile_without_lengths_binding_is_accepted() {
-    let document = r#"
-profiles:
-  transcription:
-    kind: transcription
-    version: "1.0"
-    outputs: { logits: logits }
-    batch_invariance: row_independent
     decoding:
       kind: ctc
       blank_id: 0
@@ -519,7 +492,7 @@ profiles:
     assert!(
         !reported
             .iter()
-            .any(|error| error.contains("batch_invariance")),
+            .any(|error| error.contains("decoding.lengths")),
         "{reported:?}"
     );
 }

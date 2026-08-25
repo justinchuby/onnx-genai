@@ -49,8 +49,6 @@ pub mod capabilities {
         MULTI_HEAD_ATTENTION = "multi_head_attention";
         /// Prefix-state reuse.
         PREFIX_CACHE = "prefix_cache";
-        /// Request interleaving and compaction.
-        CONTINUOUS_BATCHING = "continuous_batching";
         /// Legacy loop-control admission.
         CONTROL_FLOW_LOOP = "control_flow_loop";
 

@@ -647,9 +647,6 @@ pub struct RuntimeConfigurable {
     /// Whether prefix caching may be enabled.
     pub prefix_cache: Option<bool>,
 
-    /// Whether continuous batching may be enabled.
-    pub continuous_batching: Option<bool>,
-
     /// Chunked-prefill support and preferred chunk size.
     pub chunked_prefill: Option<ChunkedPrefillConfig>,
 }
