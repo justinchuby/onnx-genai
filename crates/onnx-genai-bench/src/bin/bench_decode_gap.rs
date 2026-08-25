@@ -63,7 +63,7 @@ use onnx_genai_bench::model_io::{
     F16_EPSILON, build_arm, build_inputs, build_ort_inputs, compare_outputs, parse_shape,
 };
 use onnx_genai_ort::{Environment, Session, SessionOptions, ep_selection};
-use onnx_runtime_ep_cpu::task_runtime;
+use onnx_runtime_ep_cpu::{dispatch_ledger, task_runtime};
 use onnx_runtime_session::InferenceSession;
 
 /// The native CPU EP's decode-pool width knob, read once into a `OnceLock` by
@@ -242,7 +242,79 @@ fn pool_delta(
         parks: after.parks.saturating_sub(before.parks),
         spin_hits: after.spin_hits.saturating_sub(before.spin_hits),
         panics: after.panics.saturating_sub(before.panics),
+        straggler_waits: after.straggler_waits.saturating_sub(before.straggler_waits),
+        straggler_yields: after
+            .straggler_yields
+            .saturating_sub(before.straggler_yields),
     }
+}
+
+/// Which kernel families ran on which backend, and with what parallel degree.
+///
+/// The pool counters answer "how hard did `task_runtime` work"; they cannot
+/// answer "did this model use `task_runtime` at all". Those two produce the
+/// same output -- a row of zeroes -- and only one of them means the harness is
+/// broken. Attribution is what separates them, so it is collected rather than
+/// assumed: an fp32 `MatMul` fans out on rayon, not on the native task pool, so
+/// a model built from fp32 `MatMul`s reports zero dispatches while saturating
+/// eight cores, and that reading is correct.
+///
+/// Recording is on only for the single attribution inference, never during the
+/// timed window, because `record_with` builds an `Observation` per dispatch.
+fn attribute_routes(run: impl FnOnce() -> Result<()>) -> Result<Vec<RouteRow>> {
+    dispatch_ledger::reset();
+    dispatch_ledger::enable();
+    let outcome = run();
+    dispatch_ledger::disable();
+    outcome?;
+
+    let mut rows: Vec<RouteRow> = Vec::new();
+    for observation in dispatch_ledger::snapshot() {
+        let key = (
+            format!("{:?}", observation.family),
+            format!("{:?}", observation.backend),
+            observation.dtype,
+        );
+        match rows.iter_mut().find(|row| row.key() == key) {
+            Some(row) => {
+                row.calls += 1;
+                row.max_threads = row.max_threads.max(observation.threads);
+            }
+            None => rows.push(RouteRow {
+                family: key.0,
+                backend: key.1,
+                dtype: observation.dtype,
+                calls: 1,
+                max_threads: observation.threads,
+            }),
+        }
+    }
+    rows.sort_by(|a, b| b.calls.cmp(&a.calls).then_with(|| a.family.cmp(&b.family)));
+    Ok(rows)
+}
+
+/// One `(family, backend, dtype)` route observed during attribution.
+struct RouteRow {
+    family: String,
+    backend: String,
+    dtype: &'static str,
+    calls: usize,
+    max_threads: usize,
+}
+
+impl RouteRow {
+    fn key(&self) -> (String, String, &'static str) {
+        (self.family.clone(), self.backend.clone(), self.dtype)
+    }
+}
+
+/// Whether any observed route is one the native task pool would drive.
+///
+/// Used only to phrase the zero-dispatch case: "this model does not use the
+/// pool" is a different statement from "the pool did nothing this run", and the
+/// report should not silently pick one.
+fn any_route_observed(rows: &[RouteRow]) -> bool {
+    !rows.is_empty()
 }
 
 /// What one timed arm produced.
@@ -261,6 +333,8 @@ struct ArmResult {
     total_wall_s: f64,
     /// Native pool counters accumulated across the steady window.
     steady_pool: task_runtime::PoolCounters,
+    /// Routes observed during the attribution inference, if one was taken.
+    routes: Vec<RouteRow>,
 }
 
 impl ArmResult {
@@ -355,6 +429,7 @@ fn assemble(samples: Vec<f64>, snapshots: Vec<Snapshot>, args: &Args) -> ArmResu
         total_metrics: last.metrics.since(&first.metrics),
         total_wall_s: last.at.duration_since(first.at).as_secs_f64(),
         steady_pool: pool_delta(last.pool, boundary.pool),
+        routes: Vec::new(),
     }
 }
 
@@ -442,7 +517,10 @@ fn run_native_arm(args: &Args, label: &str) -> Result<ArmResult> {
             GapKind::parse(&args.gap_kind).map_err(anyhow::Error::msg)?,
             args.gap_seed,
         );
-        std::hint::black_box(session.run(&refs).context("native warm run")?);
+        let routes = attribute_routes(|| {
+            std::hint::black_box(session.run(&refs).context("native warm run")?);
+            Ok(())
+        })?;
         phases.mark("timed-session-warm");
         let (samples, snapshots) =
             timed_loop(args.iters, &mut gaps, args.steady_window.max(1), || {
@@ -450,7 +528,9 @@ fn run_native_arm(args: &Args, label: &str) -> Result<ArmResult> {
                 Ok(())
             })?;
         phases.mark("timed-loop");
-        return Ok(assemble(samples, snapshots, args));
+        let mut result = assemble(samples, snapshots, args);
+        result.routes = routes;
+        return Ok(result);
     }
 
     let result = run_concurrent_native(args, sessions, owned_inputs);
@@ -670,6 +750,36 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_pool.spin_hits as f64 / iterations,
         result.steady_pool.slot_exhausted
     );
+    // A zero-dispatch row has two very different causes and the reader cannot
+    // tell them apart from the row alone, so say which one it was.
+    if result.steady_pool.dispatches == 0 {
+        if any_route_observed(&result.routes) {
+            println!(
+                "  ATTRIBUTION:   this model never dispatched to task_runtime -- the pool \
+                 row above is a true zero, not a dead counter. Routes below say what ran \
+                 instead; pool numbers here describe a pool this model does not use."
+            );
+        } else {
+            println!(
+                "  ATTRIBUTION:   zero dispatches AND zero routes recorded. The ledger saw \
+                 nothing, so this is a dead instrument, not a measurement -- do not quote \
+                 the pool row."
+            );
+        }
+    }
+    for route in &result.routes {
+        println!(
+            "  route:         {} -> {} ({}, {} calls, up to {} threads)",
+            route.family, route.backend, route.dtype, route.calls, route.max_threads
+        );
+    }
+    if dispatch_ledger::dropped() > 0 {
+        println!(
+            "  route:         WARNING {} observations dropped (ledger full); the route list \
+             is truncated and call counts are lower bounds",
+            dispatch_ledger::dropped()
+        );
+    }
     println!(
         "  whole run:     {:.3} cpu-s over {:.3} wall-s (warm-up included)",
         result.total_metrics.cpu_us() as f64 / 1e6,
