@@ -125,6 +125,12 @@ fn unconditional_syncs_are_limited_to_capture_unsupported_paths() {
         "attention.rs::run_attention_phase2a".to_string(),
         "block_quantized_matmul.rs::execute".to_string(),
         "block_quantized_moe.rs::execute_with_workspace".to_string(),
+        // Drains the non-blocking compute stream before the synchronous
+        // default-stream metadata upload, so a prior DFT still reading the
+        // step-scoped metadata prefix cannot have it overwritten. The kernel
+        // declares CaptureSupport::unsupported and names this host barrier as
+        // one of its reasons.
+        "dft.rs::run".to_string(),
         "fused_gemm.rs::run".to_string(),
         "gemm.rs::run".to_string(),
         "matmul_nbits.rs::run".to_string(),
