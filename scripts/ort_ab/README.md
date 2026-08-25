@@ -511,6 +511,52 @@ both assert that a peer holds the box. `run` refuses *without* running your
 command, which is the whole point: the failure it replaces was a host that
 reported `FREE`, ran the benchmark unlocked, and said nothing.
 
+### The same root, in another language
+
+The ledger above reads `*.py`. The benches root is also written in shell and
+in Rust, and until recently neither was enumerated at all — not classified,
+not exempted, invisible. That is not a corner of the directory:
+`decode_gap_park_ab --bench` is one of the three processes that collided on
+the box in #1803, the incident this whole check exists to make visible, and it
+is a Rust bench.
+
+Shell is now covered, and the rule there is **categorical** rather than
+behavioural: every `*.sh` under `crates/onnx-runtime-ep-cpu/benches/` holds
+the lock or carries a recorded reason. The Python side can afford a behaviour
+test because it has an AST; the standard library has no shell parser, so the
+equivalent would be a regex guessing at intent — and a guess that reports
+somebody else's quiet script as a saturating harness is exactly the false
+alarm that gets a check deleted instead of obeyed. A shell file in a benchmark
+directory is a benchmark until its author writes down that it is not.
+
+Custody is read from the **subcommand**, the word after `hostlock.sh`, not
+from the script's name appearing anywhere in the file. `status`, `provenance`,
+`wait` and `release` all name it without claiming the host; `run` and
+`acquire` take it. Comments are stripped first, and in the fail-closed
+direction — `${x#-}` and `$#` survive, a `#` inside an odd number of quotes
+survives, and anything the stripper gets wrong can only *lose* an acquisition
+and report a gated file as ungated, which costs a ledger line rather than a
+silent pass.
+
+Both properties came from real files. `decode_placement_census.sh` carried the
+sentence *"it still runs under the hostlock as a courtesy to whoever is
+measuring"* in its own header while containing no call to `scripts/hostlock.sh`
+at all — a declaration with nothing behind it, which is the failure the ledger
+was built to end, one file extension out of reach. It now takes the lock once,
+by re-executing under `hostlock.sh run`, so the holder is the outer process
+spanning all three of its pool launches rather than one per arm. And the first
+run of the new check found a second file nobody had listed,
+`int4_modulo_arms.sh`, which builds three release arms on every core; it is
+recorded as a `known-gap:` for its owner.
+
+**Rust is still uncovered, deliberately** (#2129). A `[[bench]]` target cannot
+usefully hold the lock in its own `main()`: `cargo bench` compiles on every
+core for minutes *before* the binary starts, so a lock taken there covers the
+cheap half of the run. What must hold it is the invocation, which makes that a
+documentation-conformance check on `benches/README.md` — a different check
+with a different failure mode, and a separate change rather than one bolted on
+here.
+
 ### Where the lock lives
 
 `/tmp/onnx-genai-hostlock`, and **everyone on the box must resolve the same
