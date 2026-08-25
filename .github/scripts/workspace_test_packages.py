@@ -235,10 +235,10 @@ def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = 
         for package in unlinted:
             print(f"  - {package}", file=sys.stderr)
         print(
-            "Every tested package must be reached by some `cargo clippy` step. The offline\n"
-            "clippy steps select `cargo-args lint`, so a package added to a test lane is\n"
-            "linted automatically -- this failing means a clippy step went back to a\n"
-            "hand-written -p list, or a new lane is tested but not linted.",
+            "Every tested package must be reached by some `cargo clippy` step. The Linux\n"
+            "offline clippy steps select `cargo-args lint`, so a package added to a test\n"
+            "lane is linted automatically -- this failing means a clippy step went back to\n"
+            "a hand-written -p list, or a new lane is tested but not linted.",
             file=sys.stderr,
         )
     if failed:

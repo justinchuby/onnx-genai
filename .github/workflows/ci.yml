@@ -605,11 +605,17 @@ jobs:
           -- -D warnings
 
       # The mirror image of the step above, and the other half of the same hole.
-      # That one turns the feature *on*, and it is the only `-D warnings` gate in
-      # this file that names these crates -- `Run clippy on all offline crates`
-      # cannot list them because they pull in `ort-sys`, and `CLI ORT`'s clippy
-      # steps name `onnx-genai-cli`, so `-D warnings` does not reach a dependency
-      # and dependencies do not build test targets anyway.
+      # That one turns the feature *on*; this one checks what actually ships.
+      #
+      # This step used to be the only `-D warnings` gate in this file naming
+      # these crates, because `Run clippy on all offline crates` was a
+      # hand-written list that excluded anything pulling in `ort-sys`. That is
+      # no longer true: it selects `cargo-args lint`, which includes both. The
+      # reason to keep this step is now a different one -- with `resolver = "2"`
+      # features unify across every package selected in a single invocation, so
+      # the 55-package `lint` run can turn features on for engine/server that
+      # neither crate enables by itself. Naming the two in isolation is the only
+      # way to lint the default resolve that ships.
       #
       # So the *default* configuration of both crates was compiled by
       # `Test ORT-backed workspace crates` and linted by nothing. Measured, not
