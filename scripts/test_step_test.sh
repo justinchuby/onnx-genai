@@ -261,40 +261,87 @@ done
 
 unguarded_filtered_steps() {
     awk '
-        function flush(   i, n, tok, parts, skip) {
+        function flush(   i, n, tok, parts, skip, j, m, frags, v, vars, nv, tmp) {
             if (block == "" || block !~ /cargo test/) return
             if (block ~ /run_test_step/) return
+            # A variable assigned from `$(...)` is opaque in exactly the way the
+            # substitution itself is, and the cell below proves those generators
+            # emit options only. Record those names before the blanking below
+            # hides the `$(` that identifies them. Only they are blanked: a
+            # variable assigned from anything else stays visible to the scan.
+            nv = 0
+            tmp = block
+            while (match(tmp, /[A-Za-z_][A-Za-z0-9_]*=("|'"'"')?\$\(/)) {
+                v = substr(tmp, RSTART, RLENGTH)
+                sub(/=.*$/, "", v)
+                vars[++nv] = v
+                tmp = substr(tmp, RSTART + RLENGTH)
+            }
             # `$(...)` is opaque to a static scan. Blank it out here so it is
             # not misread as a positional -- and note that doing so would open
             # a quiet hole, which the cell below closes by EXECUTING each one
             # and proving it expands to options only.
             gsub(/\$\([^)]*\)/, " ", block)
-            n = split(block, parts, /[ \t]+/)
-            skip = 0
-            for (i = 1; i <= n; i++) {
-                tok = parts[i]
-                if (tok == "" || tok == "\\" || tok == "|" || tok == ">-") continue
-                if (skip) { skip = 0; continue }
-                if (tok ~ /^-/) {
-                    # Options that consume the following token as their value.
-                    if (tok ~ /^(-p|--package|--test|--bench|--example|--bin|--features|--target|--target-dir|--manifest-path|--profile|-j|--jobs|--color|--message-format|--exclude)$/)
-                        skip = 1
-                    continue
+            for (j = 1; j <= nv; j++) {
+                gsub("\\$\\{?" vars[j] "\\}?", " ", block)
+                gsub(vars[j] "=", " ", block)
+            }
+            # A block can be a script rather than a single command. Scan only
+            # the statement that runs cargo: a guard or an error message beside
+            # it is not a selector, and reading the whole block as one command
+            # reads their words as positionals. Statement boundaries are `;`,
+            # `&&`, `||` and -- in a literal (`|`) block -- the newline, which
+            # the accumulator preserved as @@NL@@ for exactly this reason.
+            m = split(block, frags, /(\|\||&&|;|@@NL@@)/)
+            for (j = 1; j <= m; j++) {
+                if (frags[j] !~ /cargo test/) continue
+                n = split(frags[j], parts, /[ \t]+/)
+                skip = 0
+                for (i = 1; i <= n; i++) {
+                    tok = parts[i]
+                    if (tok == "" || tok == "\\") continue
+                    if (skip) { skip = 0; continue }
+                    if (tok ~ /^-/) {
+                        # Options that consume the following token as their value.
+                        if (tok ~ /^(-p|--package|--test|--bench|--example|--bin|--features|--target|--target-dir|--manifest-path|--profile|-j|--jobs|--color|--message-format|--exclude)$/)
+                            skip = 1
+                        continue
+                    }
+                    # Words that are part of the invocation itself, not selectors.
+                    if (tok ~ /^(cargo|test|env|bash|sudo|run:|[A-Z_]+=.*)$/) continue
+                    print name
+                    return
                 }
-                # Words that are part of the invocation itself, not selectors.
-                if (tok ~ /^(cargo|test|env|bash|sudo|run:|[A-Z_]+=.*)$/) continue
-                print name
-                return
             }
         }
         /^      - name:/ { flush(); block = ""; name = $0; sub(/^ *- name: */, "", name); inrun = 0; next }
-        /^        run:/ { inrun = 1; block = block " " $0; sub(/^ *run: */, "", block); next }
+        /^        run:/ {
+            inrun = 1
+            line = $0
+            sub(/^ *run: */, "", line)
+            # The block scalar style decides whether a newline is a statement
+            # separator. `|` keeps newlines, so each line is its own command;
+            # `>` folds them into spaces, so the lines are one command. Reading
+            # a literal block as folded is what makes a guard beside the cargo
+            # call look like arguments to it.
+            if (line ~ /^\|[-+0-9]*$/)      { folded = 0; line = "" }
+            else if (line ~ /^>[-+0-9]*$/)  { folded = 1; line = "" }
+            else                            { folded = 1 }
+            block = line
+            cont = 0
+            next
+        }
         {
             if (!inrun) next
             line = $0
             sub(/^[ \t]+/, "", line)
             if (line ~ /^#/) next
-            block = block " " line
+            # A trailing backslash continues the previous line even in a
+            # literal block, so it is not a boundary.
+            sep = (folded || cont) ? " " : "@@NL@@"
+            if (block == "") sep = ""
+            block = block sep line
+            cont = (line ~ /\\$/)
         }
         END { flush() }
     ' "$1"
@@ -323,11 +370,28 @@ cat > "$WORK/mutant.yml" <<'YAML'
           -p some-crate
           --features mlas
           kernels::something::
+      - name: A guarded-form step
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::empty"; exit 1; }
+          cargo test --locked $packages
+      - name: A guarded-form step with a filter
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::empty"; exit 1; }
+          cargo test --locked $packages kernels::something::
+      - name: A step whose variable is not a generator
+        run: |
+          packages="kernels::something::"
+          cargo test --locked $packages
 YAML
 MUT="$(unguarded_filtered_steps "$WORK/mutant.yml")"
+WANT="An unguarded filtered step
+A guarded-form step with a filter
+A step whose variable is not a generator"
 check "MUTATION: the detector finds an unguarded filtered step" \
-    "$([ "$MUT" = "An unguarded filtered step" ] && echo 0 || echo 1)" \
-    "expected exactly 'An unguarded filtered step', got: [$MUT]"
+    "$([ "$MUT" = "$WANT" ] && echo 0 || echo 1)" \
+    "expected exactly [$WANT], got: [$MUT]"
 
 # The scanner blanks out `$(...)`, so a generator that emitted a bare word
 # would slip past it. Close that by running each generator ci.yml actually
