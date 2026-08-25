@@ -420,17 +420,45 @@ fn block_fp8_length_validation() {
     assert_eq!(lengths.packed_bytes, 64 * 128);
     // ceil(64/128) * ceil(128/128) == 1 * 1.
     assert_eq!(lengths.scale_bytes, 1);
-    validate_planar_linear(&dims, 3 * 128, lengths.packed_bytes, lengths.scale_bytes).unwrap();
+    validate_planar_linear(
+        &dims,
+        3 * 128,
+        lengths.packed_bytes,
+        lengths.scale_bytes,
+        lengths.output_elems,
+    )
+    .unwrap();
 
     // Truncated aux scale is rejected.
-    assert!(validate_planar_linear(&dims, 3 * 128, lengths.packed_bytes, 0).is_err());
+    assert!(
+        validate_planar_linear(
+            &dims,
+            3 * 128,
+            lengths.packed_bytes,
+            0,
+            lengths.output_elems
+        )
+        .is_err()
+    );
+    // Under-sized output buffer is rejected.
+    assert!(
+        validate_planar_linear(
+            &dims,
+            3 * 128,
+            lengths.packed_bytes,
+            lengths.scale_bytes,
+            lengths.output_elems - 1
+        )
+        .is_err()
+    );
     // Wrong packed length is rejected.
     assert!(
         validate_planar_linear(
             &dims,
             3 * 128,
             lengths.packed_bytes - 1,
-            lengths.scale_bytes
+            lengths.scale_bytes,
+            lengths.output_elems
         )
         .is_err()
     );
@@ -440,7 +468,8 @@ fn block_fp8_length_validation() {
             &dims,
             3 * 128 + 1,
             lengths.packed_bytes,
-            lengths.scale_bytes
+            lengths.scale_bytes,
+            lengths.output_elems
         )
         .is_err()
     );
@@ -482,7 +511,14 @@ fn fp4_planar_length_validation() {
     let lengths = dims.expected_lengths().unwrap();
     assert_eq!(lengths.packed_bytes, 16 * (64 / 2));
     assert_eq!(lengths.scale_bytes, 16 * (64 / 32));
-    validate_planar_linear(&dims, 2 * 64, lengths.packed_bytes, lengths.scale_bytes).unwrap();
+    validate_planar_linear(
+        &dims,
+        2 * 64,
+        lengths.packed_bytes,
+        lengths.scale_bytes,
+        lengths.output_elems,
+    )
+    .unwrap();
 
     // Odd contraction (not packable into nibbles) is rejected.
     let odd = PlanarLinearDims {

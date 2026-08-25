@@ -232,15 +232,16 @@ fn run_planar_gpu(
     packed: &[u8],
     scale: &[u8],
 ) -> Vec<f32> {
+    let out_elems = dims.m_rows * dims.out_features;
     validate_planar_linear(
         dims,
         dims.m_rows * dims.in_features,
         packed.len(),
         scale.len(),
+        out_elems,
     )
     .unwrap();
 
-    let out_elems = dims.m_rows * dims.out_features;
     let out_bytes = out_elems * dtype_bytes(dtype);
 
     let a_buf = upload(ep, a_bytes);
@@ -552,7 +553,7 @@ fn invalid_geometry_is_typed_rejected() {
         bs0: 128,
         bs1: 128,
     };
-    assert!(validate_planar_linear(&dims, 2 * 128, 64 * 128, 0).is_err());
+    assert!(validate_planar_linear(&dims, 2 * 128, 64 * 128, 0, 2 * 64).is_err());
     // Zero block size.
     let bad_block = PlanarLinearDims { bs1: 0, ..dims };
     assert!(launch_planar_linear(runtime, PlanarActivationDtype::F32, &bad_block, &ptrs).is_err());

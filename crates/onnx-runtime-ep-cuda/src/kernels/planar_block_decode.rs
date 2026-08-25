@@ -117,7 +117,7 @@ __device__ __forceinline__ float planar_bf8_element(
     int out_features, int in_features, int bs0, int bs1,
     int out_row, int in_col) {
     const int scale_cols = (in_features + bs1 - 1) / bs1;
-    const unsigned char se = scale[(out_row / bs0) * scale_cols + (in_col / bs1)];
+    const unsigned char se = scale[(long long)(out_row / bs0) * scale_cols + (in_col / bs1)];
     const unsigned char code = packed[(long long)out_row * in_features + in_col];
     return planar_e4m3(code) * planar_e8m0_scale(se);
 }
@@ -288,6 +288,7 @@ impl PlanarLinearDims {
                 Ok(PlanarTensorLengths {
                     packed_bytes: self.out_features * self.in_features,
                     scale_bytes: scale_rows * scale_cols,
+                    output_elems: self.m_rows * self.out_features,
                 })
             }
             PLANAR_FORMAT_FP4_PLANAR => {
@@ -306,6 +307,7 @@ impl PlanarLinearDims {
                 Ok(PlanarTensorLengths {
                     packed_bytes: self.out_features * (self.in_features / FP4_PACK_FACTOR),
                     scale_bytes: self.out_features * (self.in_features / FP4_MICROSCALE_BLOCK),
+                    output_elems: self.m_rows * self.out_features,
                 })
             }
             other => Err(kernel_err(format!("unknown planar format id {other}"))),
@@ -313,21 +315,25 @@ impl PlanarLinearDims {
     }
 }
 
-/// Exact byte lengths of a planar weight's packed data and aux scale bank.
+/// Exact tensor extents a planar linear's geometry requires: packed-weight and
+/// aux-scale byte lengths, plus the destination element count the kernel writes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanarTensorLengths {
     pub packed_bytes: usize,
     pub scale_bytes: usize,
+    pub output_elems: usize,
 }
 
-/// Typed-reject a planar linear whose supplied tensor byte lengths do not match
-/// the exact lengths its geometry requires. This is the host-side aux/OOB guard
-/// (ragged banks, truncated scales, overflow) that must pass before any launch.
+/// Typed-reject a planar linear whose supplied tensor extents do not match the
+/// exact extents its geometry requires. This is the host-side aux/OOB guard
+/// (ragged banks, truncated scales, an under-sized output buffer, overflow) that
+/// must pass before any launch.
 pub fn validate_planar_linear(
     dims: &PlanarLinearDims,
     activation_elems: usize,
     packed_bytes: usize,
     scale_bytes: usize,
+    output_elems: usize,
 ) -> Result<()> {
     let expected = dims.expected_lengths()?;
     let expected_activation = dims.m_rows * dims.in_features;
@@ -346,6 +352,12 @@ pub fn validate_planar_linear(
         return Err(kernel_err(format!(
             "aux scale has {scale_bytes} bytes, expected {}",
             expected.scale_bytes
+        )));
+    }
+    if output_elems != expected.output_elems {
+        return Err(kernel_err(format!(
+            "output has {output_elems} elements, expected M*N = {}",
+            expected.output_elems
         )));
     }
     Ok(())
