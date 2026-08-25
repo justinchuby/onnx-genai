@@ -1029,6 +1029,17 @@ impl Executor {
             }
         }
 
+        // Install the route-residency boundary now that the model's weights and
+        // per-expert catalog are finalized and — for static-shape graphs — the
+        // executing kernels are compiled and their route-telemetry producer
+        // sources registered EP-side, but before any decode capture (issue #1810
+        // Slice 7E goal 3). Default-off: the EP installs and retains nothing
+        // unless the coarse-residency profile is enabled; the typed outcome is
+        // recorded in the EP's route-residency diagnostics. Runs once per model
+        // build on the concrete EP.
+        exec.ep
+            .install_route_residency_boundary_after_build(&exec.graph);
+
         // Pre-compute weight transposes for the GEMV decode path on Apple
         // Silicon. Model load is 15× faster than ORT (105 ms vs 1596 ms), so
         // spending ~1 s here still wins the model-load metric while eliminating

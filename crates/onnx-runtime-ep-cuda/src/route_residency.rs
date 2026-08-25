@@ -537,6 +537,18 @@ pub enum RouteResidencyBindingReject {
     /// A group member weight has no backing VMM allocator — it was not paged/
     /// committed, so the boundary consumer had no allocator to tier against.
     MissingAllocator { value: ValueId },
+    /// The discovered bank's members have no *per-bank dedicated* VMM
+    /// reservation for the coarse route-residency plan to remap (issue #1810
+    /// Slice 7E). The shipped [`CudaWeightResidency`](crate::weight_paging::CudaWeightResidency)
+    /// packs every paged weight into one *shared* VMM reservation with per-key
+    /// stable-VA slots (issue #716); the coarse plan addresses each bank at
+    /// catalog-relative offsets, which only a per-bank reservation satisfies, so
+    /// installing here would let the boundary consumer remap the wrong bytes.
+    /// The seam fail-closes instead. Route producer sources (Slice-7E goal 2)
+    /// and the real build-time install call (goal 3) are wired and fire; the
+    /// per-bank-reservation bridge in the residency is the disclosed residual a
+    /// later slice supplies, after which this same seam installs for real.
+    NoPerBankReservation { value: ValueId },
 }
 
 impl RouteResidencyBindingReject {
@@ -557,6 +569,13 @@ impl RouteResidencyBindingReject {
             }
             RouteResidencyBindingReject::MissingAllocator { value } => {
                 format!("bank value {value:?} has no VMM allocator")
+            }
+            RouteResidencyBindingReject::NoPerBankReservation { value } => {
+                format!(
+                    "bank value {value:?} has no per-bank VMM reservation; shipped residency \
+                     packs banks into one shared reservation (per-bank-reservation bridge is the \
+                     Slice-7E residual)"
+                )
             }
         }
     }
@@ -1104,5 +1123,21 @@ mod binding_tests {
         );
         let r = RouteResidencyBindingReject::MultipleBanksUnsupported { groups: 3 }.reason();
         assert!(r.contains('3'), "reason carries the group count: {r}");
+    }
+
+    #[test]
+    fn no_per_bank_reservation_reason_names_the_value_and_residual() {
+        // The shipped enabled-path terminal decline: real discovery + retention
+        // succeed, but the shared-reservation residency has no per-bank VMM
+        // reservation for the coarse plan to address. The reason must name the
+        // offending bank value and disclose the per-bank-reservation residual so
+        // the honest typed outcome is self-describing in diagnostics.
+        let value = ValueId(7);
+        let r = RouteResidencyBindingReject::NoPerBankReservation { value }.reason();
+        assert!(r.contains("7"), "reason names the bank value: {r}");
+        assert!(
+            r.contains("per-bank") && r.contains("reservation"),
+            "reason discloses the per-bank-reservation residual: {r}"
+        );
     }
 }
