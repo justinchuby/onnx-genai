@@ -95,7 +95,7 @@ impl ModelHandle {
         let ModelHandleParts {
             id,
             model_dir,
-            engine,
+            mut engine,
             tokenizer,
             chat_template,
             model_max_context,
@@ -106,6 +106,11 @@ impl ModelHandle {
             image_pipeline,
         } = parts;
         let private_channels = declares_private_channels(&model_dir);
+        // The only place a routable model gets its id, so it is also the only
+        // place the engine learns which model's sessions it owns. Everything
+        // that keys a session or a lease reads it back off the driver, which is
+        // why the two can never disagree.
+        engine.bind_model(&id);
         Ok(Self {
             id,
             engine,
@@ -967,6 +972,7 @@ mod tests {
                 crate::worker::WorkerId::PRIMARY,
                 tx,
             )),
+            model: crate::lease::ModelKey::new(""),
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,
             // A test double drives no engine, so there is no pool to

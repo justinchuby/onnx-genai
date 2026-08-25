@@ -717,17 +717,17 @@ three are reconciled by the surface below, which shipped in
 [#2009](https://github.com/justinchuby/onnx-genai/pull/2009).
 
 There was also no mechanism through which any of it could ship, and supplying one
-was a precondition rather than a detail. The metadata structs are closed —
-`InferenceMetadata` is `#[serde(deny_unknown_fields)]`
+was a precondition rather than a detail. The metadata structs were already closed
+— `InferenceMetadata` is `#[serde(deny_unknown_fields)]`
 (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`) and `schema/ir.rs` carries
 45 more, including `TensorContract`, `BatchLayout`, `ComponentPorts`, and
-`WorkflowComponent` — so an older runtime meeting a new field **rejects the whole
-document** rather than ignoring it, contrary to the "ignore unknown fields" claim
-in the `schema_version` doc comment (`schema/mod.rs:47-52`). And nothing
-validates `schema_version`: `crates/onnx-genai-metadata/src/validation.rs` never
-mentions it, so a document declaring a future version is accepted and then
-rejected field by field, which is the least actionable order in which to learn
-that a runtime upgrade is required.
+`WorkflowComponent` — so an older runtime meeting a new field rejected the whole
+document rather than ignoring it. At the time, no pre-deserialization gate
+validated `schema_version`, so a future document failed field by field instead
+of reporting that the runtime needed an upgrade. #2009 replaced that missing
+mechanism with the normalized version contract now documented at
+`schema/mod.rs:62-78` and enforced by
+`crates/onnx-genai-metadata/src/version.rs:42,78`.
 
 ### 10.5 Generic component batching
 
@@ -956,13 +956,10 @@ the gate shipped with it** (`crates/onnx-genai-metadata/src/version.rs:78`,
 `#[serde(deny_unknown_fields)]` (`crates/onnx-genai-metadata/src/schema/mod.rs:38-40`
 and 45 occurrences in `schema/ir.rs`), so an older runtime **rejects the whole
 document** when it meets `batch_capacity`, `padding`, or `levels` — it does not
-ignore them, and the forward-compatibility claim in the `schema_version` doc
-comment (`schema/mod.rs:47-52`) does not describe this codebase. Nothing
-validates `schema_version` today either
-([§10.4](#104-what-101-did-not-have)). The mechanism this surface requires is
-therefore a gate that reads `schema_version` from a generic parse and rejects an
-unsupported version with one actionable message **before** struct
-deserialization, with an exactly stated grammar:
+ignore them. The current `schema_version` contract states the accepted grammar
+and normalization (`schema/mod.rs:62-78`), and the shipped gate reads the version
+from a generic parse and rejects an unsupported version with one actionable
+message **before** struct deserialization (`version.rs:42,78`):
 
 - **Normalization.** `[v]major[.minor]`, minor defaulting to 0. All three
   spellings already in the tree — absent (14 of the 39 `inference_metadata.yaml`

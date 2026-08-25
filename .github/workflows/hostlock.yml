@@ -90,6 +90,10 @@ on:
       # filter listing today's files would skip the job for exactly the file
       # it was written to catch.
       - "scripts/ort_ab/**"
+      # Second root read by the conformance check: the acc0 harnesses. Same
+      # argument, and the file that will most likely need it is one that does
+      # not exist yet.
+      - "crates/onnx-runtime-ep-cpu/benches/**"
       - ".github/workflows/hostlock.yml"
   push:
     branches:
@@ -102,6 +106,10 @@ on:
       # filter listing today's files would skip the job for exactly the file
       # it was written to catch.
       - "scripts/ort_ab/**"
+      # Second root read by the conformance check: the acc0 harnesses. Same
+      # argument, and the file that will most likely need it is one that does
+      # not exist yet.
+      - "crates/onnx-runtime-ep-cpu/benches/**"
       - ".github/workflows/hostlock.yml"
 
 permissions:
@@ -135,7 +143,10 @@ jobs:
 
       # "Mandatory for saturating runs" has meant "somebody remembered": the
       # #2043 audit found one driver of fourteen taking the lock. This step
-      # makes every file in the directory declare what it is, and fails when a
-      # driver neither gates nor records why not.
+      # makes every file in `scripts/ort_ab/` declare what it is, and fails
+      # when a driver neither gates nor records why not. It also reads
+      # `crates/onnx-runtime-ep-cpu/benches/` by behaviour -- a file there
+      # that starts a benchmark, directly or through a helper it imports,
+      # must hold the lock or carry a recorded gap.
       - name: Driver gate conformance
         run: python3 scripts/ort_ab/test_gate_conformance.py

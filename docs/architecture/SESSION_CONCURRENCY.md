@@ -114,6 +114,15 @@ gets whole-engine serialization they did not ask for and cannot see.
 
 ### 1.2 The exclusive lease is typed, unreachable, and narrower than it looks
 
+> ✅ **Superseded in part by Phase 2 (§13).** The "unreachable" half of this
+> heading described the *interpreter's* lease, and it was accurate when written.
+> The routing lease of §4.2 has since shipped, so
+> `PackageCapabilityError::ExclusiveLeaseConflict` is now raised from the routing
+> layer for every session-bearing turn and is reachable over HTTP. Everything
+> below still stands as the description of the interpreter's own lease, which is
+> kept, unpromoted, and still narrow — read it that way rather than as a
+> statement about the runtime today.
+
 The metadata contract already declares this. A session-scoped state cell carries
 a `SessionLeaseContract` whose `policy` defaults to `exclusive`
 (`schema/inference_metadata.schema.json:3215-3254`), and the normative
@@ -187,11 +196,18 @@ The interpreter is handed a stringified copy of the numeric id at the boundary
 
 So the honest summary is:
 
-| Path | Conversation state | Lease today | Refuses a concurrent second turn? |
+| Path | Conversation state | Lease before Phase 2 | Refused a concurrent second turn? |
 |---|---|---|---|
 | Interpreted workflow (`!holds_decode_core`) | interpreter session cells | `workflow_session_leases`, keyed by `String` | would, if two could be in flight |
 | Decode core (ORT) | `Engine::sessions`, keyed by `SessionId` | none | no |
 | Decode core (native) | `Engine::native_sessions` (`engine/model.rs:78-100`) | none | no |
+
+✅ **All three rows now answer "yes", from one place.** Phase 2's routing lease
+(`server/src/lease.rs`) is keyed by `ModelSessionPlacement` and is taken before
+the turn is enqueued, so which of these three paths ends up serving it is not
+something the refusal depends on. The interpreter's row keeps its own guard as
+the inner invariant; the two decode-core rows are covered by the routing lease
+alone.
 
 This changes what §2's Decision 3 asks for. It is **not** "make the existing
 lease reachable". It is:
@@ -960,16 +976,25 @@ into a latency cliff).
 
 ### 4.2 The routing lease
 
+✅ **Shipped (Phase 2).** The lease described below exists as
+`crates/onnx-genai-server/src/lease.rs`: `SessionLeases`, a sharded map of
+`ModelSessionPlacement`, owned by the `SessionRegistry` — the one routing-layer
+map of client id → conversation, shared by every loaded model — and acquired
+through `SessionRegistry::acquire` before any command is built. `SessionLeaseGuard` is the RAII half, and it is `#[must_use]`. The
+paragraphs below are kept in the present tense as the design they describe; where
+what landed is narrower than what they specify, §13's Phase 2 entry says so by
+name.
+
 This is the section the whole document turns on, because §1.2 established that
-the lease Decision 3 needs **does not exist today** — the interpreter's
+the lease Decision 3 needs **did not exist** before that — the interpreter's
 `workflow_session_leases` covers interpreted workflow sessions only, is keyed by
 `String`, and is absent from every decode-core path.
 
 **A new lease is introduced at the routing layer.** It is keyed by the typed
 public session identity — the `SessionPlacement` that #2012 already threads
-through the driver, the session registry and the routes (`worker.rs:66-85`) —
-and it applies to every session-bearing turn regardless of which execution path
-serves it. Decode-core ORT sessions, decode-core native sessions, and
+through the driver, the session registry and the routes (`worker.rs:66-85`),
+qualified by the model that owns the engine which issued it — and it applies to
+every session-bearing turn regardless of which execution path serves it. Decode-core ORT sessions, decode-core native sessions, and
 interpreted workflow sessions are all covered by one lease, because a caller
 holding one session id should get one answer about what a concurrent second turn
 does.
@@ -993,12 +1018,27 @@ raised, and the key it is raised against, are new.
 Where the lease state lives is a consequence of §4.1, not a free choice. Since
 routing is a pure function of the session id and a session belongs to exactly
 one worker for its whole life, contention on the lease map is contention between
-*request-handling* tasks, not between workers. It is therefore one map in the
-routing façade, sharded by `WorkerId` to keep the critical section short, holding
-`SessionPlacement → LeaseState`. It is *not* a `Mutex<HashSet<String>>` dropped
-into `WorkflowRuntime` where the old one was, and it is *not* per-worker state —
-a per-worker map cannot be consulted before the command reaches the worker, and
-§4.2.1 explains why that timing is the whole point.
+*request-handling* tasks, not between workers. It is therefore **one map in the
+routing façade** — sharded to keep the critical section short — holding
+`ModelSessionPlacement → LeaseState`, and owned by the `SessionRegistry`, which
+is the thing that holds the bindings the lease is about. It is *not* a
+`Mutex<HashSet<String>>` dropped into `WorkflowRuntime` where the old one was,
+and it is *not* per-worker state — a per-worker map cannot be consulted before
+the command reaches the worker, and §4.2.1 explains why that timing is the whole
+point.
+
+✅ **The key is model-qualified, and the map is one map.** A `SessionPlacement`
+names a worker and an engine session id, and both are per-engine: each engine
+numbers its own sessions and each pool starts at worker 0, so two loaded models
+routinely produce the identical placement for two unrelated conversations. A
+per-`EngineDriver` map would additionally have meant that the *session registry*
+— which is global across models — had to pick which engine's map to consult for
+a binding, and picking wrong is precisely the failure the lease exists to
+prevent. Both are fixed by the same decision: the key is
+`ModelSessionPlacement { model: ModelKey, placement: SessionPlacement }`
+(`server/src/lease.rs`), the map is owned by the `SessionRegistry`, and every
+route acquires through it. A driver learns its own `ModelKey` once, in
+`ModelHandle::new`, and refuses a lease naming any other model.
 
 #### 4.2.1 The lease is acquired before enqueue, not inside the worker loop
 
@@ -1063,9 +1103,10 @@ while the first is still in flight. §13 therefore lands the routing lease in
 
 **What changes about reachability.** The server test's parenthetical — *"the
 driver serializes passes, so this is raised where it is decided and mapped where
-it is answered"* (`server/src/tests.rs:4858-4859`) — is deleted in Phase 2 and
-replaced by the real over-HTTP test in §12.1, because from that phase on the
-statement is simply false.
+it is answered"* — ✅ **has been deleted**, and the hand-constructed error it
+introduced is replaced by a real over-HTTP 409 inside
+`every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_on`
+(`server/src/tests.rs`), because the statement is no longer true.
 
 
 ### 4.3 What must be constructed and dropped on a worker thread
@@ -1214,6 +1255,73 @@ long generations. Three consequences:
 | `rewind_session_by`, `rewind_session_to` | `session.shard` | Mutating: take the lease. Both are `&mut self` (`engine/runtime.rs:1590-1594`, `:1608-1612`) and truncate the session's KV |
 | `session_token_count`, `session_prefill_carry` | `session.shard`, read-only | These are `&self` today (`engine/runtime.rs:1742,1788`) and remain read-only queries |
 
+**What of this table is routed today.** The HTTP surface exposes exactly three
+of these operations: `create_session` (`POST /v1/sessions`), sessionful and
+sessionless `generate` (the completion routes), and `close_session`
+(`DELETE /v1/sessions/{id}`). ✅ All three follow the table as of Phase 2 —
+close takes the lease, a sessionful generate takes it, a sessionless one does
+not — and `session_token_count`/`session_prefill_carry` remain read-only queries,
+with the carry read now performed under the calling turn's own lease so it cannot
+observe a conversation another turn is rewriting. `reset_session`,
+`rewind_session_by`/`rewind_session_to`, `fork_session`, `checkpoint_session` and
+`restore_session` have **no route and no driver command**: they are `&mut Engine`
+methods reachable only from the worker thread that owns the engine, so there is
+no routing-layer caller for the lease to guard. They are not exempt from the
+table — they are unrouted, and the phase that routes them takes the lease in the
+same place `close_session` does. §12.1's test 5 (reset racing a turn) is
+therefore deferred with them; the close-racing-a-turn case, which is the same
+shape, is covered instead.
+
+One further consequence of the lease reaches a place the table does not name:
+**LRU eviction is a close, so it obeys the close row.** The registry no longer
+picks the least recently used binding and closes it; it walks candidates
+oldest-first and takes the first lease it can, so a binding with a turn in flight
+is skipped rather than destroyed under its caller. If every binding is mid-turn
+there is no victim, and the *new* session is refused with a typed
+`AtCapacity` — mapped to the same 429 `resource_limit_error` (with
+`Retry-After`) every other transient capacity answer uses — rather than admitted
+over the bound. Admitting it would have made `max_sessions` advisory
+*permanently*: nothing walks the registry back down, because the next insert
+evicts one and adds one, so a server sized for *n* conversations could be pushed
+to *n + k* and stay there. The refusal is transient by construction and clears
+the moment any turn in flight ends (`server/src/session.rs`, `evict_lru`).
+
+**Every one of those decisions is keyed model-first.** The session registry is a
+single map across every loaded model, but a `SessionPlacement` is unique only
+*within* one engine: each engine numbers its sessions from its own counter and
+each worker pool starts at worker 0, so two loaded models routinely name two
+unrelated conversations with the identical placement. The lease key and the
+registry entry are therefore `ModelSessionPlacement` — a `ModelKey` plus the
+placement (`server/src/lease.rs`) — and there is exactly one `SessionLeases` map,
+owned by the `SessionRegistry` itself rather than by any engine. An engine-owned
+map would have answered "is this session busy?" only for the engine the caller
+happened to be holding, which is the one thing a routing conflict cannot get
+wrong. The engine learns its own `ModelKey` once, in `ModelHandle::new`, so the
+handle's id and the driver's are the same string by construction; a close whose
+lease names a different model is refused by the driver rather than performed.
+
+**Close is one decision, not three.** `DELETE` does not read a binding, take its
+lease, and then remove it: those are three decisions about a binding that can
+change between them, and the middle one is where a rebind slips in and the close
+destroys a conversation it never leased. `SessionRegistry::take_for_close` holds
+the registry lock across the find, the acquire and the remove, and hands back the
+guard — which names the owning model — so what is leased, what is unbound, and
+what is closed are the same binding by construction, on the engine that owns it
+rather than on the default model. LRU eviction removes its victim under the same
+lock and the same rule.
+
+**And the count of live conversations is reported by the map, not by the
+callers.** `active_sessions` is a gauge, so it has to track what the `HashMap`
+did rather than how many times a route asked for a session: an increment in
+`insert` cannot see whether making room evicted somebody, so LRU churn at the
+bound reports growth on a registry whose size never changed, and the gauge climbs
+for as long as the process runs. The two mutation sites own the accounting
+instead — a `HashMap::insert` that displaced nothing is an addition, a
+`HashMap::remove` that removed something is a departure — so an eviction followed
+by an insertion nets to zero, an insertion below the bound counts one, an
+explicit close counts one departure exactly once, and a refusal, which mutates
+nothing, counts nothing.
+
 Three routing rules deserve their reasons stated.
 
 **Reset and close take the lease.** They are mutations of the conversation, and
@@ -1293,23 +1401,45 @@ loser closing the session it opened rather than leaking it
 (`session.rs:22-29`, `routes/completions.rs:1325-1338`).
 
 PR #2012 already did half of this section's work. `SessionEntry` no longer stores
-a bare engine session id; it stores a `SessionPlacement`, with the reason written
-into the type: *"Stored as a pair because a later turn has to be routed back to
-that worker, and an engine session id alone cannot say which one it is"*
-(`session.rs:32-41`). That is precisely the routing key §4.1 needs, already
-threaded through the create path (`routes/completions.rs:1313`, `:1331-1338`).
+a bare engine session id; it stores a placement, with the reason written into the
+type: *"a later turn has to be routed back to that worker, and an engine session
+id alone cannot say which one it is"*. That is precisely the routing key §4.1
+needs, already threaded through the create path.
 
-So the registry is untouched by this design. It stores and returns an opaque
-placement; whether the shard lives in a side field or is encoded in the id is
-invisible to it, and clients continue to see an opaque `X-Session-Id` they never
-parse.
+So the registry's *identity* model is untouched by this design. It stores and
+returns an opaque binding; whether the shard lives in a side field or is encoded
+in the id is invisible to it, and clients continue to see an opaque
+`X-Session-Id` they never parse.
+
+⚠️ **Two things did change, and neither is client-visible identity.**
+
+First, eviction closes a conversation, and a close takes the lease (§5), so
+`insert` and `claim` hand the evicted binding back *holding its guard*
+(`SessionClaim::Claimed { evicted: Option<SessionLeaseGuard> }`). The caller
+closes under that guard, which is what stops a turn from starting on a session
+between the moment it is unbound and the moment the engine frees it, and what
+stops the client id being rebound to a new conversation while the old one is
+still being torn down. When there is no evictable binding, the insert is refused
+(§5) rather than admitted over `max_sessions`.
+
+Second, ✅ **the stored binding is model-qualified.** A `SessionPlacement` alone
+is unique only inside one engine, and the registry spans every loaded model, so
+`SessionEntry` stores a `ModelSessionPlacement` and the registry owns the one
+`SessionLeases` map keyed the same way. This is what makes `DELETE` close on the
+model that opened the session instead of on the default one, what makes eviction
+close its victim on the victim's engine, and what stops model A's first session
+and model B's first session — which have the identical placement — from being
+treated as one conversation.
 
 ---
 
 ## 6. Cancellation, errors, and lease release
 
 **Lease release is a `Drop` obligation, never a cleanup path.** The existing
-guard already establishes this (`pipeline/workflow.rs:630-634`). Every exit from
+guard already establishes this (`pipeline/workflow.rs:630-634`), and ✅ Phase 2's
+routing guard follows it: `SessionLeaseGuard` has no release method to call, only
+a `Drop`, and it is `#[must_use]` so a caller cannot acquire one and forget to
+hold it. Every exit from
 a turn — normal completion, typed refusal, `anyhow` error, client disconnect,
 explicit cancellation, or panic — unwinds the per-execution state of §3.3 and
 therefore releases the lease. This is the reason the lease lives in category 3.3
@@ -1331,6 +1461,16 @@ lease promptly or the next turn on that session sees a spurious 409. So
 cancellation becomes explicit: a typed command, observed at a token boundary,
 whose acknowledgement is the point at which the caller may assume the lease is
 free.
+
+✅ **Phase 2 made the implicit form safe rather than replacing it.** The guard is
+owned by `DriverCommand::Generate` and, for a batched turn, by the `DriverRoute`
+row, so an abandoned route releases the lease when the row is dropped and a
+disconnected client cannot lock its own conversation out
+(`a_cancelled_client_does_not_leak_its_session_lease`). What is still implicit is
+the *timing*: the release happens when the turn actually ends, not when the client
+goes away, so a client that disconnects and immediately retries can still see one
+409 for a turn it no longer wants. The explicit typed cancel command above is what
+closes that window, and it is not part of Phase 2.
 
 **Panic containment.** A panic on a worker unwinds that turn's category-3.3
 state and releases the lease, but it leaves the worker's category-3.2 backend
@@ -1724,11 +1864,14 @@ reclaim thread, asserts the waiter wakes), and
 ### 12.1 Real concurrency tests
 
 **Not acceptable as evidence:** a single-threaded test that interleaves two
-sessions by calling them alternately. That is what today's test does when it
-constructs `ExclusiveLeaseConflict` by hand
-(`server/src/tests.rs:4858-4870`), and it proves the mapping, not the
-concurrency. Every test below spawns real OS threads and synchronizes on a
-`Barrier` so the operations genuinely overlap.
+sessions by calling them alternately. That is what the server test used to do
+when it constructed `ExclusiveLeaseConflict` by hand — it proved the mapping, not
+the concurrency, and ✅ it is gone. Every test below spawns real OS threads and
+synchronizes on a `Barrier` so the operations genuinely overlap. The shipped
+Phase 2 tests come in two shapes, both of which meet that bar: `lease.rs`'s unit
+tests race real `std::thread`s on a `std::sync::Barrier`, and the HTTP tests race
+tasks on a multi-threaded Tokio runtime (`flavor = "multi_thread"`) on a
+`tokio::sync::Barrier` — real threads either way, never one thread taking turns.
 
 1. **Different sessions run concurrently.** `N` threads, `N` sessions, one
    barrier. Assert all complete, each output matches the same prompt run under
@@ -1738,39 +1881,66 @@ concurrency. Every test below spawns real OS threads and synchronizes on a
    materially below `N ×` the serial time. The last clause is what distinguishes
    concurrency from a mutex, and per [`../README.md`](../README.md)'s standing
    rule it is reported with its conditions or not at all.
-2. **Same session, overlapping turns, exclusive lease → 409.** Two threads, one
-   session, barrier-synchronized submit. Assert exactly one succeeds and the
-   other returns `PackageCapabilityError::ExclusiveLeaseConflict` naming that
-   session, and — this is the part the current test cannot do — assert it over
-   HTTP as a real 409 with `kind == "conflict_error"`. **This test runs at
-   `W = 1`** (§13, Phase 2): pre-enqueue acquisition (§4.2.1) makes the refusal
-   reachable with one worker, so it does not wait for `W > 1`.
-3. **The refusal is a refusal, not a queue.** The counterpart to test 2 and the
-   reason it exists. Assert that the losing request's 409 arrives *while the
-   winner is still generating* — bound its latency well below the winner's
-   completion — and that the loser performed no work: no admission permit
-   charged, no queue slot occupied, no tokens emitted. An implementation that
-   acquired the lease inside the worker loop instead of before enqueue would
-   still return 409 eventually and would fail this test, which is the whole
-   point of writing it separately.
-4. **The winner's conversation is intact.** After the refused turn, assert the
-   session's token count equals what the winning turn left and that a subsequent
-   turn continues from it. This is a sequential-correctness check, not a
-   lost-update check: per §11.1 a whole-turn lease cannot lose an update, and the
-   test exists to catch a lease that is released too early — before the write
-   commit — which can.
-5. **Reset racing a turn is refused, and does not vanish.** Barrier-synchronized
-   `reset_session` against a live turn on the same session. Assert the reset is
-   refused rather than silently undone by the turn's write-back — the one genuine
-   lost-update path §5 identifies.
-6. **Cancellation releases the lease.** Start a turn, cancel it, assert the next
-   turn on that session is admitted rather than 409'd, and that the cancelled
-   turn's reservations returned to the budget.
-7. **Send failure releases the lease.** Shut the worker channel so submission
-   fails with `GenerateSubmitError::DriverStopped` (`driver.rs:502-506`), then
-   assert the session is immediately leasable again. This is the exit path §4.2.1
-   flags as easiest to miss, and the only one where the guard is released on the
-   *submitting* task rather than the worker.
+2. **Same session, overlapping turns, exclusive lease → 409.** ✅ **Shipped
+   (Phase 2).** Two threads, one session, barrier-synchronized submit. Assert
+   exactly one succeeds and the other returns
+   `PackageCapabilityError::ExclusiveLeaseConflict` naming that session, and —
+   this is the part the old test could not do — assert it over HTTP as a real 409
+   with `kind == "conflict_error"`. **This test runs at `W = 1`** (§13, Phase 2):
+   pre-enqueue acquisition (§4.2.1) makes the refusal reachable with one worker,
+   so it does not wait for `W > 1`. Landed as
+   `only_one_of_many_racing_threads_takes_the_lease` (`lease.rs`, 8 OS threads on
+   a `std::sync::Barrier`),
+   `concurrent_turns_on_one_session_do_not_lose_a_conversation` and
+   `a_second_turn_on_a_busy_session_is_refused_rather_than_queued`
+   (`server/src/tests.rs`), with the HTTP body's `error.type` asserted in
+   `every_session_refusal_reports_a_status_and_a_type_a_client_can_branch_on`.
+   `turns_on_distinct_sessions_are_all_admitted` and
+   `stateless_requests_take_no_lease_and_are_never_refused` pin the other half:
+   the refusal is keyed by session and nothing else changes behaviour.
+3. **The refusal is a refusal, not a queue.** ✅ **Shipped, in the form the
+   fixture supports.** The counterpart to test 2 and the reason it exists.
+   `a_second_turn_on_a_busy_session_is_refused_rather_than_queued` holds the very
+   guard a live turn carries, races an HTTP turn against it, and asserts the 409
+   comes back *while the guard is still held* — not after it is released — and
+   that the refused turn charged no admission permit
+   (`generation_capacity.available_permits()` is untouched). An implementation
+   that acquired the lease inside the worker loop would block on the held guard
+   and fail this test. ⚠️ **What is not asserted:** a latency bound against a
+   real winner's completion time. The CPU fixture generates in milliseconds, so a
+   wall-clock bound would measure the fixture rather than the design; the held
+   guard is the deterministic form of the same claim.
+4. **The winner's conversation is intact.** ✅ **Shipped (Phase 2).**
+   `concurrent_turns_on_one_session_do_not_lose_a_conversation` asserts the
+   conversation equals exactly what the *admitted* turns produce in series
+   (`first_turn_prefill × admitted + generated`), which is short if a lease is
+   released before the write commit and long if a second turn was silently
+   queued; `a_second_turn_on_a_busy_session_is_refused_rather_than_queued`
+   asserts the next turn continues from where the winner left off.
+5. **Reset racing a turn is refused, and does not vanish.** ⚠️ **Deferred, with
+   a substitute.** `reset_session` has no route and no driver command (§5), so
+   there is no routing-layer caller to test. The same-shaped mutation that *is*
+   routed is close, and
+   `deleting_a_session_during_a_turn_is_refused_and_the_session_survives` asserts
+   a `DELETE` racing a live turn is refused 409, the binding survives, and the
+   delete succeeds once the turn ends. Test 5 proper lands with whichever phase
+   routes reset.
+6. **Cancellation releases the lease.** ✅ **Shipped for the lease half.**
+   `a_cancelled_client_does_not_leak_its_session_lease` aborts the request task
+   mid-turn and asserts a later turn on that session is admitted rather than
+   409'd forever, with nothing left leased and the binding intact.
+   `a_failed_turn_releases_its_lease` does the same for the error path, which the
+   original test list did not name separately. ⚠️ **Not asserted here:** that the
+   cancelled turn's reservations returned to the budget — that is an accounting
+   claim (§8), not a lease claim, and it is left to the phase that owns it.
+7. **Send failure releases the lease.** ✅ **Shipped (Phase 2).**
+   `a_turn_that_never_reaches_a_worker_releases_its_lease` (`driver.rs`) covers
+   both pre-worker exits in one test: a submission refused by the admission gate
+   (`GenerateSubmitError::Overloaded`) and one handed to a channel whose worker is
+   gone (`GenerateSubmitError::DriverStopped`), asserting the session is
+   immediately leasable after each. This is the exit path §4.2.1 flags as easiest
+   to miss, and the only one where the guard is released on the *submitting* task
+   rather than the worker.
 8. **Panic containment.** Inject a panic on a worker; assert the lease is
    released, the shard is quarantined, other shards keep serving, and calls
    naming a lost session get the typed worker-failure error rather than a
@@ -1845,6 +2015,40 @@ The phase each test gates is §13's, restated here so the two cannot drift: test
 2–7 gate Phase 2 (the routing lease, at `W = 1`); tests 13–15 gate Phase 1 (the
 ownership and affinity rules); tests 1, 8 and 10–12 gate Phase 3 (`W > 1`); test
 9 gates whichever phase first spawns more than one worker.
+
+Of the Phase 2 gate: **2, 3, 4, 6 and 7 have landed; 5 is deferred behind the
+absence of a routed `reset_session`, with the close-racing-a-turn case standing
+in for its shape.** Two further guards landed that the list above did not ask
+for, because the lease reaches further than the turn path:
+`eviction_skips_a_session_with_a_turn_in_flight` and
+`eviction_refuses_to_close_the_only_sessions_that_are_all_busy`
+(`server/src/session.rs`) pin that LRU eviction cannot close a conversation
+mid-turn, and `a_panic_while_holding_the_lease_releases_it` (`lease.rs`) pins the
+unwind path that `Drop` is relied on for.
+
+A third group landed for the registry invariants of §5 and §5.1, and it is
+concurrent in the same sense the list above demands. Two models are loaded whose
+first sessions have *provably identical* placements — the fixture asserts the
+collision rather than assuming it — and the tests then pin that a busy session on
+one model cannot be evicted or closed by the other, that a `DELETE` of a
+non-default model's session closes it on that model's engine, that an insert at
+full capacity with every conversation busy is **refused** rather than admitted
+over `max_sessions`, and that the next insert after a release evicts rather than
+grows (`server/src/tests.rs`, `session.rs`). Two thread-and-barrier regressions
+cover the close race directly: racing deletes unbind exactly one binding once,
+and a delete racing a rebind never leaves an orphan — every conversation ends
+either bound or closed, never both and never neither.
+
+A fourth group pins the `active_sessions` accounting of §5: sixty-four rounds of
+eviction-and-insertion at `max_sessions = 1` leave both the registry length and
+the count at one, an insertion below the bound counts one, a capacity refusal and
+a refused close count nothing, a close counts one departure and a second close of
+the same id counts none, and eight threads churning the bound leave the count
+equal to the map. These read a counter the test owns rather than the process-wide
+gauge, because every other test in the binary moves that gauge while they run, so
+an exact assertion against it would be a race rather than a measurement; one
+further test asserts the production registry still reports to the real gauge,
+which is the one thing a local counter cannot see.
 
 ### 12.2 ORT / native parity
 
@@ -2072,6 +2276,67 @@ the worker thread; this phase constructs the engine *on* the worker thread
 (§4.3), which removes the cross-thread move the SAFETY comment is arguing about.
 The gate is §12.2's `W = 1` bit-identity requirement against the pre-migration
 driver, which is unconditional at `W = 1` and therefore a real gate.
+
+✅ **Landed: the routing lease itself, and the refusal it makes reachable.**
+`crates/onnx-genai-server/src/lease.rs` holds `SessionLeases` (a sharded map
+keyed by `ModelSessionPlacement`) and the `#[must_use]` RAII `SessionLeaseGuard`.
+The `SessionRegistry` owns the one map, because §4.2 requires it be readable
+before a command exists and §5.1 requires the same map answer for every loaded
+model. Acquisition happens on the calling task in the route handler
+(`routes/completions.rs`, `lease_bound_session`) **before** the session-carry
+round trip, before the admission permit, and before the `DriverCommand` is built;
+a conflict is mapped through the pre-existing `package_capability_failure`, which
+matches on the `PackageCapabilityError` variant, so the 409 is the same 409 the
+engine's own refusal produces. The guard is then moved into
+`DriverCommand::Generate` and travels with the turn, so all five endings in
+§4.2.1's table release it by `Drop`: normal completion and pass errors release in
+`run_generation` (immediately after the engine commits, before the terminal event,
+so a client's next turn cannot race the drop); an abandoned continuous-batch route
+releases it with the `DriverRoute` row; a failed send releases it on the
+submitting task; a stopped worker drops the queued commands. The same guard is
+what `close_session` now takes by value, what `DELETE /v1/sessions/{id}` acquires
+before it unbinds the id, and what LRU eviction must take to choose a victim
+(§5, §5.1). One lease covers decode-core ORT, decode-core native and interpreted
+sessions alike, because it is keyed on the routing identity rather than on
+anything a package declares. Stateless requests and FIM completions take no
+lease, and distinct sessions never conflict with each other.
+
+✅ **Landed with it: the three registry invariants the lease is only correct
+under.** (a) The key is **model-qualified** and the map is **one map** — two
+loaded models produce identical `SessionPlacement`s for their first sessions, so
+a bare placement is not a global identity and a per-driver map is not a global
+answer (§4.2). A session id bound to one model is refused with the same typed 409
+if it is presented on another, rather than generating into an unrelated
+conversation that happens to share a placement. (b) `max_sessions` is **strict**:
+when every binding is mid-turn there is no evictable victim, and the new session
+is refused with a typed capacity error mapped to the existing 429
+`resource_limit_error` rather than admitted over the bound, which would have made
+the limit advisory permanently (§5). (c) Close is **atomic**: `take_for_close`
+finds, leases and unbinds one binding under the registry lock and returns the
+guard naming its owner, so `DELETE` closes exactly what it removed on exactly the
+model that owns it — never the default model, and never a conversation that was
+rebound between the read and the remove (§5). LRU eviction removes its victim
+under the same lock and rule.
+
+⚠️ **Not landed, and this phase is not complete without it: the `EngineOwner`
+deletion above.** It requires constructing the engine on the worker thread
+(§4.3), which is a change to where the engine is built rather than to how turns
+are routed, and it carries the §12.2 bit-identity gate with it. It is deliberately
+not bundled with the lease: the lease is a refusal contract that can be tested by
+itself, and the `unsafe impl` removal is an ownership change that cannot.
+
+⚠️ **Also outstanding at the end of this phase:** §12.1's test 5 (reset racing a
+turn), which cannot be written until `reset_session` is routed at all — see §5 on
+which operations have a routing-layer caller today — and the accounting half of
+test 6 (a cancelled turn's reservations returning to the budget), which belongs to
+§8 rather than to the lease.
+
+**What this phase explicitly did not do**, so that the next reader does not have
+to infer it: it did not enable `W > 1`, did not multiplex turns inside a worker,
+did not introduce a global `Mutex<Engine>`, and did not change any backend
+`Send`/`Sync` impl. Two turns on two different sessions still execute one after
+the other. The only observable change is that a *second* turn on a session that
+already has one is refused instead of queued.
 
 **Phase 3 — `W > 1`.** Grow `WorkerPool::single` (`worker.rs:261-265`) into a
 real pool: per-worker backend construction, the stateless distributor, and the
