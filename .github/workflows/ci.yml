@@ -120,6 +120,24 @@ jobs:
             fi
           fi
 
+          # A scan that found nothing and a scan that cannot find anything are
+          # the same two lines of log. If the regex, the pathspec or perl ever
+          # stops matching, `embedded` is empty, is_docs_path never blocks, and
+          # this guard is inert -- reopening #2077 behind a green run. So report
+          # the count, and treat zero as a broken instrument rather than as an
+          # answer: this repo has 149 such targets and cannot legitimately
+          # reach zero while any `include_str!` remains.
+          if [ -n "$embedded" ]; then
+            embedded_count="$(printf '%s\n' "$embedded" | wc -l)"
+          else
+            embedded_count=0
+          fi
+          echo "files embedded into Rust sources: $embedded_count"
+          if [ "$embedded_count" -eq 0 ]; then
+            echo "embed scan resolved no targets; the scan itself is broken"
+            embed_scan_ok=false
+          fi
+
           is_docs_path() {
             case "$1" in
               docs/*|wiki/*|*.md|*.mdx|*.markdown|LICENSE|NOTICE)
