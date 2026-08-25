@@ -14,6 +14,8 @@ categories = ["science", "hardware-support"]
 # calls are empty, so production builds carry none of it. Timing is gated a
 # second time at runtime by ONNX_GENAI_PROFILE_DISPATCH=1.
 dispatch_probe = []
+# Cross-crate shape-table agreement hooks. Shipped artifacts do not enable this.
+testutil = []
 
 [dependencies]
 onnx-runtime-ep-api = { workspace = true }

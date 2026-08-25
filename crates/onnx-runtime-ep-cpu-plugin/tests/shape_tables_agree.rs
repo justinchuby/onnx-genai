@@ -33,9 +33,6 @@ use std::collections::HashMap;
 
 use onnx_runtime_ep_api::{DevicePtr, TensorView};
 use onnx_runtime_ep_plugin::compute::ShapeInference;
-use onnx_runtime_ep_plugin::shared_shapes::{
-    SharedNativeShapeRule, SharedShapeResult, infer_shared_node,
-};
 use onnx_runtime_ir::{Attribute, DataType, Node, NodeId, ValueId};
 use onnx_runtime_shape_inference::{
     DimExpr, InferenceRegistry, MergePolicy, NodeIo, ShapeData, SymbolInterner, TypeInfo,
@@ -151,21 +148,19 @@ fn assert_agree(
         plugin[0]
     );
 
-    let shared = infer_shared_node(node, plugin_inputs);
-    assert_eq!(
-        shared,
-        SharedShapeResult::Resolved(vec![native_dims.clone()]),
-        "{what}: the production adapter did not expose the native concrete answer"
-    );
-
     let input_shapes: Vec<Vec<Option<usize>>> = plugin_inputs
         .iter()
         .map(|input| input.shape.iter().copied().map(Some).collect())
         .collect();
     let strategy = ShapeInference::for_node(node, &input_shapes, node.outputs.len());
+    let ShapeInference::SharedNative { fallback, .. } = &strategy else {
+        panic!(
+            "{what}: the production registry stopped routing this op through the shared adapter"
+        );
+    };
     assert!(
-        matches!(strategy, ShapeInference::SharedNative { .. }),
-        "{what}: the production registry stopped routing this op through the shared adapter"
+        !matches!(fallback.as_ref(), ShapeInference::SharedNative { .. }),
+        "{what}: a shared rule's fallback must not recurse into the shared adapter"
     );
     let production =
         onnx_runtime_ep_plugin::compute::infer_shapes_for_test(&strategy, plugin_inputs)
@@ -226,18 +221,74 @@ fn constant_of_shape_agrees() {
 
 #[test]
 fn migrated_shared_rules_agree() {
-    let rules = SharedNativeShapeRule::all();
-    assert!(
-        !rules.is_empty(),
-        "the shared-rule agreement test must not pass vacuously"
+    const EXPECTED_RULES: &[&str] = &["ConstantOfShape", "Expand", "Tile"];
+    let rules = onnx_runtime_ep_plugin::compute::shared_native_rule_names_for_test();
+    assert_eq!(
+        rules, EXPECTED_RULES,
+        "the production shared-rule census changed; update the explicit agreement fixtures in the same commit"
     );
+    let mut compared = 0;
     for rule in rules {
         match rule {
-            SharedNativeShapeRule::ConstantOfShape => constant_of_shape_agrees(),
-            SharedNativeShapeRule::Expand => expand_agrees_on_bidirectional_broadcast(),
-            SharedNativeShapeRule::Tile => tile_agrees(),
+            "ConstantOfShape" => constant_of_shape_agrees(),
+            "Expand" => expand_agrees_on_bidirectional_broadcast(),
+            "Tile" => tile_agrees(),
+            other => panic!("shared rule {other} has no agreement fixture"),
         }
+        compared += 1;
     }
+    assert_eq!(compared, EXPECTED_RULES.len());
+}
+
+#[test]
+fn migrated_shared_rules_agree_on_edge_extents() {
+    let empty: [i64; 0] = [];
+    let empty_shape = view(DataType::Int64, &[0], &[1], empty.as_ptr().cast());
+    assert_agree(
+        "ConstantOfShape empty shape",
+        &node("ConstantOfShape", 1, &[], 9),
+        9,
+        ShapeInference::ConstantOfShape,
+        &[empty_shape],
+        vec![typed_with_values(&[0], &empty)],
+    );
+
+    let scalar = [0.0f32; 1];
+    let data = view(DataType::Float32, &[1], &[1], scalar.as_ptr().cast());
+    let zero_target = [0i64];
+    let target = view(DataType::Int64, &[1], &[1], zero_target.as_ptr().cast());
+    assert_agree(
+        "Expand zero target extent",
+        &node("Expand", 2, &[], 8),
+        8,
+        ShapeInference::Expand,
+        &[data, target],
+        vec![
+            typed(DataType::Float32, &[1]),
+            typed_with_values(&[1], &zero_target),
+        ],
+    );
+
+    let tile_data = [0.0f32; 6];
+    let data = view(
+        DataType::Float32,
+        &[2, 3],
+        &[3, 1],
+        tile_data.as_ptr().cast(),
+    );
+    let zero_repeat = [0i64, 2];
+    let repeats = view(DataType::Int64, &[2], &[1], zero_repeat.as_ptr().cast());
+    assert_agree(
+        "Tile zero repeat",
+        &node("Tile", 2, &[], 13),
+        13,
+        ShapeInference::Tile,
+        &[data, repeats],
+        vec![
+            typed(DataType::Float32, &[2, 3]),
+            typed_with_values(&[2], &zero_repeat),
+        ],
+    );
 }
 
 // ── Sweep ────────────────────────────────────────────────────────────────────
@@ -267,6 +318,7 @@ fn shape_preserving_ops_agree() {
     ];
 
     let buf = [0u8; 64];
+    let mut compared = 0;
     for &(op, opset, extras) in CASES {
         let dims: [usize; 2] = [3, 4];
         let strides: [i64; 2] = [4, 1];
@@ -291,19 +343,16 @@ fn shape_preserving_ops_agree() {
             ));
             native_inputs.push(typed(DataType::Float32, &[3]));
         }
-        let n = node(op, 1 + extras, &[], opset);
-        let nat = match native_try(&n, native_inputs, opset) {
-            Ok(outs) => outs,
-            // The native table rejected the node outright. That is a validity
-            // judgement, not a shape answer, so there is nothing to compare —
-            // and it is recorded rather than swallowed so a reader knows the
-            // two tables differ in strictness, not in shape.
-            Err(_) => continue,
+        let attrs: &[(&str, i64)] = if matches!(op, "DequantizeLinear" | "QuantizeLinear") {
+            &[("axis", 0)]
+        } else {
+            &[]
         };
-        let Some(native_dims) = native_static(&nat) else {
-            // The native table declined to resolve this one; nothing to compare.
-            continue;
-        };
+        let n = node(op, 1 + extras, attrs, opset);
+        let nat = native_try(&n, native_inputs, opset)
+            .unwrap_or_else(|error| panic!("{op}: expected native inference to resolve: {error}"));
+        let native_dims =
+            native_static(&nat).unwrap_or_else(|| panic!("{op}: expected a concrete native shape"));
         let plugin = onnx_runtime_ep_plugin::compute::infer_shapes_for_test(
             &ShapeInference::SameAsInput(0),
             &plugin_inputs,
@@ -315,7 +364,13 @@ fn shape_preserving_ops_agree() {
              {native_dims:?}.",
             plugin[0]
         );
+        compared += 1;
     }
+    assert_eq!(
+        compared,
+        CASES.len(),
+        "every expected shape-preserving fixture must reach the comparison"
+    );
 }
 
 #[test]
@@ -341,11 +396,6 @@ fn malformed_dequantize_preserves_the_plugin_permissiveness_boundary() {
     )
     .expect_err("native inference validates the per-axis scale length");
     assert!(native_error.to_string().contains("scale length 3"));
-    assert!(matches!(
-        infer_shared_node(&n, &[data, scale]),
-        SharedShapeResult::Rejected(reason) if reason.contains("scale length 3")
-    ));
-
     let strategy = ShapeInference::for_node(&n, &[vec![Some(3), Some(4)], vec![Some(3)]], 1);
     assert!(
         matches!(strategy, ShapeInference::SameAsInput(0)),

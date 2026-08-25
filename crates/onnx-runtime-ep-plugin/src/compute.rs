@@ -3784,13 +3784,25 @@ fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
 ///
 /// Exposed so `shape_tables_agree` in `onnx-runtime-ep-cpu-plugin` can compare
 /// the compatibility fallback with the native registry and exercise the
-/// production shared route. Keeping the function itself private preserves the
-/// invariant that production callers reach it only through the Compute path.
+/// production shared route. The `testutil` feature is enabled only by that
+/// crate's dev-dependency, so shipped plugin artifacts expose no test-only API.
+#[cfg(feature = "testutil")]
+#[doc(hidden)]
 pub fn infer_shapes_for_test(
     strategy: &ShapeInference,
     inputs: &[TensorView<'_>],
 ) -> Result<Vec<Vec<usize>>, String> {
     infer_shapes(strategy, inputs)
+}
+
+/// Exact production census used by the cross-crate anti-vacuity test.
+#[cfg(feature = "testutil")]
+#[doc(hidden)]
+pub fn shared_native_rule_names_for_test() -> Vec<&'static str> {
+    SharedNativeShapeRule::all()
+        .iter()
+        .map(|rule| rule.op_type())
+        .collect()
 }
 
 /// Infer output shapes from the shape inference strategy and input views.
@@ -5216,6 +5228,120 @@ fn after() {}
         let strategy =
             ShapeInference::for_node(&node, &[vec![Some(2), Some(3)], vec![Some(2), Some(1)]], 1);
         assert_eq!(infer(&strategy, &[data, r]).unwrap(), vec![vec![6, 6]]);
+    }
+
+    #[test]
+    fn shared_expand_opset_floor_falls_back_before_version_eight() {
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3, 1], &[1, 1], &buf);
+        let want = [1i64, 4];
+        let shape_in = i64_scalar(&want, &[2], &[1]);
+        let make_node = |version| {
+            let mut node = Node::new(
+                onnx_runtime_ir::NodeId(0),
+                "Expand",
+                vec![
+                    Some(onnx_runtime_ir::ValueId(0)),
+                    Some(onnx_runtime_ir::ValueId(1)),
+                ],
+                vec![onnx_runtime_ir::ValueId(2)],
+            );
+            node.version = Some(version);
+            node
+        };
+
+        let version_seven = make_node(7);
+        assert_eq!(
+            infer_shared_node(&version_seven, &[data, shape_in]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+        let strategy =
+            ShapeInference::for_node(&version_seven, &[vec![Some(3), Some(1)], vec![Some(2)]], 1);
+        assert_eq!(
+            infer(&strategy, &[data, shape_in]).unwrap(),
+            vec![vec![3, 4]],
+            "Expand@7 must reach the compatibility fallback"
+        );
+
+        assert_eq!(
+            infer_shared_node(&make_node(8), &[data, shape_in]),
+            SharedShapeResult::Resolved(vec![vec![3, 4]])
+        );
+    }
+
+    #[test]
+    fn foreign_domain_expand_is_not_a_shared_native_rule() {
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Expand",
+            vec![None, None],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.domain = "example.foreign".into();
+        node.version = Some(8);
+        assert!(
+            !matches!(
+                ShapeInference::for_node(&node, &[vec![Some(3), Some(1)], vec![Some(2)]], 1),
+                ShapeInference::SharedNative { .. }
+            ),
+            "operator names from foreign domains must not enter default-domain shared rules"
+        );
+    }
+
+    #[test]
+    fn unregistered_native_rule_can_use_a_synthetic_fallback() {
+        let node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "NotRegisteredAnywhere",
+            vec![Some(onnx_runtime_ir::ValueId(0))],
+            vec![onnx_runtime_ir::ValueId(1)],
+        );
+        let input = view(&[2, 3], &[3, 1]);
+        assert_eq!(
+            infer_shared_node(&node, &[input]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+        let strategy = ShapeInference::SharedNative {
+            node: Box::new(node),
+            fallback: Box::new(ShapeInference::SameAsInput(0)),
+        };
+        assert_eq!(infer(&strategy, &[input]).unwrap(), vec![vec![2, 3]]);
+    }
+
+    #[test]
+    fn device_shape_operand_reaches_safe_plugin_error() {
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3, 1], &[1, 1], &buf);
+        let want = [1i64, 4];
+        let shape_in = TensorView::new(
+            DevicePtr(want.as_ptr().cast()),
+            DataType::Int64,
+            &[2],
+            &[1],
+            DeviceId::cuda(0),
+        );
+        let mut node = Node::new(
+            onnx_runtime_ir::NodeId(0),
+            "Expand",
+            vec![
+                Some(onnx_runtime_ir::ValueId(0)),
+                Some(onnx_runtime_ir::ValueId(1)),
+            ],
+            vec![onnx_runtime_ir::ValueId(2)],
+        );
+        node.version = Some(8);
+        assert_eq!(
+            infer_shared_node(&node, &[data, shape_in]),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+
+        let strategy = ShapeInference::for_node(&node, &[vec![Some(3), Some(1)], vec![Some(2)]], 1);
+        let error = infer(&strategy, &[data, shape_in])
+            .expect_err("the fallback must refuse to dereference a device pointer");
+        assert!(
+            error.contains("host cannot read") && error.contains("Cuda"),
+            "device-resident fallback error should explain the safe refusal: {error}"
+        );
     }
 
     #[test]

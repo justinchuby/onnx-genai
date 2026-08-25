@@ -13,7 +13,7 @@ use onnx_runtime_shape_inference::{
 /// The deliberately small first set of plugin rules delegated to the native
 /// shape registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SharedNativeShapeRule {
+pub(crate) enum SharedNativeShapeRule {
     ConstantOfShape,
     Expand,
     Tile,
@@ -23,12 +23,13 @@ impl SharedNativeShapeRule {
     const ALL: [Self; 3] = [Self::ConstantOfShape, Self::Expand, Self::Tile];
 
     /// Every rule currently routed through the shared adapter.
-    pub const fn all() -> &'static [Self] {
+    #[cfg(feature = "testutil")]
+    pub(crate) const fn all() -> &'static [Self] {
         &Self::ALL
     }
 
     /// The ONNX operator name for this rule.
-    pub const fn op_type(self) -> &'static str {
+    pub(crate) const fn op_type(self) -> &'static str {
         match self {
             Self::ConstantOfShape => "ConstantOfShape",
             Self::Expand => "Expand",
@@ -49,7 +50,7 @@ impl SharedNativeShapeRule {
 
 /// Result of asking the native shape registry to resolve one plugin node.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SharedShapeResult {
+pub(crate) enum SharedShapeResult {
     /// Every output rank and extent was resolved concretely.
     Resolved(Vec<Vec<usize>>),
     /// The rule left an output unknown or symbolic.
@@ -64,7 +65,14 @@ pub enum SharedShapeResult {
 /// by [`MAX_SHAPE_DATA_ELEMS`]. Device values are deliberately not read: the
 /// native rule remains symbolic and the caller can use its existing
 /// Compute-time fallback.
-pub fn infer_shared_node(node: &Node, inputs: &[TensorView<'_>]) -> SharedShapeResult {
+///
+/// The plugin graph reader stores ORT's `Node_GetSinceVersion` result in
+/// [`Node::version`]. That is the selected kernel schema's `since_version`, not
+/// necessarily the model's graph-level opset. This adapter therefore dispatches
+/// with that exact local version. If it is absent or invalid, it deliberately
+/// uses opset 1 rather than guessing the latest version. Future migrations with
+/// version-dependent semantics must account for this contract explicitly.
+pub(crate) fn infer_shared_node(node: &Node, inputs: &[TensorView<'_>]) -> SharedShapeResult {
     let input_ios = match inputs.iter().map(node_io).collect::<Result<Vec<_>, _>>() {
         Ok(inputs) => inputs,
         Err(reason) => return SharedShapeResult::Rejected(reason),
@@ -169,7 +177,7 @@ mod tests {
 
     use super::*;
 
-    fn node(op: &str, input_count: usize) -> Node {
+    fn node_at(op: &str, input_count: usize, version: Option<i64>) -> Node {
         let mut node = Node::new(
             NodeId(0),
             op,
@@ -178,8 +186,12 @@ mod tests {
                 .collect(),
             vec![ValueId(100)],
         );
-        node.version = Some(13);
+        node.version = version;
         node
+    }
+
+    fn node(op: &str, input_count: usize) -> Node {
+        node_at(op, input_count, Some(13))
     }
 
     fn view<'a>(
@@ -215,6 +227,62 @@ mod tests {
 
         assert_eq!(
             infer_shared_node(&node("Expand", 2), &inputs),
+            SharedShapeResult::SymbolicOrUnknown
+        );
+    }
+
+    #[test]
+    fn expand_dispatches_with_the_exact_node_version_not_latest() {
+        let data = [0.0f32; 3];
+        let target = [1i64, 4];
+        let inputs = [
+            view(
+                data.as_ptr().cast(),
+                DataType::Float32,
+                &[3, 1],
+                &[1, 1],
+                DeviceId::cpu(),
+            ),
+            view(
+                target.as_ptr().cast(),
+                DataType::Int64,
+                &[2],
+                &[1],
+                DeviceId::cpu(),
+            ),
+        ];
+
+        assert_eq!(
+            infer_shared_node(&node_at("Expand", 2, Some(7)), &inputs),
+            SharedShapeResult::SymbolicOrUnknown,
+            "Expand was introduced at opset 8"
+        );
+        assert_eq!(
+            infer_shared_node(&node_at("Expand", 2, Some(8)), &inputs),
+            SharedShapeResult::Resolved(vec![vec![3, 4]])
+        );
+        assert_eq!(
+            infer_shared_node(&node_at("Expand", 2, None), &inputs),
+            SharedShapeResult::SymbolicOrUnknown,
+            "an absent version must use opset 1, not silently select latest"
+        );
+    }
+
+    #[test]
+    fn shared_rule_selection_requires_the_default_domain() {
+        let mut foreign = node("Expand", 2);
+        foreign.domain = "example.foreign".into();
+        assert_eq!(SharedNativeShapeRule::for_node(&foreign), None);
+        assert_eq!(
+            SharedNativeShapeRule::for_node(&node("Expand", 2)),
+            Some(SharedNativeShapeRule::Expand)
+        );
+    }
+
+    #[test]
+    fn unregistered_operator_is_symbolic_not_rejected() {
+        assert_eq!(
+            infer_shared_node(&node("NotRegisteredAnywhere", 0), &[]),
             SharedShapeResult::SymbolicOrUnknown
         );
     }
