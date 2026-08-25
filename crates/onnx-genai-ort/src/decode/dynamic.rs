@@ -1,6 +1,8 @@
 use super::*;
 use std::collections::HashSet;
 
+use crate::session_owner::OrtSessionOwner;
+
 /// Prompt and prefill runs use CUDA-graph annotation id `-1` (no capture) so
 /// only the fixed-shape decode step is captured and replayed. Each
 /// [`DecodeSession`] that enables capture claims a process-unique positive id
@@ -64,7 +66,7 @@ fn retry_pre_run_captured_failure<T>(
 
 /// A stateful IoBinding decode runner that keeps KV OrtValues inside ORT.
 pub struct DecodeSession<'a> {
-    session: &'a Session,
+    session: OrtSessionOwner<'a>,
     binding: IoBinding<'a>,
     kv_pairs: Vec<KvPair>,
     token_input: String,
@@ -301,12 +303,39 @@ impl<'a> DecodeSession<'a> {
         Self::new_with_io(session, options, None)
     }
 
+    /// Create a decode session that co-owns a shared ORT session.
+    pub fn new_owned(
+        session: Arc<Session>,
+        options: DecodeSessionOptions,
+    ) -> Result<DecodeSession<'static>> {
+        Self::new_owned_with_io(session, options, None)
+    }
+
     /// Create a decode session using declarative graph-port roles when present.
     pub fn new_with_io(
         session: &'a Session,
         options: DecodeSessionOptions,
         io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> Result<Self> {
+        Self::new_with_owner(OrtSessionOwner::borrowed(session), options, io)
+    }
+
+    /// Create a decode session that co-owns a shared ORT session and uses
+    /// declarative graph-port roles when present.
+    pub fn new_owned_with_io(
+        session: Arc<Session>,
+        options: DecodeSessionOptions,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
+    ) -> Result<DecodeSession<'static>> {
+        DecodeSession::new_with_owner(OrtSessionOwner::shared(session), options, io)
+    }
+
+    fn new_with_owner(
+        session_owner: OrtSessionOwner<'a>,
+        options: DecodeSessionOptions,
+        io: Option<&onnx_genai_metadata::DecoderAbi>,
+    ) -> Result<Self> {
+        let session = &*session_owner;
         let kv_pairs = infer_kv_pairs(session, io)?;
         let excluded = kv_pairs
             .iter()
@@ -452,9 +481,10 @@ impl<'a> DecodeSession<'a> {
         } else {
             DecodeKvMode::ZeroCopyRebind
         };
+        let binding = session_owner.binding()?;
         let mut this = Self {
-            session,
-            binding: IoBinding::new(session)?,
+            session: session_owner,
+            binding,
             kv_pairs,
             token_input,
             attention_mask_input,
@@ -1374,7 +1404,7 @@ impl<'a> DecodeSession<'a> {
         // past), eliminating the per-step host<->device KV copies the default
         // CPU allocator would force under an accelerator EP. Falls back to the
         // CPU allocator for CPU / non-device EPs.
-        let device_allocator = self.session.device_kv_allocator()?;
+        let device_allocator = self.session.device_allocator()?;
         let cpu_allocator;
         let allocator = match device_allocator.as_ref() {
             Some(allocator) => allocator,

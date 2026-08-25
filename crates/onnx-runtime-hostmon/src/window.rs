@@ -212,8 +212,8 @@ impl Report {
         }
         Some(format!(
             "UNPROTECTED host_lock={} -- this run was not covered end-to-end by a lock held by \
-             this process (HOSTLOCK_OWNER={}). Take one with `scripts/hostlock.sh run` before \
-             publishing these numbers.",
+             this process (HOSTLOCK_OWNER={}). Take one with `scripts/hostlock.sh run --owner \
+             <you> --reason \"<what this measures>\"` before publishing these numbers.",
             self.field,
             self.self_owner.as_deref().unwrap_or("unset")
         ))

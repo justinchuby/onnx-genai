@@ -2668,6 +2668,11 @@ fn conformance_profile() -> Vec<ProfileEntry> {
         "cuFFT real/complex forward/inverse and arbitrary-axis parity",
     ));
     p.push(dedicated(
+        "NonMaxSuppression",
+        "nms_gpu.rs + cuda_unique_ort_e2e.rs",
+        "bounded device-workspace NMS and dynamic plugin materialization",
+    ));
+    p.push(dedicated(
         "STFT",
         "stft_gpu.rs",
         "batched cuFFT framed/windowed real and complex parity",

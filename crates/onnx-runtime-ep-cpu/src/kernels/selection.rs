@@ -1,7 +1,9 @@
 //! Value selection kernels: `Clip`, `ArgMax`, `ArgMin`, `TopK`, and `NonZero`.
 
 use core::cmp::Ordering;
-use onnx_runtime_ep_api::{EpError, Kernel, KernelFactory, Result, TensorMut, TensorView};
+use onnx_runtime_ep_api::{
+    EpError, Kernel, KernelFactory, KernelSizedOutput, Result, TensorMut, TensorView,
+};
 use onnx_runtime_ir::{DataType, Node};
 
 use super::add::require_same_dtype;
@@ -338,6 +340,11 @@ pub struct NonMaxSuppressionKernel {
 
 pub struct NonMaxSuppressionFactory;
 
+#[cfg(test)]
+std::thread_local! {
+    static NMS_SELECTION_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl KernelFactory for NonMaxSuppressionFactory {
     fn create(&self, node: &Node, _: &[Vec<usize>]) -> Result<Box<dyn Kernel>> {
         let center_point_box = node
@@ -356,10 +363,91 @@ impl KernelFactory for NonMaxSuppressionFactory {
 impl Kernel for NonMaxSuppressionKernel {
     fn execute(&self, inputs: &[TensorView], outputs: &mut [TensorMut]) -> Result<()> {
         check_arity("NonMaxSuppression", inputs, outputs, 2, 5, 1)?;
-        if outputs[0].dtype != DataType::Int64 {
+        let owned = self.compute_owned_output(inputs)?;
+        if outputs[0].dtype != owned.dtype || outputs[0].shape != owned.shape {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: selected_indices output must be Int64 with shape {:?}, got \
+                 {:?} with dtype {:?}",
+                owned.shape, outputs[0].shape, outputs[0].dtype
+            )));
+        }
+        write_dense_bytes(&mut outputs[0], &owned.bytes)?;
+        Ok(())
+    }
+
+    fn has_kernel_sized_outputs(&self) -> bool {
+        true
+    }
+
+    fn execute_kernel_sized(
+        &self,
+        inputs: &[TensorView],
+        requested_outputs: &[bool],
+    ) -> Result<Vec<Option<KernelSizedOutput>>> {
+        if requested_outputs != [true] {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: required selected_indices output must be present; got \
+                 requested slots {requested_outputs:?}"
+            )));
+        }
+        Ok(vec![Some(self.compute_owned_output(inputs)?)])
+    }
+
+    fn supports_strided_input(&self, _: usize) -> bool {
+        true
+    }
+}
+
+impl NonMaxSuppressionKernel {
+    fn compute_owned_output(&self, inputs: &[TensorView]) -> Result<KernelSizedOutput> {
+        if !(2..=5).contains(&inputs.len()) {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: expected 2..=5 inputs, got {}",
+                inputs.len()
+            )));
+        }
+        if inputs[0].is_absent() || inputs[1].is_absent() {
             return Err(EpError::KernelFailed(
-                "NonMaxSuppression: selected_indices output must be Int64".into(),
+                "NonMaxSuppression: required boxes and scores inputs must be present".into(),
             ));
+        }
+        for (slot, name) in [(0usize, "boxes"), (1usize, "scores")] {
+            if inputs[slot].dtype != DataType::Float32 {
+                return Err(EpError::KernelFailed(format!(
+                    "NonMaxSuppression: {name} input must be Float32, got {:?}",
+                    inputs[slot].dtype
+                )));
+            }
+        }
+        if let Some(input) = inputs.get(2).filter(|input| !input.is_absent())
+            && input.dtype != DataType::Int64
+        {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: max_output_boxes_per_class must be Int64, got {:?}",
+                input.dtype
+            )));
+        }
+        for (slot, name) in [(3usize, "iou_threshold"), (4usize, "score_threshold")] {
+            if let Some(input) = inputs.get(slot).filter(|input| !input.is_absent())
+                && input.dtype != DataType::Float32
+            {
+                return Err(EpError::KernelFailed(format!(
+                    "NonMaxSuppression: {name} must be Float32, got {:?}",
+                    input.dtype
+                )));
+            }
+        }
+        if let Some((slot, input)) = inputs
+            .iter()
+            .enumerate()
+            .find(|(_, input)| !input.is_absent() && !input.device.is_host_accessible())
+        {
+            return Err(EpError::KernelFailed(format!(
+                "NonMaxSuppression: kernel-sized output execution is host-only, but input slot \
+                 {slot} is on {:?}; place NonMaxSuppression on a host EP instead of copying \
+                 device payloads implicitly",
+                input.device
+            )));
         }
         let boxes = to_dense_f32(&inputs[0])?;
         let scores = to_dense_f32(&inputs[1])?;
@@ -383,23 +471,15 @@ impl Kernel for NonMaxSuppressionKernel {
             score_threshold,
             self.center_point_box,
         )?;
-        if outputs[0].shape != [selected.len(), 3] {
-            return Err(EpError::KernelFailed(format!(
-                "NonMaxSuppression: output shape {:?} does not match selected index count {}. \
-                 HOW: size selected_indices as [num_selected_indices, 3].",
-                outputs[0].shape,
-                selected.len()
-            )));
-        }
         let bytes = selected
             .iter()
             .flat_map(|indices| indices.iter().flat_map(|index| index.to_le_bytes()))
             .collect::<Vec<_>>();
-        write_dense_bytes(&mut outputs[0], &bytes)
-    }
-
-    fn supports_strided_input(&self, _: usize) -> bool {
-        true
+        Ok(KernelSizedOutput {
+            shape: vec![selected.len(), 3],
+            dtype: DataType::Int64,
+            bytes,
+        })
     }
 }
 
@@ -416,6 +496,8 @@ pub fn non_max_suppression(
     score_threshold: f32,
     center_point_box: i64,
 ) -> Result<Vec<[i64; 3]>> {
+    #[cfg(test)]
+    NMS_SELECTION_RUNS.with(|runs| runs.set(runs.get() + 1));
     if boxes_shape.len() != 3 || boxes_shape[2] != 4 {
         return Err(EpError::KernelFailed(format!(
             "NonMaxSuppression: boxes must have shape [batch, spatial_dimension, 4], got {boxes_shape:?}"
@@ -448,8 +530,19 @@ pub fn non_max_suppression(
                 .into(),
         )
     })?;
+    if limit == 0 || batch == 0 || classes == 0 || box_count == 0 {
+        return Ok(Vec::new());
+    }
     let mut selected = Vec::new();
     for batch_index in 0..batch {
+        let coordinates = (0..box_count)
+            .map(|box_index| {
+                box_coordinates(
+                    &boxes[(batch_index * box_count + box_index) * 4..][..4],
+                    center_point_box,
+                )
+            })
+            .collect::<Vec<_>>();
         for class_index in 0..classes {
             let score_offset = (batch_index * classes + class_index) * box_count;
             let mut candidates = (0..box_count)
@@ -465,15 +558,9 @@ pub fn non_max_suppression(
                 if kept.len() == limit {
                     break;
                 }
-                let candidate_box = box_coordinates(
-                    &boxes[(batch_index * box_count + candidate) * 4..][..4],
-                    center_point_box,
-                );
+                let candidate_box = coordinates[candidate];
                 if kept.iter().all(|&kept_index| {
-                    let kept_box = box_coordinates(
-                        &boxes[(batch_index * box_count + kept_index) * 4..][..4],
-                        center_point_box,
-                    );
+                    let kept_box = coordinates[kept_index];
                     iou(candidate_box, kept_box) <= iou_threshold
                 }) {
                     kept.push(candidate);
@@ -1126,6 +1213,210 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.to_i64(), vec![0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn nms_kernel_sized_selects_once_and_owns_exact_output() {
+        NMS_SELECTION_RUNS.with(|runs| runs.set(0));
+        let boxes = Owned::f32(
+            &[1, 3, 4],
+            &[
+                0., 0., 1., 1., //
+                0., 0., 0.9, 0.9, //
+                2., 2., 3., 3.,
+            ],
+        );
+        let scores = Owned::f32(&[1, 2, 3], &[0.9, 0.8, 0.7, 0.1, 0.95, 0.2]);
+        let max_output = Owned::i64(&[], &[2]);
+        let iou = Owned::f32(&[], &[0.5]);
+        let score = Owned::f32(&[], &[0.15]);
+        let outputs = NonMaxSuppressionKernel {
+            center_point_box: 0,
+        }
+        .execute_kernel_sized(
+            &[
+                boxes.view(),
+                scores.view(),
+                max_output.view(),
+                iou.view(),
+                score.view(),
+            ],
+            &[true],
+        )
+        .unwrap();
+        assert_eq!(NMS_SELECTION_RUNS.with(std::cell::Cell::get), 1);
+        let output = outputs[0].as_ref().unwrap();
+        assert_eq!(output.dtype, DataType::Int64);
+        assert_eq!(output.shape, [4, 3]);
+        assert_eq!(
+            output
+                .bytes
+                .chunks_exact(8)
+                .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>(),
+            [0, 0, 0, 0, 0, 2, 0, 1, 1, 0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn nms_center_point_and_threshold_semantics_are_distinct() {
+        let center_boxes = [
+            0.0, 0.0, 4.0, 2.0, //
+            1.5, 0.0, 4.0, 2.0, //
+            10.0, 10.0, 2.0, 2.0,
+        ];
+        let selected = non_max_suppression(
+            &center_boxes,
+            &[1, 3, 4],
+            &[0.9, 0.8, 0.7],
+            &[1, 1, 3],
+            3,
+            0.4,
+            0.75,
+            1,
+        )
+        .unwrap();
+        assert_eq!(selected, [[0, 0, 0]]);
+
+        let selected = non_max_suppression(
+            &center_boxes,
+            &[1, 3, 4],
+            &[0.9, 0.8, 0.7],
+            &[1, 1, 3],
+            3,
+            0.4,
+            0.65,
+            1,
+        )
+        .unwrap();
+        assert_eq!(selected, [[0, 0, 0], [0, 0, 2]]);
+    }
+
+    #[test]
+    fn nms_multi_batch_class_order_zero_and_empty_edges() {
+        let boxes = [
+            0., 0., 1., 1., 2., 2., 3., 3., // batch 0
+            0., 0., 1., 1., 2., 2., 3., 3., // batch 1
+        ];
+        let scores = [
+            0.4, 0.9, 0.8, 0.1, // batch 0 classes 0,1
+            0.7, 0.6, 0.2, 0.95, // batch 1 classes 0,1
+        ];
+        assert_eq!(
+            non_max_suppression(&boxes, &[2, 2, 4], &scores, &[2, 2, 2], 1, 0.5, 0.0, 0).unwrap(),
+            [[0, 0, 1], [0, 1, 0], [1, 0, 0], [1, 1, 1]]
+        );
+        assert!(
+            non_max_suppression(&boxes, &[2, 2, 4], &scores, &[2, 2, 2], 0, 0.5, 0.0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            non_max_suppression(&[], &[1, 0, 4], &[], &[1, 2, 0], 3, 0.5, 0.0, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            non_max_suppression(&boxes, &[2, 2, 4], &scores, &[2, 2, 2], 2, 0.5, 2.0, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn nms_nan_scores_and_threshold_boundaries_follow_strict_score_filter() {
+        let boxes = [0., 0., 1., 1., 2., 2., 3., 3., 4., 4., 5., 5.];
+        let scores = [f32::NAN, 0.5, 0.500_001];
+        assert_eq!(
+            non_max_suppression(&boxes, &[1, 3, 4], &scores, &[1, 1, 3], 3, 0.5, 0.5, 0).unwrap(),
+            [[0, 0, 2]]
+        );
+    }
+
+    #[test]
+    fn nms_equal_scores_keep_lower_box_indices_first() {
+        let boxes = [
+            0., 0., 1., 1., //
+            2., 2., 3., 3., //
+            4., 4., 5., 5.,
+        ];
+        assert_eq!(
+            non_max_suppression(
+                &boxes,
+                &[1, 3, 4],
+                &[0.5, 0.5, 0.5],
+                &[1, 1, 3],
+                3,
+                0.5,
+                0.0,
+                0,
+            )
+            .unwrap(),
+            [[0, 0, 0], [0, 0, 1], [0, 0, 2]]
+        );
+    }
+
+    #[test]
+    fn nms_optional_inputs_and_strided_host_tensors_work() {
+        let boxes = Owned::f32(
+            &[1, 6, 4],
+            &[
+                0., 0., 1., 1., 99., 99., 99., 99., //
+                0., 0., 0.9, 0.9, 99., 99., 99., 99., //
+                2., 2., 3., 3., 99., 99., 99., 99.,
+            ],
+        )
+        .with_view(&[1, 3, 4], &[24, 8, 1]);
+        let scores = Owned::f32(&[1, 1, 6], &[0.9, 99., 0.8, 99., 0.7, 99.])
+            .with_view(&[1, 1, 3], &[6, 6, 2]);
+        let output = NonMaxSuppressionKernel {
+            center_point_box: 0,
+        }
+        .execute_kernel_sized(&[boxes.view(), scores.view()], &[true])
+        .unwrap();
+        assert_eq!(output[0].as_ref().unwrap().shape, [0, 3]);
+
+        let max_output = Owned::i64(&[], &[2]);
+        let output = NonMaxSuppressionKernel {
+            center_point_box: 0,
+        }
+        .execute_kernel_sized(
+            &[
+                boxes.view(),
+                scores.view(),
+                max_output.view(),
+                TensorView::absent(DataType::Float32),
+                TensorView::absent(DataType::Float32),
+            ],
+            &[true],
+        )
+        .unwrap();
+        assert_eq!(output[0].as_ref().unwrap().shape, [2, 3]);
+    }
+
+    #[test]
+    fn nms_device_gate_precedes_selection() {
+        use onnx_runtime_ep_api::{DeviceId, DevicePtr};
+        use onnx_runtime_ir::compute_contiguous_strides;
+
+        NMS_SELECTION_RUNS.with(|runs| runs.set(0));
+        let shape = [1, 1, 4];
+        let strides = compute_contiguous_strides(&shape);
+        let view = TensorView::new(
+            DevicePtr(std::ptr::dangling()),
+            DataType::Float32,
+            &shape,
+            &strides,
+            DeviceId::cuda(0),
+        );
+        let scores = Owned::f32(&[1, 1, 1], &[0.9]);
+        let error = NonMaxSuppressionKernel {
+            center_point_box: 0,
+        }
+        .execute_kernel_sized(&[view, scores.view()], &[true])
+        .unwrap_err();
+        assert!(error.to_string().contains("host-only"));
+        assert_eq!(NMS_SELECTION_RUNS.with(std::cell::Cell::get), 0);
     }
 
     /// Proves the fast (non-MLAS) path fires on contiguous f32 input.

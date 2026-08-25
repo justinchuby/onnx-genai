@@ -69,8 +69,11 @@ pub struct Engine {
     /// counter. A second worker minting from a second counter would hand the
     /// same id to two conversations.
     pub(crate) workflow_session_ids: SharedSessionIds,
-    /// ORT session for decoder execution.
-    pub(crate) session: Option<Box<Session>>,
+    /// Immutable ORT decoder model resource.
+    ///
+    /// Workers may clone this `Arc` without cloning mutable KV, bindings,
+    /// allocators, device values, or graph-capture state.
+    pub(crate) session: Option<Arc<Session>>,
     /// Native decoder session. Native execution is single-request and serialized
     /// by the server's fallback driver in this first milestone.
     #[cfg(feature = "native-backend")]
@@ -224,13 +227,13 @@ pub(crate) struct NativePrefixSnapshot {
 }
 
 // SAFETY: `Engine` owns every ORT or native-runtime handle reachable through
-// its sessions and decode state. Neither runtime's sessions, values, bindings,
-// allocators, or CPU tensors have thread affinity. Moving the engine transfers
-// exclusive ownership; mutation still requires `&mut Engine`. Self-references
-// in ORT decode runners point into boxed `Session` allocations, whose addresses
-// remain stable when the owning `Engine` moves. This would stop being sound if
-// an execution provider introduced thread-affine handles or a field gained
-// unsynchronized shared mutation.
+// its sessions and decode state. Moving the engine transfers exclusive
+// ownership without invoking its worker-local handles; mutation still requires
+// `&mut Engine`, and the ORT affinity guards remain idle during the move.
+// Persistent ORT decode runners co-own `Arc<Session>` allocations, whose pointee
+// addresses remain stable when the owning `Engine` moves or clones a session
+// handle. This would stop being sound if an execution provider introduced a
+// non-migratable handle or a field gained unsynchronized shared mutation.
 unsafe impl Send for Engine {}
 
 /// Per-conversation state for native session-persistent KV reuse.
@@ -257,10 +260,36 @@ pub(crate) struct MtpModel {
 
 pub(crate) struct Eagle3Model {
     pub(crate) config: Eagle3Config,
-    pub(crate) session: Box<Session>,
+    pub(crate) session: Arc<Session>,
     pub(crate) embedder: LinearEmbedder,
     pub(crate) token_map: Option<Vec<TokenId>>,
     pub(crate) hidden_outputs: Vec<String>,
     pub(crate) kv_mode: onnx_genai_ort::Eagle3DraftKvMode,
     pub(crate) num_speculative_tokens: usize,
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    fn assert_arc_session(_: &Arc<Session>) {}
+
+    fn assert_engine_session_holders(
+        engine: &Engine,
+        draft: &DraftModel,
+        mtp: &MtpModel,
+        eagle3: &Eagle3Model,
+    ) {
+        if let Some(session) = &engine.session {
+            assert_arc_session(session);
+        }
+        assert_arc_session(&draft.session);
+        assert_arc_session(&mtp.session);
+        assert_arc_session(&eagle3.session);
+    }
+
+    #[test]
+    fn primary_and_speculative_ort_session_holders_are_arc_owned() {
+        let _ = assert_engine_session_holders as fn(&Engine, &DraftModel, &MtpModel, &Eagle3Model);
+    }
 }

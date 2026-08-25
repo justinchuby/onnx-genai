@@ -1233,6 +1233,32 @@ where
     }
 }
 
+impl<E> Eagle3Proposer<'static, E>
+where
+    E: TokenEmbedder,
+{
+    pub fn new_owned(
+        head: Arc<Session>,
+        options: Eagle3DecodeOptions,
+        embedder: E,
+    ) -> anyhow::Result<Self> {
+        let session = Eagle3DecodeSession::new_owned(head, options)
+            .map_err(|error| anyhow::anyhow!("Failed to create EAGLE-3 decode session: {error}"))?;
+        if session.signature().hidden_size != embedder.hidden_size() {
+            anyhow::bail!(
+                "EAGLE-3 head hidden size {} does not match target embedding hidden size {}",
+                session.signature().hidden_size,
+                embedder.hidden_size()
+            );
+        }
+        Ok(Self {
+            session,
+            embedder,
+            token_map: None,
+        })
+    }
+}
+
 impl<E> SpeculativeProposer for Eagle3Proposer<'_, E>
 where
     E: TokenEmbedder,
@@ -2147,8 +2173,8 @@ impl Engine {
                     .eagle3
                     .as_ref()
                     .context("EAGLE-3 speculation requested without a loaded EAGLE-3 head")?;
-                let mut proposer = Eagle3Proposer::new(
-                    &eagle3.session,
+                let mut proposer = Eagle3Proposer::new_owned(
+                    Arc::clone(&eagle3.session),
                     Eagle3DecodeOptions {
                         kv_mode: eagle3.kv_mode,
                         batch_size: 1,

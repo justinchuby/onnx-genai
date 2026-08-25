@@ -3,7 +3,6 @@
 //! Pure code motion from `decode.rs`.
 
 use super::resolved_io::ResolvedIo;
-use super::step::stable_session_ref;
 use super::values::{
     concat_value_axis, slice_value_axis, sole_axis_with_extent, validate_fixed_state_budget,
 };
@@ -105,7 +104,7 @@ impl DecodeState {
     /// Create decode state for a selected path, resolving ports from explicit
     /// metadata or unambiguous tensor shapes.
     pub(crate) fn new_for_path_with_io(
-        session: &Session,
+        session: &Arc<Session>,
         path: &ModelDecodePath,
         io: Option<&onnx_genai_metadata::DecoderAbi>,
     ) -> anyhow::Result<Self> {
@@ -113,7 +112,7 @@ impl DecodeState {
     }
 
     pub(crate) fn new_for_path_with_io_positions_and_state_budget(
-        session: &Session,
+        session: &Arc<Session>,
         path: &ModelDecodePath,
         io: Option<&onnx_genai_metadata::DecoderAbi>,
         positions: Option<&PositionProgram>,
@@ -121,13 +120,13 @@ impl DecodeState {
     ) -> anyhow::Result<Self> {
         match path {
             ModelDecodePath::Generic => Self::new_with_io_positions_and_state_budget(
-                session,
+                session.as_ref(),
                 io,
                 positions,
                 fixed_state_budget_bytes,
             ),
             ModelDecodePath::StaticCache { .. } => {
-                let resolved = ResolvedIo::resolve_with_positions(session, io, positions)?;
+                let resolved = ResolvedIo::resolve_with_positions(session.as_ref(), io, positions)?;
                 if !resolved.state_pairs.is_empty() || positions.is_some() {
                     anyhow::bail!(
                         "static-cache decode does not support declared generic positions or fixed loop-carried state; select the past/present or generic decode path"
@@ -146,11 +145,13 @@ impl DecodeState {
                     sliding_window: None,
                     sink_tokens: 0,
                     retained_kv_len: 0,
-                    runner: Some(DecodeRunner::StaticCache(StaticCacheDecodeSession::new(
-                        stable_session_ref(session),
-                        StaticCacheDecodeOptions { batch_size: 1 },
-                        io,
-                    )?)),
+                    runner: Some(DecodeRunner::StaticCache(
+                        StaticCacheDecodeSession::new_owned(
+                            Arc::clone(session),
+                            StaticCacheDecodeOptions { batch_size: 1 },
+                            io,
+                        )?,
+                    )),
                     #[cfg(test)]
                     test_runner_marker: false,
                 })
@@ -162,7 +163,7 @@ impl DecodeState {
                 sink_tokens,
             } => {
                 let mut state = Self::new_with_io_positions_and_state_budget(
-                    session,
+                    session.as_ref(),
                     io,
                     positions,
                     fixed_state_budget_bytes,
@@ -174,15 +175,16 @@ impl DecodeState {
                     && state.io.state_pairs.is_empty()
                     && state.positions.is_none()
                 {
-                    state.runner = Some(DecodeRunner::PastPresent(DecodeSession::new_with_io(
-                        stable_session_ref(session),
-                        DecodeSessionOptions {
-                            batch_size: 1,
-                            max_length: *max_len,
-                            past_present_share_buffer: Some(*shared_buffer),
-                        },
-                        io,
-                    )?));
+                    state.runner =
+                        Some(DecodeRunner::PastPresent(DecodeSession::new_owned_with_io(
+                            Arc::clone(session),
+                            DecodeSessionOptions {
+                                batch_size: 1,
+                                max_length: *max_len,
+                                past_present_share_buffer: Some(*shared_buffer),
+                            },
+                            io,
+                        )?));
                 }
                 Ok(state)
             }

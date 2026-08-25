@@ -162,6 +162,7 @@ static QUANTIZED_STORAGE_DTYPES: &[DataType] = &[DataType::Uint8, DataType::Int8
 static U8_ONLY: &[DataType] = &[DataType::Uint8];
 
 static I32_ONLY: &[DataType] = &[DataType::Int32];
+static I64_ONLY: &[DataType] = &[DataType::Int64];
 
 /// Integer index/length inputs, matching `to_dense_i64`'s acceptance set.
 static INDEX_DTYPES: &[DataType] = &[DataType::Int64, DataType::Int32];
@@ -174,6 +175,9 @@ static STFT_DTYPES: &[DataType] = &[
     DataType::Int32,
     DataType::Int64,
 ];
+
+/// NonMaxSuppression mixes f32 geometry/thresholds with i64 limits/output.
+static NMS_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 
 /// Per-input-slot dtype constraints for a mixed-dtype op.
 ///
@@ -268,6 +272,14 @@ pub fn input_dtype_constraints_for_op(
         (2, FLOAT_COMPUTE_DTYPES),
         (3, INDEX_DTYPES),
     ];
+    // boxes, scores, max_output_boxes_per_class?, iou_threshold?, score_threshold?
+    static NMS_SLOTS: &[(usize, &[DataType])] = &[
+        (0, F32_ONLY),
+        (1, F32_ONLY),
+        (2, I64_ONLY),
+        (3, F32_ONLY),
+        (4, F32_ONLY),
+    ];
     match (op_type, domain) {
         ("MatMulNBits", "com.microsoft") => MATMUL_NBITS_SLOTS,
         ("QLinearMatMul", "") => QLINEAR_MATMUL_SLOTS,
@@ -279,6 +291,7 @@ pub fn input_dtype_constraints_for_op(
         ("PackedMultiHeadAttention", "com.microsoft") => PACKED_MHA_SLOTS,
         ("QMoE", "com.microsoft") => QMOE_SLOTS,
         ("STFT", "") => STFT_SLOTS,
+        ("NonMaxSuppression", "") => NMS_SLOTS,
         _ => &[],
     }
 }
@@ -414,7 +427,8 @@ pub fn supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataTyp
         ("Where", "") => ALL_DTYPES,
 
         // NonZero: all types.
-        ("NonZero", "") | ("NonMaxSuppression", "") => ALL_DTYPES,
+        ("NonZero", "") => ALL_DTYPES,
+        ("NonMaxSuppression", "") => NMS_DTYPES,
 
         // Bitwise: integer types.
         ("BitShift", "")
@@ -2293,6 +2307,21 @@ mod tests {
         assert_eq!(slots[1], (1, INDEX_DTYPES));
         assert_eq!(slots[2], (2, FLOAT_COMPUTE_DTYPES));
         assert_eq!(slots[3], (3, INDEX_DTYPES));
+    }
+
+    #[test]
+    fn nms_advertises_exact_mixed_edge_dtypes() {
+        assert_eq!(supported_dtypes_for_op("NonMaxSuppression", ""), NMS_DTYPES);
+        assert_eq!(
+            input_dtype_constraints_for_op("NonMaxSuppression", ""),
+            [
+                (0, F32_ONLY),
+                (1, F32_ONLY),
+                (2, I64_ONLY),
+                (3, F32_ONLY),
+                (4, F32_ONLY),
+            ]
+        );
     }
 
     use super::*;

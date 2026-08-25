@@ -4,7 +4,7 @@
 //! Without the `cuda` feature (default), it compiles as a no-op stub so the
 //! workspace builds on hosts without a CUDA toolkit.
 //!
-//! # CUDA EP status: COMPILES, UNVALIDATED ON HARDWARE
+//! # CUDA Unique path: hardware-validated
 //!
 //! The following defects have been addressed:
 //!
@@ -32,8 +32,8 @@
 //!
 //! **Without the `cuda` feature**, zero factories are returned.
 //!
-//! **This code has not been validated on a physical CUDA GPU.** Issue #768
-//! tracks hardware validation.
+//! The CUDA Unique plugin path is exercised on physical CUDA hardware, including
+//! device-resident dynamically sized `Unique` outputs and governed workspace.
 
 #[cfg(feature = "cuda")]
 mod cuda_impl {
@@ -92,6 +92,12 @@ mod cuda_impl {
         Box::leak(s.to_owned().into_boxed_str())
     }
 
+    type ConstructedEp = (
+        Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send>,
+        *mut std::os::raw::c_void,
+        Vec<KernelRegistryEntry>,
+    );
+
     /// Device support for the CUDA EP: GPU, stream-aware, device-only memory.
     pub(crate) fn device_support() -> DeviceSupport {
         DeviceSupport::gpu("Cuda", NVIDIA_VENDOR_ID)
@@ -103,14 +109,7 @@ mod cuda_impl {
     /// available. The kernel-registry entries are derived from the constructed
     /// EP's real registry so the caller advertises each kernel under its true
     /// domain.
-    pub(crate) fn construct_ep_with_stream() -> Result<
-        (
-            Box<dyn onnx_runtime_ep_api::provider::ExecutionProvider + Send>,
-            *mut std::os::raw::c_void,
-            Vec<KernelRegistryEntry>,
-        ),
-        String,
-    > {
+    pub(crate) fn construct_ep_with_stream() -> Result<ConstructedEp, String> {
         let ep = CudaExecutionProvider::new_default().map_err(|e| {
             format!("CUDA EP construction failed (no GPU or driver unavailable): {e}")
         })?;
@@ -199,7 +198,7 @@ pub unsafe extern "C" fn CreateEpFactories(
 
             // S4 fix: use create_ep_factories_for_shared_ep which takes the
             // EP name directly, avoiding the constructor call that would panic.
-            let status = unsafe {
+            unsafe {
                 onnx_runtime_ep_plugin::factory::create_ep_factories_for_shared_ep(
                     api_base,
                     out_factories,
@@ -211,8 +210,7 @@ pub unsafe extern "C" fn CreateEpFactories(
                     support,
                     stream_handle,
                 )
-            };
-            status
+            }
         }
 
         #[cfg(not(feature = "cuda"))]
@@ -351,6 +349,94 @@ pub extern "C" fn nxrt_ep_compiled_node_count() -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn nxrt_ep_reset_compiled_node_count() {
     onnx_runtime_ep_plugin::ep::reset_compiled_node_count()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_executed_node_count() -> usize {
+    onnx_runtime_ep_plugin::compute::executed_node_count()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_executed_node_count() {
+    onnx_runtime_ep_plugin::compute::reset_executed_node_count()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_unique_execution_stats() {
+    onnx_runtime_ep_cuda::reset_unique_execution_stats()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_unique_metadata_launches() -> u64 {
+    onnx_runtime_ep_cuda::unique_execution_stats().metadata_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_unique_materialize_launches() -> u64 {
+    onnx_runtime_ep_cuda::unique_execution_stats().materialize_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_unique_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::unique_execution_stats().d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_unique_full_input_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::unique_execution_stats().full_input_d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_unique_workspace_bytes() -> u64 {
+    onnx_runtime_ep_cuda::unique_execution_stats().workspace_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_nms_execution_stats() {
+    onnx_runtime_ep_cuda::reset_nms_execution_stats()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_prepare_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().prepare_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_count_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().count_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_materialize_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().materialize_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_full_input_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().full_input_d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_workspace_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().workspace_bytes
 }
 
 /// Number of workspace **placement resolutions** since the last reset.

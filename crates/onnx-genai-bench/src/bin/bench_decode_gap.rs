@@ -246,6 +246,7 @@ fn pool_delta(
         straggler_yields: after
             .straggler_yields
             .saturating_sub(before.straggler_yields),
+        spin_yields: after.spin_yields.saturating_sub(before.spin_yields),
     }
 }
 
@@ -792,6 +793,33 @@ fn report(label: &str, result: &ArmResult, args: &Args) {
         result.steady_pool.spin_hits as f64 / iterations,
         result.steady_pool.slot_exhausted
     );
+    // The #2075 quantity. Per-iteration alone is not interpretable: yields only
+    // happen in a spin window that outlives the pure-spin phase, so the rate
+    // that matters is per *window*, and windows end at a park or a spin hit.
+    // Both denominators can be zero for reasons that are not "no yields", so
+    // each gets its own verdict rather than a rate the reader has to discount
+    // against the attribution line printed further down.
+    let windows = result.steady_pool.parks + result.steady_pool.spin_hits;
+    if result.steady_pool.dispatches == 0 {
+        println!(
+            "  spin yields:   n/a -- this model never dispatched to the pool, so its \
+             {} yields are another workload's, not a #2075 datum",
+            result.steady_pool.spin_yields
+        );
+    } else if windows == 0 {
+        println!(
+            "  spin yields:   {} total, but no spin window ended in this arm by \
+             expiring or catching a dispatch, so there is no denominator to read \
+             them against and this is not a #2075 datum",
+            result.steady_pool.spin_yields
+        );
+    } else {
+        println!(
+            "  spin yields:   {:.2}/iter  {:.1}/window over {windows} windows (#2075)",
+            result.steady_pool.spin_yields as f64 / iterations,
+            result.steady_pool.spin_yields as f64 / windows as f64,
+        );
+    }
     let sample_iters = result.steady_samples().len();
     if result.counter_iters == sample_iters {
         println!(
@@ -973,13 +1001,15 @@ fn emit_result_line(arm: &str, result: &ArmResult) {
     let summary = result.summary();
     println!(
         "result: arm={arm} p50={:.4} ms p90={:.4} ms cpu_per_wall={:.2} vol_ctxt_per_iter={:.2} \
-         parks_per_iter={:.2} spin_hits_per_iter={:.2} steady_iters={} rss_kb={}",
+         parks_per_iter={:.2} spin_hits_per_iter={:.2} spin_yields_per_iter={:.2} \
+         steady_iters={} rss_kb={}",
         summary.p50,
         summary.p90,
         result.cpu_per_wall(),
         result.parks_per_iter(),
         result.steady_pool.parks as f64 / summary.count.max(1) as f64,
         result.steady_pool.spin_hits as f64 / summary.count.max(1) as f64,
+        result.steady_pool.spin_yields as f64 / summary.count.max(1) as f64,
         summary.count,
         result.steady_metrics.rss_kb
     );

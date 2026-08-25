@@ -3149,3 +3149,70 @@ ratios on this host are not reproducible, whichever arm they favour.
   operator's memory of whether they announced it. This is the same principle as
   asserting realized placement rather than trusting the width label: make the
   artifact carry the answer.
+
+## `dequant_panel_avx2` modulo elimination: the withheld rows, resolved (2026-08-25)
+
+Full report:
+[`docs/benchmarks/2026-08-25-int4-pack-modulo-elimination-matrix.md`](../benchmarks/2026-08-25-int4-pack-modulo-elimination-matrix.md).
+
+* **#1809's prefill claim was incomplete, and it was incomplete in a
+  predictable place.** It reported "a null on prefill" from `m = 64/256/512`,
+  having **withheld `m = 1` and `m = 8`** because their A/A null came back at
+  5.31% and 4.62%. The pack is amortized over `m` rows, so the mechanism puts
+  the effect at *small* `m` — the sweep had a hole exactly where the answer
+  was. Filling it in: **a fixed ~0.02–0.03 ms saved per packed panel,
+  independent of `m`** — 1.004x–1.014x at `m = 1/8/16`, fading below the
+  instrument's ~0.3% resolution by `m = 64`.
+  A withheld row is honest; it is not neutral. It removes the reader's ability
+  to tell "no effect" from "not looked at", and here those were different.
+* **A control that was supposed to be boring is the most important number in
+  the sweep.** Block 32 at `m = 1` never calls the pack — the poisoned build is
+  bit-identical there — so the two binaries differ on that row only in code
+  that does not execute. It read **0.9807, CI [0.9794, 0.9835]**: a 1.9% loss
+  from code layout alone. **Two other pairs of arms built from the same source
+  change read +0.28% on that row** — one against a main three commits earlier,
+  one against the same main with `-Cllvm-args=-align-all-functions=5` applied
+  identically to every arm. So the layout component of a source-level A/B here
+  reaches ~2%, is not stable across rebuilds, and **is structurally invisible
+  to an A/A**, which compares a file with itself. Every A/A in that document
+  brackets 1.000 while the 1.9% artifact sits in the same table.
+  Standing consequence: a sub-2% source-level A/B with no route-not-taken row
+  is not confirmed. Where a route-not-taken row exists, prove it with a
+  poisoned build and read it as the experiment's floor. Where it does not,
+  **require the result to reproduce across independently built pairs of
+  binaries** — cheapest on demand by rebuilding every arm under
+  `-Cllvm-args=-align-all-functions=5`, which perturbs layout and nothing else.
+  Reproducing across two block sizes from one pair does *not* substitute:
+  a single pair of binaries has a single layout, and I initially argued
+  otherwise in this document. The 1/m decay of the ratio does not distinguish
+  the mechanism from layout either — a constant-absolute layout cost over a
+  total that grows with `m` produces the identical curve. What distinguishes
+  them is that the route-not-taken row is the only one that moves when the
+  layout does.
+* **The decode headline was overstated, by my own instrument's rules.** #1809
+  said 1.015x; two sweeps here give 1.0116 and 1.0095, and in both the
+  decode-loop **A/A interval excludes 1.000, with opposite signs** (+0.63% at
+  21 launches, −0.28% at 41). That is not a bias to divide out — it says the
+  floor is ~±0.6%. Reported as ≈1.010x, corroborated by the single-op harness
+  on the same route (block 16 `m = 1`, 1.0067 [1.0038, 1.0096]) which does pass
+  its own null.
+* **The instrument, not the operator, decides now.** The A/A nulls that failed
+  at 4–5% sit at 0.1–0.4%, from a CPU-efficiency gate on each launch
+  (`os.wait4` rusage `(utime + stime)/wall`, floor 0.95) instead of a runnable
+  count sampled at run boundaries, and 61 independent launches per arm instead
+  of one careful pairing. The per-launch spread at `m = 1` is **102%** while
+  the median A/A null is **0.14%**. The harness computes its own bootstrap
+  intervals and **warns when an A/A interval fails to bracket 1.000**, which is
+  how the decode overstatement was caught.
+* **Every row proves its own route.** `int4_prefill_route_ab` prints an FNV-1a
+  fold of the raw output bytes; `int4_modulo_matrix.py --route-proof` runs a
+  deliberately poisoned third build and self-checks. `before == after` on all
+  16 rows (the elimination is exact, so the speedup is free), and the poison
+  moves on every row whose route reaches the line except block 32 `m = 1`.
+  `int4_modulo_arms.sh` additionally **fails hard if two arms come out
+  byte-identical** — that failure still produces a full table of numbers, every
+  one of them a null between a binary and itself.
+* **Disposition: no kernel change.** #1809's code was already correct and
+  already on main. What shipped is the corrected scope, the per-row route
+  fingerprint, the bootstrap and A/A self-check, and the two scripts that make
+  the matrix reproducible.
