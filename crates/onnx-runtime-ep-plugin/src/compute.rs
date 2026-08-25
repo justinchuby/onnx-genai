@@ -274,7 +274,8 @@ pub enum DeclineReason {
     NodeNotShapeable(&'static str),
 }
 
-const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] = &[("", "Unique")];
+const KERNEL_SIZED_OUTPUT_STRATEGIES: &[(&str, &str)] =
+    &[("", "NonMaxSuppression"), ("", "Unique")];
 
 fn kernel_sized_output_strategy(domain: &str, op_type: &str) -> bool {
     let domain = if domain == "ai.onnx" { "" } else { domain };

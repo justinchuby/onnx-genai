@@ -39,23 +39,20 @@ const DECLINED: &[(&str, &str)] = &[
     //       `TensorView`s, values included, and resolves the real extent there.
     //       `Compress` and `DFT` are claimed that way.
     //
-    //       What keeps the rest here is cost, not possibility: for `Unique` and
-    //       `NonMaxSuppression` the extent *is* the whole algorithm, so pinning
-    //       it in `infer_shapes` means running it twice. Those need the Compute
-    //       path to let a kernel size its own output before they are worth
-    //       claiming.
-    ("", "NonMaxSuppression"), // output length = number of boxes kept
-    ("", "NonZero"),           // output length = count of non-zeros
-    ("", "Range"),             // length = ceil((limit - start) / delta)
-    ("", "OneHot"),            // depth comes from input[1]'s value
-    ("", "Pad"),               // pads come from input[1]'s values (opset 11+)
-    ("", "TopK"),              // K comes from input[1]'s value (opset 10+)
-    ("", "Split"),             // split sizes come from input[1] (opset 13+)
-    ("", "Unsqueeze"),         // axes come from input[1] (opset 13+)
-    ("", "Resize"),            // scales/sizes come from input[2]/input[3]
-    ("", "AffineGrid"),        // output size comes from input[1]'s values
-    ("", "Col2Im"),            // image_shape comes from input[1]'s values
-    ("", "CenterCropPad"),     // target shape comes from input[1]'s values
+    //       What keeps the rest here is cost, not possibility: their extent can
+    //       require the whole algorithm. `Unique` and `NonMaxSuppression` have
+    //       moved to KernelSizedOutput so selection runs once at Compute time.
+    ("", "NonZero"),       // output length = count of non-zeros
+    ("", "Range"),         // length = ceil((limit - start) / delta)
+    ("", "OneHot"),        // depth comes from input[1]'s value
+    ("", "Pad"),           // pads come from input[1]'s values (opset 11+)
+    ("", "TopK"),          // K comes from input[1]'s value (opset 10+)
+    ("", "Split"),         // split sizes come from input[1] (opset 13+)
+    ("", "Unsqueeze"),     // axes come from input[1] (opset 13+)
+    ("", "Resize"),        // scales/sizes come from input[2]/input[3]
+    ("", "AffineGrid"),    // output size comes from input[1]'s values
+    ("", "Col2Im"),        // image_shape comes from input[1]'s values
+    ("", "CenterCropPad"), // target shape comes from input[1]'s values
     // Several of these carry a *constant initializer* in practice, so a
     // future pass that resolves initializer values at capability time could
     // claim them. Until such a pass exists, declining is the honest answer.
@@ -258,7 +255,7 @@ fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
 
 #[test]
 fn kernel_sized_output_strategy_census_is_exact_and_registered() {
-    const EXPECTED: &[(&str, &str)] = &[("", "Unique")];
+    const EXPECTED: &[(&str, &str)] = &[("", "NonMaxSuppression"), ("", "Unique")];
     let actual = onnx_runtime_ep_plugin::compute::kernel_sized_output_strategy_census();
     assert!(
         !actual.is_empty(),
