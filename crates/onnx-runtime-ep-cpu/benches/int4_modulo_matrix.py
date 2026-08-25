@@ -180,12 +180,13 @@ def ratio_stats(before_vals, after_vals):
     }
 
 
-def prefill_matrix(rounds, block, shape, m_list):
+def prefill_matrix(rounds, block, shape, m_list, extra_env=None):
     arms = ["before", "after", "aa"]
     bins = {a: os.path.join(BIN, "prefill_" + ("after" if a == "aa" else a)) for a in arms}
     bins["aa"] = os.path.join(BIN, "prefill_aa")
     env = {"PROBE_BITS": "4", "PROBE_BLOCK": str(block), "PROBE_SHAPE": shape,
            "PROBE_M_LIST": ",".join(str(m) for m in m_list)}
+    env.update(extra_env or {})
     samples = {a: {m: [] for m in m_list} for a in arms}
     cold = {a: {m: [] for m in m_list} for a in arms}
     fnv = {a: {} for a in arms}
@@ -327,8 +328,18 @@ def main():
     ap.add_argument("--m-list", default="8,16,32,64,128,256,512")
     ap.add_argument("--block", type=int, default=32)
     ap.add_argument("--skip-decode", action="store_true")
+    ap.add_argument("--skip-prefill", action="store_true")
     ap.add_argument("--route-proof", action="store_true",
                     help="checksum-only; proves each row's route without timing it")
+    ap.add_argument(
+        "--env", action="append", default=[], metavar="K=V",
+        help="extra env for prefill launches. `--env ONNX_GENAI_CPU_MM_INT4_GEBP=0` "
+             "is the layout control: it takes the pack off the route entirely "
+             "(verified -- the poisoned arm goes bit-identical under it), so any "
+             "difference left between `before` and `after` is code layout and not "
+             "the change. That control has to be run on the *same* rows as the "
+             "claim; a different row can be a different kernel with different "
+             "layout sensitivity.")
     ap.add_argument("--out", default=os.path.join(BIN, "modulo_matrix.json"))
     args = ap.parse_args()
 
@@ -364,8 +375,13 @@ def main():
         f" + block16 decode ({args.rounds} rounds)",
     ):
         result["lock"] = H.lock_provenance()
-        print(f"prefill matrix block={args.block} shape={args.shape}", flush=True)
-        table, disc = prefill_matrix(args.rounds, args.block, args.shape, m_list)
+        if not args.skip_prefill:
+            print(f"prefill matrix block={args.block} shape={args.shape}", flush=True)
+        extra_env = dict(kv.split("=", 1) for kv in args.env)
+        result["extra_env"] = extra_env
+        table, disc = [], 0
+        if not args.skip_prefill:
+            table, disc = prefill_matrix(args.rounds, args.block, args.shape, m_list, extra_env)
         result["prefill"] = table
         result["prefill_discarded_launches"] = disc
         if not args.skip_decode:
@@ -378,15 +394,17 @@ def main():
 
     print(f"\npin=cpu{PIN}  cpu_eff floor={CPU_EFF_FLOOR}  "
           f"discarded={result['prefill_discarded_launches']}")
-    print(f"\nprefill block {args.block} ({args.shape}), {args.rounds} independent launches per arm")
-    print(f"{'m':>5} {'before ms':>10} {'after ms':>10} {'speedup':>8} {'95% CI':>18} "
-          f"{'verdict':>8} {'A/A':>7} {'A/A 95% CI':>18} {'A/A ok':>7} {'bit-id':>7}")
-    for row in table:
-        print(f"{row['m']:>5} {row['before_median_ms']:>10.3f} {row['after_median_ms']:>10.3f} "
-              f"{row['speedup']:>8.4f} [{row['ci_lo']:.4f}, {row['ci_hi']:.4f}] "
-              f"{row['verdict']:>8} {row['aa_speedup']:>7.4f} "
-              f"[{row['aa_ci_lo']:.4f}, {row['aa_ci_hi']:.4f}] "
-              f"{str(row['aa_brackets_unity']):>7} {str(row['bit_identical']):>7}")
+    if table:
+        print(f"\nprefill block {args.block} ({args.shape}), {args.rounds} "
+              f"independent launches per arm")
+        print(f"{'m':>5} {'before ms':>10} {'after ms':>10} {'speedup':>8} {'95% CI':>18} "
+              f"{'verdict':>8} {'A/A':>7} {'A/A 95% CI':>18} {'A/A ok':>7} {'bit-id':>7}")
+        for row in table:
+            print(f"{row['m']:>5} {row['before_median_ms']:>10.3f} {row['after_median_ms']:>10.3f} "
+                  f"{row['speedup']:>8.4f} [{row['ci_lo']:.4f}, {row['ci_hi']:.4f}] "
+                  f"{row['verdict']:>8} {row['aa_speedup']:>7.4f} "
+                  f"[{row['aa_ci_lo']:.4f}, {row['aa_ci_hi']:.4f}] "
+                  f"{str(row['aa_brackets_unity']):>7} {str(row['bit_identical']):>7}")
     print(f"\nIntervals: percentile bootstrap over launches, "
           f"{BOOTSTRAP_RESAMPLES} resamples, seed {BOOTSTRAP_SEED}.")
     if not all(r["aa_brackets_unity"] for r in table):
