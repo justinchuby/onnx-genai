@@ -61,7 +61,13 @@
 #                                       # each measured row (see below)
 #
 # Options for acquire/run:
-#   --reason TEXT     what you are running (shown to whoever is blocked)
+#   --reason TEXT     what you are running (shown to whoever is blocked).
+#                     REQUIRED, and must be non-empty, for `run`; optional for
+#                     `acquire`. Defaults to $HOSTLOCK_REASON. `run` holds the
+#                     host while its owner is elsewhere, so this is the only
+#                     channel that can tell whoever it blocks what they are
+#                     waiting for -- and unlike an announcement it survives
+#                     the announcer's death.
 #   --owner NAME      defaults to $HOSTLOCK_OWNER, else $USER.
 #                     `run` exports a DECLARED owner (--owner, or an inherited
 #                     $HOSTLOCK_OWNER) to the wrapped command, so a harness
@@ -126,6 +132,17 @@
 #   --min-efficiency F    after the command finishes, compare its measured CPU
 #                         time against N cores x wall time, and FAIL if the
 #                         ratio is below F (see "Believing a run" below).
+#
+# The measurement line names its own unit, because the ratio is a different
+# quantity depending on whether you gave a denominator:
+#
+#   cpu wall=..s cpu=..s cores_expected=unspecified efficiency_cores=8.718 ...
+#   cpu wall=..s cpu=..s cores_expected=8           efficiency_frac=1.090 ...
+#
+# `efficiency_cores` is CPU-seconds per wall second (0..ncpu); `efficiency_frac`
+# is the fraction of --expect-cores actually held (0..1 when healthy). They
+# differ by a factor of N for the same run, so never compare one against the
+# other, and grep for the specific field rather than for `efficiency`.
 #
 # Options for provenance:
 #   --expect-runnable N   judge `contended=yes/no` against N; omitted means
@@ -213,6 +230,27 @@
 # CPU time comes from this shell's own reaped-children accounting
 # (/proc/self/stat cutime+cstime), so it covers the wrapped command and every
 # descendant it waited for, and costs nothing: no sampling, no extra process.
+#
+# BECAUSE it covers the whole child tree, put `taskset` OUTERMOST:
+#
+#   hostlock.sh run --reason "..." -- taskset -c 16-23 cargo test        # yes
+#   hostlock.sh run --reason "..." -- bash -c '... taskset -c 16-23 cargo test ... | grep'   # NO
+#
+# In the second form the bound covers `cargo` and its descendants, while the
+# outer `bash` and the `grep` draining its output are unbound and still fully
+# counted. The measurement is then a SUPERSET of what the bound constrains, so
+# the reported figure can and does exceed the bound -- a real run of the
+# second form measured 8.718 cores against a `taskset -c 16-23` 8-cpu bound.
+# Nothing leaked: the bound held, and the number was correctly measured over a
+# wider set of processes than the bound applied to.
+#
+# This matters because of the conclusion it invites. A figure above the bound
+# reads as "affinity escaped" or "the tool is broken", and on this host the
+# first of those was raised as an alarm and then retracted. When CPU exceeds
+# the bound there are three candidates, not two: the bound leaked, the bound
+# was never applied, or -- this one -- the bound was applied to a subset of
+# what was measured. Only the third leaves both the bound and the instrument
+# blameless, and it is the only one you can fix by moving a word.
 #
 # Recording provenance. Emitting the lock state to a terminal helps whoever is
 # watching; embedding it in the rows is what helps six weeks later. Every
@@ -548,8 +586,20 @@ wall_now() {
 # lets somebody re-examine a suspicious row later. Returns non-zero only when
 # a --min-efficiency was asked for and is not met, or cannot be evaluated.
 check_cpu_efficiency() {
-    local t0=$1 t1=$2 w0=$3 w1=$4 hz cpu wall verdict eff
+    local t0=$1 t1=$2 w0=$3 w1=$4 hz cpu wall verdict eff eff_field
     hz=$(getconf CLK_TCK 2>/dev/null || echo 100)
+    # One field name for two different quantities is a unit error waiting to
+    # be made: without a denominator this ratio is CPU-seconds per wall second
+    # (i.e. cores, 0..ncpu), and with one it is the fraction of those cores
+    # that were actually held (0..1). The same 8-core run reads 8.000 in the
+    # first form and 1.000 in the second, so a log mixing both is not
+    # comparable to itself. Name the unit in the field rather than expecting
+    # the reader to notice `cores_expected=` first.
+    if [ -n "$EXPECT_CORES" ]; then
+        eff_field=efficiency_frac
+    else
+        eff_field=efficiency_cores
+    fi
     if [ -z "$t0" ] || [ -z "$t1" ]; then
         # Unreadable /proc accounting. Say so; do not print a number.
         echo "hostlock: cpu unmeasurable (could not read this shell's child CPU accounting)" >&2
@@ -563,7 +613,7 @@ check_cpu_efficiency() {
     # the measurement, so a ratio computed from it is noise wearing a decimal
     # point. Refuse to publish one rather than publish a bad one.
     if awk -v w="$wall" 'BEGIN { exit !(w < 0.05) }'; then
-        echo "hostlock: cpu wall=${wall}s cpu=${cpu}s efficiency=unmeasurable (run too short to judge)" >&2
+        echo "hostlock: cpu wall=${wall}s cpu=${cpu}s ${eff_field}=unmeasurable (run too short to judge)" >&2
         [ -n "$MIN_EFFICIENCY" ] || return 0
         echo "hostlock: WARNING --min-efficiency ${MIN_EFFICIENCY} cannot be evaluated on a ${wall}s run, so this run is NOT verified" >&2
         return 1
@@ -583,9 +633,9 @@ check_cpu_efficiency() {
             verdict=ok
         fi
     fi
-    echo "hostlock: cpu wall=${wall}s cpu=${cpu}s cores_expected=${EXPECT_CORES:-unspecified} efficiency=${eff} verdict=${verdict}" >&2
+    echo "hostlock: cpu wall=${wall}s cpu=${cpu}s cores_expected=${EXPECT_CORES:-unspecified} ${eff_field}=${eff} verdict=${verdict}" >&2
     if [ "$rc" -ne 0 ]; then
-        echo "hostlock: WARNING measured CPU efficiency ${eff} is below --min-efficiency ${MIN_EFFICIENCY}" >&2
+        echo "hostlock: WARNING measured ${eff_field} ${eff} is below --min-efficiency ${MIN_EFFICIENCY}" >&2
         echo "hostlock: WARNING the command did not have ${EXPECT_CORES} core(s) to itself for the whole run; treat its numbers as untrusted" >&2
         echo "hostlock: WARNING the runnable gate cannot see this -- it samples instants, this measures the whole window" >&2
     fi
@@ -1708,7 +1758,7 @@ if [ -n "${HOSTLOCK_OWNER:-}" ]; then
     OWNER_DECLARED=1
 fi
 OWNER="${HOSTLOCK_OWNER:-${USER:-unknown}}"
-REASON=""
+REASON="${HOSTLOCK_REASON:-}"
 DO_WAIT=0
 TIMEOUT=3600
 GATE=""
@@ -1918,6 +1968,18 @@ if [ "$SUB" = run ]; then
     if [ -n "$MIN_EFFICIENCY" ] && [ -z "$EXPECT_CORES" ]; then
         die "--min-efficiency requires --expect-cores N (how many cores the command should keep busy)"
     fi
+    # A `run` is the one subcommand that occupies the host for an unbounded
+    # stretch while its owner is elsewhere, so the lock is the only channel
+    # that can answer "what is this and how long" for whoever it blocks. An
+    # empty reason is not a small omission there: it is the difference between
+    # a mutex and a broadcast, and it degrades silently because the run still
+    # works perfectly for the person who started it. Accept it from
+    # $HOSTLOCK_REASON so existing automation can set it once, but never
+    # accept nothing.
+    case "$REASON" in
+        *[![:space:]]*) : ;;
+        *) die "run requires a non-empty --reason TEXT (or \$HOSTLOCK_REASON): whoever this blocks can only see what you tell them" ;;
+    esac
 else
     # These two do nothing outside `run`, which has no wrapped command to
     # measure. Accepting them silently is how a knob comes to be believed in
