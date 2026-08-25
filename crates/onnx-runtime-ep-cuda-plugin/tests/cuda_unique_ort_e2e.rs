@@ -168,8 +168,10 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
         .join(model)
         .join("model.onnx.textproto");
     let text = std::fs::read_to_string(&fixture).unwrap();
-    verify_fixture(model, &text);
-    let bytes = onnx_std::textproto::to_binary(&text).unwrap();
+    let parsed = onnx_std::textproto::from_textproto(&text)
+        .unwrap_or_else(|error| panic!("{model}: parse textproto: {error}"));
+    verify_fixture(model, &parsed);
+    let bytes = ort_fixture_bytes(&text);
     let mut session = ptr::null_mut();
     unsafe {
         check(
@@ -195,11 +197,135 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
     })
 }
 
-fn verify_fixture(name: &str, text: &str) {
+fn ort_fixture_bytes(text: &str) -> Vec<u8> {
+    // ONNX's proto3 AttributeProto uses `type` as the presence discriminator,
+    // but a generic proto3 encoder elides an explicitly written integer zero.
+    // ORT then drops that valueless attribute and applies Unique's sorted=1
+    // schema default. Restore the legal wire-level `i = 0` field for INT
+    // attributes before handing the in-memory fixture to ORT.
+    let bytes = onnx_std::textproto::to_binary(text).unwrap();
+    rewrite_length_delimited(&bytes, 7, |graph| {
+        rewrite_length_delimited(graph, 1, |node| {
+            rewrite_length_delimited(node, 5, preserve_zero_int_attribute)
+        })
+    })
+}
+
+fn preserve_zero_int_attribute(attribute: &[u8]) -> Vec<u8> {
+    const ATTRIBUTE_TYPE_INT: u64 = 2;
+    if field_varint(attribute, 20) == Some(ATTRIBUTE_TYPE_INT)
+        && field_varint(attribute, 3).is_none()
+    {
+        let mut output = attribute.to_vec();
+        encode_varint((3 << 3) as u64, &mut output);
+        encode_varint(0, &mut output);
+        output
+    } else {
+        attribute.to_vec()
+    }
+}
+
+fn field_varint(message: &[u8], wanted_field: u64) -> Option<u64> {
+    let mut cursor = 0usize;
+    while cursor < message.len() {
+        let key = decode_varint(message, &mut cursor);
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match wire_type {
+            0 => {
+                let value = decode_varint(message, &mut cursor);
+                if field == wanted_field {
+                    return Some(value);
+                }
+            }
+            1 => cursor = cursor.checked_add(8).expect("fixed64 offset overflow"),
+            2 => {
+                let length = decode_varint(message, &mut cursor) as usize;
+                cursor = cursor
+                    .checked_add(length)
+                    .expect("length-delimited offset overflow");
+            }
+            5 => cursor = cursor.checked_add(4).expect("fixed32 offset overflow"),
+            other => panic!("unsupported protobuf wire type {other}"),
+        }
+        assert!(cursor <= message.len(), "malformed protobuf field");
+    }
+    None
+}
+
+fn rewrite_length_delimited(
+    message: &[u8],
+    wanted_field: u64,
+    mut rewrite: impl FnMut(&[u8]) -> Vec<u8>,
+) -> Vec<u8> {
+    let mut cursor = 0usize;
+    let mut output = Vec::with_capacity(message.len());
+    while cursor < message.len() {
+        let field_start = cursor;
+        let key = decode_varint(message, &mut cursor);
+        let field = key >> 3;
+        let wire_type = key & 7;
+        match wire_type {
+            0 => {
+                decode_varint(message, &mut cursor);
+                output.extend_from_slice(&message[field_start..cursor]);
+            }
+            1 => {
+                cursor = cursor.checked_add(8).expect("fixed64 offset overflow");
+                assert!(cursor <= message.len(), "malformed fixed64 field");
+                output.extend_from_slice(&message[field_start..cursor]);
+            }
+            2 => {
+                let length = decode_varint(message, &mut cursor) as usize;
+                let payload_end = cursor
+                    .checked_add(length)
+                    .expect("length-delimited offset overflow");
+                assert!(payload_end <= message.len(), "malformed protobuf field");
+                if field == wanted_field {
+                    let rewritten = rewrite(&message[cursor..payload_end]);
+                    encode_varint(key, &mut output);
+                    encode_varint(rewritten.len() as u64, &mut output);
+                    output.extend_from_slice(&rewritten);
+                } else {
+                    output.extend_from_slice(&message[field_start..payload_end]);
+                }
+                cursor = payload_end;
+            }
+            5 => {
+                cursor = cursor.checked_add(4).expect("fixed32 offset overflow");
+                assert!(cursor <= message.len(), "malformed fixed32 field");
+                output.extend_from_slice(&message[field_start..cursor]);
+            }
+            other => panic!("unsupported protobuf wire type {other}"),
+        }
+    }
+    output
+}
+
+fn decode_varint(bytes: &[u8], cursor: &mut usize) -> u64 {
+    let mut value = 0u64;
+    for shift in (0..70).step_by(7) {
+        let byte = *bytes.get(*cursor).expect("truncated protobuf varint");
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return value;
+        }
+    }
+    panic!("protobuf varint exceeds u64");
+}
+
+fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn verify_fixture(name: &str, model: &onnx_std::Model) {
     use onnx_runtime_ir::{Attribute, DataType};
 
-    let model = onnx_std::textproto::from_textproto(text)
-        .unwrap_or_else(|error| panic!("{name}: parse textproto: {error}"));
     assert_eq!(model.metadata.ir_version, 11, "{name}: IR version");
     assert_eq!(
         model.graph.opset_imports.get("").copied(),
@@ -239,7 +365,7 @@ fn verify_fixture(name: &str, text: &str) {
         .collect();
     match name {
         "unique_all_outputs" => {
-            assert_eq!(sorted, 1);
+            assert_eq!(sorted, 0);
             assert_eq!(
                 output_names,
                 [
@@ -470,10 +596,10 @@ fn cuda_unique_is_claimed_and_materialized_through_real_ort_plugin() {
             .map(|output| output_bytes(session.api, *output))
             .collect();
         assert_eq!(got[0].0, [4]);
-        assert_eq!(f32s(&got[0].2), [1., 2., 3., 4.]);
-        assert_eq!(i64s(&got[1].2), [1, 0, 3, 4]);
-        assert_eq!(i64s(&got[2].2), [1, 0, 0, 2, 3, 2]);
-        assert_eq!(i64s(&got[3].2), [2, 1, 2, 1]);
+        assert_eq!(f32s(&got[0].2), [2., 1., 3., 4.]);
+        assert_eq!(i64s(&got[1].2), [0, 1, 3, 4]);
+        assert_eq!(i64s(&got[2].2), [0, 1, 1, 2, 3, 2]);
+        assert_eq!(i64s(&got[3].2), [1, 2, 2, 1]);
         assert_eq!(metadata_launches(), 1);
         assert_eq!(materialize_launches(), 1);
         assert_eq!(d2h_bytes(), 8);
@@ -496,6 +622,7 @@ fn cuda_unique_optional_outputs_stay_positional_through_real_ort_plugin() {
         if std::env::var("NXRT_REQUIRE_ORT_TESTS").as_deref() == Ok("1") {
             panic!("CUDA plugin or ORT unavailable");
         }
+
         return;
     };
     unsafe {
