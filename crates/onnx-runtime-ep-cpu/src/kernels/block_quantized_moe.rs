@@ -1387,6 +1387,159 @@ mod tests {
         );
     }
 
+    /// One expert's dense expansion is built once and handed to every row
+    /// routed to it -- not re-resolved per row, and not rebuilt per row block.
+    ///
+    /// The sharing is what makes cached-dense affordable at prefill widths: a
+    /// 48-row batch routed to one expert must pay for one fc1 and one fc2
+    /// expansion, the same as a single decode token. Counting *builds* alone
+    /// would not see a regression that moved resolution into the row loop --
+    /// the cache would absorb it and turn 46 rows into 46 hits -- so this
+    /// pins the whole activity pair. `(hits, builds) == (0, 2)` says the
+    /// resolve happened once per projection for the entire batch.
+    ///
+    /// Kernel-local counters deliberately, not the process-wide
+    /// `BLOCK_QUANT_MOE_DENSE_EXPANSIONS`: tests in this binary run
+    /// concurrently, so a delta on a global would be a race dressed as an
+    /// assertion.
+    #[test]
+    fn one_expert_expansion_is_shared_by_every_row_routed_to_it() {
+        const ROWS: usize = 48;
+        let experts = E;
+        let fc1_out = H;
+        let input_values: Vec<f32> = (0..ROWS * H)
+            .map(|i| (i % 64) as f32 / 16.0 - 1.0)
+            .collect();
+        // Every row prefers expert 0, so the batch is one expert group of 48.
+        let logits_values: Vec<f32> = (0..ROWS).flat_map(|_| [4.0f32, -4.0]).collect();
+        let fc1_values = identity_projection([2, 4]);
+        let fc2_values = identity_projection([2, 2]);
+        let shapes = vec![
+            Some((DataType::Float32, vec![ROWS, H])),
+            Some((DataType::Float32, vec![ROWS, experts])),
+            Some((DataType::Uint8, vec![experts, fc1_out, 1, 17])),
+            None,
+            Some((DataType::Uint8, vec![experts, H, 1, 17])),
+            None,
+            None,
+            None,
+        ];
+        let (graph, node) = model_node(&shapes, &attrs("identity", 1, false, 0));
+        let ValidatedMetadata {
+            attributes,
+            formats,
+        } = validate_metadata(graph.node(node), None).expect("valid BlockQuantizedMoE metadata");
+        let mut kernel = BlockQuantizedMoEKernel {
+            attributes,
+            formats,
+            constant_inputs: [false; 9],
+            weight_identities: std::array::from_fn(|_| DenseWeightIdentity::default()),
+            weight_cache: DenseWeightCache::new(),
+        };
+        kernel.set_constant_inputs(&[false, false, true, false, true, false, false, false]);
+
+        let input = Owned::f32(&[ROWS, H], &input_values);
+        let logits = Owned::f32(&[ROWS, experts], &logits_values);
+        let fc1 = Owned::u8(&[experts, fc1_out, 1, 17], &fc1_values);
+        let fc2 = Owned::u8(&[experts, H, 1, 17], &fc2_values);
+        let views = [
+            input.view(),
+            logits.view(),
+            fc1.view(),
+            TensorView::absent(DataType::Float32),
+            fc2.view(),
+            TensorView::absent(DataType::Float32),
+            TensorView::absent(DataType::Uint8),
+            TensorView::absent(DataType::Float32),
+        ];
+        let mut output = Owned::f32(&[ROWS, H], &vec![0.0; ROWS * H]);
+
+        kernel
+            .execute(&views, &mut [output.view_mut()])
+            .expect("48-row MoE execution");
+
+        assert_eq!(
+            kernel.weight_cache.activity(),
+            (0, 2),
+            "48 rows through one expert must resolve fc1 and fc2 once each, \
+             not once per row"
+        );
+        assert_eq!(
+            kernel.weight_cache.stats().0,
+            2,
+            "exactly the routed expert's two projections are resident"
+        );
+
+        // Non-vacuity: the batch really was 48 rows of real work. Without this
+        // the assertions above are satisfied by a kernel that computed nothing,
+        // which is the cheapest way to expand a weight zero times.
+        let produced = output.to_f32();
+        assert_eq!(produced.len(), ROWS * H);
+        assert!(
+            produced
+                .chunks_exact(H)
+                .all(|row| row.iter().any(|v| *v != 0.0)),
+            "every routed row must carry expert output"
+        );
+
+        // The shared buffer itself, rather than a count that stands in for it:
+        // two resolutions of the same expert projection hand back one
+        // allocation, so every row block reads the same immutable pack.
+        let first = kernel
+            .dequantize_expert_cached(
+                Some(&kernel.weight_identities[0]),
+                1,
+                &fc1.view(),
+                0,
+                fc1_out,
+                H,
+                experts,
+                kernel.formats.fc1,
+            )
+            .expect("resolve expert 0 fc1");
+        let again = kernel
+            .dequantize_expert_cached(
+                Some(&kernel.weight_identities[0]),
+                1,
+                &fc1.view(),
+                0,
+                fc1_out,
+                H,
+                experts,
+                kernel.formats.fc1,
+            )
+            .expect("resolve expert 0 fc1 again");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "row blocks must share one immutable expansion, not copies of it"
+        );
+
+        // Negative control: the counter is not simply stuck. A different
+        // expert is a different pack, and says so both ways.
+        let builds_before = kernel.weight_cache.activity().1;
+        let other = kernel
+            .dequantize_expert_cached(
+                Some(&kernel.weight_identities[0]),
+                1,
+                &fc1.view(),
+                1,
+                fc1_out,
+                H,
+                experts,
+                kernel.formats.fc1,
+            )
+            .expect("resolve expert 1 fc1");
+        assert_eq!(
+            kernel.weight_cache.activity().1,
+            builds_before + 1,
+            "an unseen expert must build"
+        );
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "two experts must not share one expansion"
+        );
+    }
+
     #[test]
     fn nonconstant_fc3_matches_dense_reference_for_unfused_gated_activations() {
         let experts = E;
