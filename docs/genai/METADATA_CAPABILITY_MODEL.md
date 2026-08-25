@@ -1,7 +1,7 @@
 # Metadata capability model
 
 Status: **normative proposal**. This document audits the current tree at
-`6705b0f55cbdfd8d5538a3c8a8d8f46019e6979c` and proposes a simplification. It
+`66ca26a5d5d1597e471c6a58c12e4913b97da56a` and proposes a simplification. It
 does not change the metadata schema, parser, validator, generated schema, or
 runtime.
 
@@ -167,7 +167,7 @@ contradict its source.
 | [`BatchingCapability`](../../crates/onnx-genai-engine/src/batched.rs) | Result derived from the resolved backend and decode path. | Runtime admission evidence; stronger than a package boolean. |
 | [`ConcurrentRunSupport`](../../crates/onnx-genai-ort/src/session/mod.rs) | Result derived from resolved providers plus capture state. | Runtime admission evidence. |
 | [`MemoryStrategyPlan`](../../crates/onnx-genai-engine/src/config.rs) | Inferred and effective memory strategy, source, evidence, and advisory status. | Useful shape for generated evidence, though ORT plans may be advisory only. |
-| [`WorkerPool` and `SessionPlacement`](../../crates/onnx-genai-server/src/worker.rs) | Thread ownership and routing of session state. | Runtime topology and placement policy. |
+| [`WorkerPool` and `SessionPlacement`](../../crates/onnx-genai-server/src/worker.rs) | One or more owner-thread engines, deterministic new-session/stateless placement, and routing back to the worker that owns session state. | Implemented runtime topology; worker count is deployment policy, while the saved placement is runtime state. |
 | [`SessionLeases`](../../crates/onnx-genai-server/src/lease.rs) | Same-session single-flight enforcement. | Runtime correctness enforcement of authored mutation semantics. |
 
 ### 2.3 Hosted Hugging Face examples
@@ -179,7 +179,7 @@ Upstream Hugging Face sources that contain no inference metadata are provenance,
 not hosted metadata examples. The resulting fleet is 28 packages.
 
 Every revision below was downloaded by immutable SHA and checked with the
-`6705b0f55` `validate_metadata --metadata-only --shape` binary. **Valid** means
+`66ca26a5d` `validate_metadata --metadata-only --shape` binary. **Valid** means
 the metadata parses and passes semantic validation. Direct ORT evidence means a
 model card or evidence file exercises graphs directly; workflow ORT evidence
 means the generic workflow engine executed the package. Neither is native
@@ -451,7 +451,28 @@ capture regions or segments selected after admission are backend-derived plans.
 
 A field that says only “graph capture supported” would conceal all four facts.
 
-### 4.13 Functional workflow execution is not a performance claim
+### 4.13 Worker placement is implemented, policy-selected, and fail closed
+
+[`OrtSessionWorkerCount`](../../crates/onnx-genai-server/src/state.rs) is the
+operator's bounded `--ort-session-workers` choice and defaults to one.
+[`WorkerPool::reserve_session_placement`](../../crates/onnx-genai-server/src/worker.rs)
+places each new session on the healthy worker with the fewest live plus pending
+sessions, while stateless turns use the fewest active turns. The resulting
+`SessionPlacement { worker, engine_session_id }` is runtime state: later turns
+return to that owner, continuous batches never span workers, and a failed
+worker's sessions are not silently migrated.
+
+Multiple workers are not a portable model capability. They are admitted only
+for a contracted single-decoder ORT engine whose resolved session reports
+concurrent `Run`; native, composite, speculative, external-KV, capture, and
+single-flight configurations fail closed rather than being silently reduced to
+one worker. Same-session turns remain protected by the routing lease even when
+distinct sessions execute on different workers. See
+[`two_ort_workers_run_distinct_sessions_concurrently_with_colliding_local_ids`](../../crates/onnx-genai-server/src/driver.rs)
+and
+[`multiple_ort_workers_fail_closed_for_native_decode`](../../crates/onnx-genai-server/src/tests.rs).
+
+### 4.14 Functional workflow execution is not a performance claim
 
 The universal interpreter has recorded functional execution for named
 fixtures/artifacts. Execution-island code and CUDA-gated tests establish
@@ -696,7 +717,7 @@ than the implementation column.
 | Backend-derived execution islands | N/A | N/A | Yes | No record | No | No record | No accepted record | [`plan_execution_islands`](../../crates/onnx-genai-engine/src/pipeline/islands.rs) is automatic optimizer planning. CUDA tests may return without executing when CUDA is unavailable, so code/tests alone do not establish a record. |
 | Concurrent ORT `Session::Run` | N/A | N/A | Yes | Recorded fixture | N/A | N/A | No accepted performance record | [`a_concurrently_runnable_session_can_actually_be_run_from_two_threads`](../../crates/onnx-genai-ort/tests/session_thread_contract.rs) is non-skipped and executes one admitted session from two threads. |
 | Same-session overlapping turns | Yes | Yes | N/A | N/A | N/A | N/A | N/A | Shared routing-layer [`SessionLeases`](../../crates/onnx-genai-server/src/lease.rs) serialize or reject overlap before backend execution unless isolated state is proven; a backend concurrency flag cannot override this. |
-| Worker placement | N/A | N/A | N/A | N/A | N/A | N/A | No accepted record | Pure deployment policy; default placement is same-thread unless explicitly configured. |
+| Worker placement / cross-session parallelism | N/A | N/A | Yes | Recorded fixture (W=2 CPU ORT) | No | Recorded refusal | No accepted performance record | Worker count is deployment policy and defaults to one. [`two_ort_workers_run_distinct_sessions_concurrently_with_colliding_local_ids`](../../crates/onnx-genai-server/src/driver.rs) records deterministic placement and simultaneous execution; [`multiple_ort_workers_fail_closed_for_native_decode`](../../crates/onnx-genai-server/src/tests.rs) records native refusal. Sessions never migrate and same-session turns remain single-flight. |
 | Workflow policy interpreter/sampler | Yes | Yes | Yes | Recorded artifact | Partial | Recorded fixture (subset) | Fail (current scoped gate) | Functional policy-graph execution does not establish an optimized sampler. [The current measured baseline](../benchmarks/2026-08-21-mobius-workflow-conformance.md#current-measured-baseline) records `0.903x` direct-composite throughput and min-p TTFT regression, and excludes production KV/per-row serving. |
 
 ## 8. Fail-closed rules and examples
@@ -823,7 +844,9 @@ the already-merged batching work.
     declaration × control flow × stable/dynamic shape. Every decline names the
     exact predicate.
 11. **Session placement:** exclusive and copy-on-write mutation policies,
-    same-session racing turns, multiple workers, failover, and state continuity.
+    same-session racing turns, default `W = 1`, opt-in ORT `W > 1`,
+    deterministic least-loaded placement, unsupported-backend refusal, worker
+    failure without silent migration, and state continuity.
 12. **Performance gates:** use
     [WORKFLOW_PERFORMANCE_CONFORMANCE.md](../WORKFLOW_PERFORMANCE_CONFORMANCE.md);
     retain raw samples and identities, and never accept an env-gated harness as
@@ -869,6 +892,9 @@ the already-merged batching work.
 14. Which execution-island enable/fallback controls, if any, should be exposed
     as deployment policy without exposing or serializing the generated island
     topology?
+15. What aggregate-throughput and memory-accounting gate must an opt-in
+    `W > 1` ORT worker deployment pass before it may claim performance benefit,
+    separately from the recorded two-worker functional result?
 
 ## 12. Reader guide
 
@@ -910,7 +936,8 @@ Read in this order:
 10. [`server/worker.rs`](../../crates/onnx-genai-server/src/worker.rs),
     [`server/lease.rs`](../../crates/onnx-genai-server/src/lease.rs), and
     [`server/driver.rs`](../../crates/onnx-genai-server/src/driver.rs) — current
-    single-worker placement and session single-flight.
+    opt-in ORT worker pool, deterministic placement, owner-thread routing,
+    fail-closed backend gate, and same-session single-flight.
 11. [ENCODER_BATCHING.md](ENCODER_BATCHING.md),
     [CHAINED_SPECULATIVE_EVIDENCE.md](CHAINED_SPECULATIVE_EVIDENCE.md),
     [WORKFLOW_PERFORMANCE_CONFORMANCE.md](../WORKFLOW_PERFORMANCE_CONFORMANCE.md),
