@@ -275,6 +275,7 @@ pub fn decoder_abi(workflow: &WorkflowSpec, component: &str) -> Option<DecoderAb
         state_pairs: (!state_pairs.is_empty()).then_some(state_pairs),
         optional_inputs,
         static_cache,
+        csa_state_groups: None,
     })
 }
 

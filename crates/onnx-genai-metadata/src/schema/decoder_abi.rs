@@ -189,6 +189,21 @@ pub struct DecoderAbi {
     /// than having its integer control ports guessed by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_cache: Option<StaticCacheIoSpec>,
+
+    /// Explicit CompressedSparseAttention (CSA/HCA) state-group contracts, one
+    /// per compressed-attention layer group.
+    ///
+    /// DeepSeek-V4 threads compressed KV attention state as role-typed
+    /// `present_* -> past_*` port pairs whose logical length is a backend-owned
+    /// cursor — neither a growing dense KV cache nor a fixed-shape replace
+    /// tensor. A schedule that alternates ratio-4 (query-selective CSA) and
+    /// ratio-128 (HCA) layers declares one group per layer, so this is a list.
+    /// When present, the runtime discovers each group from its declared roles,
+    /// validates its ports against the real graph, and refuses with a typed
+    /// reason before allocating. Absent means the graph threads no CSA state and
+    /// the historical behavior is preserved byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csa_state_groups: Option<Vec<CsaStateGroupAbi>>,
 }
 
 /// Explicit port ABI for a fixed-buffer TensorScatter static KV cache.

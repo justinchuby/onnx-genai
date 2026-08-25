@@ -783,6 +783,7 @@ impl GenAiConfig {
             state_pairs,
             optional_inputs: std::collections::BTreeMap::new(),
             static_cache: None,
+            csa_state_groups: None,
         })
     }
 

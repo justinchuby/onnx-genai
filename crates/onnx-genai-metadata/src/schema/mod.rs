@@ -16,6 +16,7 @@ where
     Ok(value)
 }
 
+mod csa_state_group;
 mod decoder_abi;
 mod generation;
 mod hardware;
@@ -23,6 +24,7 @@ mod ir;
 mod package;
 mod pipeline;
 
+pub use csa_state_group::*;
 pub use schema_vocabulary::{LENGTH_CONTENT_ROLES, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT};
 
 pub use decoder_abi::*;

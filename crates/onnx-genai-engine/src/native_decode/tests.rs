@@ -1529,6 +1529,7 @@ fn target_io(sequence_source: SequenceInputKind) -> DecoderAbi {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        csa_state_groups: None,
         aliasing: None,
     }
 }
@@ -1556,6 +1557,7 @@ fn tiny_decoder_io() -> DecoderAbi {
         state_pairs: None,
         optional_inputs: BTreeMap::new(),
         static_cache: None,
+        csa_state_groups: None,
         aliasing: None,
     }
 }

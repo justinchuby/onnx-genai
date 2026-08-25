@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 mod backend;
 mod cpu;
+mod csa;
 mod cuda;
 mod io;
 mod kv_commit;
