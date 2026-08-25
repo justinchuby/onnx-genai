@@ -198,6 +198,44 @@ pub const WORKER_PROFILE_ENV: &str = "ONNX_GENAI_CPU_DECODE_WORKER_PROFILE";
 /// pure spinning and only genuinely idle gaps ramp into yielding then parking.
 const SPIN_LOOP_BUDGET: u32 = 1 << 12;
 
+/// Pure `spin_loop` iterations between clock reads once the worker is past
+/// [`SPIN_LOOP_BUDGET`].
+///
+/// A stride of *spins* is not the stride #1825 removed. That one was a stride of
+/// **yields**, where each skipped check cost microseconds to milliseconds of an
+/// already-starved thread; 64 `spin_loop`s cost hundreds of nanoseconds to a few
+/// microseconds -- `spin_loop` lowers to `pause` on x86_64, ~5ns on Skylake and
+/// ~47ns on Ice Lake and later, and to `yield`/`isb` on aarch64 -- so on every
+/// microarchitecture in the matrix the blocktime deadline is evaluated far more
+/// often here than the every-yield form it replaces. Kept a divisor of
+/// [`SPIN_LOOP_BUDGET`] so the yield phase gets its first clock read on the
+/// iteration it begins at rather than 63 spins later.
+const YIELD_CLOCK_STRIDE: u32 = 64;
+
+/// How often the active window offers the core to a co-tenant.
+///
+/// `sched_yield` only helps when another thread is eligible to run. A decode
+/// budget confines the process to exactly its own CPUs, so during a barrier the
+/// only other runnable threads are peers in the same wait: the yield finds
+/// nothing, releases nothing, and still pays a syscall and a scheduler pass.
+/// Yielding on every iteration made that the dominant cost of the window --
+/// 2.59 of 16 cores in the kernel at width 16, for no measurable throughput.
+///
+/// 50us offers the core ~10 times per [`DEFAULT_BLOCKTIME`] window -- scaling
+/// linearly with [`DECODE_BLOCKTIME_ENV`], so an operator who widens the window
+/// gets proportionally more offers rather than a fixed budget -- which keeps the
+/// phase polite on an oversubscribed host, while cutting the yield rate
+/// **38.8x**: 14896 yields per 20ms window before, 384 after. Both counted
+/// in-process by
+/// `the_active_window_yields_on_an_interval_not_on_every_iteration`, run against
+/// each version of this loop in turn; the test asserts a rate bound, not those
+/// two numbers. That lands as 2.61 -> 0.22 of 16 cores in the kernel at width
+/// 16, measured out-of-band with `int4_decode_loop_ab` (#2071). Deliberately not
+/// an env knob: it is a property of what `sched_yield` can do, not a workload
+/// tuning parameter, and a second spin knob beside [`DECODE_BLOCKTIME_ENV`]
+/// would invite sweeps that confound the two.
+const YIELD_INTERVAL: Duration = Duration::from_micros(50);
+
 /// How long [`SpmdDecodePools::build_with_schedule`]'s readiness barrier waits
 /// for every spawned worker to announce itself before declaring the pool
 /// unbuildable.
@@ -301,16 +339,27 @@ thread_local! {
     /// observable ("was it parked at T?") is not monotone that way and is
     /// flaky in the parallel suite, which is how the first version of this test
     /// failed -- passing alone and failing beside 1695 siblings.
+    ///
+    /// Counted on every yield, injected cost or not, so the rate limit in
+    /// [`SharedState::worker_wait`] can be asserted in the uninjected regime it
+    /// governs.
     static YIELD_COUNT: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Injected yield cost, shared by both yield phases in this file. See
 /// [`SLOW_YIELD_US`], which documents which thread reads it at each site.
+///
+/// [`YIELD_COUNT`] is bumped unconditionally, and only the *sleep* is
+/// conditional. The rate-limit test needs to count yields in the regime it is
+/// asserting about -- an uninjected one, where a yield costs ~1.2us -- and
+/// injecting a sleep to make the yield countable would have set the yield
+/// interval it exists to measure. A counter that only counts when the thing it
+/// counts has been perturbed cannot observe the unperturbed case at all.
 #[cfg(test)]
 fn slow_yield() {
+    YIELD_COUNT.with(|c| c.set(c.get() + 1));
     let us = SLOW_YIELD_US.with(Cell::get);
     if us > 0 {
-        YIELD_COUNT.with(|c| c.set(c.get() + 1));
         thread::sleep(Duration::from_micros(us));
     }
 }
@@ -984,6 +1033,9 @@ impl SharedState {
         // Phase 1: bounded active spin (blocktime), spin_loop ramping into yield.
         let mut spins = 0u32;
         let start = Instant::now();
+        // Zero, so the phase still offers the core on the iteration it begins
+        // at -- the yield is rate-limited from then on, not delayed to start.
+        let mut next_yield = Duration::ZERO;
         loop {
             let current = sense.load(Ordering::Acquire);
             if current != last_seen {
@@ -996,34 +1048,56 @@ impl SharedState {
             spins = spins.wrapping_add(1);
             if spins < SPIN_LOOP_BUDGET {
                 std::hint::spin_loop();
-            } else {
-                thread::yield_now();
-                #[cfg(test)]
-                slow_yield();
-                // Check the clock on *every* yield, not on a stride -- the same
-                // correction #1825 made to the readiness barrier below, which
-                // missed this site. The clock is never read during the pure
-                // spin phase here, so a stride amortised nothing: its only
-                // effect was to multiply the granularity of the blocktime
-                // deadline by 64 yields. `SPIN_LOOP_BUDGET` (4096) is itself a
-                // multiple of that removed 64-iteration stride, so the yield
-                // phase began exactly on a stride boundary -- the deadline was
-                // evaluated once, on the first yield, and then not again for 64
-                // more. A yield costs microseconds to milliseconds under
-                // contention, and contention is exactly when a worker holding a
-                // core past the window it was told to release at does the most
-                // damage. `Instant::now()` is a vDSO read against a yield that
-                // costs orders of magnitude more -- measured on this host,
-                // 32ns per read against 1214ns for an *uncontended*
-                // `yield_now`, i.e. 2.6%, and the fraction only shrinks as
-                // contention makes the yield slower. Checking every time is
-                // free exactly where it matters.
-                // With the stride gone this file has no clock-stride constant
-                // left: its only use was in the phase its own doc comment said
-                // it did not apply to.
-                if start.elapsed() >= blocktime {
+            } else if spins.is_multiple_of(YIELD_CLOCK_STRIDE) {
+                // Check the clock on a *spin* stride, and yield on a time
+                // interval rather than on every iteration.
+                //
+                // #1825 removed a stride from this deadline because it was a
+                // stride of **yields**: `SPIN_LOOP_BUDGET` (4096) is a multiple
+                // of 64, so the phase checked the deadline on its first yield
+                // and then went blind for 64 more, each costing microseconds to
+                // milliseconds under contention. That correction stands and is
+                // strengthened here, not undone -- the stride below is 64 pure
+                // `spin_loop`s, ~640ns, so the deadline is now evaluated far
+                // more often in wall-clock terms than "on every yield" ever
+                // achieved.
+                //
+                // What changes is the yield rate. Yielding on every iteration
+                // assumes there is somebody to yield *to*. On the cpuset a
+                // decode budget confines the process to, there is not: every
+                // other runnable thread is a peer in this same loop, so
+                // `sched_yield` finds nothing else eligible, returns
+                // immediately, and releases nothing -- while still paying a
+                // syscall and a full scheduler pass. Measured at width 16 on a
+                // 16-CPU cpuset, that loop held **2.59 of 16 cores in the
+                // kernel** (n=20 runs, range 2.29-3.07) and bought no
+                // throughput: 21.0 tokens/s per user-core against 21.6 with the
+                // window disabled outright, a gap inside the A/A null envelope
+                // of a 10-round paired run.
+                //
+                // A time interval keeps the politeness the phase was written
+                // for -- an oversubscribed host still gets the core offered
+                // ~10 times per default window -- at 1/39th of the syscalls:
+                // 14896 yields per 20ms window before, 384 after. Measured
+                // 2.61 -> 0.22 of 16 cores in the kernel, with throughput
+                // unchanged (279.6 -> 276.2 tokens/s median over 20 runs each,
+                // inside the A/A null). `Instant::now()` is a vDSO read (32ns
+                // on this host) against a yield that costs 1214ns even
+                // uncontended, so reading the clock is the cheap half of this
+                // loop and the yield is the expensive half. That is the ratio
+                // the rate limit is sized on.
+                let elapsed = start.elapsed();
+                if elapsed >= blocktime {
                     break;
                 }
+                if elapsed >= next_yield {
+                    thread::yield_now();
+                    #[cfg(test)]
+                    slow_yield();
+                    next_yield = elapsed + YIELD_INTERVAL;
+                }
+            } else {
+                std::hint::spin_loop();
             }
         }
         // Phase 2: park on the futex until the sense advances (or shutdown wakes
@@ -6055,6 +6129,11 @@ mod tests {
         DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
         POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
         SLOW_YIELD_US.with(|slot| slot.set(0));
+        // This test drives the *readiness barrier's* yield site, which shares
+        // `slow_yield` with `worker_wait`. Since that helper counts
+        // unconditionally, leaving the tally behind would hand a nonzero
+        // starting count to whatever libtest schedules next on this thread.
+        YIELD_COUNT.with(|slot| slot.set(0));
 
         let panic = outcome.err().unwrap_or_else(|| {
             panic!(
@@ -9716,6 +9795,114 @@ mod dispatch_claim_tests {
              evaluated on a stride in a phase where each iteration costs orders \
              of magnitude more than the `Instant::now()` the stride was \
              amortising"
+        );
+    }
+
+    /// The active window offers the core on a time interval, not on every
+    /// iteration.
+    ///
+    /// `sched_yield` releases a core only to a thread that is already eligible
+    /// to run. A decode budget confines the process to exactly its own CPUs, so
+    /// mid-barrier every other runnable thread is a peer in this same loop: the
+    /// yield finds nothing, returns immediately, and still pays a syscall and a
+    /// scheduler pass. Yielding on every iteration therefore did not make the
+    /// pool polite, it made it expensive -- measured at width 16 on a 16-CPU
+    /// cpuset, 2.59 of 16 cores in the kernel (n=20 runs, range 2.29-3.07),
+    /// against 21.0 tokens/s per user-core versus 21.6 with the window disabled
+    /// entirely, a difference inside the A/A null envelope of a 10-round paired
+    /// run. Kernel time bought no throughput.
+    ///
+    /// The bound asserted is arithmetic rather than empirical, which is what
+    /// makes it host-independent: a yield happens only when `elapsed` has
+    /// reached `next_yield`, and `next_yield` advances by at least
+    /// [`YIELD_INTERVAL`] each time, so the phase cannot yield more than
+    /// `blocktime / YIELD_INTERVAL` times **no matter how fast the loop spins**.
+    /// Load can only reduce the count. That is the opposite of a threshold tuned
+    /// until it passed.
+    ///
+    /// The ceiling is deliberately *not* computed from [`YIELD_INTERVAL`]. A
+    /// ceiling derived from the constant under test moves with it, so setting
+    /// the interval to one nanosecond would restore the exact defect and still
+    /// satisfy the assertion -- the same shape as an A/B whose control is
+    /// latched. It is stated absolutely instead, loose enough that retuning the
+    /// interval within a sane range cannot red the lane and tight enough that an
+    /// unlimited phase misses it by ~30x.
+    ///
+    /// Deliberately uninjected: `SLOW_YIELD_US` stays 0, because injecting a
+    /// sleep to make yields countable would itself set the interval under test.
+    /// [`slow_yield`] counts unconditionally for exactly this reason.
+    #[test]
+    // Same premise failure as the stride sibling above: under the interpreter
+    // 4096 `spin_loop`s outlast a 20ms deadline, so the yield phase is entered
+    // already expired, no yield happens, and the non-vacuity assertion -- not
+    // the rate limit -- is what fires.
+    #[cfg_attr(miri, ignore = "spin-vs-deadline ratio is wall-clock, not emulated")]
+    fn the_active_window_yields_on_an_interval_not_on_every_iteration() {
+        /// Long against [`YIELD_INTERVAL`] so the rate limit has room to bind,
+        /// short enough that the test costs ~20ms. An unrate-limited phase
+        /// yields ~16000 times here at ~1.2us per uncontended yield.
+        const BLOCKTIME: Duration = Duration::from_millis(20);
+        /// After the window closes, so the worker completes phase 1 and parks
+        /// rather than being rescued out of the spin early.
+        const RELEASE_AT: Duration = Duration::from_millis(60);
+        /// The slowest yield rate this phase is allowed to sustain: one per
+        /// 20us of window. Looser than the 50us [`YIELD_INTERVAL`] ships with,
+        /// so retuning that constant within a sane range cannot red the lane,
+        /// and ~30x tighter than the unlimited phase this replaced, which
+        /// yields ~16000 times in this window at ~1.2us per uncontended yield.
+        const MAX_YIELD_RATE: Duration = Duration::from_micros(20);
+
+        let shared = one_worker_shared_state();
+        SLOW_YIELD_US.with(|c| c.set(0));
+        YIELD_COUNT.with(|c| c.set(0));
+
+        let last_seen = shared.node_sense[0].0.wake.load(Ordering::Acquire);
+        let release = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                thread::sleep(RELEASE_AT);
+                let sense = &shared.node_sense[0].0.wake;
+                sense.fetch_add(1, Ordering::Release);
+                atomic_wait::wake_all(sense);
+            })
+        };
+
+        let observed = shared.worker_wait(0, 0, last_seen, BLOCKTIME);
+        release.join().expect("release thread panicked");
+
+        let yields = YIELD_COUNT.with(Cell::get);
+        // Both knobs cleared before asserting, matching the sibling above: a
+        // panic here would otherwise leave them set for whatever else libtest
+        // runs on this thread. `SLOW_YIELD_US` is already 0 on this path, and is
+        // reset anyway so the cleanup does not have to be re-derived if this
+        // test ever grows an injected arm.
+        YIELD_COUNT.with(|c| c.set(0));
+        SLOW_YIELD_US.with(|c| c.set(0));
+
+        assert_ne!(
+            observed, last_seen,
+            "worker_wait returned without observing the sense bump"
+        );
+        // Non-vacuity: a phase that never yielded satisfies any upper bound.
+        // Reaching 0 or 1 needs a ~20ms stall of this thread -- the whole
+        // window -- which a saturated runner can produce. That is why the
+        // message says inconclusive rather than naming a defect: a red here is
+        // a re-run, not a regression in `worker_wait`.
+        assert!(
+            yields >= 2,
+            "inconclusive: the yield phase yielded {yields} time(s) against a \
+             {BLOCKTIME:?} window, so the window had expired before the rate \
+             limit could bind. A bound nothing reached is not a pass"
+        );
+        let ceiling = (BLOCKTIME.as_nanos() / MAX_YIELD_RATE.as_nanos()) as u64;
+        assert!(
+            yields <= ceiling,
+            "the active window yielded {yields} times in {BLOCKTIME:?}, above \
+             the {ceiling} that one yield per {MAX_YIELD_RATE:?} allows. The \
+             phase is yielding on iterations rather than on elapsed time, which \
+             on a cpuset confined to the decode budget is a syscall per \
+             iteration that releases nothing -- 2.59 of 16 cores in the kernel \
+             when this was last measured, for no measurable throughput"
         );
     }
 
