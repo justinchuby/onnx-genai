@@ -46,7 +46,6 @@ const DECLINED: &[(&str, &str)] = &[
     //       claiming.
     ("", "NonMaxSuppression"), // output length = number of boxes kept
     ("", "NonZero"),           // output length = count of non-zeros
-    ("", "Unique"),            // output length = number of distinct values
     ("", "Range"),             // length = ceil((limit - start) / delta)
     ("", "OneHot"),            // depth comes from input[1]'s value
     ("", "Pad"),               // pads come from input[1]'s values (opset 11+)
@@ -255,6 +254,37 @@ fn every_registered_op_has_a_shape_rule_or_is_a_known_gap() {
          {newly_covered:?}. Remove them from `DECLINED` so the list keeps \
          describing reality."
     );
+}
+
+#[test]
+fn kernel_sized_output_strategy_census_is_exact_and_registered() {
+    const EXPECTED: &[(&str, &str)] = &[("", "Unique")];
+    let actual = onnx_runtime_ep_plugin::compute::kernel_sized_output_strategy_census();
+    assert!(
+        !actual.is_empty(),
+        "kernel-sized output census must not be empty"
+    );
+    assert_eq!(
+        actual, EXPECTED,
+        "kernel-sized output strategies changed; update the execution-contract tests explicitly"
+    );
+
+    let registered = registered_ops();
+    for &(domain, op_type) in actual {
+        assert!(
+            registered.contains(&(domain.to_string(), op_type.to_string())),
+            "{domain}::{op_type} has a kernel-sized strategy but no registered CPU kernel"
+        );
+        let mut node = Node::new(NodeId(0), op_type, vec![Some(ValueId(0))], vec![ValueId(1)]);
+        node.domain = domain.to_string();
+        assert!(
+            matches!(
+                ShapeInference::for_node(&node, &[vec![Some(4)]], 1),
+                ShapeInference::KernelSizedOutputs
+            ),
+            "{domain}::{op_type} is listed but does not select KernelSizedOutputs"
+        );
+    }
 }
 
 /// Every activation and normalisation op this EP owns must be assigned to it.
