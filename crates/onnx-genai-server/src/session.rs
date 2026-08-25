@@ -1296,26 +1296,51 @@ mod tests {
         }
     }
 
-    /// The production registry reports to the process-global gauge.
+    /// A registry built the production way reports to the process-global gauge.
     ///
-    /// [`mod gauge`] asserts the arithmetic against a counter of its own; this
-    /// asserts the wire is still attached, which is the one thing a local
-    /// counter cannot see. It measures a delta rather than an absolute, because
-    /// the rest of this binary is moving the same gauge, and it asserts only a
-    /// lower bound on that delta for the same reason — anything exact would be
-    /// asserting that no other test opened a session at the same instant.
+    /// [`mod gauge`] asserts the arithmetic against a counter of its own, which
+    /// leaves exactly one thing a local counter cannot see: that production
+    /// picks the global destination rather than a test one. That is a property
+    /// of the constructor, so it is asserted as one — deterministically, and
+    /// without reading a counter the rest of this binary is also moving.
     #[test]
-    fn the_registry_reports_its_size_to_the_process_global_gauge() {
-        let before = crate::metrics::snapshot().active_sessions;
+    fn a_registry_built_the_production_way_reports_to_the_global_gauge() {
         let registry = SessionRegistry::new(4);
-        registry
-            .insert("sess-global".to_string(), binding(1))
-            .expect("under the bound");
+        assert!(
+            matches!(registry.gauge, SessionGauge::Global),
+            "SessionRegistry::new must report to the process-global gauge",
+        );
+    }
+
+    /// And the global destination is really the `/metrics` gauge.
+    ///
+    /// The assertion is a lower bound over a large batch rather than an exact
+    /// delta, and deliberately so: other tests in this binary open and close
+    /// single sessions while this one runs, so an equality here would be
+    /// asserting that none of them happened to move the counter in between —
+    /// a race, not a measurement. A batch three orders of magnitude larger than
+    /// anything the rest of the suite holds at once cannot be cancelled out by
+    /// it, so the bound is both robust and still falsified by a gauge that is
+    /// not wired up at all, which is the failure being excluded.
+    #[test]
+    fn the_global_destination_is_the_gauge_that_metrics_serves() {
+        const BATCH: u64 = 4_096;
+
+        let before = crate::metrics::snapshot().active_sessions;
+        let registry = SessionRegistry::new(usize::try_from(BATCH).unwrap());
+        for index in 0..BATCH {
+            registry
+                .insert(format!("sess-global-{index}"), binding(index))
+                .expect("under the bound");
+        }
         let after = crate::metrics::snapshot().active_sessions;
         assert!(
-            after > before,
-            "binding a conversation must reach the global gauge ({before} -> {after})",
+            after >= before + BATCH / 2,
+            "{BATCH} conversations must reach the global gauge ({before} -> {after})",
         );
+
+        // And the registry takes its own count with it, so this test does not
+        // leave the gauge raised for everybody else.
         drop(registry);
     }
 }
