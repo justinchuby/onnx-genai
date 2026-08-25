@@ -111,6 +111,9 @@ crates/*/target/
 .rg_*
 .rv_*
 .roy_*
+# Hyphenated variant. `.roy_*` does not match `.roy-scratch/`, so a scratch dir
+# named with a hyphen was committed by `add -A` and survived two reviews.
+.roy-*
 # Summary transcript from roy_validate.sh. The per-gate logs match `.rv_*`,
 # but the summary did not, so it was easy to commit by accident with `add -A`.
 roy_validate.log
