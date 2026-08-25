@@ -7693,6 +7693,56 @@ mod tests {
         }
     }
 
+    /// On a one-CPU-per-core cpuset the core rule and the historical
+    /// logical-CPU rule agree at **every** width.
+    ///
+    /// #1729 changed this reserve from `total < allowed ? total : allowed - 1`
+    /// to `min(total, cores - 1)` within the core budget. When the mask holds
+    /// one CPU per physical core, `allowed == cores` and the two coincide:
+    /// below saturation `min(total, allowed - 1) == total` because
+    /// `total <= allowed - 1`; at and above saturation both give `allowed - 1`.
+    ///
+    /// That equality is what makes every `taskset`-pinned benchmark in
+    /// `docs/performance/CPU_MATMUL_ASSIGNMENT.md` comparable across #1729 --
+    /// the pool has the same number of workers on the same CPUs before and
+    /// after. It is asserted because it was very nearly got wrong the other
+    /// way: the post-#1729 formula is easy to read as a change at saturation,
+    /// and it is only *not* one because the pre-#1729 formula reserved there
+    /// too. A future change to the reserve that breaks this silently
+    /// invalidates a file full of measurements, so let it break here instead.
+    #[test]
+    fn the_core_reserve_matches_the_logical_reserve_on_a_one_cpu_per_core_mask() {
+        // The rule #1729 replaced, kept here as the reference to compare
+        // against rather than described in prose.
+        fn logical_rule(total: usize, allowed_count: usize) -> usize {
+            if allowed_count == 0 || total < allowed_count {
+                return total;
+            }
+            allowed_count
+                .saturating_sub(DISPATCHER_RESERVED_CPUS)
+                .max(1)
+        }
+
+        for mask in [1usize, 2, 4, 8, 16, 32] {
+            for total in 1..=(mask * 2) {
+                assert_eq!(
+                    reserve_single_group_headroom(total, mask, mask),
+                    logical_rule(total, mask),
+                    "core and logical reserves disagree at total={total} on a \
+                     {mask}-CPU one-per-core mask, so #1729 moved the worker \
+                     count of a pinned benchmark"
+                );
+            }
+        }
+
+        // The contrast: with both SMT siblings allowed the rules genuinely
+        // differ, which is the 16-workers-on-8-cores case #1729 exists to fix.
+        // Without this the test above would also pass on a reserve that had
+        // simply stopped distinguishing the two masks.
+        assert_eq!(reserve_single_group_headroom(16, 32, 16), 15);
+        assert_eq!(logical_rule(16, 32), 16);
+    }
+
     #[test]
     fn reserve_single_group_headroom_is_a_noop_when_headroom_exists_or_affinity_unknown() {
         // Requested workers < allowed CPUs: genuine headroom already exists, so

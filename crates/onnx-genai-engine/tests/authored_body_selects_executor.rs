@@ -129,17 +129,18 @@ fn an_in_graph_body_selects_no_runtime_executor() -> anyhow::Result<()> {
     // invocations are: they are recorded by the interpreter's own `Invoke`
     // dispatch, so a non-empty set proves this package's tokens came out of
     // `run_workflow_node` and not from somewhere else.
-    // The decoder graph is invoked as a declared component; the sampler and
-    // termination predicate this package also declares are fused into an
-    // execution island, so they are reported there rather than individually.
+    // Every dynamic leading-axis component remains visible to admission instead
+    // of being hidden in an execution island.
     let components = engine.component_invocations();
+    for component in ["model", "token_sampler", "termination"] {
+        assert!(
+            components.get(component).copied().unwrap_or(0) > 0,
+            "the declared component '{component}' must have been invoked: {components:?}"
+        );
+    }
     assert!(
-        components.get("model").copied().unwrap_or(0) > 0,
-        "the declared decoder component must have been invoked: {components:?}"
-    );
-    assert!(
-        !engine.execution_island_diagnostics().is_empty(),
-        "this package's policy components are fused into an execution island"
+        engine.execution_island_diagnostics().is_empty(),
+        "request-batched policy components must retain their admission boundaries"
     );
     Ok(())
 }
@@ -174,18 +175,22 @@ fn a_speculative_body_selects_its_declared_components() -> anyhow::Result<()> {
     // As above: the positive half is what rules out a second drive. An empty
     // contract count would also be produced by a loop that never reached the
     // interpreter at all.
-    // The proposer and verifier graphs are fused into an execution island, so
-    // their work is reported there rather than as individual component stages;
-    // the grammar adapters this package also declares are not fusible and show
-    // up by name.
+    // The proposer and verifier both have dynamic request axes, so they remain
+    // individual component stages where admission can validate them.
     let components = engine.component_invocations();
     assert!(
         components.keys().any(|name| name.starts_with("grammar_")),
         "the declared grammar adapters must have been invoked: {components:?}"
     );
+    for component in ["proposer", "verifier"] {
+        assert!(
+            components.get(component).copied().unwrap_or(0) > 0,
+            "the declared component '{component}' must have been invoked: {components:?}"
+        );
+    }
     assert!(
-        !engine.execution_island_diagnostics().is_empty(),
-        "this package's proposer and verifier are fused into an execution island"
+        engine.execution_island_diagnostics().is_empty(),
+        "request-batched proposer and verifier must retain their admission boundaries"
     );
     Ok(())
 }

@@ -487,7 +487,13 @@ impl WorkflowRuntime {
             }
 
             let produced = self
-                .invoke_component_values(plan.proposer, &bound, &outputs, &output_symbols)
+                .invoke_component_values(
+                    plan.proposer,
+                    &bound,
+                    &outputs,
+                    &output_symbols,
+                    batch_rows,
+                )
                 .with_context(|| {
                     format!("chained proposer '{}' step {step} failed", plan.proposer)
                 })?;

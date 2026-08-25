@@ -18,6 +18,17 @@ fn package(name: &str, metadata: &str, models: &[(&str, &str)]) -> anyhow::Resul
     Ok(root)
 }
 
+fn fixed_model_dimensions(model: &str, dimensions: &[(&str, i64)]) -> String {
+    dimensions
+        .iter()
+        .fold(model.to_string(), |model, (name, extent)| {
+            model.replace(
+                &format!("dim_param: \"{name}\""),
+                &format!("dim_value: {extent}"),
+            )
+        })
+}
+
 const GREEDY: &str = r#"
 ir_version: 8
 graph {
@@ -1215,7 +1226,7 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits:
-        contract: { dtype: float32, rank: 2, shape: [batch, vocabulary] }
+        contract: { dtype: float32, rank: 2, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits }
         required: true
@@ -1231,11 +1242,11 @@ pipeline:
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [1] }
         role: tokens
         stage: pre_adapter
       done:
-        contract: { dtype: bool, rank: 1, shape: [batch] }
+        contract: { dtype: bool, rank: 1, shape: [1] }
         role: tensor
         stage: pre_adapter
     components:
@@ -1283,14 +1294,17 @@ pipeline:
         output: done
         mode: replace
 "#;
+    let min_p_filter = fixed_model_dimensions(MIN_P_FILTER, &[("batch", 1), ("vocabulary", 4)]);
+    let sampler = fixed_model_dimensions(SIMPLE_GREEDY, &[("batch", 1), ("vocabulary", 4)]);
+    let termination = fixed_model_dimensions(EOS_PREDICATE, &[("batch", 1)]);
     let root = package(
         "execution-island-min-p",
         metadata,
         &[
-            ("min-p.onnx.textproto", MIN_P_FILTER),
-            ("sampler.onnx.textproto", SIMPLE_GREEDY),
-            ("alternate-sampler.onnx.textproto", SIMPLE_GREEDY),
-            ("eos.onnx.textproto", EOS_PREDICATE),
+            ("min-p.onnx.textproto", min_p_filter.as_str()),
+            ("sampler.onnx.textproto", sampler.as_str()),
+            ("alternate-sampler.onnx.textproto", sampler.as_str()),
+            ("eos.onnx.textproto", termination.as_str()),
         ],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
@@ -1467,18 +1481,18 @@ pipeline:
       capabilities: [workflow_ssa, typed_emit]
     inputs:
       logits.raw:
-        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        contract: { dtype: float32, rank: 2, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits.raw }
         required: true
       logits_raw:
-        contract: { dtype: float32, rank: 2, shape: [batch, 4] }
+        contract: { dtype: float32, rank: 2, shape: [1, 4] }
         role: { kind: opaque }
         source: { kind: application, name: logits_raw }
         required: true
     outputs:
       token:
-        contract: { dtype: int64, rank: 1, shape: [batch] }
+        contract: { dtype: int64, rank: 1, shape: [1] }
         role: tokens
         stage: pre_adapter
     components:
@@ -1500,12 +1514,14 @@ pipeline:
         output: token
         mode: replace
 "#;
+    let add = fixed_model_dimensions(ADD_PAIR, &[("batch", 1)]);
+    let sampler = fixed_model_dimensions(SIMPLE_GREEDY, &[("batch", 1), ("vocabulary", 4)]);
     let root = package(
         "execution-island-name-collision",
         metadata,
         &[
-            ("add.onnx.textproto", ADD_PAIR),
-            ("sampler.onnx.textproto", SIMPLE_GREEDY),
+            ("add.onnx.textproto", add.as_str()),
+            ("sampler.onnx.textproto", sampler.as_str()),
         ],
     )?;
     let mut engine = Engine::from_dir(&root, EngineConfig::default())?;
@@ -2145,33 +2161,45 @@ pipeline:
     );
 
     let speculative_metadata = r#"
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
       adapter_abis: {}
       capabilities: [workflow_ssa, typed_emit, emit_valid_length]
     inputs:
-      target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }, role: { kind: opaque },
+      target: { contract: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary],
+                            batch_layout: { kind: request_aligned, axis: 0 } }, role: { kind: opaque },
                 source: { kind: application, name: target }, required: true }
-      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, draft] }, role: { kind: opaque },
+      proposed: { contract: { dtype: int64, rank: 2, shape: [batch, draft],
+                              batch_layout: { kind: request_aligned, axis: 0 } }, role: { kind: opaque },
                   source: { kind: application, name: proposed }, required: true }
     outputs:
-      accepted_len: { contract: { dtype: int64, rank: 1, shape: [batch] }, role: tensor, stage: pre_adapter }
+      accepted_len: { contract: { dtype: int64, rank: 1, shape: [batch],
+                                  batch_layout: { kind: request_aligned, axis: 0 } },
+                      role: tensor, stage: pre_adapter }
       accepted_tokens: { contract: { dtype: int64, rank: 2, shape: [batch, accepted],
                                      batch_layout: { kind: request_aligned, axis: 0 } },
                          role: tokens, stage: pre_adapter }
     components:
       verifier:
         implementation: { kind: onnx, artifact: verifier.onnx.textproto }
+        batch_capacity:
+          uniform_dimensions: [draft, vocabulary]
+          budgets: [{ dimensions: [batch], max_total: 2 }]
         ports:
           inputs:
-            target_scores: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary] }
-            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft] }
+            target_scores: { dtype: float32, rank: 3, shape: [batch, draft, vocabulary],
+                             batch_layout: { kind: request_aligned, axis: 0 } }
+            proposed_tokens: { dtype: int64, rank: 2, shape: [batch, draft],
+                               batch_layout: { kind: request_aligned, axis: 0 } }
           outputs:
             accepted_tokens: { dtype: int64, rank: 2, shape: [batch, draft],
                                batch_layout: { kind: request_aligned, axis: 0 } }
-            accepted_count: { dtype: int64, rank: 1, shape: [batch] }
-            done: { dtype: bool, rank: 1, shape: [batch] }
+            accepted_count: { dtype: int64, rank: 1, shape: [batch],
+                              batch_layout: { kind: request_aligned, axis: 0 } }
+            done: { dtype: bool, rank: 1, shape: [batch],
+                    batch_layout: { kind: request_aligned, axis: 0 } }
         contract:
           id: onnx-genai.speculative-verifier
           version: "1"

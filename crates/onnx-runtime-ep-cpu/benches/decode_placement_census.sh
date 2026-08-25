@@ -38,8 +38,11 @@
 # gives the ORT arm the same CPUs at each width, so the comparison is symmetric
 # -- but "twice the threads" is not all that changes.
 set -u
-SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-cd "$(dirname "$0")/../../.." || exit 1
+# `readlink -f` rather than `$0`, because both the re-exec target below and
+# the `cd` on the next line have to resolve to the real tree: invoked through
+# a symlink outside the repo, `dirname "$0"/../../..` names the wrong root.
+SELF=$(readlink -f "$0")
+cd "$(dirname "$SELF")/../../.." || exit 1
 
 # Take the host lock once, for the whole census, by re-executing under it.
 #
@@ -49,12 +52,41 @@ cd "$(dirname "$0")/../../.." || exit 1
 # comparison was mid-flight. `hostlock.sh run` anchors the claim to its own
 # pid and always releases, so a SIGKILL here cannot leak it.
 #
-# The sentinel is what stops the second entry from recursing. `--wait`
-# because this census is not timing-sensitive: blocking behind somebody
-# else's matrix costs nothing here and starting three pools on top of it
-# costs them their numbers.
-if [ -z "${HOSTLOCK_CENSUS_HELD:-}" ]; then
-  export HOSTLOCK_CENSUS_HELD=1
+# What stops the second entry from recursing is a check that the lock is
+# *actually* held by one of my ancestors -- not an exported sentinel. A
+# sentinel is an ordinary inheritable variable: any unrelated parent that
+# happened to export the same name would send this script through its three
+# saturating pool launches with no lock at all, silently, which is the #1803
+# hazard wearing the costume of the fix for it. Reading custody structurally
+# also gets the other case right for free: run inside somebody's larger
+# locked matrix, the census uses their lock instead of blocking on it.
+#
+# `--wait` because this census is not timing-sensitive: blocking behind
+# somebody else's matrix costs nothing here, and starting three pools on top
+# of one costs them their numbers.
+holder_of_the_host_lock() {
+  ./scripts/hostlock.sh status 2>/dev/null |
+    sed -n 's/^HELD by [^ ]* pid=\([0-9][0-9]*\) .*/\1/p'
+}
+
+# `/proc/<pid>/stat` field 4 is the parent pid, read past the last `)` so a
+# process whose name contains a space or a bracket cannot shift the fields.
+parent_of() {
+  sed -e 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f2
+}
+
+lock_is_held_by_an_ancestor() {
+  _holder=$(holder_of_the_host_lock)
+  [ -n "$_holder" ] || return 1
+  _p=$$
+  while [ -n "$_p" ] && [ "$_p" -gt 1 ] 2>/dev/null; do
+    [ "$_p" = "$_holder" ] && return 0
+    _p=$(parent_of "$_p")
+  done
+  return 1
+}
+
+if ! lock_is_held_by_an_ancestor; then
   exec ./scripts/hostlock.sh run \
     --reason "decode placement census: three pool launches (default/w16/w8)" \
     --wait --timeout 1800 -- "$SELF" "$@"

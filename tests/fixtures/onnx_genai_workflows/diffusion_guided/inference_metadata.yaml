@@ -1,4 +1,4 @@
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -205,18 +205,22 @@ pipeline:
         stage: pre_adapter
     components:
       text_encoder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: text_encoder/model.onnx.textproto
       denoiser:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: denoiser/model.onnx.textproto
       vae_decoder:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: vae_decoder/model.onnx.textproto
       solver_step:
+        batch_capacity: { uniform_dimensions: [channels, height, schedule_length, width] }
         implementation:
           kind: onnx
           artifact: policies/solver_step.onnx.textproto
@@ -303,6 +307,7 @@ pipeline:
             next_state: next_state
             next_history: next_history
       continue_predicate:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/continue_predicate.onnx.textproto
@@ -323,6 +328,7 @@ pipeline:
               shape:
               - 1
       diffusion_schedule:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/diffusion_schedule.onnx.textproto
@@ -335,6 +341,7 @@ pipeline:
               shape:
               - 4
       diffusion_timesteps:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/diffusion_timesteps.onnx.textproto
@@ -347,6 +354,7 @@ pipeline:
               shape:
               - 3
       schedule_lookup:
+        batch_capacity: { uniform_dimensions: [schedule_length] }
         implementation:
           kind: onnx
           artifact: policies/schedule_lookup.onnx.textproto
@@ -375,6 +383,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       tensor_scale:
+        batch_capacity: { uniform_dimensions: [channels, height, width] }
         implementation:
           kind: onnx
           artifact: policies/tensor_scale.onnx.textproto
@@ -409,6 +418,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       decoder_input_scale:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/decoder_input_scale.onnx.textproto
@@ -421,6 +431,7 @@ pipeline:
               shape:
               - 1
       history_initializer:
+        batch_capacity: { uniform_dimensions: [channels, height, width] }
         implementation:
           kind: onnx
           artifact: policies/history_initializer.onnx.textproto
@@ -450,6 +461,7 @@ pipeline:
                 kind: request_aligned
                 axis: 0
       guidance_combine:
+        batch_capacity: { uniform_dimensions: [channels, height, width] }
         implementation:
           kind: onnx
           artifact: policies/guidance_combine.onnx.textproto
@@ -506,6 +518,7 @@ pipeline:
             scale: scale
             estimate: estimate
       latent_row_shape:
+        batch_capacity: {}
         implementation:
           kind: onnx
           artifact: policies/latent_row_shape.onnx.textproto
@@ -518,6 +531,7 @@ pipeline:
               shape:
               - 3
       latent_noise:
+        batch_capacity: { uniform_dimensions: [row_rank] }
         implementation:
           kind: onnx
           artifact: policies/latent_noise.onnx.textproto

@@ -2477,6 +2477,56 @@ mod tests {
         assert_eq!(smt.physical_cores_within(&compact[..4]), 2);
     }
 
+    /// A cpuset that already holds one CPU per physical core is a **fixed
+    /// point** of both placement policies.
+    ///
+    /// This is the guarantee every pinned benchmark in this repository rests
+    /// on. The house rule for a clean multi-thread number is `taskset` to one
+    /// CPU per core, and the rule is only worth anything if the pool then pins
+    /// workers to the CPUs that were reserved, in the order they were reserved
+    /// — otherwise the mask says one thing and the pins do another.
+    ///
+    /// It is also what decides whether #1729 invalidates a measurement or
+    /// leaves it alone. Before #1729 the SPMD shard builder used
+    /// `allowed_cpus()` in raw ascending order; after it, the same list goes
+    /// through `order_pin_targets`. On a core-leader mask the two agree
+    /// exactly, so #1729 cannot move a number taken under such a pin — while
+    /// on a full mask it is the whole 16-workers-on-8-cores defect. Asserting
+    /// it here means the distinction is executed rather than argued from a
+    /// reading of `leaders_within`.
+    #[test]
+    fn a_one_cpu_per_core_mask_is_unchanged_by_either_placement_policy() {
+        let smt = adjacent_smt_topology();
+        // `adjacent_smt_topology` is 8 cores with siblings (0,1), (2,3), ...,
+        // so the even CPUs are exactly one per physical core -- the shape of a
+        // `taskset -c 0,2,4,...` benchmark pin.
+        let leaders: Vec<usize> = (0..8).map(|core| core * 2).collect();
+        assert_eq!(
+            smt.physical_cores_within(&leaders),
+            leaders.len(),
+            "the fixture is not one CPU per core, so this proves nothing"
+        );
+
+        for placement in [CorePlacement::Spread, CorePlacement::Compact] {
+            assert_eq!(
+                order_pin_targets_for(&leaders, Some(&smt), placement),
+                leaders,
+                "`{}` reordered a mask that was already one CPU per core, so a \
+                 pinned benchmark's workers do not land on the CPUs it reserved",
+                placement.as_str()
+            );
+        }
+
+        // The contrast that makes the above meaningful: on a full mask the
+        // policies genuinely disagree, so this is a property of the *mask*, not
+        // a policy that never reorders anything.
+        let full: Vec<usize> = (0..16).collect();
+        assert_ne!(
+            order_pin_targets_for(&full, Some(&smt), CorePlacement::Spread),
+            order_pin_targets_for(&full, Some(&smt), CorePlacement::Compact),
+        );
+    }
+
     #[test]
     fn a_cpu_the_topology_does_not_know_keeps_its_place_under_either_policy() {
         let smt = adjacent_smt_topology();
