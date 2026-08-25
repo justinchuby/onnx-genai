@@ -329,6 +329,22 @@ pub struct PoolCounters {
     /// yielded. Only reachable when the straggler's claimant is descheduled,
     /// so this is a direct oversubscription signal.
     pub straggler_yields: u64,
+    /// `sched_yield` calls made by *workers* in the second phase of their spin
+    /// window, after `SPIN_LOOP_BUDGET` pure `spin_loop`s and before parking.
+    ///
+    /// Separate from [`Self::straggler_yields`], which counts the dispatcher's
+    /// side and is already rate-limited by `DISPATCHER_YIELD_STRIDE`. This one
+    /// is not rate-limited at all: the phase yields on every iteration, which
+    /// is the shape #2072 measured at 2.61 of 16 cores of kernel time in
+    /// `decode_spmd`. Whether it costs the same here is #2075, and this counter
+    /// exists so that question can be answered from a release build instead of
+    /// from the resemblance between two loops.
+    ///
+    /// A yield rate is only interpretable against the waits that could have
+    /// produced it, so read it with [`Self::parks`] and [`Self::spin_hits`]:
+    /// those two count spin windows that ended, and this counts yields spent
+    /// inside them.
+    pub spin_yields: u64,
 }
 
 #[derive(Default)]
@@ -339,6 +355,7 @@ struct AtomicCounters {
     slot_exhausted: AtomicU64,
     straggler_waits: AtomicU64,
     straggler_yields: AtomicU64,
+    spin_yields: AtomicU64,
     parks: AtomicU64,
     spin_hits: AtomicU64,
     panics: AtomicU64,
@@ -353,6 +370,7 @@ impl AtomicCounters {
             slot_exhausted: self.slot_exhausted.load(Ordering::Relaxed),
             straggler_waits: self.straggler_waits.load(Ordering::Relaxed),
             straggler_yields: self.straggler_yields.load(Ordering::Relaxed),
+            spin_yields: self.spin_yields.load(Ordering::Relaxed),
             parks: self.parks.load(Ordering::Relaxed),
             spin_hits: self.spin_hits.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
@@ -558,6 +576,7 @@ impl Shared {
     fn spin_for_dispatch(&self, last_epoch: u32, spin_window: Duration) -> SpinOutcome {
         let start = Instant::now();
         let mut spins = 0u32;
+        let mut yields = 0u64;
         let outcome = loop {
             if self.shutdown.load(Ordering::Acquire) {
                 break SpinOutcome::Shutdown;
@@ -580,6 +599,7 @@ impl Shared {
                 }
             } else {
                 spin_yield();
+                yields += 1;
                 // ...and must not apply here. A yield costs microseconds to
                 // milliseconds under contention, so a stride of 64
                 // multiplies the window's granularity by 64 yields of an
@@ -608,6 +628,16 @@ impl Shared {
         // `spin_loop` and would distort the very phase under test.
         #[cfg(test)]
         SPIN_COUNT.with(|c| c.set(spins as u64));
+        // Same reasoning, and the reason this is a local `u64` rather than a
+        // `fetch_add` per yield: an instrument for #2075 that added a shared
+        // atomic to every iteration of the loop it is measuring would be
+        // changing the contention it exists to report. One relaxed add per
+        // window is off the measured path.
+        if yields > 0 {
+            self.counters
+                .spin_yields
+                .fetch_add(yields, Ordering::Relaxed);
+        }
         outcome
     }
 }
@@ -1078,6 +1108,74 @@ mod tests {
              pure-spin phase at all and could not be honoured until that phase \
              ended -- ~130us on this host against a window of {MIN_SPIN:?}"
         );
+    }
+
+    /// `spin_yields` must count exactly the yields the second phase performed,
+    /// and nothing from the pure-`spin_loop` phase.
+    ///
+    /// This counter is the instrument #2075 needs, and #2075 is the question
+    /// "does `decode_spmd`'s yield tax (2.61 of 16 cores in kernel time, fixed
+    /// by #2072) transfer to this loop?". An instrument answering that must be
+    /// trustworthy before any number it produces is quoted, so this asserts
+    /// the count *exactly* rather than asserting it is non-zero: a
+    /// `> 0` check passes just as happily if the bump were moved into the spin
+    /// phase, which would over-report the yield rate by ~4096x and manufacture
+    /// the very tax the issue is trying to detect.
+    ///
+    /// The assertion is an *iff* on whether the yield phase was reached, which
+    /// is what makes it load-independent. Reaching that phase is inherently
+    /// timing-dependent — it needs 4096 `spin_loop`s (~130us here) to complete
+    /// inside the window — so under Miri, or on a saturated runner, the window
+    /// expires in the spin phase instead. Rather than skip there (a test that
+    /// silently stops testing is worse than no test), the other branch asserts
+    /// the complementary property: no yield phase, no yields counted. Exactly
+    /// one branch runs on any host and both are real, so this cannot go quiet.
+    #[test]
+    fn the_spin_phase_yield_counter_counts_exactly_the_yields_the_window_performed() {
+        // Width 1 spawns no threads, so nothing can move the epoch or touch
+        // these counters concurrently: the only way out is the deadline, and
+        // the only writer is this thread.
+        let pool = TaskPool::new(1);
+        let last_epoch = pool.shared.epoch.0.load(Ordering::Acquire);
+        SLOW_YIELD_US.with(|c| c.set(0));
+        SPIN_COUNT.with(|c| c.set(0));
+
+        let before = pool.counters().spin_yields;
+        // `MAX_SPIN` rather than an arbitrary large window: it is the ceiling a
+        // busy steady state converges on, so this measures the production
+        // worst case rather than a synthetic one.
+        let outcome = pool.shared.spin_for_dispatch(last_epoch, MAX_SPIN);
+        let after = pool.counters().spin_yields;
+        let spins = SPIN_COUNT.with(std::cell::Cell::get);
+        let yields = after - before;
+
+        assert_eq!(
+            outcome,
+            SpinOutcome::Expired,
+            "no dispatch was published, so the window must have expired"
+        );
+
+        if spins >= u64::from(SPIN_LOOP_BUDGET) {
+            // Yields run for spins in `SPIN_LOOP_BUDGET..=spins`, inclusive at
+            // both ends.
+            let expected = spins - u64::from(SPIN_LOOP_BUDGET) + 1;
+            assert_eq!(
+                yields, expected,
+                "the window ran {spins} spins, so it yielded on {expected} of them \
+                 (every iteration from {SPIN_LOOP_BUDGET} onwards), but the counter \
+                 recorded {yields}: it is not counting one yield per yield-phase \
+                 iteration, so any yield rate read from it is wrong"
+            );
+        } else {
+            assert_eq!(
+                yields, 0,
+                "the window expired after {spins} spins, before the \
+                 {SPIN_LOOP_BUDGET}-iteration budget was exhausted, so the yield \
+                 phase was never reached and no yield was performed -- but the \
+                 counter recorded {yields}, meaning it is counting something \
+                 other than yields"
+            );
+        }
     }
 
     /// The spin window's deadline must be re-read on every yield.
