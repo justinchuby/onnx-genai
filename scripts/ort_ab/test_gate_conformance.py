@@ -19,16 +19,51 @@ those. It is that the *next* harness cannot ship ungated by accident, because
 an unclassified file is a failure and a misclassified one is a failure with a
 reason attached.
 
+Two roots are covered. `scripts/ort_ab/` is read by declaration: every `.py`
+must be listed as a driver, a generator, a library or a test, and a driver
+must call `hostlock_gate.require`.
+
+The second root, `crates/onnx-runtime-ep-cpu/benches/`, is read by behaviour
+instead of by declaration: it holds twenty-six analysis and harness scripts
+that are not mine, and a per-file role list there would be a claim about
+somebody else's lane that I would then have to keep true. So a file that
+starts a process or opens a session must hold the lock or carry a recorded
+gap, and a file that only reads JSON needs no entry at all. Recorded gaps are
+checked in both directions: a gap that has since been gated **fails as
+stale**, so closing one is a one-line ledger edit and the record cannot drift
+into fiction.
+
+Both lock idioms in the tree count as held: `hostlock_gate.require` in
+`scripts/ort_ab/`, and the `HostLock` context manager in `acc0_gap_matrix.py`
+that shells out to `scripts/hostlock.sh`. A checker that knew only its
+author's idiom would report three genuinely gated harnesses as ungated, which
+is how a conformance check gets deleted rather than obeyed.
+
 **What it does not catch**, written down so nobody reads more into a green
 run than is there:
 
-- A driver **outside this directory**. `crates/onnx-runtime-ep-cpu/benches/
-  acc0_*.py` are ungated and are the rest of #2043.
 - A driver **misdeclared as a generator** whose binary path is built at
   runtime (`os.path.join("target", "release", ...)`, an f-string, an env
   var). The contradiction check reads literals, so it would not object --
   `ab.py` itself has no `target/` literal. Declaring a driver a generator is
   a false statement in a reviewed file, which is the layer that catches it.
+- Whether a held lock is *the right* lock, or held for the whole matrix. The
+  loop check below is one property of custody (acquisition is not inside the
+  arm loop), not the whole of it; the run-time answer is the `host_lock`
+  column on every emitted row.
+- A spawn behind deliberate indirection: `getattr(subprocess, "run")(cmd)`,
+  a dict of callables, `importlib`. Every check here reads names in the tree,
+  so a name assembled at runtime is invisible. This is the fail-open edge
+  that cannot be closed by reading source, and it is why the ledger is a
+  reviewed file rather than only a program.
+- A file that saturates the box **in process**, without starting anything.
+  `cpu_work_probe.py` is the honest example: it burns a fixed CPU-second in
+  Python to measure delivered work. It is single-threaded and bounded, so it
+  is a probe rather than a matrix, but a twenty-thread version of it would be
+  invisible here -- as would a `threading.Thread` pool around an
+  `InferenceSession` that did not import the runtime under a name this file
+  knows. Detecting "starts something" is a proxy for "occupies the host", and
+  this is the gap between them.
 
 Run: `python3 scripts/ort_ab/test_gate_conformance.py`
 """
@@ -36,6 +71,7 @@ Run: `python3 scripts/ort_ab/test_gate_conformance.py`
 from __future__ import annotations
 
 import ast
+import functools
 import re
 import unittest
 from pathlib import Path
@@ -147,6 +183,434 @@ def imports_require_from_gate(tree: ast.Module) -> bool:
             if any(a.name == "require" for a in node.names):
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# The second root: crates/onnx-runtime-ep-cpu/benches
+# ---------------------------------------------------------------------------
+#
+# Read by behaviour rather than by declaration -- see the module docstring.
+# A file here that starts a process, imports the runtime or opens a session
+# must hold the lock or appear below.
+EP_BENCHES = ORT_AB.parents[1] / "crates" / "onnx-runtime-ep-cpu" / "benches"
+
+# The two recognised reasons, both recording rather than excusing:
+#   known-gap: the file saturates the box and does not hold the lock yet.
+#   no-bench:  the file starts a process that is not a benchmark (reading
+#              topology out of `lscpu`, say), so the lock would be noise.
+#   wrapper:   the file `exec`s whatever it is handed; its *caller* is the
+#              harness and holds the lock. A wrapper must not take the lock
+#              itself: `exec` keeps the pid and drops the release, so the
+#              lock would outlive the run and need reaping.
+EP_GAP = "known-gap:"
+EP_NOT_A_BENCH = "no-bench:"
+EP_WRAPPER = "wrapper:"
+EP_REASONS = (EP_GAP, EP_NOT_A_BENCH, EP_WRAPPER)
+
+# Ungated harnesses as of #2043. Every one of these launches a decode or
+# prefill run at width 8-16 and can therefore ruin, or be ruined by, anything
+# else on the box. They are Roy's and Sebastian's files; this records their
+# status without editing them, and each line disappears when its file gates.
+EP_LEDGER = {
+    name: f"known-gap:#2043 - saturating acc0 harness, owner to gate it ({what})"
+    for name, what in (
+        ("acc0_lowwidth_smt.py", "t=2 SMT pairing"),
+        ("acc0_w16_clock_state.py", "w16 clock/boost state"),
+        ("acc0_w16_foreign_load.py", "w16 foreign-load falsifier"),
+        ("acc0_w16_mode_placement.py", "w16 mode placement"),
+        ("acc0_w16_mode_split.py", "w16 mode split"),
+        ("acc0_w16_mode_worker_split.py", "w16 per-component window"),
+        ("acc0_w16_page_backing.py", "w16 page-backing lottery"),
+        ("acc0_w16_straggler_aslr.py", "w16 straggler vs address layout"),
+        ("acc0_w16_straggler_thp.py", "w16 straggler vs THP"),
+        ("acc0_worker_placement_probe.py", "starts a run to read worker pins"),
+        ("ort_baseline.py", "ORT CPU EP f32 baseline"),
+        ("ort_matmulnbits_baseline.py", "ORT MatMulNBits decode baseline"),
+        # Found only once the delegation was resolved: these six spawn
+        # nothing themselves, they call `acc0_gap_matrix.native` or a wrapper
+        # around it. They saturate the box exactly as much as the ones above.
+        ("acc0_w16_blocktime_ab.py", "w16 block-time A/B via gap_matrix"),
+        ("acc0_w16_straggler_identity.py", "w16 straggler identity"),
+        ("acc0_w16_straggler_window.py", "w16 straggler window"),
+        ("acc0_w16_study.py", "w16 study, runs native and ORT arms"),
+        ("acc0_w8_w16_cpu_split.py", "w8/w16 cpu split"),
+        ("acc0_w8_w16_scaling.py", "w8/w16 scaling"),
+        # Found only once same-file delegation was resolved: it runs four
+        # arms at width 16 through `H.native` and calls nothing else, so a
+        # cross-module-only table read it as starting nothing.
+        ("acc0_w16_steal_ab.py", "w16 steal-tiles A/B, four arms via H.native"),
+    )
+}
+
+# Not a gap: `acc0_nothp_exec.py` is a THP-disabling `execvp` wrapper called
+# *by* `acc0_w16_straggler_thp.py`. The caller is the harness. Found by the
+# spawn detector rather than by me reading the directory, which is the point.
+EP_LEDGER["acc0_nothp_exec.py"] = (
+    EP_WRAPPER + "execs the command it is given; the caller carries the lock "
+    "or the gap -- today that caller is acc0_w16_straggler_thp.py, which has "
+    "a gap above"
+)
+
+SPAWN_CALLS = {
+    "subprocess": {"run", "Popen", "call", "check_call", "check_output"},
+    "os": {
+        "system",
+        "popen",
+        "execv",
+        "execvp",
+        "spawnv",
+        "spawnvp",
+        "posix_spawn",
+        "fork",
+        "forkpty",
+    },
+    # None of these is in the tree today. They are here because the cost of
+    # adding a name to a set is nil and the cost of the omission is a
+    # saturating harness that reads as harmless -- the direction this check
+    # must never fail in.
+    "multiprocessing": {"Process", "Pool", "get_context"},
+    "concurrent.futures": {"ProcessPoolExecutor"},
+}
+
+
+def spawns_a_process(source: str) -> bool:
+    """Starts something. In a benches directory that is the harness signal.
+
+    `looks_like_a_driver` is not enough here: every acc0 harness takes the
+    binary as `sys.argv[1]` or builds the path at runtime, so not one of them
+    has a `target/release/` literal, and only two import the runtime. Reading
+    the spawn instead catches all thirteen.
+
+    Aliased imports count (`from subprocess import run`), because a check a
+    rename defeats is a check that reports the tree it wishes it had.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    aliases: dict[str, str] = {}
+    modules: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in SPAWN_CALLS:
+            for a in node.names:
+                if a.name in SPAWN_CALLS[node.module]:
+                    aliases[a.asname or a.name] = node.module
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in SPAWN_CALLS:
+                    modules[a.asname or a.name] = a.name
+                elif a.name.rsplit(".", 1)[0] in SPAWN_CALLS:
+                    # `import concurrent.futures` binds `concurrent`, and the
+                    # call site reads `concurrent.futures.ProcessPoolExecutor`.
+                    modules.setdefault(a.name.split(".")[0], a.name.rsplit(".", 1)[0])
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        path = dotted_name(func)
+        if path and "." in path:
+            prefix, _, attr = path.rpartition(".")
+            module = modules.get(prefix) or (prefix if prefix in SPAWN_CALLS else None)
+            if module and attr in SPAWN_CALLS[module]:
+                return True
+        elif isinstance(func, ast.Name) and func.id in aliases:
+            return True
+    return False
+
+
+def dotted_name(node: ast.AST) -> str | None:
+    """`concurrent.futures.ProcessPoolExecutor` as a string, or None.
+
+    A single `Name.attr` step is not enough: `import concurrent.futures`
+    binds only `concurrent`, so the call site is two attributes deep and a
+    one-step match reads it as something else entirely.
+    """
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def spawning_names(source: str) -> set[str]:
+    """Top-level defs and classes whose body starts a process."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    out = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if spawns_a_process(ast.unparse(node)):
+                out.add(node.name)
+    return out
+
+
+def spawning_helpers(sources: dict[str, str]) -> dict[str, set[str]]:
+    return {k: set(v) for k, v in _spawning_helpers(tuple(sorted(sources.items()))).items()}
+
+
+@functools.lru_cache(maxsize=8)
+def _spawning_helpers(items: tuple[tuple[str, str], ...]) -> dict[str, frozenset[str]]:
+    """module stem -> the names in it that start a process, directly or not.
+
+    Iterated to a fixpoint, because the delegation is layered and it is
+    layered in two directions. Across modules: `acc0_gap_matrix.native` is
+    wrapped by `acc0_w16_worker_split`, which six more files call. And
+    *within* a module: `native` itself contains no `subprocess` call, it
+    calls the same-file helper `sh`. Missing the second kind is not a
+    theoretical loss -- it left `acc0_w16_steal_ab.py`, which runs four arms
+    at width 16 through `H.native` and nothing else, reading as "starts
+    nothing" and needing neither a gate nor an entry. The files that looked
+    like they proved the resolution worked were passing on a *different*
+    call (`H.ort`), which is why the cell asserting it is now written against
+    the table rather than against the verdict.
+
+    Delegating the `subprocess.run` one function or one import away is not a
+    way to stop saturating the box.
+
+    Stems that collide (`old/gap_matrix.py` beside `gap_matrix.py`) are
+    unioned rather than overwritten. Last-write-wins would let an archived
+    copy that spawns nothing empty the live module's entry, and every file
+    importing it would read as harmless -- fail-open, from a file nobody
+    thought they were changing.
+    """
+    sources = dict(items)
+    table: dict[str, set[str]] = {}
+    for name, source in sources.items():
+        table.setdefault(Path(name).stem, set()).update(spawning_names(source))
+    for _ in range(len(table) + 1):
+        grew = False
+        for name, source in sources.items():
+            stem = Path(name).stem
+            try:
+                tree = ast.parse(source)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if node.name in table[stem]:
+                    continue
+                if calls_a_spawning_helper(
+                    ast.unparse(node), table, imports_from=tree, own_module=stem
+                ):
+                    table[stem].add(node.name)
+                    grew = True
+        if not grew:
+            break
+    return {k: frozenset(v) for k, v in table.items()}
+
+
+def calls_a_spawning_helper(
+    source: str,
+    table: dict[str, set[str]],
+    imports_from: ast.Module | None = None,
+    own_module: str | None = None,
+) -> bool:
+    """A call into a process-starting helper, here or in a module it imports.
+
+    `imports_from` supplies the import statements when `source` is a fragment
+    (one function out of a module), since the imports live at module level.
+    `own_module` is that fragment's own module, so a call to a same-file
+    helper counts -- the `native` -> `sh` shape above.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    scope = imports_from if imports_from is not None else tree
+    aliases: dict[str, str] = {}
+    # local name -> (module, name to look up in that module's table). The two
+    # differ under `from m import ort as run_ort`, where the table holds the
+    # remote name and the call site uses the local one; looking up the local
+    # name there silently found nothing.
+    direct: dict[str, tuple[str, str]] = {}
+    star: set[str] = set()
+    for node in ast.walk(scope):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                stem = a.name.split(".")[0]
+                if stem in table:
+                    aliases[a.asname or stem] = stem
+        elif isinstance(node, ast.ImportFrom):
+            stem = (node.module or "").split(".")[0]
+            if stem in table:
+                for a in node.names:
+                    if a.name == "*":
+                        star.add(stem)
+                    else:
+                        direct[a.asname or a.name] = (stem, a.name)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            module = aliases.get(func.value.id)
+            if module and func.attr in table[module]:
+                return True
+        elif isinstance(func, ast.Name):
+            found = direct.get(func.id)
+            if found and found[1] in table[found[0]]:
+                return True
+            if any(func.id in table[m] for m in star):
+                return True
+            if own_module and func.id in table.get(own_module, ()):
+                return True
+    return False
+
+
+def uses_the_shell_lock(source: str) -> bool:
+    """The other idiom in the tree: `with HostLock(...)`.
+
+    `acc0_gap_matrix.py` implements a lock client that shells out to
+    `scripts/hostlock.sh`, and two more harnesses import it as
+    `acc0_gap_matrix as H` and use `H.HostLock`. That is genuinely holding
+    the lock, so a checker that recognised only `hostlock_gate.require` would
+    report three gated harnesses as ungated -- a false alarm in somebody
+    else's lane, which is worse than no check, because the answer to it is to
+    delete the check.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name == "HostLock":
+                return True
+    return False
+
+
+def holds_the_lock(source: str) -> bool:
+    return takes_the_lock(source) or uses_the_shell_lock(source)
+
+
+def looks_like_a_harness(
+    source: str, table: dict[str, set[str]] | None = None
+) -> bool:
+    if looks_like_a_driver(source) or spawns_a_process(source):
+        return True
+    return bool(table) and calls_a_spawning_helper(source, table)
+
+
+def acquired_inside_a_loop(source: str) -> list[int]:
+    """Lines where the lock is taken from inside a `for` or `while`.
+
+    The property #1806 was built for and #1803 was filed over: the holder is
+    the outer harness spanning every A/B/null arm, not each arm. A lock taken
+    per arm releases between them, which is precisely the gap Sebastian
+    sampled in when he read the host as clear -- the lock would be *reported*
+    on every row and hold across none of the comparison.
+
+    A structural half of custody, not the whole of it: a harness could still
+    acquire once and start its arms from a helper called elsewhere. The
+    run-time half is the `host_lock` column.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    hits: list[int] = []
+
+    def walk(node: ast.AST, in_loop: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call):
+                name = getattr(child.func, "attr", None) or getattr(
+                    child.func, "id", None
+                )
+                if in_loop and name in ("HostLock", "require"):
+                    hits.append(child.lineno)
+            # A flag rather than a depth counter: only "inside any loop"
+            # is ever read, and a counter invites a mutation that changes
+            # the number without changing the answer.
+            walk(child, in_loop or isinstance(child, (ast.For, ast.While, ast.AsyncFor)))
+
+    walk(tree, False)
+    return sorted(hits)
+
+
+def ep_sources() -> dict[str, str]:
+    if not EP_BENCHES.is_dir():
+        return {}
+    return {
+        p.relative_to(EP_BENCHES).as_posix(): p.read_text()
+        for p in sorted(EP_BENCHES.rglob("*.py"))
+    }
+
+
+def ep_failures(
+    sources: dict[str, str], ledger: dict[str, str] | None = None
+) -> list[str]:
+    """Harnesses in the benches root that neither hold the lock nor say why."""
+    ledger = EP_LEDGER if ledger is None else ledger
+    table = spawning_helpers(sources)
+    out = []
+    for name, source in sorted(sources.items()):
+        if not looks_like_a_harness(source, table):
+            continue
+        if holds_the_lock(source):
+            continue
+        reason = ledger.get(name)
+        if reason is None:
+            out.append(
+                f"{name}: starts a benchmark, does not hold the host lock, and "
+                "carries no recorded gap"
+            )
+        elif not reason.startswith(EP_REASONS):
+            out.append(
+                f"{name}: recorded with an unrecognised reason {reason!r} -- "
+                f"expected one of {EP_REASONS}"
+            )
+    return out
+
+
+def stale_records(
+    sources: dict[str, str], ledger: dict[str, str], prefix: str = EP_GAP
+) -> list[str]:
+    """Recorded gaps whose file now holds the lock.
+
+    The half that keeps the ledger honest. Without it, gating a harness
+    leaves its `known-gap:` line behind, and the record slowly becomes a
+    description of the tree as it was -- with the failure mode that a file
+    which *stops* gating is then covered by a stale exemption nobody meant to
+    grant.
+    """
+    out = []
+    for name, reason in sorted(ledger.items()):
+        source = sources.get(name)
+        if source is None or not reason.startswith(prefix):
+            continue
+        if holds_the_lock(source):
+            out.append(
+                f"{name}: recorded as {prefix.rstrip(':')} but it now holds the "
+                "lock -- delete the record"
+            )
+    return out
+
+
+def dead_records(
+    sources: dict[str, str], ledger: dict[str, str] | None = None
+) -> list[str]:
+    """Entries naming a file that is gone, or that stopped being a harness."""
+    ledger = EP_LEDGER if ledger is None else ledger
+    table = spawning_helpers(sources)
+    out = []
+    for name in sorted(ledger):
+        source = sources.get(name)
+        if source is None:
+            out.append(f"{name}: recorded, but no such file -- delete the record")
+        elif not looks_like_a_harness(source, table):
+            out.append(
+                f"{name}: recorded, but it no longer starts anything -- delete "
+                "the record"
+            )
+    return out
 
 
 def declared_roles(
@@ -337,6 +801,24 @@ class Vacuity(unittest.TestCase):
         self.assertEqual(pr_block.count('"scripts/ort_ab/**"'), 1)
         self.assertEqual(push_block.count('"scripts/ort_ab/**"'), 1)
 
+    def test_the_workflow_runs_for_the_benches_root_too(self):
+        # The #2079 finding, one root over: a check that does not run for a
+        # new file cannot catch a new file, and the benches root is where the
+        # next ungated harness is most likely to land -- 19 of the 23 files
+        # there that start a benchmark are ungated today.
+        pr_block, push_block = self.trigger_blocks()
+        for block in (pr_block, push_block):
+            self.assertEqual(block.count('"crates/onnx-runtime-ep-cpu/benches/**"'), 1)
+
+    def test_the_scanned_roots_and_the_trigger_agree(self):
+        # Stated as a relation rather than two literals: the roots this file
+        # reads must each appear in the filter. Adding a third root without
+        # its path fails here instead of going green over an unread tree.
+        text = self.WORKFLOW.read_text()
+        repo = ORT_AB.parents[1]
+        for root in (ORT_AB, EP_BENCHES):
+            self.assertIn(f'"{root.relative_to(repo).as_posix()}/**"', text)
+
     def trigger_blocks(self) -> tuple[str, str]:
         """The `pull_request:` and `push:` halves of the trigger section.
 
@@ -503,6 +985,428 @@ class Contradiction(unittest.TestCase):
         # Otherwise every driver would be reported twice, and the two findings
         # mean different things.
         self.assertEqual(contradicted({"ab.py": "import onnxruntime\n"}), [])
+
+
+class Delegation(unittest.TestCase):
+    """A `subprocess.run` one import away is still a benchmark starting."""
+
+    def test_a_harness_that_calls_a_helper_is_a_harness(self):
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(cmd):\n    subprocess.run(cmd)\n",
+            "arm.py": "import lib as H\n\nH.native(cmd)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["lib"], {"native"})
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+        self.assertFalse(looks_like_a_harness(sources["arm.py"]))
+        self.assertEqual(len(ep_failures(sources, {})), 2)
+
+    def test_the_chain_resolves_further_than_one_level(self):
+        # `acc0_gap_matrix.native` -> `acc0_w16_worker_split.collect` -> six
+        # more files. Stopping at one level would clear all six.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "mid.py": "import lib as H\n\ndef collect(c):\n    return H.native(c)\n",
+            "top.py": "import mid as W\n\nW.collect(c)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["mid"], {"collect"})
+        self.assertTrue(looks_like_a_harness(sources["top.py"], table))
+
+    def test_importing_the_harness_library_is_not_by_itself_running_one(self):
+        # Nineteen files in that directory import `acc0_gap_matrix`; most use
+        # its parsers. "Imports a harness" would have required a ledger entry
+        # for every scorer in the tree, and a ledger nobody can maintain gets
+        # a blanket exemption instead of a line.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n\ndef parse(t):\n    return t.split()\n",
+            "score.py": "import lib as H\n\nprint(H.parse(text))\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertFalse(looks_like_a_harness(sources["score.py"], table))
+        self.assertEqual(ep_failures(sources, {"lib.py": "known-gap:#1 - x"}), [])
+
+    def test_the_from_import_form_resolves_too(self):
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "arm.py": "from lib import native\n\nnative(c)\n",
+            "quiet.py": "from lib import native\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+        self.assertFalse(looks_like_a_harness(sources["quiet.py"], table))
+
+    def test_a_leaf_that_delegates_inside_its_own_file_still_counts(self):
+        # The hole the first cut had, and the shape of the real tree:
+        # `acc0_gap_matrix.native` contains no `subprocess` call at all, it
+        # calls the same-file helper `sh`. Cross-module resolution alone left
+        # `native` out of the table, so a file whose only call is `H.native`
+        # read as starting nothing -- at width 16, four arms.
+        sources = {
+            "lib.py": "import subprocess\n\ndef sh(c):\n    subprocess.run(c, shell=True)\n\ndef native(b):\n    return sh(b)\n",
+            "arm.py": "import lib as H\n\nH.native(b)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["lib"], {"sh", "native"})
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+
+    def test_the_real_helper_that_delegates_is_in_the_table(self):
+        # Written against the table rather than the verdict, deliberately.
+        # The cell below asserts six real files are seen as harnesses, and it
+        # passed while `native` was missing -- because those six also call
+        # `H.ort`, which spawns directly. A cell that names one mechanism and
+        # is satisfied by another is how the ungated one stayed invisible.
+        table = spawning_helpers(ep_sources())
+        for helper in ("sh", "native", "ort", "competing_load"):
+            self.assertIn(helper, table["acc0_gap_matrix"], helper)
+
+    def test_the_harness_that_calls_only_native_is_recorded(self):
+        # `acc0_w16_steal_ab.py`: four arms (fixed/steal1/steal4/null) at
+        # width 16, entirely through `H.native`. Found by the fix above, not
+        # by reading the directory.
+        found = ep_sources()
+        table = spawning_helpers(found)
+        source = found["acc0_w16_steal_ab.py"]
+        self.assertFalse(spawns_a_process(source))
+        self.assertTrue(looks_like_a_harness(source, table))
+        self.assertIn("acc0_w16_steal_ab.py", EP_LEDGER)
+
+    def test_an_aliased_from_import_resolves_to_the_remote_name(self):
+        # `from m import ort as run_ort`: the table holds `ort`, the call
+        # site says `run_ort`. Looking the local name up in the remote
+        # module's table finds nothing and clears the file -- fail-open.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "arm.py": "from lib import native as go\n\ngo(cmd)\n",
+        }
+        self.assertTrue(
+            looks_like_a_harness(sources["arm.py"], spawning_helpers(sources))
+        )
+
+    def test_a_star_import_does_not_hide_the_helper(self):
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "arm.py": "from lib import *\n\nnative(cmd)\n",
+            "quiet.py": "from lib import *\n\nparse(text)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+        self.assertFalse(looks_like_a_harness(sources["quiet.py"], table))
+
+    def test_two_files_with_the_same_stem_are_unioned_not_overwritten(self):
+        # An archived copy beside the live module: last-write-wins would
+        # empty the live entry and clear every file importing it, from a file
+        # nobody thought they were changing. Union is the fail-closed way.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "old/lib.py": "def native(c):\n    return 0\n",
+            "arm.py": "import lib as H\n\nH.native(cmd)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["lib"], {"native"})
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+
+    def test_the_delegating_harnesses_in_the_tree_are_seen(self):
+        # The real ones, and the reason this class exists: before the table,
+        # `acc0_w16_study.py` and five others read as "starts nothing" while
+        # running native and ORT arms at width 16 through `H.native`.
+        found = ep_sources()
+        table = spawning_helpers(found)
+        for name in (
+            "acc0_w16_study.py",
+            "acc0_w8_w16_scaling.py",
+            "acc0_w16_blocktime_ab.py",
+            "acc0_w16_worker_split.py",
+            "acc0_w16_chunk_permutation.py",
+        ):
+            self.assertFalse(spawns_a_process(found[name]), name)
+            self.assertTrue(looks_like_a_harness(found[name], table), name)
+        # Two of those five hold the lock, so the ledger must not list them.
+        for gated in ("acc0_w16_worker_split.py", "acc0_w16_chunk_permutation.py"):
+            self.assertTrue(holds_the_lock(found[gated]), gated)
+            self.assertNotIn(gated, EP_LEDGER)
+
+
+class EpBenches(unittest.TestCase):
+    """The second root: crates/onnx-runtime-ep-cpu/benches."""
+
+    def test_every_harness_there_holds_the_lock_or_carries_a_recorded_gap(self):
+        self.assertEqual(ep_failures(ep_sources()), [])
+
+    def test_the_directory_is_actually_found(self):
+        # A path typo would make every cell above pass over an empty dict --
+        # the same vacuity as a non-recursive glob, one root over.
+        found = ep_sources()
+        self.assertGreater(len(found), 20, "benches root not found or empty")
+        self.assertIn("acc0_gap_matrix.py", found)
+
+    def test_a_harness_one_directory_down_is_still_read(self):
+        # The #2079 MUST FIX, transplanted: the workflow filter is
+        # `crates/onnx-runtime-ep-cpu/benches/**`, so a push touching a file
+        # in a subdirectory runs this job. A non-recursive glob would run it,
+        # read nothing and go green. Planted rather than asserted, because a
+        # pure-function assertion passes just as well with `glob` while the
+        # directory has no subdirectory.
+        planted = EP_BENCHES / "acc0_probe_tmp" / "sweep.py"
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            planted.write_text("import subprocess\nsubprocess.run(cmd)\n")
+            found = ep_sources()
+            self.assertIn("acc0_probe_tmp/sweep.py", found)
+            fail = ep_failures(found)
+            self.assertEqual(len(fail), 1)
+            self.assertIn("acc0_probe_tmp/sweep.py", fail[0])
+        finally:
+            planted.unlink(missing_ok=True)
+            planted.parent.rmdir()
+
+    def test_the_gated_harnesses_are_recognised_as_gated(self):
+        # Not a restatement of the cell above: this pins that the *shell*
+        # idiom counts, so a green run there means three files gate rather
+        # than that the ledger grew three more lines.
+        found = ep_sources()
+        for name in (
+            "acc0_gap_matrix.py",
+            "acc0_w16_worker_split.py",
+            "acc0_w16_chunk_permutation.py",
+        ):
+            self.assertTrue(holds_the_lock(found[name]), name)
+            self.assertNotIn(name, EP_LEDGER)
+
+    def test_a_new_ungated_harness_there_is_a_failure(self):
+        fail = ep_failures({"acc0_brand_new.py": "import subprocess\nsubprocess.run(c)\n"})
+        self.assertEqual(len(fail), 1)
+        self.assertIn("carries no recorded gap", fail[0])
+
+    def test_an_analysis_script_that_starts_nothing_needs_no_entry(self):
+        # Half that directory reads JSON and prints tables. Requiring an
+        # entry for those would make the ledger unmaintainable, and an
+        # unmaintainable ledger is one that gets a blanket exemption.
+        self.assertEqual(
+            ep_failures({"acc0_w16_dispersion.py": "import json\njson.load(f)\n"}), []
+        )
+        self.assertFalse(looks_like_a_harness("import json\nprint(json.load(f))\n"))
+
+    def test_an_unrecognised_reason_does_not_suppress_the_finding(self):
+        source = "import subprocess\nsubprocess.run(c)\n"
+        self.assertEqual(
+            len(ep_failures({"x.py": source}, {"x.py": "known-gap:#2043 - later"})), 0
+        )
+        for reason in ("later", "", "wontfix", "gap:#2043"):
+            fail = ep_failures({"x.py": source}, {"x.py": reason})
+            self.assertEqual(len(fail), 1, reason)
+            self.assertIn("unrecognised reason", fail[0])
+
+    def test_a_process_that_is_not_a_benchmark_can_say_so(self):
+        # Symmetry with `loads-runtime:` in the other root: a file shelling
+        # out to `lscpu` should not be failed into pretending it saturates
+        # the box, or the reason attached will be a lie by the second one.
+        source = 'import subprocess\nsubprocess.run(["lscpu"])\n'
+        self.assertEqual(
+            ep_failures({"topo.py": source}, {"topo.py": EP_NOT_A_BENCH + "reads topology"}),
+            [],
+        )
+
+    def test_every_recorded_gap_names_the_audit_issue(self):
+        # A gap with no issue attached is a gap nobody is going to close.
+        for name, reason in EP_LEDGER.items():
+            if not reason.startswith(EP_GAP):
+                continue
+            self.assertTrue(reason.startswith(EP_GAP + "#"), name)
+
+    def test_a_wrapper_is_recorded_as_a_wrapper_not_as_a_gap(self):
+        # `acc0_nothp_exec.py` execs the command it is handed, so the lock
+        # belongs to its caller. Taking it here would be worse than not: exec
+        # keeps the pid and never runs the release, so the lock would outlive
+        # the run and have to be reaped.
+        self.assertTrue(EP_LEDGER["acc0_nothp_exec.py"].startswith(EP_WRAPPER))
+        self.assertFalse(holds_the_lock(ep_sources()["acc0_nothp_exec.py"]))
+
+
+class Staleness(unittest.TestCase):
+    """A record that has come true is a record that must go."""
+
+    def test_no_recorded_gap_in_the_tree_is_stale(self):
+        self.assertEqual(stale_records(ep_sources(), EP_LEDGER), [])
+        self.assertEqual(stale_records(read_sources(), DRIVERS), [])
+
+    def test_a_gap_that_has_since_been_gated_fails(self):
+        # The drift this prevents: somebody gates `acc0_w16_page_backing.py`,
+        # the ledger still exempts it, and if the gate is later removed the
+        # stale line silently covers it again. Closing a gap is a one-line
+        # edit here, and the suite says so by name.
+        gated = {"acc0_w16_page_backing.py": "with H.HostLock(owner='roy'):\n    pass\n"}
+        fail = stale_records(gated, EP_LEDGER)
+        self.assertEqual(len(fail), 1)
+        self.assertIn("delete the record", fail[0])
+
+    def test_the_same_rule_covers_the_other_root(self):
+        cuda = {"ort_cuda_decode_bench.py": "hostlock_gate.require(cmd)\n"}
+        self.assertEqual(len(stale_records(cuda, DRIVERS)), 1)
+        self.assertEqual(stale_records({"ab.py": "hostlock_gate.require(c)\n"}, DRIVERS), [])
+
+    def test_no_record_points_at_a_file_that_is_gone(self):
+        self.assertEqual(dead_records(ep_sources()), [])
+
+    def test_a_record_for_a_deleted_or_defanged_file_fails(self):
+        self.assertEqual(
+            dead_records({}, {"gone.py": "known-gap:#2043 - x"}),
+            ["gone.py: recorded, but no such file -- delete the record"],
+        )
+        quiet = {"gone.py": "import json\n"}
+        self.assertIn("no longer starts anything", dead_records(quiet, {"gone.py": "known-gap:#1"})[0])
+
+
+class SpawnDetection(unittest.TestCase):
+    def test_the_common_spellings_all_count(self):
+        for source in (
+            "import subprocess\nsubprocess.run(cmd)\n",
+            "import subprocess\nsubprocess.Popen(cmd)\n",
+            "import subprocess\nsubprocess.check_output(cmd)\n",
+            "import os\nos.system(cmd)\n",
+            "from subprocess import run\nrun(cmd)\n",
+            "from subprocess import Popen as P\nP(cmd)\n",
+            "import subprocess as sp\nsp.run(cmd)\n",
+        ):
+            self.assertTrue(spawns_a_process(source), source)
+
+    def test_the_process_starting_idioms_all_count(self):
+        # None of these is in the tree today; a benchmark directory is
+        # exactly where the first one will appear, and the cost of the
+        # omission is a saturating harness that reads as harmless.
+        for source in (
+            "import os\nos.fork()\n",
+            "import multiprocessing\nmultiprocessing.Process(target=f).start()\n",
+            "from multiprocessing import Pool\nPool(8)\n",
+            "from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor(8)\n",
+            "import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor(8)\n",
+        ):
+            self.assertTrue(spawns_a_process(source), source)
+
+    def test_a_dotted_module_path_is_read_whole(self):
+        # `import concurrent.futures` binds `concurrent`, so the call site is
+        # two attributes deep. A one-step `Name.attr` match reads it as
+        # something else entirely and clears it.
+        self.assertEqual(
+            dotted_name(ast.parse("a.b.c(1)").body[0].value.func), "a.b.c"
+        )
+        self.assertIsNone(dotted_name(ast.parse("f()(1)").body[0].value.func))
+
+    def test_something_else_called_run_is_not_a_spawn(self):
+        # `pool.run(...)`, `bench.run(...)`: an attribute call on anything
+        # that is not the subprocess module.
+        self.assertFalse(spawns_a_process("import subprocess\npool.run(cmd)\n"))
+        self.assertFalse(spawns_a_process("def run(c):\n    pass\n\nrun(1)\n"))
+
+    def test_prose_about_running_a_benchmark_is_not_a_spawn(self):
+        self.assertFalse(spawns_a_process('"""Run subprocess.run(cmd) yourself."""\n'))
+        self.assertFalse(spawns_a_process("# subprocess.run(cmd)\n"))
+
+    def test_the_real_harnesses_are_detected(self):
+        # Anti-vacuity for the ledger: if the detector regressed to False the
+        # ledger cells above would all pass, having found nothing to check.
+        found = ep_sources()
+        table = spawning_helpers(found)
+        detected = sorted(n for n, s in found.items() if looks_like_a_harness(s, table))
+        # Floors and ceilings, both load-bearing: a detector stuck on False
+        # would let every ledger cell above pass having found nothing, and one
+        # stuck on True would "detect" the analysis scripts and make the
+        # ledger unmaintainable. Keyed off the record rather than a literal.
+        self.assertGreaterEqual(len(detected), len(EP_LEDGER))
+        self.assertLess(len(detected), len(found))
+        for name in EP_LEDGER:
+            self.assertIn(name, detected)
+        for quiet in ("acc0_w16_dispersion.py", "acc0_w16_mode_stratified.py"):
+            self.assertNotIn(quiet, detected)
+
+
+class LockIdioms(unittest.TestCase):
+    def test_the_shell_lock_counts_in_both_import_styles(self):
+        self.assertTrue(uses_the_shell_lock("with H.HostLock(owner='roy'):\n    pass\n"))
+        self.assertTrue(
+            uses_the_shell_lock(
+                "from acc0_gap_matrix import HostLock\nwith HostLock():\n    pass\n"
+            )
+        )
+
+    def test_naming_the_class_without_using_it_is_not_holding_it(self):
+        # Fail-closed direction, same as the python gate: an import or a
+        # mention is not an acquisition.
+        for source in (
+            "import acc0_gap_matrix as H\n",
+            "# with H.HostLock(): ...\n",
+            '"""Wrap the sweep in H.HostLock."""\n',
+        ):
+            self.assertFalse(uses_the_shell_lock(source), source)
+
+    def test_reading_the_lock_state_is_not_holding_it(self):
+        # Several harnesses print `hostlock_state` out of a saved JSON blob.
+        # Reporting a lock somebody else held is exactly the label-without-
+        # custody failure the column was added to prevent.
+        source = 'state = blob.get("hostlock", {}).get("hostlock_state")\n'
+        self.assertFalse(holds_the_lock(source))
+        self.assertEqual(len(ep_failures({"x.py": "import subprocess\nsubprocess.run(c)\n" + source})), 1)
+
+    def test_either_idiom_satisfies_the_benches_root(self):
+        for source in (
+            "import subprocess\nsubprocess.run(c)\nwith H.HostLock():\n    pass\n",
+            "import subprocess\nsubprocess.run(c)\nhostlock_gate.require(c)\n",
+        ):
+            self.assertEqual(ep_failures({"x.py": source}), [], source)
+
+
+class Custody(unittest.TestCase):
+    """The holder is the outer harness, not each arm."""
+
+    def test_nothing_in_the_tree_takes_the_lock_inside_a_loop(self):
+        for sources in (read_sources(), ep_sources()):
+            for name, source in sources.items():
+                if name in LIBRARIES or name in TESTS:
+                    continue
+                self.assertEqual(acquired_inside_a_loop(source), [], name)
+
+    def test_a_lock_taken_per_arm_is_caught(self):
+        # #1803's mechanism, in source form: acquiring inside the arm loop
+        # releases between arms, so the A and the B are separately protected
+        # and the comparison is not protected at all.
+        per_arm = "for arm in arms:\n    with H.HostLock():\n        run(arm)\n"
+        self.assertEqual(acquired_inside_a_loop(per_arm), [2])
+        outer = "with H.HostLock():\n    for arm in arms:\n        run(arm)\n"
+        self.assertEqual(acquired_inside_a_loop(outer), [])
+
+    def test_the_python_gate_is_held_the_same_way(self):
+        per_arm = "while more:\n    hostlock_gate.require(cmd)\n"
+        self.assertEqual(acquired_inside_a_loop(per_arm), [2])
+
+    def test_the_loop_is_found_inside_a_function_too(self):
+        # Where it actually lives: no harness in the tree loops at module
+        # level, they all loop inside `main()`. A check that read only
+        # top-level statements would pass over every real file.
+        in_main = (
+            "def main():\n"
+            "    for arm in arms:\n"
+            "        with H.HostLock():\n"
+            "            run(arm)\n"
+        )
+        self.assertEqual(acquired_inside_a_loop(in_main), [3])
+        outer = (
+            "def main():\n"
+            "    with H.HostLock():\n"
+            "        for arm in arms:\n"
+            "            run(arm)\n"
+        )
+        self.assertEqual(acquired_inside_a_loop(outer), [])
+
+    def test_a_nested_loop_does_not_hide_the_acquisition(self):
+        deep = (
+            "for a in arms:\n"
+            "    for r in reps:\n"
+            "        with HostLock():\n"
+            "            run(a)\n"
+        )
+        self.assertEqual(acquired_inside_a_loop(deep), [3])
+
+
 
 
 if __name__ == "__main__":
