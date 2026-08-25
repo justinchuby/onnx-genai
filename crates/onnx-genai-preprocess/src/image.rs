@@ -1,6 +1,7 @@
 //! Metadata-driven RGB image preprocessing.
 
 mod config;
+mod grouped;
 pub mod packed;
 
 pub use config::{
@@ -8,6 +9,7 @@ pub use config::{
     Normalization, ResizeMode, ThumbnailPosition, TileGrid, TilingMode, TokenExpansionConfig,
     expand_image_placeholders,
 };
+pub use grouped::{GroupedVisionBundle, GroupedVisionPreprocessor, MediaItem, MediaRequest};
 pub use packed::{
     ImageExpansionSummary, ImageTensorBundle, ImageTensorDType, ImageTensorData, NamedImageTensor,
 };

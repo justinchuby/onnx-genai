@@ -9,8 +9,11 @@
 # the realized placement out of /proc on the tree actually built.
 #
 # It is a `Cpus_allowed_list` read, not a benchmark: it does not need a quiet
-# host and no number here is a timing. It does spin up the pool, so it still
-# runs under the hostlock as a courtesy to whoever is measuring.
+# host and no number here is a timing. It does spin up the pool three times at
+# width 16/8, so it still runs under the hostlock as a courtesy to whoever is
+# measuring -- see the re-exec below. That sentence was here before the lock
+# call was, and nothing in the tree contradicted it, which is the reason
+# `test_gate_conformance.py` now reads this directory's shell files too.
 #
 # Three configurations, because they answer three different questions:
 #   1. default, no taskset      -- the configuration the report was taken in
@@ -35,7 +38,27 @@
 # gives the ORT arm the same CPUs at each width, so the comparison is symmetric
 # -- but "twice the threads" is not all that changes.
 set -u
+SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
 cd "$(dirname "$0")/../../.." || exit 1
+
+# Take the host lock once, for the whole census, by re-executing under it.
+#
+# Once, and around all three arms, because a lock taken per arm releases
+# between them -- which is exactly the gap #1803 was filed over: a peer who
+# sampled the host in that window read it as clear while an interleaved
+# comparison was mid-flight. `hostlock.sh run` anchors the claim to its own
+# pid and always releases, so a SIGKILL here cannot leak it.
+#
+# The sentinel is what stops the second entry from recursing. `--wait`
+# because this census is not timing-sensitive: blocking behind somebody
+# else's matrix costs nothing here and starting three pools on top of it
+# costs them their numbers.
+if [ -z "${HOSTLOCK_CENSUS_HELD:-}" ]; then
+  export HOSTLOCK_CENSUS_HELD=1
+  exec ./scripts/hostlock.sh run \
+    --reason "decode placement census: three pool launches (default/w16/w8)" \
+    --wait --timeout 1800 -- "$SELF" "$@"
+fi
 
 BIN=""
 for cand in target/release/deps/int4_decode_loop_ab-*; do

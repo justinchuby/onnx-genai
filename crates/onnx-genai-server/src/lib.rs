@@ -56,7 +56,9 @@ pub use runtime_args::{
 };
 #[cfg(feature = "native-backend")]
 pub use state::parse_native_device;
-pub use state::{AppState, ServerConfig, default_node_id, parse_kv_cache_dtype};
+pub use state::{
+    AppState, OrtSessionWorkerCount, ServerConfig, default_node_id, parse_kv_cache_dtype,
+};
 pub use types::{
     AudioSpeechRequest, AudioTranscriptionResponse, ChatChoice, ChatCompletionRequest,
     ChatCompletionResponse, ChatLogprobs, ChatMessage, ChatMessageContent, ChatMessageContentPart,

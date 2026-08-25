@@ -64,6 +64,8 @@ const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
     },
 ];
 
+const RETIRED_CONTINUOUS_BATCHING_CAPABILITY: &str = "continuous_batching";
+
 /// Capabilities this runtime supports.
 pub struct RuntimeCapabilities {
     pub supported: Vec<String>,
@@ -77,7 +79,6 @@ impl Default for RuntimeCapabilities {
                 capability::GROUPED_QUERY_ATTENTION.to_string(),
                 capability::MULTI_HEAD_ATTENTION.to_string(),
                 capability::PREFIX_CACHE.to_string(),
-                capability::CONTINUOUS_BATCHING.to_string(),
                 capability::CONTROL_FLOW_LOOP.to_string(),
                 // Structural workflow capabilities. Every package now declares
                 // its execution as a workflow, including a single decoder, so a
@@ -375,6 +376,7 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         }
     }
     validate_schema_version(metadata, &mut errors);
+    validate_retired_batching_capability(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
@@ -431,6 +433,46 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              with a puzzled unknown-field error; declare schema_version '{required}' so it is \
              refused for the reason that is true"
         ));
+    }
+}
+
+/// Reject the old opt-in spelling for an optimization the runtime derives.
+///
+/// A capability says execution would be incorrect without a behavior.
+/// Continuous batching is never required for correctness: a runtime may always
+/// execute one request at a time. Whether a resolved decode path can share a
+/// forward is derived from its graph/state contract and backend, while whether
+/// to do so is deployment policy.
+fn validate_retired_batching_capability(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if metadata
+        .required_capabilities
+        .iter()
+        .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
+    {
+        errors.push(
+            "required_capabilities contains retired capability 'continuous_batching'; remove it. \
+             Shared-forward support is derived from the workflow and resolved backend, and \
+             enabling or sizing batches is runtime policy, so single-request execution remains \
+             correct without a negotiated capability"
+                .to_string(),
+        );
+    }
+    if let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+        && workflow
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
+    {
+        errors.push(
+            "pipeline.workflow.manifest.capabilities contains retired capability \
+             'continuous_batching'; remove it. The workflow's typed batch layouts, state groups, \
+             and row-scoped ABI are the structural contract; grouping remains a runtime choice"
+                .to_string(),
+        );
     }
 }
 
@@ -758,17 +800,6 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
         let Some(decoding) = &profile.decoding else {
             continue;
         };
-        // When padding perturbs a row's values there is no reliable way to
-        // recover the valid region by re-deriving it from the input length, so
-        // the package must publish the per-row length it actually produced.
-        if profile.batch_invariance.as_deref() == Some("padding_sensitive")
-            && decoding.lengths.is_none()
-        {
-            errors.push(format!(
-                "profiles.{name}.decoding must bind a lengths output role because \
-                 profiles.{name}.batch_invariance is 'padding_sensitive'"
-            ));
-        }
         if decoding.kind == "ctc" && decoding.blank_id.is_none() {
             errors.push(format!(
                 "profiles.{name}.decoding requires blank_id because kind is 'ctc'"
@@ -787,6 +818,9 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
                 "profiles.{name}.decoding references output role '{role}' that the profile does \
                  not declare"
             ));
+        }
+        if decoding.kind == "ctc" {
+            validate_ctc_logits_contract(metadata, name, profile, decoding, errors);
         }
         if let Some(vocabulary) = &decoding.vocabulary {
             if vocabulary.source == "inline" && vocabulary.tokens.is_empty() {
@@ -836,6 +870,81 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
                 }
             }
         }
+    }
+}
+
+/// Resolve CTC through its canonical logits role and bind padded time logits
+/// to the padding contract's one validity truth.
+///
+/// `TensorContract::padding` already validates the companion's int64 dtype,
+/// shared layout, and exact outer-axis rank/shape. This cross-layer rule makes
+/// the CTC decoder consume that same value by name rather than permitting a
+/// missing or second, contradictory frame-count source.
+fn validate_ctc_logits_contract(
+    metadata: &InferenceMetadata,
+    profile_name: &str,
+    profile: &crate::schema::TaskProfile,
+    decoding: &crate::schema::SequenceDecodingSpec,
+    errors: &mut Vec<String>,
+) {
+    let Some(logits_output) = profile.outputs.get("logits") else {
+        errors.push(format!(
+            "profiles.{profile_name}.outputs.logits is required because CTC decoding reads the \
+             canonical 'logits' role; map that role to the workflow output containing the \
+             frame-by-class logits tensor"
+        ));
+        return;
+    };
+    let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+    else {
+        return;
+    };
+    let Some(logits) = workflow.outputs.get(logits_output) else {
+        return;
+    };
+    if decoding.time_axis >= logits.contract.rank {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.time_axis {} is outside workflow output \
+             '{logits_output}' rank {}",
+            decoding.time_axis, logits.contract.rank
+        ));
+        return;
+    }
+    if decoding.class_axis >= logits.contract.rank {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.class_axis {} is outside workflow output \
+             '{logits_output}' rank {}",
+            decoding.class_axis, logits.contract.rank
+        ));
+    }
+    let Some(padding) = logits.contract.padding.iter().find(|padding| {
+        axis_of_symbol(&logits.contract, &padding.dimension) == Some(decoding.time_axis)
+    }) else {
+        return;
+    };
+    let Some(lengths_role) = decoding.lengths.as_deref() else {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.lengths is required because workflow output \
+             '{logits_output}' pads decoded time axis {} ('{}') with valid_lengths '{}'; CTC \
+             must decode exactly that valid prefix",
+            decoding.time_axis, padding.dimension, padding.valid_lengths
+        ));
+        return;
+    };
+    let Some(bound_output) = profile.outputs.get(lengths_role) else {
+        return;
+    };
+    if bound_output != &padding.valid_lengths {
+        errors.push(format!(
+            "profiles.{profile_name}.decoding.lengths role '{lengths_role}' binds workflow output \
+             '{bound_output}', but workflow output '{logits_output}' pads decoded time axis {} \
+             ('{}') with valid_lengths '{}'; bind decoding.lengths to a profile output role \
+             mapping to '{}' so padding and CTC decoding have one source of truth",
+            decoding.time_axis, padding.dimension, padding.valid_lengths, padding.valid_lengths
+        ));
     }
 }
 

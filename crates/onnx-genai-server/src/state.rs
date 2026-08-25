@@ -28,6 +28,55 @@ pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 const DEFAULT_MAX_SESSIONS: usize = 256;
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
 const DEFAULT_MAX_BATCH: usize = 4;
+const MAX_ORT_SESSION_WORKERS: usize = 64;
+
+/// Number of owner threads used to execute distinct ORT sessions.
+///
+/// The name deliberately says what is multiplied: these are not ORT intra-op
+/// threads, Tokio workers, or native decode threads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrtSessionWorkerCount(std::num::NonZeroUsize);
+
+impl OrtSessionWorkerCount {
+    pub const ONE: Self = Self(std::num::NonZeroUsize::MIN);
+
+    pub fn new(value: usize) -> Result<Self, String> {
+        let value = std::num::NonZeroUsize::new(value)
+            .ok_or_else(|| "ORT session worker count must be greater than zero".to_string())?;
+        if value.get() > MAX_ORT_SESSION_WORKERS {
+            return Err(format!(
+                "ORT session worker count {} exceeds the supported maximum of \
+                 {MAX_ORT_SESSION_WORKERS}; choose a value from 1 to {MAX_ORT_SESSION_WORKERS}",
+                value.get()
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+impl Default for OrtSessionWorkerCount {
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+impl std::str::FromStr for OrtSessionWorkerCount {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let parsed = value.parse::<usize>().map_err(|_| {
+            format!(
+                "invalid ORT session worker count {value:?}; expected an integer from 1 to \
+                 {MAX_ORT_SESSION_WORKERS}"
+            )
+        })?;
+        Self::new(parsed)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ServerMemoryAuthorities {
@@ -387,6 +436,9 @@ pub struct ServerConfig {
     pub max_sessions: usize,
     /// Maximum generation requests admitted to the driver, including active and queued work.
     pub max_queue_depth: usize,
+    /// Number of distinct-session ORT engine workers. `1` preserves the
+    /// historical single-owner execution path exactly.
+    pub ort_session_workers: OrtSessionWorkerCount,
     /// Operator-requested maximum continuous-batch width (`--max-batch`). `None`
     /// leaves the server default in place and clamps silently to what the decode
     /// path can honor. `Some(n)` with `n > 1` on a backend that cannot batch is a
@@ -421,6 +473,7 @@ impl Default for ServerConfig {
             default_reasoning_effort: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_queue_depth: DEFAULT_MAX_QUEUE_DEPTH,
+            ort_session_workers: OrtSessionWorkerCount::default(),
             max_batch: None,
             enable_debug_endpoints: false,
             enable_admin_endpoints: false,
@@ -654,23 +707,48 @@ pub(crate) fn build_handle_with_authorities(
     let engine_model_dir = model_dir.to_path_buf();
     let engine_config = config.engine_config.clone();
     let configured_max_batch = config.max_batch;
-    let (engine_driver, fim_config) = EngineDriver::start(
-        move || {
-            let engine = Engine::from_dir_with_memory_authority_provider(
-                &engine_model_dir,
-                engine_config,
-                authorities,
-            )?;
-            // Refuse an explicit `--max-batch > 1` the decode path cannot honor,
-            // rather than accepting it and silently falling back to per-request
-            // decoding. This runs beside the engine before readiness is reported.
-            enforce_requested_max_batch(&engine, configured_max_batch)?;
-            let fim_config = engine.fim_config().cloned();
-            Ok((engine, fim_config))
-        },
-        requested_max_batch,
-        config.max_queue_depth,
-    )?;
+    let worker_count = config.ort_session_workers.get();
+    let engine_model_directory = model_directory.clone();
+    let (engine_driver, fim_config) = if worker_count == 1 {
+        EngineDriver::start(
+            move || {
+                let engine = Engine::from_dir_with_memory_authority_provider(
+                    &engine_model_dir,
+                    engine_config,
+                    authorities,
+                )?;
+                // Refuse an explicit `--max-batch > 1` the decode path cannot honor,
+                // rather than accepting it and silently falling back to per-request
+                // decoding. This runs beside the engine before readiness is reported.
+                enforce_requested_max_batch(&engine, configured_max_batch)?;
+                let fim_config = engine.fim_config().cloned();
+                Ok((engine, fim_config))
+            },
+            requested_max_batch,
+            config.max_queue_depth,
+        )?
+    } else {
+        EngineDriver::start_ort_workers(
+            move || {
+                let engine = Engine::from_dir_with_memory_authority_provider(
+                    &engine_model_dir,
+                    engine_config.clone(),
+                    authorities,
+                )?;
+                enforce_requested_max_batch(&engine, configured_max_batch)?;
+                let fim_config = engine.fim_config().cloned();
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(engine_model_directory, engine_config)
+                        .context("requested ORT session worker pool is unsupported")?,
+                );
+                Ok((engine, fim_config, factory))
+            },
+            worker_count,
+            requested_max_batch,
+            config.max_queue_depth,
+        )?
+    };
     Ok(ModelHandle::new(ModelHandleParts {
         id: model_id,
         model_dir: model_dir.to_path_buf(),
@@ -695,6 +773,13 @@ fn build_pipeline_handle(
     directory: PipelineModelDirectory,
     authorities: Arc<ServerMemoryAuthorities>,
 ) -> anyhow::Result<ModelHandle> {
+    if config.ort_session_workers.get() > 1 {
+        anyhow::bail!(
+            "ORT session workers currently support only a contracted single-decoder workflow; \
+             model '{model_id}' is a composite pipeline. Re-launch with \
+             --ort-session-workers 1."
+        );
+    }
     let image_pipeline = crate::image_generation::ImagePipelineSpec::from_pipeline(&directory.spec);
     let tokenizer_path = crate::multimodal::tokenizer_path(model_dir, &directory)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path)

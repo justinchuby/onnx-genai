@@ -334,11 +334,61 @@ check "MUTATION: the detector finds an unguarded filtered step" \
 # uses and proving its expansion is options only. Executed, not assumed: the
 # whole point of this file is that "it looks like it only emits -p" is the
 # kind of claim that is wrong exactly when it matters.
+#
+# Only `cargo-args` substitutions are generators: their expansion lands *in* a
+# cargo command line, which is what makes a bare word there a silent test
+# filter. The same script also answers `verify`, which is a checker -- prose on
+# stdout, the exit status is the signal, never substituted into cargo. Running
+# one of those as if it were a generator reports a defect that is not there
+# (it did: a `verify` call carrying a loop variable is unexpandable here, so
+# this cell read "did not run" and failed a green tree). So classify first and
+# execute only the generators -- and refuse any subcommand this suite has not
+# been taught to classify, so a new generator cannot arrive unexamined.
 # shellcheck disable=SC2016  # the $( is literal text being searched for
-SUBS="$(grep -o '\$(python[^)]*)' "$CI" | sort -u)"
+python_subs() { grep -o '\$(python[^)]*)' "$1" | sort -u; }
+
+# Substitutions in the wrong position for their subcommand. Which one a
+# substitution is cannot be read off its name -- it is decided by where the
+# expansion lands. A `verify` substituted into a cargo command line would
+# inject prose as test filters, and a generator outside one is not covered by
+# the execution cell below. So classify by the step block, and print anything
+# that does not match. Printed, not tolerated: silence here is how the next
+# generator would skip that cell.
+misclassified_subs() {
+    awk -v list="${2:-}" '
+        function flush(   i, n, parts, body) {
+            if (block == "") return
+            n = split(block, parts, /\$\(python/)
+            for (i = 2; i <= n; i++) {
+                body = parts[i]
+                sub(/\).*/, "", body)
+                if (list) { print "$(python" body ")"; continue }
+                if (block ~ /cargo /) {
+                    if (body !~ /workspace_test_packages\.py cargo-args /)
+                        print name ": in a cargo step but not a generator: $(python" body ")"
+                } else if (body !~ /workspace_test_packages\.py (verify|verify-required-tier|self-test)( |$|\))/) {
+                    print name ": outside a cargo step and not a known checker: $(python" body ")"
+                }
+            }
+        }
+        /^      - name:/ { flush(); block = ""; name = $0; sub(/^ *- name: */, "", name); inrun = 0; next }
+        /^        run:/ { inrun = 1; block = block " " $0; sub(/^ *run: */, "", block); next }
+        {
+            if (!inrun) next
+            line = $0
+            sub(/^[ \t]+/, "", line)
+            if (line ~ /^#/) next
+            block = block " " line
+        }
+        END { flush() }
+    ' "$1"
+}
+
+SUBS="$(python_subs "$CI")"
+ARGS_SUBS="$(printf '%s\n' "$SUBS" | grep -F 'cargo-args ' || true)"
 check "ci.yml's package-list generators are actually enumerated" \
-    "$([ -n "$SUBS" ] && echo 0 || echo 1)" \
-    "found no \$(python ...) substitutions in ci.yml -- the cell below would be vacuous"
+    "$([ -n "$ARGS_SUBS" ] && echo 0 || echo 1)" \
+    "found no \$(python ... cargo-args ...) substitutions in ci.yml -- the cell below would be vacuous"
 
 BAD_SUB=""
 while IFS= read -r sub; do
@@ -360,14 +410,52 @@ while IFS= read -r sub; do
         BAD_SUB="$BAD_SUB [$sub emits bare token: $tok]"
         break
     done
-done <<< "$SUBS"
+done <<< "$ARGS_SUBS"
 
 check "...and every one expands to options only, never a name filter" \
     "$([ -z "$BAD_SUB" ] && echo 0 || echo 1)" \
     "a generator can inject a bare test filter past the scanner:$BAD_SUB"
 
+UNCLASSIFIED="$(misclassified_subs "$CI")"
+check "...and every other \$(python ...) substitution sits where its subcommand belongs" \
+    "$([ -z "$UNCLASSIFIED" ] && echo 0 || echo 1)" \
+    "a substitution is in the wrong position for its subcommand: $UNCLASSIFIED"
+
+# The cell above passes by printing nothing -- which is also what a block
+# parser that reads nothing prints. Control for that: the classifier's own
+# enumeration must match, substitution for substitution, what a flat grep
+# finds. A pass earned by parsing zero steps is the failure mode this file
+# exists to refuse, and it is invisible from the verdict alone.
+CLASSIFIER_SAW="$(misclassified_subs "$CI" list | sort -u)"
+check "...and the classifier actually parsed them (not a pass by reading nothing)" \
+    "$([ "$CLASSIFIER_SAW" = "$SUBS" ] && echo 0 || echo 1)" \
+    "classifier enumerated [$CLASSIFIER_SAW] but ci.yml contains [$SUBS]"
+
+# And that classifier by mutation, both directions. Without this cell,
+# narrowing the execution above to `cargo-args` would be indistinguishable
+# from deleting it: a generator under a new subcommand, or a checker spliced
+# into a cargo command line, would simply go unchecked.
+cat > "$WORK/mutant_sub.yml" <<'YAML'
+      - name: A generator in a cargo step
+        run: cargo test --locked $(python .github/scripts/workspace_test_packages.py cargo-args lint)
+      - name: A checker outside a cargo step
+        run: |
+          out=$(python .github/scripts/workspace_test_packages.py verify $sim 2>&1) && rc=0 || rc=$?
+      - name: A subcommand nobody classified
+        run: echo $(python .github/scripts/workspace_test_packages.py frobnicate --lane lint)
+      - name: A checker spliced into a cargo command
+        run: cargo test --locked $(python .github/scripts/workspace_test_packages.py verify)
+YAML
+MUT_SUB="$(misclassified_subs "$WORK/mutant_sub.yml")"
+# shellcheck disable=SC2016  # the $( is literal text being matched, not expanded
+MUT_WANT='A subcommand nobody classified: outside a cargo step and not a known checker: $(python .github/scripts/workspace_test_packages.py frobnicate --lane lint)
+A checker spliced into a cargo command: in a cargo step but not a generator: $(python .github/scripts/workspace_test_packages.py verify)'
+check "MUTATION: both a new subcommand and a misplaced checker are refused" \
+    "$([ "$MUT_SUB" = "$MUT_WANT" ] && echo 0 || echo 1)" \
+    "expected exactly the two offenders, got: [$MUT_SUB]"
+
 echo ""
-EXPECTED=33
+EXPECTED=36
 TOTAL=$((PASS + FAIL))
 if [ "$TOTAL" -ne "$EXPECTED" ]; then
     echo "✗ $TOTAL assertions ran, expected $EXPECTED — a cell was added or lost" >&2

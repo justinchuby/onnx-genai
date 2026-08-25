@@ -40,6 +40,13 @@ pub(crate) async fn models(
 /// because the underlying getter does not exist yet — see per-field comments.
 pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeStatus>, ApiError> {
     let snapshot = crate::metrics::snapshot();
+    let workers = state
+        .registry
+        .worker_statuses()
+        .map_err(map_registry_error)?
+        .into_iter()
+        .map(worker_status_info)
+        .collect();
     Ok(Json(NodeStatus {
         // Node-level id from server config; independent of any loaded model.
         node_id: state.config.node_id.clone(),
@@ -82,6 +89,7 @@ pub(crate) async fn status(State(state): State<AppState>) -> Result<Json<NodeSta
             .collect(),
         // System-prompt prefix hashes are not yet surfaced by the engine.
         prefix_hashes: Vec::new(),
+        workers,
     }))
 }
 
@@ -94,6 +102,12 @@ pub(crate) async fn debug_config(
         .map_err(map_registry_error)?
         .ok_or_else(|| ApiError::internal("no model loaded"))?;
     let facts = handle.engine.workflow_facts();
+    let workers = handle
+        .engine
+        .worker_statuses()
+        .into_iter()
+        .map(|status| worker_status_info((handle.id.clone(), status)))
+        .collect();
     Ok(Json(DebugConfigResponse {
         model_id: handle.id.clone(),
         workflow_components: facts.components,
@@ -102,8 +116,24 @@ pub(crate) async fn debug_config(
         max_output_tokens: state.config.max_output_tokens,
         max_sessions: state.config.max_sessions,
         max_queue_depth: state.config.max_queue_depth,
+        ort_session_workers: state.config.ort_session_workers.get(),
         model_max_context: handle.model_max_context,
+        workers,
     }))
+}
+
+fn worker_status_info(
+    (model_id, status): (String, crate::driver::WorkerRuntimeStatus),
+) -> WorkerStatusInfo {
+    WorkerStatusInfo {
+        model_id,
+        worker_id: status.worker.id.index(),
+        active_turns: status.worker.active_turns,
+        live_sessions: status.worker.live_sessions,
+        health: status.worker.health.as_str(),
+        kv_pages_in_use: status.kv.pages_in_use,
+        kv_pages_total: status.kv.hot_capacity,
+    }
 }
 
 pub(crate) async fn debug_sessions(

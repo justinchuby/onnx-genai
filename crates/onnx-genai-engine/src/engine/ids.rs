@@ -2,18 +2,17 @@
 //!
 //! `docs/architecture/SESSION_CONCURRENCY.md` §1.2 records that the engine
 //! already has more than one session id space, that they "agree by convention,
-//! not by type", and §13 Phase 3 requires shard-encoded ids once a worker pool
-//! grows past one. Before any of that, a smaller thing has to be true: it has to
-//! be possible to say *which* namespace a counter belongs to, and whether a
-//! second worker minting from a second copy of it would collide.
+//! not by type". The server now pairs these local ids with `WorkerId`; separate
+//! workers may therefore mint the same number without aliasing conversations.
+//! Within one engine, it must still be possible to say which namespace a
+//! counter belongs to and to mint safely from every code path that shares it.
 //!
 //! Two kinds of namespace exist, and the difference decides the mechanism:
 //!
-//! * **Shared** — the id leaves the engine. A caller holds it, the server's
-//!   `SessionRegistry` routes on it, and a future `WorkerPool` may hand two
-//!   requests for it to two different threads. Two workers minting from
-//!   independent counters would hand the same id to two conversations, so the
-//!   counter is a [`SharedSessionIds`] and is atomic.
+//! * **Engine-shared** — the local id leaves the engine and is shared by the
+//!   engine's session APIs. The server routes the worker-qualified placement,
+//!   not this number alone. The counter is a [`SharedSessionIds`] and remains
+//!   atomic so all in-engine minting paths share one collision-free namespace.
 //! * **Worker-local** — the id never leaves the thread that minted it, and is
 //!   only ever compared against state that thread owns. Those live in
 //!   `crate::pipeline::runtime_state` (`PassIdAllocator`,
@@ -22,14 +21,14 @@
 //!
 //! **What is not covered.** Decode-core session ids come from
 //! `PagedKvCache::create_sequence`, not from here, so they carry their own
-//! namespace inside the KV crate. Unifying the two is §13 Phase 0's `SessionId`
-//! newtype work and is deliberately not attempted here.
+//! namespace inside the KV crate. The server's typed placement is the
+//! unification boundary; the two local allocators deliberately remain separate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::SessionId;
 
-/// Mints session ids that are handed out beyond the engine.
+/// Mints session ids that are handed out beyond one engine.
 ///
 /// One allocator owns one namespace. Ids are minted from 1 upward, which is
 /// exactly the sequence the `counter += 1; use counter` code it replaces
@@ -85,10 +84,8 @@ mod tests {
 
     #[test]
     fn one_namespace_is_collision_free_across_threads() {
-        // The engine is single-threaded today. This is the property that has to
-        // hold before it is not, and testing it now is what makes the atomic a
-        // decision rather than a habit: an allocator that a future worker pool
-        // shares must never hand two workers the same session id.
+        // One allocator remains collision-free even if multiple in-engine
+        // callers mint concurrently; separate workers own separate allocators.
         let ids = Arc::new(SharedSessionIds::new());
         let threads = (0..8)
             .map(|_| {

@@ -1,5 +1,5 @@
 # Wav2Vec2 encoder-only ASR with explicit CTC decoding profile.
-schema_version: v1
+schema_version: v1.1
 pipeline:
   workflow:
     manifest:
@@ -52,6 +52,9 @@ pipeline:
           batch_layout:
             kind: request_aligned
             axis: 0
+          padding:
+          - dimension: frames
+            valid_lengths: frame_lengths
         role: tensor
         stage: pre_adapter
       frame_lengths:
@@ -61,8 +64,7 @@ pipeline:
           shape:
           - batch
           batch_layout:
-            kind: request_aligned
-            axis: 0
+            kind: shared
         role: tensor
         stage: pre_adapter
     components:
@@ -101,14 +103,16 @@ pipeline:
               batch_layout:
                 kind: request_aligned
                 axis: 0
+              padding:
+              - dimension: frames
+                valid_lengths: frame_lengths
             frame_lengths:
               dtype: int64
               rank: 1
               shape:
               - batch
               batch_layout:
-                kind: request_aligned
-                axis: 0
+                kind: shared
     state: {}
     steps:
     - kind: invoke
@@ -134,7 +138,6 @@ profiles:
     outputs:
       logits: logits
       frame_lengths: frame_lengths
-    batch_invariance: padding_sensitive
     decoding:
       kind: ctc
       blank_id: 0

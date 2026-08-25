@@ -11,9 +11,10 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
-    ContinuousBatchManager, DeviceMemoryAuthority, EmbeddingOptions, EncodedAudio,
-    EngineGovernorError, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
-    MemoryStrategyPlan, PipelineGenerateRequest, ResourceLimit, SchedulerAdmissionError,
+    ContinuousBatchManager, EmbeddingOptions, EncodedAudio, EngineGovernorError,
+    EngineMemoryAccounting, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
+    MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest, ResourceLimit,
+    SchedulerAdmissionError,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
@@ -22,7 +23,8 @@ use crate::lease::{ModelKey, ModelSessionPlacement, SessionLeaseGuard};
 use crate::metrics::GenerationMetrics;
 use crate::multimodal::MultimodalInput;
 use crate::worker::{
-    SessionPlacement, WorkerHandle, WorkerId, WorkerPool, WorkerStartError, WorkerUnavailable,
+    SessionCloseAccounting, SessionPlacement, SessionPlacementReservation, WorkerHandle, WorkerId,
+    WorkerPool, WorkerStartError, WorkerStatusSnapshot, WorkerTurnGuard, WorkerUnavailable,
 };
 
 const DRIVER_OUTPUT_BUFFER: usize = 16;
@@ -52,7 +54,8 @@ pub(crate) struct EngineDriver {
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     pub(crate) memory_strategy_plan: Arc<MemoryStrategyPlan>,
-    pub(crate) device_authority: Option<DeviceMemoryAuthority>,
+    /// Live model-wide device/host/disk ledgers shared by every worker.
+    pub(crate) memory_accounting: Option<EngineMemoryAccounting>,
     /// Honest, decode-path-sourced batching report for this engine, resolved at
     /// startup. Surfaced over `/v1/resources` and `/v1/debug/kv` so an operator
     /// sees `batch_supported=false` / effective max batch = 1 directly instead of
@@ -61,6 +64,9 @@ pub(crate) struct EngineDriver {
     /// What the loaded package's serialized workflow says, read once at
     /// startup. Facts about the document, not about which executor runs it.
     pub(crate) workflow_facts: WorkflowFacts,
+    /// One lock-free KV mirror per worker. The legacy aggregate fields continue
+    /// to report worker 0; debug/status expose this full list.
+    pub(crate) worker_kv_telemetry: Arc<Vec<Arc<KvTelemetry>>>,
 }
 
 /// The serialized workflow, as an operator-facing summary.
@@ -69,6 +75,12 @@ pub(crate) struct WorkflowFacts {
     pub(crate) components: usize,
     pub(crate) graph_components: usize,
     pub(crate) declares_generation_loop: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WorkerRuntimeStatus {
+    pub(crate) worker: WorkerStatusSnapshot,
+    pub(crate) kv: onnx_genai_engine::KvTelemetrySnapshot,
 }
 
 /// Server-facing summary of an engine's batching capability, combining the
@@ -110,9 +122,14 @@ impl BatchingReport {
 }
 
 pub(crate) enum DriverCommand {
-    CreateSession(tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>),
+    CreateSession {
+        reservation: SessionPlacementReservation,
+        acknowledgement: std::sync::mpsc::Receiver<()>,
+        response: tokio::sync::oneshot::Sender<anyhow::Result<SessionId>>,
+    },
     CloseSession {
-        session_id: SessionId,
+        lease: SessionLeaseGuard,
+        accounting: SessionCloseAccounting,
         response: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
     },
     SessionTokenCount {
@@ -144,18 +161,18 @@ pub(crate) enum DriverCommand {
         input: Option<MultimodalInput>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
-        permit: OwnedSemaphorePermit,
+        permit: WorkerPermit,
     },
     SynthesizeSpeech {
         request: Box<GenerateRequest>,
         audio_output: String,
         reply: oneshot::Sender<anyhow::Result<EncodedAudio>>,
-        permit: OwnedSemaphorePermit,
+        permit: WorkerPermit,
     },
     GenerateImage {
         request: Box<ImageExecutionRequest>,
         reply: oneshot::Sender<anyhow::Result<ProducedImage>>,
-        permit: OwnedSemaphorePermit,
+        permit: WorkerPermit,
         track_metrics: bool,
     },
     GenerateFim {
@@ -165,12 +182,13 @@ pub(crate) enum DriverCommand {
         options: Box<GenerateOptions>,
         admission: oneshot::Sender<Result<(), DriverFailure>>,
         events: mpsc::Sender<DriverEvent>,
-        permit: OwnedSemaphorePermit,
+        permit: WorkerPermit,
     },
     Embed {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<Vec<f32>>>,
+        permit: WorkerPermit,
     },
     #[cfg(test)]
     ResourceSnapshot(tokio::sync::oneshot::Sender<anyhow::Result<GovernorSnapshot>>),
@@ -180,6 +198,20 @@ pub(crate) enum DriverCommand {
             anyhow::Result<Result<GovernorSnapshot, EngineGovernorError>>,
         >,
     },
+    #[cfg(test)]
+    BarrierGenerate {
+        session_id: SessionId,
+        barrier: Arc<std::sync::Barrier>,
+        request: Box<GenerateRequest>,
+        response: std::sync::mpsc::SyncSender<anyhow::Result<GenerateResult>>,
+    },
+    #[cfg(test)]
+    Block {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
+    #[cfg(test)]
+    Panic,
 }
 
 #[derive(Debug)]
@@ -193,6 +225,7 @@ pub(crate) enum DriverEvent {
 pub(crate) enum DriverFailureKind {
     Internal,
     MemoryOverload,
+    WorkerUnavailable,
     /// The caller asked the loaded package for something it cannot serve as
     /// asked. Carried as the engine's own type so a status code never depends
     /// on the wording of a message.
@@ -208,6 +241,12 @@ pub(crate) struct DriverFailure {
 pub(crate) struct DriverGeneration {
     pub(crate) admission: oneshot::Receiver<Result<(), DriverFailure>>,
     pub(crate) events: mpsc::Receiver<DriverEvent>,
+}
+
+struct PendingSessionCreation {
+    worker: WorkerId,
+    acknowledgement: std::sync::mpsc::SyncSender<()>,
+    response: oneshot::Receiver<anyhow::Result<SessionId>>,
 }
 
 impl std::fmt::Display for DriverFailure {
@@ -257,6 +296,13 @@ impl DriverFailure {
             },
         }
     }
+
+    fn from_worker_unavailable(error: WorkerUnavailable) -> Self {
+        Self {
+            message: error.to_string(),
+            kind: DriverFailureKind::WorkerUnavailable,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -266,10 +312,21 @@ pub(crate) enum GenerateSubmitError {
     Failed(DriverFailure),
 }
 
+fn generate_submit_worker_error(error: WorkerUnavailable) -> GenerateSubmitError {
+    match error {
+        WorkerUnavailable::Failed(_) => {
+            GenerateSubmitError::Failed(DriverFailure::from_worker_unavailable(error))
+        }
+        WorkerUnavailable::Unknown { .. } | WorkerUnavailable::Stopped(_) => {
+            GenerateSubmitError::DriverStopped
+        }
+    }
+}
+
 struct DriverRoute {
     admission: Option<oneshot::Sender<Result<(), DriverFailure>>>,
     events: mpsc::Sender<DriverEvent>,
-    _permit: OwnedSemaphorePermit,
+    _permit: WorkerPermit,
     /// Held for as long as the row is: a route that is retired, rejected, or
     /// abandoned mid-stream drops it, and the session is leasable again.
     _lease: Option<SessionLeaseGuard>,
@@ -281,13 +338,39 @@ struct PendingGeneration {
     lease: Option<SessionLeaseGuard>,
     admission: oneshot::Sender<Result<(), DriverFailure>>,
     events: mpsc::Sender<DriverEvent>,
-    permit: OwnedSemaphorePermit,
+    permit: WorkerPermit,
+}
+
+pub(crate) struct WorkerPermit {
+    _admission: OwnedSemaphorePermit,
+    _turn: WorkerTurnGuard,
+}
+
+impl WorkerPermit {
+    fn new(admission: OwnedSemaphorePermit, turn: WorkerTurnGuard) -> Self {
+        Self {
+            _admission: admission,
+            _turn: turn,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn untracked(admission: OwnedSemaphorePermit) -> Self {
+        let (commands, _rx) = mpsc::channel(1);
+        let pool = WorkerPool::single(WorkerHandle::detached(WorkerId::PRIMARY, commands));
+        Self::new(
+            admission,
+            pool.reserve_turn(WorkerId::PRIMARY)
+                .expect("detached test worker is reachable"),
+        )
+    }
 }
 
 #[derive(Clone, Copy)]
 struct MicrobatchAdmission<'a> {
     max_queue_depth: usize,
     generation_capacity: &'a Semaphore,
+    worker_count: usize,
 }
 
 /// State constructed, used, and destroyed entirely inside one worker thread.
@@ -302,6 +385,7 @@ struct EngineWorkerState<DropProbe> {
     max_queue_depth: usize,
     generation_capacity: Arc<Semaphore>,
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
+    worker_count: usize,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
     _drop_probe: DropProbe,
 }
@@ -311,8 +395,79 @@ struct EngineWorkerReady {
     kv_telemetry: Arc<KvTelemetry>,
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     memory_strategy_plan: Arc<MemoryStrategyPlan>,
-    device_authority: Option<DeviceMemoryAuthority>,
+    memory_accounting: Option<EngineMemoryAccounting>,
     workflow_facts: WorkflowFacts,
+}
+
+fn prepare_engine_worker<DropProbe>(
+    mut engine: Engine,
+    rx: mpsc::Receiver<DriverCommand>,
+    max_batch: usize,
+    max_queue_depth: usize,
+    generation_capacity: Arc<Semaphore>,
+    drop_probe: DropProbe,
+    worker_count: usize,
+) -> (EngineWorkerState<DropProbe>, EngineWorkerReady) {
+    let batching = Arc::new(BatchingReport::from_capability(
+        &engine.batching_capability(),
+        max_batch,
+    ));
+    let effective_max_batch = batching.effective_max_batch;
+    let continuous_batch_supported = engine.continuous_batch_manager(effective_max_batch).is_ok();
+    let memory_accounting = Some(engine.governor().memory_accounting());
+    let kv_telemetry = Arc::new(KvTelemetry::default());
+    if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
+        kv_telemetry.set_applicable();
+    } else {
+        kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
+    }
+    let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
+    let workflow_facts = WorkflowFacts {
+        components: engine.workflow_component_count(),
+        graph_components: engine.workflow_graph_component_count(),
+        declares_generation_loop: engine.workflow_declares_generation_loop(),
+    };
+    let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
+    let ready = EngineWorkerReady {
+        batching,
+        kv_telemetry,
+        resource_snapshot: Arc::clone(&resource_snapshot),
+        memory_strategy_plan,
+        memory_accounting,
+        workflow_facts,
+    };
+    (
+        EngineWorkerState {
+            engine,
+            commands: Some(rx),
+            continuous_batch_supported,
+            max_batch: effective_max_batch,
+            max_queue_depth,
+            generation_capacity,
+            resource_snapshot,
+            worker_count,
+            _not_send: std::marker::PhantomData,
+            _drop_probe: drop_probe,
+        },
+        ready,
+    )
+}
+
+fn worker_start_error(error: WorkerStartError<anyhow::Error>) -> anyhow::Error {
+    match error {
+        WorkerStartError::ThreadSpawn(error) => {
+            anyhow::Error::new(error).context("failed to spawn engine worker thread")
+        }
+        WorkerStartError::Initialization(error) => {
+            error.context("engine worker initialization failed")
+        }
+        WorkerStartError::InitializationPanicked(message) => {
+            anyhow::anyhow!("engine worker initialization panicked: {message}")
+        }
+        WorkerStartError::InitializationChannelClosed => {
+            anyhow::anyhow!("engine worker exited before reporting initialization")
+        }
+    }
 }
 
 impl EngineDriver {
@@ -330,107 +485,177 @@ impl EngineDriver {
         Ready: Send + 'static,
         Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
     {
-        Self::start_inner(build_engine, max_batch, max_queue_depth, ())
+        Self::start_inner(
+            move || {
+                let (engine, ready) = build_engine()?;
+                Ok((engine, ready, None))
+            },
+            1,
+            max_batch,
+            max_queue_depth,
+            (),
+            Arc::new(|_| Ok(())),
+        )
+    }
+
+    /// Start an opt-in pool whose first worker loads the shared immutable ORT
+    /// resources and whose remaining workers construct only worker-local state
+    /// from that factory.
+    pub(crate) fn start_ort_workers<Ready, Build>(
+        build_engine: Build,
+        worker_count: usize,
+        max_batch: usize,
+        max_queue_depth: usize,
+    ) -> anyhow::Result<(Self, Ready)>
+    where
+        Ready: Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready, Arc<OrtEngineWorkerFactory>)>
+            + Send
+            + 'static,
+    {
+        Self::start_inner(
+            move || {
+                let (engine, ready, factory) = build_engine()?;
+                Ok((engine, ready, Some(factory)))
+            },
+            worker_count,
+            max_batch,
+            max_queue_depth,
+            (),
+            Arc::new(|_| Ok(())),
+        )
     }
 
     fn start_inner<Ready, Build, DropProbe>(
         build_engine: Build,
+        worker_count: usize,
         max_batch: usize,
         max_queue_depth: usize,
         drop_probe: DropProbe,
+        before_additional_worker: Arc<dyn Fn(WorkerId) -> anyhow::Result<()> + Send + Sync>,
     ) -> anyhow::Result<(Self, Ready)>
     where
         Ready: Send + 'static,
-        Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
+        Build: FnOnce() -> anyhow::Result<(Engine, Ready, Option<Arc<OrtEngineWorkerFactory>>)>
+            + Send
+            + 'static,
         DropProbe: Send + 'static,
     {
+        anyhow::ensure!(worker_count > 0, "engine worker count must be nonzero");
         let (commands, rx) = mpsc::channel(max_queue_depth);
         let generation_capacity = Arc::new(Semaphore::new(max_queue_depth));
         let driver_capacity = generation_capacity.clone();
-        // One worker owns the engine for the whole life of this driver. The
-        // pool exists so a command names the worker it is going to, not so the
-        // engine can move between them: it cannot.
         let worker_id = WorkerId::PRIMARY;
-        let (worker, (ready_payload, worker_ready)) = WorkerHandle::spawn(
+        let (worker, (ready_payload, factory, worker_ready)) = WorkerHandle::spawn(
             worker_id,
             format!("onnx-genai-batch-driver-{worker_id}"),
             commands,
             move || -> anyhow::Result<_> {
-                let (mut engine, ready_payload) = build_engine()
+                let (engine, ready_payload, factory) = build_engine()
                     .with_context(|| format!("failed to construct engine on worker {worker_id}"))?;
-                let batching = Arc::new(BatchingReport::from_capability(
-                    &engine.batching_capability(),
+                let (state, worker_ready) = prepare_engine_worker(
+                    engine,
+                    rx,
                     max_batch,
-                ));
-                let effective_max_batch = batching.effective_max_batch;
-                let continuous_batch_supported =
-                    engine.continuous_batch_manager(effective_max_batch).is_ok();
-                let device_authority = Some(engine.governor().device_authority());
-                let kv_telemetry = Arc::new(KvTelemetry::default());
-                if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
-                    kv_telemetry.set_applicable();
-                } else {
-                    kv_telemetry.set_not_applicable(KvNotApplicable::CacheCannotPage);
-                }
-                let memory_strategy_plan = Arc::new(engine.memory_strategy_plan().clone());
-                let workflow_facts = WorkflowFacts {
-                    components: engine.workflow_component_count(),
-                    graph_components: engine.workflow_graph_component_count(),
-                    declares_generation_loop: engine.workflow_declares_generation_loop(),
-                };
-                let resource_snapshot = Arc::new(Mutex::new(Some(engine.resource_snapshot())));
-                let worker_ready = EngineWorkerReady {
-                    batching,
-                    kv_telemetry,
-                    resource_snapshot: Arc::clone(&resource_snapshot),
-                    memory_strategy_plan,
-                    device_authority,
-                    workflow_facts,
-                };
-                Ok((
-                    EngineWorkerState {
-                        engine,
-                        commands: Some(rx),
-                        continuous_batch_supported,
-                        max_batch: effective_max_batch,
-                        max_queue_depth,
-                        generation_capacity: driver_capacity,
-                        resource_snapshot,
-                        _not_send: std::marker::PhantomData,
-                        _drop_probe: drop_probe,
-                    },
-                    (ready_payload, worker_ready),
-                ))
+                    max_queue_depth,
+                    driver_capacity,
+                    drop_probe,
+                    worker_count,
+                );
+                Ok((state, (ready_payload, factory, worker_ready)))
             },
             run_engine_driver,
         )
-        .map_err(|error| match error {
-            WorkerStartError::ThreadSpawn(error) => {
-                anyhow::Error::new(error).context("failed to spawn engine worker thread")
-            }
-            WorkerStartError::Initialization(error) => {
-                error.context("engine worker initialization failed")
-            }
-            WorkerStartError::InitializationPanicked(message) => {
-                anyhow::anyhow!("engine worker initialization panicked: {message}")
-            }
-            WorkerStartError::InitializationChannelClosed => {
-                anyhow::anyhow!("engine worker exited before reporting initialization")
-            }
-        })
+        .map_err(worker_start_error)
         .with_context(|| format!("failed to start engine worker {worker_id}"))?;
+        let mut worker_handles = vec![worker];
+        let mut worker_readies = vec![worker_ready];
+        if worker_count > 1 {
+            let factory = factory.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "ORT worker factory was not returned for requested worker count {worker_count}"
+                )
+            })?;
+            for index in 1..worker_count {
+                let worker_id = WorkerId::new(index);
+                let (commands, rx) = mpsc::channel(max_queue_depth);
+                let factory = Arc::clone(&factory);
+                let driver_capacity = Arc::clone(&generation_capacity);
+                let before_additional_worker = Arc::clone(&before_additional_worker);
+                let started = WorkerHandle::spawn(
+                    worker_id,
+                    format!("onnx-genai-batch-driver-{worker_id}"),
+                    commands,
+                    move || -> anyhow::Result<_> {
+                        before_additional_worker(worker_id)?;
+                        let engine = factory.build_worker().with_context(|| {
+                            format!("failed to construct ORT engine on worker {worker_id}")
+                        })?;
+                        Ok(prepare_engine_worker(
+                            engine,
+                            rx,
+                            max_batch,
+                            max_queue_depth,
+                            driver_capacity,
+                            (),
+                            worker_count,
+                        ))
+                    },
+                    run_engine_driver,
+                )
+                .map_err(worker_start_error)
+                .with_context(|| format!("failed to start engine worker {worker_id}"));
+                match started {
+                    Ok((worker, ready)) => {
+                        worker_handles.push(worker);
+                        worker_readies.push(ready);
+                    }
+                    Err(error) => {
+                        WorkerPool::new(worker_handles).shutdown();
+                        return Err(error.context(format!(
+                            "ORT worker-pool startup was rolled back after {index} of \
+                             {worker_count} worker(s) became ready"
+                        )));
+                    }
+                }
+            }
+        }
+        let first_ready = worker_readies
+            .first()
+            .expect("at least one worker reported ready");
+        for (index, ready) in worker_readies.iter().enumerate().skip(1) {
+            if ready.batching.supported != first_ready.batching.supported
+                || ready.batching.effective_max_batch != first_ready.batching.effective_max_batch
+                || ready.workflow_facts.components != first_ready.workflow_facts.components
+                || ready.workflow_facts.graph_components
+                    != first_ready.workflow_facts.graph_components
+            {
+                WorkerPool::new(worker_handles).shutdown();
+                anyhow::bail!(
+                    "ORT worker {index} resolved capabilities that differ from worker 0; \
+                     all workers were shut down and the model was not loaded"
+                );
+            }
+        }
         tracing::info!(
-            batch_supported = worker_ready.batching.supported,
-            requested_max_batch = worker_ready.batching.requested_max_batch,
-            effective_max_batch = worker_ready.batching.effective_max_batch,
-            reason = %worker_ready.batching.reason,
+            batch_supported = first_ready.batching.supported,
+            requested_max_batch = first_ready.batching.requested_max_batch,
+            effective_max_batch = first_ready.batching.effective_max_batch,
+            reason = %first_ready.batching.reason,
             "resolved batching capability",
         );
-        let workers = WorkerPool::single(worker);
-        tracing::info!(
-            workers = workers.len(),
-            "engine worker pool started (one worker owns the engine)",
+        let worker_kv_telemetry = Arc::new(
+            worker_readies
+                .iter()
+                .map(|ready| Arc::clone(&ready.kv_telemetry))
+                .collect::<Vec<_>>(),
         );
+        let first_ready = worker_readies
+            .into_iter()
+            .next()
+            .expect("at least one worker reported ready");
+        let workers = WorkerPool::new(worker_handles);
+        tracing::info!(workers = workers.len(), "engine worker pool started",);
         Ok((
             Self {
                 // Rebound by `ModelHandle::new`, which is the first thing that
@@ -439,12 +664,13 @@ impl EngineDriver {
                 workers,
                 generation_capacity,
                 generation_capacity_size: u32::try_from(max_queue_depth).unwrap_or(u32::MAX),
-                kv_telemetry: worker_ready.kv_telemetry,
-                resource_snapshot: worker_ready.resource_snapshot,
-                memory_strategy_plan: worker_ready.memory_strategy_plan,
-                device_authority: worker_ready.device_authority,
-                batching: worker_ready.batching,
-                workflow_facts: worker_ready.workflow_facts,
+                kv_telemetry: Arc::clone(&first_ready.kv_telemetry),
+                resource_snapshot: first_ready.resource_snapshot,
+                memory_strategy_plan: first_ready.memory_strategy_plan,
+                memory_accounting: first_ready.memory_accounting,
+                batching: first_ready.batching,
+                workflow_facts: first_ready.workflow_facts,
+                worker_kv_telemetry,
             },
             ready_payload,
         ))
@@ -462,7 +688,17 @@ impl EngineDriver {
         Build: FnOnce() -> anyhow::Result<(Engine, Ready)> + Send + 'static,
         DropProbe: Send + 'static,
     {
-        Self::start_inner(build_engine, max_batch, max_queue_depth, drop_probe)
+        Self::start_inner(
+            move || {
+                let (engine, ready) = build_engine()?;
+                Ok((engine, ready, None))
+            },
+            1,
+            max_batch,
+            max_queue_depth,
+            drop_probe,
+            Arc::new(|_| Ok(())),
+        )
     }
 
     /// Stop every worker and wait for the engine to be destroyed.
@@ -486,8 +722,39 @@ impl EngineDriver {
     }
 
     /// The sender for a command bound to no session.
-    fn commands(&self) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
+    fn primary_commands(&self) -> Result<mpsc::Sender<DriverCommand>, WorkerUnavailable> {
         self.workers.primary_sender()
+    }
+
+    fn reserve_stateless_command(
+        &self,
+    ) -> Result<(mpsc::Sender<DriverCommand>, WorkerPermit), GenerateSubmitError> {
+        let (worker, turn) = self
+            .workers
+            .reserve_stateless_turn()
+            .map_err(generate_submit_worker_error)?;
+        let admission = self
+            .generation_capacity
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GenerateSubmitError::Overloaded)?;
+        let commands = self
+            .workers
+            .sender_for(worker)
+            .map_err(generate_submit_worker_error)?;
+        Ok((commands, WorkerPermit::new(admission, turn)))
+    }
+
+    pub(crate) fn worker_statuses(&self) -> Vec<WorkerRuntimeStatus> {
+        self.workers
+            .statuses()
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| WorkerRuntimeStatus {
+                worker,
+                kv: self.worker_kv_telemetry[index].snapshot(),
+            })
+            .collect()
     }
 
     /// What the loaded package's serialized workflow declares.
@@ -537,18 +804,41 @@ impl EngineDriver {
     /// The placement, not the bare id, is what a caller stores: an engine
     /// session id means nothing away from the worker that issued it.
     pub(crate) async fn create_session(&self) -> anyhow::Result<SessionPlacement> {
-        let worker = self.workers.placement_worker();
+        let pending = self.enqueue_session_creation().await?;
+        let engine_session_id = pending
+            .response
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        pending
+            .acknowledgement
+            .send(())
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
+        Ok(SessionPlacement::new(pending.worker, engine_session_id))
+    }
+
+    async fn enqueue_session_creation(&self) -> anyhow::Result<PendingSessionCreation> {
+        let reservation = self
+            .workers
+            .reserve_session_placement()
+            .map_err(anyhow::Error::new)?;
+        let worker = reservation.worker();
         let (response, rx) = tokio::sync::oneshot::channel();
+        let (acknowledgement, acknowledgement_rx) = std::sync::mpsc::sync_channel(1);
         self.workers
             .sender_for(worker)
             .map_err(anyhow::Error::new)?
-            .send(DriverCommand::CreateSession(response))
+            .send(DriverCommand::CreateSession {
+                reservation,
+                acknowledgement: acknowledgement_rx,
+                response,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        let engine_session_id = rx
-            .await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
-        Ok(SessionPlacement::new(worker, engine_session_id))
+        Ok(PendingSessionCreation {
+            worker,
+            acknowledgement,
+            response: rx,
+        })
     }
 
     /// Close a session, under the lease that proves no turn is in flight on it.
@@ -558,6 +848,16 @@ impl EngineDriver {
     /// destroy the state that turn is mid-way through writing. The lease is
     /// released when this returns, and never before the engine has answered.
     pub(crate) async fn close_session(&self, lease: SessionLeaseGuard) -> anyhow::Result<()> {
+        self.enqueue_session_close(lease)
+            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn enqueue_session_close(
+        &self,
+        lease: SessionLeaseGuard,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<()>>> {
         anyhow::ensure!(
             lease.model() == &self.model,
             "session lease for model '{}' cannot be closed on model '{}'",
@@ -565,17 +865,21 @@ impl EngineDriver {
             self.model,
         );
         let session = lease.placement();
+        let accounting = self
+            .workers
+            .worker(session.worker)?
+            .session_close_accounting();
         let (response, rx) = tokio::sync::oneshot::channel();
         self.session_commands(session)
             .map_err(anyhow::Error::new)?
             .send(DriverCommand::CloseSession {
-                session_id: session.engine_session_id,
+                lease,
+                accounting,
                 response,
             })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        Ok(rx)
     }
 
     /// Tokens attended ahead of the prompt and the subset re-prefilled.
@@ -649,16 +953,28 @@ impl EngineDriver {
             "a turn's lease names the engine it runs on",
         );
         let placement = session.as_ref().map(SessionLeaseGuard::placement);
-        let permit = self
+        let (worker, turn) = match placement {
+            Some(placement) => (
+                placement.worker,
+                self.workers
+                    .reserve_turn(placement.worker)
+                    .map_err(generate_submit_worker_error)?,
+            ),
+            None => self
+                .workers
+                .reserve_stateless_turn()
+                .map_err(generate_submit_worker_error)?,
+        };
+        let admission_permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let commands = match placement {
-            Some(placement) => self.session_commands(placement),
-            None => self.commands(),
-        }
-        .map_err(|_| GenerateSubmitError::DriverStopped)?;
+        let permit = WorkerPermit::new(admission_permit, turn);
+        let commands = self
+            .workers
+            .sender_for(worker)
+            .map_err(generate_submit_worker_error)?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
@@ -691,11 +1007,16 @@ impl EngineDriver {
     /// Run a small generation while blocking the calling thread. Used only by
     /// startup and the administrative warmup path, never request generation.
     pub(crate) fn warmup(&self, request: GenerateRequest) -> anyhow::Result<()> {
-        let permit = self
+        let (worker, turn) = self
+            .workers
+            .reserve_stateless_turn()
+            .map_err(anyhow::Error::new)?;
+        let admission_permit = self
             .generation_capacity
             .clone()
             .try_acquire_owned()
             .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let permit = WorkerPermit::new(admission_permit, turn);
         let (events, mut receiver) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, _admission_rx) = oneshot::channel();
         let command = DriverCommand::Generate {
@@ -707,7 +1028,8 @@ impl EngineDriver {
             events,
             permit,
         };
-        self.commands()
+        self.workers
+            .sender_for(worker)
             .map_err(anyhow::Error::new)?
             .blocking_send(command)
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
@@ -726,14 +1048,7 @@ impl EngineDriver {
         request: GenerateRequest,
         audio_output: String,
     ) -> Result<EncodedAudio, GenerateSubmitError> {
-        let permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let Ok(commands) = self.commands() else {
-            return Err(GenerateSubmitError::DriverStopped);
-        };
+        let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, response) = oneshot::channel();
         crate::metrics::generation_queued();
         if commands
@@ -759,14 +1074,7 @@ impl EngineDriver {
         &self,
         request: ImageExecutionRequest,
     ) -> Result<anyhow::Result<ProducedImage>, GenerateSubmitError> {
-        let permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let Ok(commands) = self.commands() else {
-            return Err(GenerateSubmitError::DriverStopped);
-        };
+        let (commands, permit) = self.reserve_stateless_command()?;
         let (reply, receiver) = oneshot::channel();
         crate::metrics::generation_queued();
         if commands
@@ -788,14 +1096,15 @@ impl EngineDriver {
     }
 
     pub(crate) fn warmup_image(&self, request: ImageExecutionRequest) -> anyhow::Result<()> {
-        let permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| anyhow::anyhow!("generation capacity exceeded"))?;
+        let (commands, permit) = self
+            .reserve_stateless_command()
+            .map_err(|error| match error {
+                GenerateSubmitError::Overloaded => anyhow::anyhow!("generation capacity exceeded"),
+                GenerateSubmitError::DriverStopped => anyhow::anyhow!("engine driver stopped"),
+                GenerateSubmitError::Failed(failure) => anyhow::anyhow!(failure.message),
+            })?;
         let (reply, receiver) = oneshot::channel();
-        self.commands()
-            .map_err(anyhow::Error::new)?
+        commands
             .blocking_send(DriverCommand::GenerateImage {
                 request: Box::new(request),
                 reply,
@@ -816,14 +1125,7 @@ impl EngineDriver {
         fim_config: FimConfig,
         options: GenerateOptions,
     ) -> Result<DriverGeneration, GenerateSubmitError> {
-        let permit = self
-            .generation_capacity
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| GenerateSubmitError::Overloaded)?;
-        let Ok(commands) = self.commands() else {
-            return Err(GenerateSubmitError::DriverStopped);
-        };
+        let (commands, permit) = self.reserve_stateless_command()?;
         let (events, rx) = mpsc::channel(DRIVER_OUTPUT_BUFFER);
         let (admission, admission_rx) = oneshot::channel();
         crate::metrics::generation_queued();
@@ -854,22 +1156,39 @@ impl EngineDriver {
         input_ids: Vec<TokenId>,
         options: EmbeddingOptions,
     ) -> anyhow::Result<Vec<f32>> {
-        let _permit = Arc::clone(&self.generation_capacity)
+        self.enqueue_embedding(input_ids, options)
+            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+    }
+
+    async fn enqueue_embedding(
+        &self,
+        input_ids: Vec<TokenId>,
+        options: EmbeddingOptions,
+    ) -> anyhow::Result<oneshot::Receiver<anyhow::Result<Vec<f32>>>> {
+        let (worker, turn) = self
+            .workers
+            .reserve_stateless_turn()
+            .map_err(anyhow::Error::new)?;
+        let admission = Arc::clone(&self.generation_capacity)
             .acquire_owned()
             .await
             .map_err(|_| anyhow::anyhow!("engine admission semaphore closed"))?;
+        let permit = WorkerPermit::new(admission, turn);
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.commands()
+        self.workers
+            .sender_for(worker)
             .map_err(anyhow::Error::new)?
             .send(DriverCommand::Embed {
                 input_ids,
                 options,
                 reply,
+                permit,
             })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        Ok(rx)
     }
 
     pub(crate) async fn resource_snapshot(&self) -> anyhow::Result<GovernorSnapshot> {
@@ -879,22 +1198,8 @@ impl EngineDriver {
             .expect("resource snapshot mirror lock poisoned")
             .clone()
             .ok_or_else(|| anyhow::anyhow!("resource governor is not available for this model"))?;
-        if let Some(authority) = &self.device_authority {
-            let used = authority.used_bytes();
-            let limit = authority.limit_bytes();
-            snapshot.vram.used = used;
-            snapshot.vram.limit = limit;
-            snapshot.vram.headroom = limit.saturating_sub(used);
-            // `resolved_limits.vram_bytes` is the *resolved device (VRAM)
-            // capacity limit*, which stays `None` when the device capacity could
-            // not be measured (#947). The shared authority's ceiling on such a
-            // box is the host-RAM-derived advisory bound, not a measured VRAM
-            // capacity, so it is surfaced through `vram.limit` only and must not
-            // be relabelled here as a resolved VRAM capacity. When the device WAS
-            // measured, refresh it to the shared authority's live ceiling.
-            if snapshot.resolved_limits.vram_bytes.is_some() {
-                snapshot.resolved_limits.vram_bytes = Some(limit);
-            }
+        if let Some(accounting) = &self.memory_accounting {
+            accounting.refresh_snapshot(&mut snapshot);
         }
         Ok(snapshot)
     }
@@ -908,13 +1213,20 @@ impl EngineDriver {
         limit: ResourceLimit,
     ) -> anyhow::Result<Result<GovernorSnapshot, EngineGovernorError>> {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        self.commands()
+        self.primary_commands()
             .map_err(anyhow::Error::new)?
             .send(DriverCommand::SetVramLimit { limit, reply })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        let mut result = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        if let Ok(snapshot) = &mut result
+            && let Some(accounting) = &self.memory_accounting
+        {
+            accounting.refresh_snapshot(snapshot);
+        }
+        Ok(result)
     }
 }
 
@@ -940,6 +1252,7 @@ fn run_engine_driver<DropProbe>(mut worker: EngineWorkerState<DropProbe>) {
             worker.max_queue_depth,
             &worker.generation_capacity,
             &worker.resource_snapshot,
+            worker.worker_count,
         );
     } else {
         tracing::info!(
@@ -969,6 +1282,7 @@ fn run_static_engine_driver(
     max_queue_depth: usize,
     generation_capacity: &Semaphore,
     resource_snapshot: &Mutex<Option<GovernorSnapshot>>,
+    worker_count: usize,
 ) {
     // The current ContinuousBatchManager API accepts GenerateRequest only.
     // X-Session-Id requests keep using the driver's per-request engine path so
@@ -1009,6 +1323,7 @@ fn run_static_engine_driver(
                     MicrobatchAdmission {
                         max_queue_depth,
                         generation_capacity,
+                        worker_count,
                     },
                     resource_snapshot,
                     PendingGeneration {
@@ -1111,13 +1426,21 @@ fn run_static_batch_until_idle(
             break;
         }
 
-        let in_flight = admission
-            .max_queue_depth
-            .saturating_sub(admission.generation_capacity.available_permits());
-        let deferred_permit_holders = deferred_permit_holder_count(deferred);
-        let expected_this_batch = in_flight
-            .saturating_sub(deferred_permit_holders)
-            .min(max_batch);
+        let expected_this_batch = if admission.worker_count == 1 {
+            // Preserve the pre-sharding batching heuristic byte-for-byte for
+            // the default configuration.
+            let in_flight = admission
+                .max_queue_depth
+                .saturating_sub(admission.generation_capacity.available_permits());
+            let deferred_permit_holders = deferred_permit_holder_count(deferred);
+            in_flight
+                .saturating_sub(deferred_permit_holders)
+                .min(max_batch)
+        } else {
+            // The global admission semaphore also counts turns assigned to
+            // other workers. They must never influence this worker's batch.
+            initial.len()
+        };
         // Re-evaluated every iteration rather than latched: a sibling that was
         // expected and then drained (or was never batchable to begin with)
         // must stop holding this request at the hard deadline. Latching meant
@@ -1390,7 +1713,7 @@ fn admission_step(
 /// This is subtracted from the in-flight count to estimate how many *other*
 /// requests are still arriving, so it must match the set of commands that
 /// actually take a permit — every one of `generate`, `generate_pipeline`,
-/// `generate_fim`, `render_images`, and `synthesize_speech` does.
+/// `generate_fim`, `render_images`, `synthesize_speech`, and `embed` does.
 ///
 /// Counting only the text-generation commands understated the deferred total,
 /// which inflated `expected_this_batch` and latched `saw_pending_sibling` for a
@@ -1407,6 +1730,7 @@ fn deferred_permit_holder_count(deferred: &VecDeque<DriverCommand>) -> usize {
                     | DriverCommand::GenerateImage { .. }
                     | DriverCommand::GenerateFim { .. }
                     | DriverCommand::SynthesizeSpeech { .. }
+                    | DriverCommand::Embed { .. }
             )
         })
         .count()
@@ -1593,14 +1917,44 @@ fn route_continuous_events(
 
 fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
     match command {
-        DriverCommand::CreateSession(response) => {
-            let _ = response.send(engine.create_session());
-        }
-        DriverCommand::CloseSession {
-            session_id,
+        DriverCommand::CreateSession {
+            reservation,
+            acknowledgement,
             response,
         } => {
-            let _ = response.send(engine.close_session(session_id));
+            let session_id = match engine.create_session() {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let _ = response.send(Err(error));
+                    return;
+                }
+            };
+            let committed = match reservation.commit() {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let _ = engine.close_session(session_id);
+                    let _ = response.send(Err(anyhow::Error::new(error)));
+                    return;
+                }
+            };
+            if response.send(Ok(session_id)).is_err() || acknowledgement.recv().is_err() {
+                let _ = engine.close_session(session_id);
+                return;
+            }
+            committed.persist();
+        }
+        DriverCommand::CloseSession {
+            lease,
+            accounting,
+            response,
+        } => {
+            let held_lease = lease;
+            let result = engine.close_session(held_lease.placement().engine_session_id);
+            if result.is_ok() {
+                accounting.session_closed();
+            }
+            drop(held_lease);
+            let _ = response.send(result);
         }
         DriverCommand::SessionTokenCount {
             session_id,
@@ -1696,6 +2050,7 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
             input_ids,
             options,
             reply,
+            permit: _permit,
         } => {
             let _ = reply.send(engine.embed_with_options(&input_ids, options));
         }
@@ -1709,6 +2064,23 @@ fn handle_driver_command(engine: &mut Engine, command: DriverCommand) {
                 .map(|_| engine.resource_snapshot());
             let _ = reply.send(Ok(result));
         }
+        #[cfg(test)]
+        DriverCommand::BarrierGenerate {
+            session_id,
+            barrier,
+            request,
+            response,
+        } => {
+            barrier.wait();
+            let _ = response.send(engine.generate_in_session(session_id, *request));
+        }
+        #[cfg(test)]
+        DriverCommand::Block { entered, release } => {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+        #[cfg(test)]
+        DriverCommand::Panic => panic!("injected worker failure"),
     }
 }
 
@@ -1947,7 +2319,7 @@ fn run_fim_generation(
     delivery: (
         oneshot::Sender<Result<(), DriverFailure>>,
         mpsc::Sender<DriverEvent>,
-        OwnedSemaphorePermit,
+        WorkerPermit,
     ),
 ) {
     let (admission, events, _permit) = delivery;
@@ -2005,6 +2377,30 @@ mod admission_tests {
         }
     }
 
+    async fn block_worker(driver: &EngineDriver) -> std::sync::mpsc::SyncSender<()> {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .primary_sender()
+            .unwrap()
+            .send(DriverCommand::Block {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("worker entered blocking command");
+        release_tx
+    }
+
+    async fn wait_for_prior_commands(driver: &EngineDriver) {
+        let release = block_worker(driver).await;
+        release.send(()).unwrap();
+    }
+
     #[test]
     fn engine_worker_state_is_structurally_not_send() {
         const {
@@ -2013,6 +2409,359 @@ mod admission_tests {
                 "engine worker state must not cross threads"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_ort_workers_run_distinct_sessions_concurrently_with_colliding_local_ids() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let model_directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..onnx_genai_engine::EngineConfig::default()
+        };
+        let build_config = config.clone();
+        let (driver, ()) = EngineDriver::start_ort_workers(
+            move || {
+                let engine = Engine::from_dir(&model_dir, build_config.clone())?;
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(model_directory, build_config)
+                        .expect("CPU ORT session supports concurrent Run"),
+                );
+                Ok((engine, (), factory))
+            },
+            2,
+            1,
+            8,
+        )
+        .expect("start two ORT workers");
+
+        let first = driver.create_session().await.expect("first session");
+        let second = driver.create_session().await.expect("second session");
+        assert_eq!(first.worker, WorkerId::new(0));
+        assert_eq!(second.worker, WorkerId::new(1));
+        assert_eq!(
+            first.engine_session_id, second.engine_session_id,
+            "worker-local session ids may collide; placement keeps them distinct"
+        );
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut request = GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![1]));
+        request.options.max_new_tokens = 2;
+        request.options.stop_on_eos = false;
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
+        driver
+            .workers
+            .sender_for(first.worker)
+            .unwrap()
+            .send(DriverCommand::BarrierGenerate {
+                session_id: first.engine_session_id,
+                barrier: Arc::clone(&barrier),
+                request: Box::new(request.clone()),
+                response: first_tx,
+            })
+            .await
+            .unwrap();
+        driver
+            .workers
+            .sender_for(second.worker)
+            .unwrap()
+            .send(DriverCommand::BarrierGenerate {
+                session_id: second.engine_session_id,
+                barrier,
+                request: Box::new(request),
+                response: second_tx,
+            })
+            .await
+            .unwrap();
+
+        let deadline = Duration::from_secs(10);
+        assert!(
+            first_rx
+                .recv_timeout(deadline)
+                .expect("worker 0 crossed the barrier")
+                .is_ok()
+        );
+        assert!(
+            second_rx
+                .recv_timeout(deadline)
+                .expect("worker 1 crossed the barrier")
+                .is_ok()
+        );
+        driver.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn w2_resource_snapshot_tracks_worker1_host_release_without_worker0_command() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let model_directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..onnx_genai_engine::EngineConfig::default()
+        };
+        let build_config = config.clone();
+        let (driver, ()) = EngineDriver::start_ort_workers(
+            move || {
+                let engine = Engine::from_dir(&model_dir, build_config.clone())?;
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(model_directory, build_config)
+                        .expect("CPU ORT session supports concurrent Run"),
+                );
+                Ok((engine, (), factory))
+            },
+            2,
+            1,
+            8,
+        )
+        .expect("start two ORT workers");
+
+        let worker0_at_ready = driver
+            .resource_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("worker 0 readiness snapshot");
+        let both_workers = driver.resource_snapshot().await.unwrap();
+        assert!(
+            both_workers.host_ram.used > worker0_at_ready.host_ram.used,
+            "worker 1 KV allocation must appear without a worker 0 refresh: worker0={}, live={}",
+            worker0_at_ready.host_ram.used,
+            both_workers.host_ram.used,
+        );
+
+        driver
+            .workers
+            .sender_for(WorkerId::new(1))
+            .unwrap()
+            .send(DriverCommand::Panic)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.worker_statuses()[1].worker.health != crate::worker::WorkerHealth::Failed {
+            assert!(Instant::now() < deadline, "worker 1 did not report failure");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let after_worker1_failure = driver.resource_snapshot().await.unwrap();
+        assert_eq!(
+            after_worker1_failure.host_ram.used, worker0_at_ready.host_ram.used,
+            "worker 1 KV release must disappear without executing a worker 0 command",
+        );
+
+        driver.shutdown();
+        let after_teardown = driver.resource_snapshot().await.unwrap();
+        assert_eq!(after_teardown.host_ram.used, 0);
+        assert_eq!(after_teardown.vram.used, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_worker_failure_loses_only_its_sessions() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let model_directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..onnx_genai_engine::EngineConfig::default()
+        };
+        let build_config = config.clone();
+        let (driver, ()) = EngineDriver::start_ort_workers(
+            move || {
+                let engine = Engine::from_dir(&model_dir, build_config.clone())?;
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(model_directory, build_config)
+                        .expect("CPU ORT session supports concurrent Run"),
+                );
+                Ok((engine, (), factory))
+            },
+            2,
+            1,
+            8,
+        )
+        .expect("start two ORT workers");
+        let lost = driver.create_session().await.expect("worker 0 session");
+        let survivor = driver.create_session().await.expect("worker 1 session");
+
+        driver
+            .workers
+            .sender_for(lost.worker)
+            .unwrap()
+            .send(DriverCommand::Panic)
+            .await
+            .unwrap();
+        let timeout = Instant::now() + Duration::from_secs(5);
+        loop {
+            if driver.worker_statuses()[0].worker.health == crate::worker::WorkerHealth::Failed {
+                break;
+            }
+            assert!(Instant::now() < timeout, "worker 0 did not report failure");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            driver.worker_statuses()[0].worker.live_sessions,
+            0,
+            "failed-worker placements are invalidated"
+        );
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let lease = leases
+            .acquire(driver.binding(lost), "lost-session")
+            .expect("the failed worker cannot strand the routing lease");
+        assert!(matches!(
+            driver.generate(Some(lease), warmup_request(), None).await,
+            Err(GenerateSubmitError::Failed(DriverFailure {
+                kind: DriverFailureKind::WorkerUnavailable,
+                ..
+            }))
+        ));
+
+        let lost_error = driver
+            .session_token_count(lost)
+            .await
+            .expect_err("the failed worker's session is lost");
+        assert!(
+            lost_error
+                .to_string()
+                .contains("sessions placed on this worker"),
+            "{lost_error:#}"
+        );
+        assert!(
+            driver.session_token_count(survivor).await.is_ok(),
+            "worker 1 remains available"
+        );
+        let replacement = driver
+            .create_session()
+            .await
+            .expect("healthy worker accepts");
+        assert_eq!(replacement.worker, WorkerId::new(1));
+        driver.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_session_and_embedding_calls_finish_worker_owned_cleanup() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let (driver, ()) = EngineDriver::start(
+            move || {
+                Ok((
+                    Engine::from_dir(&model_dir, onnx_genai_engine::EngineConfig::default())?,
+                    (),
+                ))
+            },
+            1,
+            8,
+        )
+        .expect("load tiny fixture");
+
+        // Cancellation after enqueue drops the acknowledgement and response.
+        // The worker creates, closes, and releases the pending reservation.
+        let create_release = block_worker(&driver).await;
+        let pending_create = driver.enqueue_session_creation().await.unwrap();
+        drop(pending_create);
+        create_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // Even after the response was delivered, ownership is not transferred
+        // until the submitting future sends its non-awaiting acknowledgement.
+        let mut delivered_create = driver.enqueue_session_creation().await.unwrap();
+        (&mut delivered_create.response).await.unwrap().unwrap();
+        drop(delivered_create);
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // A close command owns both the exclusive lease and its accounting.
+        // Dropping the response receiver cannot admit another turn early or
+        // leave the live-session count behind.
+        let session = driver.create_session().await.unwrap();
+        let leases = crate::lease::SessionLeases::with_shards(1);
+        let binding = driver.binding(session);
+        let lease = leases.acquire(binding.clone(), "cancel-close").unwrap();
+        let close_release = block_worker(&driver).await;
+        let close_response = driver.enqueue_session_close(lease).await.unwrap();
+        drop(close_response);
+        assert!(leases.is_held(&binding));
+        close_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert!(!leases.is_held(&binding));
+        assert_eq!(driver.worker_statuses()[0].worker.live_sessions, 0);
+
+        // Embedding admission and turn accounting travel with the queued work.
+        // They stay charged after the caller disconnects and release only once
+        // the worker has actually attempted the embedding.
+        let embed_release = block_worker(&driver).await;
+        let embed_response = driver
+            .enqueue_embedding(vec![1], EmbeddingOptions::default())
+            .await
+            .unwrap();
+        drop(embed_response);
+        assert_eq!(driver.generation_capacity.available_permits(), 7);
+        assert_eq!(driver.worker_statuses()[0].worker.active_turns, 1);
+        embed_release.send(()).unwrap();
+        wait_for_prior_commands(&driver).await;
+        assert_eq!(driver.generation_capacity.available_permits(), 8);
+        assert_eq!(driver.worker_statuses()[0].worker.active_turns, 0);
+
+        driver.shutdown();
+    }
+
+    #[test]
+    fn partial_worker_startup_rolls_back_and_joins_ready_workers() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let model_directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..onnx_genai_engine::EngineConfig::default()
+        };
+        let build_config = config.clone();
+        let caller = thread::current().id();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::sync_channel(1);
+
+        let error = match EngineDriver::start_inner(
+            move || {
+                let engine = Engine::from_dir(&model_dir, build_config.clone())?;
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(model_directory, build_config)
+                        .expect("CPU ORT session supports concurrent Run"),
+                );
+                Ok((engine, (), Some(factory)))
+            },
+            2,
+            1,
+            8,
+            EngineDropThread(dropped_tx),
+            Arc::new(|worker| {
+                anyhow::ensure!(
+                    worker != WorkerId::new(1),
+                    "injected worker startup failure"
+                );
+                Ok(())
+            }),
+        ) {
+            Ok(_) => panic!("the injected second-worker failure must abort pool startup"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("startup was rolled back after 1 of 2"),
+            "{error:#}"
+        );
+        assert_ne!(
+            dropped_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("ready worker was shut down and joined"),
+            caller,
+            "the first engine must be destroyed on its owner thread"
+        );
     }
 
     fn pending_route() -> (
@@ -2027,7 +2776,7 @@ mod admission_tests {
             DriverRoute {
                 admission: Some(admission),
                 events,
-                _permit: permit,
+                _permit: WorkerPermit::untracked(permit),
                 _lease: None,
                 metrics: GenerationMetrics::start(),
             },
@@ -2193,9 +2942,10 @@ mod admission_tests {
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
+            worker_kv_telemetry: Arc::new(vec![Arc::new(KvTelemetry::default())]),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
             memory_strategy_plan: Arc::new(engine.memory_strategy_plan().clone()),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::from_capability(
                 &engine.batching_capability(),
                 1,
@@ -2295,7 +3045,7 @@ mod admission_tests {
                 lease: None,
                 admission,
                 events,
-                permit,
+                permit: WorkerPermit::untracked(permit),
             },
         );
 
@@ -2422,13 +3172,14 @@ mod admission_tests {
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
+            worker_kv_telemetry: Arc::new(vec![Arc::new(KvTelemetry::default())]),
             resource_snapshot: Arc::new(Mutex::new(None)),
             memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
                 0,
                 None,
                 "driver test stub",
             )),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::single_sequence_stub()),
         };
         let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
@@ -2474,13 +3225,14 @@ mod admission_tests {
             generation_capacity: Arc::new(Semaphore::new(1)),
             generation_capacity_size: 1,
             kv_telemetry: Arc::new(KvTelemetry::default()),
+            worker_kv_telemetry: Arc::new(vec![Arc::new(KvTelemetry::default())]),
             resource_snapshot: Arc::new(Mutex::new(None)),
             memory_strategy_plan: Arc::new(onnx_genai_engine::MemoryStrategyPlan::unknown(
                 0,
                 None,
                 "driver test stub",
             )),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::single_sequence_stub()),
         };
         let session = SessionPlacement::new(WorkerId::PRIMARY, 7);
@@ -2716,7 +3468,7 @@ mod driver_delivery_tests {
             DriverRoute {
                 admission: None,
                 events,
-                _permit: permit,
+                _permit: WorkerPermit::untracked(permit),
                 _lease: None,
                 metrics: GenerationMetrics::start(),
             },

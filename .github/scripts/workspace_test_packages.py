@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+WORKFLOWS = ROOT / ".github" / "workflows"
 
 # The status checks the `main` branch ruleset marks required. A job outside this
 # set can go red without blocking a merge, so a package tested only there is,
@@ -103,12 +104,109 @@ def lane_packages(lane: str) -> list[str]:
             selected = ORT_BACKED & packages
         case "linux-only":
             selected = LINUX_ONLY & packages
+        case "lint":
+            # Every package any test lane compiles. `cargo clippy` only ever
+            # *checks*, so the ort-sys/CUDA constraint that splits the test
+            # lanes does not apply to it: nothing here is linked or run.
+            selected = packages - denied
         case _:
             raise SystemExit(f"unknown lane '{lane}'")
     return sorted(selected)
 
 
-def verify(simulate_missing: str | None = None) -> int:
+LANES = ("offline-linux", "offline-cross-platform", "ort-backed", "linux-only", "lint")
+
+# `cargo clippy ...` spelled across a folded YAML scalar. A step ends at a blank
+# line or at the next `- name:`/key at or below the invocation's indentation.
+_CLIPPY = re.compile(r"^(?P<indent>\s*)(?:run:\s*)?.*\bcargo clippy\b")
+# A second cargo command inside the same block. `clippy` itself is excluded so a
+# continuation line of the invocation being read does not end it.
+_CARGO_AGAIN = re.compile(r"(?:^|[\s;&|])cargo\s+(?:\+\S+\s+)?(?!clippy\b)\S+")
+_GENERATOR = re.compile(
+    r"\$\(\s*python3?\s+\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+([a-z-]+)\s*\)"
+)
+
+
+def clippy_blocks(lines: list[str]) -> list[str]:
+    """The `cargo clippy` invocations in one workflow's lines, as raw text.
+
+    Three things end a block, and each one is a false-green vector if it is
+    left out. Every `-p` token this returns is credited as lint coverage, so
+    the whole risk lives in over-reading:
+
+    * a blank line or a key at or below the invocation's indentation -- the
+      step is over, and reading on would credit the *next* step's packages;
+    * a comment, wherever it sits. A de-indented one ends the step; a
+      deeper-indented one is skipped rather than appended. This function's
+      first version only did the former, so `# -p ghost` indented inside a
+      folded scalar was harvested as coverage -- prose granting a lint claim,
+      which is exactly what the comment handling exists to prevent;
+    * a second `cargo` command in the same `run:` block. `cargo clippy ... &&
+      cargo test -p x` or a `run: |` running both would otherwise credit `x`
+      to clippy on the strength of a step that only *tests* it.
+
+    All three fail quietly if missed: the package looks linted and nothing
+    says otherwise. Hence `clippy_block_arms` in the self-test.
+    """
+    found: list[str] = []
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("#"):
+            continue
+        match = _CLIPPY.match(line)
+        if not match:
+            continue
+        base = len(match.group("indent"))
+        block = [line]
+        for follow in lines[index + 1 :]:
+            if not follow.strip():
+                break
+            stripped = follow.lstrip()
+            indent = len(follow) - len(stripped)
+            if indent <= base and (
+                stripped.startswith("#") or re.match(r"\s*(-\s+\w+:|\w[\w-]*:)", follow)
+            ):
+                break
+            if stripped.startswith("#"):
+                continue
+            block.append(follow)
+        text = "\n".join(block)
+        # Truncate at the first non-clippy `cargo`, wherever it falls -- the
+        # same line (`cargo clippy ... && cargo test -p x`) or a later one in a
+        # `run: |` block. Doing this line-wise instead misses the `&&` form,
+        # which is how the first version of this cut credited `x` to clippy.
+        after = _CARGO_AGAIN.search(text, match.end())
+        if after:
+            text = text[: after.start()]
+        found.append(text)
+    return found
+
+
+def clippy_commands() -> list[tuple[Path, str]]:
+    """Every `cargo clippy` invocation in `.github/workflows`, as raw text."""
+    found: list[tuple[Path, str]] = []
+    for workflow in sorted(WORKFLOWS.glob("*.yml")):
+        for block in clippy_blocks(workflow.read_text().splitlines()):
+            found.append((workflow, block))
+    return found
+
+
+def linted_packages() -> set[str]:
+    """Packages reached by some clippy invocation, generators expanded.
+
+    Generator calls are *expanded*, not skipped: a `-p` list that is computed
+    counts exactly as much as one that is spelled out, and a list that is
+    spelled out cannot hide behind the fact that some other step computes one.
+    """
+    linted: set[str] = set()
+    for _, command in clippy_commands():
+        for lane in _GENERATOR.findall(command):
+            if lane in LANES:
+                linted.update(lane_packages(lane))
+        linted.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", command))
+    return linted
+
+
+def verify(simulate_missing: str | None = None, simulate_unlinted: str | None = None) -> int:
     packages = workspace_packages()
     tested = (
         set(lane_packages("offline-linux"))
@@ -122,7 +220,16 @@ def verify(simulate_missing: str | None = None) -> int:
     uncovered = sorted(packages - tested - denied)
     stale_tested = sorted(tested - packages)
     stale_denied = sorted(denied - packages)
+
+    commands = clippy_commands()
+    linted = linted_packages() & packages
+    if simulate_unlinted:
+        linted.discard(simulate_unlinted)
+    unlinted = sorted(tested - linted)
+
+    failed = False
     if uncovered or stale_tested or stale_denied:
+        failed = True
         print("Workspace test package coverage check failed.", file=sys.stderr)
         if uncovered:
             print(
@@ -139,9 +246,42 @@ def verify(simulate_missing: str | None = None) -> int:
             print(f"Non-workspace package(s) in tested lanes: {stale_tested}", file=sys.stderr)
         if stale_denied:
             print(f"Non-workspace package(s) in deny-list: {stale_denied}", file=sys.stderr)
+
+    # Positive control: the lint half is computed by scanning workflow text, so
+    # a scanner that silently matches nothing would report full coverage of an
+    # empty set. Finding no clippy at all means the scanner broke, not that the
+    # repo stopped linting.
+    if not commands:
+        failed = True
+        print(
+            f"No `cargo clippy` invocation found under {WORKFLOWS}; the lint-coverage "
+            "scanner is broken or the workflows moved.",
+            file=sys.stderr,
+        )
+    if unlinted:
+        failed = True
+        print("Workspace lint coverage check failed.", file=sys.stderr)
+        print(
+            "Package(s) are compiled and tested by CI and linted by nothing:",
+            file=sys.stderr,
+        )
+        for package in unlinted:
+            print(f"  - {package}", file=sys.stderr)
+        print(
+            "Every tested package must be reached by some `cargo clippy` step. The Linux\n"
+            "offline clippy steps select `cargo-args lint`, so a package added to a test\n"
+            "lane is linted automatically -- this failing means a clippy step went back to\n"
+            "a hand-written -p list, or a new lane is tested but not linted.",
+            file=sys.stderr,
+        )
+    if failed:
         return 1
     print(
         f"workspace test package coverage ok: {len(tested)} tested, {len(denied)} denied"
+    )
+    print(
+        f"workspace lint coverage ok: {len(tested)} tested, all linted by "
+        f"{len(commands)} clippy invocation(s)"
     )
     return 0
 
@@ -823,6 +963,100 @@ def _conditional_arms() -> int:
 _PARSER_ARM_COUNT = 8
 
 
+# Each arm is (label, workflow text, the packages the scanner must credit).
+# Every one of these fails *quietly* if the terminator it exercises is removed:
+# the package appears linted and the gate stays green. The two prose arms are
+# the reviewer's, not mine -- I had left `# -p ghost` inside a folded scalar
+# harvestable while the docstring claimed comments could not grant coverage.
+_CLIPPY_BLOCK_ARMS: tuple[tuple[str, str, list[str]], ...] = (
+    (
+        "a plain clippy step credits its own packages (control)",
+        "      - name: lint\n"
+        "        run: >-\n"
+        "          cargo clippy --all-targets\n"
+        "          -p real\n"
+        "          -- -D warnings\n",
+        ["real"],
+    ),
+    (
+        "the next step's packages are not credited to clippy",
+        "      - name: lint\n"
+        "        run: cargo clippy -p real --all-targets -- -D warnings\n"
+        "      - name: test\n"
+        "        run: cargo test -p tested-not-linted\n",
+        ["real"],
+    ),
+    (
+        # Contrived on purpose: with the indent rule in place this is the only
+        # shape whose verdict the blank line actually decides. Without it the
+        # branch is unobservable, and an unobservable branch is one nobody can
+        # tell is broken.
+        "a blank line ends the block even when what follows is indented deeper",
+        "      - name: lint\n"
+        "        run: >-\n"
+        "          cargo clippy -p real --all-targets -- -D warnings\n"
+        "\n"
+        "          -p ghost-after-blank\n",
+        ["real"],
+    ),
+    (
+        "a following non-cargo step is not credited either",
+        "      - name: lint\n"
+        "        run: cargo clippy -p real --all-targets -- -D warnings\n"
+        "      - name: shell lint\n"
+        "        run: ./scripts/lint.sh -p ghost-next\n",
+        ["real"],
+    ),
+    (
+        "a second cargo command in the same block is not clippy",
+        "      - name: lint and test\n"
+        "        run: |\n"
+        "          cargo clippy -p real --all-targets -- -D warnings\n"
+        "          cargo test -p tested-not-linted\n",
+        ["real"],
+    ),
+    (
+        "an && chain to a cargo test is not clippy either",
+        "      - name: lint then test\n"
+        "        run: cargo clippy -p real -- -D warnings && cargo test -p tested-not-linted\n",
+        ["real"],
+    ),
+    (
+        "a deeper-indented comment inside the block grants nothing",
+        "      - name: lint\n"
+        "        run: >-\n"
+        "          cargo clippy --all-targets\n"
+        "            # -p ghost-deeper is prose, not an invocation\n"
+        "          -p real\n"
+        "          -- -D warnings\n",
+        ["real"],
+    ),
+    (
+        "a comment that merely discusses clippy starts no block",
+        "      # cargo clippy -p ghost-prose would be nice to add\n"
+        "      - name: test\n"
+        "        run: cargo test -p tested-not-linted\n",
+        [],
+    ),
+)
+
+
+def _clippy_block_arms() -> int:
+    """Prove the lint scanner stops where it says it stops."""
+    failures = 0
+    for label, text, want in _CLIPPY_BLOCK_ARMS:
+        blocks = clippy_blocks(text.splitlines())
+        got = sorted(set(re.findall(r"-p\s+([A-Za-z0-9_-]+)", "\n".join(blocks))))
+        if got != sorted(want):
+            failures += 1
+            print(f"  FAIL  {label}", file=sys.stderr)
+            print(f"        credited want={sorted(want)} got={got}", file=sys.stderr)
+            print(f"        blocks: {blocks}", file=sys.stderr)
+        else:
+            print(f"  ok    {label} -> credited {got}")
+    return failures
+
+
 def _parser_arms() -> int:
     """Prove a job boundary is never absorbed into the job above it."""
     failures = 0
@@ -996,6 +1230,13 @@ def self_test() -> int:
             1,
             ["onnx-genai-engine"],
         ),
+        (
+            "verify --simulate-unlinted onnx-runtime-ep-cpu",
+            verify,
+            {"simulate_unlinted": "onnx-runtime-ep-cpu"},
+            1,
+            ["onnx-runtime-ep-cpu"],
+        ),
         ("verify-required-tier (control)", verify_required_tier, {}, 0, []),
         (
             "verify-required-tier --simulate-dropped-lane ort-backed",
@@ -1030,8 +1271,13 @@ def self_test() -> int:
     failures += _parser_arms()
     failures += _conditional_arms()
     failures += _job_condition_arms()
+    failures += _clippy_block_arms()
     total = (
-        len(arms) + _PARSER_ARM_COUNT + len(_CONDITIONAL_ARMS) + len(_JOB_CONDITION_ARMS)
+        len(arms)
+        + _PARSER_ARM_COUNT
+        + len(_CONDITIONAL_ARMS)
+        + len(_JOB_CONDITION_ARMS)
+        + len(_CLIPPY_BLOCK_ARMS)
     )
     if failures:
         print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
@@ -1046,12 +1292,16 @@ def main() -> int:
     cargo_args = subparsers.add_parser("cargo-args")
     cargo_args.add_argument(
         "lane",
-        choices=["offline-linux", "offline-cross-platform", "ort-backed", "linux-only"],
+        choices=list(LANES),
     )
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument(
         "--simulate-missing",
         help="drop one package from the derived tested set to prove the guard fails",
+    )
+    verify_parser.add_argument(
+        "--simulate-unlinted",
+        help="drop one package from the scanned linted set to prove the lint guard fails",
     )
     subparsers.add_parser("self-test")
     required_parser = subparsers.add_parser("verify-required-tier")
@@ -1062,7 +1312,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "verify":
-        return verify(args.simulate_missing)
+        return verify(args.simulate_missing, args.simulate_unlinted)
     if args.command == "self-test":
         return self_test()
     if args.command == "verify-required-tier":

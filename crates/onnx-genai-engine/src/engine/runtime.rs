@@ -330,7 +330,7 @@ impl Engine {
         let mut ids = self.declared_eos_token_ids()?;
         for id in self
             .tokenizer
-            .as_ref()
+            .as_deref()
             .map(Tokenizer::eos_token_ids)
             .unwrap_or_default()
         {
@@ -393,7 +393,7 @@ impl Engine {
     /// decode loop.
     pub(crate) fn require_tokenizer(&self) -> anyhow::Result<&Tokenizer> {
         self.tokenizer
-            .as_ref()
+            .as_deref()
             .context("this package declares no tokenizer, so it cannot tokenize or decode text")
     }
 
@@ -3056,7 +3056,7 @@ mod tests {
                 scheduler_config,
                 onnx_genai_scheduler::ByteBudget::new(budget_bytes),
             ),
-            governor,
+            governor: Arc::new(governor),
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -3072,12 +3072,13 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(Arc::new(tokenizer)),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
+            _shared_memory_plan: None,
             _environment: None,
         })
     }
@@ -3573,7 +3574,7 @@ mod tests {
                 onnx_genai_scheduler::SchedulerConfig::default(),
                 onnx_genai_scheduler::ByteBudget::new(10),
             ),
-            governor,
+            governor: Arc::new(governor),
             sessions: HashMap::new(),
             session: None,
             native_session: None,
@@ -3589,12 +3590,13 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(Arc::new(tokenizer)),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
+            _shared_memory_plan: None,
             _environment: None,
         };
 

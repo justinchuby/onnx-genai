@@ -90,6 +90,7 @@ pub(crate) use decode_backend::*;
 pub(crate) use governor::*;
 pub use governor::{EngineGovernorError, EngineResourceGovernor, resolve_device_vram_limit_bytes};
 pub(crate) use ids::SharedSessionIds;
+pub use load::{OrtEngineWorkerFactory, OrtSessionWorkerLoadError};
 pub(crate) use load::{
     force_managed_weight_streaming_enabled, session_device_domain, validate_shared_authority_limit,
 };
@@ -207,7 +208,7 @@ mod tests {
             kv_model: None,
             decode_path: ModelDecodePath::Generic,
             scheduler: Scheduler::new(onnx_genai_scheduler::SchedulerConfig::default()),
-            governor,
+            governor: Arc::new(governor),
             sessions,
             workflow_sessions: HashMap::new(),
             workflow_session_ids: SharedSessionIds::new(),
@@ -235,12 +236,13 @@ mod tests {
             draft: None,
             mtp: None,
             eagle3: None,
-            tokenizer: Some(tokenizer),
+            tokenizer: Some(Arc::new(tokenizer)),
             fim_config: None,
             num_speculative_tokens: 1,
             speculative_mode: SpeculativeMode::None,
             last_speculative_stats: SpeculativeStats::default(),
             connector: ConnectorBridge::null(),
+            _shared_memory_plan: None,
             _environment: None,
         })
     }
@@ -1240,6 +1242,66 @@ mod tests {
         .to_string();
         assert!(error.contains("EngineDecodeBackend::Ort"), "{error}");
         assert!(error.contains("ONNX_GENAI_BACKEND=ort"), "{error}");
+    }
+
+    #[test]
+    fn ort_worker_factory_shares_only_immutable_runtime_resources() {
+        let model_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+        let directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = EngineConfig {
+            decode_backend: EngineDecodeBackend::Ort,
+            ..EngineConfig::default()
+        };
+        let primary = Engine::from_dir(&model_dir, config.clone()).expect("load primary engine");
+        let fixed_weight_bytes = primary
+            .governor
+            .leased_breakdown()
+            .into_iter()
+            .find_map(|(name, _, bytes)| (name == "fixed device reservation").then_some(bytes))
+            .expect("tiny fixture has one fixed weight reservation");
+        let authority = primary.governor.device_authority();
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OrtEngineWorkerFactory>();
+        let mut speculative = config.clone();
+        speculative.draft_model = Some(model_dir.clone());
+        assert!(matches!(
+            primary.ort_worker_factory(directory.clone(), speculative),
+            Err(OrtSessionWorkerLoadError::Speculative)
+        ));
+        let worker = primary
+            .ort_worker_factory(directory, config)
+            .expect("CPU ORT supports concurrent Run")
+            .build_worker()
+            .expect("build worker-local engine");
+
+        assert!(Arc::ptr_eq(
+            primary.session.as_ref().unwrap(),
+            worker.session.as_ref().unwrap()
+        ));
+        assert!(
+            !Arc::ptr_eq(&primary.governor, &worker.governor),
+            "governor policy, scheduler counters, and diagnostics are worker-local"
+        );
+        assert_eq!(
+            primary.governor.device_authority().authority_id(),
+            worker.governor.device_authority().authority_id(),
+            "only the process-wide device accounting authority is shared"
+        );
+        assert!(worker.sessions.is_empty());
+        assert!(worker.workflow_sessions.is_empty());
+
+        drop(primary);
+        assert!(
+            authority.used_bytes() >= fixed_weight_bytes,
+            "shared ORT weights remain accounted after the primary worker exits"
+        );
+        drop(worker);
+        assert_eq!(
+            authority.used_bytes(),
+            0,
+            "the shared fixed reservation drops after the final worker"
+        );
     }
 
     #[cfg(feature = "native-backend")]
