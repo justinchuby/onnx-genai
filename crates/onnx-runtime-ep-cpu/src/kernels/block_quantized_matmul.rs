@@ -46,7 +46,7 @@ const IQ1_S_BLOCK_BYTES: usize = 50;
 const IQ1_M_BLOCK_BYTES: usize = 56;
 const IQ1_S_DELTA: f32 = 0.125;
 const IQ1_M_DELTA: f32 = 0.125;
-const DEFAULT_DENSE_WEIGHT_CACHE_BYTES: usize = 256 * 1024 * 1024;
+pub(super) const DEFAULT_DENSE_WEIGHT_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const DENSE_WEIGHT_CACHE_BYTES_ENV: &str = "ONNX_GENAI_CPU_BLOCK_QUANT_CACHE_BYTES";
 
 pub static BLOCK_QUANT_MATMUL_CACHED_DENSE_TEST_HITS: AtomicUsize = AtomicUsize::new(0);
@@ -580,7 +580,7 @@ impl DenseWeightCache {
     }
 
     #[cfg(test)]
-    fn with_limit(limit_bytes: usize) -> Self {
+    pub(super) fn with_limit(limit_bytes: usize) -> Self {
         Self {
             max_bytes: Some(limit_bytes),
             inner: Mutex::new(DenseWeightCacheInner {
