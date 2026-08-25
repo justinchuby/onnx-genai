@@ -19878,6 +19878,7 @@ mod tests {
     ///
     /// Written directly to stderr so it survives libtest capture on a passing
     /// test, unlike `eprintln!`.
+    #[cfg(target_os = "linux")]
     const AFFINITY_FIXTURE_SKIP_MARKER: &str = "NXRT_AFFINITY_FIXTURE_SKIPPED:";
 
     /// Set on a realized-width child to make it misreport its own placement.
@@ -20095,6 +20096,7 @@ mod tests {
         worker_masks_readable: bool,
         /// Whether the child successfully applied and read back the exact CPU
         /// mask requested by the parent before constructing the pool.
+        #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
         affinity_mask_applied: bool,
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
@@ -20357,16 +20359,27 @@ mod tests {
         // `requested=0` marks the default-resolver arm in the report line: the
         // parent did not ask for a width, so there is no requested value to
         // echo and the only honest thing to print is "none".
-        let mut affinity_mask_applied = false;
-        let requested: usize = if raw == SPMD_WIDTH_CHILD_DEFAULT {
-            let raw_mask = std::env::var(SPMD_WIDTH_CHILD_MASK_ENV)
-                .expect("the default-width child requires an exact CPU mask");
-            let requested_cpus = parse_test_cpu_mask(&raw_mask);
-            apply_exact_test_affinity_mask(&requested_cpus);
-            affinity_mask_applied = true;
-            0
+        let (requested, affinity_mask_applied): (usize, bool) = if raw == SPMD_WIDTH_CHILD_DEFAULT {
+            #[cfg(target_os = "linux")]
+            {
+                let raw_mask = std::env::var(SPMD_WIDTH_CHILD_MASK_ENV)
+                    .expect("the default-width child requires an exact CPU mask");
+                let requested_cpus = parse_test_cpu_mask(&raw_mask);
+                apply_exact_test_affinity_mask(&requested_cpus);
+                (0, true)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                panic!(
+                    "the exact default-width affinity child is unsupported on this target; \
+                         its parent test must remain ignored"
+                )
+            }
         } else {
-            raw.parse().expect("the parent passes a decimal width")
+            (
+                raw.parse().expect("the parent passes a decimal width"),
+                false,
+            )
         };
         // Read *after* any narrowing above, so the report describes the cpuset
         // the pool was actually built on rather than the one inherited.
@@ -20437,6 +20450,7 @@ mod tests {
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
 
+    #[cfg(target_os = "linux")]
     fn parse_test_cpu_mask(raw: &str) -> Vec<usize> {
         let cpus: Vec<usize> = raw
             .split(',')
@@ -20454,13 +20468,8 @@ mod tests {
     }
 
     /// Apply and read back the exact mask before any worker pool exists.
+    #[cfg(target_os = "linux")]
     fn apply_exact_test_affinity_mask(requested: &[usize]) {
-        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
-            panic!(
-                "the exact affinity child is Linux-only; its parent test must be ignored on \
-                 targets without process-wide masking"
-            );
-        }
         crate::decode_affinity::set_current_thread_affinity(requested)
             .unwrap_or_else(|reason| panic!("apply exact child affinity {requested:?}: {reason}"));
         let observed = crate::decode_affinity::allowed_cpus()
@@ -20472,17 +20481,20 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Debug, PartialEq, Eq)]
     struct AffinityFixtureSkip {
         reason: String,
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Debug, PartialEq, Eq)]
     enum AffinityFixtureOutcome {
         Ready(Vec<usize>),
         Skipped(AffinityFixtureSkip),
     }
 
+    #[cfg(target_os = "linux")]
     fn record_affinity_fixture_skip(case: &str, skip: &AffinityFixtureSkip) {
         use std::io::Write;
         assert!(
@@ -20498,6 +20510,7 @@ mod tests {
         let _ = err.flush();
     }
 
+    #[cfg(target_os = "linux")]
     fn numa_node_cpu_sets(
         allowed: &[usize],
         numa: Option<&crate::decode_affinity::NumaTopology>,
@@ -20510,6 +20523,7 @@ mod tests {
         .unwrap_or_else(|| vec![allowed.to_vec()])
     }
 
+    #[cfg(target_os = "linux")]
     fn contiguous_default_width_mask(
         node_cpu_sets: &[Vec<usize>],
         topology: &crate::core_topology::CoreTopology,
@@ -20543,6 +20557,7 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn one_cpu_per_core(
         allowed: &[usize],
         topology: &crate::core_topology::CoreTopology,
@@ -20576,6 +20591,7 @@ mod tests {
         selected
     }
 
+    #[cfg(target_os = "linux")]
     fn sparse_multi_node_default_width_mask(
         node_cpu_sets: &[Vec<usize>],
         topology: &crate::core_topology::CoreTopology,
@@ -20614,6 +20630,7 @@ mod tests {
         AffinityFixtureOutcome::Ready(mask)
     }
 
+    #[cfg(target_os = "linux")]
     #[derive(Debug, PartialEq, Eq)]
     enum DefaultPoolExpectation {
         FlatSingleCpu {
@@ -20628,6 +20645,7 @@ mod tests {
 
     /// Expected NUMA-split compute width after reserving one service CPU per
     /// fully subscribed node for the unpinned dispatcher/control path.
+    #[cfg(target_os = "linux")]
     fn expected_split_worker_width(shards: &[crate::decode_affinity::NodeShard]) -> usize {
         const RESERVED_SERVICE_CPUS_PER_NODE: usize = 1;
         shards
@@ -20643,6 +20661,7 @@ mod tests {
             .sum()
     }
 
+    #[cfg(target_os = "linux")]
     fn default_pool_expectation(
         mask: &[usize],
         topology: &crate::core_topology::CoreTopology,
@@ -20679,6 +20698,7 @@ mod tests {
 
     /// Spawn the child with **no** explicit width on an exact caller-supplied
     /// CPU mask.
+    #[cfg(target_os = "linux")]
     fn realized_default_width_report(mask: &[usize]) -> RealizedWidth {
         realized_width_report_inner(SPMD_WIDTH_CHILD_DEFAULT, None, false, None, Some(mask))
     }
@@ -21013,6 +21033,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_default_width_mask_case(
         case: &str,
         mask: &[usize],
@@ -21097,15 +21118,9 @@ mod tests {
     /// contiguous and sparse cases prevent that expectation from being fitted
     /// only to the current host. A one-CPU case covers the flat fallback
     /// separately.
+    #[cfg(target_os = "linux")]
     #[test]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        ignore = "process-wide CPU affinity masking is implemented only on Linux"
-    )]
     fn a_default_width_pool_obeys_runtime_masks_and_reservations() {
-        if !crate::decode_affinity::AFFINITY_MASKING_SUPPORTED {
-            panic!("this test must stay ignored where exact process-wide affinity is unsupported");
-        }
         let allowed = crate::decode_affinity::allowed_cpus()
             .expect("Linux must report the CPU set used to derive affinity fixtures");
         assert!(
@@ -21152,6 +21167,17 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    #[ignore = "process-wide CPU affinity masking is implemented only on Linux"]
+    fn a_default_width_pool_obeys_runtime_masks_and_reservations() {
+        panic!(
+            "this ignored test was forced to run on a target without process-wide CPU affinity \
+             masking; no exact-mask assertion is possible here"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn default_width_expectation_accounts_for_one_reserved_service_cpu_per_node() {
         let shards: Vec<crate::decode_affinity::NodeShard> = (0..4)
@@ -21169,6 +21195,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn runtime_mask_planner_covers_contiguous_leader_and_non_leader_cpus() {
         let topology = crate::core_topology::CoreTopology::from_sibling_groups([
@@ -21194,6 +21221,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unrepresentable_sparse_topology_is_a_typed_skip() {
         let topology =
