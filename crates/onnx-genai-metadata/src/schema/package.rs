@@ -229,9 +229,10 @@ pub struct SequenceDecodingSpec {
 
     /// Profile output role naming the per-row count of valid frames.
     ///
-    /// Present when the package is batched with padding: rows are decoded only
-    /// over their own valid frame prefix so a padded batch produces the same
-    /// transcript per row as an unpadded single-row run.
+    /// Required when the logits output pads `time_axis`. The role must map to
+    /// the exact workflow output named by that dimension's
+    /// `padding.valid_lengths`; CTC then decodes only that valid prefix. An
+    /// unpadded time axis needs no lengths binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lengths: Option<String>,
 
