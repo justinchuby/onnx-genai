@@ -10,7 +10,8 @@
 //! shape the design sanctions for CPU testing. A real CUDA end-to-end check is
 //! gated separately (GPU-only) and is not part of CI.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use prost::Message;
 
@@ -114,6 +115,9 @@ impl ExecutionProvider for AcceleratorEp {
         self.inner.allocate(size, alignment)
     }
     fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+        if buffer.is_borrowed() {
+            return Ok(());
+        }
         self.inner.deallocate(buffer)
     }
     fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> EpResult<()> {
@@ -132,6 +136,121 @@ impl ExecutionProvider for AcceleratorEp {
     }
 }
 
+struct AsyncAcceleratorEp {
+    inner: AcceleratorEp,
+    pending: Mutex<Option<(Vec<u8>, usize)>>,
+    waits: Arc<AtomicUsize>,
+}
+
+impl AsyncAcceleratorEp {
+    fn new(allowed: Vec<&'static str>, waits: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: AcceleratorEp::new(allowed),
+            pending: Mutex::new(None),
+            waits,
+        }
+    }
+}
+
+impl ExecutionProvider for AsyncAcceleratorEp {
+    fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "async_accel_ep"
+    }
+
+    fn device_type(&self) -> DeviceType {
+        self.inner.device_type()
+    }
+
+    fn device_id(&self) -> DeviceId {
+        self.inner.device_id()
+    }
+
+    fn initialize(&mut self, config: &EpConfig) -> EpResult<()> {
+        self.inner.initialize(config)
+    }
+
+    fn shutdown(&mut self) -> EpResult<()> {
+        self.inner.shutdown()
+    }
+
+    fn supports_op(
+        &self,
+        op: &Node,
+        opset: u64,
+        shapes: &[Shape],
+        input_dtypes: &[DataType],
+        layouts: &[TensorLayout],
+    ) -> KernelMatch {
+        self.inner
+            .supports_op(op, opset, shapes, input_dtypes, layouts)
+    }
+
+    fn get_kernel(
+        &self,
+        op: &Node,
+        shapes: &[Vec<usize>],
+        opset: u64,
+    ) -> EpResult<Box<dyn Kernel>> {
+        self.inner.get_kernel(op, shapes, opset)
+    }
+
+    fn allocate(&self, size: usize, alignment: usize) -> EpResult<DeviceBuffer> {
+        let mut buffer = self.inner.allocate(size, alignment)?;
+        self.inner.copy_from_host(&vec![0; size], &mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn deallocate(&self, buffer: DeviceBuffer) -> EpResult<()> {
+        self.inner.deallocate(buffer)
+    }
+
+    fn copy(&self, src: &DeviceBuffer, dst: &mut DeviceBuffer, size: usize) -> EpResult<()> {
+        self.inner.copy(src, dst, size)
+    }
+
+    fn copy_async(
+        &self,
+        src: &DeviceBuffer,
+        dst: &mut DeviceBuffer,
+        size: usize,
+    ) -> EpResult<Fence> {
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), size) }.to_vec();
+        *self.pending.lock().expect("pending copy lock") = Some((bytes, dst.as_mut_ptr() as usize));
+        Ok(Fence::new(1))
+    }
+
+    fn wait_fence(&self, fence: &Fence) -> EpResult<()> {
+        if fence.is_signalled() {
+            return Ok(());
+        }
+        let (bytes, destination) = self
+            .pending
+            .lock()
+            .expect("pending copy lock")
+            .take()
+            .expect("wait must consume a pending async copy");
+        // SAFETY: the destination allocation is owned by the live binding that
+        // requested the copy and remains allocated until this wait returns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), destination as *mut u8, bytes.len());
+        }
+        self.waits.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn copy_to_host(&self, src: &DeviceBuffer, dst: &mut [u8]) -> EpResult<()> {
+        self.inner.copy_to_host(src, dst)
+    }
+
+    fn sync(&self) -> EpResult<()> {
+        self.inner.sync()
+    }
+}
+
 fn cpu_slot(ep: u32) -> ProviderPlacement {
     let mut inner = CpuExecutionProvider::new();
     inner.initialize(&EpConfig::default()).unwrap();
@@ -145,6 +264,17 @@ fn accel_slot(ep: u32, allowed: Vec<&'static str>) -> ProviderPlacement {
     ProviderPlacement {
         ep: EpId(ep),
         provider: Arc::new(AcceleratorEp::new(allowed)),
+    }
+}
+
+fn async_accel_slot(
+    ep: u32,
+    allowed: Vec<&'static str>,
+    waits: Arc<AtomicUsize>,
+) -> ProviderPlacement {
+    ProviderPlacement {
+        ep: EpId(ep),
+        provider: Arc::new(AsyncAcceleratorEp::new(allowed, waits)),
     }
 }
 
@@ -623,9 +753,9 @@ fn fully_accelerator_single_partition() {
     assert_eq!(plan.partitions.len(), 1);
     assert_eq!(plan.partitions[0].ep, EpId(0));
     assert_eq!(plan.partitions[0].device, DeviceId::new(DeviceType::Mlx, 0));
-    // Exactly one transfer: the graph input onto the accelerator device.
-    assert_eq!(plan.transfers.len(), 1);
-    assert_eq!(plan.transfers[0].to, DeviceId::new(DeviceType::Mlx, 0));
+    // Graph-input staging belongs to the partition executor, not the
+    // cross-provider transfer plan.
+    assert!(plan.transfers.is_empty());
 
     let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
     let out = execute(&plan, &graph, &weights(), &providers, &[("x", &x)]).unwrap();
@@ -724,7 +854,7 @@ fn fan_out_boundary_transfer_is_deduplicated() {
         "fan-out value must be transferred to CPU exactly once"
     );
     assert_eq!(y_to_cpu[0].from, mlx);
-    assert_eq!(plan.transfers.iter().filter(|t| t.value == x).count(), 1);
+    assert_eq!(plan.transfers.iter().filter(|t| t.value == x).count(), 0);
 
     let x_val = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
     let out = execute(&plan, &graph, &weights(), &providers, &[("x", &x_val)]).unwrap();
@@ -788,6 +918,13 @@ fn node_unsupported_by_all_providers_fails_before_execution() {
         msg.contains("Sqrt"),
         "error should name the unsupported op: {msg}"
     );
+    assert_eq!(
+        msg.matches("accelerator does not support this op").count(),
+        2,
+        "the error must preserve both provider decline reasons: {msg}"
+    );
+    assert!(msg.contains("ai.onnx::Sqrt"), "{msg}");
+    assert!(msg.contains("opset 17"), "{msg}");
 }
 
 #[test]
@@ -860,6 +997,138 @@ fn classified_heterogeneous_plan_still_executes_byte_identically() {
     let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
     let hetero = execute(&plan, &graph, &weights(), &providers, &[("x", &x)]).unwrap();
     assert_byte_identical(&hetero, &reference(&graph, &[("x", &x)]));
+}
+
+#[test]
+fn accel_cpu_accel_executes_with_two_planned_transfers_and_owned_lifetimes() {
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let providers = vec![accel_slot(0, vec!["Relu", "Neg"]), cpu_slot(1)];
+    let plan = plan(&graph, &providers).unwrap();
+    let accel_nodes = plan
+        .node_placement
+        .values()
+        .filter(|&&ep| ep == EpId(0))
+        .count();
+    let cpu_nodes = plan
+        .node_placement
+        .values()
+        .filter(|&&ep| ep == EpId(1))
+        .count();
+    assert_eq!((accel_nodes, cpu_nodes), (2, 1));
+    assert_eq!(
+        plan.transfers.len(),
+        2,
+        "only Accel->CPU and CPU->Accel edges are transfers"
+    );
+
+    let first_boundary = value_by_name(&graph, "t0").unwrap();
+    let second_boundary = value_by_name(&graph, "t1").unwrap();
+    let mut executor = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers).unwrap();
+    let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+    let output = executor.run(&[("x", &x)]).unwrap();
+    assert_eq!(output[0].to_vec_f32(), vec![-0.0, -2.0, -0.0, -4.0]);
+    assert_eq!(executor.last_transfer_count(), 2);
+    for (value, source, destination) in [
+        (first_boundary, EpId(0), EpId(1)),
+        (second_boundary, EpId(1), EpId(0)),
+    ] {
+        assert_eq!(executor.last_release_count(value, source), 1);
+        assert_eq!(executor.last_release_count(value, destination), 1);
+    }
+    assert!(
+        executor
+            .placement_report()
+            .contains("2 node(s) on accel_ep")
+    );
+    assert!(executor.placement_report().contains("1 node(s) on cpu_ep"));
+    assert!(
+        executor
+            .placement_report()
+            .contains("2 cross-provider transfer(s)")
+    );
+}
+
+#[test]
+fn default_executor_opt_in_uses_mixed_plan_instead_of_whole_cpu_fallback() {
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let accelerator: Arc<dyn ExecutionProvider> = Arc::new(AcceleratorEp::new(vec!["Relu", "Neg"]));
+    let mut executor =
+        Executor::build_with_heterogeneous_enabled(graph, weights(), accelerator).unwrap();
+    assert!(
+        executor.execution_provider_fallback_report().is_none(),
+        "mixed execution must not retain a whole-session CPU fallback report"
+    );
+    let report = executor
+        .heterogeneous_placement_report()
+        .expect("the opt-in executor must expose placement");
+    assert!(report.contains("2 node(s) on accel_ep"), "{report}");
+    assert!(report.contains("1 node(s) on cpu_ep"), "{report}");
+    assert!(report.contains("2 cross-provider transfer(s)"), "{report}");
+
+    let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+    assert_eq!(
+        executor.run(&[("x", &x)]).unwrap()[0].to_vec_f32(),
+        vec![-0.0, -2.0, -0.0, -4.0]
+    );
+
+    let binding_error = executor
+        .run_with_device_bindings(&[("x", &x)], &mut [])
+        .unwrap_err()
+        .to_string();
+    assert!(binding_error.contains("persistent device bindings"));
+    let capture_error = match executor.try_capture_with_device_bindings(&[("x", &x)], &mut []) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("mixed-provider capture must fail closed"),
+    };
+    assert!(capture_error.contains("device-graph capture"));
+}
+
+#[test]
+fn async_destination_waits_for_transfer_before_consumer_runs() {
+    let graph = build_chain(&["Relu", "Abs", "Neg"]);
+    let waits = Arc::new(AtomicUsize::new(0));
+    let providers = vec![
+        async_accel_slot(0, vec!["Relu", "Neg"], Arc::clone(&waits)),
+        cpu_slot(1),
+    ];
+    let plan = plan(&graph, &providers).unwrap();
+    let mut executor = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers).unwrap();
+    let x = Tensor::from_f32(&[4], &[-1.0, 2.0, -3.0, 4.0]).unwrap();
+    let output = executor.run(&[("x", &x)]).unwrap();
+    assert_eq!(output[0].to_vec_f32(), vec![-0.0, -2.0, -0.0, -4.0]);
+    assert_eq!(
+        waits.load(Ordering::SeqCst),
+        1,
+        "the CPU->accelerator copy fence must be awaited exactly once"
+    );
+}
+
+#[test]
+fn control_flow_and_sequence_fail_during_planning() {
+    let providers = vec![accel_slot(0, vec!["Relu"]), cpu_slot(1)];
+
+    let control_flow = build_chain(&["If"]);
+    let error = plan(&control_flow, &providers).unwrap_err().to_string();
+    assert!(error.contains("control flow"), "{error}");
+    assert!(error.contains("If"), "{error}");
+
+    let sequence = build_chain(&["SequenceEmpty"]);
+    let error = plan(&sequence, &providers).unwrap_err().to_string();
+    assert!(error.contains("sequence"), "{error}");
+    assert!(error.contains("SequenceEmpty"), "{error}");
+}
+
+#[test]
+fn view_producing_kernel_is_rejected_before_partition_execution() {
+    let graph = build_chain(&["Transpose"]);
+    let providers = vec![cpu_slot(0)];
+    let plan = plan(&graph, &providers).unwrap();
+    let error = HeterogeneousExecutor::build(plan, &graph, &weights(), &providers)
+        .err()
+        .expect("view-producing boundary must fail closed")
+        .to_string();
+    assert!(error.contains("Transpose"), "{error}");
+    assert!(error.contains("aliased/view output"), "{error}");
 }
 
 #[test]

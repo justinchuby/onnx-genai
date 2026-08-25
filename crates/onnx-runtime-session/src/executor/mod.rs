@@ -618,7 +618,7 @@ fn scan_list_attr(node: &Node, name: &str, count: usize, default: i64) -> Result
 /// control-flow ops the executor handles recursively (default `ai.onnx`
 /// domain). Kept in lock-step with the loader's `validate_no_control_flow`
 /// allow-list.
-fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
+pub(crate) fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
     domain.is_empty() && matches!(op_type, "If" | "Loop" | "Scan")
 }
 
@@ -628,7 +628,7 @@ fn is_control_flow_op(op_type: &str, domain: &str) -> bool {
 /// because a `Kernel` sees only tensor views, never a *sequence-of-tensors*
 /// runtime value. Kept as a small self-contained routing predicate (mirroring
 /// [`is_control_flow_op`]) so it never collides with the EP kernel registry.
-fn is_sequence_op(op_type: &str, domain: &str) -> bool {
+pub(crate) fn is_sequence_op(op_type: &str, domain: &str) -> bool {
     domain.is_empty()
         && matches!(
             op_type,
@@ -641,6 +641,15 @@ fn is_sequence_op(op_type: &str, domain: &str) -> bool {
                 | "SplitToSequence"
                 | "ConcatFromSequence"
         )
+}
+
+fn heterogeneous_api_error(operation: &str) -> SessionError {
+    SessionError::HeterogeneousExecutionUnsupported {
+        placement_summary: format!(
+            "{operation} requires persistent external state or device-graph capture, which the \
+             first heterogeneous execution slice deliberately rejects before execution"
+        ),
+    }
 }
 
 /// Whether a Sequence op yields a *sequence* value (vs. a tensor). Used at build

@@ -1,10 +1,24 @@
 # Heterogeneous CPU+CUDA Placement for the Native Runtime
 
-> Status: ON HOLD — re-scoped (2026-07-14). Superseded premise: CUDA quantized GEMM prefill now exists (main 776a8b9); CPU fallback narrows to genuinely-unsupported ops only.
+> Status: OPT-IN FIRST EXECUTION SLICE (`ONNX_GENAI_HETERO=1`, 2026-08-24).
+> CUDA quantized GEMM prefill remains on CUDA; CPU fallback is limited to
+> genuinely unsupported nodes.
 >
-> This document is a design proposal. The current implementation remains a
-> single-EP executor and fails CUDA model load when the selected CUDA EP cannot
-> serve every node.
+> The default path remains the byte-identical single-EP/whole-session fallback.
+> The opt-in path executes fully-static, tensor-only DAGs as topologically
+> ordered per-EP partitions. Control flow, sequences, symbolic shapes,
+> view-producing kernels, persistent external bindings/state, and mixed capture
+> fail closed before execution.
+
+The first execution slice gives every boundary value one authoritative
+provider-owned `DeviceBuffer`. A destination realization is allocated through
+that destination EP (and therefore its existing governor), created only for a
+planned cross-provider edge, and freed by its owning EP after the last consuming
+partition. H2D/D2D uses `copy_async` followed by `wait_fence`. D2H is the one
+documented synchronous boundary: `copy_to_host` writes directly into a governed
+CPU `DeviceBuffer`; it does not allocate an intermediate host `Vec` or issue a
+whole-session `sync`. Placement reports count assigned nodes per EP and planned
+cross-provider transfers.
 >
 > **Primary targets:** GLM-5.2/DeepSeek-scale sub-4-bit decoder models.
 >
