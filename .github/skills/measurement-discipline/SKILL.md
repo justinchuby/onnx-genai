@@ -3,7 +3,7 @@ name: "measurement-discipline"
 description: "Make a performance or memory number trustworthy before you report it — or believe it"
 domain: "quality"
 confidence: "high"
-source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption, #1628/#1982 selector vacuity)"
+source: "earned (#834 knob artifact, #851 self-contended retraction, #853 2x weight bytes, #877→#880 proxy correction, #886 silent corruption, #1619/#1982 selector vacuity)"
 ---
 
 # Measurement discipline
@@ -164,8 +164,8 @@ vacuous arms at once, which reads as partial coverage rather than a broken
 instrument.
 
 Found independently at least three times here: guarded in code with a comment
-saying why (`agrees_with_hostlock_sh.rs`, #2026), recorded as a harness bug after
-it reported seven of seven mutations as undetected (#1628), and paid for in full
+saying why (`agrees_with_hostlock_sh.rs`, #1950), recorded as a harness bug after
+it reported seven of seven mutations as undetected (#1619), and paid for in full
 again in #1982.
 
 **Check:** prove the selector resolved, and prefer a count to a string. `--list`
@@ -178,16 +178,42 @@ n=$(cargo test -q --lib "$FILTER" -- --exact --list 2>/dev/null | grep -c ': tes
 ```
 
 Asserting `1 passed` in the run output is the same idea and is what
-`agrees_with_hostlock_sh.rs` does, but it is a string match on a *result*: it
-false-alarms the moment a filter selects more than one test (a module filter over
-two tests prints `2 failed`, which contains neither `1 passed` nor `1 failed`),
-and it cannot separate a broken filter from a real failure. The listing answers
-only "did the filter resolve", which is the question being asked.
+`agrees_with_hostlock_sh.rs` does, but on its own it is a substring match on a
+*result*, and it fails in the direction this whole section is about. Measured:
+
+```
+filter selects 11 passing tests -> "11 passed; 0 failed"   contains "1 passed" -> accepted
+filter selects 2, one failing   -> "1 passed; 1 failed"    contains "1 passed" -> accepted
+```
+
+Both are false greens: the first accepts a filter that resolved to eleven tests
+instead of one, the second accepts a run containing a genuine failure. It is
+sound in `agrees_with_hostlock_sh.rs` only because that child selects exactly one
+test by construction — `window_probe_child` is a `#[test]` at the integration
+crate's root.
+
+So the two checks **compose**, and neither is sufficient alone: the listing pins
+the selection to exactly one, which is what makes the substring reading of the
+run output trustworthy afterwards. Pin the count first, then read the result.
+
+One residual gap in the count, also measured: `--list` prints an `#[ignore]`d
+test with the same `: test` suffix, so a test that gets ignored still resolves to
+`n = 1` while the run executes nothing (`0 passed; 0 failed; 1 ignored`). The
+listing proves the *name* resolves, never that the arm *ran* — which is why the
+run-output half is not optional.
 
 **Check:** every battery carries a **vacuity arm** — a mutation so destructive
 that survival is impossible (refuse every request; empty the function body). Its
 expected result is the one you know independently of the code under test, so it
 is the only arm that can report that the apparatus itself is lying.
+
+**Check:** cite the commit that *introduced* a claim, not the last one to touch
+the file. Review of this section caught two wrong PR numbers in it, both produced
+by `git log -1 -- <file>`, which resolves to the file's most recent commit and
+answers a question nobody asked. `git log -S '<the exact line>' -- <file>` finds
+the change that made the claim. Same failure as the rest of §9, one level up: the
+command returned a real, correct, confidently-formatted answer to the wrong
+query.
 
 ## Reporting rules
 
