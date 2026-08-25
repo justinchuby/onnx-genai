@@ -14,18 +14,27 @@
 //! is a typed refusal, never a partial allocation.
 
 use super::*;
-use onnx_genai_metadata::{CsaStateGroupAbi, CsaStateRole};
+use onnx_genai_metadata::{CsaCacheFormat, CsaStateGroupAbi, CsaStateRole};
 use onnx_runtime_session::IoMeta;
 
-/// The frozen v1 element dtype each CSA state role carries.
+/// The frozen v1 element dtype each CSA state role carries, given the group's
+/// declared cache format.
 ///
-/// Packed compressed records and learned index keys are byte buffers; the
-/// compression and index carries are float32 accumulators. These mirror the
-/// frozen CSA op ABI (inputs `past_compressed_kv`/`past_index_key` are `uint8`,
-/// `past_compression_carry`/`past_index_carry` are `float32`).
-fn expected_dtype(role: CsaStateRole) -> DataType {
+/// The compression and index carries are always float32 accumulators, and the
+/// learned index keys are always packed uint8 records. The compressed KV
+/// records take the group's declared `cache_format`: an `f32` cache keeps them
+/// float32, while a block-quantized cache (`fp8_e4m3_block64`) packs them into
+/// uint8 byte records. This mirrors the CSA op kernel exactly, whose
+/// `CacheFormat::dtype()` is `Float32` for `f32` and `Uint8` for the packed
+/// formats; `fp4_e2m1_block32` is the learned-index format and is refused as a
+/// KV cache format before this is ever reached.
+fn expected_dtype(role: CsaStateRole, cache_format: CsaCacheFormat) -> DataType {
     match role {
-        CsaStateRole::CompressedKv | CsaStateRole::IndexKey => DataType::Uint8,
+        CsaStateRole::CompressedKv => match cache_format {
+            CsaCacheFormat::F32 => DataType::Float32,
+            CsaCacheFormat::Fp8E4m3Block64 | CsaCacheFormat::Fp4E2m1Block32 => DataType::Uint8,
+        },
+        CsaStateRole::IndexKey => DataType::Uint8,
         CsaStateRole::CompressionCarry | CsaStateRole::IndexCarry => DataType::Float32,
     }
 }
@@ -71,7 +80,7 @@ pub(super) fn resolve_csa_state_edges(
                     "CSA state edge '{role}' declares present output '{present}' but the graph does not expose it"
                 )
             })?;
-        let expected = expected_dtype(role);
+        let expected = expected_dtype(role, group.cache_format);
         if input.dtype != expected {
             bail!(
                 "CSA state edge '{role}' past input '{past}' has dtype {:?}, expected {expected:?} for this role",
@@ -314,7 +323,7 @@ mod tests {
             meta("l0_past_cc", DataType::Float32, &[1, 512]),
             meta("l0_past_ik", DataType::Uint8, &[1, 0, 68]),
             meta("l0_past_ic", DataType::Float32, &[1, 128]),
-            meta("l1_past_ckv", DataType::Uint8, &[1, 0, 512]),
+            meta("l1_past_ckv", DataType::Float32, &[1, 0, 512]),
             meta("l1_past_cc", DataType::Float32, &[1, 512]),
         ];
         let outputs = vec![
@@ -322,7 +331,7 @@ mod tests {
             meta("l0_present_cc", DataType::Float32, &[1, 512]),
             meta("l0_present_ik", DataType::Uint8, &[1, 1, 68]),
             meta("l0_present_ic", DataType::Float32, &[1, 128]),
-            meta("l1_present_ckv", DataType::Uint8, &[1, 1, 512]),
+            meta("l1_present_ckv", DataType::Float32, &[1, 1, 512]),
             meta("l1_present_cc", DataType::Float32, &[1, 512]),
         ];
         (vec![layer0, layer1], inputs, outputs)
@@ -349,10 +358,72 @@ mod tests {
         groups[1].edges[0].past_port = "l0_past_ckv".to_string();
         inputs.retain(|m| m.name != "l1_past_ckv");
         outputs.retain(|m| m.name != "l1_present_ckv"); // keep IO consistent
-        outputs.push(meta("l1_present_ckv", DataType::Uint8, &[1, 1, 512]));
+        outputs.push(meta("l1_present_ckv", DataType::Float32, &[1, 1, 512]));
         let err = resolve_csa_state_groups(&inputs, &outputs, &groups, &HashSet::new())
             .unwrap_err()
             .to_string();
         assert!(err.contains("overlaps"), "{err}");
+    }
+
+    /// The `f32` cache format threads its compressed-KV records as float32, not
+    /// uint8: the ratio-128 HCA layer the official schedule builds keeps
+    /// uncompressed float32 records, and the resolver must expect that dtype
+    /// from the group's declared `cache_format` (mirroring the CSA op kernel's
+    /// `CacheFormat::dtype()`), never a hard-coded uint8.
+    #[test]
+    fn f32_cache_expects_float32_compressed_kv_records() {
+        let group = CsaStateGroupAbi {
+            ratio: CsaCompressionRatio::Ratio128,
+            cache_format: CsaCacheFormat::F32,
+            recurrence: CsaRecurrence::Standard,
+            edges: vec![
+                edge(CsaStateRole::CompressedKv, "past_ckv", "present_ckv"),
+                edge(CsaStateRole::CompressionCarry, "past_cc", "present_cc"),
+            ],
+        };
+        let inp = vec![
+            meta("past_ckv", DataType::Float32, &[1, 0, 128]),
+            meta("past_cc", DataType::Float32, &[1, 512]),
+        ];
+        let out = vec![
+            meta("present_ckv", DataType::Float32, &[1, 1, 128]),
+            meta("present_cc", DataType::Float32, &[1, 512]),
+        ];
+        let edges = resolve_csa_state_edges(&inp, &out, &group, &HashSet::new()).unwrap();
+        assert_eq!(
+            edges,
+            vec![
+                ("past_ckv".to_string(), "present_ckv".to_string()),
+                ("past_cc".to_string(), "present_cc".to_string()),
+            ]
+        );
+    }
+
+    /// The dtype the resolver expects is a function of the declared cache
+    /// format: under an `f32` cache, uint8 compressed-KV records are the wrong
+    /// dtype and must be refused before allocation.
+    #[test]
+    fn f32_cache_refuses_uint8_compressed_kv_records() {
+        let group = CsaStateGroupAbi {
+            ratio: CsaCompressionRatio::Ratio128,
+            cache_format: CsaCacheFormat::F32,
+            recurrence: CsaRecurrence::Standard,
+            edges: vec![
+                edge(CsaStateRole::CompressedKv, "past_ckv", "present_ckv"),
+                edge(CsaStateRole::CompressionCarry, "past_cc", "present_cc"),
+            ],
+        };
+        let inp = vec![
+            meta("past_ckv", DataType::Uint8, &[1, 0, 512]),
+            meta("past_cc", DataType::Float32, &[1, 512]),
+        ];
+        let out = vec![
+            meta("present_ckv", DataType::Uint8, &[1, 1, 512]),
+            meta("present_cc", DataType::Float32, &[1, 512]),
+        ];
+        let err = resolve_csa_state_edges(&inp, &out, &group, &HashSet::new())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dtype"), "{err}");
     }
 }
