@@ -1,0 +1,4 @@
+# Generated binary artifacts (reproduce with generate.py). The typed IO
+# reference (io_report.json) and the generator are the committed sources.
+*.onnx
+*.onnx.data
