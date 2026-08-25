@@ -3765,6 +3765,21 @@ fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+/// Test-only entry point to [`infer_shapes`].
+///
+/// Exposed so `shape_tables_agree` in `onnx-runtime-ep-cpu-plugin` can drive
+/// this table and the native `onnx-runtime-shape-inference` one over the same
+/// node and compare them. Two independent encodings of one ONNX specification
+/// drift, and the drift is silent — the two paths simply disagree about the same
+/// graph. Keeping the function itself private preserves the invariant that
+/// production callers reach it only through the Compute path.
+pub fn infer_shapes_for_test(
+    strategy: &ShapeInference,
+    inputs: &[TensorView<'_>],
+) -> Result<Vec<Vec<usize>>, String> {
+    infer_shapes(strategy, inputs)
+}
+
 /// Infer output shapes from the shape inference strategy and input views.
 fn infer_shapes(
     strategy: &ShapeInference,
