@@ -134,7 +134,6 @@ profiles:
     outputs:
       logits: logits
       frame_lengths: frame_lengths
-    batch_invariance: padding_sensitive
     decoding:
       kind: ctc
       blank_id: 0

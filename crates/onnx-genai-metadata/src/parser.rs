@@ -211,10 +211,10 @@ pub fn load_metadata(path: &Path) -> Result<InferenceMetadata, crate::MetadataEr
 /// The one way a document becomes an [`InferenceMetadata`].
 ///
 /// Every loader goes through here rather than calling `serde` itself, because
-/// two things have to happen before a typed reader sees the bytes. The retired
-/// `model.io` block has to be recognized so a package that still declares one
-/// gets told how to convert it instead of failing later with a puzzled "declares
-/// no workflow". And the schema version has to be compared, because every
+/// migrations have to happen before a typed reader sees the bytes. Retired
+/// shapes and batching hints are recognized so a package gets an actionable
+/// conversion instead of an unknown-field error. The schema version is compared
+/// first for migrations whose meaning is scoped to the v1 vocabulary, because every
 /// structure in this schema denies unknown fields: a document from a newer
 /// runtime is not malformed, and reporting the first field this build happens
 /// not to know would send a reader hunting for a typo that is not there.
@@ -288,6 +288,7 @@ fn gate_document(document: &serde_yaml::Value) -> Result<(), crate::MetadataErro
     // same line, so no comparison of version numbers can tell them apart. A
     // retired spelling is only ever found by recognizing its shape.
     reject_flat_token_packed(document, String::new())
+        .and_then(|_| reject_retired_batching_hints(document))
 }
 
 /// Refuse a document that still declares the retired `model.io` block.
@@ -366,6 +367,7 @@ fn reject_flat_token_packed(
                     retired.join("` and `")
                 )));
             }
+
             for (key, value) in mapping {
                 let segment = key.as_str().unwrap_or("?");
                 let child = if path.is_empty() {
@@ -385,6 +387,76 @@ fn reject_flat_token_packed(
         }
         _ => Ok(()),
     }
+}
+
+/// Refuse batching hints that duplicated structural contracts or runtime policy.
+///
+/// These fields were never consumed by execution. Keeping them would allow a
+/// profile, model hint, capability list, and component contract to disagree
+/// about the same optimization. The component's `batch_capacity` is now the
+/// sole authored claim that grouped execution preserves semantics; graph/state
+/// contracts and the resolved backend determine feasibility, and deployment
+/// configuration decides whether to group.
+fn reject_retired_batching_hints(document: &serde_yaml::Value) -> Result<(), crate::MetadataError> {
+    if document
+        .get("model")
+        .and_then(|model| model.get("runtime_configurable"))
+        .and_then(|runtime| runtime.get("continuous_batching"))
+        .is_some()
+    {
+        return Err(crate::MetadataError::Parse(
+            "`model.runtime_configurable.continuous_batching` is retired. Remove it: whether a \
+             resolved graph/backend can share a forward is derived structurally, while enabling \
+             and sizing batches is deployment policy. For an encoder component, declare \
+             `batch_capacity` only when grouped execution is semantically equivalent to solo \
+             execution."
+                .to_string(),
+        ));
+    }
+
+    if let Some(profiles) = document
+        .get("profiles")
+        .and_then(serde_yaml::Value::as_mapping)
+    {
+        for (name, profile) in profiles {
+            if profile.get("batch_invariance").is_some() {
+                let name = name.as_str().unwrap_or("?");
+                return Err(crate::MetadataError::Parse(format!(
+                    "`profiles.{name}.batch_invariance` is retired. Grouping correctness belongs \
+                     to the component that executes the grouped call: declare `batch_capacity` \
+                     when grouped and solo results are equivalent, and omit `batch_capacity` when \
+                     padding or co-batching changes the answer. Keep validity provenance in \
+                     `TensorContract.padding` or the profile's decoding lengths binding."
+                )));
+            }
+        }
+    }
+
+    for path in [
+        "required_capabilities",
+        "pipeline.workflow.manifest.capabilities",
+    ] {
+        let value = path
+            .split('.')
+            .try_fold(document, |value, segment| value.get(segment));
+        if value
+            .and_then(serde_yaml::Value::as_sequence)
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability.as_str() == Some("continuous_batching"))
+            })
+        {
+            return Err(crate::MetadataError::Parse(format!(
+                "`{path}` contains retired capability `continuous_batching`. Remove it: \
+                 continuous batching is an optimization, not a correctness requirement. Typed \
+                 workflow/state contracts and the resolved backend determine feasibility; \
+                 deployment policy decides whether and how much to batch."
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Load inference metadata together with its canonical semantic identity.

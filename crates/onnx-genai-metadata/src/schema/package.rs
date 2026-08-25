@@ -159,20 +159,6 @@ pub struct TaskProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decoding: Option<SequenceDecodingSpec>,
 
-    /// Whether a row's outputs depend on the other rows batched with it.
-    ///
-    /// `row_independent` means a row produces identical values whether it is
-    /// run alone or co-batched with rows of any other length, so a runtime may
-    /// batch freely. `padding_sensitive` means padding a row to the batch width
-    /// changes its values — for example when a normalization reduces over the
-    /// padded time axis — so a runtime that batches trades accuracy for
-    /// throughput and must not treat batched results as equal to solo results.
-    ///
-    /// Absent means unstated, not `row_independent`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<schema_vocabulary::BatchInvariance>")]
-    pub batch_invariance: Option<String>,
-
     /// Whether this profile changes generated output and therefore participates
     /// in cache correctness dependencies.
     #[serde(default)]

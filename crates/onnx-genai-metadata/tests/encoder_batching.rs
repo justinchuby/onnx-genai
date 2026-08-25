@@ -279,6 +279,27 @@ fn a_packed_encoder_result_maps_items_back_to_rows() {
 }
 
 #[test]
+fn packed_encoder_contracts_are_modality_neutral() {
+    for (payload, offsets, owner, count) in [
+        ("audio_frames", "window_offsets", "window_owner", "windows"),
+        (
+            "text_tokens",
+            "segment_offsets",
+            "segment_owner",
+            "segments",
+        ),
+    ] {
+        let document = PACKED_VISION_ENCODER
+            .replace("image_pixels", payload)
+            .replace("image_offsets", offsets)
+            .replace("image_owner", owner)
+            .replace("items", count);
+        validate_metadata(&parse(&document))
+            .unwrap_or_else(|errors| panic!("{payload} must use the same contract: {errors:#?}"));
+    }
+}
+
+#[test]
 fn packed_offsets_must_name_a_declared_value() {
     let document = PACKED_VISION_ENCODER.replace("offsets: image_offsets", "offsets: nowhere");
     assert_reports(
@@ -2684,6 +2705,89 @@ fn a_document_from_a_version_this_build_cannot_read_is_refused_for_that() {
         message.contains("v2.0"),
         "the refusal must name the version it cannot read, got: {message}"
     );
+}
+
+#[test]
+fn retired_profile_batch_invariance_explains_the_component_contract_migration() {
+    let message = gated_error(
+        r#"
+schema_version: v1.1
+profiles:
+  embedding:
+    kind: embedding
+    version: "1.0"
+    batch_invariance: padding_sensitive
+"#,
+    );
+    assert!(
+        message.contains("profiles.embedding.batch_invariance")
+            && message.contains("batch_capacity"),
+        "the refusal must move grouping correctness to the component: {message}"
+    );
+}
+
+#[test]
+fn retired_model_batching_hint_explains_derived_feasibility_and_policy() {
+    let message = gated_error(
+        r#"
+schema_version: v1.1
+model:
+  runtime_configurable:
+    continuous_batching: true
+"#,
+    );
+    assert!(
+        message.contains("model.runtime_configurable.continuous_batching")
+            && message.contains("derived structurally")
+            && message.contains("deployment policy"),
+        "the refusal must separate structure from policy: {message}"
+    );
+}
+
+#[test]
+fn retired_continuous_batching_capability_is_not_a_correctness_requirement() {
+    for document in [
+        "schema_version: v1.1\nrequired_capabilities: [continuous_batching]\n",
+        r#"
+schema_version: v1.1
+pipeline:
+  workflow:
+    manifest:
+      capabilities: [continuous_batching]
+    inputs: {}
+    outputs: {}
+    components: {}
+    steps: []
+"#,
+    ] {
+        let message = gated_error(document);
+        assert!(
+            message.contains("retired capability `continuous_batching`")
+                && message.contains("optimization"),
+            "the refusal must explain why no capability replaces it: {message}"
+        );
+    }
+
+    let metadata = parse("required_capabilities: [continuous_batching]\n");
+    assert_reports(
+        "required_capabilities: [continuous_batching]\n",
+        "retired capability 'continuous_batching'",
+    );
+    assert!(
+        metadata
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == "continuous_batching"),
+        "the semantic validator test must exercise the typed in-memory path"
+    );
+}
+
+#[test]
+fn published_schema_omits_retired_batching_hints() {
+    let schema = inference_metadata_schema_json().expect("schema serializes");
+    assert!(!schema.contains("\"BatchInvariance\""));
+    assert!(!schema.contains("\"batch_invariance\""));
+    assert!(!schema.contains("\"continuous_batching\""));
 }
 
 /// A padded output with two padded dimensions, and a length vector for each.

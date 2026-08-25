@@ -790,29 +790,6 @@
       ],
       "type": "string"
     },
-    "BatchInvariance": {
-      "description": "Dependence of a row's outputs on the rows batched with it.",
-      "oneOf": [
-        {
-          "enum": [
-            "row_independent",
-            "padding_sensitive"
-          ],
-          "title": "Known standard value"
-        },
-        {
-          "not": {
-            "enum": [
-              "row_independent",
-              "padding_sensitive"
-            ]
-          },
-          "title": "Forward-compatible extension value",
-          "type": "string"
-        }
-      ],
-      "type": "string"
-    },
     "BatchLayout": {
       "description": "Structural relationship between a typed value and the runtime batch.\n\n`shared` values are invariant across requests. `request_aligned` values carry\nexactly one entry per in-flight request along `axis`, so compaction permutes\nthat axis. `token_packed` values are ragged: the items of every request are\nconcatenated along one physical axis, and the ownership companions say which\nrequest each item came from, which is what lets a runtime split and regroup\nthe packed value without any serialized request ID. `runtime_sequence_state`\nmarks a value whose per-sequence storage the runtime owns outright.",
       "oneOf": [
@@ -2603,13 +2580,6 @@
           ],
           "description": "Chunked-prefill support and preferred chunk size."
         },
-        "continuous_batching": {
-          "description": "Whether continuous batching may be enabled.",
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
         "prefix_cache": {
           "description": "Whether prefix caching may be enabled.",
           "type": [
@@ -3776,17 +3746,6 @@
       "additionalProperties": false,
       "description": "One executable task profile that shares the package's common facts.\n\nGenerative and non-generative tasks live in one document. Each profile\ncarries its own version and a requirement class so a strict reader can skip\nan optional profile it does not understand while still rejecting unknown\ncore fields.",
       "properties": {
-        "batch_invariance": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/BatchInvariance"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Whether a row's outputs depend on the other rows batched with it.\n\n`row_independent` means a row produces identical values whether it is\nrun alone or co-batched with rows of any other length, so a runtime may\nbatch freely. `padding_sensitive` means padding a row to the batch width\nchanges its values — for example when a normalization reduces over the\npadded time axis — so a runtime that batches trades accuracy for\nthroughput and must not treat batched results as equal to solo results.\n\nAbsent means unstated, not `row_independent`."
-        },
         "decoding": {
           "anyOf": [
             {

@@ -8,10 +8,11 @@ supplies, and what a validator must reject. It supersedes contrary statements
 elsewhere in this repository.
 
 Requirement keywords (**MUST**, **MUST NOT**, **SHOULD**, **MAY**) are used in
-the RFC 2119 sense. Every **MUST** in this document is either enforced by the
-semantic validator in `crates/onnx-genai-metadata/src/validation.rs` or is a
-structural property of the schema in `crates/onnx-genai-metadata/src/schema/`.
-Section [Conformance](#20-conformance) maps each requirement to its test.
+the RFC 2119 sense. Unless a subsection explicitly labels runtime behavior as
+unimplemented acceptance criteria, every **MUST** is enforced by the semantic
+validator in `crates/onnx-genai-metadata/src/validation.rs` or is a structural
+property of `crates/onnx-genai-metadata/src/schema/`. Section
+[Conformance](#20-conformance) maps shipped requirements to tests.
 
 ---
 
@@ -35,9 +36,10 @@ Section [Conformance](#20-conformance) maps each requirement to its test.
 
 ### 1.2 Non-goals
 
-1. **Deployment policy.** Memory budgets, device placement, execution providers,
-   allocators, paging, tiering, quality of service, and deadlines are not
-   metadata. See [§5](#5-ownership-layers-in-the-schema).
+1. **Deployment policy.** Device-memory and allocator budgets, placement,
+   execution providers, paging, tiering, quality of service, and deadlines are
+   not metadata. Static artifact footprint bounds are metadata; measured
+   resource availability is not. See [§5](#5-ownership-layers-in-the-schema).
 2. **Backward compatibility.** There is no export path to `genai_config.json`
    and no reverse synthesizer. See [§17](#17-legacy-import).
 3. **Integrity and trust.** Signing, provenance, and artifact attestation belong
@@ -250,7 +252,7 @@ There are two declaration surfaces:
 Both fields intentionally accept extension-defined strings. Therefore no
 repository can enumerate every future vendor extension. The table below is the
 complete **built-in** vocabulary defined or advertised by this repository:
-**30 identifiers** — syntax/IR 10, state/serving 8, media 5, adapters 4,
+**29 identifiers** — syntax/IR 10, state/serving 7, media 5, adapters 4,
 speculative 1, implementation 2, distributed 0. The source of truth is
 `onnx_genai_metadata::capabilities::BUILTIN`; a test compares that constant
 directly with this table. Adding a built-in identifier without documenting it
@@ -264,7 +266,6 @@ or producer that defines them and MUST still fail closed when unavailable.
 | `grouped_query_attention` | implementation | Execution of grouped-query attention. | Explicit top-level `required_capabilities`; attention geometry remains a package fact, not an inferred grant. | Execute the declared GQA semantics or reject; never silently substitute MHA. | Gemma/Qwen-style decoders; often paired with `kv_cache`. |
 | `multi_head_attention` | implementation | Execution of ordinary multi-head attention. | Explicit top-level `required_capabilities`. | Execute MHA with the artifact's exact ABI or reject. | DeepSeek/GLM test fixtures; independent of GQA. |
 | `prefix_cache` | state/serving | Reuse of a compatible cached prefix. | Explicit top-level `required_capabilities`; reuse dependencies and state-group reuse facts constrain correctness. | Reuse only when all declared dependencies match; otherwise reject or do not admit the package if the capability is required. | Repeated-prefix text serving; builds on cache-state support. |
-| `continuous_batching` | state/serving | Interleaving, row compaction, and release while requests advance independently. | Explicit top-level `required_capabilities`; workflow `batch_layout`, serving values, and row-scoped ABIs provide the structural contract. | Apply one consistent row permutation to every request-aligned value and compact/release row-scoped components; reject if this cannot be guaranteed. | Batched decoder serving; depends on correct row semantics, not serialized row IDs. |
 | `control_flow_loop` | syntax/IR | Legacy admission of a runtime-controlled generation loop. | Explicit top-level `required_capabilities`; retained for bare/legacy packages. | Honor the loop contract or reject; do not guess termination defaults. | Legacy decoder metadata; new workflows use `workflow_ssa` plus structural loop capabilities. |
 | `image_preprocessing_program` | media | Typed, declarative image transform execution. | Explicit top-level `required_capabilities` with `preprocessing.image`. | Execute the declared transforms and tensor contracts exactly or reject. | Vision-language preprocessing; may combine with `packed_image_outputs`. |
 | `packed_image_outputs` | media | More than one packed image tensor output and its packing metadata. | Explicit top-level `required_capabilities` when the image program emits multiple packed tensors. | Preserve offsets/ownership and output contracts; reject readers that only understand one dense image tensor. | Multi-view or grid-aware VLM preprocessing; depends on `image_preprocessing_program`. |
@@ -315,6 +316,13 @@ table**:
 Those strings select a versioned semantic ABI or state bound and are validated
 at the structure that owns them. They do not become negotiated capabilities
 merely because older comments used the word "capability" broadly.
+
+`continuous_batching` is also not a capability identifier. It was retired
+because a runtime may always execute requests separately without changing
+correctness. Shared-forward feasibility is derived from the workflow/state
+contract and resolved backend; enabling and sizing batches is deployment policy.
+The parser rejects the old capability, profile, and model-hint spellings with
+their migrations.
 
 ### 4.4 Semantic identity
 
@@ -496,7 +504,7 @@ That is the whole vocabulary. It states **where the request axis is**, never
 spelling `{ offsets, owner, axis }` meant; the flat spelling is **replaced**, not
 retained alongside it, and that replacement is the one deliberate compatibility
 break in the v1.1 surface
-([`ENCODER_BATCHING.md` §6.1](ENCODER_BATCHING.md#61-schema-evolution-what-actually-happens-to-an-old-runtime)).
+([`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main)).
 
 ### 8.3 No row identity
 
@@ -619,9 +627,10 @@ construction.
 
 ### 10.1 Independent encoder batching
 
-Vision and audio encoders batch on a different axis from the decoder: a request
-may carry zero, one, or many images, and images from many requests pack together.
-Encoder values therefore use `token_packed`:
+Image, video, audio, and text encoders may batch on a different axis from the
+decoder: a request may carry zero, one, or many items, and items from many
+requests may pack together. Dense encoders use `request_aligned`; ragged item
+counts use `token_packed`:
 
 ```yaml
 image_features:
@@ -641,7 +650,7 @@ rows, and one level is the whole chain when items sit directly in rows. A second
 level expresses items that nest — the frames of a video clip
 ([§10.5](#105-generic-component-batching)). This replaced the earlier
 flat `{ offsets, owner, axis }` spelling of the same fact; see
-[`ENCODER_BATCHING.md` §6.1](ENCODER_BATCHING.md#61-schema-evolution-what-actually-happens-to-an-old-runtime)
+[`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main)
 for why the flat form was migrated rather than kept.
 
 ### 10.2 Externally suppliable results
@@ -690,24 +699,20 @@ invocation, and nothing else did either:
 - the image preprocessing adapter passes exactly one encoded item per invocation
   (`crates/onnx-genai-engine/src/pipeline/workflow.rs:3135`), even though the
   preprocessor underneath accepts many;
-- no declared preprocessing program could produce the `offsets`/`owner` pair that
-  `token_packed` names, because the content-role vocabulary had no entry for
-  either. `pack_offsets`, `pack_owner`, and `valid_lengths` are now in both the
-  vision and audio vocabularies
-  (`crates/onnx-genai-metadata/src/schema/mod.rs:349-363`, `mod.rs:449-456`),
-  though nothing *produces* them yet;
+- no declared preprocessing program could name the `offsets`/`owner` pair that
+  `token_packed` references. `pack_offsets`, `pack_owner`, and `valid_lengths`
+  are now in the vision and audio vocabularies, and `preprocessing.video` uses
+  the shared vision program type. Runtime production is still missing: the
+  image/audio adapter executors accept one encoded item per workflow invocation,
+  and no video adapter executor is registered;
 - validation checked nothing about `offsets`/`owner` beyond the serving-emit rule
   in `validation.rs`, which accepted `request_aligned` or `token_packed` without
   distinguishing them. [§10.6](#106-packed-companions-must-validate) is now
   implemented;
-- and nothing expresses *nesting*. A video clip is a sequence of frames inside an
-  item, but the encoder-side vocabulary has no temporal validity value and no
-  second ownership level, while `temporal_patch_size`
-  (`crates/onnx-genai-metadata/src/schema/pipeline.rs:195-198`) replicates one
-  frame rather than carrying a sequence. Video is fully expressible as a workflow
-  *output* (`WorkflowOutputRole::Video`, `ir.rs:822-829`) and absent as an
-  encoder input. `levels` supplies the nesting spelling (`ir.rs:109-118`); the
-  frame-sequence *producer* remains absent.
+- and nothing expressed *nesting*. `levels` now supplies frame → clip → request
+  ownership, while the video program schema supplies `sample_frames` and
+  `pad_frames`. What remains absent is executable runtime production and grouped
+  assembly, not the metadata spelling.
 
 The consequence of the last point was already visible: the schema doc comment
 called `offsets` request-aligned, the canonical fixture declared it `shared`,
@@ -735,15 +740,30 @@ mechanism with the normalized version contract now documented at
 `levels` ownership chain, the companion roles, and the version gate — shipped in
 [#2009](https://github.com/justinchuby/onnx-genai/pull/2009) (`0448f2bc6`) and
 is validated at load. No runtime consumes it yet: nothing groups, nothing packs,
-and no preprocessing program produces the companions. Read the rules as
-normative and in force at load, and the runtime behaviour they describe as the
-contract the remaining phases are written against
-([`ENCODER_BATCHING.md`](ENCODER_BATCHING.md) §8).
+the image/audio adapters still accept one encoded item, and no video adapter
+executor is registered. Read the schema and validator rules as implemented.
+Runtime statements are acceptance criteria for the open work listed in
+[`ENCODER_BATCHING.md`](ENCODER_BATCHING.md) §10.
 
 The requirement keywords in this subsection are schema fields and validator rules
 at load, and describe runtime behaviour that is not yet implemented. The design
 of record, with the evidence, phasing, and acceptance matrix, is
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
+
+The ownership split is strict:
+
+- the package authors `batch_capacity`, layouts, padding provenance, ownership,
+  and static footprint bounds;
+- the runtime derives compatibility, request-local spans, and backend
+  feasibility from those contracts;
+- deployment policy decides whether, when, and how much to group.
+
+There is no second supports-batching flag. The former
+`profiles.*.batch_invariance`,
+`model.runtime_configurable.continuous_batching`, and built-in
+`continuous_batching` capability are retired. `batch_capacity` is the sole
+authored assertion that grouped execution is semantically equivalent to solo
+execution; if padding or co-batching changes the result, the component omits it.
 
 Vision encoders — images and video — motivate the work; nothing about it is
 modality-specific. The contracts carry shape symbols, bounds, lengths, and
@@ -867,8 +887,9 @@ declared on its own dimension and they never compete for one.
   in [§10.6](#106-packed-companions-must-validate) forbids a `padding` entry only
   on the dimension the layout *packs*. Scoping it to layouts with a request axis
   would exempt the value with the most extents a trim can misdescribe.
-  `padding` does not by itself make a component padding-invariant — that remains
-  the profile's `batch_invariance` declaration.
+  `padding` states validity provenance. Grouping safety is asserted by the
+  component's `batch_capacity`: a component whose result changes when padded
+  omits the capacity and runs per item.
 - **Ownership is an ordered chain of levels over one physically packed axis.**
   `TokenPacked` declares `axis` — which **MUST** be `0` wherever `token_packed`
   appears, not only on a component that declares a capacity, because the runtime
@@ -932,10 +953,10 @@ trimming frames, resampling a clip to a common frame count, or downscaling to a
 common resolution are semantic changes, so the correct response to an
 incompatible pair is two groups.
 
-Two runtime obligations travel with the metadata and are stated here because
-they bound what "the interpreter executes it" may cost. First, grouping
-**MUST NOT** introduce a host round-trip for a value that is already device
-resident, and splitting a packed result back to rows is an aliasing operation —
+The unimplemented runtime path has two acceptance requirements. First, grouping
+must not introduce a host round-trip for a value that is already device
+resident, and splitting a packed result back to rows should be an aliasing
+operation —
 which is the practical reason the packed axis is pinned to 0 and the ownership
 rules demand contiguity, since a no-copy view is a contiguous element window and
 "a slice along an inner axis is not a contiguous range"
@@ -947,7 +968,7 @@ parity reports that it cannot group, receives no group, and the workload runs
 item by item as it does today. Declining is safe; attempting is not. Neither fact
 is a metadata field — residency and execution capability are runtime-owned
 ([§10.2](#102-externally-suppliable-results)) — and both are specified in
-[`ENCODER_BATCHING.md` §5.1](ENCODER_BATCHING.md#51-grouped-buffers-aliasing-residency-and-what-padding-costs).
+[`ENCODER_BATCHING.md` §9](ENCODER_BATCHING.md#9-fail-closed-backend-readiness).
 
 **Shipping this surface required a version gate, not a compatibility claim, and
 the gate shipped with it** (`crates/onnx-genai-metadata/src/version.rs:78`,
@@ -961,11 +982,10 @@ and normalization (`schema/mod.rs:62-78`), and the shipped gate reads the versio
 from a generic parse and rejects an unsupported version with one actionable
 message **before** struct deserialization (`version.rs:42,78`):
 
-- **Normalization.** `[v]major[.minor]`, minor defaulting to 0. All three
-  spellings already in the tree — absent (14 of the 39 `inference_metadata.yaml`
-  files), `v1` (19), and `1.0` (6) — normalize to **v1.0**, so no existing
-  document changes meaning or bytes. Anything unparseable is rejected as
-  malformed.
+- **Normalization.** `[v]major[.minor]`, minor defaulting to 0. The legacy
+  spellings absent, `v1`, `1`, and `1.0` normalize to **v1.0**, so no existing
+  document changes meaning merely because its spelling predates the canonical
+  form. Anything unparseable is rejected as malformed.
 - **Direction.** Reject when the document's major differs from the runtime's,
   **and** when the document's minor exceeds the runtime's supported minor.
 - **Deliberately stricter than the in-repo precedent.**
@@ -999,7 +1019,7 @@ load-time half of this subsection is in force; the invocation-time checks it
 also specifies belong to the interpreter phase and are not implemented.
 
 Full rules and their negative fixtures are
-in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-strict-token_packed-validation).
+in [`ENCODER_BATCHING.md` §4](ENCODER_BATCHING.md#4-validation-shipped-on-main).
 In summary, a `token_packed` value's companions are checked at **load**: every
 level's `offsets` and `owner` **MUST** resolve to declared values; each is
 `shared`, `int64`, rank 1, with level `k`'s `owner` carrying that level's unit
@@ -1744,41 +1764,36 @@ Preprocessing uses typed semantic contracts. Implementations **MAY** be ONNX or
 native. A runtime **MUST NOT** infer preprocessing behavior from a model-family
 name.
 
-`preprocessing.image` and `preprocessing.audio` are the two declared programs.
-Both have the same shape — an ordered list of generic `transforms` plus named
-`outputs` that bind program-local values to workflow SSA names — and both draw
-their operation names and content roles from one open vocabulary per modality,
-so a new family adds a fixture, not a runtime branch. Every parameter is model
-**data**: a mel-bin count, an FFT size, a sample rate, and a target window all
-live in the package. A CTC acoustic model declares
+`preprocessing.image`, `preprocessing.video`, and `preprocessing.audio` are the
+declared programs. Image and video share one vision program type; video adds
+`sample_frames` and `pad_frames` to the spatial transform vocabulary rather than
+duplicating it. All three programs are ordered generic `transforms` plus named
+`outputs` that bind program-local values to workflow SSA names. Every parameter
+is model **data**: a mel-bin count, an FFT size, a sample rate, a frame-sampling
+rule, and a target window all live in the package. A CTC acoustic model declares
 `resample`/`downmix`/`zero_mean_unit_variance` over raw samples; an
 encoder-decoder speech model declares `resample`/`pad`/`log_mel` over a fixed
 window. The runtime reads the same fields either way and never dispatches on
 which one it is.
 
-In workflow metadata each program is materialized by exactly one
-manifest-pinned adapter invocation (`onnx-genai.image-preprocess@1` or
-`onnx-genai.audio-preprocess@1`) that takes a `uint8` rank-1 `encoded` input,
-and every declared output **MUST** carry a `TensorContract` compatible with the
-adapter port it binds to. A package **MAY** instead hand the server an
-already-featurized media tensor by declaring a `media` runtime input with the
-full contract and no program; there the input's own shape states the geometry.
+In workflow metadata each program is materialized by one manifest-pinned
+adapter invocation (`onnx-genai.image-preprocess@1`,
+`onnx-genai.video-preprocess@1`, or `onnx-genai.audio-preprocess@1`) and every
+declared output **MUST** carry a `TensorContract` compatible with its adapter
+port. Current runtime support is narrower than the schema: image and audio
+executors accept one encoded item per invocation, and no video executor is
+registered. A package **MAY** instead hand the server an already-featurized
+media tensor with the full contract and no program; there the input's shape
+states the geometry. Text encoders use this typed-tensor path because there is
+no dedicated text preprocessing program.
 
-A program's outputs cannot currently state how several items pack together: the
-content-role vocabulary has no entry for per-item offsets or per-item ownership,
-so the `offsets`/`owner` pair that `token_packed` names
-([§8.2](#82-declared-layout-facts)) has no declared producer. Nor can a program
-state how an item nests — the frames of a video clip, the windows of an
-utterance — or how much of a padded item is real. Two level-agnostic roles,
-`pack_offsets` and `pack_owner`, close the first two gaps at any nesting level,
-and a third role, `valid_lengths`, closes the third. That role is **new**, not a
-generalization of an existing one: the audio vocabulary offered `valid_frames`,
-`valid_samples`, `sample_lengths`, and `frame_lengths` and no `valid_lengths`,
-and all three roles are now declarable
-(`crates/onnx-genai-metadata/src/schema/mod.rs:449-456`) though nothing produces
-them. Since a padding contract references its length value by name, those
-modality-specific spellings keep working alongside the generic one
-— see [§10.5](#105-generic-component-batching) and
+A program output can declare `pack_offsets`, `pack_owner`, and
+`valid_lengths`. These level-agnostic roles let image, video, and audio programs
+name the companions referenced by `token_packed` and `padding`. Existing audio
+roles such as `frame_lengths` and `sample_lengths` remain valid because a
+padding contract references its companion by value name. The missing part is
+runtime production of grouped companions, not schema vocabulary — see
+[§10.5](#105-generic-component-batching) and
 [`ENCODER_BATCHING.md`](ENCODER_BATCHING.md).
 
 Application policy inputs — a grammar, a JSON Schema, a regex — are **request

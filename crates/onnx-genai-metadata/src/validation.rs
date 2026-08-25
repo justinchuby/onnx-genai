@@ -64,6 +64,8 @@ const CONTRACT_OBLIGATIONS: &[ContractObligation] = &[
     },
 ];
 
+const RETIRED_CONTINUOUS_BATCHING_CAPABILITY: &str = "continuous_batching";
+
 /// Capabilities this runtime supports.
 pub struct RuntimeCapabilities {
     pub supported: Vec<String>,
@@ -77,7 +79,6 @@ impl Default for RuntimeCapabilities {
                 capability::GROUPED_QUERY_ATTENTION.to_string(),
                 capability::MULTI_HEAD_ATTENTION.to_string(),
                 capability::PREFIX_CACHE.to_string(),
-                capability::CONTINUOUS_BATCHING.to_string(),
                 capability::CONTROL_FLOW_LOOP.to_string(),
                 // Structural workflow capabilities. Every package now declares
                 // its execution as a workflow, including a single decoder, so a
@@ -375,6 +376,7 @@ pub fn validate_metadata(metadata: &InferenceMetadata) -> Result<(), Vec<String>
         }
     }
     validate_schema_version(metadata, &mut errors);
+    validate_retired_batching_capability(metadata, &mut errors);
     validate_preprocessing_workflow(metadata, &mut errors);
     validate_generation_contract(metadata, &mut errors);
     validate_profiles(metadata, &mut errors);
@@ -431,6 +433,46 @@ fn validate_schema_version(metadata: &InferenceMetadata, errors: &mut Vec<String
              with a puzzled unknown-field error; declare schema_version '{required}' so it is \
              refused for the reason that is true"
         ));
+    }
+}
+
+/// Reject the old opt-in spelling for an optimization the runtime derives.
+///
+/// A capability says execution would be incorrect without a behavior.
+/// Continuous batching is never required for correctness: a runtime may always
+/// execute one request at a time. Whether a resolved decode path can share a
+/// forward is derived from its graph/state contract and backend, while whether
+/// to do so is deployment policy.
+fn validate_retired_batching_capability(metadata: &InferenceMetadata, errors: &mut Vec<String>) {
+    if metadata
+        .required_capabilities
+        .iter()
+        .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
+    {
+        errors.push(
+            "required_capabilities contains retired capability 'continuous_batching'; remove it. \
+             Shared-forward support is derived from the workflow and resolved backend, and \
+             enabling or sizing batches is runtime policy, so single-request execution remains \
+             correct without a negotiated capability"
+                .to_string(),
+        );
+    }
+    if let Some(workflow) = metadata
+        .pipeline
+        .as_ref()
+        .map(|pipeline| &pipeline.workflow)
+        && workflow
+            .manifest
+            .capabilities
+            .iter()
+            .any(|capability| capability == RETIRED_CONTINUOUS_BATCHING_CAPABILITY)
+    {
+        errors.push(
+            "pipeline.workflow.manifest.capabilities contains retired capability \
+             'continuous_batching'; remove it. The workflow's typed batch layouts, state groups, \
+             and row-scoped ABI are the structural contract; grouping remains a runtime choice"
+                .to_string(),
+        );
     }
 }
 
@@ -758,17 +800,6 @@ fn validate_profile_decoding(metadata: &InferenceMetadata, errors: &mut Vec<Stri
         let Some(decoding) = &profile.decoding else {
             continue;
         };
-        // When padding perturbs a row's values there is no reliable way to
-        // recover the valid region by re-deriving it from the input length, so
-        // the package must publish the per-row length it actually produced.
-        if profile.batch_invariance.as_deref() == Some("padding_sensitive")
-            && decoding.lengths.is_none()
-        {
-            errors.push(format!(
-                "profiles.{name}.decoding must bind a lengths output role because \
-                 profiles.{name}.batch_invariance is 'padding_sensitive'"
-            ));
-        }
         if decoding.kind == "ctc" && decoding.blank_id.is_none() {
             errors.push(format!(
                 "profiles.{name}.decoding requires blank_id because kind is 'ctc'"
