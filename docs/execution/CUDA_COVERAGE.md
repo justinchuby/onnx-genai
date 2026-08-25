@@ -232,6 +232,7 @@ not yet wired) · **🔬 custom** (needs a fused NVRTC/CUTLASS kernel).
 | `ScatterND` (v11/v16/v18) | `` | ✅ | **NVRTC-custom** | Deterministic slice updates in row-major tuple order for f32/f16/bf16/Int64 data and Int64 indices; negative indices and `none`/`add`/`mul`/`min`/`max` reductions match the CPU EP (`indexing.rs`). |
 | `HannWindow`, `HammingWindow`, `BlackmanWindow` (v17) | `` | ✅ | **NVRTC-custom** | Periodic or symmetric signal windows generated directly on device in f16/bf16/f32/f64, with the scalar size and `output_datatype` contract matched to the CPU EP (`window.rs`). |
 | `DFT` (v17/v20) | `` | ✅ | **cuFFT + NVRTC pack/unpack** | f32 real/complex input, forward/inverse, full/onesided output, arbitrary signal axis, and truncating/zero-padding `dft_length`. A bounded 16-entry plan cache reuses stream-bound C2C plans; execution scratch and packed data use governed EP workspace. Plan selection and scalar staging deliberately decline CUDA-graph capture (`dft.rs`, `cufft.rs`). |
+| `STFT` (v17) | `` | ✅ | **cuFFT + fused NVRTC frame/window pack + unpack** | Contiguous f32 `[batch, signal, 1|2]`, dynamic Int32/Int64 `frame_step` and optional `frame_length`, optional matching f32 window, complete unpadded frames, full spectrum or real-input onesided output. All frames across the signal batch execute in one PlanMany call through DFT's shared 16-entry plan cache and governed workspace. Runtime scalar reads/plan selection deliberately decline CUDA-graph capture (`stft.rs`, `cufft.rs`). |
 | `CenterCropPad` | `` | ✅ | **NVRTC-custom** | Dtype-agnostic fixed-width centered crop/zero-pad over all or selected axes, including negative axes and CPU-matched odd-difference placement (`index_transform.rs`). |
 | `Col2Im` | `` | ✅ | **NVRTC-custom** | Arbitrary spatial-rank f32/f16/bf16 inverse image-column transform with overlap accumulation, dilation, strides, and padding; accumulation is widened to f32 (`index_transform.rs`). |
 
@@ -365,12 +366,12 @@ worth stating precisely:
   non-gap is recorded here (and pinned by a unit test in `kernels/mod.rs`) to
   prevent future re-investigation.
 
-`ai.onnx::DFT` is now implemented for CUDA in `kernels/dft.rs`. The CUDA path
+`ai.onnx::DFT` and `ai.onnx::STFT` are implemented for CUDA in `kernels/dft.rs`
+and `kernels/stft.rs`. The DFT path
 packs arbitrary ONNX signal axes into contiguous complex f32 batches, executes
 cuFFT C2C, and unpacks to the requested full or half spectrum. This common
-packed-batch/plan-cache seam is the reusable FFT foundation for STFT; STFT still
-needs framing/windowing, optional window input handling, hop length, and its
-specified output layout.
+packed-batch/plan-cache seam is reused by STFT, whose fused pack kernel extracts
+complete frames and applies the optional window before one batched cuFFT call.
 
 | Backend | CPU-covered gaps mapped here | Rationale |
 |---------|------------------------------|-----------|

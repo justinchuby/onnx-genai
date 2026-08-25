@@ -100,6 +100,7 @@ pub mod softmax;
 pub mod sparse_kv_gather;
 pub mod standard_attention;
 pub(crate) mod standard_claims;
+pub mod stft;
 pub mod structural;
 pub mod tensor_scatter;
 pub mod topk;
@@ -194,6 +195,7 @@ pub const CUDA_COVERED_OPS: &[&str] = &[
     "FusedGemm",
     "Conv",
     "DFT",
+    "STFT",
     "MaxPool",
     "AveragePool",
     "LpPool",
@@ -387,6 +389,9 @@ static CUDA_FLOAT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Float16, 
 /// DFT data/output are f32; its optional length and axis inputs are i64.
 static CUDA_DFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int64];
 
+/// STFT data/output/window are f32; frame scalars may be i32 or i64.
+static CUDA_STFT_DTYPES: &[DataType] = &[DataType::Float32, DataType::Int32, DataType::Int64];
+
 /// Every element type the CUDA EP can move byte-for-byte through a structural
 /// op (Reshape, Transpose, Gather, Concat, Cast, Shape, …). These kernels do
 /// not compute on the values, so they accept the full dtype set. Matches the
@@ -489,6 +494,7 @@ static CUDA_ATTENTION_DTYPES: &[DataType] = &[
 pub fn cuda_supported_dtypes_for_op(op_type: &str, domain: &str) -> &'static [DataType] {
     match (op_type, domain) {
         ("DFT", "") => CUDA_DFT_DTYPES,
+        ("STFT", "") => CUDA_STFT_DTYPES,
 
         // Block-quantized GEMM / MoE: f16/f32 activation + Uint8 packed weight.
         ("MatMulNBits", "com.microsoft")
@@ -658,12 +664,19 @@ pub fn build_cuda_registry_with_metrics(
 ) -> OpRegistry {
     let mut reg = OpRegistry::new();
 
-    let dft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
+    let fft_plans = Arc::new(crate::cufft::CufftPlanCache::default());
     reg.register(
         OpKey::new("DFT", "", 17),
         Box::new(dft::DftFactory {
             runtime: runtime.clone(),
-            plans: dft_plans,
+            plans: fft_plans.clone(),
+        }),
+    );
+    reg.register(
+        OpKey::new("STFT", "", 17),
+        Box::new(stft::StftFactory {
+            runtime: runtime.clone(),
+            plans: fft_plans,
         }),
     );
 
@@ -1661,7 +1674,8 @@ pub fn build_cuda_registry_with_metrics(
 #[cfg(test)]
 mod tests {
     use super::{
-        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, cuda_supported_dtypes_for_op,
+        CUDA_COVERED_OPS, CUDA_DFT_DTYPES, CUDA_FLOAT_DTYPES, CUDA_STFT_DTYPES,
+        cuda_supported_dtypes_for_op,
     };
 
     /// Every operator the CPU EP registers but CUDA does not must be named in
@@ -1850,6 +1864,16 @@ mod tests {
             cuda_supported_dtypes_for_op("DFT", ""),
             CUDA_DFT_DTYPES,
             "DFT must advertise f32 data plus its Int64 scalar inputs"
+        );
+    }
+
+    #[test]
+    fn stft_registration_advertises_only_implemented_input_types() {
+        assert!(CUDA_COVERED_OPS.contains(&"STFT"));
+        assert_eq!(
+            cuda_supported_dtypes_for_op("STFT", ""),
+            CUDA_STFT_DTYPES,
+            "STFT must advertise f32 data/window plus Int32/Int64 scalar inputs"
         );
     }
 
