@@ -276,10 +276,42 @@ relevant ran". Cardinality proves the selector resolved; only identity proves it
 resolved to the subject.
 
 ```sh
+: "${FILTER:?}" "${EXPECTED_TEST:?}"   # an empty filter runs the whole suite
+
 # expect-FAIL arm: the named test must be among the failures, not just some test
-cargo test -q --lib "$FILTER" 2>&1 | tee out.txt | grep -qE '^test result: FAILED' \
-  && grep -qE "^ +$EXPECTED_TEST\$" out.txt \
+cargo test -q --lib "$FILTER" > arm.out 2>&1 || true
+grep -qE '^test result: FAILED' arm.out \
+  && grep -qE "^ +$EXPECTED_TEST\$" arm.out \
   || { echo "ARM-DRIFT: '$EXPECTED_TEST' did not fail under the mutation"; exit 2; }
+```
+
+Redirect rather than pipe, and swallow the status with `|| true`, for a reason
+that is this section one level up. The obvious form pipes `cargo` into `tee` into
+`grep` and reads the pipeline's status — which is `grep`'s status only while
+`pipefail` is off. Under `set -euo pipefail`, the idiom in every hardened
+battery, the pipeline reports **cargo's** 101 instead, so the `&&` short-circuits
+and *every correct expect-FAIL arm reports ARM-DRIFT*. Measured on the same
+crate, right filter, mutation live:
+
+```
+pipefail off   arm OK      (exit 0)      <- what the author sees
+pipefail on    ARM-DRIFT   (exit 2)      <- what the copier sees
+```
+
+Review caught that in this very snippet, after I had tested it three ways —
+because I ran it in my shell, which had no `pipefail`, and the copier's shell
+does. The failure direction is safe (loud, never a false green), which is also
+why it could have survived a long time in someone's script as a check that
+always fires. The redirect form is verified at 6/6 across both settings.
+
+The expect-PASS arm needs the same naming and cannot use `-q`: quiet mode prints
+passing tests as dots and emits no per-test line, so there is nothing to match.
+Drop it and assert the name resolved *and* passed.
+
+```sh
+cargo test --lib "$FILTER" -- --exact > arm.out 2>&1 || true
+grep -qE "^test $EXPECTED_TEST \.\.\. ok\$" arm.out \
+  || { echo "ARM-DRIFT: '$EXPECTED_TEST' did not run and pass"; exit 2; }
 ```
 
 **Check:** every battery carries a **vacuity arm** — a mutation so destructive
