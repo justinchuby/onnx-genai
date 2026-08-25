@@ -85,30 +85,39 @@ jobs:
           # assert_eq -- both are pure markdown edits).
           #
           # Derived by scanning rather than listed, so it cannot go stale when a
-          # third embed is added (Rule 10). Only literal-path embeds are visible;
-          # a computed path (concat!/env!) is not, and stays classified as docs.
+          # third embed is added (Rule 10). The scan is whole-file, not
+          # line-oriented: rustfmt wraps any call over 100 columns onto its own
+          # line, and the two .md embeds are 87 and 86 columns, so a line-based
+          # `git grep` would stop seeing them after an unrelated reformat and
+          # silently reopen #2077. 15 of the 163 embed sites here are already in
+          # that wrapped form. Only literal-path embeds are visible; a computed
+          # path (concat!/env!) is not, and stays classified as docs.
           embed_scan_ok=true
           embed_hits=""
-          # Assignment inside `if` so a no-match (rc 1) cannot trip `bash -e`.
-          # A dead `changes` job would SKIP fast-linux and rust-quality, and a
-          # skipped required check satisfies the ruleset -- failing here must
-          # never be quieter than failing loudly.
-          if embed_hits="$(git grep -I -n -oE 'include_(str|bytes)!\s*\(\s*"[^"]+"' -- '*.rs' 2>/dev/null)"; then
-            :
-          else
-            [ $? -eq 1 ] || embed_scan_ok=false
+          # Assignments inside `if` so a non-zero status cannot trip the step's
+          # `-eo pipefail` shell. A dead `changes` job would SKIP fast-linux and
+          # rust-quality, and a skipped required check satisfies the ruleset --
+          # failing here must never be quieter than failing loudly.
+          if ! embed_hits="$(
+            git ls-files -z -- '*.rs' \
+              | xargs -0 --no-run-if-empty perl -0777 -ne '
+                  while (/include_(?:str|bytes)!\s*\(\s*b?r?\#*"([^"]*)"/g) {
+                    print "$ARGV\t$1\n";
+                  }'
+          )"; then
+            embed_scan_ok=false
           fi
           embedded=""
           if [ "$embed_scan_ok" = true ] && [ -n "$embed_hits" ]; then
-            embedded="$(
-              printf '%s\n' "$embed_hits" | while IFS= read -r hit; do
-                [ -z "$hit" ] && continue
-                src="${hit%%:*}"
-                target="${hit#*\"}"
-                target="${target%\"}"
+            if ! embedded="$(
+              printf '%s\n' "$embed_hits" | while IFS="$(printf '\t')" read -r src target; do
+                [ -z "$src" ] && continue
+                [ -z "$target" ] && continue
                 realpath -m --relative-to="$PWD" "$(dirname "$src")/$target"
               done | LC_ALL=C sort -u
-            )"
+            )"; then
+              embed_scan_ok=false
+            fi
           fi
 
           is_docs_path() {
