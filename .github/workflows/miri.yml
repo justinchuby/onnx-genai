@@ -73,17 +73,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          run_miri() {
-            local label="$1"
-            shift
-            local start end
-            start=$(date +%s)
-            echo "::group::Miri: ${label}"
-            "$@"
-            end=$(date +%s)
-            echo "MIRI_TIMING ${label}: $((end - start))s"
-            echo "::endgroup::"
-          }
+          # `run_miri` lives in a script so it can have a conformance suite:
+          # it is a gate whose failure mode is a green report. Most steps below
+          # select tests BY NAME, and libtest exits 0 on a filter that matches
+          # nothing, so a renamed test silently turns its step into a no-op that
+          # reports `ok`. The wrapper fails the step when it executed no tests.
+          # See scripts/miri_step.sh and scripts/miri_step_test.sh.
+          # shellcheck source=scripts/miri_step.sh
+          . ./scripts/miri_step.sh
 
           # Keep Stacked Borrows (Miri default) instead of Tree Borrows so the raw
           # pointer ownership checks stay maximally strict. Only ep-api/session/C
