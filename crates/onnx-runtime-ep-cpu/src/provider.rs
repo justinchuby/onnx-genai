@@ -439,6 +439,13 @@ impl ExecutionProvider for CpuExecutionProvider {
         {
             return KernelMatch::unsupported(reason);
         }
+        if op.op_type == "DsaIndexSelect"
+            && op.domain == "pkg.nxrt"
+            && let Some(reason) =
+                crate::kernels::dsa_index_select::unsupported_reason(op, shapes, input_dtypes)
+        {
+            return KernelMatch::unsupported(reason);
+        }
         if op.op_type == "VarlenAttention"
             && op.domain == "pkg.nxrt"
             && let Some(reason) =
@@ -1561,6 +1568,145 @@ mod tests {
             let reason = rejected.reason().expect("CSA claim must be denied");
             assert!(reason.contains(expected), "{reason}");
         }
+    }
+
+    /// Builds a `pkg.nxrt::DsaIndexSelect` node plus the `(shapes, dtypes)`
+    /// claim metadata for a compatible baseline: batch=1, q_seq=2, heads=2,
+    /// head_dim=4, key_seq=3, top_k=2. Each shape/dtype axis matches
+    /// `DsaIndexSelectKernel::derive_dims`'s cross-input contract exactly, so
+    /// callers can flip exactly one axis to prove exactly one rejection.
+    fn dsa_index_select_baseline() -> (Node, Vec<Shape>, Vec<DataType>) {
+        let mut graph = Graph::new();
+        let value = |graph: &mut Graph, name: &str, dtype| {
+            Some(graph.create_named_value(name.to_string(), dtype, static_shape([])))
+        };
+        let inputs = vec![
+            value(&mut graph, "query", DataType::Float32),
+            value(&mut graph, "key", DataType::Float32),
+            value(&mut graph, "weights", DataType::Float32),
+            value(&mut graph, "attention_bias", DataType::Float32),
+        ];
+        let output = graph.create_named_value(
+            "selected_indices".to_string(),
+            DataType::Int64,
+            static_shape([]),
+        );
+        let mut node = Node::new(NodeId(0), "DsaIndexSelect", inputs, vec![output]);
+        node.domain = "pkg.nxrt".into();
+        node.attributes.insert("top_k".into(), Attribute::Int(2));
+        node.attributes
+            .insert("scale".into(), Attribute::Float(1.0));
+        let shapes = vec![
+            static_shape([1, 2, 2, 4]), // query (B, S, H, D)
+            static_shape([1, 3, 4]),    // key (B, T, D)
+            static_shape([1, 2, 2]),    // weights (B, S, H)
+            static_shape([1, 1, 2, 3]), // attention_bias (B, 1, S, T)
+        ];
+        let dtypes = vec![
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+        ];
+        (node, shapes, dtypes)
+    }
+
+    #[test]
+    fn dsa_index_select_claim_gate_accepts_a_compatible_node() {
+        let ep = CpuExecutionProvider::new();
+        let (node, shapes, dtypes) = dsa_index_select_baseline();
+        let claim = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        assert!(
+            claim.is_supported(),
+            "a shape/dtype/attribute-compatible DsaIndexSelect node must be claimed; got {:?}",
+            claim.reason()
+        );
+        // Claim/execute mirroring: the factory must accept the same node
+        // (`DsaIndexSelectFactory::create` only parses attributes, so an
+        // empty shape list is the correct call shape here).
+        assert!(
+            ep.get_kernel(&node, &[], 1).is_ok(),
+            "a node the claim gate accepts must also be instantiable by the factory"
+        );
+    }
+
+    #[test]
+    fn dsa_index_select_claim_gate_rejects_non_f32_attention_bias() {
+        // `attention_bias` carries the `-inf`/finfo.min causal-fill sentinel,
+        // which is only meaningful at Float32 precision; the kernel and the
+        // claim gate both hard-require Float32 for input 3 regardless of the
+        // query/key/weights element type.
+        let ep = CpuExecutionProvider::new();
+        let (node, shapes, mut dtypes) = dsa_index_select_baseline();
+        dtypes[3] = DataType::Float16;
+        let rejected = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected
+            .reason()
+            .expect("DsaIndexSelect claim must be denied");
+        assert!(
+            reason.contains("attention_bias") && reason.contains("expected Float32"),
+            "{reason}"
+        );
+        // Mirror: the factory must reject with the same reasoning family, not
+        // silently accept a node the claim gate declined.
+        let mut execute_dtypes = dtypes.clone();
+        execute_dtypes[3] = DataType::Float16;
+        assert!(
+            crate::kernels::dsa_index_select::unsupported_reason(&node, &shapes, &execute_dtypes)
+                .unwrap()
+                .contains("expected Float32")
+        );
+    }
+
+    #[test]
+    fn dsa_index_select_claim_gate_rejects_incompatible_shape() {
+        // query/key head_dim mismatch (query D=4, key D=5): a cross-input
+        // shape contract violation, not a rank or dtype issue.
+        let ep = CpuExecutionProvider::new();
+        let (node, mut shapes, dtypes) = dsa_index_select_baseline();
+        shapes[1] = static_shape([1, 3, 5]);
+        let rejected = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected
+            .reason()
+            .expect("DsaIndexSelect claim must be denied");
+        assert!(reason.contains("query/key head_dim"), "{reason}");
+    }
+
+    #[test]
+    fn dsa_index_select_claim_gate_rejects_bad_bias_head_broadcast() {
+        // `attention_bias` dim 1 must be exactly 1 (head-broadcast); a wider
+        // dim 1 is a distinct rejection axis from rank or cross-seq mismatches.
+        let ep = CpuExecutionProvider::new();
+        let (node, mut shapes, dtypes) = dsa_index_select_baseline();
+        shapes[3] = static_shape([1, 2, 2, 3]);
+        let rejected = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected
+            .reason()
+            .expect("DsaIndexSelect claim must be denied");
+        assert!(reason.contains("head-broadcast"), "{reason}");
+    }
+
+    #[test]
+    fn dsa_index_select_claim_gate_rejects_non_positive_top_k() {
+        let ep = CpuExecutionProvider::new();
+        let (mut node, shapes, dtypes) = dsa_index_select_baseline();
+        node.attributes.insert("top_k".into(), Attribute::Int(0));
+        let rejected = ep.supports_op(&node, 1, &shapes, &dtypes, &[]);
+        assert!(!rejected.is_supported());
+        let reason = rejected
+            .reason()
+            .expect("DsaIndexSelect claim must be denied");
+        assert!(
+            reason.contains("top_k") && reason.contains("must be > 0"),
+            "{reason}"
+        );
+        // Mirror: the factory (execute-time attribute parse) rejects for the
+        // same reason, proving the claim gate did not invent a check the
+        // kernel does not also enforce.
+        assert!(ep.get_kernel(&node, &[], 1).is_err());
     }
 
     #[test]
