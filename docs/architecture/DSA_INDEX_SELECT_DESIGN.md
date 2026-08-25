@@ -116,9 +116,17 @@ silent miscompute:
 
 - unknown attributes, missing/`≤0` `top_k` or `scale`, non-finite/`≤0` `weights_scale`;
 - wrong input arity (`≠ 4`) or output arity (`≠ 1`);
-- unsupported/mismatched dtypes (non-float inputs, `key`/`weights` not matching `query`, output not int64);
+- unsupported/mismatched dtypes (non-float inputs, `key`/`weights` not matching
+  `query`, `attention_bias` not exactly f32);
 - wrong ranks (`query` 4, `key` 3, `weights` 3, `bias` 4) and static cross-input
   dimension conflicts (batch, seq, heads, head_dim, key seq, bias head-broadcast `= 1`).
+
+`attention_bias` is pinned to f32 because the mask decision `bias > -1e30` depends
+on the fill magnitude: an f16 `finfo.min` (−65504) would be misread as "allowed".
+
+Output shape/dtype are not part of claim metadata (which is inputs-only, matching
+the sibling `IndexShare` gate), so the `int64` + `[B,1,S,top_k]` output contract is
+enforced at **execute** time rather than claim time.
 
 Index *values* are produced by this op (never read from an input), so there is no
 run-time index-validation step here — that lives in the consuming `IndexShare`.

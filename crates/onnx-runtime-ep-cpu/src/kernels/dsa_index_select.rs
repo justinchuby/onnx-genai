@@ -173,7 +173,7 @@ impl Kernel for DsaIndexSelectKernel {
             }
         }
         // query/key/weights share one element type; the bias is an additive f32
-        // mask that may arrive at a different (also-float) precision.
+        // mask whose `-inf`/finfo.min fill magnitude is only meaningful in f32.
         for index in [1, 2] {
             if inputs[index].dtype != inputs[0].dtype {
                 return Err(error(format!(
@@ -181,6 +181,12 @@ impl Kernel for DsaIndexSelectKernel {
                     INPUT_NAMES[index], inputs[index].dtype, inputs[0].dtype
                 )));
             }
+        }
+        if inputs[3].dtype != DataType::Float32 {
+            return Err(error(format!(
+                "input 3 ('attention_bias') dtype {:?} unsupported; expected Float32",
+                inputs[3].dtype
+            )));
         }
         if outputs[0].dtype != DataType::Int64 {
             return Err(error(format!(
@@ -355,6 +361,12 @@ fn validate_claim_metadata(
             ));
         }
     }
+    if dtypes[3] != DataType::Float32 {
+        return Err(format!(
+            "input 3 ('attention_bias') dtype {:?} unsupported; expected Float32",
+            dtypes[3]
+        ));
+    }
     let expected_ranks = [4usize, 3, 3, 4];
     for (index, &rank) in expected_ranks.iter().enumerate() {
         if shapes[index].len() != rank {
@@ -375,7 +387,9 @@ fn validate_claim_metadata(
     require_same_static(&shapes[0], 1, &shapes[3], 2, "query/bias seq")?;
     require_same_static(&shapes[1], 1, &shapes[3], 3, "key/bias seq")?;
     check_static_dim(&shapes[3], 1, 1, "attention_bias head-broadcast")?;
-    // Static output width, if declared, must equal `top_k`.
+    // Output shape/dtype are not part of claim metadata (inputs only), so the
+    // Int64 + `[B,1,S,top_k]` output contract is enforced at execute time (see
+    // `execute`), matching the sibling `IndexShare` claim gate.
     let _ = attrs;
     Ok(())
 }
@@ -1040,6 +1054,61 @@ mod tests {
                 .map(|()| Vec::new()),
         );
         assert!(err.contains("dim 1 must be 1"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_f32_attention_bias() {
+        // Contract: attention_bias is always f32 (its -inf/finfo.min fill
+        // magnitude is only meaningful in f32). An f16 finfo.min fill would
+        // otherwise be misread as "allowed" (-65504 > -1e30).
+        let case = base(2);
+        let query = vec![1.0; case.heads * case.head_dim];
+        let key = vec![0.5; case.key_seq * case.head_dim];
+        let weights = vec![1.0; case.heads];
+        let bias = causal_bias(1, 1, case.key_seq, 3);
+        let (graph, id) = node(case, DataType::Float32, DataType::Int64);
+        let kernel = DsaIndexSelectFactory.create(graph.node(id), &[]).unwrap();
+        let q = Owned::f32(&[case.batch, case.q_seq, case.heads, case.head_dim], &query);
+        let k = Owned::f32(&[case.batch, case.key_seq, case.head_dim], &key);
+        let w = Owned::f32(&[case.batch, case.q_seq, case.heads], &weights);
+        let b = Owned::f16(&[case.batch, 1, case.q_seq, case.key_seq], &bias); // wrong precision
+        let mut out = Owned::zeros(DataType::Int64, &[case.batch, 1, case.q_seq, case.top_k]);
+        let err = err_of(
+            kernel
+                .execute(
+                    &[q.view(), k.view(), w.view(), b.view()],
+                    &mut [out.view_mut()],
+                )
+                .map(|()| Vec::new()),
+        );
+        assert!(
+            err.contains("attention_bias") && err.contains("Float32"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn claim_gate_rejects_non_f32_bias() {
+        let case = base(4);
+        let (graph, id) = node(case, DataType::Float32, DataType::Int64);
+        let n = graph.node(id);
+        let shapes: Vec<Shape> = vec![
+            static_shape([1usize, 1, 1, 2]),
+            static_shape([1usize, 4, 2]),
+            static_shape([1usize, 1, 1]),
+            static_shape([1usize, 1, 1, 4]),
+        ];
+        let dtypes = vec![
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float32,
+            DataType::Float16, // bias must be f32
+        ];
+        let reason = unsupported_reason(n, &shapes, &dtypes).unwrap();
+        assert!(
+            reason.contains("attention_bias") && reason.contains("Float32"),
+            "{reason}"
+        );
     }
 
     #[test]
