@@ -6309,6 +6309,12 @@ mod tests {
             "build_with_schedule, on a healthy but slow-starting pool",
             Duration::from_secs(60),
             || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
                 assert_eq!(
                     FAIL_WORKER_BEFORE_READY.with(Cell::get),
                     usize::MAX,
@@ -6487,6 +6493,12 @@ mod tests {
             "shutdown, on a healthy pool in both dispatcher-shard regimes",
             Duration::from_secs(60),
             || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
                 assert_eq!(
                     WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get),
                     usize::MAX,
@@ -6567,6 +6579,12 @@ mod tests {
             "build_with_schedule, with workers slow enough to expire the deadline",
             Duration::from_secs(60),
             || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
                 assert_eq!(
                     FAIL_WORKER_BEFORE_READY.with(Cell::get),
                     usize::MAX,
@@ -6611,9 +6629,12 @@ mod tests {
                 POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
                 SLOW_YIELD_US.with(|slot| slot.set(0));
                 // This test drives the *readiness barrier's* yield site, which shares
-                // `slow_yield` with `worker_wait`. Since that helper counts
-                // unconditionally, leaving the tally behind would hand a nonzero
-                // starting count to whatever libtest schedules next on this thread.
+                // `slow_yield` with `worker_wait`, and that helper counts
+                // unconditionally. The reset is now belt-and-braces: the harness
+                // thread is discarded after this returns, so there is no next test
+                // on it to inherit the tally, and the other `YIELD_COUNT` consumers
+                // zero it on entry anyway. Kept so the invariant survives if either
+                // of those two facts stops holding.
                 YIELD_COUNT.with(|slot| slot.set(0));
 
                 let panic = outcome.err().unwrap_or_else(|| {
