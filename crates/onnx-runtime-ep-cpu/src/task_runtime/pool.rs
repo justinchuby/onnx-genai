@@ -157,6 +157,12 @@ thread_local! {
     /// discriminates just as sharply.
     static HOLD_WORKER_IGNORES_SHUTDOWN_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
+    /// Test injection: on the first deadline expiry, publish `ready ==
+    /// workers` immediately before the barrier re-reads it, reproducing the
+    /// lost race the re-read exists to absorb. No amount of timing could
+    /// arrange that window reliably.
+    static FORCE_READY_RACE_AT_DEADLINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
     /// Test injection of the *other* case: every worker announces, but late.
     /// Without it the healthy-pool assertion is vacuous, because real workers
     /// announce inside the spin budget and the deadline is never consulted --
@@ -211,6 +217,22 @@ fn ready_yield() {
         }
     }
 }
+
+/// Test observation of the held worker's deaf window, tagged by generation.
+///
+/// Generation-tagged rather than a pair of booleans because a held worker from
+/// an *earlier* test outlives the constructor that abandoned it: it is released
+/// by the shutdown store, but the store recording that it left runs on the
+/// worker's thread and can be descheduled past the next test's reset. Two
+/// booleans would then report the previous test's exit as this one's -- a false
+/// failure no amount of resetting can close. A generation only ever matches the
+/// test that issued it.
+#[cfg(test)]
+static DEAF_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DEAF_ENTERED_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DEAF_LEFT_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
 /// Read on the builder thread only, which is where the barrier runs, so the
 /// thread-local scoping above answers the injecting test's question rather than
@@ -681,6 +703,10 @@ impl TaskPool {
         #[cfg(test)]
         let hold_ignores_shutdown_ms = HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(std::cell::Cell::get);
         #[cfg(test)]
+        let force_ready_race = FORCE_READY_RACE_AT_DEADLINE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let deaf_generation = DEAF_GENERATION.load(Ordering::SeqCst);
+        #[cfg(test)]
         let ready_delay_ms = DELAY_WORKER_BEFORE_READY_MS.with(std::cell::Cell::get);
         for worker_id in 0..requested {
             let shared = Arc::clone(&shared);
@@ -706,11 +732,13 @@ impl TaskPool {
                             // returning to the abandon path.
                             let deaf_until =
                                 Instant::now() + Duration::from_millis(hold_ignores_shutdown_ms);
+                            DEAF_ENTERED_GENERATION.store(deaf_generation, Ordering::SeqCst);
                             while !shared.shutdown.load(Ordering::Acquire)
                                 || Instant::now() < deaf_until
                             {
                                 thread::sleep(Duration::from_millis(1));
                             }
+                            DEAF_LEFT_GENERATION.store(deaf_generation, Ordering::SeqCst);
                             return;
                         }
                     }
@@ -766,6 +794,10 @@ impl TaskPool {
                 // barrier after a build 3x over its deadline completed as if
                 // healthy.
                 if ready_since.elapsed() >= pool_ready_timeout() {
+                    #[cfg(test)]
+                    if force_ready_race {
+                        shared.ready.store(workers, Ordering::Release);
+                    }
                     let ready = shared.ready.load(Ordering::Acquire);
                     // The loop condition and this load are two separate reads,
                     // so a worker can announce between them. Accept that pool
@@ -1479,6 +1511,7 @@ mod ready_backstop_tests {
     /// remember.
     struct Injected {
         _serialise: MutexGuard<'static, ()>,
+        generation: usize,
     }
 
     /// Serialises the readiness-injection tests against each other.
@@ -1502,8 +1535,10 @@ mod ready_backstop_tests {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(ms));
+            let generation = DEAF_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
             Self {
                 _serialise: serialise,
+                generation,
             }
         }
 
@@ -1514,6 +1549,11 @@ mod ready_backstop_tests {
 
         fn hold_ignores_shutdown_ms(self, ms: u64) -> Self {
             HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(ms));
+            self
+        }
+
+        fn force_ready_race(self) -> Self {
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(true));
             self
         }
 
@@ -1542,6 +1582,7 @@ mod ready_backstop_tests {
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(0));
             HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(usize::MAX));
             HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(0));
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(false));
             DELAY_WORKER_BEFORE_READY_MS.with(|cell| cell.set(0));
             READY_SLOW_YIELD_US.with(|cell| cell.set(0));
             READY_YIELDS.with(|cell| cell.set(0));
@@ -1667,21 +1708,48 @@ mod ready_backstop_tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "a 4s wall-clock stubbornness window against a 250ms deadline"
+        ignore = "leaves a deliberately deaf worker alive at exit, which Miri's remaining-threads check reports"
     )]
     fn an_abandoned_worker_that_ignores_shutdown_does_not_delay_the_builder() {
-        let injected = Injected::timeout_ms(250)
+        let injected = Injected::timeout_ms(PAIRED_DEADLINE_MS)
             .hold_worker(0)
-            .hold_ignores_shutdown_ms(4_000);
-        let started = Instant::now();
+            .hold_ignores_shutdown_ms(8_000);
         build_expecting_failure(3).expect_err("the injected hold must fail the build");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the constructor took {elapsed:?} against a 250ms deadline while a \
-             worker ignored shutdown for 4s, which is the signature of the \
-             abandon path joining the handles it must only drop"
+        assert_eq!(
+            DEAF_ENTERED_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the injected worker never reached its deaf window, so this test \
+             observed nothing about the abandon path"
         );
+        assert_ne!(
+            DEAF_LEFT_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the constructor returned only after the deaf worker finished, \
+             which is the signature of the abandon path joining the handles it \
+             must only drop"
+        );
+        drop(injected);
+    }
+
+    /// A worker that announces inside the deadline's race window must be kept,
+    /// not torn down.
+    ///
+    /// The barrier reads `ready` twice -- once in the loop condition, once
+    /// after the deadline fires -- so a worker can announce between them.
+    /// Without the re-read the pool is destroyed and the diagnostic says the
+    /// self-contradictory "N of N workers announced ... never became ready".
+    /// The knob publishes the announcement in exactly that window, which no
+    /// amount of timing could do reliably.
+    #[test]
+    fn a_worker_that_announces_in_the_race_window_is_not_torn_down() {
+        let injected = Injected::timeout_ms(50).hold_worker(0).force_ready_race();
+        let pool = TaskPool::new(3);
+        assert_eq!(
+            pool.width(),
+            3,
+            "a pool whose workers had all announced by the re-read was torn down"
+        );
+        drop(pool);
         drop(injected);
     }
 

@@ -43,6 +43,67 @@ thread_local! {
     /// readiness, or `usize::MAX` for none.
     pub(super) static HOLD_WORKER_BEFORE_READY: std::cell::Cell<usize> =
         const { std::cell::Cell::new(usize::MAX) };
+
+    /// Test injection: how long the held worker ignores the shutdown flag, in
+    /// milliseconds; `0` honours it immediately.
+    ///
+    /// The held worker parks on `shared.shutdown`, which the abandon path
+    /// sets, so it is *cooperative*: a `join()` restored to that path would
+    /// return promptly and leave the suite green while production -- against
+    /// the genuinely wedged worker this backstop exists for -- reintroduced
+    /// the unbounded wait. This knob models the worker that does not
+    /// cooperate, so the no-join contract has an oracle.
+    pub(super) static HOLD_WORKER_IGNORES_SHUTDOWN_MS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test injection of a *contended* yield, in microseconds; `0` yields
+    /// normally. The every-yield clock check is invisible when yields are
+    /// cheap: an uncontended `yield_now` costs ~1.2 us, so a stride of 64
+    /// moves the deadline by ~78 us and no assertion against a millisecond
+    /// deadline can see it. Injecting the yield *cost* makes the regime
+    /// deterministic without manufacturing real contention.
+    pub(super) static READY_SLOW_YIELD_US: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Counts the barrier's yields, so a test can discriminate an every-yield
+    /// clock check from a strided one by the count rather than by wall clock.
+    pub(super) static READY_YIELDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Test injection: on the first deadline expiry, publish `ready ==
+    /// worker_count` immediately before the barrier re-reads it, reproducing
+    /// the lost race the re-read exists to absorb.
+    pub(super) static FORCE_READY_RACE_AT_DEADLINE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Test observation of the held worker's deaf window, tagged by generation.
+///
+/// Generation-tagged rather than a pair of booleans because a held worker from
+/// an *earlier* test outlives the constructor that abandoned it: it is released
+/// by the shutdown store, but the store recording that it left runs on the
+/// worker's thread and can be descheduled past the next test's reset. Two
+/// booleans would then report the previous test's exit as this one's, which is
+/// a false failure that no amount of resetting can close. A generation only
+/// ever matches the test that issued it.
+#[cfg(test)]
+pub(super) static DEAF_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) static DEAF_ENTERED_GENERATION: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+pub(super) static DEAF_LEFT_GENERATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Yield the way the barrier does, counting it and optionally making it
+/// expensive. Free in production: the whole body is `#[cfg(test)]`.
+fn ready_yield() {
+    #[cfg(test)]
+    {
+        READY_YIELDS.with(|cell| cell.set(cell.get().saturating_add(1)));
+        let slow_us = READY_SLOW_YIELD_US.with(std::cell::Cell::get);
+        if slow_us > 0 {
+            thread::sleep(Duration::from_micros(slow_us));
+            return;
+        }
+    }
+    thread::yield_now();
 }
 
 /// Read on the builder thread, which is where the barrier runs.
@@ -178,6 +239,12 @@ impl WorkStealingThreadPool {
         // thread where it is always at its default.
         #[cfg(test)]
         let held_worker = HOLD_WORKER_BEFORE_READY.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let hold_ignores_shutdown_ms = HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let force_ready_race = FORCE_READY_RACE_AT_DEADLINE.with(std::cell::Cell::get);
+        #[cfg(test)]
+        let deaf_generation = DEAF_GENERATION.load(Ordering::SeqCst);
         for worker_id in 0..worker_count {
             let shared = Arc::clone(&shared);
             let queue_id = worker_id + 1;
@@ -191,9 +258,20 @@ impl WorkStealingThreadPool {
                             // `Arc<Shared>`, a tidier failure than the one being
                             // reproduced. The defect is a worker that exists,
                             // holds its share of the pool, and never announces.
-                            while !shared.shutdown.load(Ordering::Acquire) {
+                            //
+                            // `HOLD_WORKER_IGNORES_SHUTDOWN_MS` makes it deaf to
+                            // the shutdown flag for a bounded window first,
+                            // which is the only shape that can catch a `join()`
+                            // returning to the abandon path.
+                            let deaf_until =
+                                Instant::now() + Duration::from_millis(hold_ignores_shutdown_ms);
+                            DEAF_ENTERED_GENERATION.store(deaf_generation, Ordering::SeqCst);
+                            while !shared.shutdown.load(Ordering::Acquire)
+                                || Instant::now() < deaf_until
+                            {
                                 thread::sleep(Duration::from_millis(1));
                             }
+                            DEAF_LEFT_GENERATION.store(deaf_generation, Ordering::SeqCst);
                             return;
                         }
                         worker_loop(shared, queue_id);
@@ -222,12 +300,16 @@ impl WorkStealingThreadPool {
             if spins < SPIN_LOOP_BUDGET {
                 std::hint::spin_loop();
             } else {
-                thread::yield_now();
+                ready_yield();
                 // Every yield, not on a stride: a yield under contention costs
                 // microseconds to milliseconds, so a stride of N multiplies the
                 // deadline's granularity by N yields of an already-starved
                 // thread.
                 if ready_since.elapsed() >= pool_ready_timeout() {
+                    #[cfg(test)]
+                    if force_ready_race {
+                        shared.ready.store(worker_count, Ordering::Release);
+                    }
                     let ready = shared.ready.load(Ordering::Acquire);
                     // Two separate reads, so a worker can announce between
                     // them; accept that pool rather than tearing down a healthy
@@ -617,6 +699,7 @@ mod ready_backstop_tests {
     /// than left to each call site to remember.
     struct Injected {
         _serialise: MutexGuard<'static, ()>,
+        generation: usize,
     }
 
     impl Injected {
@@ -626,9 +709,35 @@ mod ready_backstop_tests {
                 .unwrap_or_else(|poison| poison.into_inner());
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(timeout_ms));
             HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(held));
+            let generation = DEAF_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
             Self {
                 _serialise: serialise,
+                generation,
             }
+        }
+
+        fn hold_ignores_shutdown_ms(self, ms: u64) -> Self {
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(ms));
+            self
+        }
+
+        fn slow_yield_us(self, us: u64) -> Self {
+            READY_SLOW_YIELD_US.with(|cell| cell.set(us));
+            self
+        }
+
+        fn force_ready_race(self) -> Self {
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(true));
+            self
+        }
+
+        fn reset_yields(self) -> Self {
+            READY_YIELDS.with(|cell| cell.set(0));
+            self
+        }
+
+        fn yields(&self) -> u64 {
+            READY_YIELDS.with(std::cell::Cell::get)
         }
     }
 
@@ -636,6 +745,10 @@ mod ready_backstop_tests {
         fn drop(&mut self) {
             POOL_READY_TIMEOUT_MS.with(|cell| cell.set(0));
             HOLD_WORKER_BEFORE_READY.with(|cell| cell.set(usize::MAX));
+            HOLD_WORKER_IGNORES_SHUTDOWN_MS.with(|cell| cell.set(0));
+            READY_SLOW_YIELD_US.with(|cell| cell.set(0));
+            READY_YIELDS.with(|cell| cell.set(0));
+            FORCE_READY_RACE_AT_DEADLINE.with(|cell| cell.set(false));
         }
     }
 
@@ -696,6 +809,98 @@ mod ready_backstop_tests {
             calls.fetch_add(end - begin, Ordering::Relaxed);
         });
         assert_eq!(calls.load(Ordering::Relaxed), 64);
+        drop(injected);
+    }
+
+    /// The deadline must be consulted on every yield, not on a stride.
+    ///
+    /// The discriminator is the yield *count*, not elapsed time. A wall-clock
+    /// bound has to sit above the healthy path and below the strided signature,
+    /// an interval contention can close from below -- at which point the test
+    /// either reds on the host or gets widened past the signature and silently
+    /// stops catching the stride. A stride of N cannot leave before its first
+    /// multiple of N, and a slow host only makes each yield cost *more* wall
+    /// clock, moving the count away from the failing value rather than towards
+    /// it.
+    #[test]
+    fn the_deadline_is_checked_on_every_yield_not_on_a_stride() {
+        let injected = Injected::new(100, 0).slow_yield_us(12_000).reset_yields();
+        WorkStealingThreadPool::new(3)
+            .err()
+            .expect("the injected hold must fail the build");
+        let yields = injected.yields();
+        assert!(
+            yields > 0,
+            "no yield happened, so the stride this test is about was never reached"
+        );
+        // `thread::sleep` is a floor, never early, so a correct barrier cannot
+        // exceed ceil(deadline / yield_cost) = ceil(100/12) = 9 yields on any
+        // host; a slower host makes each yield cost more and drives the count
+        // *down*. 3x that is a bound only a strided check can cross -- the
+        // sibling barrier's stride of 64 lands at 64-65 -- and it needs no
+        // stride constant of its own to state.
+        const PREDICTED_YIELDS: u64 = 9;
+        assert!(
+            yields <= 3 * PREDICTED_YIELDS,
+            "the barrier yielded {yields} times at 12ms per yield against a \
+             100ms deadline, more than 3x the {PREDICTED_YIELDS} an every-yield \
+             clock check can take, so it cannot have consulted the clock on each \
+             one; that is the signature of a strided check"
+        );
+        drop(injected);
+    }
+
+    /// The abandoned workers must not be joined, and a cooperative fault
+    /// cannot show that.
+    ///
+    /// The abandon path drops the handles unjoined on purpose: joining would
+    /// block on precisely the worker that is not coming. Every other test here
+    /// injects a worker that parks on `shared.shutdown` -- the same flag that
+    /// path sets -- so it *is* coming, and a restored `join()` would return
+    /// promptly and leave the suite green while production hung.
+    ///
+    /// The oracle is the worker's own deaf flag rather than elapsed time, so
+    /// there is no absolute threshold for a loaded or emulated host to breach:
+    /// correct code returns *during* the deaf window, a restored join returns
+    /// only after it closes, and both sides scale with the host.
+    #[test]
+    fn an_abandoned_worker_that_ignores_shutdown_does_not_delay_the_builder() {
+        let injected = Injected::new(PAIRED_DEADLINE_MS, 0).hold_ignores_shutdown_ms(8_000);
+        WorkStealingThreadPool::new(3)
+            .err()
+            .expect("the injected hold must fail the build");
+        assert_eq!(
+            DEAF_ENTERED_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the injected worker never reached its deaf window, so this test \
+             observed nothing about the abandon path"
+        );
+        assert_ne!(
+            DEAF_LEFT_GENERATION.load(Ordering::SeqCst),
+            injected.generation,
+            "the constructor returned only after the deaf worker finished, \
+             which is the signature of the abandon path joining the handles it \
+             must only drop"
+        );
+        drop(injected);
+    }
+
+    /// A worker that announces inside the deadline's race window must be kept,
+    /// not torn down.
+    ///
+    /// The barrier reads `ready` twice -- once in the loop condition, once
+    /// after the deadline fires -- so a worker can announce between them.
+    /// Without the re-read the pool is destroyed and the diagnostic says the
+    /// self-contradictory "N of N workers announced ... never became ready".
+    /// The knob publishes the announcement in exactly that window, which no
+    /// amount of timing could do reliably.
+    #[test]
+    fn a_worker_that_announces_in_the_race_window_is_not_torn_down() {
+        let injected = Injected::new(50, 0).force_ready_race();
+        let pool = WorkStealingThreadPool::new(3)
+            .expect("a pool whose workers all announced must not be torn down");
+        assert_eq!(pool.thread_count(), 3);
+        drop(pool);
         drop(injected);
     }
 }
