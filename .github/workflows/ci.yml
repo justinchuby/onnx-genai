@@ -407,6 +407,24 @@ jobs:
       - name: Verify workspace test package coverage
         run: python .github/scripts/workspace_test_packages.py verify
 
+      # `verify` above answers "is every crate in *some* lane", which stayed
+      # green all the while six crates sat in a lane no ruleset enforces. This
+      # answers the question that actually gates a merge: does a *required*
+      # status check run them. #1982 put a failing `shape_dispatch_gate` on
+      # `main` with both required checks green; #2015 is the general case.
+      - name: Verify every workspace crate is tested by a required lane
+        run: python .github/scripts/workspace_test_packages.py verify-required-tier
+
+      # Both gates above are the kind that pass by seeing nothing, so each one
+      # is asked to fail on demand and is judged on what it *names*, not on its
+      # exit status: `python` missing exits 127 and every SystemExit in that
+      # script exits 1, so a status alone cannot separate a verdict from a
+      # crash. The first draft of this step was a shell `if` and did exactly
+      # that -- it reported both gates as refusing while neither had run.
+      # `--simulate-missing` had shipped with no caller since it was written.
+      - name: Workspace test package gates can still detect (self-test)
+        run: python .github/scripts/workspace_test_packages.py self-test
+
       - name: Check the profile table matches the samples
         run: python3 scripts/check_profile_table.py
 
@@ -649,6 +667,35 @@ jobs:
           cargo clippy --locked --all-targets
           -p onnx-genai-engine -p onnx-genai-server
           -- -D warnings
+
+      # onnx-genai, -capi, -cli, -engine, -ort and -server were executed by no
+      # required status check: `Fast (Linux x86_64)` derives its set as
+      # everything *minus* these (they pull the ort-sys download), the test
+      # steps above are all `-p onnx-runtime-ep-cpu`, and `CLI ORT` -- the only
+      # lane that ran them -- is advisory. That is how #1982 landed a red
+      # `shape_dispatch_gate` on `main` with every required check green, and it
+      # left the server admission tests unenforced too. #2015.
+      #
+      # This is the same execution `CLI ORT (Linux x86_64)` used to perform,
+      # moved rather than duplicated: that step is now Windows-only, so the
+      # tests run on exactly the same platforms as before, one of them now
+      # under a check that can actually block a merge. The two clippy steps
+      # above already build this graph `--all-targets`, ORT download included,
+      # so what is added here is codegen, linking and the run itself.
+      #
+      # NXRT_REQUIRE_ORT_TESTS mirrors the `CLI ORT` job env. No test in these
+      # six crates reads it today; it is set so that the first one that does
+      # cannot silently skip here after passing there.
+      #
+      # Serialized for the reason the `CLI ORT` step was: several integration
+      # tests select sessions through process-wide environment variables.
+      - name: Test ORT-backed workspace crates
+        env:
+          NXRT_REQUIRE_ORT_TESTS: "1"
+        run: >-
+          cargo test --locked
+          $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
+          -- --test-threads=1
 
       # No shipped artifact links MLAS: the wheel builds it only when someone
       # opts in with NXRT_EP_CPU_RESEARCH_MLAS=1 on one of the platforms in
@@ -1059,7 +1106,13 @@ jobs:
       # here; adding a new ORT-backed crate means classifying it in the script.
       # Serialize because several integration tests temporarily select sessions
       # through process-wide environment variables.
+      #
+      # Linux only runs this in `Rust quality` now (#2015): this job is advisory,
+      # so while it was the sole executor a failure here could not block a merge.
+      # Windows has no required lane that builds the ORT graph at all, so this
+      # remains the only place these tests run on Windows and stays here.
       - name: Test ORT-backed workspace crates
+        if: runner.os == 'Windows'
         run: >-
           cargo test --locked
           $(python .github/scripts/workspace_test_packages.py cargo-args ort-backed)
