@@ -3241,14 +3241,39 @@ mask, the remainder is empty, and `leaders_within` returns it
 `i` to `cpus[i % len]` either way. Same set, same order, same pins: **#1729's
 placement change cannot move a number taken under this pin.**
 
-**The reserve half is not the identity, and it bites at exactly one width.**
-`reserve_single_group_headroom(total, allowed, cores)` with `allowed = cores =
-16` returns `total.min(15)`, so on this mask:
+**The reserve half is the identity on that mask too** — which is *not* what
+the first draft of this section said, and the correction is the whole reason it
+is worth writing down. #1729 did not introduce the dispatcher reserve; it
+changed the reserve from a **logical-CPU** rule to a **physical-core** rule.
+Pre-#1729 (`6e8c31ebd^`):
 
-| explicit width | workers pre-#1729 | workers post-#1729 |
-|---|---|---|
-| 1, 2, 4, 8 | 1, 2, 4, 8 | 1, 2, 4, 8 (unchanged) |
-| 16 | 16 | **15** + a free core for the inline dispatcher |
+```
+total < allowed_count ? total : allowed_count - 1
+```
+
+post-#1729, within the core budget:
+
+```
+min(total, core_count - 1).max(1)
+```
+
+On a one-CPU-per-core mask `allowed_count == core_count`, and there the two
+agree for **every** `total`: below saturation `min(total, allowed-1) == total`
+because `total <= allowed - 1`; at and above saturation both give
+`allowed - 1`. So the worker count is unchanged at every width, `t=16`
+included.
+
+The two rules diverge only when `allowed_count > core_count` — a mask holding
+both SMT siblings. That is precisely the unpinned configuration #1729 was
+written to fix (16 workers on 8 cores), and precisely the configuration this
+file's rows are not taken in.
+
+An earlier draft of this section claimed `t=16` went 16 workers -> 15 and
+therefore needed re-taking. That was wrong, and wrong in the characteristic
+way: the post-#1729 formula was read carefully and the pre-#1729 formula was
+*assumed* rather than fetched. Both give 15 under this pin. The lesson is the
+one this file keeps relearning — a delta needs both of its sides measured, and
+"the old code obviously did the naive thing" is not a measurement.
 
 **#1794 (`0652fdd2e`) does not touch these rows at all.** It fixed
 `default_persistent_threads` returning `available / 2`, which on a 16-CPU pin
@@ -3258,14 +3283,22 @@ default entirely. The rows this defect *did* corrupt are pinned runs that left
 the width to the default — of which this file has none, because the pin and the
 explicit width were adopted together in §24.
 
-So the disposition is narrow: **`t=8` and below survive unchanged; `t=16` does
-not.** And the `t=16` row was already withheld for an entirely independent
-reason — its A/A null spans 0.969-1.295 (+-30%) against 3.6% at `t=1` and 2.8%
-at `t=8`, so it was never claimed. That is the second time this week a figure
-has been retired by two unrelated arguments at once (the other being the "71%
-of one core" at `t=2`), and it is worth noticing that in both cases the
-*independent* reason arrived first. Re-taking `t=16` needs the dispatcher
-reserve held constant across arms, not just the pin.
+So the disposition is: **no row in this file taken under the even-CPU pin is
+moved by #1729 or #1794, at any width.** Both halves of #1729 are the identity
+on a one-CPU-per-core mask, and #1794's defect lived in a default these sweeps
+never used.
+
+That is a stronger claim than the one asked for, so it carries a stronger
+obligation: it holds *because* of the pin, and it says nothing about an
+unpinned row. Any number in this file that was not taken under the pin is
+governed by §24's standing rule instead — an unpinned multi-thread number on
+this host is measuring the scheduler, not the kernel — and is not rehabilitated
+by anything here.
+
+`t=16` remains withheld, for the reason it was always withheld and not for a
+placement reason: its A/A null spans 0.969-1.295 (+-30%) against 3.6% at `t=1`
+and 2.8% at `t=8`. The placement question and the instrument question are
+independent, and only the second one ever disqualified that row.
 
 **`t=2` is closed, by agreement between two methods that share no apparatus.**
 This file measured 20.447 ms/token at `=2` against 40.039 at `=1` — **1.96x**,
