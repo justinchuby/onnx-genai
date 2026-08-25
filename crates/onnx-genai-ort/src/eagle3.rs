@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::session_owner::OrtSessionOwner;
 use crate::{DataType, IoBinding, MemoryInfo, OrtError, Result, Session, TensorInfo, Value};
 
 /// Introspected EAGLE-3 draft-head graph signature.
@@ -79,7 +80,7 @@ struct Eagle3KvPair {
 
 /// Stateful runner for one EAGLE-3 draft-head forward at a time.
 pub struct Eagle3DecodeSession<'a> {
-    session: &'a Session,
+    session: OrtSessionOwner<'a>,
     binding: IoBinding<'a>,
     signature: Eagle3HeadSignature,
     mode: Eagle3DraftKvMode,
@@ -104,6 +105,22 @@ impl<'a> Eagle3DecodeSession<'a> {
 
     /// Create a stateful EAGLE-3 draft-head runner.
     pub fn new(session: &'a Session, options: Eagle3DecodeOptions) -> Result<Self> {
+        Self::new_with_owner(OrtSessionOwner::borrowed(session), options)
+    }
+
+    /// Create a stateful EAGLE-3 runner that co-owns a shared ORT session.
+    pub fn new_owned(
+        session: Arc<Session>,
+        options: Eagle3DecodeOptions,
+    ) -> Result<Eagle3DecodeSession<'static>> {
+        Eagle3DecodeSession::new_with_owner(OrtSessionOwner::shared(session), options)
+    }
+
+    fn new_with_owner(
+        session_owner: OrtSessionOwner<'a>,
+        options: Eagle3DecodeOptions,
+    ) -> Result<Self> {
+        let session = &*session_owner;
         let (signature, kv_pairs, io) = detect_eagle3_head(session)?.ok_or_else(|| {
             OrtError::InvalidArgument(
                 "model is not an EAGLE-3 head (needs inputs_embeds, fused_hidden, \
@@ -111,9 +128,10 @@ impl<'a> Eagle3DecodeSession<'a> {
                     .into(),
             )
         })?;
+        let binding = session_owner.binding()?;
         Ok(Self {
-            session,
-            binding: IoBinding::new(session)?,
+            session: session_owner,
+            binding,
             signature,
             mode: options.kv_mode,
             batch_size: options.batch_size,

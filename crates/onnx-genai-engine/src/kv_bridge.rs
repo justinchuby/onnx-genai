@@ -1109,7 +1109,7 @@ mod tests {
     use onnx_genai_kv::{KvCacheOps, MaterializedLayerKv};
     use onnx_genai_ort::{Environment, SessionOptions};
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     fn model_test_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1792,6 +1792,7 @@ mod tests {
             ),
         ] {
             let (_environment, session) = load_session(fixture_name)?;
+            let session = Arc::new(session);
             let io = fixture_io(fixture_name)?;
             let mut state = DecodeState::new_for_path_with_io(&session, &path, Some(&io))?;
             let mut cache = PagedKvCache::new(2, 8);
@@ -1826,6 +1827,7 @@ mod tests {
     fn windowed_past_present_keeps_absolute_positions_with_bounded_past() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
+        let session = Arc::new(session);
         let io = fixture_io("tiny-llm")?;
         let path = detect_model_decode_path(Some(&io), Some(2), 0, SharedKvOffer::default())?;
         assert!(matches!(
@@ -1864,6 +1866,7 @@ mod tests {
     fn windowed_past_present_pins_attention_sink_rows() -> anyhow::Result<()> {
         let _guard = model_test_lock();
         let (_environment, session) = load_session("tiny-llm")?;
+        let session = Arc::new(session);
         // window=2, sink=1 (StreamingLLM): retained buffer = 1 sink row + up to 2
         // window rows once the context exceeds sink + window.
         let path = ModelDecodePath::PastPresent {

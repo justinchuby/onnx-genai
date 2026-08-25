@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use onnx_genai_ort::{
-    Allocator, ConcurrentRunSupport, DataType, Environment, IoBinding, Session, SessionOptions,
+    Allocator, ConcurrentRunSupport, DataType, DecodeSession, DecodeSessionOptions,
+    Eagle3DecodeOptions, Eagle3DecodeSession, Environment, IoBinding, Session, SessionOptions,
     ThreadAccess, ThreadAffinity, Value,
 };
 
@@ -193,11 +194,108 @@ fn tiny_llm() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm/model.onnx.textproto")
 }
 
+fn tiny_llm_metadata() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-llm/inference_metadata.yaml")
+}
+
+fn tiny_eagle3() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/tiny-eagle3/model.onnx.textproto")
+}
+
 fn cpu_session() -> (Environment, Arc<Session>) {
     let environment = Environment::new("session-thread-contract").expect("ORT environment");
     let session = Session::new(&environment, &tiny_llm(), SessionOptions::default())
         .expect("tiny-llm CPU session");
     (environment, Arc::new(session))
+}
+
+#[test]
+fn a_shared_session_keeps_its_address_and_capability_when_its_holder_moves_and_clones() {
+    struct ModelResources {
+        session: Arc<Session>,
+    }
+
+    let (environment, session) = cpu_session();
+    let address = Arc::as_ptr(&session);
+    let concurrent_run_support = session.concurrent_run_support().clone();
+    let resources = ModelResources { session };
+    let moved = resources;
+    let cloned = Arc::clone(&moved.session);
+
+    assert_eq!(Arc::as_ptr(&moved.session), address);
+    assert_eq!(Arc::as_ptr(&cloned), address);
+    assert_eq!(
+        cloned.concurrent_run_support(),
+        concurrent_run_support,
+        "shared ownership must preserve the provider capability signal without enabling use"
+    );
+
+    drop(cloned);
+    drop(moved);
+    drop(environment);
+}
+
+#[test]
+fn an_owned_primary_decode_runner_keeps_its_session_alive() {
+    let (environment, session) = cpu_session();
+    let weak = Arc::downgrade(&session);
+    let metadata =
+        onnx_genai_metadata::load_metadata(&tiny_llm_metadata()).expect("tiny-llm metadata");
+    let io = metadata.decoder_io().expect("tiny-llm decoder ABI");
+    let mut runner = DecodeSession::new_owned_with_io(
+        Arc::clone(&session),
+        DecodeSessionOptions {
+            batch_size: 1,
+            max_length: None,
+            past_present_share_buffer: Some(false),
+        },
+        Some(io),
+    )
+    .expect("owned decode runner");
+
+    drop(session);
+    assert!(
+        weak.upgrade().is_some(),
+        "the runner and its binding must co-own the session"
+    );
+    let logits = runner
+        .step(&[1, 2, 3], &[1, 1, 1], &[0, 1, 2])
+        .expect("decode through the retained session");
+    drop(logits);
+    drop(runner);
+    assert!(
+        weak.upgrade().is_none(),
+        "the session must drop after the last derived/shared owner"
+    );
+    drop(environment);
+}
+
+#[test]
+fn an_owned_eagle_runner_keeps_its_session_alive() {
+    let environment = Environment::new("eagle-session-thread-contract").expect("ORT environment");
+    let session = Arc::new(
+        Session::new(&environment, &tiny_eagle3(), SessionOptions::default())
+            .expect("tiny EAGLE-3 session"),
+    );
+    let weak = Arc::downgrade(&session);
+    let runner =
+        Eagle3DecodeSession::new_owned(Arc::clone(&session), Eagle3DecodeOptions::default())
+            .expect("owned EAGLE-3 runner");
+
+    drop(session);
+    assert!(
+        weak.upgrade().is_some(),
+        "the EAGLE-3 runner and its binding must co-own the session"
+    );
+    assert_eq!(runner.signature().hidden_size, 16);
+    drop(runner);
+    assert!(
+        weak.upgrade().is_none(),
+        "the EAGLE-3 session must drop after its derived owners"
+    );
+    drop(environment);
 }
 
 #[test]
