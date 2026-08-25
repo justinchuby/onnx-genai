@@ -79,28 +79,44 @@ jobs:
   # not too large to read, but a single added line in a diff of hundreds, and the
   # root is exactly where `git add -A` in a working tree picks up scratch.
   #
-  # Six have reached `main`, found by walking every root path ever added and
-  # subtracting the ones still here (`git log --diff-filter=A --name-only`), rather
-  # than by collecting the ones somebody happened to report:
+  # Seven entries, in six incidents, found by walking every root path ever added
+  # and subtracting what is still here -- not by collecting what people reported:
   #
-  #   .msg.txt         39675330b  ~1.5h on main
-  #   .wa64.log        83a51bfa6   ~17h
-  #   .commitmsg/      faedea4d1    ~3m   <- a DIRECTORY, not a file
-  #   .commitmsg       #1881        ~37h  (removed by #1999)
-  #   .pris_v4.log     #1951        ~1.3h (removed by #1975)
-  #   .body.md         #2026        ~2.8h (removed by #2036)
+  #   .msg.txt       39675330b -> bbc193117    1.6h
+  #   .commitmsg/    faedea4d1 -> 490b846c3      3m   <- DIRECTORIES, one incident,
+  #   .goldens/      faedea4d1 -> 490b846c3      3m      "Remove accidentally
+  #                                                       tracked PR artifacts"
+  #   .wa64.log      83a51bfa6 -> c07acaa78   17.2h
+  #   .commitmsg     e42fa9470 -> 398cff8e5   19.8h   (#1881, removed by #1999)
+  #   .pris_v4.log   589d48ffd -> 7a6482c83    1.3h   (#1951, removed by #1975)
+  #   .body.md       79196f89d -> 54625db9d    2.7h   (#2026, removed by #2036)
+  #
+  # Deliberately excluded, because their removal commits say what they were:
+  # `site` (moved to onnx-genai-wiki, #1488), `third_party` (oneDNN backend
+  # removal) and `abresults` (added by a `docs(benchmarks):` commit that says it
+  # is recording a result, reconsidered 5.5 days later -- intentional when added,
+  # which is what separates it from the seven).
   #
   # Each repair added one more pattern to .gitignore, and each time the next name
-  # fell outside every pattern written for the previous one -- .body.md landed hours
-  # after two such fixes, and its intended name .pr-body.md was already ignored.
-  # Enumerating what belongs is the only form of this check that does not have to
-  # predict the next name.
+  # fell outside every pattern written for the previous one -- .body.md landed
+  # hours after two such fixes, and its intended name .pr-body.md was already
+  # ignored. Enumerating what belongs is the only form of this check that does not
+  # have to predict the next name.
   #
-  # This compares root *entries*, files and directories alike. #2036 compared files
-  # only, so `.commitmsg/m.txt` -- an instance its own header cited -- passed: the
-  # path has a separator, so it was filtered out as "not at the root". Naming an
-  # instance is not the same as testing its shape.
-  root-files:
+  # This compares root *entries* -- first path segments -- so files and
+  # directories alike are visible. #2036 compared files only, and so passed
+  # `.commitmsg/m.txt`: the path has a separator, so it was filtered out as "not
+  # at the root", while the thing actually at the root never appears in
+  # `ls-files` output at all. #2036's own header cited that instance. Naming an
+  # instance is not the same as testing its shape, and the walk that produced
+  # #2036's list had the identical blind spot -- it filtered to paths without a
+  # separator, so it could not report a stray directory either.
+  #
+  # The cost of comparing first segments: this sees root children only. Scratch
+  # dropped under an already-blessed directory (scripts/tmp/junk.log) is invisible
+  # to it. That is the correct trade -- the six incidents were all at the root --
+  # but "clean root" means the root's own entries, not the tree beneath them.
+    root-files:
     name: Root file allowlist
     runs-on: ubuntu-latest
     steps:
@@ -127,8 +143,10 @@ jobs:
           # octal-escaped, quoted form ("caf\303\251.txt"). Under the default a
           # contributor who adds the real name to the allowlist -- the documented way
           # to add a root entry -- is told both that their entry is unlisted and that
-          # their entry is stale. The escape hatch has to work for the names people
-          # actually use, not just for ASCII.
+          # their entry is stale. This covers UTF-8, which is what the escape hatch
+          # actually needs; a name containing a quote, backslash, tab or newline is
+          # still rendered in git's quoted form and would not match. Not worth
+          # handling, but the limit is real.
           actual=$(git -c core.quotePath=false ls-files | sed 's#/.*##' | LC_ALL=C sort -u)
 
           # Strip CR (a CRLF checkout would otherwise mismatch every entry), then
@@ -136,6 +154,19 @@ jobs:
           # an entry is invisible in review and would silently never match.
           allowed=$(sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$allow" \
                     | { grep -vE '^(#|$)' || true; } | LC_ALL=C sort)
+
+          # `actual` is deduplicated by `sort -u`, so the allowlist must be too.
+          # `comm` pairs line by line: an entry listed twice leaves one copy
+          # unpaired, which lands in the col-2-only column and is reported as
+          # "not present at the root" for a name that plainly is. Harmless --
+          # a duplicate can never suppress an unlisted entry -- but the message
+          # would be false, so name the real mistake instead.
+          dupes=$(printf '%s\n' "$allowed" | LC_ALL=C uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::warning::$allow lists the following more than once:"
+            printf '%s\n' "$dupes" | while IFS= read -r d; do echo "::warning::  $d"; done
+          fi
+          allowed=$(printf '%s\n' "$allowed" | LC_ALL=C uniq)
 
           # Explicit, rather than letting `set -e` abort on the empty grep above: an
           # empty list cannot express "the root is correct", and failing silently
@@ -157,7 +188,9 @@ jobs:
             rc=1
             echo "::error::Root-level entr(ies) not on the allowlist:"
             printf '%s\n' "$unlisted" | while IFS= read -r f; do
-              if [ -d "$f" ]; then
+              if [ -L "$f" ]; then
+                echo "::error::  $f    (symlink)"
+              elif [ -d "$f" ]; then
                 echo "::error::  $f/   (directory)"
               else
                 echo "::error::  $f"
