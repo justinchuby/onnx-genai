@@ -3991,10 +3991,13 @@ fn explicit_affinity_shards_for(
             if cpus.is_empty() {
                 return None;
             }
-            // Order through the same spread the default path uses. An explicit
-            // request selects *which* CPUs, never how workers are laid out
-            // across them; without this, `compact` would pin two workers per
-            // physical core and quietly reintroduce the defect #1729 fixed.
+            // Order through the same placement policy the default path uses. An
+            // explicit request selects *which* CPUs, never how workers are laid
+            // out across them; without this, `compact` (a NUMA-node selector)
+            // would inherit whatever ordering happened to be lying around and
+            // could quietly reintroduce the defect #1729 fixed. The layout
+            // itself is chosen by `ONNX_GENAI_CPU_DECODE_PLACEMENT`, which
+            // defaults to spread.
             let cores = crate::core_topology::host();
             let cpus = crate::decode_affinity::order_pin_targets(&cpus, cores);
             let core_count = cores.map_or(0, |cores| cores.leaders_within(&cpus).len());
@@ -4765,7 +4768,11 @@ mod tests {
             (0..8).map(|c| vec![c * 2, c * 2 + 1]),
         );
         let all: Vec<usize> = (0..16).collect();
-        let ordered = crate::decode_affinity::order_pin_targets(&all, Some(&synthetic));
+        let ordered = crate::decode_affinity::order_pin_targets_for(
+            &all,
+            Some(&synthetic),
+            crate::decode_affinity::CorePlacement::Spread,
+        );
         let mut leaders = synthetic.leaders_within(&all);
         leaders.sort_unstable();
         let mut first_eight: Vec<usize> = ordered.iter().take(8).copied().collect();
@@ -6191,9 +6198,10 @@ mod tests {
         }
         // Two full physical cores' worth of CPUs, spread the way the placement
         // policy spreads them.
-        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets_for(
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
+            crate::decode_affinity::CorePlacement::Spread,
         );
         let workers = cores.core_count().min(4);
         if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
@@ -6300,9 +6308,10 @@ mod tests {
             );
             return;
         }
-        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets_for(
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
+            crate::decode_affinity::CorePlacement::Spread,
         );
         let workers = cores.core_count().min(4);
         if !environment_can_pin(&cpus[..workers.min(cpus.len())]) {
@@ -6500,9 +6509,10 @@ mod tests {
         ) {
             return;
         }
-        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets(
+        let cpus: Vec<usize> = crate::decode_affinity::order_pin_targets_for(
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
+            crate::decode_affinity::CorePlacement::Spread,
         );
         let workers = cores.core_count().min(4).min(cpus.len());
         if workers < 2 {
@@ -7027,9 +7037,10 @@ mod tests {
         ) {
             return;
         }
-        let spread = crate::decode_affinity::order_pin_targets(
+        let spread = crate::decode_affinity::order_pin_targets_for(
             &(0..cores.logical_count()).collect::<Vec<_>>(),
             Some(cores),
+            crate::decode_affinity::CorePlacement::Spread,
         );
         if !environment_can_pin(&spread[..2]) {
             return;

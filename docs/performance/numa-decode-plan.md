@@ -69,6 +69,34 @@ Qwen2.5-Coder-7B int4, 32 decode threads, steady M=1, 5 runs x 3 rounds):
 jitter that makes the unpinned pool swing run to run. Greedy token ids are
 bit-identical with and without pinning (it only changes placement, not math).
 
+### Placement inside the chosen CPU set: `ONNX_GENAI_CPU_DECODE_PLACEMENT`
+
+`ONNX_GENAI_CPU_DECODE_AFFINITY` selects *which* CPUs the decode pool may use.
+`ONNX_GENAI_CPU_DECODE_PLACEMENT` selects how the workers are arranged inside
+that set. The two are orthogonal and can be combined.
+
+- unset / `spread` -- **default**. Worker `i` takes a distinct physical core for
+  as long as cores last, only then doubling up on SMT siblings. Fastest on a
+  host the process has to itself.
+- `compact` -- SMT siblings are filled before the next core is used, so an
+  N-worker pool occupies about `N / siblings` physical cores and leaves the rest
+  of the machine to a co-tenant.
+
+Neither is universally better, which is why it is a selector and not a constant.
+Measured with four DRAM-bandwidth hogs on a 16-core/32-thread host, `compact`
+ran 4.54 ms/token against `spread`'s 5.03--6.26; with eight hogs covering both
+halves the ranking inverts (`compact` 15.92 against `spread` 6.08). The full
+table is in `crates/onnx-runtime-ep-cpu/src/core_topology.rs`'s module docs.
+
+An unrecognized value is reported on stderr once and then treated as `spread`,
+rather than refusing to decode: unlike `ONNX_GENAI_CPU_DECODE_AFFINITY`, which
+decides which CPUs the process may touch, this knob only ranks a set already
+chosen, so a misspelling must not be fatal. It is never silent.
+
+Because the ordering is only a ranking of a permitted set, both values are
+permutations of the same CPU list: no placement policy can widen or shrink the
+CPUs a cgroup or `taskset` allows.
+
 Not yet implemented (steps 4--5, deferred): sharding a single projection across
 node-local replicas on both sockets. A naive dual-node pool regresses badly --
 a 64-thread pool spanning both sockets with interleaved memory measured
