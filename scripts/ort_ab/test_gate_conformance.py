@@ -41,7 +41,8 @@ recorded), for the reason written at `EP_SHELL_LEDGER`. The thirteen Rust
 `[[bench]]` targets in the same directory are still uncovered, deliberately
 and with the reason written down in the same place (#2129), because what must
 hold the lock for those is the `cargo bench` invocation rather than the
-source.
+source. Their *names* are pinned, so a fourteenth cannot arrive silently
+while none of the thirteen gates.
 
 Both lock idioms in the tree count as held: `hostlock_gate.require` in
 `scripts/ort_ab/`, and the `HostLock` context manager in `acc0_gap_matrix.py`
@@ -81,6 +82,7 @@ Run: `python3 scripts/ort_ab/test_gate_conformance.py`
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
 import re
 import subprocess
@@ -680,52 +682,263 @@ EP_SHELL_LEDGER: dict[str, str] = {
 SHELL_ACQUIRING = ("run", "acquire")
 
 
-def strip_shell_comments(source: str) -> str:
-    """Drop `#` comments, conservatively and in the fail-closed direction.
+# Words that may precede a command without making it an argument. `exec ./x`
+# and `TMPDIR=/x env ./x` are both still `./x` in command position; `echo ./x`
+# is not.
+SHELL_PREFIX_WORDS = frozenset(
+    {
+        "exec",
+        "command",
+        "builtin",
+        "sudo",
+        "env",
+        "time",
+        "nice",
+        "setsid",
+        "nohup",
+        # Keywords a command can follow directly.
+        "then",
+        "else",
+        "do",
+    }
+)
 
-    There is no shell parser to borrow, so this is an approximation and its
-    errors are chosen rather than accepted:
+# The heredoc operator, and only that. `(?<!<)` and `(?!<)` keep a `<<<`
+# herestring out, which would otherwise register a phantom heredoc whose
+# delimiter never arrives -- `hostlock.sh` and the test suites both use `<<<`.
+# `<<-` is captured rather than matched away, because the two forms terminate
+# differently: `<<` wants the delimiter alone on the line, `<<-` allows
+# leading **tabs** and nothing else.
+_HEREDOC = re.compile(r"(?<!<)(<<-?)(?!<)\s*(['\"]?)(\w+)")
 
-    * A `#` that is not at the start of a word is kept, so `${x#-}` and
-      `$#` survive intact and do not truncate the line.
-    * A `#` preceded by an odd number of `'` or `"` is kept, so a literal
-      `"# 1"` inside a string does not truncate it either.
-    * Anything this gets wrong truncates a line, which can only *lose* an
-      acquisition and therefore can only report a file as ungated. A file
-      this cannot read is a file it cannot certify, and the answer is a
-      ledger line, not a silent pass.
+# A quoted word directly after the operator is the delimiter -- `<<'EOF'` --
+# and is the one quoted region that has to survive into the heredoc scan.
+_HEREDOC_OPEN = re.compile(r"<<-?\s*$")
+
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# The script named as a word: optionally a path, bounded on the left by a
+# shell separator or a quote, so `my-hostlock.sh` is not a match and
+# `"$ROOT/scripts/hostlock.sh"` is.
+_MENTION = re.compile(
+    "(?:^|[\\s;|&(){}`\"'])((?:[^\\s;|&(){}`\"']*/)?hostlock\\.sh)\\b"
+)
+
+# Quotes and separators become whitespace when the *subcommand* is read, so
+# `hostlock.sh "run"` and `hostlock.sh acquire; done` both yield their verb.
+_TO_SPACE = str.maketrans({c: " " for c in "\"';|&(){}`"})
+
+# Characters after which a `#` starts a comment, and after which a word is in
+# command position. Both are the shell's own metacharacters plus whitespace.
+SHELL_SEPARATORS = " \t\n;|&(){}`"
+
+
+def _heredoc_body_end(source: str, start: int, dash: bool, delim: str) -> int | None:
+    """Where the body opened by `<<delim` ends, or None if it never does.
+
+    The terminator must be the delimiter **alone** on its line -- `<<-` also
+    allows leading tabs, and nothing else does. Matching it with `.strip()`
+    was fail-open: an indented `  EOF` inside the body ended the heredoc
+    early and exposed the rest of it as code, which for a usage block is
+    precisely the false custody this scanner exists to refuse.
+
+    Returning None for a delimiter that never arrives is deliberate, and it
+    is the fail-closed direction made cheap. A `<<` that is not a heredoc at
+    all -- `$(( 1 << k ))`, or one inside a construct this scanner does not
+    model -- would otherwise blank the whole rest of the file and lose a real
+    acquisition below it, reporting somebody else's gated harness as ungated.
     """
-    out = []
-    for line in source.splitlines():
-        cut = None
-        for i, ch in enumerate(line):
-            if ch != "#":
-                continue
-            if i and line[i - 1] not in " \t":
-                continue
-            if line[:i].count("'") % 2 or line[:i].count('"') % 2:
-                continue
-            cut = i
-            break
-        out.append(line if cut is None else line[:cut])
-    return "\n".join(out)
+    n = len(source)
+    probe = start
+    while probe < n:
+        end = source.find("\n", probe)
+        end = n if end < 0 else end
+        line = source[probe:end]
+        if (line.lstrip("\t") if dash else line) == delim:
+            return end
+        probe = end + 1
+    return None
+
+
+def strip_shell_comments(source: str) -> str:
+    """Blank out comments, heredoc bodies and multi-line quoted strings.
+
+    Blanked rather than deleted so that offsets and "the rest of this logical
+    line" survive. There is no shell parser in the standard library, so this
+    is a scanner rather than a parse, and what it is for is narrow: after it
+    runs, together with the command-position test in [`shell_holds_the_lock`],
+    a `hostlock.sh` left in the text is one the shell would actually execute
+    rather than one it would print.
+
+    The shapes it exists to remove are the ones that made the first version
+    of this **fail open**, which is the direction that matters here: a
+    categorical rule exempts whatever it reads as gated, so a false positive
+    is a silent pass with no ledger line -- the same "declaration with
+    nothing behind it" this whole check was written to end.
+
+      * `cat <<EOF ... hostlock.sh run ... EOF`, including `<<'EOF'` and
+        `<<-EOT` -- usage text is an entirely plausible thing for a bench
+        script to print, and it would have read as custody.
+      * `echo hi;# scripts/hostlock.sh run -- x`, `echo "it's x" # ...` and
+        `echo '"' # ...` -- real comments that the first version's
+        "preceded by a space, even quote count" heuristic kept.
+      * A quoted string spanning a newline. Its interior newlines are
+        replaced by **spaces** rather than kept, so what follows the closing
+        quote stays on the same logical line: with the newlines kept,
+        `printf 'a\\nuse: %s %s\\n' scripts/hostlock.sh run` put the trailing
+        arguments at the start of a line of their own, where they read as a
+        command. That was a fail-open, and it is why this is not simply
+        "blank the region".
+
+    Single-line quoted regions are kept verbatim, because a quoted word is
+    often the command itself -- `"$ROOT/scripts/hostlock.sh" run` -- and
+    blanking those would lose a real acquisition. Deciding between a quoted
+    *path* and quoted *prose* is the command-position test's job, not this
+    one's. `$'...'` processes `\\'`, and is scanned that way.
+
+    `${x#-}`, `$#` and `a#b` are not comments and survive intact, because a
+    `#` only opens one at the start of a word.
+
+    The heredoc scan runs over a **second** blanking of the same text in
+    which every quoted region is blanked, so `echo "x << 2"` cannot register
+    a heredoc; the sole exception is a quoted word directly after the
+    operator, which is the delimiter (`<<'EOF'`).
+
+    What it does not model, each with the direction it fails in:
+
+      * Deliberate indirection -- `eval`, a subcommand held in a variable, a
+        `$LOCK` alias. **Fail-open**, exactly as the Python side cannot see
+        `getattr(subprocess, "run")`, and not closable by reading source.
+      * A heredoc whose delimiter never arrives, i.e. a script the shell
+        would reject: its body is read as code. **Fail-open**, on a file
+        that does not run.
+      * `<<` that is not a heredoc, in a construct not modelled here, where
+        the shift's right-hand word later appears alone on a line.
+        **Fail-closed**, and it costs a ledger line rather than a pass.
+    """
+    out: list[str] = []
+    # A parallel copy in which *every* quoted region is blanked. `out` keeps
+    # single-line quotes because they are often the command path; the heredoc
+    # scan must not, or a `<<` inside a string opens a phantom body.
+    scan: list[str] = []
+    pending: list[tuple[bool, str]] = []
+    chunk = 0
+    i, n = 0, len(source)
+
+    def emit(text: str) -> None:
+        out.append(text)
+        scan.append(text)
+
+    def close_line() -> None:
+        """Blank the bodies of any heredocs the finished line opened."""
+        nonlocal i, chunk
+        for m in _HEREDOC.finditer("".join(scan[chunk:])):
+            pending.append((m.group(1).endswith("-"), m.group(3)))
+        i += 1
+        while pending and i < n:
+            dash, delim = pending.pop(0)
+            end = _heredoc_body_end(source, i, dash, delim)
+            if end is None:
+                pending.clear()
+                break
+            emit("".join(c if c == "\n" else " " for c in source[i:end]))
+            i = end
+            if i < n:
+                emit("\n")
+                i += 1
+        chunk = len(out)
+
+    while i < n:
+        ch = source[i]
+        if ch == "\\" and i + 1 < n:
+            emit(source[i : i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            # `$'...'` is the one single-quoted form that processes `\'`.
+            escapes = ch == '"' or source[i - 1 : i] == "$"
+            close = i + 1
+            while close < n and source[close] != ch:
+                close += 2 if (escapes and source[close] == "\\") else 1
+            close = min(close, n - 1)
+            region = source[i : close + 1]
+            if "\n" in region:
+                out.append(" " * len(region))
+            else:
+                out.append(region)
+            scan.append(
+                region
+                if _HEREDOC_OPEN.search(source[max(0, i - 8) : i])
+                else " " * len(region)
+            )
+            i = close + 1
+            continue
+        if ch == "#" and (i == 0 or source[i - 1] in SHELL_SEPARATORS):
+            end = source.find("\n", i)
+            end = n if end < 0 else end
+            emit(" " * (end - i))
+            i = end
+            continue
+        if ch == "\n":
+            emit("\n")
+            close_line()
+            continue
+        emit(ch)
+        i += 1
+    return "".join(out)
+
+
+def _in_command_position(line: str, start: int) -> bool:
+    """Is the word beginning at `start` the command, not one of its arguments?
+
+    Walks left over whitespace, over the prefix words that keep a command a
+    command (`exec`, `env`, ...) and over `VAR=value` assignments. Anything
+    else in front of it -- `echo`, `printf`, a `--reason` -- means the name
+    is being *mentioned*, not run.
+    """
+    head = line[:start]
+    while True:
+        stripped = head.rstrip().rstrip("\"'")
+        if stripped != head:
+            head = stripped
+            continue
+        if not head or head[-1] in ";|&(){}`":
+            return True
+        word = head.rsplit(None, 1)[-1] if head.split() else ""
+        if word in SHELL_PREFIX_WORDS or _ASSIGNMENT.match(word):
+            head = head[: len(head) - len(word)]
+            continue
+        return False
 
 
 def shell_holds_the_lock(source: str) -> bool:
-    """The script invokes `scripts/hostlock.sh` with an acquiring subcommand.
+    """The script *runs* `scripts/hostlock.sh` with an acquiring subcommand.
 
-    Keyed on the *subcommand*, which is the word after the script name, so
-    `hostlock.sh status` in a progress message does not count as custody. The
-    remainder of the file is searched rather than the remainder of the line,
-    which is what makes a backslash line continuation work: the subcommand is
-    the first word after the name wherever it lands.
+    Three conditions, and each one is a defect that was found rather than
+    imagined:
+
+    * The name survives comment/string/heredoc blanking, so usage text that
+      tells the reader to run under the lock is not custody (fail-open).
+    * The name is in command position, so `echo scripts/hostlock.sh` and
+      `LOCK=scripts/hostlock.sh` are not custody either (fail-open).
+    * The subcommand -- the next word **on the same logical line** -- is one
+      that takes the lock. `status`, `provenance`, `wait` and `release` all
+      name it without claiming the host (#2106's lesson), and reading past
+      the end of the line let an unrelated `run` on the next line count.
+
+    Line continuations are joined first, so a backslash before the
+    subcommand is still the same logical line.
     """
-    code = strip_shell_comments(source).replace("\\\n", " ")
-    for m in re.finditer(r"hostlock\.sh\b", code):
-        rest = code[m.end() :].replace('"', " ").replace("'", " ")
-        word = next(iter(rest.split()), "")
-        if word in SHELL_ACQUIRING:
-            return True
+    code = strip_shell_comments(source).replace("\\\n", "  ")
+    for line in code.splitlines():
+        for m in re.finditer(_MENTION, line):
+            start = m.start(1)
+            if not _in_command_position(line, start):
+                continue
+            rest = line[m.end(1) :].translate(_TO_SPACE)
+            word = next(iter(rest.split()), "")
+            if word in SHELL_ACQUIRING:
+                return True
     return False
 
 
@@ -789,6 +1002,58 @@ def stale_shell_records(
                 "delete the record"
             )
     return out
+
+
+# The third language in that directory, and the one this file does not yet
+# check: thirteen `[[bench]]` targets in `crates/onnx-runtime-ep-cpu/`.
+# Deferred to #2129 rather than bodged, because what must hold the lock for a
+# Rust bench is the `cargo bench` *invocation* -- the source has no process
+# boundary to wrap, and `cargo bench -p onnx-runtime-ep-cpu` (the headline
+# line in that directory's README) runs all thirteen back to back.
+#
+# Pinning the name set is not a substitute for gating them. It is the cheap
+# half: while #2129 is open, adding a Rust bench fails here, so the decision
+# to leave it uncovered is taken consciously by whoever adds it instead of
+# defaulting to silence -- which is the exact way `decode_gap_park_ab` came to
+# be one of the three processes in the collision that motivated #1803.
+EP_RUST_UNCOVERED = frozenset(
+    {
+        "activation_bench",
+        "decode_gap_park_ab",
+        "gqa_decode",
+        "half_decode_gemv_ab",
+        "half_prefill_route_ab",
+        "int4_acc0_attribution",
+        "int4_decode_loop_ab",
+        "int4_prefill_route_ab",
+        "int8_prefill_route_ab",
+        "kernels",
+        "matmul_nbits_prefill_ab",
+        "native_vs_mlas",
+        "sdpa_simd",
+    }
+)
+
+_BENCH_NAME = re.compile(r"""^\s*name\s*=\s*['"]([^'"]+)['"]""")
+
+
+@functools.lru_cache(maxsize=1)
+def ep_rust_benches() -> frozenset[str]:
+    """`[[bench]]` target names in the EP crate's manifest."""
+    manifest = EP_BENCHES.parent / "Cargo.toml"
+    names, in_bench = set(), False
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            # `[ [bench] ]` is legal TOML and would otherwise read as a
+            # different table, silently dropping its target from the pin.
+            in_bench = "".join(stripped.split()) == "[[bench]]"
+            continue
+        if in_bench:
+            found = _BENCH_NAME.match(line)
+            if found:
+                names.add(found.group(1))
+    return frozenset(names)
 
 
 def declared_roles(
@@ -1611,22 +1876,51 @@ class EpShellHarnesses(unittest.TestCase):
         self.assertNotIn("decode_placement_census.sh", EP_SHELL_LEDGER)
 
     def test_the_census_takes_it_once_around_every_arm(self):
-        # #1803's property, checked structurally as far as shell allows: the
-        # acquisition must not sit inside `run()`, which is called three
-        # times. A lock taken per arm is released between them, which is the
-        # window a peer sampled the host in and read it as clear.
+        # #1803's property as far as reading the file can pin it: exactly one
+        # *acquiring* invocation, and it precedes the definition of `run()`
+        # and all of its calls. A lock taken per arm is released between
+        # them, which is the window a peer sampled the host in and read it as
+        # clear.
+        #
+        # Positional, and deliberately not sold as more: what actually holds
+        # the lock across all three arms is the whole-script re-exec, and the
+        # run-time half of the same question is the `host_lock` column on an
+        # emitted row. `taken` counts acquisitions rather than mentions, so
+        # switching the census to `hostlock.sh status` fails here as well as
+        # in the cell above.
         lines = strip_shell_comments(
             ep_shell_sources()["decode_placement_census.sh"]
         ).splitlines()
-        taken = [i for i, ln in enumerate(lines) if "hostlock.sh" in ln]
+        taken = [i for i, ln in enumerate(lines) if shell_holds_the_lock(ln)]
         self.assertEqual(len(taken), 1, taken)
-        arms = [
-            i
-            for i, ln in enumerate(lines)
-            if re.match(r"\s*run\s*(\(\)|\")", ln)
-        ]
-        self.assertEqual(len(arms), 4, arms)  # the definition and three calls
-        self.assertLess(taken[0], min(arms))
+        defined = [i for i, ln in enumerate(lines) if re.match(r"\s*run\s*\(\)", ln)]
+        called = [i for i, ln in enumerate(lines) if re.match(r'\s*run\s+"', ln)]
+        self.assertEqual(len(defined), 1, defined)
+        self.assertGreaterEqual(len(called), 3, called)
+        self.assertLess(taken[0], min(defined + called))
+
+    def test_the_census_decides_by_custody_not_by_an_inherited_variable(self):
+        # Review of this file found the re-exec guarded by an exported
+        # sentinel. A sentinel is an ordinary inheritable variable: any
+        # unrelated ancestor exporting that name sends the census through
+        # three saturating pool launches with **no lock at all**, silently --
+        # #1803's hazard wearing the costume of the fix for it.
+        #
+        # So the guard reads custody instead: the holder pid from the lock
+        # itself, walked against this process's own ancestry. Asserted here
+        # by mechanism rather than by outcome, because the outcome (it ran
+        # once, it acquired once) is identical either way -- which is exactly
+        # why the defect survived a working end-to-end run.
+        source = ep_shell_sources()["decode_placement_census.sh"]
+        code = strip_shell_comments(source)
+        self.assertIn("hostlock.sh status", code)
+        self.assertIn("/proc/$1/stat", code)
+        self.assertRegex(code, r"\bHELD by\b")
+        self.assertNotIn("HOSTLOCK_CENSUS_HELD", code)
+        # And the ancestry walk has to be a walk: a single `$PPID` compare
+        # is wrong the moment the lock is held by a grandparent, which is
+        # the normal case under `hostlock.sh run` inside another harness.
+        self.assertRegex(code, r"while \[.*\$_p.*\]")
 
     def test_a_new_ungated_shell_harness_there_is_a_failure(self):
         fail = ep_shell_failures({"knee.sh": "#!/bin/sh\ncargo bench --bench x\n"})
@@ -1648,7 +1942,12 @@ class EpShellHarnesses(unittest.TestCase):
             self.assertIn("acc0_shell_tmp/sweep.sh", fail[0])
         finally:
             planted.unlink(missing_ok=True)
-            planted.parent.rmdir()
+            # Suppressed: if the body raised, `rmdir` raising here would
+            # replace the real failure with a directory-not-empty error and
+            # the diagnosis would start in the wrong place. An empty stray
+            # directory is inert -- `ep_shell_sources` globs `*.sh`.
+            with contextlib.suppress(OSError):
+                planted.parent.rmdir()
 
     def test_naming_the_script_is_not_holding_the_lock(self):
         # The #2106 defect, in the other direction: a substring check for
@@ -1667,18 +1966,116 @@ class EpShellHarnesses(unittest.TestCase):
     def test_a_commented_out_acquisition_does_not_count(self):
         # The exact shape of the defect this class was written for: the claim
         # lived in a comment and the call did not exist.
+        #
+        # The last three are the shapes the first version of the stripper got
+        # **wrong**, each of them fail-open -- a real comment read as custody,
+        # which under a categorical rule is a silent exemption with no ledger
+        # line. They are here rather than in a note because a documented
+        # weakness that no cell exercises is a weakness that comes back.
         for line in (
             "# it runs under scripts/hostlock.sh run as a courtesy\n",
             "  # ./scripts/hostlock.sh acquire --wait\n",
             "echo hi  # scripts/hostlock.sh run -- x\n",
+            "echo hi;# scripts/hostlock.sh run -- x\n",
+            "echo \"it's fine\"  # scripts/hostlock.sh run -- x\n",
+            "echo '\"'  # scripts/hostlock.sh run -- x\n",
+            # A comment containing a separator ahead of the mention. Found by
+            # mutation: with the word-start rule weakened to whitespace only,
+            # the `;` inside the comment reads as command position and the
+            # line certifies the file.
+            "echo hi;# see; ./scripts/hostlock.sh run -- x\n",
         ):
             self.assertFalse(shell_holds_the_lock(line), line)
 
+    def test_printing_the_recipe_is_not_running_it(self):
+        # Usage text telling the reader to run under the lock is the single
+        # most plausible false positive in a bench directory, and it is the
+        # census's own defect one syntactic layer up: a declaration with
+        # nothing behind it.
+        #
+        # The last three came from review of this file, and each was a live
+        # fail-open: a multi-line quoted argument whose interior newline put
+        # the following *arguments* at the start of a line, where they read
+        # as a command; and a heredoc ended early by an indented
+        # delimiter-lookalike, which real `sh` does not treat as a
+        # terminator (`<<-` strips tabs, and nothing strips spaces).
+        for source in (
+            'usage(){ echo "run under: scripts/hostlock.sh run -- $0"; }\n',
+            'echo see scripts/hostlock.sh run\n',
+            'printf "%s\\n" "scripts/hostlock.sh run -- x"\n',
+            'cat <<EOF\nrun it under scripts/hostlock.sh run -- x\nEOF\n',
+            "cat <<'EOF'\nscripts/hostlock.sh run -- x\nEOF\n",
+            "cat <<-EOT\n\tscripts/hostlock.sh acquire\n\tEOT\n",
+            'echo "\nscripts/hostlock.sh run -- x"\n',
+            "printf 'intro\\ninvoke: %s %s\\n' scripts/hostlock.sh run\n",
+            'echo "a\nb" ./scripts/hostlock.sh run\n',
+            "cat <<EOF\n  EOF\n./scripts/hostlock.sh run -- x\nEOF\n",
+        ):
+            self.assertFalse(shell_holds_the_lock(source), source)
+
+    def test_a_run_below_something_that_is_not_a_heredoc_still_counts(self):
+        # The other direction of the same machinery, and the one that costs
+        # somebody else a false ledger line in their lane -- which is how a
+        # conformance check gets deleted rather than obeyed.
+        #
+        # Each of these has a `<<` that is not a heredoc operator, or a quote
+        # that is not what it looks like, followed by a real acquisition. The
+        # first version blanked everything below the `<<` to end of file and
+        # reported all four as ungated. `hostlock.sh` itself uses `<<<`.
+        for source in (
+            "n=$(( 1 << k ))\n./scripts/hostlock.sh run -- x\n",
+            "# shift << bits\n./scripts/hostlock.sh run -- x\n",
+            'echo "x << 2"\n./scripts/hostlock.sh run -- x\n',
+            "cat <<<word\n./scripts/hostlock.sh run -- x\n",
+            "msg=$'can\\'t'\n./scripts/hostlock.sh run -- x\n",
+            "cat <<EOF\nhello\nEOF\n./scripts/hostlock.sh run -- x\n",
+            # The last two discriminate the two *narrower* guards from the
+            # broad one above them: excluding `<<<`, and running the heredoc
+            # scan over a copy in which quoted regions are blanked. Both are
+            # defence in depth -- with only the "a delimiter that never
+            # arrives blanks nothing" rule, a phantom heredoc is harmless
+            # until some later line happens to equal its delimiter, which is
+            # what these two supply. Contrived inputs, deliberately: the
+            # mechanism is what is being pinned, and a guard no cell can
+            # distinguish is a guard that gets deleted as dead weight.
+            "cat <<<word\n./scripts/hostlock.sh run -- x\nword\n",
+            'echo "x << 2"\n./scripts/hostlock.sh run -- x\n2\n',
+        ):
+            self.assertTrue(shell_holds_the_lock(source), source)
+
+    def test_naming_the_path_is_not_running_it(self):
+        # `LOCK=scripts/hostlock.sh` assigns a path and runs nothing. The
+        # subcommand is read from the same logical line for exactly this
+        # reason: scanning to the end of the file let an unrelated `run` two
+        # lines down certify the file.
+        self.assertFalse(shell_holds_the_lock("LOCK=scripts/hostlock.sh\nrun --foo\n"))
+        self.assertFalse(shell_holds_the_lock("./my-hostlock.sh run -- x\n"))
+        # A differently-named wrapper *in* an assignment. Found by mutation:
+        # command position alone accepts this one, because `LOCK=./my-` parses
+        # as an assignment and clears the head -- so the left boundary on the
+        # match is load-bearing here rather than decorative.
+        self.assertFalse(shell_holds_the_lock("LOCK=./my-hostlock.sh run -- x\n"))
+
     def test_a_quoted_path_or_a_continuation_still_counts(self):
+        # The other direction, and the reason single-line quoted regions are
+        # kept rather than blanked: a quoted word is very often the command.
         for source in (
             '"$REPO/scripts/hostlock.sh" run --reason x -- ./bench\n',
+            'exec "$ROOT/scripts/hostlock.sh" run --wait -- "$@"\n',
             "./scripts/hostlock.sh \\\n  run \\\n  --wait -- ./bench\n",
             "exec ./scripts/hostlock.sh 'run' --wait -- \"$SELF\"\n",
+            "TMPDIR=/x env ./scripts/hostlock.sh acquire --wait\n",
+            "if true; then ./scripts/hostlock.sh run -- x; fi\n",
+            "for a in 1 2; do ./scripts/hostlock.sh acquire; done\n",
+            "cmd && ./scripts/hostlock.sh run -- x\n",
+            # Every separator in the command-position set, because a mutant
+            # deleting `|`, `(`, `{` or a backtick from it survived the
+            # battery: nothing else here reaches those branches.
+            "foo | ./scripts/hostlock.sh run -- x\n",
+            "( ./scripts/hostlock.sh run -- x )\n",
+            "{ ./scripts/hostlock.sh acquire; }\n",
+            "v=`./scripts/hostlock.sh run -- x`\n",
+            "case $x in a) ./scripts/hostlock.sh run -- y ;; esac\n",
         ):
             self.assertTrue(shell_holds_the_lock(source), source)
 
@@ -1716,14 +2113,33 @@ class EpShellHarnesses(unittest.TestCase):
         )
 
     def test_the_readme_says_what_is_true_of_these_two_files(self):
-        # The doc names both files and states opposite things about them. A
-        # doc claim nothing checks is the defect this class was written for,
-        # so if either file changes side the paragraph fails with it.
+        # The doc names both files and states opposite things about them:
+        # one gates, one is recorded. Asserting only that both names appear
+        # would pass with the two descriptions **swapped**, which is the doc
+        # drifting into fiction -- the failure this class exists for. So the
+        # claim is read out of the sentence each name sits in.
         doc = (ORT_AB / "README.md").read_text()
         sources = ep_shell_sources()
-        self.assertIn("decode_placement_census.sh", doc)
+
+        def sentence(name: str) -> str:
+            at = doc.index(name)
+            start = max(doc.rfind(". ", 0, at), doc.rfind("\n\n", 0, at)) + 1
+            end = doc.find(". ", at + len(name))
+            text = doc[start : end if end > 0 else len(doc)].lower()
+            # Emphasis and line wrapping are formatting, not claims: `**takes
+            # the lock**` split across two lines is the same sentence.
+            return " ".join(text.replace("*", "").replace("`", "").split())
+
+        census = sentence("decode_placement_census.sh")
+        # "takes the lock", not the bare token `lock` -- which "hostlock.sh"
+        # contains, so the weaker assertion held even for a sentence saying
+        # the opposite.
+        self.assertIn("takes the lock", census)
+        self.assertNotIn("known-gap", census)
         self.assertTrue(shell_holds_the_lock(sources["decode_placement_census.sh"]))
-        self.assertIn("int4_modulo_arms.sh", doc)
+
+        modulo = sentence("int4_modulo_arms.sh")
+        self.assertIn("known-gap", modulo)
         self.assertTrue(EP_SHELL_LEDGER["int4_modulo_arms.sh"].startswith(EP_GAP))
         self.assertFalse(shell_holds_the_lock(sources["int4_modulo_arms.sh"]))
 
@@ -1738,6 +2154,45 @@ class EpShellHarnesses(unittest.TestCase):
         fail = stale_shell_records(gated, {"g.sh": "known-gap:#1 - x"})
         self.assertEqual(len(fail), 1)
         self.assertIn("delete the record", fail[0])
+
+
+class EpRustBenches(unittest.TestCase):
+    """The third language, pinned rather than gated, while #2129 is open."""
+
+    def test_the_rust_bench_set_is_the_one_that_was_deferred(self):
+        # The whole value is in the failure: this cell exists so that adding
+        # a fourteenth `[[bench]]` cannot happen silently while none of the
+        # thirteen takes the lock.
+        found = ep_rust_benches()
+        self.assertEqual(
+            found,
+            EP_RUST_UNCOVERED,
+            "the EP crate's [[bench]] set moved -- gate the new target's "
+            "`cargo bench` invocation under scripts/hostlock.sh, or add it "
+            "here and say why on #2129",
+        )
+
+    def test_the_pin_is_not_vacuous(self):
+        # Two ways this could pass while reading nothing: an empty manifest
+        # parse compared against an empty constant, and a parser that finds
+        # `name` keys outside `[[bench]]`. So: a live non-empty assertion,
+        # the two targets named in the incident reports, and a negative --
+        # the crate's `[package] name` must not leak in.
+        found = ep_rust_benches()
+        self.assertGreaterEqual(len(found), 13)
+        self.assertIn("decode_gap_park_ab", found)
+        self.assertIn("native_vs_mlas", found)
+        self.assertNotIn("onnx-runtime-ep-cpu", found)
+
+    def test_every_pinned_bench_has_a_source_file(self):
+        # A stale pin is the shell ledger's dead record in another form: a
+        # name kept here after its target was deleted still passes the set
+        # comparison only if the manifest kept it too, but a `#[bench]` whose
+        # file is gone is a manifest that will not build. Cheap to state.
+        for name in sorted(ep_rust_benches()):
+            self.assertTrue(
+                (EP_BENCHES / f"{name}.rs").exists(), f"{name}.rs is missing"
+            )
 
 
 class Staleness(unittest.TestCase):
