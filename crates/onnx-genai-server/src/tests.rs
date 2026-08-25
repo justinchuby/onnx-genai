@@ -2594,17 +2594,18 @@ async fn native_driver_sessions_generate_through_server_path() {
     )
     .unwrap();
     let driver = EngineDriver::start(engine, 2, 4);
-    let session_id = driver.create_session().await.unwrap();
+    let session = driver.create_session().await.unwrap();
+    let leases = crate::lease::SessionLeases::with_shards(1);
+    let lease = leases
+        .acquire(driver.binding(session), "sess-native")
+        .expect("an idle session is leasable");
 
     let mut request =
         onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
     request.options.max_new_tokens = 2;
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
-    let generation = driver
-        .generate(Some(session_id), request, None)
-        .await
-        .unwrap();
+    let generation = driver.generate(Some(lease), request, None).await.unwrap();
     let result = timeout(
         Duration::from_secs(5),
         collect_generation_result(generation.events),
@@ -2614,8 +2615,11 @@ async fn native_driver_sessions_generate_through_server_path() {
     .expect("native session generation failed");
 
     assert_eq!(result.token_ids, vec![1, 1]);
-    assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
-    driver.close_session(session_id).await.unwrap();
+    assert_eq!(driver.session_token_count(session).await.unwrap(), 3);
+    let lease = leases
+        .acquire(driver.binding(session), "sess-native")
+        .expect("the finished turn released its lease");
+    driver.close_session(lease).await.unwrap();
 }
 
 // ── KV cache dtype CLI/env surface tests ─────────────────────────────────────
