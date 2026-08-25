@@ -130,6 +130,9 @@ pub use kernels::group_query_attention::{
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSITION;
+pub use kernels::non_max_suppression::{
+    NmsExecutionStats, nms_execution_stats, reset_nms_execution_stats,
+};
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::stft::{StftExecutionStats, stft_last_execution_stats};
 pub use kernels::unique::{

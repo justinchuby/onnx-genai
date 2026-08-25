@@ -1,0 +1,30 @@
+ir_version: 11
+graph {
+  node: [{
+    input: ["boxes", "scores", "max_output", "iou_threshold", "score_threshold"]
+    output: ["selected_indices"]
+    op_type: "NonMaxSuppression"
+  }]
+  name: "nms_device_workspace"
+  input: [{
+    name: "boxes"
+    type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 1 }, { dim_value: 3 }, { dim_value: 4 }] } } }
+  }, {
+    name: "scores"
+    type { tensor_type { elem_type: 1 shape { dim: [{ dim_value: 1 }, { dim_value: 2 }, { dim_value: 3 }] } } }
+  }, {
+    name: "max_output"
+    type { tensor_type { elem_type: 7 shape {} } }
+  }, {
+    name: "iou_threshold"
+    type { tensor_type { elem_type: 1 shape {} } }
+  }, {
+    name: "score_threshold"
+    type { tensor_type { elem_type: 1 shape {} } }
+  }]
+  output: [{
+    name: "selected_indices"
+    type { tensor_type { elem_type: 7 shape { dim: [{}, { dim_value: 3 }] } } }
+  }]
+}
+opset_import: [{ version: 24 }]

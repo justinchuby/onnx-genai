@@ -397,6 +397,48 @@ pub extern "C" fn nxrt_ep_unique_workspace_bytes() -> u64 {
     onnx_runtime_ep_cuda::unique_execution_stats().workspace_bytes
 }
 
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_reset_nms_execution_stats() {
+    onnx_runtime_ep_cuda::reset_nms_execution_stats()
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_prepare_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().prepare_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_count_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().count_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_materialize_launches() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().materialize_launches
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_full_input_d2h_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().full_input_d2h_bytes
+}
+
+#[cfg(feature = "cuda")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nxrt_ep_nms_workspace_bytes() -> u64 {
+    onnx_runtime_ep_cuda::nms_execution_stats().workspace_bytes
+}
+
 /// Number of workspace **placement resolutions** since the last reset.
 ///
 /// One resolution happens per served `StepScoped` workspace and nowhere else: a
