@@ -2610,6 +2610,7 @@ async fn native_driver_sessions_generate_through_server_path() {
     )
     .unwrap();
     let session_id = driver.create_session().await.unwrap();
+    let leases = crate::lease::SessionLeases::with_shards(1);
 
     let mut request =
         onnx_genai::GenerateRequest::new(onnx_genai::GeneratePrompt::TokenIds(vec![0]));
@@ -2617,7 +2618,15 @@ async fn native_driver_sessions_generate_through_server_path() {
     request.options.temperature = 0.0;
     request.options.stop_on_eos = false;
     let generation = driver
-        .generate(Some(session_id), request, None)
+        .generate(
+            Some(
+                leases
+                    .acquire(driver.binding(session_id), "native-session")
+                    .expect("a session with no turn in flight is leasable"),
+            ),
+            request,
+            None,
+        )
         .await
         .unwrap();
     let result = timeout(
@@ -2630,7 +2639,23 @@ async fn native_driver_sessions_generate_through_server_path() {
 
     assert_eq!(result.token_ids, vec![1, 1]);
     assert_eq!(driver.session_token_count(session_id).await.unwrap(), 3);
-    driver.close_session(session_id).await.unwrap();
+    // The route that holds the turn's lease is dropped by the driver *after*
+    // it sends `Finished`, so a returned result does not by itself imply a
+    // released lease — it only implies the release is imminent. Poll rather
+    // than assume: this still fails if the release never happens, without
+    // racing the driver thread when it does.
+    let mut lease = None;
+    for _ in 0..200 {
+        match leases.acquire(driver.binding(session_id), "native-session-close") {
+            Ok(guard) => {
+                lease = Some(guard);
+                break;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+        }
+    }
+    let lease = lease.expect("the finished turn never released its lease");
+    driver.close_session(lease).await.unwrap();
 }
 
 // ── KV cache dtype CLI/env surface tests ─────────────────────────────────────
