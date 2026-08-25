@@ -6150,6 +6150,85 @@ mod tests {
         built > spawned
     }
 
+    /// Run `op` on its own thread under a wall-clock bound, failing loudly if
+    /// it does not return.
+    ///
+    /// Every hang regression test in this file had the same defect, and it is
+    /// the defect they exist to prohibit. Each called the operation under test
+    /// inline and asserted the bound *afterwards*:
+    ///
+    /// ```ignore
+    /// let started = Instant::now();
+    /// pools.shutdown();
+    /// assert!(started.elapsed() < Duration::from_secs(30));
+    /// ```
+    ///
+    /// That assertion is unreachable in the only case it was written for. If
+    /// the wait under test loses its bound -- the exact regression -- then
+    /// `shutdown` never returns, `elapsed()` is never evaluated, and the test
+    /// does not go red: it hangs, at full occupancy, indistinguishable from
+    /// work. The red state of a hang regression test was a hang. The comments
+    /// on those asserts said so in as many words ("an unbounded join fails
+    /// this by never returning at all rather than by returning late") and
+    /// asserted anyway, which is how a known limitation becomes a shipped one.
+    ///
+    /// So the bound cannot live on the thread whose blocking it bounds. Here
+    /// `op` runs on a spawned thread and the harness waits on a channel, which
+    /// expires on schedule whether or not `op` ever returns.
+    ///
+    /// `op` keeps its own panics: they are caught, carried across the channel
+    /// and resumed here, so assertions inside `op` fail with their own
+    /// messages and libtest reports them exactly as before.
+    ///
+    /// Two consequences worth stating. The fault-injection knobs in this file
+    /// are thread-local, so `op` must set them itself -- hoisting them into
+    /// the test body would configure the harness thread and silently disarm
+    /// the injection, leaving a test that passes because nothing was broken.
+    /// And when the bound does expire the spawned thread is left running,
+    /// because a thread wedged in an unbounded wait cannot be reclaimed; it
+    /// dies with the process. That leak is the price rather than an oversight:
+    /// one thread for the remainder of a suite, in exchange for turning an
+    /// unbounded CI hang into a named red test in seconds.
+    fn fails_loud_rather_than_hanging<T: Send + 'static>(
+        what: &'static str,
+        bound: Duration,
+        op: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::Builder::new()
+            .name("bounded-op".to_owned())
+            .spawn(move || {
+                let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(op)));
+            })
+            .expect("the harness must be able to spawn the thread whose work it bounds");
+
+        match rx.recv_timeout(bound) {
+            Ok(Ok(value)) => value,
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Several of these tests silence the panic hook around their
+                // own injected faults and restore it on the way out. An `op`
+                // that hung never reached its restore, so the hook is still
+                // swallowing messages -- including the one below, which is the
+                // only explanation anyone would get. `take_hook` reinstates the
+                // default hook, which is all that is needed here.
+                let _ = std::panic::take_hook();
+                panic!(
+                    "{what} did not return within {bound:?}. This is a regression test \
+                     for an unbounded wait, so a wait that never ends has to fail it \
+                     here rather than reproduce the hang the test exists to catch."
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = std::panic::take_hook();
+                panic!(
+                    "{what} dropped its result without reporting, so the harness cannot \
+                     say whether it completed"
+                );
+            }
+        }
+    }
+
     /// A worker that never announces must fail the build loudly, not spin.
     ///
     /// This is the defect that cost a shared host 5h40m: the barrier waited on
@@ -6164,51 +6243,49 @@ mod tests {
     /// pool happened to be building concurrently.
     #[test]
     fn a_worker_that_never_announces_fails_the_build_instead_of_spinning() {
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(250));
-        FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(1));
-        // The injected worker panic is expected; keep it off the test log.
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        fails_loud_rather_than_hanging(
+            "build_with_schedule, with a worker that never announces",
+            Duration::from_secs(30),
+            || {
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(250));
+                FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(1));
+                // The injected worker panic is expected; keep it off the test log.
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
 
-        let started = Instant::now();
-        let outcome = std::panic::catch_unwind(|| {
-            SpmdDecodePools::build_with_schedule(
-                &[NodeShard {
-                    index: 0,
-                    cpus: Vec::new(),
-                    workers: 3,
-                }],
-                DecodeSchedule::Fixed,
-                false,
-            )
-        });
+                let outcome = std::panic::catch_unwind(|| {
+                    SpmdDecodePools::build_with_schedule(
+                        &[NodeShard {
+                            index: 0,
+                            cpus: Vec::new(),
+                            workers: 3,
+                        }],
+                        DecodeSchedule::Fixed,
+                        false,
+                    )
+                });
 
-        std::panic::set_hook(previous);
-        FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(usize::MAX));
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+                std::panic::set_hook(previous);
+                FAIL_WORKER_BEFORE_READY.with(|slot| slot.set(usize::MAX));
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
 
-        let panic = outcome
-            .err()
-            .expect("a pool missing a worker cannot be built; the barrier must not report success");
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or_default();
-        assert!(
-            message.contains("never became ready"),
-            "the build must say why it gave up, got: {message}"
-        );
-        assert!(
-            message.contains("2 of 3"),
-            "the diagnostic must report how many workers did arrive, got: {message}"
-        );
-        // Bounds the *test*, and with it the claim: an unbounded barrier fails
-        // this by never returning at all rather than by returning late.
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "the barrier gave up, but took {:?} to do it",
-            started.elapsed()
+                let panic = outcome.err().expect(
+                    "a pool missing a worker cannot be built; the barrier must not report success",
+                );
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or_default();
+                assert!(
+                    message.contains("never became ready"),
+                    "the build must say why it gave up, got: {message}"
+                );
+                assert!(
+                    message.contains("2 of 3"),
+                    "the diagnostic must report how many workers did arrive, got: {message}"
+                );
+            },
         );
     }
 
@@ -6228,40 +6305,52 @@ mod tests {
     /// arrangement in which "slow is not the same as broken" can be tested.
     #[test]
     fn a_healthy_pool_never_trips_the_readiness_backstop() {
-        assert_eq!(
-            FAIL_WORKER_BEFORE_READY.with(Cell::get),
-            usize::MAX,
-            "no fault may be injected on the thread building a healthy pool"
-        );
-        const DELAY_MS: u64 = 300;
-        const DEADLINE_MS: u64 = 5_000;
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
-        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
+        fails_loud_rather_than_hanging(
+            "build_with_schedule, on a healthy but slow-starting pool",
+            Duration::from_secs(60),
+            || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
+                assert_eq!(
+                    FAIL_WORKER_BEFORE_READY.with(Cell::get),
+                    usize::MAX,
+                    "no fault may be injected on the thread building a healthy pool"
+                );
+                const DELAY_MS: u64 = 300;
+                const DEADLINE_MS: u64 = 5_000;
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
+                DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
 
-        let started = Instant::now();
-        let pools = SpmdDecodePools::build_with_schedule(
-            &[NodeShard {
-                index: 0,
-                cpus: Vec::new(),
-                workers: 4,
-            }],
-            DecodeSchedule::Fixed,
-            false,
-        );
-        let elapsed = started.elapsed();
-        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+                let started = Instant::now();
+                let pools = SpmdDecodePools::build_with_schedule(
+                    &[NodeShard {
+                        index: 0,
+                        cpus: Vec::new(),
+                        workers: 4,
+                    }],
+                    DecodeSchedule::Fixed,
+                    false,
+                );
+                let elapsed = started.elapsed();
+                DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
 
-        assert_eq!(pools.total_workers(), 4);
-        // Proves the barrier actually waited rather than exiting on the fast
-        // path: without this, a build that never consulted the deadline would
-        // satisfy the test and the deadline logic would go unexercised.
-        assert!(
-            elapsed >= Duration::from_millis(DELAY_MS),
-            "the barrier returned in {elapsed:?}, before the injected {DELAY_MS}ms \
+                assert_eq!(pools.total_workers(), 4);
+                // Proves the barrier actually waited rather than exiting on the fast
+                // path: without this, a build that never consulted the deadline would
+                // satisfy the test and the deadline logic would go unexercised.
+                assert!(
+                    elapsed >= Duration::from_millis(DELAY_MS),
+                    "the barrier returned in {elapsed:?}, before the injected {DELAY_MS}ms \
              delay could have elapsed, so it never reached the deadline path"
+                );
+                pools.shutdown();
+            },
         );
-        pools.shutdown();
     }
 
     /// A worker that never leaves must be abandoned, not joined forever.
@@ -6287,81 +6376,87 @@ mod tests {
     /// would pass on one that reported correctly after hanging for an hour.
     #[test]
     fn a_worker_that_never_exits_is_abandoned_instead_of_hanging_shutdown() {
-        const WEDGED: usize = 1;
-        // Releases the wedge on *every* exit from this test, including a failed
-        // assertion. Released inline, an assertion that fires before the
-        // release leaves the injected worker sleeping in the pool for the life
-        // of the test process -- a test whose failure mode is a leaked thread
-        // teaches the wrong lesson about leaked threads.
-        struct ReleaseWedge;
-        impl Drop for ReleaseWedge {
-            fn drop(&mut self) {
-                WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+        fails_loud_rather_than_hanging(
+            "shutdown, with a worker wedged before it can be counted out",
+            Duration::from_secs(30),
+            || {
+                const WEDGED: usize = 1;
+                // Releases the wedge on *every* exit from this test, including a failed
+                // assertion. Released inline, an assertion that fires before the
+                // release leaves the injected worker sleeping in the pool for the life
+                // of the test process -- a test whose failure mode is a leaked thread
+                // teaches the wrong lesson about leaked threads.
+                struct ReleaseWedge;
+                impl Drop for ReleaseWedge {
+                    fn drop(&mut self) {
+                        WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+                        WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
+                        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+                    }
+                }
+                WEDGED_WORKER_RELEASED.store(false, Ordering::Release);
+                WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(WEDGED));
+                // Far above any plausible deschedule of a *healthy* sibling on a
+                // contended host, and far below the harness bound below. At 250ms a
+                // sibling starved past the deadline would be abandoned too, and while
+                // that direction only produces a false red, the same tightness lets a
+                // future broken wedge relay be masked by a coincidentally slow sibling
+                // that keeps the count at 1.
+                SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(2_000));
+                let _release = ReleaseWedge;
+
+                let pools = SpmdDecodePools::build_with_schedule(
+                    &[NodeShard {
+                        index: 0,
+                        cpus: Vec::new(),
+                        workers: 3,
+                    }],
+                    DecodeSchedule::Fixed,
+                    false,
+                );
                 WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
-                SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
-            }
-        }
-        WEDGED_WORKER_RELEASED.store(false, Ordering::Release);
-        WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(WEDGED));
-        // Far above any plausible deschedule of a *healthy* sibling on a
-        // contended host, and far below the harness bound below. At 250ms a
-        // sibling starved past the deadline would be abandoned too, and while
-        // that direction only produces a false red, the same tightness lets a
-        // future broken wedge relay be masked by a coincidentally slow sibling
-        // that keeps the count at 1.
-        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(2_000));
-        let _release = ReleaseWedge;
-
-        let pools = SpmdDecodePools::build_with_schedule(
-            &[NodeShard {
-                index: 0,
-                cpus: Vec::new(),
-                workers: 3,
-            }],
-            DecodeSchedule::Fixed,
-            false,
-        );
-        WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
-        // A pool that spawned no worker cannot wedge one, and would satisfy
-        // every assertion below by doing nothing at all.
-        assert!(
-            pools.spawned_workers() > WEDGED,
-            "the wedged index {WEDGED} is not a spawned worker (spawned {}), so the \
+                // A pool that spawned no worker cannot wedge one, and would satisfy
+                // every assertion below by doing nothing at all.
+                assert!(
+                    pools.spawned_workers() > WEDGED,
+                    "the wedged index {WEDGED} is not a spawned worker (spawned {}), so the \
              fault could not have been injected",
-            pools.spawned_workers()
-        );
+                    pools.spawned_workers()
+                );
 
-        let started = Instant::now();
-        pools.shutdown();
-        let elapsed = started.elapsed();
-
-        // Bounds the *test*, and with it the claim: the unbounded join fails
-        // this by never returning at all rather than by returning late.
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "shutdown returned, but took {elapsed:?} to give up on a wedged worker"
-        );
-        assert_eq!(
-            pools.workers_abandoned(),
-            1,
-            "shutdown must report the worker it stopped waiting for; a give-up that \
+                let started = Instant::now();
+                pools.shutdown();
+                let elapsed = started.elapsed();
+                // A secondary check only. The bound that makes this test *fail* on an
+                // unbounded join is the harness bound above, which does not need
+                // `shutdown` to return in order to fire; this one merely reports.
+                assert!(
+                    elapsed < Duration::from_secs(30),
+                    "shutdown returned, but took {elapsed:?} to give up on a wedged worker"
+                );
+                assert_eq!(
+                    pools.workers_abandoned(),
+                    1,
+                    "shutdown must report the worker it stopped waiting for; a give-up that \
              is indistinguishable from a clean teardown is not a diagnostic"
-        );
+                );
 
-        // Release it and let it leave, so the wedge does not outlive the test
-        // that injected it.
-        WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
-        let draining = Instant::now();
-        while pools.workers_exited() < pools.spawned_workers()
-            && draining.elapsed() < Duration::from_secs(10)
-        {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            pools.workers_exited(),
-            pools.spawned_workers(),
-            "the released worker must leave; if it does not, the abandonment above \
+                // Release it and let it leave, so the wedge does not outlive the test
+                // that injected it.
+                WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+                let draining = Instant::now();
+                while pools.workers_exited() < pools.spawned_workers()
+                    && draining.elapsed() < Duration::from_secs(10)
+                {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(
+                    pools.workers_exited(),
+                    pools.spawned_workers(),
+                    "the released worker must leave; if it does not, the abandonment above \
              was permanent rather than a deferral"
+                );
+            },
         );
     }
 
@@ -6394,55 +6489,67 @@ mod tests {
     /// here, quickly, and named.
     #[test]
     fn a_healthy_teardown_never_abandons_a_worker() {
-        assert_eq!(
-            WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get),
-            usize::MAX,
-            "no fault may be injected on the thread building a healthy pool"
-        );
-        let mut saw_inline_shard = false;
-        for dispatcher_shard in [false, true] {
-            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(5_000));
-            let pools = SpmdDecodePools::build_with_schedule(
-                &[NodeShard {
-                    index: 0,
-                    cpus: Vec::new(),
-                    workers: 4,
-                }],
-                DecodeSchedule::Fixed,
-                dispatcher_shard,
-            );
-            let spawned = pools.spawned_workers();
-            assert!(
-                spawned > 0,
-                "a pool that spawned nothing cannot demonstrate a clean teardown"
-            );
-            saw_inline_shard |= spawned != pools.total_workers();
+        fails_loud_rather_than_hanging(
+            "shutdown, on a healthy pool in both dispatcher-shard regimes",
+            Duration::from_secs(60),
+            || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
+                assert_eq!(
+                    WEDGE_WORKER_AT_SHUTDOWN.with(Cell::get),
+                    usize::MAX,
+                    "no fault may be injected on the thread building a healthy pool"
+                );
+                let mut saw_inline_shard = false;
+                for dispatcher_shard in [false, true] {
+                    SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(5_000));
+                    let pools = SpmdDecodePools::build_with_schedule(
+                        &[NodeShard {
+                            index: 0,
+                            cpus: Vec::new(),
+                            workers: 4,
+                        }],
+                        DecodeSchedule::Fixed,
+                        dispatcher_shard,
+                    );
+                    let spawned = pools.spawned_workers();
+                    assert!(
+                        spawned > 0,
+                        "a pool that spawned nothing cannot demonstrate a clean teardown"
+                    );
+                    saw_inline_shard |= spawned != pools.total_workers();
 
-            pools.shutdown();
-            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+                    pools.shutdown();
+                    SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
 
-            assert_eq!(
-                pools.workers_abandoned(),
-                0,
-                "a healthy pool's teardown must join every worker (dispatcher_shard \
+                    assert_eq!(
+                        pools.workers_abandoned(),
+                        0,
+                        "a healthy pool's teardown must join every worker (dispatcher_shard \
                  {dispatcher_shard}); abandoning one means the backstop fires on \
                  correct pools"
-            );
-            assert_eq!(
-                pools.workers_exited(),
-                spawned,
-                "shutdown returned without every worker counted out \
+                    );
+                    assert_eq!(
+                        pools.workers_exited(),
+                        spawned,
+                        "shutdown returned without every worker counted out \
                  (dispatcher_shard {dispatcher_shard}), so the join it reported was \
                  not the barrier it claims to be"
-            );
-        }
-        // Without this the `true` arm can silently degrade into a second copy of
-        // the `false` arm -- and it is the *only* arm in which the wait target
-        // and `total_workers` disagree, which is the whole reason it is here.
-        assert!(
-            saw_inline_shard,
-            "no arm reached the inline-dispatcher-shard regime, so the count this \
+                    );
+                }
+                // Without this the `true` arm can silently degrade into a second copy of
+                // the `false` arm -- and it is the *only* arm in which the wait target
+                // and `total_workers` disagree, which is the whole reason it is here.
+                assert!(
+                    saw_inline_shard,
+                    "no arm reached the inline-dispatcher-shard regime, so the count this \
              test exists to pin was never exercised"
+                );
+            },
         );
     }
 
@@ -6468,78 +6575,93 @@ mod tests {
     /// false failure.
     #[test]
     fn the_readiness_backstop_fires_within_its_deadline_not_a_stride_later() {
-        assert_eq!(
-            FAIL_WORKER_BEFORE_READY.with(Cell::get),
-            usize::MAX,
-            "no fault may be injected; the workers here are slow, not broken"
-        );
-        // Sized so the two behaviours are separated by a wide margin rather
-        // than a granularity: the deadline expires on the yield path at
-        // ~DEADLINE_MS, while a stride of 64 injected yields would not consult
-        // it again until 64 * SLOW_US = 1280ms -- long after the workers
-        // announce at DELAY_MS and the loop has already exited. Fires-late
-        // becomes never-fires, which is an outcome rather than a duration.
-        //
-        // The 8x gap between when the barrier should give up (~100ms) and when
-        // it would be let off the hook (800ms) is deliberate headroom for a
-        // loaded runner: this test may only fail because the deadline was not
-        // consulted, never because the builder thread was descheduled.
-        const DELAY_MS: u64 = 800;
-        const DEADLINE_MS: u64 = 100;
-        const SLOW_US: u64 = 20_000;
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
-        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
-        SLOW_YIELD_US.with(|slot| slot.set(SLOW_US));
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        fails_loud_rather_than_hanging(
+            "build_with_schedule, with workers slow enough to expire the deadline",
+            Duration::from_secs(60),
+            || {
+                // Structurally true rather than checked, now that the body runs on a
+                // fresh harness thread where every knob is at its default: this cannot
+                // fail as written. It is kept as a tripwire for the one refactor that
+                // would matter -- hoisting the body back onto a reused libtest thread,
+                // where a sibling test's leftover knob could arm a fault here. Read it
+                // as a guard against that change, not as live coverage.
+                assert_eq!(
+                    FAIL_WORKER_BEFORE_READY.with(Cell::get),
+                    usize::MAX,
+                    "no fault may be injected; the workers here are slow, not broken"
+                );
+                // Sized so the two behaviours are separated by a wide margin rather
+                // than a granularity: the deadline expires on the yield path at
+                // ~DEADLINE_MS, while a stride of 64 injected yields would not consult
+                // it again until 64 * SLOW_US = 1280ms -- long after the workers
+                // announce at DELAY_MS and the loop has already exited. Fires-late
+                // becomes never-fires, which is an outcome rather than a duration.
+                //
+                // The 8x gap between when the barrier should give up (~100ms) and when
+                // it would be let off the hook (800ms) is deliberate headroom for a
+                // loaded runner: this test may only fail because the deadline was not
+                // consulted, never because the builder thread was descheduled.
+                const DELAY_MS: u64 = 800;
+                const DEADLINE_MS: u64 = 100;
+                const SLOW_US: u64 = 20_000;
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(DEADLINE_MS));
+                DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(DELAY_MS));
+                SLOW_YIELD_US.with(|slot| slot.set(SLOW_US));
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
 
-        let started = Instant::now();
-        let outcome = std::panic::catch_unwind(|| {
-            SpmdDecodePools::build_with_schedule(
-                &[NodeShard {
-                    index: 0,
-                    cpus: Vec::new(),
-                    workers: 2,
-                }],
-                DecodeSchedule::Fixed,
-                false,
-            )
-        });
-        let elapsed = started.elapsed();
+                let started = Instant::now();
+                let outcome = std::panic::catch_unwind(|| {
+                    SpmdDecodePools::build_with_schedule(
+                        &[NodeShard {
+                            index: 0,
+                            cpus: Vec::new(),
+                            workers: 2,
+                        }],
+                        DecodeSchedule::Fixed,
+                        false,
+                    )
+                });
+                let elapsed = started.elapsed();
 
-        std::panic::set_hook(previous);
-        DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
-        POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
-        SLOW_YIELD_US.with(|slot| slot.set(0));
-        // This test drives the *readiness barrier's* yield site, which shares
-        // `slow_yield` with `worker_wait`. Since that helper counts
-        // unconditionally, leaving the tally behind would hand a nonzero
-        // starting count to whatever libtest schedules next on this thread.
-        YIELD_COUNT.with(|slot| slot.set(0));
+                std::panic::set_hook(previous);
+                DELAY_WORKER_BEFORE_READY_MS.with(|slot| slot.set(0));
+                POOL_READY_TIMEOUT_MS.with(|slot| slot.set(0));
+                SLOW_YIELD_US.with(|slot| slot.set(0));
+                // This test drives the *readiness barrier's* yield site, which shares
+                // `slow_yield` with `worker_wait`, and that helper counts
+                // unconditionally. The reset is now belt-and-braces: the harness
+                // thread is discarded after this returns, so there is no next test
+                // on it to inherit the tally, and the other `YIELD_COUNT` consumers
+                // zero it on entry anyway. Kept so the invariant survives if either
+                // of those two facts stops holding.
+                YIELD_COUNT.with(|slot| slot.set(0));
 
-        let panic = outcome.err().unwrap_or_else(|| {
-            panic!(
-                "the pool exceeded its {DEADLINE_MS}ms deadline by design and the \
+                let panic = outcome.err().unwrap_or_else(|| {
+                    panic!(
+                        "the pool exceeded its {DEADLINE_MS}ms deadline by design and the \
                  barrier reported success after {elapsed:?}: the deadline was \
                  consulted once, before it expired, and never again"
-            )
-        });
-        let message = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or_default();
-        assert!(
-            message.contains("never became ready"),
-            "the build must say why it gave up, got: {message}"
-        );
-        // Pins the granularity itself: the barrier may overrun its deadline by
-        // the cost of one yield, never by the injected delay that a strided
-        // check would have slept through.
-        assert!(
-            elapsed < Duration::from_millis(DELAY_MS),
-            "the barrier gave up only after {elapsed:?}, past the {DELAY_MS}ms \
+                    )
+                });
+                let message = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or_default();
+                assert!(
+                    message.contains("never became ready"),
+                    "the build must say why it gave up, got: {message}"
+                );
+                // Pins the granularity itself: the barrier may overrun its deadline by
+                // the cost of one yield, never by the injected delay that a strided
+                // check would have slept through.
+                assert!(
+                    elapsed < Duration::from_millis(DELAY_MS),
+                    "the barrier gave up only after {elapsed:?}, past the {DELAY_MS}ms \
              delay it was supposed to abandon at {DEADLINE_MS}ms"
+                );
+            },
         );
     }
 
