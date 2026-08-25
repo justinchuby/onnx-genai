@@ -27,6 +27,7 @@ mod cli;
 mod driver;
 mod image_generation;
 mod image_input;
+mod lease;
 mod metrics;
 mod models_config;
 pub mod multimodal;

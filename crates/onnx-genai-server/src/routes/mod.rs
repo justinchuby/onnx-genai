@@ -30,6 +30,7 @@ use crate::{
         DriverEvent, DriverFailure, DriverFailureKind, DriverGeneration, EngineDriver,
         GenerateSubmitError,
     },
+    lease::SessionLeaseGuard,
     multimodal::MultimodalInput,
     registry::ModelHandle,
     session::SessionRegistry,
@@ -47,7 +48,6 @@ use crate::{
         EmbeddingRequest, EmbeddingResponse, EmbeddingUsage, EmbeddingVector, InputAudio,
         ReasoningEffort, ResponseFormat, StopInput, ToolChoice, ToolChoiceMode, Usage,
     },
-    worker::SessionPlacement,
 };
 
 mod admin;
@@ -514,7 +514,13 @@ pub(crate) fn session_create_failure(error: anyhow::Error) -> ApiError {
     }
 }
 
-fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
+/// The status a package refusal actually is, read off the variant.
+///
+/// Shared by every layer that can raise one — session creation, generation, and
+/// the routing lease — so an `ExclusiveLeaseConflict` answers 409 whether it was
+/// decided before the turn was enqueued or inside the pass that ran it. Matching
+/// the type rather than the wording is what keeps those answers identical.
+pub(crate) fn package_capability_failure(capability: PackageCapabilityError) -> ApiError {
     match capability {
         PackageCapabilityError::NoSessionState => ApiError::conflict(capability.to_string()),
         PackageCapabilityError::ConversationOverBound { .. } => {
@@ -692,9 +698,15 @@ fn audio_decoder_prompt(
         .map_err(|error| ApiError::bad_request(format!("{error:#}")))
 }
 
+/// Close a session the registry let go of, under the lease it was handed back
+/// holding.
+///
+/// The guard is consumed here, so the lease is released exactly when the engine
+/// has answered — never earlier, which would let a turn start on a session that
+/// is being closed, and never later, which would strand the id.
 async fn close_evicted_session(
     engine: &EngineDriver,
-    evicted: Option<SessionPlacement>,
+    evicted: Option<SessionLeaseGuard>,
 ) -> Result<(), ApiError> {
     if let Some(evicted) = evicted {
         engine

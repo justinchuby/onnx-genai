@@ -967,6 +967,7 @@ mod tests {
                 crate::worker::WorkerId::PRIMARY,
                 tx,
             )),
+            session_leases: crate::lease::SessionLeases::with_shards(1),
             generation_capacity: Arc::new(Semaphore::new(0)),
             generation_capacity_size: 0,
             // A test double drives no engine, so there is no pool to

@@ -62,7 +62,7 @@ impl fmt::Display for WorkerId {
 /// never travels alone. Carrying the pair means a later turn is routed back to
 /// the thread that holds the conversation's KV state instead of being sent to
 /// whichever worker answers first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct SessionPlacement {
     /// The worker that owns this session.
     pub(crate) worker: WorkerId,
