@@ -70,13 +70,15 @@ const INPUT_NAMES: [&str; 9] = [
 /// Planar block-scaled B2 formats (DeepSeek-V4): the packed weight carries its
 /// UE8M0 block scales in a *separate* aux tensor, so they are not part of the
 /// interleaved single-tensor [`BlockFormat`] family the CUDA device kernel
-/// decodes. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns them
-/// numerically today; the CUDA planar decoder is a pending follow-up and must
-/// not claim a planar node without proven kernel parity. These strings are the
-/// stable runtime capability names emitted by the Mobius #602 / Deckard #593
-/// planar emitters — recognised here purely to produce an accurate typed
-/// rejection (never an "re-export as mxfp4" message, which would be wrong: the
-/// checkpoint genuinely is these formats).
+/// decodes. A device-proven **matmul** primitive for both formats now exists
+/// (`onnx_runtime_ep_cuda::launch_planar_linear`, advertised by
+/// [`crate::planar_matmul_capable_formats`]); what remains unproven is the
+/// **routed top-k MoE** kernel, so this claim gate still typed-rejects a planar
+/// MoE node. The onnx-runtime-ep-cpu `planar_block_quant` oracle owns the routed
+/// path numerically today. These strings are the stable runtime capability names
+/// emitted by the Mobius #602 / Deckard #593 planar emitters — recognised here
+/// purely to produce an accurate typed rejection (never an "re-export as mxfp4"
+/// message, which would be wrong: the checkpoint genuinely is these formats).
 const PLANAR_B2_FORMAT_NAMES: [&str; 2] = ["block_fp8", "fp4_planar"];
 
 // Kernels appended after the shared `decode_weight`/`block_sum` prelude. The
@@ -610,7 +612,7 @@ fn claim_format_attr(
     };
     if PLANAR_B2_FORMAT_NAMES.contains(&text) {
         return Err(Cow::Owned(format!(
-            "BlockQuantizedMoE: CUDA has no exact decoder yet for planar B2 format '{text}' at '{name}' (DeepSeek-V4) — it is a recognised runtime ABI currently owned by the onnx-runtime-ep-cpu planar_block_quant oracle; the CUDA planar decoder is a pending follow-up and must not claim without proven kernel parity"
+            "BlockQuantizedMoE: planar B2 format '{text}' at '{name}' (DeepSeek-V4) has a device-proven planar matmul primitive (see onnx_runtime_ep_cuda::launch_planar_linear / planar_matmul_capable_formats), but no proven routed top-k MoE kernel yet; the routed-MoE path stays typed-reject and must not claim without proven kernel parity"
         )));
     }
     match BlockFormat::parse(text) {

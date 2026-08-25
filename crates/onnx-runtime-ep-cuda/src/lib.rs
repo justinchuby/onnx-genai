@@ -127,6 +127,11 @@ pub use kernels::group_query_attention::{
 pub use kernels::index_share::INDEX_SHARE_CAPTURE_ERROR_INDEX;
 pub use kernels::indexing::SCATTER_CAPTURE_ERROR_INDEX;
 pub use kernels::kv_cache_capacity_append::KV_CAPACITY_APPEND_CAPTURE_ERROR_POSITION;
+pub use kernels::planar_block_decode::{
+    PLANAR_FORMAT_BLOCK_FP8, PLANAR_FORMAT_FP4_PLANAR, PlanarActivationDtype, PlanarLinearDims,
+    PlanarLinearPtrs, PlanarTensorLengths, launch_planar_linear, planar_matmul_capable_formats,
+    validate_planar_linear, warm_planar_linear,
+};
 pub use kernels::reduce::REDUCE_CAPTURE_ERROR_AXES;
 pub use kernels::{
     CUDA_COVERED_OPS, CudaOpDescriptor, build_cuda_registry, build_cuda_registry_descriptors,

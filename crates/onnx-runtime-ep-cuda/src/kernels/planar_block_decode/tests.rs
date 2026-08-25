@@ -1,12 +1,15 @@
-//! Parity tests for the planar CUDA decode against the CPU oracle.
+//! Host-mirror parity tests for the planar CUDA decode against the CPU oracle.
 //!
-//! There is no CUDA device (nor nvcc/NVRTC) in this environment, so the device
-//! source in [`PLANAR_BLOCK_DECODE_CUH`] cannot be compiled or launched here.
-//! Instead — exactly as [`crate::kernels::block_quant`] verifies its device
-//! quantizers against the CPU `block_dequant` reference — we test the **host
-//! mirror** (a bit-identical Rust transcription of the device arithmetic) against
-//! the independently-vetted CPU planar oracle
-//! [`onnx_runtime_ep_cpu::kernels::planar_block_quant`].
+//! The launched device path is exercised by the GPU integration test
+//! `tests/planar_block_decode_gpu.rs` (compiles + launches the NVRTC kernel on
+//! real hardware and compares to the CPU oracle). These *host* tests need no GPU:
+//! exactly as [`crate::kernels::block_quant`] verifies its device quantizers
+//! against the CPU `block_dequant` reference, we test the **host mirror** (a
+//! bit-identical Rust transcription of the device arithmetic) against the
+//! independently-vetted CPU planar oracle
+//! [`onnx_runtime_ep_cpu::kernels::planar_block_quant`], plus the pure host
+//! surfaces (geometry/aux length validation, dtype selection, capability
+//! strings).
 //!
 //! * The mirror's per-element decode is compared **bit-exactly** to
 //!   `dequantize_planar_kn` (same values, same indexing → no accumulation).
@@ -17,15 +20,13 @@
 //!
 //! The device C and the mirror are hand-written to the same formulae and kept
 //! adjacent in [`super`] so their correspondence is auditable by inspection.
-//! This proves the *algorithm*; on-device numeric parity remains a GPU-gated
-//! follow-up ([`planar_decode_gpu_parity_placeholder`]) and the
-//! `BlockQuantizedMoE` claim gate stays typed-reject until it passes.
 
 use super::*;
 use onnx_runtime_ep_cpu::kernels::planar_block_quant::{
     FP4_MICROSCALE_BLOCK, FP4_PACK_FACTOR, PlanarBlockFormat, PlanarLayout, dequantize_planar_kn,
     planar_block_matmul,
 };
+use onnx_runtime_ir::DataType;
 
 // ---------------------------------------------------------------------------
 // Deterministic fixtures (mirror of the CPU test generators)
@@ -333,9 +334,8 @@ fn fp4_planar_matmul_matches_oracle() {
 // Device-source structural guard + claim-boundary documentation
 // ---------------------------------------------------------------------------
 
-/// The NVRTC source must define every symbol the (future) launch path names, so
-/// a rename here can never silently diverge from the host mirror or the entry
-/// constant.
+/// The NVRTC source must define every symbol the launch path names, so a rename
+/// here can never silently diverge from the host mirror or the entry constants.
 #[test]
 fn device_source_declares_required_symbols() {
     for needle in [
@@ -346,29 +346,154 @@ fn device_source_declares_required_symbols() {
         "planar_bf8_element",
         "planar_fp4_element",
         "planar_e2m1_lut",
+        "planar_to_f32",
+        "planar_store",
+        "planar_linear_impl",
+        "#include <cuda_fp16.h>",
+        "#include <cuda_bf16.h>",
     ] {
         assert!(
             PLANAR_BLOCK_DECODE_CUH.contains(needle),
             "planar device source is missing `{needle}`"
         );
     }
-    assert!(PLANAR_BLOCK_DECODE_CUH.contains("__global__ void planar_linear_f32"));
+    for dtype in PlanarActivationDtype::all() {
+        assert!(
+            PLANAR_BLOCK_DECODE_CUH.contains(&format!("__global__ void {}", dtype.entry())),
+            "planar device source is missing entry `{}`",
+            dtype.entry()
+        );
+    }
 }
 
-/// GPU-gated on-device parity. Until this launches `planar_linear_f32` on real
-/// hardware and matches the CPU oracle, the `BlockQuantizedMoE` claim gate MUST
-/// keep typed-rejecting `block_fp8`/`fp4_planar`. It is `#[ignore]`d (no device
-/// here) and fails loudly if force-run without implementing the real launch, so
-/// it can never masquerade as a passed parity proof. The on-hardware follow-up
-/// must also add reserved-code (E4M3 NaN / UE8M0 `0xff`) validation to preserve
-/// the CPU oracle's fail-closed contract before the gate may flip.
+/// The three precision entry points must be distinct and stable.
 #[test]
-#[ignore = "requires a CUDA device + NVRTC to launch planar_linear_f32 and compare to the CPU oracle; the BlockQuantizedMoE claim gate stays typed-reject until this passes on hardware"]
-fn planar_decode_gpu_parity_placeholder() {
-    panic!(
-        "planar CUDA on-device parity is unproven without a GPU; implement the real \
-         NVRTC compile + launch of `{PLANAR_LINEAR_ENTRY}` (plus reserved-code \
-         validation) and compare against onnx_runtime_ep_cpu planar_block_matmul \
-         before flipping the claim gate"
+fn planar_activation_dtype_entries_are_distinct() {
+    assert_eq!(PlanarActivationDtype::F32.entry(), PLANAR_LINEAR_ENTRY);
+    let entries: Vec<&str> = PlanarActivationDtype::all()
+        .iter()
+        .map(|dtype| dtype.entry())
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            "planar_linear_f32",
+            "planar_linear_f16",
+            "planar_linear_bf16"
+        ]
     );
+    assert_eq!(
+        PlanarActivationDtype::from_data_type(DataType::Float32).unwrap(),
+        PlanarActivationDtype::F32
+    );
+    assert_eq!(
+        PlanarActivationDtype::from_data_type(DataType::Float16).unwrap(),
+        PlanarActivationDtype::F16
+    );
+    assert_eq!(
+        PlanarActivationDtype::from_data_type(DataType::BFloat16).unwrap(),
+        PlanarActivationDtype::Bf16
+    );
+    assert!(PlanarActivationDtype::from_data_type(DataType::Int8).is_err());
+}
+
+/// Advertised planar matmul capability strings must exactly match the format
+/// names the routed-MoE claim gate recognises (so the two never drift).
+#[test]
+fn planar_matmul_capability_strings_are_stable() {
+    assert_eq!(planar_matmul_capable_formats(), ["block_fp8", "fp4_planar"]);
+}
+
+/// `block_fp8` geometry yields the exact packed/scale byte lengths and accepts a
+/// matching set of tensors, and typed-rejects ragged banks / overflowing dims.
+#[test]
+fn block_fp8_length_validation() {
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 3,
+        in_features: 128,
+        out_features: 64,
+        bs0: 128,
+        bs1: 128,
+    };
+    let lengths = dims.expected_lengths().unwrap();
+    assert_eq!(lengths.packed_bytes, 64 * 128);
+    // ceil(64/128) * ceil(128/128) == 1 * 1.
+    assert_eq!(lengths.scale_bytes, 1);
+    validate_planar_linear(&dims, 3 * 128, lengths.packed_bytes, lengths.scale_bytes).unwrap();
+
+    // Truncated aux scale is rejected.
+    assert!(validate_planar_linear(&dims, 3 * 128, lengths.packed_bytes, 0).is_err());
+    // Wrong packed length is rejected.
+    assert!(
+        validate_planar_linear(
+            &dims,
+            3 * 128,
+            lengths.packed_bytes - 1,
+            lengths.scale_bytes
+        )
+        .is_err()
+    );
+    // Wrong activation length is rejected.
+    assert!(
+        validate_planar_linear(
+            &dims,
+            3 * 128 + 1,
+            lengths.packed_bytes,
+            lengths.scale_bytes
+        )
+        .is_err()
+    );
+
+    // Zero block size is rejected.
+    let bad = PlanarLinearDims { bs1: 0, ..dims };
+    assert!(bad.expected_lengths().is_err());
+}
+
+/// A non-128-aligned `block_fp8` scale grid is still exact via ceil-division.
+#[test]
+fn block_fp8_ragged_scale_grid_is_exact() {
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_BLOCK_FP8,
+        m_rows: 1,
+        in_features: 130,
+        out_features: 130,
+        bs0: 128,
+        bs1: 128,
+    };
+    let lengths = dims.expected_lengths().unwrap();
+    // ceil(130/128) == 2 in each dim.
+    assert_eq!(lengths.scale_bytes, 2 * 2);
+    assert_eq!(lengths.packed_bytes, 130 * 130);
+}
+
+/// `fp4_planar` geometry yields packed `[out, in/2]` and scale `[out, in/32]`,
+/// and typed-rejects odd or non-block-aligned contractions.
+#[test]
+fn fp4_planar_length_validation() {
+    let dims = PlanarLinearDims {
+        format: PLANAR_FORMAT_FP4_PLANAR,
+        m_rows: 2,
+        in_features: 64,
+        out_features: 16,
+        bs0: 0,
+        bs1: 0,
+    };
+    let lengths = dims.expected_lengths().unwrap();
+    assert_eq!(lengths.packed_bytes, 16 * (64 / 2));
+    assert_eq!(lengths.scale_bytes, 16 * (64 / 32));
+    validate_planar_linear(&dims, 2 * 64, lengths.packed_bytes, lengths.scale_bytes).unwrap();
+
+    // Odd contraction (not packable into nibbles) is rejected.
+    let odd = PlanarLinearDims {
+        in_features: 63,
+        ..dims
+    };
+    assert!(odd.expected_lengths().is_err());
+    // Even but not block-32-aligned is rejected.
+    let unaligned = PlanarLinearDims {
+        in_features: 48,
+        ..dims
+    };
+    assert!(unaligned.expected_lengths().is_err());
 }
