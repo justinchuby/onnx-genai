@@ -242,17 +242,17 @@ fn migrated_shared_rules_agree() {
 
 // ── Sweep ────────────────────────────────────────────────────────────────────
 
-/// Every plain shape-preserving op must agree, driven from the registry rather
-/// than a hand-written list.
+/// Every plain shape-preserving op added by #2049 must agree.
 ///
 /// The three cases above are hand-built because they need *values*. These do
 /// not: one input, output shape equals it. Sweeping them costs nothing and
 /// catches the case where one table quietly stops preserving the shape — a
 /// `DequantizeLinear` that started broadcasting against its scale, say.
 ///
-/// A hand-written list would drift from the rules themselves, which is the very
-/// failure this file exists to catch, so the op names come from the same place
-/// the plugin's arm does.
+/// Unlike the migrated cases above, these not-yet-shared rules have no
+/// production descriptor to enumerate. Their explicit list is temporary
+/// duplication and should disappear as later slices move them into
+/// [`SharedNativeShapeRule`].
 #[test]
 fn shape_preserving_ops_agree() {
     // (op, opset, extra input count) — the companions are dtype/scale operands
