@@ -2409,7 +2409,10 @@ profiles:
 through `profiles.transcription.outputs` must yield the exact
 `padding.valid_lengths` workflow output. This prevents padded frames from being
 decoded and prevents two contradictory length sources. Unpadded CTC remains
-valid without `decoding.lengths`.
+valid without `decoding.lengths`. Every CTC profile also exposes the decoded
+tensor through the canonical `outputs.logits` role; renaming that role to an
+alias such as `emissions` is rejected rather than bypassing logits-contract
+validation.
 
 Embedding, reranking, classification, reward scoring, detection, and ordinary
 encoder inference are the same one-pass shape: preprocess if needed, invoke one
