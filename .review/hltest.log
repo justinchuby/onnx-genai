@@ -1,0 +1,443 @@
+== lifecycle ==
+  PASS  free host reports FREE
+  PASS  after acquire reports HELD
+  PASS  status names the owner
+  PASS  status carries the reason
+  PASS  after release reports FREE
+== the lock outlives the process that took it ==
+  PASS  lock taken by an exited script is still HELD
+== mutual exclusion ==
+  PASS  second acquirer exits 2 (busy)
+  PASS  second acquirer is told it is busy
+  PASS  second acquirer is told who holds it
+== atomicity: a lock is never visible without its metadata ==
+  PASS  no lock ever observed without complete metadata
+== RACE A: 40 simultaneous acquirers on a free lock ==
+  PASS  trial 1: exactly one winner
+  PASS  trial 2: exactly one winner
+  PASS  trial 3: exactly one winner
+== RACE B: 40 simultaneous acquirers on a stale lock ==
+  PASS  trial 1: exactly one winner
+  PASS  trial 1: reaped exactly once
+  PASS  trial 2: exactly one winner
+  PASS  trial 2: reaped exactly once
+  PASS  trial 3: exactly one winner
+  PASS  trial 3: reaped exactly once
+== crash recovery ==
+  PASS  dead holder reported STALE
+  PASS  dead holder is reaped and lock acquired
+== an unreadable lock degrades to busy, not free ==
+  PASS  empty metadata is treated as held
+== ttl expiry ==
+  PASS  expired lock is reported EXPIRED
+  PASS  expired lock is taken over
+  PASS  takeover of a live holder warns loudly
+== run: releases on every exit path ==
+  PASS  released after success
+  PASS  propagates the command's exit code
+  PASS  released after failure
+  PASS  held while the command runs
+  PASS  the wrapped command is a child of the runner
+  PASS  and the test actually found it
+  PASS  runner terminates on SIGTERM
+  PASS  released after SIGTERM
+  PASS  the wrapped command is really stopped, not left orphaned
+scripts/hostlock_test.sh: line 115: 178341 Killed                  $HL run --owner leon --reason "hard kill" -- sleep 60 > /dev/null 2>&1
+  PASS  SIGKILL leaves the lock behind
+  PASS  next acquirer reaps the killed holder
+== run does not clobber a successor's lock ==
+  PASS  successor takes over the expired run
+  PASS  finished run leaves the successor holding it
+  PASS  finished run did not steal the lock from the successor
+== a leaked reaper guard does not wedge stale recovery ==
+  PASS  an abandoned reaper guard is cleared
+== R8: the reaper guard cannot wedge the box ==
+  PASS  a reaper is reachable inside its critical section
+scripts/hostlock_test.sh: line 115: 179655 Killed                  HOSTLOCK_REAPER_STALL=30 $HL acquire --owner victim --ttl 600 > /dev/null 2>&1
+  PASS  killing it in the window really does orphan the guard
+  PASS  and the orphan still names its dead owner
+  PASS  a guard orphaned by SIGKILL does not wedge the next acquirer
+  PASS  and recovery is immediate, not after REAPER_GRACE
+  PASS  a reap cycle leaves no guard litter behind
+  PASS  an ancient guard held by a LIVE reaper is not stolen
+  PASS  and the live reaper still holds its guard
+scripts/hostlock_test.sh: line 115: 180028 Killed                  sleep 120
+  PASS  a second reaper is reachable inside its critical section
+  PASS  a reaper whose guard was reclaimed leaves the successor's guard alone
+scripts/hostlock_test.sh: line 115: 180393 Killed                  sleep 120
+  PASS  a third reaper is reachable inside its critical section
+  PASS  a guard on our pid but not our start time is somebody else's
+  PASS  the guard is never created in place
+  PASS  it is renamed into place already populated
+  PASS  the stall seam does nothing when unset
+  PASS  and the reap still happened
+== corrupt metadata fails safe ==
+  PASS  corrupt ttl/epoch produce no shell errors
+  PASS  corrupt metadata is treated as held, not expired
+== interrupting a run releases promptly, and stops the command ==
+  PASS  released within 10s of the signal, not after the command
+  PASS  prompt release actually freed the lock
+  PASS  the wrapped command was stopped too
+== SIGHUP releases ==
+  PASS  runner terminates on SIGHUP
+  PASS  released after SIGHUP
+== wait ==
+  PASS  wait returns immediately on a free host
+  PASS  wait times out (3) while held
+  PASS  wait does not block on an expired lock
+== gate ==
+  PASS  a trivially satisfied gate does not block
+  PASS  a satisfied gate is recorded
+  PASS  an unsatisfiable gate fails closed (5)
+  PASS  a failed gate leaves no lock behind
+  PASS  proceeding past the gate requires asking for it
+  PASS  and still acquires
+  PASS  and is recorded as timed_out_proceeded
+  PASS  --on-gate-timeout rejects a bogus value
+== a reaped acquire is not the same event as a clean one ==
+  PASS  a clean acquire records takeover=none
+  PASS  a reaping acquire says so on stdout
+  PASS  and records which kind of takeover
+  PASS  --strict-reap refuses a takeover (4)
+  PASS  and does not hold the lock it refused
+== provenance ==
+  PASS  provenance on a free host reports no claim
+  PASS  provenance names the holder
+  PASS  provenance carries the reason into the row
+  PASS  provenance marks a held lock as declared
+  PASS  contended is unknown without an expectation
+  PASS  contended is answerable when the caller supplies one
+  PASS  and reports contention when the expectation is not met
+  PASS  --oneline emits exactly one line
+  PASS  --oneline carries the same fields
+  PASS  --expect-runnable rejects a non-integer
+== a released-then-reacquired lock belongs to its new owner ==
+  PASS  a successor can take over a TTL-expired lock
+  PASS  the loser's failing gate returns 5
+  PASS  and does NOT release the successor's lock
+  PASS  which is still the successor's
+scripts/hostlock_test.sh: line 115: 188700 Killed                  sleep 60
+  PASS  successor holds it while the loser is still gating
+  PASS  the loser proceeds past its own gate (0)
+  PASS  but cannot stamp its gate result on the successor's lock
+  PASS  and the successor still owns it
+scripts/hostlock_test.sh: line 115: 189745 Killed                  sleep 60
+  PASS  meta_set stages inside the lock directory, not beside it
+== strict-reap ==
+  PASS  strict-reap beats the gate (4, not 5)
+  PASS  and does not linger on the lock it refused
+  PASS  stdout says reap_refused, not acquired
+  PASS  and never says acquired_after_reap
+  PASS  a TTL takeover is reported as its own kind
+  PASS  and recorded as ttl_expired
+scripts/hostlock_test.sh: line 115: 195125 Killed                  sleep 60
+  PASS  strict-reap also refuses a TTL takeover
+scripts/hostlock_test.sh: line 115: 195488 Killed                  sleep 60
+== metadata is only writable by the lock's own holder ==
+  PASS  the holder's gate result is recorded
+  PASS  a losing acquirer does not rewrite the holder's owner
+  PASS  nor its takeover field
+scripts/hostlock_test.sh: line 115: 196169 Killed                  sleep 60
+== value-taking options require values ==
+  PASS  --gate with no value fails fast
+  PASS  --gate-timeout with no value fails fast
+  PASS  --ttl with no value fails fast
+  PASS  --timeout with no value fails fast
+  PASS  --pid with no value fails fast
+  PASS  --owner with no value fails fast
+  PASS  --reason with no value fails fast
+  PASS  --on-gate-timeout with no value fails fast
+  PASS  --expect-runnable with no value fails fast
+  PASS  --gate rejects a non-integer
+  PASS  --gate-timeout rejects a non-integer
+== provenance does not assert facts it does not have ==
+  PASS  an old lock reports takeover=unknown, not none
+  PASS  and gate=unknown, not none
+  PASS  an expired-but-live lock is still EXPIRED
+  PASS  and is still declared -- the box IS claimed
+  PASS  the EXPIRED message does not say the holder is gone
+  PASS  and it says EXPIRED
+scripts/hostlock_test.sh: line 115: 196848 Killed                  sleep 60
+  PASS  an unparseable lock has no age rather than a 56-year one
+== a peer's free text cannot travel in the one-line form ==
+  PASS  --oneline omits reason entirely
+  PASS  --oneline is still exactly one line with a multi-word reason
+  PASS  the multi-line form carries the reason whole
+  PASS  and nothing executed it
+== the no-argument help covers the options it documents ==
+  PASS  help mentions --strict-reap
+  PASS  help mentions --on-gate-timeout
+  PASS  help mentions --expect-runnable
+  PASS  help mentions --oneline
+  PASS  help mentions --ttl
+  PASS  help mentions --pid
+
+== REQUIREMENTS CONFORMANCE ==
+-- R1: the holder is the outer harness, spanning every arm --
+  PASS  a per-arm anchor holds the box while its arm runs
+  PASS  and LOSES it the moment that arm ends normally -- the hole
+  PASS  a harness anchor still holds it in the same gap
+  PASS  and the row emitted in the gap names the harness
+  PASS  the two anchorings genuinely disagree
+-- R2: emitted rows carry identity, state and occupancy --
+  PASS  the row carries hostlock_state
+  PASS  the row carries declared
+  PASS  the row carries held_by
+  PASS  the row carries held_uid
+  PASS  the row carries held_pid
+  PASS  the row carries held_secs
+  PASS  the row carries takeover
+  PASS  the row carries gate
+  PASS  the row carries runnable_at_acquire
+  PASS  the row carries runnable
+  PASS  the row carries contended
+  PASS  the row carries sampled_at
+  PASS  the row's state is the real state
+  PASS  the row's owner is the real owner
+  PASS  identity is corroborated against the kernel, not just declared
+  PASS  held_uid is the HOLDER's uid, not the reader's
+  PASS  occupancy is a number, not a label
+  PASS  the row brackets the window with occupancy at acquire
+scripts/hostlock_test.sh: line 115: 199206 Killed                  spin
+scripts/hostlock_test.sh: line 115: 199207 Killed                  spin
+scripts/hostlock_test.sh: line 115: 199208 Killed                  spin
+scripts/hostlock_test.sh: line 115: 199209 Killed                  spin
+scripts/hostlock_test.sh: line 115: 199210 Killed                  spin
+scripts/hostlock_test.sh: line 115: 199211 Killed                  spin
+  PASS  occupancy tracks load the test itself created
+  PASS  runnable_at_acquire is sampled while the window is open
+  PASS  and it is the holder's stored sample, not a reading taken now
+  PASS  while the live occupancy column is still a live reading
+-- R3: FREE, HELD, STALE and EXPIRED are four distinct states --
+scripts/hostlock_test.sh: line 115: 199782 Killed                  sleep 30
+scripts/hostlock_test.sh: line 115: 200131 Killed                  sleep 30
+  PASS  the four states are FREE/HELD/STALE/EXPIRED
+  PASS  and all four are distinct
+-- R4: both expiries fail closed --
+  PASS  admission expiry fails closed (5)
+  PASS  and holds nothing afterwards
+  PASS  wait expiry on acquire fails closed (3)
+  PASS  and the incumbent still holds it
+  PASS  and is genuinely still alive, not merely named
+  PASS  run inherits the same failure, it does not run the command
+scripts/hostlock_test.sh: line 115: 204897 Killed                  sleep 300
+-- R5: reaping compares start time, not just the pid --
+  PASS  a live pid with the wrong start time is STALE, not HELD
+  PASS  and is reaped as a stale pid
+  PASS  the same pid with the right start time is HELD
+  PASS  and is not reapable
+  PASS  a live holder with no start_time keeps its box
+  PASS  and is still the owner afterwards
+  PASS  and is not labelled STALE while being treated as busy
+  PASS  the BUSY message does not tell a human the box is abandoned
+  PASS  and it names the real holder
+  PASS  a live holder with no start_time keeps its box past the grace too
+  PASS  and is still the owner after the grace lapses
+  PASS  the ttl fixture starts from a lock that is still alice's
+  PASS  an overrun live holder with no start_time is EXPIRED, not STALE
+  PASS  and the human text does not call that live pid gone
+  PASS  and it says the ttl ran out
+  PASS  a live holder with no start_time still honours its own ttl
+  PASS  and the takeover warns the holder is STILL ALIVE
+  PASS  and warns that both sets of numbers are suspect
+  PASS  and never claims it reaped a dead pid
+scripts/hostlock_test.sh: line 115: 206762 Killed                  sleep 300
+  PASS  a dead anchor with no start_time is still protected inside the grace
+  PASS  a dead anchor with no start_time is reapable past the grace
+  PASS  and that takeover is labelled unverifiable too
+  PASS  the fixture anchor really is a zombie
+  PASS  a zombie anchor with no start_time is protected inside the grace
+  PASS  a zombie anchor with no start_time is reapable past the grace, ttl=0 and all
+  PASS  an unreadable lock inside the grace is held
+  PASS  an unreadable lock past the grace is reapable
+  PASS  and the takeover is labelled unverifiable, not stale_pid
+-- R6: a SIGKILLed holder is recoverable --
+  PASS  held while the anchor lives
+scripts/hostlock_test.sh: line 115: 208704 Killed                  sleep 300
+  PASS  SIGKILL leaves the lock behind, reported STALE
+  PASS  the STALE human text says STALE, with nothing leaked in front of it
+  PASS  and status writes nothing at all on stderr for a departed pid
+  PASS  and names the owner it is about to reap
+  PASS  and says a reap is what happens next
+  PASS  and still reports occupancy, because a stale lock does not stop the load
+  PASS  the next acquirer recovers the box
+  PASS  and is told it was a takeover, not a free box
+  PASS  held while the run-form anchor lives
+  PASS  the anchor really did become a zombie
+  PASS  a zombie anchor is STALE, not HELD
+  PASS  and the box is recoverable despite ttl=0
+scripts/hostlock_test.sh: line 115: 209370 Killed                  python3 -c '
+import os, subprocess, time, sys
+c = subprocess.Popen(["sleep", "300"])
+open(sys.argv[1], "w").write(str(c.pid))
+time.sleep(6)
+c.kill()          # SIGKILL, and deliberately no wait(): the child stays a zombie
+time.sleep(90)
+' "$LOCK.zpid"
+  PASS  a live threaded harness can report state Z
+  PASS  and it still has more than one thread
+  PASS  a Z leader with live threads keeps its box
+  PASS  and is not reaped out from under the run
+  PASS  and the owner is unchanged
+scripts/hostlock_test.sh: line 115: 209855 Killed                  python3 -c '
+import ctypes, os, sys, threading, time
+open(sys.argv[1], "w").write(str(os.getpid()))
+def worker():
+    time.sleep(120)
+t = threading.Thread(target=worker, daemon=False)
+t.start()
+time.sleep(2)
+# Exit the thread-group LEADER only. The process stays alive via the worker.
+ctypes.CDLL(None).pthread_exit(None)
+' "$LOCK.zlpid"
+-- R2b: a run that did not get its cores must say so --
+  PASS  the efficiency of a real run is measured, not labelled
+  PASS  the CPU seconds reported are the ones the child says it spent
+  PASS  and the efficiency is those seconds over cores x wall, not a scaled copy
+  PASS  the verdict follows the number printed on the same row
+  PASS  a run that got what this host had to give passes the gate
+  PASS  and is reported as ok
+  PASS  a run that never touched its core fails the efficiency gate
+  PASS  and is reported as contended
+  PASS  and says which direction to disbelieve
+  PASS  and names the gate that cannot see it
+  PASS  and the lock is released even when the run is rejected
+  PASS  a run whose time is mostly kernel time still counts as using its core
+  PASS  and is reported as ok rather than under-measured
+  PASS  and it passes the same threshold the user-mode run did
+  PASS  one core of work judged against two cores is contended
+  PASS  and the row records the denominator it used
+  PASS  a failing command keeps its own exit status
+  PASS  without a threshold the run is not judged
+  PASS  but the measurement is still recorded
+  PASS  and it does not invent a denominator it was not given
+  PASS  a threshold with no denominator is a usage error
+  PASS  and the command never ran
+  PASS  and no lock was left behind
+  PASS  a run too short to measure is not certified as clean
+  PASS  and says it could not be evaluated rather than that it passed
+  PASS  --expect-cores is refused outside run
+  PASS  --min-efficiency is refused outside run
+  PASS  and refusing it did not leave a lock
+-- R2c: the measurement names its unit, and a bound inside the command is not a ceiling --
+  PASS  without --expect-cores the field is named in cores
+  PASS  with --expect-cores the field is named as a fraction
+  PASS  and the cores-form field is then absent, so neither can be misread
+  PASS  and the fraction is divided by the cores it was told to expect
+  PASS  and a bound applied outermost cannot exceed its bound
+  PASS  but a bound applied inside the command does not cap the measurement
+  PASS  a run with no reason is a usage error
+  PASS  and that run's command never ran
+  PASS  and no lock was left behind
+  PASS  a whitespace-only reason is refused too, not treated as text
+  PASS  and that command never ran either
+  PASS  $HOSTLOCK_REASON satisfies the requirement
+  PASS  and is the text that gets published to whoever is blocked
+  PASS  acquire still does not require a reason
+-- R7: the lock never kills anything it did not start --
+scripts/hostlock_test.sh: line 115: 211490 Killed                  sleep 300
+  PASS  reaping leaves the dead holder's orphaned load running
+scripts/hostlock_test.sh: line 115: 211489 Killed                  bash -c 'exec -a onnx-genai-bench-orphan sleep 300'
+  PASS  exactly one call in the kill family anywhere in the script
+  PASS  and it targets the command the script itself started
+  PASS  and the teardown guard is exactly a start-time comparison
+  PASS  cmd_run installs all three traps before it reads the child's start time
+  PASS  and there are three of them
+
+TTL: run refuses a finite TTL
+  PASS  run --ttl is refused
+  PASS  and it refuses before running the command
+  PASS  and the refusal names the process-tree remedy, so it is actionable
+  PASS  run without --ttl still runs, and records ttl=0
+  PASS  acquire --ttl is still accepted
+  PASS  run --ttl 0 is accepted, because 0 arms no takeover
+  PASS  and it is accepted quietly, not with a refusal it then ignores
+  PASS  a spaced owner is refused rather than published
+  PASS  and the refusal names the field it would have overwritten
+  PASS  no lock was taken by the refused acquire
+  PASS  a multi-word owner is refused, not silently truncated to its first word
+  PASS  a newline in the owner is refused
+  PASS  the same injection via $HOSTLOCK_OWNER is refused too
+  PASS  an ordinary owner name is still accepted
+  PASS  and its provenance row parses back to exactly one held_by
+  PASS  with the state field the row physically carries
+== which lock is this: path resolution, and saying so ==
+  PASS  with no config and no env, the lock is the documented default path
+  PASS  and is attributed to the default, not to a config nobody wrote
+  PASS  and is box-wide, which is the only scope that coordinates anything
+  PASS  a machine-local config moves the lock for every invocation on the box
+  PASS  and the row says the path came from the config
+  PASS  and a configured path is still box-wide
+  PASS  HOSTLOCK_DIR overrides the config, because it is set later and per-process
+  PASS  and is reported as PRIVATE, which is the fact that makes it dangerous
+  PASS  and attributed to the environment
+  PASS  whitespace around the value and a trailing comment are not part of the path
+  PASS  the first key wins, as the reader's head -1 does
+  PASS  a key that merely starts the same way does not move the lock
+  PASS  a commented-out key is not a key
+  PASS  a relative lock_dir is refused rather than resolved
+  PASS  and it does NOT quietly fall back to the default path
+  PASS  and says which file and which value, so it can be fixed
+  PASS  an empty lock_dir is an unusable value, not an absent key
+  PASS  the config is parsed, never sourced
+  PASS  and the value is carried literally, not expanded
+  PASS  a private lock announces itself on every invocation
+  PASS  and names the path peers are actually using, so the warning is actionable
+  PASS  and says how to acknowledge it
+  PASS  the announcement is on stderr, not in the machine-readable output
+  PASS  acknowledging it silences it
+  PASS  and the acknowledgement is explicit: any other value still warns
+  PASS  provenance carries the lock directory into the row
+  PASS  and its scope
+  PASS  and where the path came from
+  PASS  the one-line form carries the scope too, and is still one line
+  PASS  and remains exactly one line with the new fields
+== migrating off the old path cannot silently double-book the box ==
+  PASS  acquiring the new path is refused while the old one is live (2, busy)
+  PASS  and it names the holder it is deferring to
+  PASS  and takes no lock at the configured path
+  PASS  and never reaps, renames or rewrites the old lock
+  PASS  the human status names the legacy holder rather than reporting FREE alone
+  PASS  and the machine row says which path was consulted
+  PASS  and who was found there
+  PASS  run is refused for the same reason, since it acquires first
+  PASS  and the wrapped command did not run
+  PASS  an explicit private lock is not blocked by the legacy path
+  PASS  and reports no legacy consult, rather than an unexplained one
+scripts/hostlock_test.sh: line 115: 213150 Killed                  sleep 300
+  PASS  a dead legacy holder does not block the configured path
+  PASS  and the lock it took is the configured one
+  PASS  a legacy lock naming a RECYCLED pid does not block the configured path
+  PASS  a fresh legacy lock with unreadable metadata is treated as busy
+  PASS  one that aged out of the grace no longer blocks the migration
+== run hands its declared identity to the command, and only when declared ==
+  PASS  run --owner reaches the command, as the identity the lock records
+  PASS  a declared owner overrides an inherited one in the child, not just in the lock
+  PASS  an owner defaulted from the unix user is NOT exported
+  PASS  but the lock still records that defaulted owner
+  PASS  a nested hostlock inherits that identity, deliberately
+  PASS  the identity is exported in exactly one place
+  PASS  and that place is cmd_run, which is the only one with a child
+  PASS  status calls an uncreatable lock dir UNUSABLE, not FREE
+  PASS  and porcelain says so in the state field
+  PASS  porcelain names the reason rather than only the verdict
+  PASS  a usable free host emits the same key, empty
+  PASS  and still calls itself FREE
+  PASS  a writable but unsearchable parent is UNUSABLE too
+  PASS  acquire exits 7, not 1 (a bad host is not a bad argument)
+  PASS  wait exits 7 instead of announcing free
+  PASS  and prints no free announcement at all
+  PASS  the refusal names the path, so it is actionable
+  PASS  run exits 7
+  PASS  and does not run the command
+  PASS  a lock path that is a plain file is UNUSABLE
+  PASS  acquire --wait refuses instead of waiting out the timeout
+  PASS  and refuses promptly rather than blaming peers for 30s
+  PASS  a deep path under a writable ancestor is usable
+  PASS  and can actually be acquired, mkdir -p building the rest
+  PASS  a held lock still reads HELD, not UNUSABLE
+  PASS  a held-but-unwritable lock dir is BUSY, not UNUSABLE
+  PASS  an unusable configured dir refuses as 7 even while the legacy path is live
+  PASS  every assertion in this file ran
+
+passed=355 failed=0

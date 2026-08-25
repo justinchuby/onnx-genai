@@ -5,6 +5,7 @@
 //! all other cases fall back to a Cooley–Tukey radix-2 FFT (power-of-two) or naive
 //! O(N²) DFT (arbitrary length).
 
+use std::cell::Cell;
 use std::f32::consts::PI;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +22,65 @@ pub static DFT_VDSP_TEST_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Dispatch counter for the radix-2 FFT fallback path.
 pub static DFT_FFT_TEST_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// Total transforms that took *a* fast path rather than the naive O(n^2) DFT.
+///
+/// The two counters above are mutually exclusive per call and which of them
+/// fires is a platform detail: on Apple targets [`DftPlan::new`] requests a
+/// vDSP setup for every power-of-two `n >= 4`, and when vDSP returns one
+/// [`DftPlan::transform`] returns from that arm before the radix-2 counter is
+/// reached. A null setup falls through to radix-2, so neither counter alone is
+/// a reliable answer even on one target. A caller that means
+/// "this transform did not fall back to the naive path" must therefore read the
+/// sum. Reading `DFT_FFT_TEST_HITS` alone states an x86-shaped implementation
+/// detail, and on Apple targets it is unsatisfiable for any eligible `n` --
+/// which is exactly how #2089 turned an STFT assertion into a deterministic red
+/// on `Rust coverage (macOS arm64)`.
+///
+/// A test that specifically wants the *radix-2* path is a different question
+/// and must not use this: pick an `n` below the vDSP minimum and read
+/// `DFT_FFT_TEST_HITS`, as `fft_fallback_reachability` does with `n = 2`.
+///
+/// Process-global and monotonic. Prefer [`dft_fast_path_hits_this_thread`] for
+/// a delta around a specific call: this counter is shared by every thread, and
+/// the unit-test binary runs tests in parallel, so a delta taken from it is a
+/// lower bound on the caller's own transforms rather than a measurement of
+/// them.
+pub fn dft_fast_path_hits() -> u64 {
+    let hits = DFT_FFT_TEST_HITS.load(Ordering::Relaxed);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let hits = hits + DFT_VDSP_TEST_HITS.load(Ordering::Relaxed);
+    hits
+}
+
+thread_local! {
+    /// Per-thread mirror of [`dft_fast_path_hits`].
+    static LOCAL_FAST_PATH_HITS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Fast-path transforms performed *on the calling thread*.
+///
+/// The process-global counters cannot express "this call took a fast path".
+/// A test differences them around a call and asserts `after - before >= k`,
+/// but the true delta is `own + other`, where `other` is whatever concurrent
+/// tests transformed inside the same window. `own >= k` implies the assertion
+/// holds, so a global delta never yields a false red -- but the converse is
+/// what a regression guard needs, and it does not hold: a frame dropping to
+/// the naive path (`own = k - 1`) is masked whenever a concurrent test
+/// contributes one hit. The assertion then passes without having measured
+/// anything about the code under test.
+///
+/// This counter is not shared, so a delta around a call is exactly that
+/// call's fast-path count -- provided the work happens on the calling thread,
+/// which holds for `Dft` and `Stft`: neither fans out. Callers that fan out
+/// must use the global counters and accept the lower bound.
+pub fn dft_fast_path_hits_this_thread() -> u64 {
+    LOCAL_FAST_PATH_HITS.with(Cell::get)
+}
+
+fn record_fast_path_hit() {
+    LOCAL_FAST_PATH_HITS.with(|hits| hits.set(hits.get().wrapping_add(1)));
+}
 
 pub struct DftFactory;
 
@@ -339,11 +399,13 @@ impl DftPlan {
                 }
             }
             DFT_VDSP_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+            record_fast_path_hit();
             return;
         }
 
         if self.n.is_power_of_two() && self.n > 1 {
             DFT_FFT_TEST_HITS.fetch_add(1, Ordering::Relaxed);
+            record_fast_path_hit();
             real_out.copy_from_slice(real_in);
             imag_out.copy_from_slice(imag_in);
             fft_radix2_in_place(real_out, imag_out, self.inverse);
@@ -700,5 +762,43 @@ mod tests {
         assert!((r[0]).abs() < 1e-6, "DC real = {}", r[0]);
         assert!((r[1] - 2.0).abs() < 1e-6, "bin[1] real = {}", r[1]);
         assert!(i[0].abs() < 1e-6 && i[1].abs() < 1e-6);
+    }
+
+    /// The cross-platform counterpart of [`fft_fallback_reachability`], and the
+    /// regression guard for #2089.
+    ///
+    /// That test deliberately uses `n = 2`, which is below the vDSP minimum, so
+    /// it says nothing about the sizes production actually transforms. `n = 4`
+    /// is the *first* length for which [`DftPlan::new`] builds a vDSP setup, so
+    /// it is exactly the size at which the two platforms diverge: Linux and
+    /// Windows reach the radix-2 counter, Apple returns from the vDSP arm
+    /// before it. Asserting on the fast-path counter is what makes the claim
+    /// -- "an eligible power-of-two length does not fall back to the naive
+    /// O(n^2) transform" -- true on every target rather than on x86 only.
+    ///
+    /// This fails on macOS against the pre-#2089 code and passes here, which is
+    /// the only property that distinguishes the fix from deleting the
+    /// assertion.
+    #[test]
+    fn an_eligible_power_of_two_takes_a_fast_path_on_every_target() {
+        let n = 4usize;
+        let real = vec![1.0f32, 2.0, 3.0, 4.0];
+        let imag = vec![0.0f32; n];
+
+        let before = dft_fast_path_hits_this_thread();
+        let (r, i) = compute_dft(&real, &imag, n, false, false);
+        let after = dft_fast_path_hits_this_thread();
+        assert_eq!(
+            after,
+            before + 1,
+            "n={n} is vDSP-eligible and power-of-two, so it must take a fast path on \
+             every target (before={before}, after={after})"
+        );
+
+        // Independent of which fast path served it: DC is the sum, and bin 2 is
+        // the alternating sum.
+        assert!((r[0] - 10.0).abs() < 1e-5, "DC real = {}", r[0]);
+        assert!(i[0].abs() < 1e-5, "DC imag = {}", i[0]);
+        assert!((r[2] + 2.0).abs() < 1e-5, "bin[2] real = {}", r[2]);
     }
 }
