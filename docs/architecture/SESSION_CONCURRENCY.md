@@ -400,6 +400,11 @@ reason.
   weights are charged once while every worker-local KV pool is charged once
   against one aggregate host ceiling rather than receiving a private copy of
   that ceiling.
+  The server retains a read-only `EngineMemoryAccounting` handle to those live
+  ledgers and rewrites device, host, and disk usage/headroom whenever
+  `/v1/resources` or metrics takes a snapshot. Worker allocation, failure, and
+  teardown are therefore visible without routing an observability command
+  through worker 0.
   Underneath,
   `ByteBudget` is already `Arc<Mutex<BudgetState>>` and documents itself as *"A
   shared, dynamic, cross-session KV byte budget"* whose clones "account against a

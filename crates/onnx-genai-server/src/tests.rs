@@ -1596,6 +1596,104 @@ async fn status_reports_each_configured_ort_worker() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_and_metrics_track_worker1_host_release_without_worker0_command() {
+    let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
+    let state = AppState::load_with_config(
+        &model_dir,
+        Some("tiny-llm".to_string()),
+        ServerConfig {
+            ort_session_workers: OrtSessionWorkerCount::new(2).unwrap(),
+            ..ServerConfig::default()
+        },
+    )
+    .expect("load fixture with two ORT workers");
+    let handle = state.registry.resolve("").unwrap().unwrap();
+    let worker0_at_ready = handle
+        .engine
+        .resource_snapshot
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .host_ram
+        .used;
+    let router = app(state.clone());
+
+    let before = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let before = json_body(before).await;
+    let both_workers = before["host_ram"]["used"].as_u64().unwrap();
+    assert!(
+        both_workers > worker0_at_ready,
+        "worker 1 allocation must be visible through /v1/resources"
+    );
+
+    handle
+        .engine
+        .workers
+        .sender_for(crate::worker::WorkerId::new(1))
+        .unwrap()
+        .send(DriverCommand::Panic)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if handle.engine.worker_statuses()[1].worker.health
+                == crate::worker::WorkerHealth::Failed
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker 1 reports failure");
+
+    let after = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/resources")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let after = json_body(after).await;
+    let worker0_only = after["host_ram"]["used"].as_u64().unwrap();
+    assert_eq!(worker0_only, worker0_at_ready);
+
+    let metrics = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let metrics = String::from_utf8(
+        to_bytes(metrics.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        metrics.contains(&format!("onnx_genai_host_ram_used_bytes {worker0_only}\n")),
+        "metrics must use the same live shared-ledger snapshot:\n{metrics}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multiple_workers_still_refuse_a_second_turn_on_one_session() {
     let model_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny-llm");
     let state = AppState::load_with_config(

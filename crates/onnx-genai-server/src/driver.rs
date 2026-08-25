@@ -11,8 +11,8 @@ use onnx_genai::{
 };
 use onnx_genai_engine::{
     BatchingCapability, ContinuousBatchAdmission, ContinuousBatchEvent, ContinuousBatchHandle,
-    ContinuousBatchManager, DeviceMemoryAuthority, EmbeddingOptions, EncodedAudio,
-    EngineGovernorError, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
+    ContinuousBatchManager, EmbeddingOptions, EncodedAudio, EngineGovernorError,
+    EngineMemoryAccounting, FimConfig, GovernorSnapshot, KvNotApplicable, KvTelemetry,
     MemoryStrategyPlan, OrtEngineWorkerFactory, PipelineGenerateRequest, ResourceLimit,
     SchedulerAdmissionError,
 };
@@ -54,7 +54,8 @@ pub(crate) struct EngineDriver {
     /// Latest engine-ledger snapshot, readable without a driver-thread round trip.
     pub(crate) resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     pub(crate) memory_strategy_plan: Arc<MemoryStrategyPlan>,
-    pub(crate) device_authority: Option<DeviceMemoryAuthority>,
+    /// Live model-wide device/host/disk ledgers shared by every worker.
+    pub(crate) memory_accounting: Option<EngineMemoryAccounting>,
     /// Honest, decode-path-sourced batching report for this engine, resolved at
     /// startup. Surfaced over `/v1/resources` and `/v1/debug/kv` so an operator
     /// sees `batch_supported=false` / effective max batch = 1 directly instead of
@@ -394,7 +395,7 @@ struct EngineWorkerReady {
     kv_telemetry: Arc<KvTelemetry>,
     resource_snapshot: Arc<Mutex<Option<GovernorSnapshot>>>,
     memory_strategy_plan: Arc<MemoryStrategyPlan>,
-    device_authority: Option<DeviceMemoryAuthority>,
+    memory_accounting: Option<EngineMemoryAccounting>,
     workflow_facts: WorkflowFacts,
 }
 
@@ -413,7 +414,7 @@ fn prepare_engine_worker<DropProbe>(
     ));
     let effective_max_batch = batching.effective_max_batch;
     let continuous_batch_supported = engine.continuous_batch_manager(effective_max_batch).is_ok();
-    let device_authority = Some(engine.governor().device_authority());
+    let memory_accounting = Some(engine.governor().memory_accounting());
     let kv_telemetry = Arc::new(KvTelemetry::default());
     if engine.attach_kv_telemetry(Arc::clone(&kv_telemetry)) {
         kv_telemetry.set_applicable();
@@ -432,7 +433,7 @@ fn prepare_engine_worker<DropProbe>(
         kv_telemetry,
         resource_snapshot: Arc::clone(&resource_snapshot),
         memory_strategy_plan,
-        device_authority,
+        memory_accounting,
         workflow_facts,
     };
     (
@@ -666,7 +667,7 @@ impl EngineDriver {
                 kv_telemetry: Arc::clone(&first_ready.kv_telemetry),
                 resource_snapshot: first_ready.resource_snapshot,
                 memory_strategy_plan: first_ready.memory_strategy_plan,
-                device_authority: first_ready.device_authority,
+                memory_accounting: first_ready.memory_accounting,
                 batching: first_ready.batching,
                 workflow_facts: first_ready.workflow_facts,
                 worker_kv_telemetry,
@@ -1197,22 +1198,8 @@ impl EngineDriver {
             .expect("resource snapshot mirror lock poisoned")
             .clone()
             .ok_or_else(|| anyhow::anyhow!("resource governor is not available for this model"))?;
-        if let Some(authority) = &self.device_authority {
-            let used = authority.used_bytes();
-            let limit = authority.limit_bytes();
-            snapshot.vram.used = used;
-            snapshot.vram.limit = limit;
-            snapshot.vram.headroom = limit.saturating_sub(used);
-            // `resolved_limits.vram_bytes` is the *resolved device (VRAM)
-            // capacity limit*, which stays `None` when the device capacity could
-            // not be measured (#947). The shared authority's ceiling on such a
-            // box is the host-RAM-derived advisory bound, not a measured VRAM
-            // capacity, so it is surfaced through `vram.limit` only and must not
-            // be relabelled here as a resolved VRAM capacity. When the device WAS
-            // measured, refresh it to the shared authority's live ceiling.
-            if snapshot.resolved_limits.vram_bytes.is_some() {
-                snapshot.resolved_limits.vram_bytes = Some(limit);
-            }
+        if let Some(accounting) = &self.memory_accounting {
+            accounting.refresh_snapshot(&mut snapshot);
         }
         Ok(snapshot)
     }
@@ -1231,8 +1218,15 @@ impl EngineDriver {
             .send(DriverCommand::SetVramLimit { limit, reply })
             .await
             .map_err(|_| anyhow::anyhow!("engine driver stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("engine driver stopped"))?
+        let mut result = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("engine driver stopped"))??;
+        if let Ok(snapshot) = &mut result
+            && let Some(accounting) = &self.memory_accounting
+        {
+            accounting.refresh_snapshot(snapshot);
+        }
+        Ok(result)
     }
 }
 
@@ -2501,6 +2495,72 @@ mod admission_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn w2_resource_snapshot_tracks_worker1_host_release_without_worker0_command() {
+        let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/tiny-llm");
+        let model_directory =
+            onnx_genai_ort::ModelDirectory::load(&model_dir).expect("resolve tiny fixture");
+        let config = onnx_genai_engine::EngineConfig {
+            decode_backend: onnx_genai_engine::EngineDecodeBackend::Ort,
+            ..onnx_genai_engine::EngineConfig::default()
+        };
+        let build_config = config.clone();
+        let (driver, ()) = EngineDriver::start_ort_workers(
+            move || {
+                let engine = Engine::from_dir(&model_dir, build_config.clone())?;
+                let factory = Arc::new(
+                    engine
+                        .ort_worker_factory(model_directory, build_config)
+                        .expect("CPU ORT session supports concurrent Run"),
+                );
+                Ok((engine, (), factory))
+            },
+            2,
+            1,
+            8,
+        )
+        .expect("start two ORT workers");
+
+        let worker0_at_ready = driver
+            .resource_snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("worker 0 readiness snapshot");
+        let both_workers = driver.resource_snapshot().await.unwrap();
+        assert!(
+            both_workers.host_ram.used > worker0_at_ready.host_ram.used,
+            "worker 1 KV allocation must appear without a worker 0 refresh: worker0={}, live={}",
+            worker0_at_ready.host_ram.used,
+            both_workers.host_ram.used,
+        );
+
+        driver
+            .workers
+            .sender_for(WorkerId::new(1))
+            .unwrap()
+            .send(DriverCommand::Panic)
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while driver.worker_statuses()[1].worker.health != crate::worker::WorkerHealth::Failed {
+            assert!(Instant::now() < deadline, "worker 1 did not report failure");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let after_worker1_failure = driver.resource_snapshot().await.unwrap();
+        assert_eq!(
+            after_worker1_failure.host_ram.used, worker0_at_ready.host_ram.used,
+            "worker 1 KV release must disappear without executing a worker 0 command",
+        );
+
+        driver.shutdown();
+        let after_teardown = driver.resource_snapshot().await.unwrap();
+        assert_eq!(after_teardown.host_ram.used, 0);
+        assert_eq!(after_teardown.vram.used, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_worker_failure_loses_only_its_sessions() {
         let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/tiny-llm");
@@ -2885,7 +2945,7 @@ mod admission_tests {
             worker_kv_telemetry: Arc::new(vec![Arc::new(KvTelemetry::default())]),
             resource_snapshot: Arc::new(Mutex::new(Some(snapshot.clone()))),
             memory_strategy_plan: Arc::new(engine.memory_strategy_plan().clone()),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::from_capability(
                 &engine.batching_capability(),
                 1,
@@ -3119,7 +3179,7 @@ mod admission_tests {
                 None,
                 "driver test stub",
             )),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::single_sequence_stub()),
         };
         let elsewhere = SessionPlacement::new(WorkerId::new(4), 1);
@@ -3172,7 +3232,7 @@ mod admission_tests {
                 None,
                 "driver test stub",
             )),
-            device_authority: None,
+            memory_accounting: None,
             batching: Arc::new(BatchingReport::single_sequence_stub()),
         };
         let session = SessionPlacement::new(WorkerId::PRIMARY, 7);
