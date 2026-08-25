@@ -2481,6 +2481,7 @@ dependencies = [
  "onnx-runtime-ep-plugin",
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
+ "onnx-std",
 ]
 
 [[package]]

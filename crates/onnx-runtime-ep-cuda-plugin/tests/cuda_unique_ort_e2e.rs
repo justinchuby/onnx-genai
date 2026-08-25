@@ -166,8 +166,10 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
         .join("tests")
         .join("fixtures")
         .join(model)
-        .join("model.onnx");
-    let bytes = std::fs::read(&fixture).unwrap();
+        .join("model.onnx.textproto");
+    let text = std::fs::read_to_string(&fixture).unwrap();
+    verify_fixture(model, &text);
+    let bytes = onnx_std::textproto::to_binary(&text).unwrap();
     let mut session = ptr::null_mut();
     unsafe {
         check(
@@ -191,6 +193,89 @@ unsafe fn session(model: &str, registration: &str) -> Option<Session> {
         session,
         registration,
     })
+}
+
+fn verify_fixture(name: &str, text: &str) {
+    use onnx_runtime_ir::{Attribute, DataType};
+
+    let model = onnx_std::textproto::from_textproto(text)
+        .unwrap_or_else(|error| panic!("{name}: parse textproto: {error}"));
+    assert_eq!(model.metadata.ir_version, 11, "{name}: IR version");
+    assert_eq!(
+        model.graph.opset_imports.get("").copied(),
+        Some(24),
+        "{name}: ai.onnx opset"
+    );
+    assert!(model.graph.initializers.is_empty(), "{name}: initializers");
+    assert_eq!(model.graph.inputs.len(), 1, "{name}: graph inputs");
+    let input = model.graph.value(model.graph.inputs[0]);
+    assert_eq!(input.name.as_deref(), Some("X"), "{name}: input name");
+    assert_eq!(input.dtype, DataType::Float32, "{name}: input dtype");
+
+    let nodes: Vec<_> = model.graph.nodes.iter().map(|(_, node)| node).collect();
+    assert_eq!(nodes.len(), 1, "{name}: node count");
+    let node = nodes[0];
+    assert_eq!(node.op_type, "Unique", "{name}: op type");
+    assert_eq!(node.inputs.len(), 1, "{name}: node input slots");
+    assert_eq!(node.outputs.len(), 4, "{name}: positional output slots");
+    let sorted = match node.attr("sorted") {
+        Some(Attribute::Int(value)) => *value,
+        other => panic!("{name}: expected integer sorted attribute, got {other:?}"),
+    };
+
+    let output_names: Vec<_> = node
+        .outputs
+        .iter()
+        .map(|&output| model.graph.value(output).name.as_deref())
+        .collect();
+    let graph_outputs: Vec<_> = model
+        .graph
+        .outputs
+        .iter()
+        .map(|&output| {
+            let value = model.graph.value(output);
+            (value.name.as_deref(), value.dtype)
+        })
+        .collect();
+    match name {
+        "unique_all_outputs" => {
+            assert_eq!(sorted, 1);
+            assert_eq!(
+                output_names,
+                [
+                    Some("Y"),
+                    Some("indices"),
+                    Some("inverse_indices"),
+                    Some("counts")
+                ]
+            );
+            assert_eq!(
+                graph_outputs,
+                [
+                    (Some("Y"), DataType::Float32),
+                    (Some("indices"), DataType::Int64),
+                    (Some("inverse_indices"), DataType::Int64),
+                    (Some("counts"), DataType::Int64),
+                ]
+            );
+        }
+        "unique_optional_subset" => {
+            assert_eq!(sorted, 1);
+            assert_eq!(
+                output_names,
+                [Some("Y"), None, Some("inverse_indices"), None],
+                "{name}: optional middle/trailing slots"
+            );
+            assert_eq!(
+                graph_outputs,
+                [
+                    (Some("Y"), DataType::Float32),
+                    (Some("inverse_indices"), DataType::Int64),
+                ]
+            );
+        }
+        other => panic!("unexpected CUDA Unique fixture {other}"),
+    }
 }
 
 unsafe fn input(api: *const ort::OrtApi, values: &mut [f32]) -> *mut ort::OrtValue {
@@ -385,10 +470,10 @@ fn cuda_unique_is_claimed_and_materialized_through_real_ort_plugin() {
             .map(|output| output_bytes(session.api, *output))
             .collect();
         assert_eq!(got[0].0, [4]);
-        assert_eq!(f32s(&got[0].2), [2., 1., 3., 4.]);
-        assert_eq!(i64s(&got[1].2), [0, 1, 3, 4]);
-        assert_eq!(i64s(&got[2].2), [0, 1, 1, 2, 3, 2]);
-        assert_eq!(i64s(&got[3].2), [1, 2, 2, 1]);
+        assert_eq!(f32s(&got[0].2), [1., 2., 3., 4.]);
+        assert_eq!(i64s(&got[1].2), [1, 0, 3, 4]);
+        assert_eq!(i64s(&got[2].2), [1, 0, 0, 2, 3, 2]);
+        assert_eq!(i64s(&got[3].2), [2, 1, 2, 1]);
         assert_eq!(metadata_launches(), 1);
         assert_eq!(materialize_launches(), 1);
         assert_eq!(d2h_bytes(), 8);
