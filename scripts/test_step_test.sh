@@ -260,9 +260,27 @@ done
 # step needs no guard.
 
 unguarded_filtered_steps() {
-    awk '
-        function flush(   i, n, tok, parts, skip, j, m, frags, v, vars, nv, tmp) {
-            if (block == "" || block !~ /cargo test/) return
+    awk -v mode="${2:-}" '
+        # Replace `$name` / `${name}` with the opaque-expansion sentinel, but
+        # only at a real word boundary: `$packages` must not match inside
+        # `$packages_extra`. POSIX awk has no lookahead, so this inspects the
+        # character after the match instead of asserting on it.
+        function blank_var(text, name,   out, after) {
+            out = ""
+            while (match(text, "\\$\\{?" name "\\}?")) {
+                after = substr(text, RSTART + RLENGTH, 1)
+                if (after ~ /[A-Za-z0-9_]/)
+                    out = out substr(text, 1, RSTART + RLENGTH - 1)
+                else
+                    out = out substr(text, 1, RSTART - 1) " @@SUB@@ "
+                text = substr(text, RSTART + RLENGTH)
+            }
+            return out text
+        }
+        function flush(   i, n, tok, parts, skip, j, m, frags, v, vars, nv, tmp, first) {
+            # `cargo llvm-cov` runs the tests too, and so does a `+toolchain`
+            # form, so a bare filter is exactly as silent there.
+            if (block == "" || block !~ /cargo[ \t]+(\+[^ \t]+[ \t]+)?(test|llvm-cov)/) return
             if (block ~ /run_test_step/) return
             # A variable assigned from `$(...)` is opaque in exactly the way the
             # substitution itself is, and the cell below proves those generators
@@ -277,15 +295,19 @@ unguarded_filtered_steps() {
                 vars[++nv] = v
                 tmp = substr(tmp, RSTART + RLENGTH)
             }
-            # `$(...)` is opaque to a static scan. Blank it out here so it is
-            # not misread as a positional -- and note that doing so would open
-            # a quiet hole, which the cell below closes by EXECUTING each one
-            # and proving it expands to options only.
-            gsub(/\$\([^)]*\)/, " ", block)
+            # `$(...)` is opaque to a static scan. Stand a sentinel in its place
+            # -- note *a token*, not a blank. Blanking it lets the preceding
+            # option swallow the word after it, so `--features $list my::filter::`
+            # reads as `--features my::filter::` and the filter disappears. The
+            # sentinel keeps the argument count honest, and the token loop below
+            # treats it as opaque rather than as a selector because the cell
+            # further down EXECUTES every generator and proves it emits options.
+            gsub(/\$\([^)]*\)/, " @@SUB@@ ", block)
             for (j = 1; j <= nv; j++) {
-                gsub("\\$\\{?" vars[j] "\\}?", " ", block)
+                block = blank_var(block, vars[j])
                 gsub(vars[j] "=", " ", block)
             }
+            if (mode == "scan") { print name; return }
             # A block can be a script rather than a single command. Scan only
             # the statement that runs cargo: a guard or an error message beside
             # it is not a selector, and reading the whole block as one command
@@ -294,21 +316,36 @@ unguarded_filtered_steps() {
             # the accumulator preserved as @@NL@@ for exactly this reason.
             m = split(block, frags, /(\|\||&&|;|@@NL@@)/)
             for (j = 1; j <= m; j++) {
-                if (frags[j] !~ /cargo test/) continue
+                if (frags[j] !~ /cargo[ \t]+(\+[^ \t]+[ \t]+)?(test|llvm-cov)/) continue
                 n = split(frags[j], parts, /[ \t]+/)
+                # The invocation has to BE the fragment, not sit inside a shell
+                # construct: `if cargo llvm-cov --version | grep -q ...` is a
+                # capability probe, and reading its words as cargo arguments
+                # reports `if` and `grep` as name filters.
+                first = ""
+                for (i = 1; i <= n; i++)
+                    if (parts[i] != "") { first = parts[i]; break }
+                if (first !~ /^(cargo|env|sudo|bash|taskset|[A-Z_]+=.*)$/) continue
                 skip = 0
                 for (i = 1; i <= n; i++) {
                     tok = parts[i]
                     if (tok == "" || tok == "\\") continue
                     if (skip) { skip = 0; continue }
+                    # The stand-in for a `$(...)`/`$var` expansion. Opaque, and
+                    # proven options-only by the cell below, so it is neither a
+                    # selector nor eligible to be eaten as the value of an
+                    # option -- the `skip` test above deliberately runs first so
+                    # that `--features @@SUB@@ my::filter::` still reports the
+                    # filter rather than swallowing it.
+                    if (tok == "@@SUB@@") continue
                     if (tok ~ /^-/) {
                         # Options that consume the following token as their value.
-                        if (tok ~ /^(-p|--package|--test|--bench|--example|--bin|--features|--target|--target-dir|--manifest-path|--profile|-j|--jobs|--color|--message-format|--exclude)$/)
+                        if (tok ~ /^(-p|--package|--test|--bench|--example|--bin|--features|--target|--target-dir|--manifest-path|--profile|-j|--jobs|--color|--message-format|--exclude|--output-path)$/)
                             skip = 1
                         continue
                     }
                     # Words that are part of the invocation itself, not selectors.
-                    if (tok ~ /^(cargo|test|env|bash|sudo|run:|[A-Z_]+=.*)$/) continue
+                    if (tok ~ /^(cargo|test|llvm-cov|env|bash|sudo|taskset|run:|\+[^ ]+|[A-Z_]+=.*)$/) continue
                     print name
                     return
                 }
@@ -352,6 +389,26 @@ check "no cargo test step in ci.yml carries an unguarded name filter" \
     "$([ -z "$STRAY" ] && echo 0 || echo 1)" \
     "these steps select tests by name outside run_test_step, so an empty filter is green: $STRAY"
 
+# The check above passes by printing nothing, which is also what a scanner that
+# stopped matching `ci.yml` prints. Its exact-indent anchors (`^      - name:`,
+# `^        run:`) make that a live risk: a reindent, or a step shape the
+# accumulator does not recognise, silently empties the scan and the assertion
+# reads as a clean bill of health. The MUTATION cell below proves the detector
+# works on a synthetic file; this proves it worked on the real one. `scan` mode
+# reuses the same predicate rather than reimplementing it, so it cannot agree
+# with a scanner it is not actually sharing.
+SCANNED="$(unguarded_filtered_steps "$CI" scan)"
+SCANNED_COUNT="$(printf '%s\n' "$SCANNED" | grep -c '[^[:space:]]' || true)"
+check "...and the scan actually reached ci.yml (not a pass by reading nothing)" \
+    "$([ "$SCANNED_COUNT" -ge 8 ] && echo 0 || echo 1)" \
+    "expected the scanner to examine at least 8 test-running steps, it examined $SCANNED_COUNT"
+
+# Cardinality is not identity: a scanner that matched eight of the wrong steps
+# also reports eight. Name one the required lane depends on.
+check "...including the required lane's own test step, by name" \
+    "$(printf '%s\n' "$SCANNED" | grep -qx "Test Linux offline crates" && echo 0 || echo 1)" \
+    "the scan never examined 'Test Linux offline crates'; it saw: $(printf '%s' "$SCANNED" | paste -sd',' -)"
+
 # And the detector itself, by mutation: a synthetic unguarded filtered step
 # must be found. A scanner that reports "nothing unguarded" because it parses
 # nothing is the same vacuous pass this whole file exists to refuse.
@@ -384,11 +441,44 @@ cat > "$WORK/mutant.yml" <<'YAML'
         run: |
           packages="kernels::something::"
           cargo test --locked $packages
+      - name: A step whose filter follows a blanked option value
+        run: |
+          feats="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          cargo test --locked -p some-crate --features $feats kernels::something::
+      - name: A step whose filter follows an inline substitution
+        run: >-
+          cargo test --locked -p some-crate
+          --features $(python .github/scripts/workspace_test_packages.py cargo-args lint)
+          kernels::something::
+      - name: A guarded llvm-cov step
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args offline-linux)"
+          test -n "$packages" || { echo "::error::empty"; exit 1; }
+          cargo llvm-cov --locked --codecov --output-path cov.json $packages
+      - name: An unguarded filtered llvm-cov step
+        run: >-
+          cargo llvm-cov --locked
+          --codecov --output-path cov.json
+          -p some-crate
+          kernels::something::
+      - name: A step naming a variable that only shares a prefix
+        run: |
+          packages="$(python .github/scripts/workspace_test_packages.py cargo-args lint)"
+          packages_extra="$(python .github/scripts/workspace_test_packages.py cargo-args linux-only)"
+          cargo test --locked $packages_extra
+      - name: A cargo llvm-cov capability probe
+        run: |
+          if cargo llvm-cov --version 2>/dev/null | grep -q 0.5; then
+            echo present
+          fi
 YAML
 MUT="$(unguarded_filtered_steps "$WORK/mutant.yml")"
 WANT="An unguarded filtered step
 A guarded-form step with a filter
-A step whose variable is not a generator"
+A step whose variable is not a generator
+A step whose filter follows a blanked option value
+A step whose filter follows an inline substitution
+An unguarded filtered llvm-cov step"
 check "MUTATION: the detector finds an unguarded filtered step" \
     "$([ "$MUT" = "$WANT" ] && echo 0 || echo 1)" \
     "expected exactly [$WANT], got: [$MUT]"
@@ -519,7 +609,7 @@ check "MUTATION: both a new subcommand and a misplaced checker are refused" \
     "expected exactly the two offenders, got: [$MUT_SUB]"
 
 echo ""
-EXPECTED=36
+EXPECTED=38
 TOTAL=$((PASS + FAIL))
 if [ "$TOTAL" -ne "$EXPECTED" ]; then
     echo "✗ $TOTAL assertions ran, expected $EXPECTED — a cell was added or lost" >&2

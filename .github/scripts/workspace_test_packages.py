@@ -134,6 +134,16 @@ _GENERATOR_ASSIGN = re.compile(
     r"^([A-Za-z_][A-Za-z0-9_]*)=\"?\$\(\s*python3?\s+"
     r"\.github/scripts/workspace_test_packages\.py\s+cargo-args\s+[a-z-]+\s*\)"
 )
+# Any assignment to a shell name. Needed so a later non-generator assignment
+# shadows an earlier generator one, which is the property `packages_tested_by`
+# already documents; recording only generator assignments would let
+# `packages="$(... lint)"` followed by `packages="-p one-crate"` keep crediting
+# the whole lint lane.
+_ANY_ASSIGN = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+# A YAML key or list item, at the indentation that ends a step. The forward
+# scan in `clippy_blocks` already refuses to cross one of these; the backwards
+# walk has to refuse the same boundary or it reads into the step above.
+_STEP_BOUNDARY = re.compile(r"\s*(-\s+\w+:|\w[\w-]*:)")
 
 
 def _generator_vars_before(lines: list[str], index: int, base: int) -> dict[str, str]:
@@ -145,25 +155,49 @@ def _generator_vars_before(lines: list[str], index: int, base: int) -> dict[str,
     the default members instead of the lane. Binding it moves the lane name off
     the invocation line and out of the text `clippy_blocks` returns.
 
-    The read is deliberately narrow in both directions. It stops at the first
-    line indented less than the invocation, so it cannot walk out of the step
-    into the one above; and `clippy_blocks` appends what it finds only when the
-    invocation actually references the variable. Crediting every assignment in
-    scope would be a join rather than a dataflow read, and this scanner's whole
-    documented risk is over-reading.
+    The read is deliberately narrow in both directions. It stops at a blank
+    line, at a line indented less than the invocation, and at a YAML key or
+    list item at or below that indentation -- the same boundary the forward
+    scan refuses to cross, because a `- run:` step carrying no `name:` sits at
+    the invocation's own indentation and `indent < base` alone would walk
+    straight through it into the step above. `clippy_blocks` then appends what
+    it finds only when the invocation actually references the variable.
+    Crediting every assignment in scope would be a join rather than a dataflow
+    read, and this scanner's whole documented risk is over-reading.
     """
     assigned: dict[str, str] = {}
+    shadowed: set[str] = set()
+    # If the invocation line is itself the list item or carries the `run:` key,
+    # its block starts there and has no earlier lines. Walking anyway would
+    # cross into the step above, whose body is indented *deeper* than a `- run:`
+    # line -- so the indent and boundary tests below never fire and the whole
+    # previous step is read as if it were this one's.
+    opening = lines[index].lstrip()
+    if opening.startswith("- ") or re.match(r"(-\s+)?[\w-]+:", opening):
+        return assigned
     for position in range(index - 1, -1, -1):
         line = lines[position]
         if not line.strip():
             break
         stripped = line.lstrip()
-        if len(line) - len(stripped) < base:
+        indent = len(line) - len(stripped)
+        if indent < base:
             break
-        match = _GENERATOR_ASSIGN.match(stripped)
-        if match:
-            # Nearest assignment wins: a later one replaces an earlier one.
-            assigned.setdefault(match.group(1), line)
+        if indent <= base and _STEP_BOUNDARY.match(stripped):
+            break
+        assignment = _ANY_ASSIGN.match(stripped)
+        if not assignment:
+            continue
+        # Walking backwards, the first assignment seen is the last one that
+        # ran, so a plain assignment here shadows a generator assignment above
+        # it and the lane must not be credited.
+        name = assignment.group(1)
+        if name in assigned or name in shadowed:
+            continue
+        if _GENERATOR_ASSIGN.match(stripped):
+            assigned[name] = line
+        else:
+            shadowed.add(name)
     return assigned
 
 
@@ -218,9 +252,11 @@ def clippy_blocks(lines: list[str]) -> list[str]:
         if after:
             text = text[: after.start()]
         # Recover a package list the invocation reads from a variable, but only
-        # the ones it actually names. See `_generator_vars_before`.
+        # the ones it actually names. The trailing boundary matters: without it
+        # `$packages` matches inside `$packages_extra` and credits a lane the
+        # invocation never used. See `_generator_vars_before`.
         for variable, source in _generator_vars_before(lines, index, base).items():
-            if re.search(r"\$\{?" + re.escape(variable) + r"\}?", text):
+            if re.search(r"\$\{?" + re.escape(variable) + r"\}?(?![A-Za-z0-9_])", text):
                 text = f"{text}\n{source}"
         found.append(text)
     return found
@@ -1311,39 +1347,70 @@ def _probe_guarded_assignment(used: bool = True) -> int:
     return 0
 
 
-def _probe_clippy_generator_var(referenced: bool = True) -> int:
+def _probe_clippy_generator_var(shape: str = "referenced") -> int:
     """Attribution probe for a clippy step whose package list is in a variable.
 
-    `referenced=True` is the form the workflow ships. `referenced=False` is the
-    mutation that matters: the assignment is still in the step, and the
-    invocation never mentions it. Crediting the lane there would turn the
-    backwards read into a join, which is the over-read `clippy_blocks` exists
-    to prevent -- and it fails quietly, because an over-credited package looks
-    linted and nothing says otherwise.
+    `referenced` is the form the workflow ships. Every other shape is a way the
+    backwards read could become a join, and each one fails quietly if it
+    regresses: an over-credited package looks linted and nothing says
+    otherwise, so `verify` stays green while the coverage claim is false.
+
+    * `unreferenced` -- the assignment is in the step and the invocation never
+      mentions it.
+    * `prefix` -- the invocation names `$packages_extra`, which contains the
+      assigned name as a prefix.
+    * `shadowed` -- a plain assignment replaces the generator before the
+      invocation runs, which is the property `packages_tested_by` documents.
+    * `neighbour` -- the assignment belongs to the *previous* step, and the
+      clippy step carries no `name:` so it sits at the invocation's own
+      indentation.
     """
-    resolver = "python .github/scripts/workspace_test_packages.py cargo-args linux-only"
-    invocation = (
-        "          cargo clippy --locked --all-targets $packages -- -D warnings"
-        if referenced
-        else "          cargo clippy --locked --all-targets -p onnx-genai-cli -- -D warnings"
-    )
-    text = "\n".join(
-        [
-            "      - name: Clippy offline crates",
-            "        shell: bash",
-            "        run: |",
-            f'          packages="$({resolver})"',
-            '          test -n "$packages" || { echo "::error::empty"; exit 1; }',
-            invocation,
+    lane = "python .github/scripts/workspace_test_packages.py cargo-args linux-only"
+    step = [
+        "      - name: Clippy offline crates",
+        "        shell: bash",
+        "        run: |",
+        f'          packages="$({lane})"',
+        '          test -n "$packages" || { echo "::error::empty"; exit 1; }',
+    ]
+    if shape == "referenced":
+        lines = step + ["          cargo clippy --locked --all-targets $packages -- -D warnings"]
+        want = set(lane_packages("linux-only"))
+    elif shape == "unreferenced":
+        lines = step + [
+            "          cargo clippy --locked --all-targets -p onnx-genai-cli -- -D warnings"
         ]
-    )
+        want = {"onnx-genai-cli"}
+    elif shape == "prefix":
+        lines = step + [
+            '          packages_extra="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages_extra"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "shadowed":
+        lines = step + [
+            '          packages="-p onnx-genai-cli"',
+            "          cargo clippy --locked --all-targets $packages"
+            " -p onnx-genai-cli -- -D warnings",
+        ]
+        want = {"onnx-genai-cli"}
+    elif shape == "neighbour":
+        lines = step + [
+            "          cargo test --locked $packages",
+            "      - run: cargo clippy --locked --all-targets $packages -- -D warnings",
+        ]
+        want = set()
+    else:  # pragma: no cover - a typo in an arm must not read as a pass
+        print(f"unknown probe shape {shape!r}", file=sys.stderr)
+        return 1
+
     credited: set[str] = set()
-    for block in clippy_blocks(text.splitlines()):
-        for lane in _GENERATOR.findall(block):
-            if lane in LANES:
-                credited.update(lane_packages(lane))
+    for block in clippy_blocks(lines):
+        for found in _GENERATOR.findall(block):
+            if found in LANES:
+                credited.update(lane_packages(found))
         credited.update(re.findall(r"-p\s+([A-Za-z0-9_-]+)", block))
-    want = set(lane_packages("linux-only")) if referenced else {"onnx-genai-cli"}
     if credited != want:
         print(
             "clippy attribution mismatch: "
@@ -1351,7 +1418,7 @@ def _probe_clippy_generator_var(referenced: bool = True) -> int:
             file=sys.stderr,
         )
         return 1
-    print("clippy attribution as stated: " + ", ".join(sorted(credited)))
+    print("clippy attribution as stated: " + (", ".join(sorted(credited)) or "credited nothing"))
     return 0
 
 
@@ -1405,16 +1472,37 @@ def self_test() -> int:
         (
             "linted_packages credits a lane the clippy call reads from a variable",
             _probe_clippy_generator_var,
-            {"referenced": True},
+            {"shape": "referenced"},
             0,
             sorted(lane_packages("linux-only")),
         ),
         (
             "linted_packages refuses a lane the clippy call never references",
             _probe_clippy_generator_var,
-            {"referenced": False},
+            {"shape": "unreferenced"},
             0,
             ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable whose name is only a prefix",
+            _probe_clippy_generator_var,
+            {"shape": "prefix"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a generator a plain assignment shadowed",
+            _probe_clippy_generator_var,
+            {"shape": "shadowed"},
+            0,
+            ["onnx-genai-cli"],
+        ),
+        (
+            "linted_packages refuses a variable assigned by the previous step",
+            _probe_clippy_generator_var,
+            {"shape": "neighbour"},
+            0,
+            ["credited nothing"],
         ),
     ]
     failures = 0
