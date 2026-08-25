@@ -1,6 +1,7 @@
 //! Metadata-driven RGB image preprocessing.
 
 mod config;
+mod grouped;
 pub mod packed;
 
 pub use config::{
@@ -8,6 +9,7 @@ pub use config::{
     Normalization, ResizeMode, ThumbnailPosition, TileGrid, TilingMode, TokenExpansionConfig,
     expand_image_placeholders,
 };
+pub use grouped::{GroupedVisionBundle, GroupedVisionPreprocessor, MediaItem, MediaRequest};
 pub use packed::{
     ImageExpansionSummary, ImageTensorBundle, ImageTensorDType, ImageTensorData, NamedImageTensor,
 };
@@ -27,3 +29,9 @@ mod transform;
 mod program;
 pub use program::ImagePreprocessor;
 use program::{CoordinateOrder, PatchChannelOrder, PatchTemporalOrder, PatchifySpec};
+
+fn is_grouping_output_content(content: &str) -> bool {
+    content == onnx_genai_metadata::PACK_OFFSETS_CONTENT
+        || content == onnx_genai_metadata::PACK_OWNER_CONTENT
+        || onnx_genai_metadata::LENGTH_CONTENT_ROLES.contains(&content)
+}

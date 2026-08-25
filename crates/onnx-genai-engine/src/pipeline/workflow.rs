@@ -345,6 +345,10 @@ fn workflow_adapter_registry()
                 WorkflowRuntime::run_image_preprocess_adapter as WorkflowAdapterExecutor,
             ),
             (
+                ("onnx-genai.video-preprocess", "1"),
+                WorkflowRuntime::run_video_preprocess_adapter as WorkflowAdapterExecutor,
+            ),
+            (
                 ("onnx-genai.audio-preprocess", "1"),
                 WorkflowRuntime::run_audio_preprocess_adapter as WorkflowAdapterExecutor,
             ),
@@ -3126,13 +3130,18 @@ impl WorkflowRuntime {
             )
         })?;
         let target_shape = resolve_workflow_adapter_shape(pixel_contract, package_symbols)?;
-        let processor = onnx_genai_preprocess::image::ImagePreprocessor::from_input_and_program(
-            &target_shape,
-            program,
-        )?;
+        let processor =
+            onnx_genai_preprocess::image::GroupedVisionPreprocessor::from_input_and_program(
+                component,
+                &target_shape,
+                program,
+            )?;
         let encoded_bytes = encoded.as_raw_bytes()?;
         let mut tensors = processor
-            .preprocess_encoded([encoded_bytes])?
+            .preprocess_encoded(&[onnx_genai_preprocess::image::MediaRequest::new([
+                onnx_genai_preprocess::image::MediaItem::single(encoded_bytes),
+            ])])?
+            .tensors
             .tensors
             .into_iter()
             .map(|tensor| (tensor.name.clone(), tensor))
@@ -3170,6 +3179,68 @@ impl WorkflowRuntime {
             );
         }
         Ok(())
+    }
+
+    // Encoded video containers need a decoder/sampler that does not exist yet.
+    // Registering the ABI here makes the boundary explicit and typed instead of
+    // letting it fall through to an "unknown adapter" or an image reinterpretation.
+    #[allow(clippy::too_many_arguments)]
+    fn run_video_preprocess_adapter(
+        &self,
+        component: &str,
+        inputs: &std::collections::BTreeMap<String, String>,
+        _outputs: &std::collections::BTreeMap<String, String>,
+        declaration: &onnx_genai_metadata::WorkflowComponent,
+        values: &mut PipelineTensors,
+        _package_symbols: &HashMap<String, i64>,
+        component_symbols: &mut HashMap<String, i64>,
+    ) -> anyhow::Result<()> {
+        self.plan
+            .preprocessing
+            .as_ref()
+            .and_then(|spec| spec.video.as_ref())
+            .with_context(|| {
+                format!(
+                    "workflow video preprocessing adapter '{component}' requires \
+                     preprocessing.video metadata"
+                )
+            })?;
+        let encoded_ref = inputs.get("encoded").with_context(|| {
+            format!("workflow video preprocessing adapter '{component}' requires input 'encoded'")
+        })?;
+        let encoded = values
+            .get(encoded_ref)
+            .with_context(|| format!("workflow value '{encoded_ref}' is unavailable"))?;
+        let encoded_contract = declaration.ports.inputs.get("encoded").with_context(|| {
+            format!(
+                "workflow video preprocessing adapter '{component}' has no declared input \
+                 port 'encoded'"
+            )
+        })?;
+        validate_workflow_value(
+            encoded_ref,
+            encoded,
+            encoded_contract,
+            component_symbols,
+            &std::collections::HashSet::new(),
+        )?;
+        if encoded.dtype() != DataType::Uint8 || encoded.shape().len() != 1 {
+            anyhow::bail!(
+                "workflow video preprocessing adapter '{component}' input 'encoded' must be \
+                 uint8 rank 1"
+            );
+        }
+        Err(
+            onnx_genai_preprocess::batching::EncoderBatchingError::UnsupportedExecution {
+                component: component.to_owned(),
+                detail:
+                    "encoded video-container decode and temporal sampling are not implemented; \
+                         use the grouped frame-sequence preprocessing API with ordered encoded \
+                         frames, or provide a supported video decoder adapter"
+                        .to_owned(),
+            }
+            .into(),
+        )
     }
 
     // Same component context as the image adapter above.

@@ -224,11 +224,29 @@ impl ImagePreprocessor {
         shape: &[i64],
         program: &VisionPreprocessingProgram,
     ) -> anyhow::Result<Self> {
+        Self::from_typed_program(shape, program, false)
+    }
+
+    pub(super) fn from_input_and_grouped_program(
+        shape: &[i64],
+        program: &VisionPreprocessingProgram,
+    ) -> anyhow::Result<Self> {
+        Self::from_typed_program(shape, program, true)
+    }
+
+    fn from_typed_program(
+        shape: &[i64],
+        program: &VisionPreprocessingProgram,
+        omit_grouping_outputs: bool,
+    ) -> anyhow::Result<Self> {
         Self::from_metadata_document(
             shape,
             Some(MetadataDocument {
                 preprocessing: Some(PreprocessingMetadata {
-                    image: Some(Self::image_metadata_from_program(program)),
+                    image: Some(Self::image_metadata_from_program(
+                        program,
+                        omit_grouping_outputs,
+                    )),
                 }),
             }),
         )
@@ -251,7 +269,10 @@ impl ImagePreprocessor {
         Self::from_metadata_document(shape, document)
     }
 
-    fn image_metadata_from_program(program: &VisionPreprocessingProgram) -> ImageMetadata {
+    fn image_metadata_from_program(
+        program: &VisionPreprocessingProgram,
+        omit_grouping_outputs: bool,
+    ) -> ImageMetadata {
         ImageMetadata {
             resize: None,
             tiling: None,
@@ -264,6 +285,9 @@ impl ImagePreprocessor {
             outputs: program
                 .outputs
                 .iter()
+                .filter(|output| {
+                    !omit_grouping_outputs || !super::is_grouping_output_content(&output.content)
+                })
                 .map(Self::image_output_metadata)
                 .collect(),
         }
