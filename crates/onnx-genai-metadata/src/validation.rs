@@ -5168,7 +5168,12 @@ fn validate_compaction_derivability(
             // emitted value's contract names as the description of its own shape
             // — an ownership offsets or owner map, or the valid_lengths of a
             // padded dimension — and only at the rank that naming requires of
-            // it. All of that is decidable from the declared outputs alone.
+            // it. The claiming output must also be written by some step: a
+            // declaration nothing writes cannot confer the carve-out, or a
+            // padded output declared and never emitted would admit any vector
+            // beside it. So this is decided from the workflow's own
+            // declarations — its outputs and its steps — with no runtime
+            // information, which is what makes it affordable at load.
             // Anything else `shared` and rank > 0 is still a per-request result
             // with no way back to a request.
             let expectations = output_companions(workflow);
