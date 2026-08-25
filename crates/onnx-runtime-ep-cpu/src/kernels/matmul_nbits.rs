@@ -20379,7 +20379,16 @@ mod tests {
     /// silently halves the pool. Doing it from inside the child keeps the test
     /// free of a `taskset` dependency and makes the mask an observable the
     /// child reports (`allowed`/`cores`) rather than an assumption.
+    ///
+    /// Only Linux can do this. `set_current_thread_affinity` is a documented
+    /// no-op that returns `Err` everywhere else (see `decode_affinity.rs`), so
+    /// on those targets the leader-only cpuset cannot be constructed at all and
+    /// the caller must skip rather than assert. That is a different thing from
+    /// the restriction failing, which stays fatal on Linux.
     fn restrict_self_to_leader_cpus() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
         let Some(allowed) = crate::decode_affinity::allowed_cpus() else {
             return;
         };
@@ -20714,6 +20723,21 @@ mod tests {
     /// report in what "default" resolved to.
     #[test]
     fn a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given() {
+        // Process-wide affinity masking is Linux-only, so on every other target
+        // the leader-only cpuset this test asserts about cannot be built. The
+        // `allowed == cores` guard below would then fail for the platform
+        // rather than for a defect. Skipping is loud rather than silent: an
+        // unexplained green here is exactly the vacuity the sweep exists to
+        // avoid, and the reason belongs in the log, not only in this comment.
+        if !cfg!(target_os = "linux") {
+            eprintln!(
+                "SKIP a_default_width_pool_on_leader_cpus_uses_every_core_it_was_given: \
+                 process-wide CPU affinity masking is implemented only on Linux, so a \
+                 leader-only cpuset cannot be constructed on this target"
+            );
+            return;
+        }
+
         let report = realized_default_width_report();
 
         if !report.pool_built {
