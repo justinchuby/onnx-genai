@@ -6288,9 +6288,29 @@ mod tests {
     #[test]
     fn a_worker_that_never_exits_is_abandoned_instead_of_hanging_shutdown() {
         const WEDGED: usize = 1;
+        // Releases the wedge on *every* exit from this test, including a failed
+        // assertion. Released inline, an assertion that fires before the
+        // release leaves the injected worker sleeping in the pool for the life
+        // of the test process -- a test whose failure mode is a leaked thread
+        // teaches the wrong lesson about leaked threads.
+        struct ReleaseWedge;
+        impl Drop for ReleaseWedge {
+            fn drop(&mut self) {
+                WEDGED_WORKER_RELEASED.store(true, Ordering::Release);
+                WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(usize::MAX));
+                SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+            }
+        }
         WEDGED_WORKER_RELEASED.store(false, Ordering::Release);
         WEDGE_WORKER_AT_SHUTDOWN.with(|slot| slot.set(WEDGED));
-        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(250));
+        // Far above any plausible deschedule of a *healthy* sibling on a
+        // contended host, and far below the harness bound below. At 250ms a
+        // sibling starved past the deadline would be abandoned too, and while
+        // that direction only produces a false red, the same tightness lets a
+        // future broken wedge relay be masked by a coincidentally slow sibling
+        // that keeps the count at 1.
+        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(2_000));
+        let _release = ReleaseWedge;
 
         let pools = SpmdDecodePools::build_with_schedule(
             &[NodeShard {
@@ -6314,7 +6334,6 @@ mod tests {
         let started = Instant::now();
         pools.shutdown();
         let elapsed = started.elapsed();
-        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
 
         // Bounds the *test*, and with it the claim: the unbounded join fails
         // this by never returning at all rather than by returning late.
@@ -6354,6 +6373,20 @@ mod tests {
     /// the one it guards -- and one that no test asserting only the wedged case
     /// can see.
     ///
+    /// Both arms are needed, and the second is the point. The wait target is
+    /// `handles.len()`, and the only count in this type that differs from it is
+    /// [`SpmdDecodePools::total_workers`], which includes the inline dispatcher
+    /// shard -- a participant that never runs [`worker_loop`] and so can never
+    /// be counted out. "Tidying" the target to `total_workers` would make the
+    /// wait unsatisfiable and abandon exactly one worker on *every* real
+    /// shutdown, and with a `dispatcher_shard: false` arm alone that regression
+    /// is invisible: the two counts are equal there, so both arms of this test
+    /// and every existing teardown test would stay green while production leaked
+    /// a thread per shutdown. This file has paid for that exact off-by-one
+    /// before -- see `shutdown_pools_is_a_barrier_not_a_request`, which was
+    /// wrong by one in the inline-shard regime, invisible on a 32-CPU host and a
+    /// hard failure on a 2-core runner.
+    ///
     /// The deadline override is deliberately short rather than absent. With the
     /// production 30s bound a regression that hangs teardown would be reported
     /// by this test as a 30s pass followed by an assertion failure, or by the
@@ -6366,36 +6399,50 @@ mod tests {
             usize::MAX,
             "no fault may be injected on the thread building a healthy pool"
         );
-        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(5_000));
-        let pools = SpmdDecodePools::build_with_schedule(
-            &[NodeShard {
-                index: 0,
-                cpus: Vec::new(),
-                workers: 4,
-            }],
-            DecodeSchedule::Fixed,
-            false,
-        );
-        let spawned = pools.spawned_workers();
+        let mut saw_inline_shard = false;
+        for dispatcher_shard in [false, true] {
+            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(5_000));
+            let pools = SpmdDecodePools::build_with_schedule(
+                &[NodeShard {
+                    index: 0,
+                    cpus: Vec::new(),
+                    workers: 4,
+                }],
+                DecodeSchedule::Fixed,
+                dispatcher_shard,
+            );
+            let spawned = pools.spawned_workers();
+            assert!(
+                spawned > 0,
+                "a pool that spawned nothing cannot demonstrate a clean teardown"
+            );
+            saw_inline_shard |= spawned != pools.total_workers();
+
+            pools.shutdown();
+            SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
+
+            assert_eq!(
+                pools.workers_abandoned(),
+                0,
+                "a healthy pool's teardown must join every worker (dispatcher_shard \
+                 {dispatcher_shard}); abandoning one means the backstop fires on \
+                 correct pools"
+            );
+            assert_eq!(
+                pools.workers_exited(),
+                spawned,
+                "shutdown returned without every worker counted out \
+                 (dispatcher_shard {dispatcher_shard}), so the join it reported was \
+                 not the barrier it claims to be"
+            );
+        }
+        // Without this the `true` arm can silently degrade into a second copy of
+        // the `false` arm -- and it is the *only* arm in which the wait target
+        // and `total_workers` disagree, which is the whole reason it is here.
         assert!(
-            spawned > 0,
-            "a pool that spawned nothing cannot demonstrate a clean teardown"
-        );
-
-        pools.shutdown();
-        SHUTDOWN_JOIN_TIMEOUT_MS.with(|slot| slot.set(0));
-
-        assert_eq!(
-            pools.workers_abandoned(),
-            0,
-            "a healthy pool's teardown must join every worker; abandoning one means \
-             the backstop fires on correct pools"
-        );
-        assert_eq!(
-            pools.workers_exited(),
-            spawned,
-            "shutdown returned without every worker counted out, so the join it \
-             reported was not the barrier it claims to be"
+            saw_inline_shard,
+            "no arm reached the inline-dispatcher-shard regime, so the count this \
+             test exists to pin was never exercised"
         );
     }
 
