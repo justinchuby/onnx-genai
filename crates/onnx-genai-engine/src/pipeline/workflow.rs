@@ -1197,7 +1197,7 @@ impl<'a> WorkflowExecutionPlan<'a> {
                 &dynamic_symbols,
             )?;
         }
-        super::batching::validate_workflow_packed_inputs(workflow, &values)?;
+        super::batching::validate_workflow_batch_inputs(workflow, &values)?;
         let input_names = values.keys().cloned().collect::<Vec<_>>();
         // The bound the continuation cell declares is the package's own context
         // limit, and this is the only place it can be checked: a continuation is
@@ -1773,12 +1773,9 @@ impl WorkflowRuntime {
                         // node; which executor does is answered by the
                         // contract, never by inspecting the package.
                         //
-                        // Consulted before the inputs are resolved on purpose:
-                        // such an executor supplies the ports it owns (the
-                        // attention mask it builds from the sequence it holds),
-                        // and demanding them of the caller first would ask for
-                        // a second answer to a question it has already
-                        // answered.
+                        // The hosted executor is selected before generic ONNX
+                        // resolution, but admission still validates every
+                        // invocation-bound input before the executor can run.
                         if let Some(contract) = declaration
                             .contract
                             .as_ref()
@@ -1786,19 +1783,49 @@ impl WorkflowRuntime {
                             && let Some(host) = host.as_deref_mut()
                             && host.hosted_contracts().contains(&contract)
                         {
-                            let handled = host.execute_contract_node(WorkflowNodeRequest {
+                            let prepared = prepare_hosted_component_batch_inputs(
+                                component,
+                                declaration,
+                                inputs,
+                                values,
+                            )?;
+                            let mut component_symbols = prepared.symbols;
+                            let request_count = prepared.request_count;
+                            drop(prepared.resolved);
+                            let handled = match host.execute_contract_node(WorkflowNodeRequest {
                                 contract,
                                 component,
                                 inputs,
                                 outputs,
                                 values,
-                            })?;
-                            anyhow::ensure!(
-                                handled,
-                                "workflow component '{component}' declares contract \
-                                 '{contract}', which the running host lists as implemented but \
-                                 then declined to execute"
-                            );
+                            }) {
+                                Ok(handled) => handled,
+                                Err(error) => {
+                                    clear_bound_component_outputs(outputs, values);
+                                    return Err(error);
+                                }
+                            };
+                            if !handled {
+                                clear_bound_component_outputs(outputs, values);
+                                anyhow::bail!(
+                                    "workflow component '{component}' declares contract \
+                                     '{contract}', which the running host lists as implemented but \
+                                     then declined to execute"
+                                );
+                            }
+                            let produced =
+                                take_bound_component_outputs(component, outputs, values, true)?;
+                            validate_and_publish_component_outputs(
+                                component,
+                                declaration,
+                                inputs,
+                                outputs,
+                                produced,
+                                values,
+                                &mut component_symbols,
+                                &std::collections::HashSet::new(),
+                                request_count,
+                            )?;
                             self.record_contract_execution(contract);
                             telemetry.record_stage(
                                 component.clone(),
@@ -1833,41 +1860,16 @@ impl WorkflowRuntime {
                         // Values crossing the package boundary were already checked there; the
                         // component contract unifies its own ports without conflating equal
                         // spelling in separate contract scopes.
-                        let mut component_symbols = HashMap::new();
                         let component_dynamic_symbols = std::collections::HashSet::new();
-                        let resolved = selected_inputs
-                            .iter()
-                            .map(|(port, value)| {
-                                values
-                                    .get(value)
-                                    .with_context(|| {
-                                        format!(
-                                            "workflow component '{selected_component}' input '{port}' \
-                                             references unavailable value '{value}'"
-                                        )
-                                    })
-                                    .and_then(|tensor| {
-                                        if let Some(contract) =
-                                            selected_declaration.ports.inputs.get(port)
-                                        {
-                                            validate_workflow_value(
-                                                value,
-                                                tensor,
-                                                contract,
-                                                &mut component_symbols,
-                                                &component_dynamic_symbols,
-                                            )?;
-                                        }
-                                        Ok((port.as_str(), tensor))
-                                    })
-                            })
-                            .collect::<anyhow::Result<Vec<_>>>()?;
-                        super::batching::validate_component_batch_before_enqueue(
+                        let prepared = prepare_component_batch_inputs(
                             selected_component,
                             selected_declaration,
-                            &resolved,
-                            &component_symbols,
+                            &selected_inputs,
+                            values,
                         )?;
+                        let resolved = prepared.resolved;
+                        let mut component_symbols = prepared.symbols;
+                        let request_count = prepared.request_count;
                         // Concrete output shapes known from the bound input
                         // symbols, so the native CUDA seam can keep resolvable
                         // outputs (a recurring/state tensor in particular)
@@ -1888,38 +1890,54 @@ impl WorkflowRuntime {
                             &selected_outputs,
                             &component_output_shapes,
                         )?;
-                        for (port, tensor) in produced {
-                            let Some(value) = selected_outputs.get(&port) else {
-                                continue;
-                            };
-                            if let Some(contract) = selected_declaration.ports.outputs.get(&port) {
-                                validate_workflow_value(
-                                    value,
-                                    &tensor,
-                                    contract,
-                                    &mut component_symbols,
-                                    &component_dynamic_symbols,
-                                )?;
-                            }
-
-                            values.insert(value.clone(), tensor);
-                        }
+                        drop(resolved);
+                        validate_and_publish_component_outputs(
+                            selected_component,
+                            selected_declaration,
+                            &selected_inputs,
+                            &selected_outputs,
+                            produced,
+                            values,
+                            &mut component_symbols,
+                            &component_dynamic_symbols,
+                            request_count,
+                        )?;
                     }
                     ComponentImplementation::Binding => {
                         // A binding says "a step happens here and the runtime
                         // implements it". When it names a contract, the host is
                         // the implementation; the interpreter still owns the
                         // loop around it.
+                        let prepared = if declaration.contract.is_some() && host.is_some() {
+                            prepare_hosted_component_batch_inputs(
+                                component,
+                                declaration,
+                                inputs,
+                                values,
+                            )?
+                        } else {
+                            prepare_component_batch_inputs(component, declaration, inputs, values)?
+                        };
+                        let mut component_symbols = prepared.symbols;
+                        let request_count = prepared.request_count;
+                        drop(prepared.resolved);
                         let contract = declaration.contract.as_ref().map(|c| c.id.as_str());
                         let handled = match (contract, host.as_deref_mut()) {
                             (Some(contract), Some(host)) => {
-                                let handled = host.execute_contract_node(WorkflowNodeRequest {
-                                    contract,
-                                    component,
-                                    inputs,
-                                    outputs,
-                                    values,
-                                })?;
+                                let handled =
+                                    match host.execute_contract_node(WorkflowNodeRequest {
+                                        contract,
+                                        component,
+                                        inputs,
+                                        outputs,
+                                        values,
+                                    }) {
+                                        Ok(handled) => handled,
+                                        Err(error) => {
+                                            clear_bound_component_outputs(outputs, values);
+                                            return Err(error);
+                                        }
+                                    };
                                 if handled {
                                     self.record_contract_execution(contract);
                                 }
@@ -1933,6 +1951,7 @@ impl WorkflowRuntime {
                             // outputs with the wrong tensors and let a declared
                             // step silently not happen.
                             if let Some(contract) = contract {
+                                clear_bound_component_outputs(outputs, values);
                                 // Two different problems, and an operator can act
                                 // on only one of them: a contract this build has
                                 // no executor for is a package/runtime version
@@ -1951,7 +1970,8 @@ impl WorkflowRuntime {
                                      '{contract}', which no runtime executor implements"
                                 );
                             }
-                            for (port, output) in outputs {
+                            let mut produced = Vec::with_capacity(outputs.len());
+                            for port in outputs.keys() {
                                 let source = inputs.get(port).with_context(|| {
                                     format!(
                                         "binding component '{component}' output '{port}' requires \
@@ -1961,19 +1981,48 @@ impl WorkflowRuntime {
                                 let tensor = values.get(source).with_context(|| {
                                     format!("binding source value '{source}' is unavailable")
                                 })?;
-                                values.insert(output.clone(), clone_value(tensor)?);
+                                produced.push((port.clone(), clone_value(tensor)?));
                             }
+                            validate_and_publish_component_outputs(
+                                component,
+                                declaration,
+                                inputs,
+                                outputs,
+                                produced,
+                                values,
+                                &mut component_symbols,
+                                &std::collections::HashSet::new(),
+                                request_count,
+                            )?;
+                        } else {
+                            let produced =
+                                take_bound_component_outputs(component, outputs, values, true)?;
+                            validate_and_publish_component_outputs(
+                                component,
+                                declaration,
+                                inputs,
+                                outputs,
+                                produced,
+                                values,
+                                &mut component_symbols,
+                                &std::collections::HashSet::new(),
+                                request_count,
+                            )?;
                         }
                     }
                     ComponentImplementation::Adapter { abi, version, .. } => {
                         for value in inputs.values() {
                             self.materialize_workflow_value(values, value)?;
                         }
+                        let prepared =
+                            prepare_component_batch_inputs(component, declaration, inputs, values)?;
+                        let mut component_symbols = prepared.symbols;
+                        let request_count = prepared.request_count;
+                        drop(prepared.resolved);
                         if let Some(execute) =
                             workflow_adapter_registry().get(&(abi.as_str(), version.as_str()))
                         {
-                            let mut component_symbols = HashMap::new();
-                            execute(
+                            if let Err(error) = execute(
                                 self,
                                 component,
                                 inputs,
@@ -1982,6 +2031,22 @@ impl WorkflowRuntime {
                                 values,
                                 symbols,
                                 &mut component_symbols,
+                            ) {
+                                clear_bound_component_outputs(outputs, values);
+                                return Err(error);
+                            }
+                            let produced =
+                                take_bound_component_outputs(component, outputs, values, false)?;
+                            validate_and_publish_component_outputs(
+                                component,
+                                declaration,
+                                inputs,
+                                outputs,
+                                produced,
+                                values,
+                                &mut component_symbols,
+                                &std::collections::HashSet::new(),
+                                request_count,
                             )?;
                         } else {
                             anyhow::bail!(
@@ -2537,7 +2602,7 @@ impl WorkflowRuntime {
                 )?;
             }
         }
-        super::batching::validate_component_batch_before_enqueue(
+        let request_count = super::batching::validate_component_batch_before_enqueue(
             component,
             declaration,
             inputs,
@@ -2570,6 +2635,17 @@ impl WorkflowRuntime {
                 )?;
             }
         }
+        let output_values = produced
+            .iter()
+            .map(|(port, value)| (port.as_str(), value))
+            .collect::<Vec<_>>();
+        super::batching::validate_component_outputs_before_publish(
+            component,
+            declaration,
+            inputs,
+            &output_values,
+            request_count,
+        )?;
         Ok(produced)
     }
 
@@ -4352,6 +4428,163 @@ pub(super) fn validate_workflow_value(
     Ok(())
 }
 
+struct PreparedComponentInputs<'a> {
+    resolved: Vec<(&'a str, &'a Value)>,
+    symbols: HashMap<String, i64>,
+    request_count: usize,
+}
+
+fn prepare_component_batch_inputs<'a>(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    bindings: &'a BTreeMap<String, String>,
+    values: &'a PipelineTensors,
+) -> anyhow::Result<PreparedComponentInputs<'a>> {
+    prepare_component_batch_inputs_impl(component, declaration, bindings, values, false)
+}
+
+fn prepare_hosted_component_batch_inputs<'a>(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    bindings: &'a BTreeMap<String, String>,
+    values: &'a PipelineTensors,
+) -> anyhow::Result<PreparedComponentInputs<'a>> {
+    prepare_component_batch_inputs_impl(component, declaration, bindings, values, true)
+}
+
+fn prepare_component_batch_inputs_impl<'a>(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    bindings: &'a BTreeMap<String, String>,
+    values: &'a PipelineTensors,
+    allow_runtime_owned_inputs: bool,
+) -> anyhow::Result<PreparedComponentInputs<'a>> {
+    let mut symbols = HashMap::new();
+    let dynamic = std::collections::HashSet::new();
+    let resolved = bindings
+        .iter()
+        .filter_map(|(port, value)| {
+            let tensor = match values.get(value) {
+                Some(tensor) => tensor,
+                None if allow_runtime_owned_inputs => return None,
+                None => {
+                    return Some(Err(anyhow::anyhow!(
+                        "workflow component '{component}' input '{port}' references unavailable \
+                         value '{value}'"
+                    )));
+                }
+            };
+            if let Some(contract) = declaration.ports.inputs.get(port)
+                && let Err(error) =
+                    validate_workflow_value(value, tensor, contract, &mut symbols, &dynamic)
+            {
+                return Some(Err(error));
+            }
+            Some(Ok((port.as_str(), tensor)))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let request_count = if allow_runtime_owned_inputs {
+        super::batching::validate_available_component_batch_before_enqueue(
+            component,
+            declaration,
+            &resolved,
+            &symbols,
+        )?
+    } else {
+        super::batching::validate_component_batch_before_enqueue(
+            component,
+            declaration,
+            &resolved,
+            &symbols,
+        )?
+    };
+    Ok(PreparedComponentInputs {
+        resolved,
+        symbols,
+        request_count,
+    })
+}
+
+fn clear_bound_component_outputs(outputs: &BTreeMap<String, String>, values: &mut PipelineTensors) {
+    for value in outputs.values() {
+        values.remove(value);
+    }
+}
+
+fn take_bound_component_outputs(
+    component: &str,
+    outputs: &BTreeMap<String, String>,
+    values: &mut PipelineTensors,
+    allow_runtime_owned_outputs: bool,
+) -> anyhow::Result<Vec<(String, Value)>> {
+    let mut produced = Vec::with_capacity(outputs.len());
+    for (port, value_ref) in outputs {
+        let Some(value) = values.remove(value_ref) else {
+            if allow_runtime_owned_outputs {
+                continue;
+            }
+            clear_bound_component_outputs(outputs, values);
+            anyhow::bail!(
+                "workflow component '{component}' did not produce bound output port '{port}' \
+                 as value '{value_ref}'"
+            );
+        };
+        produced.push((port.clone(), value));
+    }
+    Ok(produced)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_publish_component_outputs(
+    component: &str,
+    declaration: &onnx_genai_metadata::WorkflowComponent,
+    input_bindings: &BTreeMap<String, String>,
+    output_bindings: &BTreeMap<String, String>,
+    produced: Vec<(String, Value)>,
+    values: &mut PipelineTensors,
+    component_symbols: &mut HashMap<String, i64>,
+    component_dynamic_symbols: &std::collections::HashSet<String>,
+    expected_requests: usize,
+) -> anyhow::Result<()> {
+    let mut pending = Vec::new();
+    for (port, tensor) in produced {
+        let Some(value_ref) = output_bindings.get(&port) else {
+            continue;
+        };
+        if let Some(contract) = declaration.ports.outputs.get(&port) {
+            validate_workflow_value(
+                value_ref,
+                &tensor,
+                contract,
+                component_symbols,
+                component_dynamic_symbols,
+            )?;
+        }
+        pending.push((port, value_ref.clone(), tensor));
+    }
+
+    let inputs = input_bindings
+        .iter()
+        .filter_map(|(port, value_ref)| values.get(value_ref).map(|value| (port.as_str(), value)))
+        .collect::<Vec<_>>();
+    let outputs = pending
+        .iter()
+        .map(|(port, _, value)| (port.as_str(), value))
+        .collect::<Vec<_>>();
+    super::batching::validate_component_outputs_before_publish(
+        component,
+        declaration,
+        &inputs,
+        &outputs,
+        expected_requests,
+    )?;
+
+    for (_, value_ref, value) in pending {
+        values.insert(value_ref, value);
+    }
+    Ok(())
+}
+
 fn validate_state_recurrence(
     cell: &str,
     current: &Value,
@@ -5857,6 +6090,130 @@ mod workflow_sampling_binding_tests {
 mod node_host_tests {
     use super::*;
 
+    fn batching_workflow(implementation: &str) -> WorkflowSpec {
+        serde_yaml::from_str(&format!(
+            r#"
+manifest: {{}}
+inputs: {{}}
+outputs: {{}}
+components:
+  encoder:
+    implementation: {implementation}
+    contract: {{ id: onnx-genai.token-policy, version: "1" }}
+    batch_capacity:
+      budgets:
+        - {{ dimensions: [items], max_total: 1 }}
+    ports:
+      inputs:
+        payload:
+          dtype: int64
+          rank: 1
+          shape: [items]
+          batch_layout:
+            kind: token_packed
+            axis: 0
+            levels:
+              - {{ offsets: offsets, owner: owner }}
+        offsets:
+          dtype: int64
+          rank: 1
+          shape: [offset_rows]
+          batch_layout: {{ kind: shared }}
+        owner:
+          dtype: int64
+          rank: 1
+          shape: [owner_rows]
+          batch_layout: {{ kind: shared }}
+      outputs: {{}}
+state: {{}}
+steps: []
+"#
+        ))
+        .expect("test workflow")
+    }
+
+    fn over_budget_values() -> PipelineTensors {
+        PipelineTensors::from([
+            (
+                "payload_value".to_string(),
+                Value::from_slice_i64(&[10, 11], &[2]).expect("payload"),
+            ),
+            (
+                "offsets_value".to_string(),
+                Value::from_slice_i64(&[0, 2], &[2]).expect("offsets"),
+            ),
+            (
+                "owner_value".to_string(),
+                Value::from_slice_i64(&[0, 0], &[2]).expect("owners"),
+            ),
+        ])
+    }
+
+    fn packed_invoke() -> WorkflowNode {
+        WorkflowNode::Invoke {
+            component: "encoder".to_string(),
+            inputs: BTreeMap::from([
+                ("payload".to_string(), "payload_value".to_string()),
+                ("offsets".to_string(), "offsets_value".to_string()),
+                ("owner".to_string(), "owner_value".to_string()),
+            ]),
+            outputs: BTreeMap::new(),
+            effects: BTreeMap::new(),
+        }
+    }
+
+    fn test_runtime(workflow: WorkflowSpec) -> WorkflowRuntime {
+        let directory = onnx_genai_ort::PipelineModelDirectory {
+            root: std::path::PathBuf::from("."),
+            metadata_path: None,
+            spec: onnx_genai_metadata::PipelineSpec {
+                workflow: workflow.clone(),
+            },
+            adapters: None,
+            metadata: None,
+            preprocessing: None,
+            model_paths: BTreeMap::new(),
+            tokenizer_paths: onnx_genai_ort::PipelineTokenizerPaths {
+                shared: None,
+                per_component: BTreeMap::new(),
+            },
+        };
+        WorkflowRuntime::hosted(
+            std::path::PathBuf::from("."),
+            workflow,
+            crate::EngineDecodeBackend::Ort,
+            crate::MemoryStrategyPlan::unknown(0, None, "batch admission test"),
+            onnx_genai_ort::PipelineModels::hosted(
+                directory,
+                onnx_genai_ort::SessionOptions::default(),
+                None,
+            ),
+            None,
+        )
+        .expect("test runtime")
+    }
+
+    fn run_test_node(
+        runtime: &WorkflowRuntime,
+        workflow: &WorkflowSpec,
+        node: &WorkflowNode,
+        values: &mut PipelineTensors,
+        host: &mut Option<&mut dyn WorkflowNodeHost>,
+    ) -> anyhow::Result<()> {
+        runtime.run_workflow_node(
+            node,
+            workflow,
+            values,
+            &mut HashMap::new(),
+            &std::collections::HashSet::new(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            &HashMap::new(),
+            &mut WorkflowRunTelemetry::default(),
+            host,
+        )
+    }
+
     /// A host that records what it was asked to run and defines its outputs by
     /// copying the first input, so a test can tell "the executor ran" from
     /// "the interpreter fell through to a port copy".
@@ -5974,6 +6331,188 @@ mod node_host_tests {
             values.contains_key("out"),
             "the host must define every output the invocation declares"
         );
+    }
+
+    #[test]
+    fn hosted_onnx_fails_admission_before_the_host_can_execute() {
+        let workflow = batching_workflow("{ kind: onnx, artifact: encoder.onnx }");
+        let runtime = test_runtime(workflow.clone());
+        let mut values = over_budget_values();
+        let mut host = RecordingHost {
+            contract: "onnx-genai.token-policy".to_string(),
+            seen: Vec::new(),
+        };
+        let error = {
+            let mut hosted: Option<&mut dyn WorkflowNodeHost> = Some(&mut host);
+            run_test_node(
+                &runtime,
+                &workflow,
+                &packed_invoke(),
+                &mut values,
+                &mut hosted,
+            )
+            .expect_err("the materialized item budget must reject the hosted invocation")
+        };
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(super::super::batching::BatchContractError::Admission { .. })
+        ));
+        assert!(
+            host.seen.is_empty(),
+            "admission must run before the hosted executor"
+        );
+    }
+
+    #[test]
+    fn adapter_fails_admission_before_abi_dispatch() {
+        let workflow = batching_workflow(r#"{ kind: adapter, abi: "test.missing", version: "1" }"#);
+        let runtime = test_runtime(workflow.clone());
+        let mut values = over_budget_values();
+        let mut host = None;
+
+        let error = run_test_node(
+            &runtime,
+            &workflow,
+            &packed_invoke(),
+            &mut values,
+            &mut host,
+        )
+        .expect_err("the materialized item budget must reject the adapter invocation");
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(super::super::batching::BatchContractError::Admission { .. })
+        ));
+        assert!(
+            !error.to_string().contains("unsupported ABI"),
+            "admission must fail before adapter dispatch"
+        );
+    }
+}
+
+#[cfg(test)]
+mod atomic_component_output_tests {
+    use super::*;
+
+    fn component_with_packed_outputs() -> onnx_genai_metadata::WorkflowComponent {
+        serde_yaml::from_str(
+            r#"
+implementation: { kind: binding }
+ports:
+  inputs: {}
+  outputs:
+    good:
+      dtype: int64
+      rank: 1
+      shape: [batch]
+      batch_layout: { kind: request_aligned, axis: 0 }
+    packed:
+      dtype: int64
+      rank: 1
+      shape: [items]
+      batch_layout:
+        kind: token_packed
+        axis: 0
+        levels:
+          - { offsets: packed_offsets, owner: packed_owner }
+    packed_offsets:
+      dtype: int64
+      rank: 1
+      shape: [offset_rows]
+      batch_layout: { kind: shared }
+    packed_owner:
+      dtype: int64
+      rank: 1
+      shape: [owner_rows]
+      batch_layout: { kind: shared }
+"#,
+        )
+        .expect("component")
+    }
+
+    fn output_bindings() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("good".to_string(), "good_value".to_string()),
+            ("packed".to_string(), "packed_value".to_string()),
+            (
+                "packed_offsets".to_string(),
+                "packed_offsets_value".to_string(),
+            ),
+            ("packed_owner".to_string(), "packed_owner_value".to_string()),
+        ])
+    }
+
+    fn produced_packed_outputs(offsets: &[i64], owners: &[i64]) -> Vec<(String, Value)> {
+        vec![
+            (
+                "good".to_string(),
+                Value::from_slice_i64(&[7], &[1]).expect("good"),
+            ),
+            (
+                "packed".to_string(),
+                Value::from_slice_i64(&[10, 11], &[2]).expect("packed"),
+            ),
+            (
+                "packed_offsets".to_string(),
+                Value::from_slice_i64(offsets, &[offsets.len() as i64]).expect("offsets"),
+            ),
+            (
+                "packed_owner".to_string(),
+                Value::from_slice_i64(owners, &[owners.len() as i64]).expect("owners"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn malformed_packed_output_publishes_no_sibling_outputs() {
+        let mut values = PipelineTensors::default();
+        let error = validate_and_publish_component_outputs(
+            "encoder",
+            &component_with_packed_outputs(),
+            &BTreeMap::new(),
+            &output_bindings(),
+            produced_packed_outputs(&[0, 1], &[0]),
+            &mut values,
+            &mut HashMap::new(),
+            &std::collections::HashSet::new(),
+            1,
+        )
+        .expect_err("the packed terminal extent must be validated before publication");
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(super::super::batching::BatchContractError::TerminalExtent { .. })
+        ));
+        assert!(
+            output_bindings()
+                .values()
+                .all(|value| !values.contains_key(value)),
+            "no output may become visible when any sibling output is malformed"
+        );
+    }
+
+    #[test]
+    fn packed_output_request_count_must_match_the_inputs() {
+        let mut values = PipelineTensors::default();
+        let error = validate_and_publish_component_outputs(
+            "encoder",
+            &component_with_packed_outputs(),
+            &BTreeMap::new(),
+            &output_bindings(),
+            produced_packed_outputs(&[0, 1, 2], &[0, 1]),
+            &mut values,
+            &mut HashMap::new(),
+            &std::collections::HashSet::new(),
+            1,
+        )
+        .expect_err("two output owners cannot be published for one input request");
+
+        assert!(matches!(
+            error.downcast_ref::<super::super::batching::BatchContractError>(),
+            Some(super::super::batching::BatchContractError::RequestExtent { .. })
+        ));
+        assert!(values.is_empty());
     }
 }
 
