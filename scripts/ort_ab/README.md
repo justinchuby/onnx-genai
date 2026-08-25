@@ -354,9 +354,10 @@ so each invocation is bounded by `--cell-timeout` (default 3600s, `0`
 disables).
 `ab.py` buffers, so it stamps the label on the rows.
 `crates/onnx-runtime-ep-cpu/benches/acc0_*.py` are mostly not wired up yet —
-of the 22 files there that start a benchmark, 3 hold the lock, 18 are recorded
-gaps under issue #2043 and 1 is an `exec` wrapper whose caller holds it. A
-recorded gap is one somebody can close; an absent one is one nobody can see.
+of the 23 files there that start a benchmark, 3 hold the lock, 19 are recorded
+gaps under issue #2043 and 1 is an `exec` wrapper whose caller carries the
+gap. A recorded gap is one somebody can close; an absent one is one nobody can
+see.
 
 Which drivers take the lock is now checked rather than remembered.
 `scripts/ort_ab/test_gate_conformance.py` requires every `.py` in this
@@ -389,10 +390,13 @@ entry.
 
 Resolving the delegation is what makes that root readable at all. Not one acc0
 harness contains a `target/release/` literal — they take the binary as
-`sys.argv[1]` — and six of them do not call `subprocess` either; they call
-`acc0_gap_matrix.native`, or a wrapper around it, one or two imports away. A
-file-local check reported those six as "starts nothing" while they ran width-16
-arms, so the helper table is resolved to a fixpoint. *Importing* the harness
+`sys.argv[1]` — and seven of them do not call `subprocess` either; they call
+`acc0_gap_matrix.native`, or a wrapper around it, one or two imports away. The
+resolution runs to a fixpoint in **both** directions, across modules and
+within one: `native` itself contains no `subprocess` call, it calls the
+same-file helper `sh`. Cross-module resolution alone left `native` out of the
+table, and `acc0_w16_steal_ab.py` — four arms at width 16, calling nothing
+else — read as starting nothing and needed neither a gate nor an entry. *Importing* the harness
 library is not enough: nineteen files there import it, mostly for its parsers,
 and requiring an entry for every scorer would produce a ledger nobody
 maintains, which is how a check ends up with a blanket exemption instead of a

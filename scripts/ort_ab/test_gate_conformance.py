@@ -51,12 +51,19 @@ run than is there:
   loop check below is one property of custody (acquisition is not inside the
   arm loop), not the whole of it; the run-time answer is the `host_lock`
   column on every emitted row.
+- A spawn behind deliberate indirection: `getattr(subprocess, "run")(cmd)`,
+  a dict of callables, `importlib`. Every check here reads names in the tree,
+  so a name assembled at runtime is invisible. This is the fail-open edge
+  that cannot be closed by reading source, and it is why the ledger is a
+  reviewed file rather than only a program.
 - A file that saturates the box **in process**, without starting anything.
   `cpu_work_probe.py` is the honest example: it burns a fixed CPU-second in
   Python to measure delivered work. It is single-threaded and bounded, so it
   is a probe rather than a matrix, but a twenty-thread version of it would be
-  invisible here. Detecting "starts something" is a proxy for "occupies the
-  host", and this is the gap between them.
+  invisible here -- as would a `threading.Thread` pool around an
+  `InferenceSession` that did not import the runtime under a name this file
+  knows. Detecting "starts something" is a proxy for "occupies the host", and
+  this is the gap between them.
 
 Run: `python3 scripts/ort_ab/test_gate_conformance.py`
 """
@@ -228,6 +235,10 @@ EP_LEDGER = {
         ("acc0_w16_study.py", "w16 study, runs native and ORT arms"),
         ("acc0_w8_w16_cpu_split.py", "w8/w16 cpu split"),
         ("acc0_w8_w16_scaling.py", "w8/w16 scaling"),
+        # Found only once same-file delegation was resolved: it runs four
+        # arms at width 16 through `H.native` and calls nothing else, so a
+        # cross-module-only table read it as starting nothing.
+        ("acc0_w16_steal_ab.py", "w16 steal-tiles A/B, four arms via H.native"),
     )
 }
 
@@ -235,12 +246,30 @@ EP_LEDGER = {
 # *by* `acc0_w16_straggler_thp.py`. The caller is the harness. Found by the
 # spawn detector rather than by me reading the directory, which is the point.
 EP_LEDGER["acc0_nothp_exec.py"] = (
-    EP_WRAPPER + "execs the command it is given; the caller holds the lock"
+    EP_WRAPPER + "execs the command it is given; the caller carries the lock "
+    "or the gap -- today that caller is acc0_w16_straggler_thp.py, which has "
+    "a gap above"
 )
 
 SPAWN_CALLS = {
     "subprocess": {"run", "Popen", "call", "check_call", "check_output"},
-    "os": {"system", "popen", "execv", "execvp", "spawnv", "spawnvp", "posix_spawn"},
+    "os": {
+        "system",
+        "popen",
+        "execv",
+        "execvp",
+        "spawnv",
+        "spawnvp",
+        "posix_spawn",
+        "fork",
+        "forkpty",
+    },
+    # None of these is in the tree today. They are here because the cost of
+    # adding a name to a set is nil and the cost of the omission is a
+    # saturating harness that reads as harmless -- the direction this check
+    # must never fail in.
+    "multiprocessing": {"Process", "Pool", "get_context"},
+    "concurrent.futures": {"ProcessPoolExecutor"},
 }
 
 
@@ -270,19 +299,40 @@ def spawns_a_process(source: str) -> bool:
             for a in node.names:
                 if a.name in SPAWN_CALLS:
                     modules[a.asname or a.name] = a.name
+                elif a.name.rsplit(".", 1)[0] in SPAWN_CALLS:
+                    # `import concurrent.futures` binds `concurrent`, and the
+                    # call site reads `concurrent.futures.ProcessPoolExecutor`.
+                    modules.setdefault(a.name.split(".")[0], a.name.rsplit(".", 1)[0])
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            module = modules.get(func.value.id) or (
-                func.value.id if func.value.id in SPAWN_CALLS else None
-            )
-            if module and func.attr in SPAWN_CALLS[module]:
+        path = dotted_name(func)
+        if path and "." in path:
+            prefix, _, attr = path.rpartition(".")
+            module = modules.get(prefix) or (prefix if prefix in SPAWN_CALLS else None)
+            if module and attr in SPAWN_CALLS[module]:
                 return True
         elif isinstance(func, ast.Name) and func.id in aliases:
             return True
     return False
+
+
+def dotted_name(node: ast.AST) -> str | None:
+    """`concurrent.futures.ProcessPoolExecutor` as a string, or None.
+
+    A single `Name.attr` step is not enough: `import concurrent.futures`
+    binds only `concurrent`, so the call site is two attributes deep and a
+    one-step match reads it as something else entirely.
+    """
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    parts.append(node.id)
+    return ".".join(reversed(parts))
 
 
 def spawning_names(source: str) -> set[str]:
@@ -307,19 +357,31 @@ def spawning_helpers(sources: dict[str, str]) -> dict[str, set[str]]:
 def _spawning_helpers(items: tuple[tuple[str, str], ...]) -> dict[str, frozenset[str]]:
     """module stem -> the names in it that start a process, directly or not.
 
-    Iterated to a fixpoint, because the delegation is layered: `H.native`
-    spawns, `acc0_w16_worker_split` wraps it, and six more files call the
-    wrapper. One level of resolution would still miss those.
+    Iterated to a fixpoint, because the delegation is layered and it is
+    layered in two directions. Across modules: `acc0_gap_matrix.native` is
+    wrapped by `acc0_w16_worker_split`, which six more files call. And
+    *within* a module: `native` itself contains no `subprocess` call, it
+    calls the same-file helper `sh`. Missing the second kind is not a
+    theoretical loss -- it left `acc0_w16_steal_ab.py`, which runs four arms
+    at width 16 through `H.native` and nothing else, reading as "starts
+    nothing" and needing neither a gate nor an entry. The files that looked
+    like they proved the resolution worked were passing on a *different*
+    call (`H.ort`), which is why the cell asserting it is now written against
+    the table rather than against the verdict.
 
-    This closes the hole the first cut of this ledger had: two harnesses that
-    genuinely hold the lock -- and two that do not -- never spawn anything
-    themselves, they call `acc0_gap_matrix.native`. A file-local spawn check
-    reported all four as "not a harness", so the two ungated ones would have
-    needed no entry and no gate. Delegating the `subprocess.run` one import
-    away is not a way to stop saturating the box.
+    Delegating the `subprocess.run` one function or one import away is not a
+    way to stop saturating the box.
+
+    Stems that collide (`old/gap_matrix.py` beside `gap_matrix.py`) are
+    unioned rather than overwritten. Last-write-wins would let an archived
+    copy that spawns nothing empty the live module's entry, and every file
+    importing it would read as harmless -- fail-open, from a file nobody
+    thought they were changing.
     """
     sources = dict(items)
-    table = {Path(n).stem: spawning_names(s) for n, s in sources.items()}
+    table: dict[str, set[str]] = {}
+    for name, source in sources.items():
+        table.setdefault(Path(name).stem, set()).update(spawning_names(source))
     for _ in range(len(table) + 1):
         grew = False
         for name, source in sources.items():
@@ -333,7 +395,9 @@ def _spawning_helpers(items: tuple[tuple[str, str], ...]) -> dict[str, frozenset
                     continue
                 if node.name in table[stem]:
                     continue
-                if calls_a_spawning_helper(ast.unparse(node), table, imports_from=tree):
+                if calls_a_spawning_helper(
+                    ast.unparse(node), table, imports_from=tree, own_module=stem
+                ):
                     table[stem].add(node.name)
                     grew = True
         if not grew:
@@ -345,11 +409,14 @@ def calls_a_spawning_helper(
     source: str,
     table: dict[str, set[str]],
     imports_from: ast.Module | None = None,
+    own_module: str | None = None,
 ) -> bool:
-    """A call into another file's process-starting helper.
+    """A call into a process-starting helper, here or in a module it imports.
 
     `imports_from` supplies the import statements when `source` is a fragment
     (one function out of a module), since the imports live at module level.
+    `own_module` is that fragment's own module, so a call to a same-file
+    helper counts -- the `native` -> `sh` shape above.
     """
     try:
         tree = ast.parse(source)
@@ -357,7 +424,12 @@ def calls_a_spawning_helper(
         return False
     scope = imports_from if imports_from is not None else tree
     aliases: dict[str, str] = {}
-    direct: dict[str, str] = {}
+    # local name -> (module, name to look up in that module's table). The two
+    # differ under `from m import ort as run_ort`, where the table holds the
+    # remote name and the call site uses the local one; looking up the local
+    # name there silently found nothing.
+    direct: dict[str, tuple[str, str]] = {}
+    star: set[str] = set()
     for node in ast.walk(scope):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -368,11 +440,10 @@ def calls_a_spawning_helper(
             stem = (node.module or "").split(".")[0]
             if stem in table:
                 for a in node.names:
-                    direct[a.asname or a.name] = stem
-                    if a.asname:
-                        # `from m import f as g`: the local name is what is
-                        # called, the remote name is what is looked up.
-                        direct[a.asname] = stem
+                    if a.name == "*":
+                        star.add(stem)
+                    else:
+                        direct[a.asname or a.name] = (stem, a.name)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -382,8 +453,12 @@ def calls_a_spawning_helper(
             if module and func.attr in table[module]:
                 return True
         elif isinstance(func, ast.Name):
-            module = direct.get(func.id)
-            if module and func.id in table[module]:
+            found = direct.get(func.id)
+            if found and found[1] in table[found[0]]:
+                return True
+            if any(func.id in table[m] for m in star):
+                return True
+            if own_module and func.id in table.get(own_module, ()):
                 return True
     return False
 
@@ -729,7 +804,7 @@ class Vacuity(unittest.TestCase):
     def test_the_workflow_runs_for_the_benches_root_too(self):
         # The #2079 finding, one root over: a check that does not run for a
         # new file cannot catch a new file, and the benches root is where the
-        # next ungated harness is most likely to land -- 18 of the 22 files
+        # next ungated harness is most likely to land -- 19 of the 23 files
         # there that start a benchmark are ungated today.
         pr_block, push_block = self.trigger_blocks()
         for block in (pr_block, push_block):
@@ -961,6 +1036,76 @@ class Delegation(unittest.TestCase):
         self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
         self.assertFalse(looks_like_a_harness(sources["quiet.py"], table))
 
+    def test_a_leaf_that_delegates_inside_its_own_file_still_counts(self):
+        # The hole the first cut had, and the shape of the real tree:
+        # `acc0_gap_matrix.native` contains no `subprocess` call at all, it
+        # calls the same-file helper `sh`. Cross-module resolution alone left
+        # `native` out of the table, so a file whose only call is `H.native`
+        # read as starting nothing -- at width 16, four arms.
+        sources = {
+            "lib.py": "import subprocess\n\ndef sh(c):\n    subprocess.run(c, shell=True)\n\ndef native(b):\n    return sh(b)\n",
+            "arm.py": "import lib as H\n\nH.native(b)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["lib"], {"sh", "native"})
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+
+    def test_the_real_helper_that_delegates_is_in_the_table(self):
+        # Written against the table rather than the verdict, deliberately.
+        # The cell below asserts six real files are seen as harnesses, and it
+        # passed while `native` was missing -- because those six also call
+        # `H.ort`, which spawns directly. A cell that names one mechanism and
+        # is satisfied by another is how the ungated one stayed invisible.
+        table = spawning_helpers(ep_sources())
+        for helper in ("sh", "native", "ort", "competing_load"):
+            self.assertIn(helper, table["acc0_gap_matrix"], helper)
+
+    def test_the_harness_that_calls_only_native_is_recorded(self):
+        # `acc0_w16_steal_ab.py`: four arms (fixed/steal1/steal4/null) at
+        # width 16, entirely through `H.native`. Found by the fix above, not
+        # by reading the directory.
+        found = ep_sources()
+        table = spawning_helpers(found)
+        source = found["acc0_w16_steal_ab.py"]
+        self.assertFalse(spawns_a_process(source))
+        self.assertTrue(looks_like_a_harness(source, table))
+        self.assertIn("acc0_w16_steal_ab.py", EP_LEDGER)
+
+    def test_an_aliased_from_import_resolves_to_the_remote_name(self):
+        # `from m import ort as run_ort`: the table holds `ort`, the call
+        # site says `run_ort`. Looking the local name up in the remote
+        # module's table finds nothing and clears the file -- fail-open.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "arm.py": "from lib import native as go\n\ngo(cmd)\n",
+        }
+        self.assertTrue(
+            looks_like_a_harness(sources["arm.py"], spawning_helpers(sources))
+        )
+
+    def test_a_star_import_does_not_hide_the_helper(self):
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "arm.py": "from lib import *\n\nnative(cmd)\n",
+            "quiet.py": "from lib import *\n\nparse(text)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+        self.assertFalse(looks_like_a_harness(sources["quiet.py"], table))
+
+    def test_two_files_with_the_same_stem_are_unioned_not_overwritten(self):
+        # An archived copy beside the live module: last-write-wins would
+        # empty the live entry and clear every file importing it, from a file
+        # nobody thought they were changing. Union is the fail-closed way.
+        sources = {
+            "lib.py": "import subprocess\n\ndef native(c):\n    subprocess.run(c)\n",
+            "old/lib.py": "def native(c):\n    return 0\n",
+            "arm.py": "import lib as H\n\nH.native(cmd)\n",
+        }
+        table = spawning_helpers(sources)
+        self.assertEqual(table["lib"], {"native"})
+        self.assertTrue(looks_like_a_harness(sources["arm.py"], table))
+
     def test_the_delegating_harnesses_in_the_tree_are_seen(self):
         # The real ones, and the reason this class exists: before the table,
         # `acc0_w16_study.py` and five others read as "starts nothing" while
@@ -1124,6 +1269,28 @@ class SpawnDetection(unittest.TestCase):
             "import subprocess as sp\nsp.run(cmd)\n",
         ):
             self.assertTrue(spawns_a_process(source), source)
+
+    def test_the_process_starting_idioms_all_count(self):
+        # None of these is in the tree today; a benchmark directory is
+        # exactly where the first one will appear, and the cost of the
+        # omission is a saturating harness that reads as harmless.
+        for source in (
+            "import os\nos.fork()\n",
+            "import multiprocessing\nmultiprocessing.Process(target=f).start()\n",
+            "from multiprocessing import Pool\nPool(8)\n",
+            "from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor(8)\n",
+            "import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor(8)\n",
+        ):
+            self.assertTrue(spawns_a_process(source), source)
+
+    def test_a_dotted_module_path_is_read_whole(self):
+        # `import concurrent.futures` binds `concurrent`, so the call site is
+        # two attributes deep. A one-step `Name.attr` match reads it as
+        # something else entirely and clears it.
+        self.assertEqual(
+            dotted_name(ast.parse("a.b.c(1)").body[0].value.func), "a.b.c"
+        )
+        self.assertIsNone(dotted_name(ast.parse("f()(1)").body[0].value.func))
 
     def test_something_else_called_run_is_not_a_spawn(self):
         # `pool.run(...)`, `bench.run(...)`: an attribute call on anything
