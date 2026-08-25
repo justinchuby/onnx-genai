@@ -69,6 +69,7 @@ impl WorkflowRuntime {
         output_name: &str,
     ) -> anyhow::Result<EncodedAudio> {
         let declaration = self
+            .plan
             .workflow
             .outputs
             .get(output_name)

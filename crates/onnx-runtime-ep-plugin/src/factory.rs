@@ -115,6 +115,20 @@ unsafe fn init_host_api(
         return Err(ptr::null_mut());
     }
 
+    // Ordered deliberately: the pin must be in place *before* this library
+    // publishes a pointer that outlives ORT's reference to it. `set_host_api`
+    // caches the host `OrtApi` in a process-global that lives in this library's
+    // data segment, and every entry point reaches this line before building a
+    // factory, so this is the one place that covers `export_ep_factories!`, the
+    // CPU plugin's hand-written copy, and the shared-EP path alike. See
+    // [`crate::pin`] for the hazard.
+    //
+    // The early returns above deliberately do *not* pin. On those paths the
+    // library published nothing ORT can reach, and an instrumented build's
+    // profile writer runs at unload rather than being left dangling, so there
+    // is nothing to protect -- while pinning would strand the mapping of a
+    // plugin that failed to load at all.
+    crate::pin::pin_plugin_library();
     unsafe { set_host_api(api) };
     Ok(api)
 }
@@ -1184,6 +1198,10 @@ mod tests {
     }
 
     impl ExecutionProvider for CountingEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "counting_ep"
         }

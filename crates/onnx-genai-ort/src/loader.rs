@@ -427,7 +427,12 @@ fn lazy_environment(cell: &OnceLock<Arc<Environment>>) -> Result<&Arc<Environmen
 
 /// Loaded ORT sessions and tokenizer assets for a pipeline model directory.
 pub struct PipelineModels {
-    pub sessions: BTreeMap<String, Session>,
+    /// Component sessions, co-ownable so that anything ORT derives from a
+    /// session (an `IoBinding`, a `CreateAllocator` allocator) can hold the
+    /// session alive for as long as it needs it. ORT frees that derived state
+    /// through the session, so `ReleaseSession` has to come last; an `Arc` makes
+    /// that a refcount fact rather than a field-order convention.
+    pub sessions: BTreeMap<String, Arc<Session>>,
     /// Declared graph I/O for components whose ORT [`Session`] was intentionally
     /// not built because the pipeline executes them on the native backend (an
     /// ORT session for such a component would be redundant, and a native-only
@@ -497,11 +502,11 @@ impl PipelineModels {
             if build_ort_session(name) {
                 sessions.insert(
                     name.clone(),
-                    Session::new(
+                    Arc::new(Session::new(
                         lazy_environment(&environment)?.as_ref(),
                         path,
                         component_options.clone(),
-                    )?,
+                    )?),
                 );
             } else {
                 graph_io_metadata.insert(name.clone(), graph_io_from_model_path(path)?);
@@ -570,7 +575,16 @@ impl PipelineModels {
 
     /// Return a loaded session by component name.
     pub fn session(&self, component: &str) -> Option<&Session> {
-        self.sessions.get(component)
+        self.sessions.get(component).map(Arc::as_ref)
+    }
+
+    /// Return a co-ownable handle to a loaded session.
+    ///
+    /// Callers that build an `IoBinding` or a session-derived `Allocator` and
+    /// store it alongside (or outliving) their borrow of `PipelineModels` take
+    /// the session this way, so the session cannot be released first.
+    pub fn shared_session(&self, component: &str) -> Option<Arc<Session>> {
+        self.sessions.get(component).map(Arc::clone)
     }
 
     /// Return a component's declared graph I/O through the backend-neutral
@@ -581,7 +595,7 @@ impl PipelineModels {
     /// runs the component.
     pub fn graph_io(&self, component: &str) -> Option<&dyn GraphIo> {
         if let Some(session) = self.sessions.get(component) {
-            return Some(session as &dyn GraphIo);
+            return Some(session.as_ref() as &dyn GraphIo);
         }
         self.graph_io_metadata
             .get(component)

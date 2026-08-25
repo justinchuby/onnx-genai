@@ -176,6 +176,10 @@ fn a_cuda_session_can_route_internal_and_external_allocations_through_the_manage
     }
     drop(env);
     run_once(&session).expect("the CUDA session must run after its Environment wrapper is dropped");
+    // The allocator allocates through the session's EP, so it has to be
+    // released first; the borrow in `Allocator<'_>` is what makes that a
+    // compile error to get wrong rather than a latent use-after-free.
+    drop(allocator);
     drop(session);
 }
 

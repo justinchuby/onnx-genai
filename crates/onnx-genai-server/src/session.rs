@@ -4,7 +4,8 @@ use std::{
 };
 
 use anyhow::Context;
-use onnx_genai::SessionId;
+
+use crate::worker::SessionPlacement;
 
 #[derive(Clone)]
 pub(crate) struct SessionRegistry {
@@ -23,14 +24,19 @@ struct SessionRegistryInner {
 pub(crate) enum SessionClaim {
     /// Another request bound this client id first; use its session and release
     /// the one this caller opened.
-    Existing(SessionId),
+    Existing(SessionPlacement),
     /// This caller's session is now the client id's session.
-    Claimed { evicted: Option<SessionId> },
+    Claimed { evicted: Option<SessionPlacement> },
 }
 
+/// One client id's binding: where its conversation lives, and when it was last
+/// touched (the LRU key).
 #[derive(Debug)]
 struct SessionEntry {
-    engine_session_id: SessionId,
+    /// The worker that owns this conversation and the engine session id inside
+    /// it. Stored as a pair because a later turn has to be routed back to that
+    /// worker, and an engine session id alone cannot say which one it is.
+    placement: SessionPlacement,
     last_access: u64,
 }
 
@@ -48,25 +54,15 @@ impl SessionRegistry {
     pub(crate) fn insert(
         &self,
         client_id: String,
-        engine_session_id: SessionId,
-    ) -> anyhow::Result<Option<SessionId>> {
+        placement: SessionPlacement,
+    ) -> anyhow::Result<Option<SessionPlacement>> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| anyhow::anyhow!("session registry mutex poisoned"))?;
         let previous_len = inner.sessions.len();
         let evicted = if previous_len >= self.max_sessions {
-            inner
-                .sessions
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(id, _)| id.clone())
-                .and_then(|id| {
-                    inner
-                        .sessions
-                        .remove(&id)
-                        .map(|entry| entry.engine_session_id)
-                })
+            evict_lru(&mut inner)
         } else {
             None
         };
@@ -75,7 +71,7 @@ impl SessionRegistry {
         inner.sessions.insert(
             client_id,
             SessionEntry {
-                engine_session_id,
+                placement,
                 last_access,
             },
         );
@@ -96,7 +92,7 @@ impl SessionRegistry {
     pub(crate) fn claim(
         &self,
         client_id: String,
-        engine_session_id: SessionId,
+        placement: SessionPlacement,
     ) -> anyhow::Result<SessionClaim> {
         let mut inner = self
             .inner
@@ -110,21 +106,11 @@ impl SessionRegistry {
                 .get_mut(&client_id)
                 .expect("entry checked above");
             entry.last_access = last_access;
-            return Ok(SessionClaim::Existing(entry.engine_session_id));
+            return Ok(SessionClaim::Existing(entry.placement));
         }
         let previous_len = inner.sessions.len();
         let evicted = if previous_len >= self.max_sessions {
-            inner
-                .sessions
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(id, _)| id.clone())
-                .and_then(|id| {
-                    inner
-                        .sessions
-                        .remove(&id)
-                        .map(|entry| entry.engine_session_id)
-                })
+            evict_lru(&mut inner)
         } else {
             None
         };
@@ -133,7 +119,7 @@ impl SessionRegistry {
         inner.sessions.insert(
             client_id,
             SessionEntry {
-                engine_session_id,
+                placement,
                 last_access,
             },
         );
@@ -143,7 +129,7 @@ impl SessionRegistry {
         Ok(SessionClaim::Claimed { evicted })
     }
 
-    pub(crate) fn get(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
+    pub(crate) fn get(&self, client_id: &str) -> anyhow::Result<Option<SessionPlacement>> {
         let mut inner = self
             .inner
             .lock()
@@ -158,10 +144,10 @@ impl SessionRegistry {
             .get_mut(client_id)
             .expect("entry checked above");
         entry.last_access = last_access;
-        Ok(Some(entry.engine_session_id))
+        Ok(Some(entry.placement))
     }
 
-    pub(crate) fn remove(&self, client_id: &str) -> anyhow::Result<Option<SessionId>> {
+    pub(crate) fn remove(&self, client_id: &str) -> anyhow::Result<Option<SessionPlacement>> {
         let mut inner = self
             .inner
             .lock()
@@ -169,7 +155,7 @@ impl SessionRegistry {
         let removed = inner
             .sessions
             .remove(client_id)
-            .map(|entry| entry.engine_session_id);
+            .map(|entry| entry.placement);
         if removed.is_some() {
             crate::metrics::active_sessions_removed(1);
         }
@@ -211,6 +197,21 @@ impl Drop for SessionRegistry {
     }
 }
 
+/// Drop the least recently accessed binding and return where its session lives,
+/// so the caller can close it on the worker that owns it.
+///
+/// One implementation for both `insert` and `claim`: the two make the same
+/// eviction decision, and a second copy of it is a second answer waiting to
+/// drift.
+fn evict_lru(inner: &mut SessionRegistryInner) -> Option<SessionPlacement> {
+    let victim = inner
+        .sessions
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_access)
+        .map(|(id, _)| id.clone())?;
+    inner.sessions.remove(&victim).map(|entry| entry.placement)
+}
+
 fn hex_token(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -237,5 +238,109 @@ fn redact_session_id(id: &str) -> String {
     } else {
         // Unknown format — redact entirely.
         "[redacted]".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::WorkerId;
+
+    fn placement(engine_session_id: onnx_genai::SessionId) -> SessionPlacement {
+        SessionPlacement::new(WorkerId::PRIMARY, engine_session_id)
+    }
+
+    #[test]
+    fn a_bound_session_remembers_the_worker_that_owns_it() {
+        let registry = SessionRegistry::new(4);
+        let bound = SessionPlacement::new(WorkerId::new(0), 7);
+
+        assert_eq!(registry.insert("sess-a".to_string(), bound).unwrap(), None);
+
+        let found = registry.get("sess-a").unwrap().expect("session is bound");
+        assert_eq!(found, bound);
+        assert_eq!(found.worker, WorkerId::PRIMARY);
+        assert_eq!(found.engine_session_id, 7);
+    }
+
+    #[test]
+    fn an_unbound_client_id_has_no_session() {
+        let registry = SessionRegistry::new(4);
+        assert_eq!(registry.get("sess-missing").unwrap(), None);
+        assert_eq!(registry.remove("sess-missing").unwrap(), None);
+    }
+
+    #[test]
+    fn removing_a_session_returns_its_placement_once() {
+        let registry = SessionRegistry::new(4);
+        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+
+        assert_eq!(registry.remove("sess-a").unwrap(), Some(placement(1)));
+        assert_eq!(registry.remove("sess-a").unwrap(), None);
+        assert_eq!(registry.get("sess-a").unwrap(), None);
+    }
+
+    /// The registry is capped, and the binding evicted to make room is the one
+    /// accessed longest ago — not the one inserted first.
+    #[test]
+    fn insert_evicts_the_least_recently_accessed_session() {
+        let registry = SessionRegistry::new(2);
+        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+        registry.insert("sess-b".to_string(), placement(2)).unwrap();
+
+        // Touching "a" makes "b" the least recently accessed binding.
+        registry.get("sess-a").unwrap().expect("a is bound");
+
+        let evicted = registry.insert("sess-c".to_string(), placement(3)).unwrap();
+        assert_eq!(evicted, Some(placement(2)), "LRU 'b' must be evicted");
+        assert_eq!(registry.get("sess-b").unwrap(), None);
+        assert_eq!(registry.get("sess-a").unwrap(), Some(placement(1)));
+        assert_eq!(registry.get("sess-c").unwrap(), Some(placement(3)));
+    }
+
+    /// A second request for a client id that is already bound loses: it is told
+    /// which session to use, and closes the one it opened.
+    #[test]
+    fn claim_returns_the_existing_binding_and_refreshes_it() {
+        let registry = SessionRegistry::new(2);
+        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+        registry.insert("sess-b".to_string(), placement(2)).unwrap();
+
+        let claim = registry.claim("sess-a".to_string(), placement(9)).unwrap();
+        assert_eq!(claim, SessionClaim::Existing(placement(1)));
+
+        // The losing claim also counts as an access, so "b" is now the LRU.
+        let evicted = registry.insert("sess-c".to_string(), placement(3)).unwrap();
+        assert_eq!(evicted, Some(placement(2)));
+    }
+
+    #[test]
+    fn claim_binds_a_new_client_id_and_evicts_under_pressure() {
+        let registry = SessionRegistry::new(1);
+        registry.insert("sess-a".to_string(), placement(1)).unwrap();
+
+        let claim = registry.claim("sess-b".to_string(), placement(2)).unwrap();
+        assert_eq!(
+            claim,
+            SessionClaim::Claimed {
+                evicted: Some(placement(1)),
+            }
+        );
+        assert_eq!(registry.get("sess-b").unwrap(), Some(placement(2)));
+        assert_eq!(registry.get("sess-a").unwrap(), None);
+    }
+
+    #[test]
+    fn claimed_sessions_are_listed_redacted() {
+        let registry = SessionRegistry::new(4);
+        let client_id = registry.next_client_id().unwrap();
+        registry.insert(client_id.clone(), placement(1)).unwrap();
+
+        let listed = registry.client_ids_redacted().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].starts_with("sess-"));
+        assert!(listed[0].ends_with('…'));
+        assert!(!listed[0].contains(&client_id[13..]));
+        assert_eq!(registry.max_sessions(), 4);
     }
 }

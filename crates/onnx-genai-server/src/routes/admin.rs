@@ -411,16 +411,24 @@ pub(crate) async fn admin_unload_model(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.registry.unload(&id).map_err(|err| {
-        if err
-            .downcast_ref::<crate::registry::RegistryError>()
-            .is_some()
-        {
-            map_registry_error(crate::registry::RegistryError)
-        } else {
-            ApiError::not_found(format!("model '{id}' is not loaded"))
-        }
-    })?;
+    // Unloading waits for the model's engine worker to stop, which can take as
+    // long as the generation it is running, so it runs on a blocking thread
+    // instead of stalling the executor that has to keep serving everyone else.
+    let registry = state.registry.clone();
+    let unload_id = id.clone();
+    tokio::task::spawn_blocking(move || registry.unload(&unload_id))
+        .await
+        .map_err(|err| ApiError::internal(format!("model unload task panicked: {err}")))?
+        .map_err(|err| {
+            if err
+                .downcast_ref::<crate::registry::RegistryError>()
+                .is_some()
+            {
+                map_registry_error(crate::registry::RegistryError)
+            } else {
+                ApiError::not_found(format!("model '{id}' is not loaded"))
+            }
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

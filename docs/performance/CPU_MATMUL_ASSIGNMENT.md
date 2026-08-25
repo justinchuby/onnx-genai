@@ -2142,7 +2142,190 @@ time. That figure is now stale; the re-measurement replaces it.
 > [`docs/benchmarks/2026-08-24-acc0-dispatcher-placement.md`](../benchmarks/2026-08-24-acc0-dispatcher-placement.md),
 > [`docs/benchmarks/2026-08-24-acc0-w16-null-page-backing.md`](../benchmarks/2026-08-24-acc0-w16-null-page-backing.md),
 > [`docs/benchmarks/2026-08-24-acc0-steal-tiles-retest.md`](../benchmarks/2026-08-24-acc0-steal-tiles-retest.md),
-> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md).
+> [`docs/benchmarks/2026-08-24-acc0-w16-mode-placement.md`](../benchmarks/2026-08-24-acc0-w16-mode-placement.md),
+> [`docs/benchmarks/2026-08-24-acc0-lowwidth-smt.md`](../benchmarks/2026-08-24-acc0-lowwidth-smt.md),
+> [`docs/benchmarks/2026-08-24-acc0-w16-clock-state.md`](../benchmarks/2026-08-24-acc0-w16-clock-state.md).
+>
+> **The t=2 `Percent of CPU` anomaly is retired (2026-08-24).** The old
+> 98 / 71 / 186 table at widths 1/2/4 had a t=2 cell below one core. Forcing
+> two workers onto one physical core was tested directly and costs 1.86x
+> throughput while leaving CPU-time at **200.0%** (vs 196.5% on two cores), so
+> SMT co-location cannot produce a sub-one-core reading -- it steals throughput
+> without stealing CPU-time, and the work-completed ratio 0.550 replicates an
+> independent scalar probe's 0.5505. Re-pointing the *retired instrument
+> itself* at current main reads **99 / 196 / 372**, with w=1 reproducing
+> exactly, so the anomaly was a property of an older tree, not of the
+> instrument. Neither the original wake-latency attribution nor the SMT
+> hypothesis survives; there is no anomaly left on this tree.
+>
+> Also recorded there: **decode width `w` builds `w - 1` `onnx-genai-spmd`
+> threads and runs the w-th lane on the dispatcher thread**, so any instrument
+> counting named worker threads is off by one.
+>
+> **Clock/boost state is excluded (2026-08-24).** This host has no direct clock
+> instrument -- no `cpufreq` sysfs, no vPMU (`perf stat -e cycles` reports
+> `<not supported>`), no readable MSR, and `/proc/cpuinfo` `cpu MHz` is a
+> constant 2870.7 in all 18 launches of both modes, i.e. nominal. None is
+> needed: a clock drop raises CPU-time per token by the *same* factor as wall
+> time, unlike SMT contention (wall up, CPU-time unchanged) or parking (wall
+> up, CPU-time down). Measured, wall/token ratio is **1.5225** while user
+> CPU/token ratio is **1.0250** -- 4.8% of the required inflation. REJECT.
+>
+> **Correction to the null record's sys reading.** That record reported the
+> slow mode as `+4.6% user, +170% sys` and I generalised the mode difference to
+> yield-loop time. In this run sys/token is flat to **2.4%** while wall is
+> +52%. Both runs are real; different slow launches were drawn. The statement
+> that holds in both is: **user CPU per token is flat between modes** (+2.5%
+> and +4.6%) while wall moves 1.5-1.7x, and in this run both user and sys are
+> flat, so the ~3.3 missing lanes are consuming no CPU at all rather than
+> spending longer in the kernel. The sys behaviour is not stable across slow
+> launches and is not carried as a mechanism until measured over several.
+>
+> **The candidate list is empty (2026-08-24).** "Weight-arena placement across
+> the two L3/CCX domains" was carried as the last live candidate for two
+> records and is **malformed on this host**: `numactl --hardware` reports one
+> NUMA node over all 32 CPUs at a single distance, so there is no second memory
+> domain to place an arena in, and an L3 is a cache rather than an allocation
+> target. I listed it twice without checking the host could express it.
+>
+> **Mode-stratifying the worker-split instrument reports nothing, and says
+> why**: under `ONNX_GENAI_CPU_DECODE_WORKER_PROFILE` the width-16 `wall_s`
+> values are one broad distribution (between-mode gap 0.106 s against a
+> within-mode spread of 0.292 s), i.e. two clock reads per worker per op
+> dissolve the bimodality. The counters that would explain the modes perturb
+> them away.
+>
+> **New lead, not the bimodality:** the aggregate width-16 window spends
+> **0.313** in straggler wait, with one worker holding **0.565** of
+> `last_arrivals` against a chance share of 0.067 (`straggler_excess` 8.47) and
+> `work_skew` **0.562** -- one worker doing ~56% more than the mean, with every
+> other worker waiting on it. A direct per-CPU scalar census shows **cpu 0 is
+> not degraded** (rel 0.965 inside a 0.965-1.032 band), contradicting an
+> external report of a permanent competitor there, so the imbalance is ours.
+> Deliberately *not* diagnosed from source: `output_chunk_len_for` returns
+> `n.div_ceil(tasks)` and every llama width divides evenly by 16, so static
+> reading predicts no skew while measurement says 0.562. That contradiction is
+> recorded rather than resolved by argument. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-straggler-lead.md`](../benchmarks/2026-08-24-acc0-straggler-lead.md).
+>
+> **The contradiction is now resolved by measurement, and the source reading
+> won (2026-08-24).** The worker instrument already reported `timed_ops` per
+> lane and `derive()` was discarding it, taking `workers[0]` as *the* op count
+> -- silently assuming the thing in question. Reading all fifteen over 24
+> trusted launches gives `ops_spread` = **0.0000 in every launch**: the split
+> is exactly even, `output_chunk_len_for` is exonerated, and **the excess is
+> execution time on equal work rather than unequal assignment**.
+>
+> Two further mechanisms are excluded. **Placement**: one lane->cpu map across
+> all 24 launches (lane *i* on cpu *2i*, one per physical core -- #1729 working
+> as specified), yet the victim moves, with top lane and top cpu concentration
+> both 0.208 against a 0.5 bar. **Address layout**: with `setarch -R` holding
+> the layout byte-identical the concentration is **0.267, the same number as
+> under ASLR**, so layout does not select the victim either. The `setarch -R`
+> knob was verified to work before measuring, because #1792 on this project is
+> a user-facing placement control that is entirely inert and an inert knob here
+> would have manufactured exactly the observed REJECT.
+>
+> **The straggler survived its own null test.** `work_skew` is a maximum over
+> fifteen lanes and so cannot return zero; `straggler_share` has no null model
+> either, and both had been read as an imbalance across three records. Scaling
+> the window 4x separates a slow lane from max-of-noise: chance predicts the
+> excess over 1/15 decaying by 1/sqrt(4) = 0.50, and it instead **rose**,
+> R = **1.690**, with one lane last on a median **72% of 3840 ops**. The
+> straggler is real, persistent within a process, and worth ~0.31 of the
+> width-16 window. What picks the victim at startup is not placement, not
+> assignment and not address layout, and is deliberately left unnamed until
+> measured. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-straggler-identity.md`](../benchmarks/2026-08-24-acc0-straggler-identity.md).
+>
+> **Post-hoc lead from the same data, recorded as a lead and not a verdict:**
+> across 73 launches in three independent experiments the last-arriving lane is
+> also the highest-`work_ns` lane in **0.667 / 0.667 / 0.684** of launches
+> against a chance share of 0.067 -- so the victim usually computes longer
+> rather than merely starting late. That constrains the selector to something
+> that makes identical work, on a fixed core, at fixed virtual addresses, take
+> longer. **Physical page assignment** is the family that fits and is the next
+> hypothesis to test: `setarch -R` fixes virtual addresses while the kernel
+> still hands out different physical frames each exec, and the large caches
+> here are physically indexed. Not yet tested, and not to be cited as a cause.
+>
+> **Tested the same session, and rejected.** `prctl(PR_SET_THP_DISABLE)` is the
+> only unprivileged lever on this host (pagemap PFNs are masked, the sysfs THP
+> control is root-only), and it was verified to work before measuring
+> (`AnonHugePages` 262144 kB default, 0 kB under the wrapper). 14 launches per
+> arm, interleaved: `work_skew` **0.5329** with 2 MiB backing against **0.5454**
+> with 4 KiB backing, ratio **1.023** against a required 0.60. Both arms held
+> `ops_spread` = 0.0000 and one lane->cpu map. `work_skew` is scale-invariant,
+> so the 1.027x wall cost of disabling THP cannot have manufactured this.
+> **Physical page backing is not the selector**, and no candidate replaces it:
+> the list is empty. The straggler is real, costs ~0.31 of the width-16 window,
+> and is unexplained. What the next probe must satisfy: fixed for a process,
+> different between processes, and none of lane index, CPU, virtual layout or
+> page size.
+>
+> **The dynamic decode claim was unreachable in production (2026-08-24).**
+> `ONNX_GENAI_CPU_DECODE_SCHEDULE=steal` is documented as selecting a dynamic
+> tile claim and was **inert in every default build**: the parse arms
+> recognising it were `#[cfg(feature = "mlas")]`, while the path they select --
+> an `AtomicUsize` cursor over the tile table on the ordinary native SPMD pool
+> -- has no MLAS dependency at all. Only the *optional executor* needs `mlas`,
+> and `mlas` is off by default by policy. It survived because the existing
+> `work_stealing_*` tests construct `DecodeSchedule::Steal` directly, bypassing
+> the parser: the implementation was covered, its reachability was not. Third
+> member of the family after #1792 and the latched-`OnceLock` A/B. Un-gated, with
+> a test that starts from the env string and asserts parse -> build -> dispatch
+> with every output claimed exactly once; the control (gate restored) fails it
+> with `left: Fixed`.
+>
+> **What it is worth, and why the default did not change.** Four interleaved
+> arms with an A/A null, 60 launches each, width 16. Every arm is bimodal with
+> modes ~2.25x apart, so a pooled median estimates the *mode fraction* rather
+> than the effect and the report stratifies per arm. **Inside the slow mode the
+> dynamic claim removes ~20% of decode latency** (steal1 +19.44%, steal4
+> +20.41%, A/A null **0.0043**), replicated at n=24 (+19.72 / +21.46, A/A
+> 0.0223). The fast mode is unresolvable (A/A 0.0327) and the **A/A null on the
+> mode-weighted expectation is 0.0655**, so *no end-to-end claim is licensed and
+> `decode_schedule_from_raw` still falls through to `Fixed`*. The fix ships on
+> contract grounds -- a documented switch that silently does nothing is wrong
+> independently of whether turning it on is faster.
+>
+> Two things this changes for the straggler. The slow mode's excess over the
+> fast mode is ~2.01 ms and the claim recovers ~0.74 of it, so **~37% of the
+> width-16 slow mode is work-distribution cost that scheduling can recover** --
+> the first bite taken out of the straggler after five rejected hypotheses, and
+> it lands without identifying the selector. But **both granularities win
+> equally**, which undercuts the discrimination the probe was built for: a
+> `steal1` win (tiles == workers) is what absorbing a *late-waking* lane looks
+> like, and argues against the slow-executor reading that
+> `straggler_idx == slowest_idx` (0.667/0.667/0.684) supports. Recorded as a
+> tension, not resolved. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-steal-selector.md`](../benchmarks/2026-08-24-acc0-steal-selector.md).
+>
+> **The straggler's selector is unknown after six rejected hypotheses, and the
+> seventh cannot be tested with the EP as it stands (#2017).** Lane *i* always
+> runs on cpu *2i* and always computes chunk *i*, so "slow lane" (a
+> thread/core/hardware property) and "slow chunk" (a data property) predict
+> *identical* observations in every dataset collected to date. Both maps are
+> static for the life of a process; this is a structural ambiguity, not a
+> sample-size problem, and more repetitions cannot resolve it. Both readings
+> currently score ~0.208 against a 0.5 bar **only because they are the same
+> number**. `ONNX_GENAI_CPU_DECODE_CHUNK_PERMUTATION` (`rotate:<k>` / `seed:<n>`)
+> breaks the tie by permuting lane->chunk while holding lane->cpu fixed. Off by
+> default, and its default is the *identity function*, so the shipped path is
+> byte-for-byte unchanged: the permutation reorders an already-computed segment
+> table (alignment is applied to the canonical order and permuted afterwards), it
+> stays inside a NUMA node group, and `place_rows` and dispatch read the same
+> permuted table so a lane touches and computes the same rows. **No timing claim
+> is made and the experiment has not been run** -- the instrument is published
+> before its verdict on purpose. Reachability is asserted from the documented env
+> string in a child process, with the anti-vacuity assertion that the map must
+> *change*, because this is the third knob in a family (#1792 inert affinity, the
+> latched-`OnceLock` A/B, and #2014's MLAS-gated `steal`) where the
+> implementation was covered and its reachability was not: **a knob is not
+> verified until an observable changes when you turn it.** Both negative controls
+> fired -- a dead env read, and a corrupted permutation caught by the dispatch's
+> own per-row coverage counter. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md`](../benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md).
 >
 > The old figure was **not mislabelled — it was a correct measurement of a tree
 > that no longer exists.** An earlier draft argued this from the ORT arm alone
@@ -2212,6 +2395,26 @@ time. That figure is now stale; the re-measurement replaces it.
 > study of t=16 with launch distributions and a pre-registered A/A threshold is
 > the next action. Full record:
 > [`docs/benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md`](../benchmarks/2026-08-23-acc0-gap-vs-ort-by-width.md).
+>
+> **2026-08-24 — the width-16 straggler is a lane property, not a chunk
+> property.** Using the chunk-permutation knob (#2030) and the arm observable
+> (#2041), 832 trusted samples across three datasets on a quiet host. The
+> pre-registered primary rule returns NEITHER in all three: no single index
+> dominates in either frame. But the lane frame is significantly non-uniform in
+> every dataset (chi-square p<0.0001, three replications) while the chunk frame
+> never is (p=0.78/0.87/0.57) — pooling in the lane frame preserves the
+> structure, pooling in the chunk frame destroys it. An arm-set defect found
+> mid-analysis (all-even rotations make odd-lane and odd-chunk the same claim)
+> was fixed with odd-`k` arms, which settle it: odd lane p=0.00018, odd chunk
+> p=0.99989. The victim is core-anchored, drawn from a biased distribution over
+> lanes (concentrated in the first 32 MiB L3 and on cpus = 2 mod 4), not fixed
+> to one. Within a process it holds a median 74.8% of last-arrivals, 11.2x
+> chance. This retires the whole data-property class (cache colouring, page
+> interleave, NUMA placement of the weight range) as the selector — the 8th
+> rejection and the first to close a class rather than a candidate. Remaining
+> limit: placement is one map, so lane and cpu are still the same claim; the
+> analogous lane->cpu permutation is the next instrument. Full record:
+> [`docs/benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md`](../benchmarks/2026-08-24-acc0-chunk-permutation-instrument.md).
 
 Full record for the acc4 table above:
 [`docs/benchmarks/2026-08-21-int4-acc4-execution-regime.md`](../benchmarks/2026-08-21-int4-acc4-execution-regime.md).

@@ -49,6 +49,10 @@ impl Drop for TestNxrtEp {
 }
 
 impl ExecutionProvider for TestNxrtEp {
+    fn consume_route_residency_at_boundary(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "NxrtTestPlugin"
     }

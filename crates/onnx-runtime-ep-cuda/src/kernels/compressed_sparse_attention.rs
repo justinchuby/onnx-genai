@@ -44,6 +44,7 @@ use crate::error::{driver_err, not_implemented};
 use crate::kernels::block_quant;
 use crate::kernels::csa_checkpoint::{CsaAttentionMode, CsaCursors, CsaLayerMetrics, CsaMetrics};
 use crate::kernels::csa_device_state::{CsaBufferLayout, CsaDeviceBufferManager};
+use crate::kernels::csa_state_group::CsaStateGroupDescriptor;
 use crate::runtime::{CudaRuntime, cuptr};
 
 const OP: &str = "CompressedSparseAttention";
@@ -1004,8 +1005,26 @@ impl KernelFactory for CompressedSparseAttentionFactory {
         // call, so size every workspace to the fixed-capacity (D3) bound now and
         // reserve stable addresses.
         let workspace_bytes = csa_workspace_bytes(node, input_shapes, &layout);
-        let device_state =
-            CsaDeviceBufferManager::reserve(self.runtime.clone(), layout, &workspace_bytes)?;
+        // B6 accounting authority: reserve a per-(request, device) charge on the
+        // shared CSA state-group ledger BEFORE any device allocation, so the
+        // ledger is the single accountant for every CSA device buffer and an
+        // over-limit group fails closed with a typed refusal instead of leaking.
+        // `validate` carries the property gate (ratio/cache_format/head geometry
+        // /device/state-edge) so an unsupported config is refused with its
+        // reason rather than reaching CUDA. When the ledger is unlimited (the
+        // default) the reservation is byte-identical to the pre-accounting path.
+        let ledger = self.metrics.state_group_ledger();
+        let request_id = ledger.next_request_id();
+        let descriptor =
+            CsaStateGroupDescriptor::from_node(node, self.runtime.ordinal(), 1, request_id)?;
+        descriptor.validate()?;
+        let device_state = CsaDeviceBufferManager::reserve(
+            self.runtime.clone(),
+            layout,
+            &workspace_bytes,
+            ledger,
+            descriptor.charge_key(),
+        )?;
 
         // Ratio-128 compression and attention both consume graph-threaded device
         // state. Hybrid FP8 is fully resident/capturable; f32 retains the

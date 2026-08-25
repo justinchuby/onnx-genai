@@ -197,8 +197,57 @@ pub enum ShapeInference {
     /// depthwise weight `[C, 1, K]` — not from any input's outer shape — so it
     /// has to be read off input 1.
     CausalConvWithState,
-    /// Op with no modelled shape rule — Compute will error with op details.
-    Declined { op_type: String, domain: String },
+    /// `ai.onnx::DFT`: discrete Fourier transform along a signal axis.
+    ///
+    /// Output shape is the input's, with the last dimension forced to 2 (the
+    /// complex component pair, even for real input) and the signal axis set to
+    /// `dft_length` — halved to `n / 2 + 1` when `onesided`.
+    ///
+    /// Both `dft_length` (input 1) and, from opset 20, `axis` (input 2) arrive
+    /// as *inputs*, so like [`Self::Compress`] this resolves at Compute time by
+    /// reading values. `axis_attr` carries the pre-opset-20 spelling.
+    Dft {
+        onesided: bool,
+        axis_attr: Option<i64>,
+    },
+    /// `ai.onnx::Compress`: select along `axis` (or over the flattened input
+    /// when absent) using a 1-D Bool `condition`.
+    ///
+    /// The selected extent is **data-dependent** — it is the number of true
+    /// entries in `condition`, which no amount of shape reasoning can supply.
+    /// That is expressible here because `infer_shapes` runs at Compute time and
+    /// receives `TensorView`s, so it reads the condition's *values*. Capability
+    /// only needs the rule to exist, not to produce an extent.
+    Compress { axis: Option<i64> },
+    /// Op the shape table cannot resolve. `reason` separates the two cases,
+    /// which look identical at the decline site and are not the same defect.
+    Declined {
+        op_type: String,
+        domain: String,
+        reason: DeclineReason,
+    },
+}
+
+/// Why [`ShapeInference::for_node`] could not produce a rule.
+///
+/// `GetCapability` drops any claim containing a declined node either way, so
+/// the distinction changes no routing. It changes what the situation *means*:
+/// [`Self::NodeNotShapeable`] is the table working as designed, while
+/// [`Self::Unmodelled`] on an operator that has a registered kernel is wiring
+/// nobody finished — the kernel exists and is never dispatched to, and the only
+/// symptom is that the op quietly runs somewhere else.
+///
+/// `registered_ops_are_claimable` in `onnx-runtime-ep-cpu-plugin` turns that
+/// second case into a test failure instead of a silent slowdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// No arm in the table names this operator. If a kernel is registered for
+    /// it, the registration is incomplete.
+    Unmodelled,
+    /// An arm exists, but this node cannot be shaped from what it carries —
+    /// a missing attribute, or an extent that only an input's *values* fix.
+    /// Declining is the correct outcome and the claim is dropped on purpose.
+    NodeNotShapeable(&'static str),
 }
 
 impl ShapeInference {
@@ -351,6 +400,7 @@ impl ShapeInference {
                 _ => Self::Declined {
                     op_type: op.to_string(),
                     domain: domain.to_string(),
+                    reason: DeclineReason::NodeNotShapeable("MatMulNBits without a usable N attribute"),
                 },
             },
 
@@ -414,6 +464,7 @@ impl ShapeInference {
                     Self::Declined {
                         op_type: op.to_string(),
                         domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable("Unsqueeze opset-13 takes axes from input[1]"),
                     }
                 }
             }
@@ -454,6 +505,7 @@ impl ShapeInference {
                     Self::Declined {
                         op_type: op.to_string(),
                         domain: domain.to_string(),
+                        reason: DeclineReason::NodeNotShapeable("Conv attributes/input shapes do not determine the output"),
                     }
                 }
             }
@@ -511,9 +563,26 @@ impl ShapeInference {
                 }
             }
 
+            // ── DFT ───────────────────────────────────────────────────────
+            // Pre-opset-20 the axis is an attribute defaulting to -2; from
+            // opset 20 it is input 2. Both are modelled, so neither reaches
+            // `Unmodelled`.
+            "DFT" => Self::Dft {
+                onesided: int_attr("onesided").unwrap_or(0) != 0,
+                axis_attr: int_attr("axis"),
+            },
+
+            // ── Compress ──────────────────────────────────────────────────
+            // `axis` is optional: absent means the input is flattened first.
+            // Both spellings are modelled, so neither reaches `Unmodelled`.
+            "Compress" => Self::Compress {
+                axis: int_attr("axis"),
+            },
+
             _ => Self::Declined {
                 op_type: op.to_string(),
                 domain: domain.to_string(),
+                reason: DeclineReason::Unmodelled,
             },
         }
     }
@@ -3526,6 +3595,97 @@ fn buf_view_mut(buf: &mut IntermediateBuf) -> onnx_runtime_ep_api::tensor::Tenso
 // Shape inference implementations
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Read a scalar `i64` (or `i32`) out of a host-accessible view.
+///
+/// Same device restriction, and for the same reason, as [`count_true`]: this
+/// runs on the host, so a device-resident value is refused with an explanation
+/// rather than dereferenced.
+fn read_scalar_i64(t: &TensorView<'_>, what: &str) -> Result<i64, String> {
+    if !t.device.is_host_accessible() {
+        return Err(format!(
+            "{what} is on {:?}, which the host cannot read during shape \
+             inference. An EP with device-resident inputs must copy it to the \
+             host before Compute.",
+            t.device
+        ));
+    }
+    let base = t.data.as_ptr() as *const u8;
+    if base.is_null() {
+        return Err(format!("{what} has a null data pointer"));
+    }
+    // SAFETY: host-accessible view of at least one element of the stated dtype;
+    // `byte_offset` is inside it by the view's contract.
+    let p = unsafe { base.add(t.byte_offset) };
+    match t.dtype {
+        DataType::Int64 => Ok(unsafe { p.cast::<i64>().read_unaligned() }),
+        DataType::Int32 => Ok(i64::from(unsafe { p.cast::<i32>().read_unaligned() })),
+        other => Err(format!("{what} must be Int32 or Int64, got {other:?}")),
+    }
+}
+
+/// Resolve a possibly-negative axis against `rank`.
+fn normalize_axis(axis: i64, rank: usize, what: &str) -> Result<usize, String> {
+    let r = rank as i64;
+    let a = if axis < 0 { axis + r } else { axis };
+    if a < 0 || a >= r {
+        return Err(format!("{what} {axis} out of range for rank {rank}"));
+    }
+    Ok(a as usize)
+}
+
+/// Indices of the true entries in a 1-D Bool `condition`.
+///
+/// This is the only place the shape table reads a tensor's *values*, so the two
+/// ways it can be wrong are worth naming.
+///
+/// **Device memory.** `TensorView::data` may point at device memory, and this
+/// runs on the host. A device-resident condition is refused rather than read
+/// through a pointer the host cannot dereference. That is a hard error, not a
+/// silent decline, because by Compute time the claim has already been accepted —
+/// the honest outcome is to say why. Making the CUDA plugin claim `Compress`
+/// needs a D2H copy of the condition (a 1-D Bool tensor, so cheap) plus a stream
+/// sync, which belongs with that EP rather than here.
+///
+/// **Strides.** ORT may hand back a non-contiguous view, so the stride is
+/// honoured instead of assuming packed bytes.
+fn count_true(condition: &TensorView<'_>) -> Result<Vec<usize>, String> {
+    if condition.dtype != DataType::Bool {
+        return Err(format!(
+            "Compress: condition must be Bool, got {:?}",
+            condition.dtype
+        ));
+    }
+    if !condition.device.is_host_accessible() {
+        return Err(format!(
+            "Compress: condition is on {:?}, which the host cannot read during \
+             shape inference. Compress needs the condition's values to size its \
+             output; an EP with device-resident inputs must copy it to the host \
+             before Compute.",
+            condition.device
+        ));
+    }
+
+    let len = condition.shape.first().copied().unwrap_or(0);
+    let stride = condition.strides.first().copied().unwrap_or(1);
+    let base = condition.data.as_ptr() as *const u8;
+    if base.is_null() {
+        return Err("Compress: condition has a null data pointer".into());
+    }
+
+    let mut out = Vec::new();
+    for i in 0..len {
+        let offset = condition.byte_offset as isize + (i as isize) * (stride as isize);
+        // SAFETY: `condition` is a host-accessible Bool view of `len` elements;
+        // the offset is inside it by the view's own contract, and Bool is one
+        // byte so the element stride is the byte stride.
+        let byte = unsafe { *base.offset(offset) };
+        if byte != 0 {
+            out.push(i);
+        }
+    }
+    Ok(out)
+}
+
 /// Infer output shapes from the shape inference strategy and input views.
 fn infer_shapes(
     strategy: &ShapeInference,
@@ -4267,11 +4427,125 @@ fn infer_shapes(
             Ok(outputs)
         }
 
-        ShapeInference::Declined { op_type, domain } => Err(format!(
-            "Op '{op_type}' (domain '{domain}') has no shape-inference rule. \
-             If the op is not yet modelled, add a variant to ShapeInference, \
-             resolve it in ShapeInference::for_node, and handle it in infer_shapes."
-        )),
+        ShapeInference::Dft {
+            onesided,
+            axis_attr,
+        } => {
+            if inputs.is_empty() {
+                return Err("DFT: expected at least 1 input".into());
+            }
+            let input = &inputs[0];
+            let rank = input.shape.len();
+            if rank < 2 {
+                return Err(format!(
+                    "DFT: input must have rank >= 2 (signal axis plus complex \
+                     component dim), got {rank}"
+                ));
+            }
+            let last = rank - 1;
+            let complex_dim = input.shape[last];
+            if complex_dim != 1 && complex_dim != 2 {
+                return Err(format!(
+                    "DFT: last dimension must be 1 (real) or 2 (complex), got {complex_dim}"
+                ));
+            }
+
+            // opset 20 moves `axis` into input 2; before that it is an
+            // attribute defaulting to -2.
+            let axis_raw = match inputs.get(2) {
+                Some(t) if !t.shape.is_empty() => read_scalar_i64(t, "DFT axis")?,
+                _ => axis_attr.unwrap_or(-2),
+            };
+            let axis = normalize_axis(axis_raw, rank, "DFT axis")?;
+            if axis == last {
+                return Err(
+                    "DFT: the signal axis cannot be the complex component dimension".into(),
+                );
+            }
+
+            // `dft_length` (input 1) overrides the signal extent when present.
+            let signal_len = match inputs.get(1) {
+                Some(t) if t.shape.iter().product::<usize>() > 0 => {
+                    let n = read_scalar_i64(t, "DFT dft_length")?;
+                    usize::try_from(n)
+                        .map_err(|_| format!("DFT: dft_length must be non-negative, got {n}"))?
+                }
+                _ => input.shape[axis],
+            };
+
+            let mut shape = input.shape.to_vec();
+            shape[axis] = if *onesided {
+                signal_len / 2 + 1
+            } else {
+                signal_len
+            };
+            // Always complex out, even for real input.
+            shape[last] = 2;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::Compress { axis } => {
+            // The only rule here that reads input *values* rather than shapes.
+            // `Compress` selects the entries where `condition` is true, so the
+            // output extent is a popcount and is unknowable until Compute —
+            // which is precisely when this runs.
+            if inputs.len() < 2 {
+                return Err(format!(
+                    "Compress: expected 2 inputs (data, condition), got {}",
+                    inputs.len()
+                ));
+            }
+            let data = &inputs[0];
+            let condition = &inputs[1];
+            if condition.shape.len() != 1 {
+                return Err(format!(
+                    "Compress: condition must be 1-D, got rank {}",
+                    condition.shape.len()
+                ));
+            }
+
+            // Mirror the kernel: with no axis the input is flattened first.
+            let (mut shape, axis_idx) = match axis {
+                Some(a) => {
+                    let rank = data.shape.len() as i64;
+                    let a = if *a < 0 { a + rank } else { *a };
+                    if a < 0 || a >= rank {
+                        return Err(format!("Compress: axis {a} out of range for rank {rank}"));
+                    }
+                    (data.shape.to_vec(), a as usize)
+                }
+                None => (vec![data.shape.iter().product::<usize>()], 0),
+            };
+
+            // `condition` may be shorter or longer than the axis; the spec
+            // selects over the overlap, which is what the kernel does too.
+            let axis_len = shape[axis_idx];
+            let selected = count_true(condition)?
+                .into_iter()
+                .filter(|&i| i < axis_len)
+                .count();
+            shape[axis_idx] = selected;
+            Ok(vec![shape])
+        }
+
+        ShapeInference::Declined {
+            op_type,
+            domain,
+            reason,
+        } => Err(match reason {
+            DeclineReason::Unmodelled => format!(
+                "Op '{op_type}' (domain '{domain}') has no shape-inference rule at all. \
+                 If a kernel is registered for it, that registration is incomplete and the \
+                 kernel is never dispatched to. Add a variant to ShapeInference, resolve it \
+                 in ShapeInference::for_node, and handle it in infer_shapes. A data-dependent \
+                 extent is expressed as `None` for that dimension."
+            ),
+            DeclineReason::NodeNotShapeable(why) => format!(
+                "Op '{op_type}' (domain '{domain}') is modelled, but this node cannot be \
+                 shaped: {why}. The claim was dropped deliberately; this is the shape table \
+                 working as intended, not a missing rule."
+            ),
+        }),
     }
 }
 
@@ -4654,6 +4928,229 @@ fn after() {}
         infer_shapes(strategy, inputs)
     }
 
+    // ── DFT ──────────────────────────────────────────────────────────────────
+
+    fn i64_scalar<'a>(v: &'a [i64], shape: &'a [usize], strides: &'a [i64]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(v.as_ptr() as *mut std::ffi::c_void),
+            DataType::Int64,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn dft_real_input_produces_a_complex_last_dim() {
+        // [batch=2, signal=8, real=1] -> [2, 8, 2]. The last dim must become 2
+        // even though the input is real; a rule that copied it through would
+        // answer 1 and the kernel would reject the buffer.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: false,
+                    axis_attr: Some(1)
+                },
+                &[x]
+            )
+            .unwrap(),
+            vec![vec![2, 8, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_onesided_halves_the_signal_axis() {
+        // n=8 -> 8/2+1 = 5. This is the whole point of `onesided`, and a rule
+        // that ignored the attribute would answer 8.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: true,
+                    axis_attr: Some(1)
+                },
+                &[x]
+            )
+            .unwrap(),
+            vec![vec![2, 5, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_length_input_overrides_the_signal_extent() {
+        // dft_length=4 against a signal of 8: the output follows the request,
+        // not the input extent.
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        let n = [4i64];
+        let len = i64_scalar(&n, &[1], &[1]);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: false,
+                    axis_attr: Some(1)
+                },
+                &[x, len]
+            )
+            .unwrap(),
+            vec![vec![2, 4, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_opset20_reads_the_axis_from_input_two() {
+        // The axis input must win over the attribute. Attribute says 1, input
+        // says 0 — a rule that ignored the input would resize the wrong axis.
+        let buf = vec![0.0f32; 24];
+        let x = f32_data(&[3, 4, 2], &[8, 2, 1], &buf);
+        let empty: [i64; 0] = [];
+        let no_len = i64_scalar(&empty, &[0], &[1]);
+        let a = [0i64];
+        let axis_in = i64_scalar(&a, &[1], &[1]);
+        assert_eq!(
+            infer(
+                &ShapeInference::Dft {
+                    onesided: true,
+                    axis_attr: Some(1)
+                },
+                &[x, no_len, axis_in]
+            )
+            .unwrap(),
+            // axis 0 of extent 3, onesided -> 3/2+1 = 2
+            vec![vec![2, 4, 2]]
+        );
+    }
+
+    #[test]
+    fn dft_refuses_the_complex_dim_as_the_signal_axis() {
+        let buf = vec![0.0f32; 16];
+        let x = f32_data(&[2, 8, 1], &[8, 1, 1], &buf);
+        let err = infer(
+            &ShapeInference::Dft {
+                onesided: false,
+                axis_attr: Some(-1),
+            },
+            &[x],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("complex component"),
+            "error should name the reason: {err}"
+        );
+    }
+
+    // ── Compress ─────────────────────────────────────────────────────────────
+    //
+    // The only rule that reads input *values*, so it gets its own tests rather
+    // than riding on the claimability guard: that guard only asserts the op has
+    // an arm, which a wrong arm satisfies just as well as a right one.
+
+    /// Build a host Bool condition view over `bits`.
+    fn bool_condition<'a>(
+        bits: &'a [u8],
+        shape: &'a [usize],
+        strides: &'a [i64],
+    ) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(bits.as_ptr() as *mut std::ffi::c_void),
+            DataType::Bool,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    fn f32_data<'a>(shape: &'a [usize], strides: &'a [i64], buf: &'a [f32]) -> TensorView<'a> {
+        TensorView::new(
+            DevicePtr(buf.as_ptr() as *mut std::ffi::c_void),
+            DataType::Float32,
+            shape,
+            strides,
+            onnx_runtime_ir::DeviceId::cpu(),
+        )
+    }
+
+    #[test]
+    fn compress_axis_extent_is_the_condition_popcount() {
+        // 3x4, compress along axis 1 keeping columns 0 and 2.
+        let buf = vec![0.0f32; 12];
+        let data = f32_data(&[3, 4], &[4, 1], &buf);
+        let bits = [1u8, 0, 1, 0];
+        let cond = bool_condition(&bits, &[4], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(1) }, &[data, cond]).unwrap(),
+            vec![vec![3, 2]]
+        );
+    }
+
+    #[test]
+    fn compress_without_axis_flattens_first() {
+        // No axis: the input is flattened, so the output is 1-D of the popcount.
+        let buf = vec![0.0f32; 6];
+        let data = f32_data(&[2, 3], &[3, 1], &buf);
+        let bits = [1u8, 1, 0, 1, 0, 0];
+        let cond = bool_condition(&bits, &[6], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: None }, &[data, cond]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn compress_ignores_condition_entries_past_the_axis() {
+        // The spec selects over the overlap: a condition longer than the axis
+        // does not invent rows. Picking a *true* entry past the end is what
+        // makes this discriminating — a rule that counted the whole condition
+        // would answer 3 here instead of 2.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1, 1, 1];
+        let cond = bool_condition(&bits, &[5], &[1]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap(),
+            vec![vec![2]]
+        );
+    }
+
+    #[test]
+    fn compress_honours_a_non_unit_condition_stride() {
+        // A strided view must not be read as packed bytes. Every other element
+        // is true, so a packed read would answer 1 where the truth is 2.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1, 0, 1];
+        let cond = bool_condition(&bits, &[3], &[2]);
+        assert_eq!(
+            infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap(),
+            vec![vec![3]]
+        );
+    }
+
+    #[test]
+    fn compress_refuses_a_device_resident_condition() {
+        // The host cannot dereference device memory. Erroring names the reason;
+        // reading through the pointer would be undefined behaviour and sizing
+        // the output from a guess would be silently wrong.
+        let buf = vec![0.0f32; 3];
+        let data = f32_data(&[3], &[1], &buf);
+        let bits = [1u8, 0, 1];
+        let cond = TensorView::new(
+            DevicePtr(bits.as_ptr() as *mut std::ffi::c_void),
+            DataType::Bool,
+            &[3],
+            &[1],
+            onnx_runtime_ir::DeviceId::cuda(0),
+        );
+        let err = infer(&ShapeInference::Compress { axis: Some(0) }, &[data, cond]).unwrap_err();
+        assert!(
+            err.contains("host cannot read"),
+            "error should name the device restriction: {err}"
+        );
+    }
+
     // ── AttentionStd (ai.onnx::Attention, opset 23+) ──────────────────────────
 
     #[test]
@@ -4760,6 +5257,7 @@ fn after() {}
         let s = ShapeInference::Declined {
             op_type: "FooBar".into(),
             domain: "some.domain".into(),
+            reason: DeclineReason::Unmodelled,
         };
         let err = infer(&s, &[]).unwrap_err();
         assert!(err.contains("FooBar"), "error should mention op: {err}");

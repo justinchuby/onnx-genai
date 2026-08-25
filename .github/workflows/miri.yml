@@ -73,17 +73,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          run_miri() {
-            local label="$1"
-            shift
-            local start end
-            start=$(date +%s)
-            echo "::group::Miri: ${label}"
-            "$@"
-            end=$(date +%s)
-            echo "MIRI_TIMING ${label}: $((end - start))s"
-            echo "::endgroup::"
-          }
+          # `run_miri` lives in a script so it can have a conformance suite:
+          # it is a gate whose failure mode is a green report. Most steps below
+          # select tests BY NAME, and libtest exits 0 on a filter that matches
+          # nothing, so a renamed test silently turns its step into a no-op that
+          # reports `ok`. The wrapper fails the step when it executed no tests.
+          # See scripts/miri_step.sh and scripts/miri_step_test.sh.
+          # shellcheck source=scripts/miri_step.sh
+          . ./scripts/miri_step.sh
 
           # Keep Stacked Borrows (Miri default) instead of Tree Borrows so the raw
           # pointer ownership checks stay maximally strict. Only ep-api/session/C
@@ -252,10 +249,10 @@ jobs:
           # exists. Present since the module was written, on both sides of
           # #1526, and no native run can observe it.
           #
-          # Two tests in the module assert on wall clock (`PROBE_STALL`) and
-          # are `#[cfg_attr(miri, ignore)]`d: the interpreter is ~1000x slower
-          # than native, so the claim is not one Miri can represent. Everything
-          # that touches the pointer runs.
+          # Since #2018 the module has no `#[cfg_attr(miri,
+          # ignore)]` tests at all: the two that used to assert on wall clock
+          # (`PROBE_STALL`) now assert on a stall *count*, which an interpreter
+          # can represent perfectly well. All 24 run here.
           run_miri "onnx-runtime-ep-plugin host pool" \
             cargo +nightly miri test --locked -p onnx-runtime-ep-plugin --lib host_pool::
 

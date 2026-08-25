@@ -3,11 +3,13 @@
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 pub use onnx_genai_runtime_config::CudaAttentionMode;
 #[cfg(test)]
 use onnx_genai_runtime_config::{EpSelection, ExecutionProviderEntry};
 
+use crate::thread_affinity::{OwnerThread, ThreadAccess, ThreadAffinity};
 use crate::{Allocator, DataType, Environment, IoBinding, MemoryInfo, OrtError, Result, Value};
 
 #[cfg(feature = "cuda")]
@@ -497,6 +499,12 @@ pub struct Session {
     node_cpu_fallback_allowed: bool,
     /// Whether ORT actually placed nodes on CPU through internal fallback.
     node_cpu_fallback_used: Option<bool>,
+    /// Guards `Run` against overlapping calls when this session's providers or
+    /// graph-capture state make concurrent runs unsafe. Sessions that
+    /// [`Session::supports_concurrent_run`] are guarded as
+    /// [`ThreadAffinity::Shared`], i.e. the guard costs one branch and never
+    /// refuses.
+    run_affinity: OwnerThread,
 }
 
 impl Session {
@@ -735,6 +743,16 @@ impl Session {
         let input_names = inputs.iter().map(|info| info.name.clone()).collect();
         let output_names = outputs.iter().map(|info| info.name.clone()).collect();
 
+        let execution_providers = effective_options.execution_providers.clone();
+        let graph_capture = effective_options.graph_capture;
+        let run_affinity = OwnerThread::new(
+            "Session",
+            match concurrent_run_support(&execution_providers, graph_capture) {
+                ConcurrentRunSupport::Supported => ThreadAffinity::Shared,
+                ConcurrentRunSupport::Unsupported { .. } => ThreadAffinity::Exclusive,
+            },
+        );
+
         Ok(Self {
             ptr,
             _model_path: model_path,
@@ -742,17 +760,19 @@ impl Session {
             output_names,
             inputs,
             outputs,
-            execution_providers: effective_options.execution_providers.clone(),
-            graph_capture: effective_options.graph_capture,
+            execution_providers,
+            graph_capture,
             cpu_fallback_used,
             skipped_providers,
             node_cpu_fallback_allowed,
             node_cpu_fallback_used,
+            run_affinity,
         })
     }
 
     /// Run inference with named inputs, returns named outputs.
     pub fn run(&self, inputs: &[(&str, &Value)]) -> Result<Vec<Value>> {
+        let _access = self.enter_run("run")?;
         let input_names: Vec<CString> = inputs
             .iter()
             .map(|(name, _)| {
@@ -808,7 +828,9 @@ impl Session {
     }
 
     /// Run inference using pre-bound I/O (zero-copy for device tensors).
-    pub fn run_with_binding(&self, binding: &IoBinding) -> Result<()> {
+    pub fn run_with_binding(&self, binding: &IoBinding<'_>) -> Result<()> {
+        let _session_access = self.enter_run("run_with_binding")?;
+        let _binding_access = binding.enter_run("run_with_binding")?;
         let api = crate::error::api()?;
         let run = api
             .RunWithBinding
@@ -823,6 +845,47 @@ impl Session {
     /// Whether this session was created with EP graph capture enabled.
     pub fn graph_capture(&self) -> bool {
         self.graph_capture
+    }
+
+    /// Whether ORT permits several threads to run this session at once.
+    ///
+    /// A session worker pool may only share one [`Session`] across threads when
+    /// this is `true`; otherwise each worker needs its own session. It answers
+    /// from the providers this session actually resolved to plus its
+    /// graph-capture state, never from a model or vendor name, and fails closed
+    /// when a provider does not declare [`capability::CONCURRENT_RUN`].
+    ///
+    /// Use [`Session::concurrent_run_support`] when the caller has to explain
+    /// the refusal.
+    #[must_use]
+    pub fn supports_concurrent_run(&self) -> bool {
+        matches!(
+            self.concurrent_run_support(),
+            ConcurrentRunSupport::Supported
+        )
+    }
+
+    /// [`Session::supports_concurrent_run`], with the reason for a refusal.
+    #[must_use]
+    pub fn concurrent_run_support(&self) -> ConcurrentRunSupport {
+        concurrent_run_support(&self.execution_providers, self.graph_capture)
+    }
+
+    /// Take this session for one run.
+    ///
+    /// Sessions whose providers support concurrent `Run` are shared, so this
+    /// costs a branch and never refuses. For the rest — a graph-capturing
+    /// session above all, whose capture/replay state machine lives in the
+    /// session and not in the call — it turns a second concurrent run into a
+    /// named error instead of a corrupted capture.
+    fn enter_run(&self, operation: &'static str) -> Result<ThreadAccess<'_>> {
+        self.run_affinity.enter(operation).map_err(Into::into)
+    }
+
+    /// The guard that decides whether two threads may run this session at once.
+    #[must_use]
+    pub fn run_thread_affinity(&self) -> &OwnerThread {
+        &self.run_affinity
     }
 
     /// Execution providers this session actually runs on, in priority order.
@@ -891,7 +954,7 @@ impl Session {
     /// leaving the variable-shape prefill uncaptured.
     pub fn run_with_binding_graph(
         &self,
-        binding: &IoBinding,
+        binding: &IoBinding<'_>,
         graph_annotation_id: i32,
     ) -> Result<()> {
         self.run_with_binding_graph_phased(binding, graph_annotation_id)
@@ -901,9 +964,15 @@ impl Session {
     /// Run with graph annotation while distinguishing setup from invocation failures.
     pub fn run_with_binding_graph_phased(
         &self,
-        binding: &IoBinding,
+        binding: &IoBinding<'_>,
         graph_annotation_id: i32,
     ) -> std::result::Result<(), RunPhaseError> {
+        let _session_access = self
+            .enter_run("run_with_binding_graph")
+            .map_err(RunPhaseError::Setup)?;
+        let _binding_access = binding
+            .enter_run("run_with_binding_graph")
+            .map_err(RunPhaseError::Setup)?;
         let api = crate::error::api().map_err(RunPhaseError::Setup)?;
         let run = api
             .RunWithBinding
@@ -1092,7 +1161,30 @@ impl Session {
     /// allocator. If a device EP is selected but ORT cannot produce a matching
     /// allocator (e.g. the EP silently fell back to CPU), the error is logged
     /// and `Ok(None)` is returned so decode still works via CPU buffers.
-    pub fn device_kv_allocator(&self) -> Result<Option<Allocator>> {
+    pub fn device_kv_allocator(&self) -> Result<Option<Allocator<'_>>> {
+        self.device_kv_allocator_with(|memory_info| {
+            Allocator::for_session_device(self, memory_info)
+        })
+    }
+
+    /// Same as [`Session::device_kv_allocator`], but the allocator co-owns the
+    /// session instead of borrowing it.
+    ///
+    /// An owner that stores the session beside the allocator (an execution
+    /// island, a workflow component cache) cannot name the borrow the borrowed
+    /// form needs, so it takes a strong reference instead: ORT then releases
+    /// the allocator before the session no matter which field the owner
+    /// declared first.
+    pub fn shared_device_allocator(session: &Arc<Session>) -> Result<Option<Allocator<'static>>> {
+        session.device_kv_allocator_with(|memory_info| {
+            Allocator::for_shared_session_device(Arc::clone(session), memory_info)
+        })
+    }
+
+    fn device_kv_allocator_with<'a>(
+        &self,
+        create: impl Fn(MemoryInfo) -> Result<Allocator<'a>>,
+    ) -> Result<Option<Allocator<'a>>> {
         if !self
             .execution_providers
             .iter()
@@ -1119,7 +1211,7 @@ impl Session {
             }
         }) {
             let memory_info = MemoryInfo::cuda(device_id)?;
-            return match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+            return match create(memory_info) {
                 Ok(allocator) => {
                     tracing::info!(device_id, "allocating shared GQA KV on CUDA device memory");
                     Ok(Some(allocator))
@@ -1149,7 +1241,7 @@ impl Session {
                 return Ok(None);
             }
         };
-        match Allocator::for_session_device(self.ptr.as_ptr(), memory_info) {
+        match create(memory_info) {
             Ok(allocator) => {
                 tracing::warn!(
                     "ONNX_GENAI_DEVICE_KV=1: allocating shared GQA KV on the WebGPU device allocator (EXPERIMENTAL; ORT 1.27 WebGPU may segfault during multi-step decode)"
@@ -1170,7 +1262,7 @@ impl Session {
     /// This is the generic counterpart to the decode KV allocation path. It is
     /// used by execution-island I/O binding so CUDA graph capture sees stable,
     /// device-resident input and output addresses.
-    pub fn device_allocator(&self) -> Result<Option<Allocator>> {
+    pub fn device_allocator(&self) -> Result<Option<Allocator<'_>>> {
         self.device_kv_allocator()
     }
 
@@ -1179,7 +1271,7 @@ impl Session {
     /// Returns `false` when the session has no supported device allocator.
     pub fn bind_output_to_execution_device(
         &self,
-        binding: &mut IoBinding,
+        binding: &mut IoBinding<'_>,
         name: &str,
     ) -> Result<bool> {
         #[cfg(feature = "cuda")]
@@ -1221,17 +1313,96 @@ impl Drop for Session {
     }
 }
 
-// SAFETY: `Session` owns one `OrtSession` handle plus immutable Rust metadata.
-// ONNX Runtime documents `OrtSession::Run`/`RunWithBinding` as safe for
-// concurrent calls on the same session; per-run inputs, outputs, and `IoBinding`
-// values are supplied by the caller and are not stored in `Session`. `Drop` still
-// requires unique ownership and releases the handle exactly once. This would stop
-// being sound for an execution provider that violates ORT's concurrent-run
-// contract, or if future code cached mutable per-run state inside `Session`.
+/// Whether ORT permits concurrent `Run` calls on one session, and why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrentRunSupport {
+    /// Every resolved provider declares [`capability::CONCURRENT_RUN`] and the
+    /// session holds no per-session run state of its own.
+    Supported,
+    /// Concurrent runs are refused. `reason` names what makes them unsafe and
+    /// what a caller can do instead.
+    Unsupported { reason: String },
+}
+
+impl ConcurrentRunSupport {
+    /// The refusal reason, or `None` when concurrent runs are supported.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Supported => None,
+            Self::Unsupported { reason } => Some(reason),
+        }
+    }
+}
+
+/// Resolve concurrent-run support from what a session actually runs on.
+///
+/// Two properties decide it, and both are properties of this session rather
+/// than of a model or a vendor:
+///
+/// * **Graph capture.** A capturing session owns a capture/replay state machine
+///   keyed by `gpu_graph_id`, and it replays against the exact device addresses
+///   seen at capture time. Two threads inside that state machine capture each
+///   other's buffers; the corruption is silent, so this fails closed.
+/// * **Provider capability.** ORT's session-level contract allows concurrent
+///   `Run` only as far as every provider under it does, so an EP that does not
+///   declare [`capability::CONCURRENT_RUN`] withdraws it for the whole session.
+///   A session with no resolved providers has nothing to declare it, which is
+///   also a refusal.
+fn concurrent_run_support(
+    execution_providers: &[ResolvedEp],
+    graph_capture: bool,
+) -> ConcurrentRunSupport {
+    if graph_capture {
+        return ConcurrentRunSupport::Unsupported {
+            reason: "this session captures and replays EP graphs, and capture/replay is \
+                     per-session state keyed by gpu_graph_id: a second concurrent run would \
+                     capture the first run's buffers. Give each worker thread its own \
+                     session, or create the session without graph capture."
+                .to_owned(),
+        };
+    }
+    if execution_providers.is_empty() {
+        return ConcurrentRunSupport::Unsupported {
+            reason: "this session resolved no execution provider, so nothing declares that \
+                     concurrent Run is safe. Give each worker thread its own session."
+                .to_owned(),
+        };
+    }
+    if let Some(provider) = execution_providers
+        .iter()
+        .find(|ep| !ep.caps.has(capability::CONCURRENT_RUN))
+    {
+        return ConcurrentRunSupport::Unsupported {
+            reason: format!(
+                "execution provider '{}' does not declare the '{}' capability, so ORT may not \
+                 run this session from two threads at once. Give each worker thread its own \
+                 session, or select a provider that declares it.",
+                provider.caps.name,
+                capability::CONCURRENT_RUN
+            ),
+        };
+    }
+    ConcurrentRunSupport::Supported
+}
+
+// SAFETY: `Session` owns one `OrtSession` handle plus immutable Rust metadata,
+// and the only interior mutability is `run_affinity`, whose atomics are
+// synchronized. Moving a session to another thread is therefore sound
+// unconditionally: ORT sessions have no thread affinity, and `Drop` still
+// requires unique ownership and releases the handle exactly once. This would
+// stop being sound if future code cached unsynchronized mutable per-run state
+// inside `Session`.
 unsafe impl Send for Session {}
-// SAFETY: Shared `&Session` access only permits ORT runs against the thread-safe
-// session handle and reads immutable metadata. Callers must not share a mutable
-// ORT binding/value through unsafe code across concurrent runs.
+// SAFETY: Shared `&Session` access permits reading immutable metadata and
+// calling ORT `Run`/`RunWithBinding`. ORT documents concurrent `Run` on one
+// session as safe *when the providers underneath it are*, which is precisely
+// what `Session::supports_concurrent_run` reports; a session that is not
+// concurrently runnable refuses the second overlapping run through
+// `run_affinity` with a named error rather than corrupting a capture. Sharing a
+// `&Session` never hands out an `IoBinding`, `Allocator`, or `Value` — those are
+// `!Send + !Sync` and stay with the thread that created them — so `Sync` here
+// does not make the non-thread-safe handles shareable.
 unsafe impl Sync for Session {}
 
 struct RawSessionOptions {

@@ -212,7 +212,8 @@ looked wrong from the inside: intra-run spread stayed under 6% in some of the
 corrupted samples, because a tight spread only says the contention was steady,
 not that the host was quiet.
 
-So announce, and prefer the mechanical form:
+So announce, and take the lock. For any **saturating** run — a full benchmark
+matrix, the EP test suite, a qemu leg — it is *required*, not preferred:
 
 ```sh
 scripts/hostlock.sh status                       # is anybody benchmarking?
@@ -222,11 +223,52 @@ scripts/hostlock.sh run --owner leon \
 ```
 
 `run` is the form to use: it releases on success, on failure and on Ctrl-C.
-It is held by the harness for the whole run, so an interleaved A/B/null keeps
-the lock across every arm — sampling `ps` between two arms of someone else's
-A/B is how a host was declared free while a sweep was mid-flight.
-`--gate N` additionally waits for the *instantaneous runnable count* to fall to
-N before starting, which drains load from people who never took the lock.
+The holder must be the **outer harness**, spanning every arm of an interleaved
+A/B/null — not each benchmark child. Wrapping the children individually leaves
+a gap between arms in which the box looks idle, and that gap is not
+hypothetical: a peer ran `ps`, saw no benchmark process, and started a sweep
+*between two arms* of somebody else's A/B.
+
+That is the general rule, and it is worth stating on its own. **Never conclude
+the host is free from "nothing of mine is running", from `ps`, or from a single
+`loadavg` reading.** The first two sample an instant, and occupancy is a
+property of an interval. `loadavg` fails the other way — it is an exponential
+moving average, so it stays high after a heavy run has ended and reads low
+while a burst is still in flight (see below) — but the conclusion is the same:
+the lock is the only statement about the interval, because it is a
+*declaration* rather than a measurement. `--gate N` additionally waits for the
+*instantaneous runnable count* to fall to N before starting, which drains load
+from people who never took the lock; it is a start admission control and
+nothing more.
+
+`ab.py` **enforces this rather than documenting it.** Before it launches a
+single arm it reads the lock and requires a declaration whose anchor is itself
+or one of its ancestors; anything else stops the run with exit 3 and prints the
+wrapping command. The ancestry test is what distinguishes the two shapes that
+both look like "a lock is held": a lock held by an *ancestor* spans every arm,
+while a lock held by a benchmark *child* is released between them, which is the
+gap a peer's sweep once started in. A peer's lock stops the run for the
+opposite reason — they declared the box.
+
+```sh
+scripts/hostlock.sh run --owner leon --reason "moe mt panel 6-cell" -- \
+    python3 scripts/ort_ab/ab.py --arms base=./a mine=./b --null-control ...
+```
+
+Every CSV row then carries `host_lock`, `lock_owner`, `lock_anchor_pid` and
+`runnable_at_start`, and the label covers the **whole window**: the lock is
+read again at the end, and a run that changed hands halfway through is stamped
+`changed` rather than named after whoever happened to hold it last. If that
+second reading fails the row says `unverified-end`, because an unreadable lock
+is not evidence of a handoff and is not evidence against one either.
+`runnable_at_start` is a single sample taken before the first arm — a note
+about the conditions at the start, not a property of the interval; see the
+`--gate` paragraph above for why no threshold on it is honest here.
+`--unlocked` runs anyway and stamps every row `unlocked:<state>` — for smoke
+tests, never for anything publishable — but it will **not** run over a lock
+somebody else declared, because that damage lands on their measurement, where
+no label of ours can reach it. `scripts/ort_ab/test_ab_lock.py` covers the
+admission table and runs in the `Host lock` workflow.
 
 `SIGKILL` (and a full-box crash) cannot be caught, so it leaves the lock
 directory behind. Nothing wedges: the lock carries its holder's pid **and**
@@ -236,7 +278,17 @@ never reaped, which still resolves in `/proc`. The same is true of the
 internal guard that serialises reclaiming, so there is no state a kill can
 leave that requires a human with `rm -rf`. If you want to see it before
 trusting it: `hostlock.sh status` distinguishes FREE / HELD / STALE /
-EXPIRED, and `provenance` prints who holds it and since when.
+EXPIRED / UNUSABLE, and `provenance` prints who holds it and since when.
+
+`UNUSABLE` is the answer that is neither "yours" nor "somebody else's": no
+lock can be **created** at the configured path on this host, so nobody here
+can participate. `status` names the reason (also `lock_dir_problem=` in
+`--porcelain`, always emitted and empty when there is none), and `acquire`,
+`wait` and `run` refuse with exit **7** — distinct from 1, because a
+misconfigured host is not a bad argument, and distinct from 2 and 3, which
+both assert that a peer holds the box. `run` refuses *without* running your
+command, which is the whole point: the failure it replaces was a host that
+reported `FREE`, ran the benchmark unlocked, and said nothing.
 
 ### Where the lock lives
 
@@ -249,6 +301,11 @@ a machine-local config, which every invocation by every agent reads:
 mkdir -p ~/.config/onnx-genai
 echo 'lock_dir=/var/lib/onnx-genai/hostlock' > ~/.config/onnx-genai/hostlock.conf
 ```
+
+You will be told when you need this rather than having to guess: on a host
+where the path cannot be created, `status` reports `UNUSABLE` with the reason
+and `acquire`/`run`/`wait` exit 7. Until that existed the same host reported
+`FREE` and ran unlocked.
 
 `$HOSTLOCK_DIR` also moves the path and is **not** the same thing: it is set per
 process, so it does not move your peers with you. It is a **private** lock. It
@@ -276,7 +333,7 @@ The lock and the gate decide whether to **start**. They cannot tell you
 afterwards whether the numbers are any good, because they sample instants: a
 gate sampled either side of a 2 s arm reported "runnable 2-4, clean" for runs
 that were getting 50-70% of a core, against a 52% A/A null. Add
-`--expect-cores N --min-efficiency F` to decide whether to **believe** it:
+`--expect-cores N --min-efficiency F` to decide whether to **reject** it:
 
 ```sh
 scripts/hostlock.sh run --owner leon --reason "softmax 28-cell matrix" \
@@ -293,10 +350,32 @@ one measurement, never a claim that the host owes you every core.
 
 That compares the CPU the command actually consumed against `N x wall` and
 exits 6 if it falls short, so an unattended harness stops instead of
-publishing. It needs no quiet host -- it tells you which reps to throw away.
-Set `F` from a measured quiet-host run of *your* workload, not from 1.0: a
-benchmark with a deliberate inter-token gap is legitimately below 1.0 and is
-not contended.
+publishing. Set `F` from a measured quiet-host run of *your* workload, not from
+1.0: a benchmark with a deliberate inter-token gap is legitimately below 1.0
+and is not contended.
+
+**Both are supplementary. Neither certifies a number, and neither replaces the
+lock.** `(utime+stime)/wall` measures how much of the wall clock your process
+spent *scheduled on a CPU*, and that is not the same as how much work it got
+done:
+
+* **An SMT sibling never deschedules you.** A competitor on the other
+  hyperthread of your core shares the front end and the execution ports. You
+  keep running, efficiency stays around 1.00, and your throughput falls anyway.
+* **Neither does a neighbour off-core.** Memory bandwidth, LLC occupancy and
+  turbo headroom are shared box-wide. A process saturating DRAM on other cores
+  slows you without ever touching your runqueue.
+
+The A/A null has the mirror-image blind spot. It is a *variance* measurement:
+it sees contention that differs between the two arms, and it is blind to
+contention that is steady across both. Both arms are depressed by the same
+factor, the null comes out small, and the ratio you publish is a ratio of two
+equally contaminated numbers — which is why a tight intra-run spread means only
+that the contention was steady, never that the host was quiet.
+
+So: the lock decides whether you may **start**, `--gate` drains stragglers who
+never took it, and efficiency and the null throw away a *subset* of the reps
+that were spoiled anyway. Only the lock says the box was yours.
 
 Gate on that runnable count (`cut -d' ' -f4 /proc/loadavg | cut -d/ -f1`), not
 on the 1-minute load average: `loadavg` is an exponential moving average, so it
@@ -316,6 +395,7 @@ whichever holder happened to be there at the end:
 | `unverified:<owner>` / `stale:<owner>` | held by an anchor whose liveness is unprovable, or provably gone |
 | `changed` | the window spans a change of custody; no single holder describes it |
 | `free` / `unknown` | nobody declared the host, or the lock could not be read -- deliberately not the same value |
+| `unusable` | the lock could not exist here at all: no directory, and none creatable. Not `free` -- nobody declared the host **and nobody could have**, this row's peers included. The remedy is a working `lock_dir=` (see [Where the lock lives](#where-the-lock-lives)), not a retry |
 
 `run --owner leon -- ...` is enough: since #1929 `run` exports the declared
 owner into the wrapped command, so the obvious invocation is also the one that

@@ -413,13 +413,184 @@ pub(crate) fn topology_or_fail_closed(
 ///
 /// Placement *tests* must call this rather than [`host`]. `host` keeps its
 /// `Option` because production callers must not panic on an undiscoverable
-/// topology -- `placement_is_one_worker_per_physical_core` answering `None` is
+/// topology -- `planned_placement_is_one_worker_per_physical_core` answering `None` is
 /// correct, since claiming `Some(true)` there would be a lie. The difference is
 /// that a test skipping is a defect being missed, whereas production declining
 /// to cap is the documented "never cap on a guess" policy.
 #[cfg(test)]
 pub(crate) fn require_host_for_placement() -> Result<&'static CoreTopology, &'static str> {
     topology_or_fail_closed(host(), DETECTION_SUPPORTED)
+}
+
+/// The variable a CI lane sets to declare that this crate's placement
+/// falsifiers must actually execute there.
+///
+/// Modelled on `NXRT_REQUIRE_ORT_TESTS`, which the `cli-ort` job sets so that a
+/// missing ORT reddens the one lane whose job is to run against ORT, while a
+/// developer without ORT still gets a skip. The same asymmetry applies here:
+/// no host is obliged to have two physical cores or a working
+/// `sched_setaffinity`, but the lanes we point at this crate are, and until
+/// something says so their absence is indistinguishable from a pass.
+#[cfg(test)]
+pub(crate) const REQUIRE_PLACEMENT_ENV: &str = "NXRT_REQUIRE_PLACEMENT_TESTS";
+
+/// Whether the current lane has declared the placement falsifiers mandatory.
+#[cfg(test)]
+pub(crate) fn placement_tests_required() -> bool {
+    std::env::var(REQUIRE_PLACEMENT_ENV).as_deref() == Ok("1")
+}
+
+/// The second placement capability, after detection: at least two physical
+/// cores to place workers on.
+///
+/// Returns `true` when the check may proceed. When it may not, this panics in a
+/// lane that declared the checks mandatory and otherwise states the skip on
+/// stderr -- as opposed to the bare `return` these sites used before, which is
+/// a silent pass.
+///
+/// Detection already fails closed through [`require_host_for_placement`], but
+/// that only proves the topology is *readable*. A host that reads back one
+/// physical core switches every "one worker per physical core" assertion off
+/// while satisfying the anti-vacuity guard, because the guard asserts
+/// `core_count() > 0`. The capabilities the assertions need and the capability
+/// the guard checks are not the same set.
+#[cfg(test)]
+pub(crate) fn require_two_cores_for_placement(cores: &CoreTopology, what: &str) -> bool {
+    if cores.core_count() >= 2 {
+        return true;
+    }
+    assert!(
+        !placement_tests_required(),
+        "{REQUIRE_PLACEMENT_ENV}=1 but this host reports {} physical core(s), so `{what}` cannot \
+         distinguish one worker per physical core from two workers sharing one, and would report \
+         success without testing anything. Point this lane at a runner with two physical cores or \
+         stop requiring placement tests on it.",
+        cores.core_count()
+    );
+    eprintln!(
+        "skipping {what}: {} physical core(s) cannot express \"one worker per core\" \
+         distinguishably",
+        cores.core_count()
+    );
+    false
+}
+
+/// The CPU layout a placement falsifier has to be able to build before it can
+/// answer anything.
+///
+/// `require_two_cores_for_placement` asks what the *host* has. That is not the
+/// same question as what this *process* may use: a `taskset`, cpuset or
+/// container narrows the allowed set, and a check whose layout is
+/// unrepresentable inside it returns without testing anything.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PlacementLayout {
+    /// Two SMT siblings of one physical core -- the *bad* layout a negative
+    /// control must construct in order to report it as a defect.
+    SharedCore,
+    /// Two CPUs on different physical cores -- the good layout the positive arm
+    /// needs, without which the negative arm above it is equally satisfied by a
+    /// predicate that is simply always false.
+    DistinctCores,
+}
+
+#[cfg(test)]
+impl PlacementLayout {
+    /// The CPUs realising this layout inside `allowed`, if it is representable
+    /// there at all.
+    pub(crate) fn within(
+        self,
+        cores: &CoreTopology,
+        allowed: &BTreeSet<usize>,
+    ) -> Option<Vec<usize>> {
+        match self {
+            Self::SharedCore => cores.cores().iter().find_map(|group| {
+                let mut inside = group.iter().copied().filter(|cpu| allowed.contains(cpu));
+                match (inside.next(), inside.next()) {
+                    (Some(first), Some(second)) => Some(vec![first, second]),
+                    _ => None,
+                }
+            }),
+            Self::DistinctCores => {
+                let cpus: Vec<usize> = cores
+                    .cores()
+                    .iter()
+                    .filter_map(|group| group.iter().copied().find(|cpu| allowed.contains(cpu)))
+                    .take(2)
+                    .collect();
+                (cpus.len() == 2).then_some(cpus)
+            }
+        }
+    }
+
+    /// Whether the *host* could supply this layout if nothing were narrowing the
+    /// allowed set. This is the discriminator between a platform fact and a
+    /// binding artifact, and it is why the skip cannot be a bare `return`.
+    pub(crate) fn representable_on(self, cores: &CoreTopology) -> bool {
+        match self {
+            Self::SharedCore => cores.cores().iter().any(|group| group.len() >= 2),
+            Self::DistinctCores => cores.core_count() >= 2,
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::SharedCore => "two SMT siblings of one physical core",
+            Self::DistinctCores => "two CPUs on distinct physical cores",
+        }
+    }
+}
+
+/// The third placement capability, after detection and two physical cores: the
+/// layout has to be representable inside the CPU set this process may use.
+///
+/// Returns the CPUs to use, or `None` when the check cannot run. `None` is a
+/// panic in a lane that declared placement mandatory *and* whose host could
+/// have supplied the layout -- i.e. when the only reason the check cannot run
+/// is how the run was bound. A host that genuinely lacks the layout (no SMT, or
+/// one physical core) is exempt, because failing there would be a false failure
+/// and the pressure would be to delete the requirement rather than fix the lane.
+///
+/// `required` is a parameter rather than a direct call to
+/// [`placement_tests_required`] for the same reason `detection_supported` is one
+/// on [`topology_or_fail_closed`]: both states have to be assertable from a
+/// multi-threaded test binary, where toggling the process-wide environment would
+/// make unrelated placement tests observe whichever value won the race.
+#[cfg(test)]
+pub(crate) fn placement_cpus_or_fail_closed(
+    layout: PlacementLayout,
+    cores: &CoreTopology,
+    allowed: &BTreeSet<usize>,
+    required: bool,
+    what: &str,
+) -> Option<Vec<usize>> {
+    if let Some(cpus) = layout.within(cores, allowed) {
+        return Some(cpus);
+    }
+    let representable_on_host = layout.representable_on(cores);
+    assert!(
+        !(representable_on_host && required),
+        "{REQUIRE_PLACEMENT_ENV}=1 and this host can express {} somewhere, but not inside the CPU \
+         set this process may use ({allowed:?}), so `{what}` cannot build the layout it exists to \
+         judge and would report success without testing anything. That is a property of how this \
+         run was bound -- taskset, cpuset or container -- not of the platform: bind the lane to \
+         CPUs that can express {}, or stop requiring placement tests on it.",
+        layout.description(),
+        layout.description()
+    );
+    if representable_on_host {
+        eprintln!(
+            "skipping {what}: this run is bound to {allowed:?}, which cannot express {}",
+            layout.description()
+        );
+    } else {
+        eprintln!(
+            "skipping {what}: this host cannot express {} at all, so the layout is \
+             unrepresentable rather than merely unreachable",
+            layout.description()
+        );
+    }
+    None
 }
 
 /// The number of physical cores the current process may actually run on.
@@ -793,7 +964,7 @@ mod tests {
     /// actually exercised in CI.
     ///
     /// Every placement assertion this crate added in #1805 reaches its subject
-    /// through `host()` returning `Some`: `placement_is_one_worker_per_physical_core`
+    /// through `host()` returning `Some`: `planned_placement_is_one_worker_per_physical_core`
     /// opens with `host()?`, so it answers `None` when the topology is
     /// undiscoverable, and each caller then skips. That includes the
     /// `saw_placement_check` anti-vacuity guard in the width sweep, which is
@@ -838,11 +1009,202 @@ mod tests {
         );
     }
 
+    /// The anti-vacuity guard for the *other two* capabilities.
+    ///
+    /// `linux_detection_succeeds_so_placement_checks_cannot_silently_skip`
+    /// proves detection answers. The placement falsifiers need three things,
+    /// not one: detection, at least two physical cores, and an environment that
+    /// accepts `sched_setaffinity`. The existing guard is satisfied on hosts
+    /// where the other two are absent -- a 2-vCPU runner exposing one SMT pair
+    /// reports `core_count() == 1`, and every placement check returns early
+    /// while the guard reports the machine is fine.
+    ///
+    /// So this is deliberately *not* an unconditional assertion. A developer
+    /// laptop in a 1-core container is a legitimate environment and reddening
+    /// it gets the guard deleted. `NXRT_REQUIRE_PLACEMENT_TESTS=1` is the lane
+    /// saying "here, absence is a defect" -- the same shape as
+    /// `NXRT_REQUIRE_ORT_TESTS=1` on the `cli-ort` job.
+    #[test]
+    fn placement_capabilities_are_present_when_the_lane_requires_them() {
+        if !placement_tests_required() {
+            eprintln!(
+                "{REQUIRE_PLACEMENT_ENV} is unset, so placement capabilities are not required \
+                 here; the placement checks in this crate may be skipping"
+            );
+            return;
+        }
+        assert!(
+            crate::decode_affinity::affinity_observation_supported(),
+            "{REQUIRE_PLACEMENT_ENV}=1 on a target with no affinity backend. Placement is \
+             unanswerable there by construction, so requiring it can only ever be a false \
+             failure -- unset it for this lane."
+        );
+        let topology = require_host_for_placement()
+            .expect("affinity is supported here, so detection must be too");
+        assert!(
+            topology.core_count() >= 2,
+            "{REQUIRE_PLACEMENT_ENV}=1 but this host reports {} physical core(s) across {} \
+             logical CPUs. Every `one worker per physical core` check in this crate returns \
+             early below two, so this lane is running them as no-ops.",
+            topology.core_count(),
+            topology.logical_count()
+        );
+        // Probing the CPUs the placement checks actually pin to, not a
+        // representative one: a confined process (cgroup cpuset, `taskset`)
+        // can pin to some CPUs and not others, and the checks derive their
+        // targets from the machine's topology rather than from the allowed set.
+        let cpus: Vec<usize> = (0..topology.logical_count()).collect();
+        let pinnable = crate::decode_affinity::order_pin_targets(&cpus, Some(topology))
+            .into_iter()
+            .take(2)
+            .all(|cpu| {
+                std::thread::spawn(move || {
+                    crate::decode_affinity::pin_current_thread_to_cpu(cpu).is_ok()
+                })
+                .join()
+                .unwrap_or(false)
+            });
+        assert!(
+            pinnable,
+            "{REQUIRE_PLACEMENT_ENV}=1 but this environment refuses to pin a thread to the first \
+             two CPUs the placement policy would choose out of {} logical CPUs, so every \
+             observed-placement check skips here.",
+            topology.logical_count()
+        );
+    }
+
+    /// The binding case, forced rather than waited for.
+    ///
+    /// `placement_capabilities_are_present_when_the_lane_requires_them` above
+    /// asks what the *host* has. A run bound to one SMT sibling per core --
+    /// `taskset -c 16,18,20,22`, which is how a careful measurement binds --
+    /// satisfies every one of those assertions and still leaves the actual-mask
+    /// control unable to build a shared-core layout. Measured on this repo's
+    /// host before the gate existed: that band ran the control green with
+    /// `NXRT_REQUIRE_PLACEMENT_TESTS=1` set, printing only a skip line that a
+    /// captured CI log never shows.
+    ///
+    /// Both states of `required` and both causes of a missing layout are
+    /// asserted here, because the exemption is the part that decays: if a
+    /// genuine no-SMT host panicked, the requirement would be deleted rather
+    /// than the lane fixed.
+    #[test]
+    fn a_layout_missing_only_because_of_binding_fails_closed_when_required() {
+        let smt = CoreTopology::from_sibling_groups([vec![0, 1], vec![2, 3]]);
+        let sibling_avoiding: BTreeSet<usize> = [0, 2].into_iter().collect();
+
+        let forced = std::panic::catch_unwind(|| {
+            placement_cpus_or_fail_closed(
+                PlacementLayout::SharedCore,
+                &smt,
+                &sibling_avoiding,
+                true,
+                "a placement control",
+            )
+        });
+        assert!(
+            forced.is_err(),
+            "an SMT host bound to one sibling per core reported success for a control that \
+             cannot construct a shared core, in a lane that declared placement mandatory"
+        );
+
+        assert_eq!(
+            placement_cpus_or_fail_closed(
+                PlacementLayout::SharedCore,
+                &smt,
+                &sibling_avoiding,
+                false,
+                "a placement control",
+            ),
+            None,
+            "a developer who has not declared placement mandatory must get a stated skip, not a \
+             panic"
+        );
+
+        let no_smt = CoreTopology::from_sibling_groups([vec![0], vec![1]]);
+        let everything: BTreeSet<usize> = [0, 1].into_iter().collect();
+        assert_eq!(
+            placement_cpus_or_fail_closed(
+                PlacementLayout::SharedCore,
+                &no_smt,
+                &everything,
+                true,
+                "a placement control",
+            ),
+            None,
+            "a host with no SMT anywhere cannot express a shared core, so requiring the control \
+             there would be a false failure -- the exemption this gate depends on"
+        );
+
+        assert_eq!(
+            placement_cpus_or_fail_closed(
+                PlacementLayout::SharedCore,
+                &smt,
+                &[0, 1].into_iter().collect(),
+                true,
+                "a placement control",
+            ),
+            Some(vec![0, 1]),
+            "the layout is representable inside the allowed set, so the gate must hand back the \
+             CPUs rather than skip"
+        );
+    }
+
+    /// The positive arm has the same shape, and a `DistinctCores` gate that
+    /// silently answered `None` would remove the arm that stops the negative
+    /// control being satisfied by an always-false predicate.
+    #[test]
+    fn a_single_allowed_core_fails_closed_for_the_distinct_core_layout() {
+        let smt = CoreTopology::from_sibling_groups([vec![0, 1], vec![2, 3]]);
+        let one_core: BTreeSet<usize> = [0, 1].into_iter().collect();
+
+        let forced = std::panic::catch_unwind(|| {
+            placement_cpus_or_fail_closed(
+                PlacementLayout::DistinctCores,
+                &smt,
+                &one_core,
+                true,
+                "a placement control",
+            )
+        });
+        assert!(
+            forced.is_err(),
+            "a two-core host bound to a single core reported success for a control that needs \
+             two distinct cores, in a lane that declared placement mandatory"
+        );
+
+        let single = CoreTopology::from_sibling_groups([vec![0, 1]]);
+        assert_eq!(
+            placement_cpus_or_fail_closed(
+                PlacementLayout::DistinctCores,
+                &single,
+                &one_core,
+                true,
+                "a placement control",
+            ),
+            None,
+            "a one-core host cannot express two distinct cores at all; that is a platform fact \
+             and `require_two_cores_for_placement` is what reports it"
+        );
+
+        assert_eq!(
+            placement_cpus_or_fail_closed(
+                PlacementLayout::DistinctCores,
+                &smt,
+                &[0, 2].into_iter().collect(),
+                true,
+                "a placement control",
+            ),
+            Some(vec![0, 2]),
+            "one CPU from each of two cores is exactly the layout this arm needs"
+        );
+    }
+
     /// The mutation test, made permanent.
     ///
     /// #1805's placement checks were all reached through `host()` returning
     /// `Some`, so forcing detection to `None` made three of them -- including
-    /// `placement_reports_a_shared_core_as_a_defect`, the *negative control* --
+    /// `the_planner_reports_a_shared_core_as_a_defect`, the *negative control* --
     /// pass vacuously. That was proved once by hand-editing `detect_linux`,
     /// which is exactly the kind of evidence that decays: the next person to
     /// reintroduce a silent skip has nothing to trip over.

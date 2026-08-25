@@ -12,6 +12,7 @@
 use std::fs;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -184,9 +185,11 @@ opset_import { domain: "" version: 13 }
 struct StableRunner {
     outputs: Vec<(String, Value)>,
     inputs: Vec<(String, Value)>,
-    binding: IoBinding,
-    _allocator: Option<Allocator>,
-    session: Session,
+    binding: IoBinding<'static>,
+    _allocator: Option<Allocator<'static>>,
+    /// Co-owned by `binding` and `_allocator`, so ORT releases the session last
+    /// no matter how this struct's fields are ordered.
+    session: Arc<Session>,
     capture: bool,
     captured: bool,
 }
@@ -199,13 +202,13 @@ impl StableRunner {
         inputs: &[(&str, &Value)],
         outputs: &[(&str, &[i64], DataType)],
     ) -> anyhow::Result<Self> {
-        let session = Session::new(env, model, options)?;
+        let session = Arc::new(Session::new(env, model, options)?);
         let capture = session.graph_capture() && session.cuda_device_id().is_some();
         let allocator = capture
-            .then(|| session.device_allocator())
+            .then(|| Session::shared_device_allocator(&session))
             .transpose()?
             .flatten();
-        let mut binding = IoBinding::new(&session)?;
+        let mut binding = IoBinding::for_shared_session(Arc::clone(&session))?;
         let mut stable_inputs = Vec::new();
         for (name, source) in inputs {
             let stable = if let Some(allocator) = allocator.as_ref() {

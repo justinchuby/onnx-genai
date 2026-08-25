@@ -61,7 +61,7 @@ fn logits_output_by_exclusion(
 /// write hint, not the source of truth for cache ownership.
 pub struct StaticCacheDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: StaticCacheSignature,
     batch_size: i64,
     current_len: usize,
@@ -80,7 +80,7 @@ pub struct StaticCacheDecodeSession<'a> {
 /// and avoid running model compute for inactive rows.
 pub struct BatchedStaticCacheDecodeSession<'a> {
     session: &'a Session,
-    binding: IoBinding,
+    binding: IoBinding<'a>,
     signature: StaticCacheSignature,
     batch_size: usize,
     row_lens: Vec<usize>,

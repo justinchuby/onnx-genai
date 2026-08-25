@@ -962,6 +962,10 @@ mod tests {
     }
 
     impl ExecutionProvider for MockDeviceEp {
+        fn consume_route_residency_at_boundary(&self) -> EpResult<()> {
+            Ok(())
+        }
+
         fn name(&self) -> &str {
             "mock_device_ep"
         }

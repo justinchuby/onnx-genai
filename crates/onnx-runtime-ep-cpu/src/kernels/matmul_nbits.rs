@@ -20009,22 +20009,39 @@ mod tests {
         pool_built: bool,
         /// Physical cores covered by the child's allowed cpuset.
         cores: usize,
-        /// Whether the pinned workers landed on distinct physical cores.
+        /// Whether the workers' **planned** CPUs are on distinct physical cores.
         /// `None` when the pool is unpinned or the topology is unreadable, so
-        /// there is no placement claim to check.
-        distinct_cores: Option<bool>,
+        /// there is no plan to check.
+        ///
+        /// This is the planner's output, not the machine's: it stays
+        /// `Some(true)` on a build whose pinning reports success and does
+        /// nothing. `realized` is the one that asks the kernel.
+        planned_distinct_cores: Option<bool>,
+        /// What the pool's workers *observed* about their own placement, as the
+        /// wire code of [`crate::decode_spmd::RealizedPlacement`]. The blind-spot
+        /// codes are distinct from `one-per-core`, so an unanswerable child can
+        /// never be read as a placed one.
+        realized: String,
         /// Whether the placement the pool *reports* is the placement the OS
-        /// actually enforced, cross-checked against `/proc`. `None` when the
-        /// question is unanswerable (not Linux, partially pinned pool,
-        /// unreadable `/proc`). See [`placement_is_honest`].
+        /// actually enforced, cross-checked against each worker's own observed
+        /// mask. `None` when the question is unanswerable (no affinity query on
+        /// this target, partially pinned pool, query failure). See
+        /// [`placement_is_honest`].
         placement_honest: Option<bool>,
         /// Whether every worker carries an applied pin. Distinct from
-        /// `distinct_cores`, which answers `Some(false)` for a partially pinned
-        /// pool and so cannot say whether the `/proc` cross-check is even
+        /// `planned_distinct_cores`, which answers `Some(false)` for a partially
+        /// pinned pool and so cannot say whether the cross-check is even
         /// answerable.
         fully_pinned: bool,
-        /// Whether the child could read the affinities actually in force.
-        proc_readable: bool,
+        /// Whether every worker could read the affinity actually in force for
+        /// it.
+        ///
+        /// Named for the mechanism it now uses. It was `proc_readable` when the
+        /// cross-check scanned `/proc/self/task`; it is a per-thread
+        /// `sched_getaffinity` / `GetThreadGroupAffinity` now, and keeping the
+        /// old name would have left the parent's escape hatch below checking a
+        /// host fact that no longer has anything to do with it.
+        worker_masks_readable: bool,
         /// Attempts the parent consumed to obtain this report. `1` on a clean
         /// run; more means environmental crashes were retried away and this
         /// number is the only in-band trace of them (#1745).
@@ -20040,43 +20057,69 @@ mod tests {
         attempts: u32,
     }
 
-    /// The placement the OS actually enforced, read from `/proc`, as one CPU
-    /// list per SPMD worker thread.
+    /// Can this process query its own thread affinity at all?
     ///
-    /// Threads are matched by name, which is why this returns a *multiset* and
-    /// never a per-worker mapping: `/proc/<pid>/task/*/comm` truncates at 15
-    /// bytes and `onnx-genai-spmd` is exactly 15, so every worker of every pool
-    /// in the process is indistinguishable by name. Multiset equality is
-    /// nevertheless the whole property worth asserting here -- "these N CPUs
-    /// are the ones actually in force" -- and it does not require identity.
-    ///
-    /// A thread that exits between `read_dir` and the reads is skipped rather
-    /// than treated as an error; the caller catches any resulting shortfall by
-    /// requiring the counts to match.
-    #[cfg(target_os = "linux")]
-    fn observed_worker_affinities() -> Option<Vec<Vec<usize>>> {
-        let mut observed = Vec::new();
-        for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
-            let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
-                continue;
-            };
-            if !comm.trim_end().starts_with("onnx-genai-spmd") {
-                continue;
-            }
-            let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
-                continue;
-            };
-            let list = status
-                .lines()
-                .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
-            observed.push(onnx_runtime_hostmon::parse_cpu_list(list)?);
-        }
-        (!observed.is_empty()).then_some(observed)
+    /// The parent's independent probe of the *same* capability the child's
+    /// cross-check depends on. Deliberately not a `/proc` read: the child asks
+    /// the kernel directly now, and excusing it on the strength of an unrelated
+    /// host fact would make the escape hatch a place for real failures to hide.
+    fn parent_cannot_query_its_own_affinity() -> bool {
+        crate::decode_affinity::observe_current_thread_cpus()
+            .cpus()
+            .is_none()
     }
 
-    #[cfg(not(target_os = "linux"))]
-    fn observed_worker_affinities() -> Option<Vec<Vec<usize>>> {
-        None
+    /// Encode a realized placement for the child's single marker line.
+    ///
+    /// Every blind spot gets its own code rather than a shared "unknown": the
+    /// parent has to be able to say *why* a child could not answer, and a code
+    /// that lumps "macOS has no affinity query" together with "the query failed
+    /// on Linux" would let the second hide behind the first's legitimate skip.
+    fn realized_placement_code(placement: &crate::decode_spmd::RealizedPlacement) -> &'static str {
+        use crate::decode_spmd::{PlacementBlindSpot, RealizedPlacement};
+        match placement {
+            RealizedPlacement::OneWorkerPerPhysicalCore => "one-per-core",
+            RealizedPlacement::SharedCore => "shared-core",
+            RealizedPlacement::Unpinned => "unpinned",
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported) => {
+                "no-affinity-query"
+            }
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed) => {
+                "affinity-query-failed"
+            }
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected) => {
+                "no-topology"
+            }
+        }
+    }
+
+    #[test]
+    fn every_realized_placement_has_its_own_wire_code() {
+        use crate::decode_spmd::{PlacementBlindSpot, RealizedPlacement};
+        let all = [
+            RealizedPlacement::OneWorkerPerPhysicalCore,
+            RealizedPlacement::SharedCore,
+            RealizedPlacement::Unpinned,
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryUnsupported),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::AffinityQueryFailed),
+            RealizedPlacement::Unobservable(PlacementBlindSpot::TopologyUndetected),
+        ];
+        let codes: std::collections::BTreeSet<&str> =
+            all.iter().map(realized_placement_code).collect();
+        // A collision would make two different facts indistinguishable on the
+        // wire, and the one that matters is a blind spot colliding with the
+        // success code -- exactly the failure this whole apparatus exists to
+        // prevent, reintroduced in the serializer.
+        assert_eq!(
+            codes.len(),
+            all.len(),
+            "two realized placements share a wire code: {codes:?}"
+        );
+        assert!(
+            !codes.contains("one-per-core")
+                || realized_placement_code(&RealizedPlacement::OneWorkerPerPhysicalCore)
+                    == "one-per-core"
+        );
     }
 
     /// Does the pool's reported placement match the placement in force?
@@ -20110,7 +20153,32 @@ mod tests {
         {
             *slot = slot.wrapping_add(1);
         }
-        placement_verdict(&reported, observed_worker_affinities())
+        placement_verdict(&reported, pool_observed_affinities(pool))
+    }
+
+    /// The masks the pool's own workers read for themselves, in worker order.
+    ///
+    /// This replaced a `/proc/self/task` scan filtered on the `comm` prefix
+    /// `onnx-genai-spmd`, which could not be made correct: `comm` truncates at
+    /// 15 bytes and that prefix is exactly 15, so every worker of every pool in
+    /// the process was indistinguishable, and a second pool alive anywhere --
+    /// another test, a benchmark, a torn-down pool whose threads had not yet
+    /// exited -- silently joined the sample. Asking each worker to record its
+    /// own mask removes the ambiguity at the source.
+    ///
+    /// `None` when any worker could not read its own mask, which keeps
+    /// "unanswerable" distinct from "wrong".
+    fn pool_observed_affinities(
+        pool: &crate::decode_spmd::SpmdDecodePools,
+    ) -> Option<Vec<Vec<usize>>> {
+        let placements = pool.worker_placements();
+        if placements.is_empty() {
+            return None;
+        }
+        placements
+            .iter()
+            .map(|placement| placement.observed.cpus().map(<[usize]>::to_vec))
+            .collect()
     }
 
     /// The policy-neutral half of the placement contract, as a helper so the
@@ -20129,7 +20197,7 @@ mod tests {
         }
     }
     ///
-    /// Split out from the `/proc` read so the decision itself is testable
+    /// Split out from the mask collection so the decision itself is testable
     /// against synthetic inputs. The interesting cases -- a pin the kernel did
     /// not apply, a reported CPU that is not the one in force -- cannot be
     /// produced on demand by building a real pool, so a predicate that could
@@ -20244,11 +20312,11 @@ mod tests {
                 crate::decode_affinity::allowed_cpus()
                     .map_or(allowed, |cpus| topology.physical_cores_within(&cpus))
             });
-        let (pool_built, workers, nodes, placement, honest, fully_pinned) =
+        let (pool_built, workers, nodes, placement, honest, fully_pinned, realized, observed_ok) =
             match crate::decode_spmd::pools() {
                 Some(pool) => {
                     // Reported separately from `placement`, because
-                    // `placement_is_one_worker_per_physical_core` answers
+                    // `planned_placement_is_one_worker_per_physical_core` answers
                     // `Some(false)` for a *partially* pinned pool and so cannot
                     // distinguish "every worker pinned, sharing cores" from
                     // "some worker's pin failed". Only the latter makes the
@@ -20260,16 +20328,15 @@ mod tests {
                         true,
                         pool.total_workers(),
                         pool.node_count(),
-                        pool.placement_is_one_worker_per_physical_core(),
+                        pool.planned_placement_is_one_worker_per_physical_core(),
                         placement_is_honest(pool),
                         fully_pinned,
+                        realized_placement_code(&pool.realized_placement()),
+                        pool_observed_affinities(pool).is_some(),
                     )
                 }
-                None => (false, 0, 0, None, None, false),
+                None => (false, 0, 0, None, None, false, "nopool", false),
             };
-        // Whether `/proc` answered at all, so that an unreadable `/proc` reads
-        // as "unanswerable" rather than as a pool that failed to pin.
-        let proc_ok = observed_worker_affinities().is_some();
         let tri = |value: Option<bool>| match value {
             Some(true) => "1",
             Some(false) => "0",
@@ -20278,13 +20345,13 @@ mod tests {
         println!(
             "{SPMD_WIDTH_MARKER}requested={requested} available={} allowed={allowed} \
              nodes={nodes} workers={workers} pool={} cores={cores} placement={} honest={} \
-             pinned={} proc={}",
+             pinned={} proc={} realized={realized}",
             available_parallelism(),
             u8::from(pool_built),
             tri(placement),
             tri(honest),
             u8::from(fully_pinned),
-            u8::from(proc_ok)
+            u8::from(observed_ok)
         );
         quiesce_pools_for_child_exit("spmd_realized_width");
     }
@@ -20406,10 +20473,11 @@ mod tests {
             workers: field("workers"),
             pool_built: field("pool") == 1,
             cores: field("cores"),
-            distinct_cores: tri("placement"),
+            planned_distinct_cores: tri("placement"),
+            realized: text("realized").to_string(),
             placement_honest: tri("honest"),
             fully_pinned: field("pinned") == 1,
-            proc_readable: field("proc") == 1,
+            worker_masks_readable: field("proc") == 1,
             attempts: attempts_used,
         };
 
@@ -20467,11 +20535,26 @@ mod tests {
     /// #1792 shape of "reports one placement, runs another" -- and requires the
     /// verdict to come back false.
     ///
-    /// Linux-only because the cross-check reads `/proc`; elsewhere the verdict
-    /// is `None` by design and there is nothing to falsify.
+    /// Linux-only for the harness, not for the property: the child is driven
+    /// through this crate's subprocess machinery. The *cross-check* itself is
+    /// per-thread `sched_getaffinity`/`GetThreadGroupAffinity` and is no longer
+    /// a `/proc` read, so the capability it actually needs is asserted below
+    /// rather than assumed from the target.
     #[test]
     #[cfg(target_os = "linux")]
     fn a_pool_that_misreports_its_placement_is_caught_end_to_end() {
+        // The capability this test needs is the affinity *query*, not pinning
+        // and not `/proc`. Naming it here keeps the precondition attached to
+        // the mechanism: the previous version inherited its skip from the
+        // target triple, which was correct only while the cross-check read
+        // `/proc`.
+        if !crate::decode_affinity::affinity_observation_supported() {
+            eprintln!(
+                "skipping placement falsification: this target has no per-thread affinity \
+                 query, so a misreported placement is unobservable rather than false"
+            );
+            return;
+        }
         let allowed = crate::decode_affinity::allowed_cpus().map_or(0, |cpus| cpus.len());
         // Fails closed on the topology: this used to skip on
         // `core_topology::host().is_none()`, so a detection regression turned
@@ -20497,9 +20580,9 @@ mod tests {
         // reported independently of the verdict, so a suppressed verdict here
         // is still a failure.
         assert!(
-            honest.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
-            "this process can read `/proc/self/task` but the control child could not, so \
-             the cross-check is not running at all ({honest:?})"
+            honest.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+            "this process can read its own thread affinity but the control child could \
+             not, so the cross-check is not running at all ({honest:?})"
         );
         if !honest.fully_pinned {
             return;
@@ -20555,6 +20638,7 @@ mod tests {
 
         let mut saw_full_subscription = false;
         let mut saw_placement_check = false;
+        let mut saw_realized_placement_check = false;
         for requested in widths {
             let report = realized_width_report(requested);
             assert_eq!(
@@ -20611,10 +20695,10 @@ mod tests {
             // that stops being produced turns the check above into decoration
             // that still passes.
             //
-            // The condition is `fully_pinned && proc_readable`, reported by the
+            // The condition is `fully_pinned && worker_masks_readable`, reported by the
             // child, and deliberately *not* `distinct_cores.is_some()`. An
             // earlier version used the latter and was wrong:
-            // `placement_is_one_worker_per_physical_core` answers `Some(false)`
+            // `planned_placement_is_one_worker_per_physical_core` answers `Some(false)`
             // for a partially pinned pool, while `placement_verdict` answers
             // `None` for that same pool, so a single failed
             // `sched_setaffinity` -- a CPU offlined or dropped from the cpuset
@@ -20638,32 +20722,33 @@ mod tests {
             // it for all five. The per-width form catches what neither did:
             // verdicts disappearing for widths 4/8/16 while width 2 keeps
             // working.
-            // Asserting `/proc` readability rather than skipping on it is what
+            // Asserting mask readability rather than skipping on it is what
             // keeps "the cross-check was disabled outright" a failure instead
             // of a silent skip -- an earlier version tolerated it and the
             // mutation battery immediately showed P4 escaping through it.
             //
-            // The escape hatch is the *parent's own* read, not a tolerated
-            // `false`: `hidepid` restricts other processes' entries and never
-            // your own, so the one host that legitimately cannot answer is one
-            // with no `/proc` mounted at all (minimal container, chroot,
-            // initramfs) -- and there this process cannot read it either.
-            // Checking it here rather than trusting the child's flag is the
-            // point: the parent's read is independent of whatever the child's
-            // cross-check does, so a broken cross-check on a normal host still
-            // fails.
-            #[cfg(target_os = "linux")]
+            // The escape hatch is the *parent's own* probe of the *same
+            // mechanism*, not a tolerated `false`. It used to be a
+            // `read_dir("/proc/self/task")`, which was the right cross-signal
+            // while the child scanned `/proc` -- and became the wrong one the
+            // moment the child switched to `sched_getaffinity`. A container
+            // with `/proc` mounted normally and a seccomp policy denying
+            // `sched_getaffinity` would then have failed here for a legitimate
+            // host limitation. Probing the query the child actually uses keeps
+            // the escape hatch tied to the capability it is excusing, and it is
+            // still independent of whatever the child's cross-check does, so a
+            // broken cross-check on a healthy host still fails.
             assert!(
-                report.proc_readable || std::fs::read_dir("/proc/self/task").is_err(),
-                "width {requested}: this process can read `/proc/self/task` but the child \
-                 could not, so the failure is in the cross-check rather than the host -- \
-                 the placement cross-check is not running ({report:?})"
+                report.worker_masks_readable || parent_cannot_query_its_own_affinity(),
+                "width {requested}: this process can read its own thread affinity but the \
+                 child could not, so the failure is in the cross-check rather than the host \
+                 -- the placement cross-check is not running ({report:?})"
             );
 
-            #[cfg(target_os = "linux")]
             assert!(
-                !(report.fully_pinned && report.proc_readable) || report.placement_honest.is_some(),
-                "width {requested}: every worker is pinned and `/proc` is readable, so the \
+                !(report.fully_pinned && report.worker_masks_readable)
+                    || report.placement_honest.is_some(),
+                "width {requested}: every worker is pinned and every mask was readable, so the \
                  cross-check was answerable, yet no honesty verdict came back -- \
                  `worker_cpus()` went unverified at this width and the #1792 class is \
                  unguarded here ({report:?})"
@@ -20674,13 +20759,14 @@ mod tests {
             // producible from a fully pinned pool, so one that exists while
             // `pinned=0` means the two disagree and one of them is lying.
             assert!(
-                report.placement_honest.is_none() || (report.fully_pinned && report.proc_readable),
+                report.placement_honest.is_none()
+                    || (report.fully_pinned && report.worker_masks_readable),
                 "width {requested}: a placement verdict was produced while the child \
                  reports it could not have produced one (pinned={}, proc={}), so the \
                  honesty check and the host facts its guard keys off disagree about the \
                  same pool ({report:?})",
                 report.fully_pinned,
-                report.proc_readable
+                report.worker_masks_readable
             );
 
             // (2) POLICY-DEPENDENT, and deliberately labelled as such: one
@@ -20703,9 +20789,9 @@ mod tests {
             // Only assert where one-per-core is achievable: past the core
             // budget the workers must double up, and demanding otherwise would
             // fail the host, not the code.
-            if report.workers <= report.cores && report.distinct_cores.is_some() {
+            if report.workers <= report.cores && report.planned_distinct_cores.is_some() {
                 assert_eq!(
-                    report.distinct_cores,
+                    report.planned_distinct_cores,
                     Some(true),
                     "requested width {requested} realized {} workers that share physical \
                      cores on a host with {} cores available, so a decode row labelled \
@@ -20716,7 +20802,42 @@ mod tests {
                 );
             }
             saw_placement_check |=
-                report.workers <= report.cores && report.distinct_cores.is_some();
+                report.workers <= report.cores && report.planned_distinct_cores.is_some();
+
+            // (3) The same policy claim, asked of the kernel instead of the
+            // planner. (2) reads `worker_cpus()`, which is the assignment plus
+            // whatever the pin call *returned*, so it survives a build whose
+            // pinning does nothing and reports success. This one reads the mask
+            // each worker read for itself.
+            //
+            // Blind spots are named, and none of them is `one-per-core`: a
+            // child that could not answer fails the guard below rather than
+            // passing this one. Conditioned on the affinity query existing --
+            // `fully_pinned` reports the *pinning* capability, and a target
+            // that can pin without being able to read a mask back would fail
+            // this for a host limitation rather than a defect. The guard
+            // immediately after is what stops that condition from becoming an
+            // escape: where the query does exist, a child claiming it does not
+            // is a defect in the apparatus.
+            if crate::decode_affinity::affinity_observation_supported()
+                && report.fully_pinned
+                && report.workers <= report.cores
+            {
+                assert_eq!(
+                    report.realized, "one-per-core",
+                    "requested width {requested}: every worker reports an applied pin and the                      host has room, but the placement the workers actually observed for                      themselves is `{}` -- so the label t={requested} describes a placement                      the kernel did not enforce ({report:?})",
+                    report.realized
+                );
+            }
+            assert!(
+                !crate::decode_affinity::affinity_observation_supported()
+                    || report.realized != "no-affinity-query",
+                "width {requested}: this target has a per-thread affinity query, yet the                  child reported it had none -- the realized-placement observation is                  switched off, which is the exact shape of a check that cannot fail                  ({report:?})"
+            );
+            saw_realized_placement_check |=
+                crate::decode_affinity::affinity_observation_supported()
+                    && report.fully_pinned
+                    && report.workers <= report.cores;
 
             assert_eq!(
                 report.workers, effective,
@@ -20763,9 +20884,23 @@ mod tests {
         if allowed_now >= 2 && crate::core_topology::DETECTION_SUPPORTED {
             assert!(
                 saw_placement_check,
-                "no swept width produced a checkable placement on a {allowed_now}-CPU cpuset, \
-                 so the pool's core layout went unasserted and only the worker count was \
-                 verified"
+                "no swept width produced a checkable *planned* placement on a \
+                 {allowed_now}-CPU cpuset, so the planner's core layout went unasserted \
+                 and only the worker count was verified"
+            );
+            // Separate counter from `saw_placement_check`, because the two can
+            // diverge in exactly the direction that matters: the planned check
+            // needs only a topology, while the realized one needs pins that
+            // actually took. A single flag would let the planner's assertions
+            // vouch for a realized check that never ran.
+            assert!(
+                saw_realized_placement_check
+                    || !crate::decode_affinity::pinning_supported()
+                    || !crate::decode_affinity::affinity_observation_supported(),
+                "no swept width produced a checkable *realized* placement on a \
+                 {allowed_now}-CPU cpuset that supports pinning and can read affinity \
+                 back, so every assertion about where the workers actually ran was \
+                 skipped and the sweep verified only what the planner intended"
             );
         }
     }
