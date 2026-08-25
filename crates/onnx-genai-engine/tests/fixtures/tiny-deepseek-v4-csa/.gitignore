@@ -1,4 +1,3 @@
-# Generated binary artifacts (reproduce with generate.py). The typed IO
-# reference (io_report.json) and the generator are the committed sources.
-*.onnx
-*.onnx.data
+# `model.onnx` and `model.onnx.data` are committed so the E2E cannot skip-pass.
+# The generator's transient report is compared with `io_report.json`, not kept.
+model.onnx_io.json

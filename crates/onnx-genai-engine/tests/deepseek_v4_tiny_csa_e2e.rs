@@ -30,8 +30,9 @@
 //! of real quantized weights and of the planar-format runtime slice, so **no
 //! performance claim is made or implied**.
 //!
-//! `DEEPSEEK_V4_TINY_CSA_E2E_DIR` may override the committed fixture. A missing
-//! fixture skips cleanly so source packages that omit binary fixtures stay green.
+//! `DEEPSEEK_V4_TINY_CSA_E2E_DIR` may override the committed fixture. Missing
+//! or corrupt fixture artifacts are hard failures: these tests must execute the
+//! real model rather than silently skip-pass.
 //!
 //! Scope: this is the **CPU** native-decode proof. The CUDA native-decode path
 //! (`DecodeCudaState`) does not yet support CSA/HCA compressed state — it sizes
@@ -56,17 +57,22 @@ use onnx_genai_metadata::{
 };
 use onnx_runtime_session::{DevicePreference, InferenceSession};
 
-/// Resolve the committed fixture directory, honoring the env override first.
-fn fixture_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("DEEPSEEK_V4_TINY_CSA_E2E_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("model.onnx").is_file() {
-            return Some(p);
-        }
+/// Resolve and validate the committed fixture directory, honoring the env
+/// override first. The ONNX loader performs the full corruption check.
+fn fixture_dir() -> PathBuf {
+    let dir = std::env::var_os("DEEPSEEK_V4_TINY_CSA_E2E_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa")
+        });
+    for artifact in ["model.onnx", "model.onnx.data"] {
+        assert!(
+            dir.join(artifact).is_file(),
+            "required tiny CSA fixture artifact is missing: {}",
+            dir.join(artifact).display()
+        );
     }
-    let committed =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-csa");
-    committed.join("model.onnx").is_file().then_some(committed)
+    dir
 }
 
 fn edge(role: CsaStateRole, past: &str, present: &str) -> CsaStateEdge {
@@ -185,10 +191,7 @@ fn build_cpu_session(dir: &Path) -> NativeDecodeSession {
 /// and >=16 decode steps with a per-step present->past cursor advance.
 #[test]
 fn tiny_csa_hca_cpu_prefill_and_16_decode_threads_compressed_state() {
-    let Some(dir) = fixture_dir() else {
-        eprintln!("skipping: tiny CSA fixture not present");
-        return;
-    };
+    let dir = fixture_dir();
     let mut sess = build_cpu_session(&dir);
 
     // Prefill an 8-token prompt from an empty past. Reaching logits proves the
@@ -250,10 +253,7 @@ fn tiny_csa_hca_cpu_prefill_and_16_decode_threads_compressed_state() {
 /// tokens (here: none — a full rollback to the anchor).
 #[test]
 fn tiny_csa_hca_cpu_snapshot_rollback_then_continue() {
-    let Some(dir) = fixture_dir() else {
-        eprintln!("skipping: tiny CSA fixture not present");
-        return;
-    };
+    let dir = fixture_dir();
     let mut sess = build_cpu_session(&dir);
     let prompt: Vec<u32> = vec![9, 8, 7, 6, 5];
     let mut logits = sess
@@ -324,10 +324,7 @@ fn tiny_csa_hca_cpu_snapshot_rollback_then_continue() {
 /// are `reset()` (to 0) and the snapshot/rollback path exercised above.
 #[test]
 fn tiny_csa_hca_cpu_bare_nonzero_rewind_is_typed_refused() {
-    let Some(dir) = fixture_dir() else {
-        eprintln!("skipping: tiny CSA fixture not present");
-        return;
-    };
+    let dir = fixture_dir();
     let mut sess = build_cpu_session(&dir);
     sess.decode(&[3, 1, 4, 1, 5], 0).expect("prefill");
     for _ in 0..3 {
@@ -358,10 +355,7 @@ fn tiny_csa_hca_cpu_bare_nonzero_rewind_is_typed_refused() {
 /// an empty committed cursor, and a fresh prefill still works (no leaked state).
 #[test]
 fn tiny_csa_hca_cpu_reset_clears_committed_state() {
-    let Some(dir) = fixture_dir() else {
-        eprintln!("skipping: tiny CSA fixture not present");
-        return;
-    };
+    let dir = fixture_dir();
     let mut sess = build_cpu_session(&dir);
     sess.decode(&[1, 2, 3, 4], 0).expect("prefill");
     for _ in 0..3 {
@@ -379,10 +373,7 @@ fn tiny_csa_hca_cpu_reset_clears_committed_state() {
 /// without cross-talk (each holds its own compressed state).
 #[test]
 fn tiny_csa_hca_cpu_multi_request_isolation() {
-    let Some(dir) = fixture_dir() else {
-        eprintln!("skipping: tiny CSA fixture not present");
-        return;
-    };
+    let dir = fixture_dir();
     let mut a = build_cpu_session(&dir);
     let mut b = build_cpu_session(&dir);
     a.decode(&[1, 2, 3, 4, 5, 6], 0).expect("a prefill");
