@@ -343,6 +343,13 @@ def job_condition(job_body: str) -> str | None:
 def verify_required_job_conditions(jobs: dict[str, str]) -> int:
     """Refuse a required job whose own `if:` is not one this gate has reasoned about."""
     problems = []
+    # Iterating the intersection alone would return 0 for a required job that is
+    # simply absent -- the same "unread value degrades to the most permissive
+    # verdict" shape this gate exists to refuse. `verify_required_tier` already
+    # rejects a missing required job earlier, so this is defence in depth: it
+    # keeps the guarantee inside the function rather than in the caller's order.
+    for name in sorted(REQUIRED_JOB_NAMES - set(jobs)):
+        problems.append((name, "<required job absent from the workflow>"))
     for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
         condition = job_condition(jobs[name])
         if condition is not None and condition not in _ALLOWED_JOB_IF:
@@ -403,14 +410,26 @@ def job_steps(job_body: str) -> list[tuple[str | None, str, str | None]]:
 def _step_entry(lines: list[str]) -> tuple[str | None, str, str | None]:
     """(reason this step must not be credited, step text, its `shell:`)."""
     first = lines[0]
-    body_indent = len(first) - len(first.lstrip()) + 2
+    dash_indent = len(first) - len(first.lstrip())
+    # The step's own keys sit at the SHALLOWEST column under the dash -- not at
+    # `dash + 2`. YAML allows any run of spaces after the dash (`-   name:`),
+    # which puts the real keys deeper than dash+2; an equality test then reads
+    # `if:` as shell text and credits a guarded step. Taking the minimum also
+    # survives `- run: |` leading the step, where the first following line is
+    # shell text deeper than the sibling keys.
+    deeper = [
+        len(line) - len(line.lstrip())
+        for line in lines[1:]
+        if line.strip() and len(line) - len(line.lstrip()) > dash_indent
+    ]
+    body_indent = min(deeper) if deeper else dash_indent + 2
     keys: dict[str, str] = {}
     for index, line in enumerate(lines):
         if not line.strip():
             continue
         if index == 0:
             stripped = first.lstrip()
-            text = stripped[2:] if stripped.startswith("- ") else ""
+            text = stripped[1:].lstrip() if stripped.startswith("- ") else ""
         elif len(line) - len(line.lstrip()) == body_indent:
             # A key at the step's own depth. Anything deeper is shell text
             # inside a run block and must not be read as a step key.
@@ -505,7 +524,20 @@ def run_blocks(job_body: str) -> list[str]:
 
 
 def packages_tested_by(commands: Iterable[str]) -> set[str]:
-    """Packages whose tests the given shell commands actually execute."""
+    """Packages whose tests the given shell commands actually execute.
+
+    Known, deliberate under-read: a `cargo test` continued across physical lines
+    with a trailing backslash puts its `-p` flags in fragments that carry no
+    cargo invocation, so they are not attributed. `Rust quality`'s three MLAS
+    steps are written that way and are credited to no lane by this function --
+    harmless today because `Fast` covers that package, and harmless in principle
+    because it can only ever make the gate stricter. It is NOT joined here on
+    purpose: joining continuations moves attribution in the permissive
+    direction, and this gate's whole thesis is that an over-read is fatal while
+    an under-read merely fails loudly. If a package's only required-lane
+    execution is ever written this way, this gate will refuse it rather than
+    credit it, and the fix is to put the invocation on one line.
+    """
     tested: set[str] = set()
     for command in commands:
         for fragment in re.split(r"&&|\|\||;|\n", command):
@@ -669,6 +701,27 @@ _CONDITIONAL_ARMS: tuple[tuple[str, str | None, list[str], list[str]], ...] = (
         "      - name: x\n        run: cargo test -p pkg-alpha\n",
         ["pkg-alpha"],
         [],
+    ),
+    # Reviewer finding: the step-key column is not always dash+2. YAML allows any
+    # run of spaces after the dash, which pushes the real keys deeper; reading the
+    # column as dash+2 dropped `if:` as shell text and CREDITED a guarded step.
+    (
+        "extra spaces after the dash still expose the step's if:",
+        "      -   name: x\n          if: false\n          run: cargo test -p pkg-alpha\n",
+        [],
+        ["if: false"],
+    ),
+    (
+        "extra spaces after the dash still expose continue-on-error",
+        "      -   name: x\n          continue-on-error: true\n          run: cargo test -p pkg-alpha\n",
+        [],
+        ["continue-on-error: true"],
+    ),
+    (
+        "a run: block leading the step does not hide a later if:",
+        "      - run: |\n          cargo test -p pkg-alpha\n        if: false\n",
+        [],
+        ["if: false"],
     ),
     (
         "if: always() is credited",
@@ -888,8 +941,17 @@ _JOB_CONDITION_ARMS: tuple[tuple[str, dict, int, list[str]], ...] = (
     # Discriminator: a step-level `if:` is indented deeper and must not be read
     # as the job's. Without this arm a regex that matched any `if:` would pass
     # every arm above -- the fixtures would not distinguish the two.
-    ("job-if: a step-level if: is not mistaken for the job's",
+    # Discriminator. The fixture carries ONLY a step-level `if:` -- no job-level
+    # one -- because a job-level guard would be matched first by `.search()` and
+    # the arm would pass under a regex that wrongly matched both. Monkeypatching
+    # `_JOB_IF` to `^\s*if:` makes exactly this arm fail, which is what makes it
+    # a control rather than a restatement.
+    ("job-if: a step-level if: is not read as the job's",
+     {n: _job_body(None, step_condition="false") for n in _REQ}, 0, []),
+    ("job-if: both present -- the job's is the one read",
      {n: _job_body(_OK_IF, step_condition="false") for n in _REQ}, 0, []),
+    ("job-if: an absent required job is refused, not passed over",
+     {_REQ[0]: _job_body(_OK_IF)}, 1, [_REQ[1]]),
 )
 
 
