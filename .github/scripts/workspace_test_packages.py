@@ -316,6 +316,54 @@ _STEP_IF = re.compile(r"^\s*if:\s*(.+?)\s*$")
 # is decorative.
 _STEP_COE = re.compile(r"^\s*continue-on-error:\s*(.+?)\s*$")
 _JOB_COE = re.compile(r"^    continue-on-error:\s*(.+?)\s*$", re.MULTILINE)
+
+
+# A step this gate credits only runs if its *job* runs. Both required jobs carry
+# a job-level `if:`, and a skipped required check SATISFIES a ruleset -- so the
+# whole tier can be waved through by never executing. @holden demonstrated the
+# live route with real builds (#2077): two `.md` files under `docs/` are pulled
+# into Rust by `include_str!`, so a pure-markdown edit is classified docs-only,
+# both required jobs skip, and the tree does not compile.
+#
+# The classifier's correctness is #2081's problem, not this gate's. What IS this
+# gate's problem is that it models step-level `if:` (see `unconditional_run_blocks`)
+# and would credit a step in a job whose own condition had been quietly narrowed.
+# So: the required jobs may carry the repo's known docs-only guard or no guard at
+# all, and anything else is refused rather than interpreted.
+_JOB_IF = re.compile(r"^    if:\s*(.+?)\s*$", re.MULTILINE)
+_ALLOWED_JOB_IF = frozenset({"needs.changes.outputs.docs_only != 'true'"})
+
+
+def job_condition(job_body: str) -> str | None:
+    """The job-level `if:`, or None. Step-level `if:` is indented deeper."""
+    match = _JOB_IF.search(job_body)
+    return match.group(1) if match else None
+
+
+def verify_required_job_conditions(jobs: dict[str, str]) -> int:
+    """Refuse a required job whose own `if:` is not one this gate has reasoned about."""
+    problems = []
+    for name in sorted(REQUIRED_JOB_NAMES & set(jobs)):
+        condition = job_condition(jobs[name])
+        if condition is not None and condition not in _ALLOWED_JOB_IF:
+            problems.append((name, condition))
+    if not problems:
+        return 0
+    print("Required-lane coverage check failed.", file=sys.stderr)
+    print(
+        "A required job carries a job-level `if:` this gate has not reasoned about.\n"
+        "A skipped required check satisfies the ruleset, so narrowing this condition\n"
+        "silently voids every guarantee below it -- the steps still exist and still\n"
+        "never run.",
+        file=sys.stderr,
+    )
+    for name, condition in problems:
+        print(f"  - {name}: if: {condition}", file=sys.stderr)
+    print(
+        f"Known-good conditions: {sorted(_ALLOWED_JOB_IF)} (or no `if:` at all).",
+        file=sys.stderr,
+    )
+    return 1
 _FALSEY = {"false", "${{ false }}", "'false'", '"false"'}
 _STEP_SHELL = re.compile(r"^\s*shell:\s*(.+?)\s*$")
 # A command whose failure is swallowed runs its tests and reports success
@@ -566,6 +614,9 @@ def verify_required_tier(simulate_dropped_lane: str | None = None) -> int:
         )
         return 1
 
+    if rc := verify_required_job_conditions(workflow_jobs()):
+        return rc
+
     packages = workspace_packages()
     required_tested = packages_tested_by(commands) & packages
     unenforced = sorted(packages - required_tested - set(DENYLIST))
@@ -806,6 +857,65 @@ def _parser_arms() -> int:
     return failures
 
 
+
+_OK_IF = "needs.changes.outputs.docs_only != 'true'"
+_REQ = sorted(REQUIRED_JOB_NAMES)
+
+
+def _job_body(condition: str | None = None, step_condition: str | None = None) -> str:
+    body = "    name: x\n    runs-on: ubuntu-latest\n"
+    if condition is not None:
+        body += f"    if: {condition}\n"
+    body += "    steps:\n      - name: t\n"
+    if step_condition is not None:
+        body += f"        if: {step_condition}\n"
+    return body + "        run: cargo test -p pkg-alpha\n"
+
+
+# label, jobs, expected exit, names the report must contain
+_JOB_CONDITION_ARMS: tuple[tuple[str, dict, int, list[str]], ...] = (
+    # Positive control FIRST: a zero from the arms below has to be attributable
+    # to the condition being acceptable, not to a harness that cannot refuse.
+    ("job-if: the known docs-only guard is accepted",
+     {n: _job_body(_OK_IF) for n in _REQ}, 0, []),
+    ("job-if: absent is accepted (the job always runs)",
+     {n: _job_body(None) for n in _REQ}, 0, []),
+    ("job-if: narrowed on one required job is refused",
+     {_REQ[0]: _job_body(_OK_IF),
+      _REQ[1]: _job_body(_OK_IF + " && github.event_name == 'push'")}, 1, [_REQ[1]]),
+    ("job-if: replaced wholesale is refused",
+     {_REQ[0]: _job_body("false"), _REQ[1]: _job_body(_OK_IF)}, 1, [_REQ[0]]),
+    # Discriminator: a step-level `if:` is indented deeper and must not be read
+    # as the job's. Without this arm a regex that matched any `if:` would pass
+    # every arm above -- the fixtures would not distinguish the two.
+    ("job-if: a step-level if: is not mistaken for the job's",
+     {n: _job_body(_OK_IF, step_condition="false") for n in _REQ}, 0, []),
+)
+
+
+def _job_condition_arms() -> int:
+    failures = 0
+    for label, jobs, want_code, want_named in _JOB_CONDITION_ARMS:
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                code = verify_required_job_conditions(jobs)
+        except SystemExit as exit_error:
+            print(f"  FAIL  {label}\n        raised SystemExit: {exit_error}", file=sys.stderr)
+            failures += 1
+            continue
+        text = out.getvalue() + err.getvalue()
+        missing = [name for name in want_named if name not in text]
+        if code != want_code or missing:
+            failures += 1
+            print(f"  FAIL  {label}\n        exit want={want_code} got={code}", file=sys.stderr)
+            if missing:
+                print(f"        expected the report to name: {missing}", file=sys.stderr)
+        else:
+            named = f", naming {want_named}" if want_named else ""
+            print(f"  ok    {label} -> exit {code}{named}")
+    return failures
+
 def self_test() -> int:
     """Prove both gates still refuse, on content and not merely on exit code.
 
@@ -857,7 +967,10 @@ def self_test() -> int:
             print(f"  ok    {label} -> exit {code}{named}")
     failures += _parser_arms()
     failures += _conditional_arms()
-    total = len(arms) + _PARSER_ARM_COUNT + len(_CONDITIONAL_ARMS)
+    failures += _job_condition_arms()
+    total = (
+        len(arms) + _PARSER_ARM_COUNT + len(_CONDITIONAL_ARMS) + len(_JOB_CONDITION_ARMS)
+    )
     if failures:
         print(f"workspace test package self-test: {failures} arm(s) failed", file=sys.stderr)
         return 1
