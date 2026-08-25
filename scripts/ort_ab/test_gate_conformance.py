@@ -795,6 +795,7 @@ class GateReuse(unittest.TestCase):
     """
 
     GATE = ORT_AB / "hostlock_gate.py"
+    ACQUIRING = {"acquire", "run"}
 
     def module_level_names(self) -> set[str]:
         tree = ast.parse(self.GATE.read_text())
@@ -810,26 +811,85 @@ class GateReuse(unittest.TestCase):
             if isinstance(t, ast.Name)
         }
 
+    def documented_recipe(self) -> str:
+        """The fenced snippet under the README's "Closing a gap" heading.
+
+        Extracted rather than restated: a copy here would drift from the copy
+        a reader follows, and the copy a reader follows is the one that has
+        to work.
+        """
+        readme = (ORT_AB / "README.md").read_text()
+        after = readme.split("### Closing a gap", 1)
+        self.assertEqual(len(after), 2, "the README section was renamed or removed")
+        block = re.search(r"```python\n(.*?)```", after[1], re.S)
+        self.assertIsNotNone(block, "no python block under that heading")
+        return block.group(1)
+
     def test_the_documented_recipe_names_only_things_that_exist(self):
         # Doc drift with a safety instruction in it is worse than no doc: the
         # reader concludes the gate is broken and writes their own client,
         # which is the outcome the shared module exists to prevent.
         docs = self.GATE.read_text() + (ORT_AB / "README.md").read_text()
-        # `(?!py)` so the filename `hostlock_gate.py` is not read as a call.
-        named = set(re.findall(r"hostlock_gate\.(?!py\b)([a-z_]+)", docs))
+        # `(?!py\b)` so the filename `hostlock_gate.py` is not read as a call.
+        # The capture is deliberately not `[a-z_]+`: `HOSTLOCK` is public and
+        # a name this cannot see is a name it cannot check.
+        named = set(re.findall(r"hostlock_gate\.(?!py\b)([A-Za-z_][A-Za-z0-9_]*)", docs))
+        for group in re.findall(r"from hostlock_gate import ([^\n]+)", docs):
+            named |= {n.strip() for n in group.split(",") if n.strip().isidentifier()}
         self.assertTrue(named, "the recipe named nothing -- did the docs move?")
         missing = sorted(named - self.module_level_names())
         self.assertEqual(missing, [])
+        # An alias would put every later reference out of the regex's reach
+        # and this check back to passing vacuously, so the docs may not use
+        # one. Cheaper than resolving it, and there is no reason to want one.
+        self.assertNotIn("import hostlock_gate as", docs)
 
-    def test_the_path_depth_in_the_recipe_reaches_the_repo_root(self):
-        # `parents[3]` from a file in the benches root. An off-by-one here
-        # inserts a directory that does not contain the gate, and the import
-        # fails at the top of somebody's harness with a bare ImportError.
-        text = self.GATE.read_text()
-        depth = int(re.search(r"parents\[(\d+)\] / \"scripts\"", text).group(1))
-        planted = EP_BENCHES / "a_harness.py"
-        self.assertEqual(planted.parents[depth], ORT_AB.parents[1])
-        self.assertTrue((planted.parents[depth] / "scripts" / "ort_ab").is_dir())
+    def test_the_documented_recipe_runs_from_that_root(self):
+        # Executed, not parsed. The previous form of this cell read the path
+        # depth out of the recipe and checked the arithmetic, which pins the
+        # constant that happens to be written rather than the property the
+        # reader needs -- and said nothing about a harness one directory
+        # deeper, where a fixed depth silently points at `crates/`.
+        recipe = self.documented_recipe()
+        insert = recipe.split("import hostlock_gate", 1)[0] + "import hostlock_gate\n"
+        self.assertIn("scripts", insert)
+        self.assertNotRegex(
+            insert,
+            r"parents\[\d+\]",
+            "a fixed depth is correct only for a direct child of that root",
+        )
+        probe = insert + "print(hostlock_gate.HOSTLOCK.is_file())\n"
+        nested = EP_BENCHES / "leon_recipe_probe"
+        planted = [EP_BENCHES / "_recipe_probe.py", nested / "_recipe_probe.py"]
+        # A decoy `scripts/` between the harness and the repo root. An ascent
+        # that stops at the first ancestor merely *called* `scripts` lands
+        # here, inserts a path with no gate in it, and the harness dies on
+        # `import hostlock_gate` -- so the recipe has to key on the directory
+        # it actually needs. Nothing in the tree has one today, which is why
+        # this cell has to make one rather than wait for it.
+        decoy = EP_BENCHES.parent / "scripts"
+        decoy_is_ours = not decoy.exists()
+        try:
+            nested.mkdir(exist_ok=True)
+            if decoy_is_ours:
+                decoy.mkdir()
+            for path in planted:
+                path.write_text(probe)
+                out = subprocess.run(
+                    [sys.executable, str(path)], capture_output=True, text=True
+                )
+                self.assertEqual(
+                    out.stdout.strip(),
+                    "True",
+                    f"the documented recipe fails from {path}: {out.stderr[-400:]}",
+                )
+        finally:
+            for path in planted:
+                path.unlink(missing_ok=True)
+            if nested.is_dir():
+                nested.rmdir()
+            if decoy_is_ours and decoy.is_dir():
+                decoy.rmdir()
 
     def test_the_gate_does_not_read_the_working_directory(self):
         # The property that makes reuse possible at all, checked by running
@@ -850,14 +910,59 @@ class GateReuse(unittest.TestCase):
         )
         self.assertEqual(out.stdout.strip(), "True", out.stderr[-400:])
 
-    def test_the_gate_checks_custody_rather_than_taking_the_lock(self):
-        # A driver that takes the lock itself releases it when it exits, so
-        # a matrix run as several processes is certified arm by arm and
-        # protected across none of them -- #1803's mechanism. `require` must
-        # therefore never call `acquire`.
-        source = self.GATE.read_text()
-        self.assertNotIn('"acquire"', source)
-        self.assertIn("hostlock.sh run --owner", source)
+    def test_the_gate_never_runs_an_acquiring_subcommand(self):
+        # A driver that takes the lock itself releases it when it exits, so a
+        # matrix run as several processes is certified arm by arm and
+        # protected across none of them -- #1803's mechanism. The gate must
+        # therefore only ever *read* the lock.
+        #
+        # Read from the AST rather than by searching the text for `acquire`:
+        # `hostlock.sh run -- CMD` acquires too, and is the more likely
+        # regression precisely because it is the idiom the docs recommend to
+        # everyone else. A substring check for the wrong word is a guard that
+        # reports the defect it was not written for.
+        tree = ast.parse(self.GATE.read_text())
+        found = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            argv = node.args[0] if node.args else None
+            if argv is None or "HOSTLOCK" not in ast.unparse(argv):
+                continue
+            # Keyed on the argv, not on the callee: `read_provenance` shells
+            # out through an injected `runner=subprocess.run` so a test can
+            # substitute it, and a check that only knew `subprocess.run` by
+            # name would find nothing here and say so by passing.
+            found += 1
+            if not isinstance(argv, ast.List):
+                # `str(HOSTLOCK)` converts the path; anything else that hands
+                # the lock script somewhere this cannot read is a refusal,
+                # not a pass.
+                self.assertIn(
+                    dotted_name(node.func),
+                    {"str", "os.fspath"},
+                    f"unreadable argv at line {node.lineno}",
+                )
+                found -= 1
+                continue
+            words = set()
+            for element in argv.elts:
+                if isinstance(element, ast.Constant) and isinstance(element.value, str):
+                    words.add(element.value)
+                elif isinstance(element, ast.Call) and dotted_name(element.func) == "str":
+                    continue  # `str(HOSTLOCK)`, the path itself
+                else:
+                    self.fail(f"argv element not readable at line {node.lineno}")
+            taking = sorted(words & self.ACQUIRING)
+            self.assertEqual(taking, [], f"the gate takes the lock at {node.lineno}")
+        # Without this the cell passes by finding nothing -- which is exactly
+        # what a rewrite that shells out some other way would produce.
+        self.assertTrue(found, "no hostlock.sh invocation found in the gate")
+
+    def test_the_remedy_points_at_the_outer_wrapper(self):
+        # The message half of the same property: refusing is only useful if
+        # what it prints is the thing that would have worked.
+        self.assertIn("hostlock.sh run --owner", self.GATE.read_text())
 
 
 class Vacuity(unittest.TestCase):

@@ -428,9 +428,9 @@ calls:
 import pathlib
 import sys
 
-sys.path.insert(
-    0, str(pathlib.Path(__file__).resolve().parents[3] / "scripts" / "ort_ab")
-)
+_here = pathlib.Path(__file__).resolve()
+_root = next(p for p in _here.parents if (p / "scripts" / "ort_ab").is_dir())
+sys.path.insert(0, str(_root / "scripts" / "ort_ab"))
 import hostlock_gate
 
 label, prov = hostlock_gate.require(
@@ -441,6 +441,12 @@ label, prov = hostlock_gate.require(
 label = hostlock_gate.window_label(label, prov, hostlock_gate.read_provenance())
 row.update(hostlock_gate.lock_columns(label, prov))
 ```
+
+The walk up is there instead of a `parents[3]` because that constant holds
+only for a file sitting directly in the benches root — every one of the
+nineteen does today, and the first harness in a subdirectory would get a path
+insert pointing at `crates/` and a bare `ImportError`. A recipe that is
+copied gets copied somewhere else.
 
 Then delete that file's line from `EP_LEDGER` — the check **fails on a stale
 record**, so the deletion is forced rather than remembered.
@@ -457,11 +463,16 @@ scripts/hostlock.sh run --owner <you> --reason "<what this measures>" -- \
 ```
 
 Three properties of that recipe are pinned by cells rather than by this
-paragraph: every `hostlock_gate.*` name used in the docs exists, `parents[3]`
-really is the repo root from that directory, and importing the gate from an
-unrelated working directory still finds `hostlock.sh`. Doc drift in a safety
-instruction is worse than no doc — the reader concludes the gate is broken and
-writes their own client, which is how this started.
+paragraph: every `hostlock_gate.*` name used in the docs exists, the snippet
+above is *executed* from a file planted in that root (and one directory
+deeper, past a decoy `scripts/`) rather than read, and importing the gate
+from an unrelated working directory still finds `hostlock.sh`. Two more read
+the gate itself: it must never run an acquiring subcommand — `acquire` or
+`run` — because "the driver must not take the lock" is the whole point, and a
+text search for the word `acquire` would not see `run`; and what it prints
+when it refuses has to be the command that would have worked. Doc drift in a
+safety instruction is worse than no doc — the reader concludes the gate is
+broken and writes their own client, which is how this started.
 
 One structural property of custody is checked with it: the lock must not be
 acquired **inside** an arm loop. A lock taken per arm is released between

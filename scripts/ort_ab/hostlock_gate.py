@@ -42,9 +42,9 @@ needs a path insert and the same two calls:
     import pathlib
     import sys
 
-    sys.path.insert(
-        0, str(pathlib.Path(__file__).resolve().parents[3] / "scripts" / "ort_ab")
-    )
+    _here = pathlib.Path(__file__).resolve()
+    _root = next(p for p in _here.parents if (p / "scripts" / "ort_ab").is_dir())
+    sys.path.insert(0, str(_root / "scripts" / "ort_ab"))
     import hostlock_gate
 
     label, prov = hostlock_gate.require(
@@ -52,11 +52,17 @@ needs a path insert and the same two calls:
         unlocked=args.unlocked,
     )
 
-`parents[3]` is the repo root from that directory. The gate *checks* custody;
-it never takes the lock, because a lock taken by the driver is released when
-the driver exits and certifies nothing about a matrix run as several
-processes. `scripts/hostlock.sh run -- <driver>` is what holds it, and
-`remedy()` prints that line with the caller's own command in it.
+The ascent is deliberate where a `parents[3]` would read more simply: that
+constant is correct only for a file sitting directly in the benches root, and
+a harness one directory deeper gets a path insert pointing at `crates/` and a
+bare `ImportError` at the top of its `main()`. A recipe that is copied is a
+recipe that will be copied somewhere else.
+
+The gate *checks* custody; it never takes the lock, because a lock taken by
+the driver is released when the driver exits and certifies nothing about a
+matrix run as several processes. `scripts/hostlock.sh run -- <driver>` is
+what holds it, and `remedy()` prints that line with the caller's own command
+in it.
 """
 
 from __future__ import annotations
