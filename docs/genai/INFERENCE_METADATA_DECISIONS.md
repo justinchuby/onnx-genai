@@ -848,12 +848,18 @@ declared on its own dimension and they never compete for one.
   stops at two levels, so a third is a deliberate schema change rather than
   something a package asserts into existence.
 - **Raggedness leaves a workflow with the metadata that decodes it.** An emitted
-  `token_packed` value declares every level's `offsets` and `owner` as outputs,
-  and an emitted padded value declares each entry's `valid_lengths`. The serving
-  rule that rejects an emitted rank > 0 `shared` value
+  `token_packed` value publishes every level's `offsets` and `owner`, and an
+  emitted padded value publishes each entry's `valid_lengths` — published meaning
+  *emitted by some declared step*, since an output nothing writes delivers an
+  empty vector beside a ragged payload. The serving rule that rejects an emitted
+  rank > 0 `shared` value
   (`crates/onnx-genai-metadata/src/validation.rs:3313-3321`) is carved out for
-  exactly those referenced companions — `int64`, rank 1, named by another emitted
-  value's layout or `padding` entry in the same workflow — and for nothing else.
+  exactly those referenced companions — `int64`, of the rank that reference
+  demands, named by another emitted value's layout or `padding` entry in the same
+  workflow — and for nothing else. The rank is per reference rather than a flat
+  1: `offsets` and `owner` are rank 1 by construction, but a `valid_lengths` has
+  one entry per position of the axes *outer* to the dimension it bounds, so a
+  value padded on axis 2 publishes a rank-2 length vector.
   Withholding a length vector is not a smaller version of the same package: since
   a materialized validity mask is rejected for the contract, that vector is the
   only account of the padding that exists.
@@ -980,10 +986,20 @@ emitted value of rank > 0 that declares `shared`
 the very companions a ragged emit is required to publish — a packed value's
 `offsets` and `owner`, and a padded value's `valid_lengths`. The carve-out is
 minimal and decidable from the declared outputs alone: a `shared` emitted value
-is admitted **iff** it is `int64`, rank 1, and named as an `offsets` or `owner`
-of another emitted value's layout, or as the `valid_lengths` of another emitted
-value's `padding` entry, in the same workflow; anything else keeps the existing
-rejection. A companion is never compacted and never split like a payload — each
+is admitted **iff** it is `int64`, carries the rank that reference demands, and
+is named as an `offsets` or `owner` of another emitted value's layout, or as the
+`valid_lengths` of another emitted value's `padding` entry, in the same workflow;
+anything else keeps the existing rejection. The rank is read from the reference,
+not fixed at 1: an `offsets` and an `owner` are rank 1 by construction, while a
+`valid_lengths` has the rank [§10.5](#105-generic-component-batching--proposed)
+fixes — the number of axes outer to the padded one — so a flat rank-1 admission
+would refuse a companion this design elsewhere requires, and would refuse it by
+advising the one layout a companion may not declare. A companion must also be
+**emitted**, not merely declared: an output no step writes is an empty vector
+beside a ragged payload, which is this rule's failure case wearing the appearance
+of compliance. That check is whole-workflow rather than path-sensitive, because
+"written by some declared step" is what is decidable without evaluating branch
+predicates. A companion is never compacted and never split like a payload — each
 request receives its own span plus **rebased**, zero-based offsets for that span,
 and the slice of any `valid_lengths` that indexes its own items, which needs no
 rebasing because a length is already relative to what it measures. A declared
