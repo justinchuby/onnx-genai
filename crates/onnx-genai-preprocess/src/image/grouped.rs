@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use onnx_genai_metadata::{
-    BatchLayout, TensorDimension, VisionOutputBinding, VisionPreprocessingProgram,
+    BatchLayout, PACK_OFFSETS_CONTENT, PACK_OWNER_CONTENT, TensorDimension, VisionOutputBinding,
+    VisionPreprocessingProgram,
 };
 
 use crate::batching::{EncoderBatchingError, PackedOwnership, RequestOwnership, RequestSpan};
@@ -850,12 +851,15 @@ fn declared_grouping_references(
         }
     }
     let ownership_pairs = declared.unwrap_or_default();
-    let output_names = outputs
+    let output_bindings = outputs
         .iter()
-        .map(|output| output.name.clone())
-        .collect::<BTreeSet<_>>();
+        .map(|output| (output.name.as_str(), output))
+        .collect::<BTreeMap<_, _>>();
     let mut referenced_roles = BTreeMap::<String, &'static str>::new();
-    let mut register = |name: &str, role: &'static str| -> Result<(), EncoderBatchingError> {
+    let mut register = |name: &str,
+                        role: &'static str,
+                        required_content: Option<&str>|
+     -> Result<(), EncoderBatchingError> {
         if let Some(previous) = referenced_roles.insert(name.to_owned(), role)
             && previous != role
         {
@@ -866,22 +870,33 @@ fn declared_grouping_references(
                 ),
             });
         }
-        if !output_names.contains(name) {
+        let Some(binding) = output_bindings.get(name) else {
             return Err(EncoderBatchingError::Preprocessing {
                 detail: format!(
                     "structural companion '{name}' is referenced by a payload contract but is not \
                      declared as a preprocessing output"
                 ),
             });
+        };
+        if let Some(required_content) = required_content
+            && binding.content != required_content
+        {
+            return Err(EncoderBatchingError::Preprocessing {
+                detail: format!(
+                    "structural companion '{name}' is referenced as {role} but carries content \
+                     role '{}'; referenced {role} must carry content role '{required_content}'",
+                    binding.content
+                ),
+            });
         }
         Ok(())
     };
     for (offsets, owner) in &ownership_pairs {
-        register(offsets, "ownership offsets")?;
-        register(owner, "ownership owner map")?;
+        register(offsets, "ownership offsets", Some(PACK_OFFSETS_CONTENT))?;
+        register(owner, "ownership owner map", Some(PACK_OWNER_CONTENT))?;
     }
     for name in &valid_length_names {
-        register(name, "padding valid lengths")?;
+        register(name, "padding valid lengths", None)?;
     }
     Ok(GroupingReferences {
         ownership_pairs,

@@ -299,6 +299,75 @@ fn padding_reference_not_content_role_selects_the_synthesized_length() {
 }
 
 #[test]
+fn referenced_ownership_bindings_with_correct_roles_are_synthesized() {
+    let square = png(2, 2, [0, 0, 255]);
+    let processor = GroupedVisionPreprocessor::from_input_and_program(
+        "image_preprocess",
+        &[-1, -1, 3],
+        &program(IMAGE_PROGRAM, "image"),
+    )
+    .unwrap();
+    let bundle = processor
+        .preprocess_encoded(&[MediaRequest::new([MediaItem::single(&square)])])
+        .unwrap();
+
+    assert_eq!(i64_tensor(&bundle, "media.offsets"), [0, 1]);
+    assert_eq!(i64_tensor(&bundle, "media.owner"), [0]);
+}
+
+#[test]
+fn referenced_ownership_bindings_reject_swapped_roles() {
+    let mut declared = program(IMAGE_PROGRAM, "image");
+    declared
+        .outputs
+        .iter_mut()
+        .find(|output| output.name == "media.offsets")
+        .unwrap()
+        .content = "pack_owner".to_owned();
+    declared
+        .outputs
+        .iter_mut()
+        .find(|output| output.name == "media.owner")
+        .unwrap()
+        .content = "pack_offsets".to_owned();
+
+    let error = GroupedVisionPreprocessor::from_input_and_program(
+        "image_preprocess",
+        &[-1, -1, 3],
+        &declared,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("media.offsets"));
+    assert!(message.contains("ownership offsets"));
+    assert!(message.contains("content role 'pack_owner'"));
+    assert!(message.contains("content role 'pack_offsets'"));
+}
+
+#[test]
+fn referenced_ownership_binding_rejects_wrong_role() {
+    let mut declared = program(IMAGE_PROGRAM, "image");
+    declared
+        .outputs
+        .iter_mut()
+        .find(|output| output.name == "media.owner")
+        .unwrap()
+        .content = "pixels".to_owned();
+
+    let error = GroupedVisionPreprocessor::from_input_and_program(
+        "image_preprocess",
+        &[-1, -1, 3],
+        &declared,
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("media.owner"));
+    assert!(message.contains("ownership owner map"));
+    assert!(message.contains("content role 'pixels'"));
+    assert!(message.contains("content role 'pack_owner'"));
+}
+
+#[test]
 fn unreferenced_length_role_lookalike_is_not_intercepted() {
     let mut declared = program(IMAGE_PROGRAM, "image");
     declared.outputs.push(VisionOutputBinding {
