@@ -86,6 +86,8 @@ on:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
       - "scripts/ort_ab/ab.py"
+      - "scripts/ort_ab/hostlock_gate.py"
+      - "scripts/ort_ab/sweep_decode.py"
       - "scripts/ort_ab/test_ab_lock.py"
       - ".github/workflows/hostlock.yml"
   push:
@@ -95,6 +97,8 @@ on:
       - "scripts/hostlock.sh"
       - "scripts/hostlock_test.sh"
       - "scripts/ort_ab/ab.py"
+      - "scripts/ort_ab/hostlock_gate.py"
+      - "scripts/ort_ab/sweep_decode.py"
       - "scripts/ort_ab/test_ab_lock.py"
       - ".github/workflows/hostlock.yml"
 

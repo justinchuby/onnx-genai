@@ -2442,6 +2442,7 @@ dependencies = [
  "onnx-runtime-ep-plugin",
  "onnx-runtime-ir",
  "onnx-runtime-ort-testkit",
+ "onnx-runtime-shape-inference",
  "onnx-std",
  "serde_json",
  "serde_yaml",

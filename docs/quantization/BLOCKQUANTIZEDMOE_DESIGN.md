@@ -1,9 +1,12 @@
-# `pkg.nxrt::BlockQuantizedMoE` v1 — Operator Design Note
+# `pkg.nxrt::BlockQuantizedMoE` — Operator Design Note (mixed-projection ABI)
 
-**Status:** v1 ABI FROZEN — CPU reference oracle implemented after Justin/Roy
-sign-off.
-**Author:** Ripley (architect)
-**Date:** 2026-07-18
+**Status:** Mixed-projection ABI — CPU reference oracle implemented. This
+supersedes the frozen single-`format` v1 ABI: each projection (`fc1`/`fc2`/`fc3`)
+now carries its **own** native block format, because real GLM-5.2 GGUF routed
+experts pack gate/up and down at different qtypes and block widths. There is no
+backward-compatibility layer — the old single-`format` attribute is removed.
+**Author:** Ripley (architect); mixed-projection revision by Sebastian (systems/perf)
+**Date:** 2026-07-18; revised 2026-08-24
 **Scope:** ABI, dispatch semantics, decode reuse, determinism, shape inference,
 CPU+CUDA staging plan. This op is P1 #6, the largest practical GLM blocker
 ([GLM_READINESS_GAPS.md:259-268](../models/GLM_READINESS_GAPS.md#L259-L268)).
@@ -49,10 +52,13 @@ Three existing contracts are the load-bearing precedents this ABI mirrors:
 
 ---
 
-## 1. Operator ABI (v1)
+## 1. Operator ABI (mixed-projection)
 
-**v1 ABI FROZEN (2026-07-19).** The CPU reference oracle now implements this
-schema; the v1 positional inputs and attribute surface below are frozen.
+The CPU reference oracle implements this schema. The positional inputs are
+unchanged from the frozen v1 layout; the **attribute surface changed**: the
+single `format` attribute is replaced by three per-projection format attributes
+`fc1_format`, `fc2_format`, `fc3_format` (see §1.3). This is a breaking change
+with no compatibility shim.
 
 - **Domain:** `pkg.nxrt`
 - **Op type:** `BlockQuantizedMoE` (exact string the seam matches at
@@ -78,7 +84,7 @@ packed `uint8` blob per projection, expert-major. This is the deliberate,
 justified deviation from the QMoE precedent — its reason is the block format
 itself, not a stylistic choice.
 
-### 1.2 Input list (v1)
+### 1.2 Input list
 
 Ordering mirrors QMoE positions 0/1/2/(bias)/(down)/(bias)/(gate)/(bias) so a
 graph author can transcode a QMoE node by swapping weight tensors and dropping
@@ -111,25 +117,47 @@ Notes:
   ([moe.rs:287-298](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L287-L298)).
   `fc3` is present only for **unfused** SwiGLU / gated-GLU, exactly as QMoE
   gates it ([qmoe.rs:254-291](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L254-L291)).
-- The **block format is uniform across all experts and all three projections**
-  in v1 (one `format` attribute). Mixed per-projection formats are deferred
-  (Decision 5).
-- `blocksN = KN.div_ceil(qk(format))` and `block_bytes = block_bytes(format)`,
-  reusing `BlockFormat::qk` / `block_bytes`
+- Each projection carries its **own** native block format: `fc1_format`
+  (gate/up), `fc2_format` (down), and `fc3_format` (the separate gate of an
+  unfused SwiGLU / gated-GLU, present iff `fc3_experts_weights` is wired). The
+  formats are independent. This is required by real GLM-5.2 UD-IQ1_S routed
+  experts (arch `glm-dsa`, 1809 tensors), whose per-layer combinations are, from
+  the on-disk GGUF header metadata:
+
+  | gate/up (`fc1_format`) | down (`fc2_format`) | layers |
+  |---|---|---|
+  | IQ1_S | IQ3_XXS | 53 |
+  | IQ2_XXS | IQ3_XXS | 18 |
+  | IQ2_XXS | IQ4_XS | 4 |
+  | Q2_K | Q3_K | 1 |
+
+  Gate always equals up; down always differs from gate/up. The single-`format`
+  v1 ABI could not represent any of these layers. The lone `Q2_K`/`Q3_K` layer
+  and the shared experts (`Q5_K`/`Q6_K`/`Q8_0`) are **not** in `BlockFormat` and
+  are **typed-rejected** at the claim boundary — never dequantized or
+  dense-fallback executed.
+- Each projection's packed shape is `[E, N, blocksN, block_bytesN]` where
+  `blocksN = KN.div_ceil(qk(fmt))` and `block_bytesN = block_bytes(fmt)` for that
+  projection's own `fmt`, reusing `BlockFormat::qk` / `block_bytes`
   ([block_quantized_matmul.rs:84-112](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L84-L112)),
   where `KN` is the input-feature width of that projection
-  (H for fc1/fc3, inter for fc2).
+  (H for fc1/fc3, inter for fc2). All byte offsets, per-row and per-expert
+  strides are derived from one property-typed `ProjectionLayout` contract shared
+  by the schema validator, the CPU oracle, and the CUDA claim gate.
 
-### 1.3 Attributes (v1)
+### 1.3 Attributes
 
 All attributes reuse the QMoE/`MoeAttributes` parse contract
 ([moe.rs:57-107](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L57-L107))
-except `format` / `block_layout_version`, which reuse `BlockQuantizedMatMul`
+except the per-projection format attributes and `block_layout_version`, which
+reuse `BlockQuantizedMatMul`'s `BlockFormat::parse`
 ([block_quantized_matmul.rs:155-169](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L155-L169)).
 
 | Attribute | Type | Default | Source precedent |
 |---|---|---|---|
-| `format` | string enum | *required* | `BlockFormat::parse` — `mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, iq1_m` ([block_quantized_matmul.rs:66-82](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L66-L82)) |
+| `fc1_format` | string enum | *required* | `BlockFormat::parse` — `mxfp4, iq4_nl, iq4_xs, iq3_s, iq3_xxs, iq2_s, iq2_xs, iq2_xxs, iq1_s, iq1_m` ([block_quantized_matmul.rs:66-82](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L66-L82)) |
+| `fc2_format` | string enum | *required* | same enum as `fc1_format` |
+| `fc3_format` | string enum | required **iff** `fc3_experts_weights` wired; forbidden otherwise | same enum as `fc1_format` |
 | `block_layout_version` | int | 1 | must equal 1 ([block_quantized_matmul.rs:157-162](../../crates/onnx-runtime-ep-cpu/src/kernels/block_quantized_matmul.rs#L157-L162)) |
 | `k` (top_k) | int | 1 | `MoeAttributes.k`, must be `>0` and `<= E` ([moe.rs:59-62](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L59-L62), [qmoe.rs:192-197](../../crates/onnx-runtime-ep-cpu/src/kernels/qmoe.rs#L192-L197)) |
 | `activation_type` | string | `relu` | `relu, gelu, silu, swiglu, identity` ([moe.rs:63-80](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L63-L80)) |
@@ -138,6 +166,10 @@ except `format` / `block_layout_version`, which reuse `BlockQuantizedMatMul`
 | `activation_alpha` | float | 1.0 | ([moe.rs:103](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L103)) |
 | `activation_beta` | float | 0.0 | ([moe.rs:104](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L104)) |
 | `swiglu_limit` | float | +inf | ([moe.rs:105](../../crates/onnx-runtime-ep-cpu/src/kernels/moe.rs#L105)) |
+
+The claim validator rejects any node carrying the obsolete single `format`
+attribute (it is no longer in the attribute whitelist) — there is no silent
+fallback to a uniform format.
 
 **Intentionally NOT present** (justified): `expert_weight_bits`, `block_size`,
 `quant_type`, and `use_sparse_mixer`. The first three are affine-int-only knobs
@@ -349,8 +381,12 @@ Staged exactly like QMoE Phase 1/2
 - Add `BlockQuantizedMoE` to the CUDA registry next to `qmoe`/`qmoe_gemm`/
   `qmoe_grouping` (existing CUDA QMoE surface). Reuse the CUDA
   `block_quantized_matmul` decoder.
-- All-f32; every node claimed (no heterogeneous fallback,
-  [GLM_READINESS_GAPS.md:359-360](../models/GLM_READINESS_GAPS.md#L359-L360)).
+- All-f32. The current device kernel decodes a **single uniform** format across
+  all projections. Under the mixed-projection ABI it therefore claims only nodes
+  whose `fc1_format`/`fc2_format`/`fc3_format` are all equal; **mixed-projection
+  nodes (the real GLM-5.2 case) are typed-rejected at the CUDA claim gate** and
+  fall back to the CPU oracle. A per-projection CUDA decoder is an explicit
+  follow-up — no success claim is made for mixed-projection CUDA execution.
 - Gate merges on bitwise parity vs. the Phase 1 CPU oracle (§4).
 
 **Phase 3b (out of v1 scope) — live device paging.**
@@ -407,12 +443,16 @@ Each item lists a recommended default. Sign-off requested before kernel work.
    `use_sparse_mixer` from v1 (§7). **Default: outside / absent from schema.**
 
 5. **Single uniform `format` vs. per-projection / per-expert formats.**
-   *Recommend:* **one uniform, currently verified `format`** for all experts and
-   projections in v1 (GLM's routed tensors are homogeneous IQ). Existing
-   `mxfp4` means the current BlockQuantizedMatMul layout, not an unpublished
-   K3/Moonshot format with a similar name. Per-projection or new native formats
-   are deferred to a later namespaced format/version. **Default: uniform,
-   verified formats only.**
+   **RESOLVED (2026-08-24): per-projection formats implemented.** The original v1
+   recommendation of one uniform `format` was **wrong for real GLM-5.2 GGUF** —
+   its routed experts pack gate/up and down at different qtypes on every layer
+   (see §1.1). The ABI now carries independent `fc1_format`/`fc2_format`/
+   `fc3_format`; the uniform `format` attribute is removed with no compatibility
+   shim. `mxfp4`/IQ names still mean the current `BlockQuantizedMatMul` layout,
+   not an unpublished K3/Moonshot format. **Per-expert** (as opposed to
+   per-projection) formats remain out of scope — every expert in a layer shares
+   that layer's per-projection formats. Native layouts outside `BlockFormat`
+   (`Q2_K`/`Q3_K`/`Q5_K`/`Q8_0`) are **typed-rejected**, never dequantized.
 
 6. **`inter`/`expert_dim` inferred vs. declared attributes.**
    *Recommend:* **inferred from weight shapes** (QMoE precedent,
